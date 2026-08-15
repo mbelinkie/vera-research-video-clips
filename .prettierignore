@@ -1,0 +1,12 @@
+node_modules
+dist
+coverage
+playwright-report
+test-results
+data
+exports
+package-lock.json
+tests/fixtures/media/*.mp4
+PROJECT_GUIDE.md
+outline.md
+.agents/

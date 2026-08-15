@@ -1,0 +1,95 @@
+{
+  "track": {
+    "id": "019fbb95-cd76-7920-93fa-e23ba755e301",
+    "videoId": "M7lc1UVf-VE",
+    "language": "en",
+    "kind": "english",
+    "source": "generated",
+    "provider": "fixture",
+    "timingPrecision": "word",
+    "schemaVersion": 1,
+    "contentSha256": "1111111111111111111111111111111111111111111111111111111111111111",
+    "version": 1
+  },
+  "segments": [
+    {
+      "id": "019fbb95-cd76-7920-93fa-e23ba755e311",
+      "ordinal": 0,
+      "startMs": 0,
+      "endMs": 1800,
+      "text": "This fixture has accurate word timing."
+    },
+    {
+      "id": "019fbb95-cd76-7920-93fa-e23ba755e312",
+      "ordinal": 1,
+      "startMs": 1800,
+      "endMs": 4000,
+      "text": "Click any word to seek precisely."
+    }
+  ],
+  "tokens": [
+    {
+      "id": "019fbb95-cd76-7920-93fa-e23ba755e321",
+      "segmentId": "019fbb95-cd76-7920-93fa-e23ba755e311",
+      "ordinal": 0,
+      "text": "This",
+      "startMs": 0,
+      "endMs": 300,
+      "timingConfidence": 0.99
+    },
+    {
+      "id": "019fbb95-cd76-7920-93fa-e23ba755e322",
+      "segmentId": "019fbb95-cd76-7920-93fa-e23ba755e311",
+      "ordinal": 1,
+      "text": "fixture",
+      "startMs": 300,
+      "endMs": 750,
+      "timingConfidence": 0.99
+    },
+    {
+      "id": "019fbb95-cd76-7920-93fa-e23ba755e323",
+      "segmentId": "019fbb95-cd76-7920-93fa-e23ba755e311",
+      "ordinal": 2,
+      "text": "has",
+      "startMs": 750,
+      "endMs": 950,
+      "timingConfidence": 0.99
+    },
+    {
+      "id": "019fbb95-cd76-7920-93fa-e23ba755e324",
+      "segmentId": "019fbb95-cd76-7920-93fa-e23ba755e311",
+      "ordinal": 3,
+      "text": "accurate word timing.",
+      "startMs": 950,
+      "endMs": 1800,
+      "timingConfidence": 0.98
+    },
+    {
+      "id": "019fbb95-cd76-7920-93fa-e23ba755e325",
+      "segmentId": "019fbb95-cd76-7920-93fa-e23ba755e312",
+      "ordinal": 0,
+      "text": "Click",
+      "startMs": 1800,
+      "endMs": 2200,
+      "timingConfidence": 0.99
+    },
+    {
+      "id": "019fbb95-cd76-7920-93fa-e23ba755e326",
+      "segmentId": "019fbb95-cd76-7920-93fa-e23ba755e312",
+      "ordinal": 1,
+      "text": "any word",
+      "startMs": 2200,
+      "endMs": 2900,
+      "timingConfidence": 0.98
+    },
+    {
+      "id": "019fbb95-cd76-7920-93fa-e23ba755e327",
+      "segmentId": "019fbb95-cd76-7920-93fa-e23ba755e312",
+      "ordinal": 2,
+      "text": "to seek precisely.",
+      "startMs": 2900,
+      "endMs": 4000,
+      "timingConfidence": 0.98
+    }
+  ]
+}

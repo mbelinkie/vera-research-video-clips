@@ -1,0 +1,17 @@
+{
+  "name": "@research-video/providers",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./captions-local": "./src/captions-local.ts",
+    "./speech-whisper-cpp": "./src/speech-whisper-cpp.ts",
+    "./translation-aws": "./src/translation-aws.ts"
+  },
+  "dependencies": {
+    "@aws-sdk/client-translate": "^3.1101.0",
+    "@research-video/contracts": "*",
+    "@research-video/transcript": "*"
+  }
+}

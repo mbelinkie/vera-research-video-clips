@@ -1,0 +1,30 @@
+{
+  "track": {
+    "id": "019fbb95-cd76-7920-93fa-e23ba755e101",
+    "videoId": "fixture-english",
+    "language": "en",
+    "kind": "original",
+    "source": "youtube-manual",
+    "provider": "fixture",
+    "timingPrecision": "cue",
+    "schemaVersion": 1,
+    "contentSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "version": 1
+  },
+  "segments": [
+    {
+      "id": "019fbb95-cd76-7920-93fa-e23ba755e111",
+      "ordinal": 0,
+      "startMs": 0,
+      "endMs": 1800,
+      "text": "This fixture is intentionally short."
+    },
+    {
+      "id": "019fbb95-cd76-7920-93fa-e23ba755e112",
+      "ordinal": 1,
+      "startMs": 1800,
+      "endMs": 4000,
+      "text": "It tests cue-level transcript behavior."
+    }
+  ]
+}

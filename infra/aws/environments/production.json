@@ -1,0 +1,6 @@
+{
+  "EnvironmentName": "production",
+  "TranscriptBucketName": "replace-with-production-bucket-name",
+  "AllowedUploadOrigins": "https://replace-with-production-origin.example",
+  "CloudApiRoleArn": ""
+}

@@ -1,0 +1,49 @@
+{
+  "original": {
+    "track": {
+      "id": "019fbb95-cd76-7920-93fa-e23ba755e201",
+      "videoId": "fixture-spanish",
+      "language": "es",
+      "kind": "original",
+      "source": "generated",
+      "provider": "fixture",
+      "timingPrecision": "word",
+      "schemaVersion": 1,
+      "contentSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "version": 1
+    },
+    "segments": [
+      {
+        "id": "019fbb95-cd76-7920-93fa-e23ba755e211",
+        "ordinal": 0,
+        "startMs": 500,
+        "endMs": 2500,
+        "text": "Este es un ejemplo breve."
+      }
+    ]
+  },
+  "english": {
+    "track": {
+      "id": "019fbb95-cd76-7920-93fa-e23ba755e202",
+      "videoId": "fixture-spanish",
+      "language": "en",
+      "kind": "english",
+      "source": "translated",
+      "sourceTrackId": "019fbb95-cd76-7920-93fa-e23ba755e201",
+      "provider": "fixture",
+      "timingPrecision": "word",
+      "schemaVersion": 1,
+      "contentSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "version": 1
+    },
+    "segments": [
+      {
+        "id": "019fbb95-cd76-7920-93fa-e23ba755e212",
+        "ordinal": 0,
+        "startMs": 500,
+        "endMs": 2500,
+        "text": "This is a short example."
+      }
+    ]
+  }
+}

@@ -1,0 +1,19 @@
+﻿WEBVTT Sample fixture
+
+NOTE This comment must not become transcript text.
+It can span more than one line.
+
+STYLE
+::cue { color: lime; }
+
+REGION
+id:fixture
+width:40%
+
+late-cue
+00:03.500 --> 00:05.250 align:start position:10%
+<v Narrator><c.emphasis>Second &amp; final line.</c></v>
+
+early-cue
+00:01.000 --> 00:04.000
+First &lt;overlapping&gt; cue.

@@ -1,0 +1,5 @@
+url,expected
+https://www.youtube.com/watch?v=ReadyVideo1,ready
+https://youtu.be/ForeignVid1,ready
+https://www.youtube.com/watch?v=ReadyVideo1,duplicate
+https://www.youtube.com/watch?v=FailedVid01,failed

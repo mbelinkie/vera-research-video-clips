@@ -1,0 +1,376 @@
+import { readFile } from "node:fs/promises";
+
+import { describe, expect, it } from "vitest";
+
+import fixture from "../../../tests/fixtures/transcripts/english-cue.json" with { type: "json" };
+import wordFixture from "../../../tests/fixtures/transcripts/english-word.json" with { type: "json" };
+import bilingualFixture from "../../../tests/fixtures/transcripts/spanish-bilingual.json" with { type: "json" };
+
+import {
+  deriveTranscriptSelection,
+  normalizeTranscriptFixture,
+  normalizeGeneratedTranscript,
+  normalizeTranslatedTranscript,
+  normalizeWebVttCaption,
+  searchTranscript,
+  segmentAtTime,
+  timedTranscriptTokens,
+  tokenAtTime,
+  transcriptVirtualWindow,
+  transcriptToSrt,
+  updateTranscriptSelectionExportBounds,
+  type TranscriptSegment,
+} from "./index.ts";
+
+describe("transcript range selection", () => {
+  it("normalizes reverse DOM selection into stable word-timed bounds", () => {
+    const transcript = normalizeTranscriptFixture(wordFixture);
+    const selection = deriveTranscriptSelection({
+      transcript,
+      anchor: {
+        segmentId: transcript.segments[1]!.id,
+        tokenId: transcript.tokens[5]!.id,
+      },
+      focus: {
+        segmentId: transcript.segments[0]!.id,
+        tokenId: transcript.tokens[1]!.id,
+      },
+    });
+
+    expect(selection).toMatchObject({
+      firstSegmentId: transcript.segments[0]!.id,
+      lastSegmentId: transcript.segments[1]!.id,
+      firstTokenId: transcript.tokens[1]!.id,
+      lastTokenId: transcript.tokens[5]!.id,
+      transcriptStartMs: 300,
+      transcriptEndMs: 2_900,
+      exportStartMs: 300,
+      exportEndMs: 2_900,
+      text: "fixture has accurate word timing. Click any word",
+      timingPrecision: "word",
+    });
+  });
+
+  it("uses honest cue bounds when word timing is unavailable", () => {
+    const transcript = normalizeTranscriptFixture(fixture);
+    const selection = deriveTranscriptSelection({
+      transcript,
+      anchor: { segmentId: transcript.segments[0]!.id },
+      focus: { segmentId: transcript.segments[1]!.id },
+    });
+
+    expect(selection).toMatchObject({
+      transcriptStartMs: 0,
+      transcriptEndMs: 4_000,
+      exportStartMs: 0,
+      exportEndMs: 4_000,
+      text: "This fixture is intentionally short. It tests cue-level transcript behavior.",
+      timingPrecision: "cue",
+    });
+  });
+
+  it("keeps source selection bounds immutable while padding export bounds", () => {
+    const transcript = normalizeTranscriptFixture(wordFixture);
+    const selection = deriveTranscriptSelection({
+      transcript,
+      anchor: {
+        segmentId: transcript.segments[0]!.id,
+        tokenId: transcript.tokens[1]!.id,
+      },
+      focus: {
+        segmentId: transcript.segments[1]!.id,
+        tokenId: transcript.tokens[5]!.id,
+      },
+      paddingBeforeMs: 500,
+      paddingAfterMs: 500,
+      sourceDurationMs: 3_000,
+    });
+
+    expect(selection).toMatchObject({
+      transcriptStartMs: 300,
+      transcriptEndMs: 2_900,
+      exportStartMs: 0,
+      exportEndMs: 3_000,
+    });
+    expect(() =>
+      updateTranscriptSelectionExportBounds(selection, {
+        startMs: 400,
+        endMs: 3_000,
+      }),
+    ).toThrow(/include the transcript selection/u);
+  });
+});
+
+describe("translated transcript normalization", () => {
+  it("creates a separate time-linked English cue track", async () => {
+    const original = normalizeTranscriptFixture(bilingualFixture.original);
+    const translated = await normalizeTranslatedTranscript({
+      sourceTranscript: original,
+      targetLanguage: "en",
+      provider: "amazon-translate",
+      translations: [
+        {
+          sourceSegmentId: original.segments[0]!.id,
+          text: "This is a short example.",
+        },
+      ],
+    });
+
+    expect(translated.track).toMatchObject({
+      language: "en",
+      kind: "english",
+      source: "translated",
+      provider: "amazon-translate",
+      sourceTrackId: original.track.id,
+      timingPrecision: "cue",
+    });
+    expect(translated.segments[0]).toMatchObject({
+      startMs: original.segments[0]!.startMs,
+      endMs: original.segments[0]!.endMs,
+      text: "This is a short example.",
+    });
+    expect(
+      translated.tokens.every((token) => token.startMs === undefined),
+    ).toBe(true);
+  });
+
+  it("rejects missing, duplicate, or empty translated segments", async () => {
+    const original = normalizeTranscriptFixture(bilingualFixture.original);
+    await expect(
+      normalizeTranslatedTranscript({
+        sourceTranscript: original,
+        targetLanguage: "en",
+        provider: "fixture",
+        translations: [],
+      }),
+    ).rejects.toMatchObject({ code: "invalid_translation", retryable: false });
+  });
+});
+
+describe("generated transcript normalization", () => {
+  it("preserves generated segment timing without inventing word timing", async () => {
+    const transcript = await normalizeGeneratedTranscript({
+      videoId: "fixture-spanish",
+      language: "es",
+      provider: "whisper.cpp",
+      model: "large-v3-turbo",
+      segments: [
+        { startMs: 500, endMs: 2_500, text: " Este es un ejemplo breve. " },
+      ],
+    });
+
+    expect(transcript.track).toMatchObject({
+      language: "es",
+      kind: "original",
+      source: "generated",
+      provider: "whisper.cpp",
+      model: "large-v3-turbo",
+      timingPrecision: "cue",
+    });
+    expect(transcript.segments).toMatchObject([
+      { startMs: 500, endMs: 2_500, text: "Este es un ejemplo breve." },
+    ]);
+    expect(
+      transcript.tokens.every((token) => token.startMs === undefined),
+    ).toBe(true);
+  });
+});
+
+describe("SRT serialization", () => {
+  it("serializes canonical source-video cue timing", () => {
+    const transcript = normalizeTranscriptFixture(fixture);
+    expect(transcriptToSrt(transcript)).toContain(
+      "1\n00:00:00,000 --> 00:00:01,800\nThis fixture is intentionally short.\n",
+    );
+  });
+});
+
+const webVttFixture = new URL(
+  "../../../tests/fixtures/transcripts/caption-sample.vtt",
+  import.meta.url,
+);
+
+const segments: TranscriptSegment[] = [
+  {
+    id: "a",
+    trackId: "track",
+    ordinal: 0,
+    startMs: 0,
+    endMs: 1_000,
+    text: "Hello",
+  },
+  {
+    id: "b",
+    trackId: "track",
+    ordinal: 1,
+    startMs: 1_000,
+    endMs: 2_000,
+    text: "World",
+  },
+];
+
+describe("segmentAtTime", () => {
+  it("uses half-open source-time ranges", () => {
+    expect(segmentAtTime(segments, 999)?.id).toBe("a");
+    expect(segmentAtTime(segments, 1_000)?.id).toBe("b");
+    expect(segmentAtTime(segments, 2_000)).toBeUndefined();
+  });
+});
+
+describe("timed transcript navigation", () => {
+  it("uses exact token bounds without inventing timing for untimed tokens", () => {
+    const timed = timedTranscriptTokens([
+      {
+        id: "019fbb95-cd76-7920-93fa-e23ba755e401",
+        segmentId: "019fbb95-cd76-7920-93fa-e23ba755e402",
+        ordinal: 0,
+        text: "untimed",
+      },
+      {
+        id: "019fbb95-cd76-7920-93fa-e23ba755e403",
+        segmentId: "019fbb95-cd76-7920-93fa-e23ba755e402",
+        ordinal: 1,
+        text: "timed",
+        startMs: 1_200,
+        endMs: 1_600,
+      },
+    ]);
+
+    expect(timed).toHaveLength(1);
+    expect(tokenAtTime(timed, 1_450)?.text).toBe("timed");
+    expect(tokenAtTime(timed, 1_600)).toBeUndefined();
+  });
+
+  it("windows a ten-thousand-segment transcript to a small render range", () => {
+    expect(
+      transcriptVirtualWindow({
+        itemCount: 10_000,
+        scrollTop: 72_000,
+        viewportHeight: 504,
+        rowHeight: 72,
+      }),
+    ).toEqual({
+      startIndex: 995,
+      endIndex: 1_012,
+      offsetTop: 71_640,
+      totalHeight: 720_000,
+    });
+  });
+});
+
+describe("normalized transcript fixtures", () => {
+  it("attaches segments to their canonical track and preserves cue timing", () => {
+    const transcript = normalizeTranscriptFixture(fixture);
+
+    expect(transcript.track.timingPrecision).toBe("cue");
+    expect(transcript.segments[0]?.trackId).toBe(transcript.track.id);
+    expect(segmentAtTime(transcript.segments, 1_900)?.ordinal).toBe(1);
+  });
+
+  it("supports literal case-insensitive segment search", () => {
+    const transcript = normalizeTranscriptFixture(fixture);
+
+    expect(searchTranscript(transcript.segments, "CUE-LEVEL")).toHaveLength(1);
+    expect(searchTranscript(transcript.segments, "")).toHaveLength(2);
+  });
+});
+
+describe("WebVTT normalization", () => {
+  it("normalizes metadata, cue settings, markup, entities, and overlap honestly", async () => {
+    const contents = await readFile(webVttFixture);
+    const transcript = await normalizeWebVttCaption({
+      contents,
+      videoId: "M7lc1UVf-VE",
+      language: "en-US",
+      source: "youtube-manual",
+      provider: "yt-dlp",
+    });
+
+    expect(transcript.track).toMatchObject({
+      videoId: "M7lc1UVf-VE",
+      language: "en-US",
+      kind: "english",
+      source: "youtube-manual",
+      provider: "yt-dlp",
+      timingPrecision: "cue",
+    });
+    expect(transcript.track.contentSha256).toMatch(/^[a-f0-9]{64}$/);
+    expect(transcript.segments).toMatchObject([
+      {
+        ordinal: 0,
+        startMs: 1_000,
+        endMs: 4_000,
+        text: "First <overlapping> cue.",
+      },
+      {
+        ordinal: 1,
+        startMs: 3_500,
+        endMs: 5_250,
+        text: "Second & final line.",
+      },
+    ]);
+    expect(transcript.tokens.map((token) => token.text)).toEqual([
+      "First",
+      "<overlapping>",
+      "cue.",
+      "Second",
+      "&",
+      "final",
+      "line.",
+    ]);
+    expect(
+      transcript.tokens.every((token) => token.startMs === undefined),
+    ).toBe(true);
+  });
+
+  it("produces stable IDs and hashes for equivalent normalized content", async () => {
+    const input = {
+      contents: "WEBVTT\r\n\r\n00:00.000 --> 00:01.250\r\nHello\r\n",
+      videoId: "M7lc1UVf-VE",
+      language: "en",
+      source: "youtube-auto" as const,
+      provider: "yt-dlp",
+    };
+
+    const first = await normalizeWebVttCaption(input);
+    const second = await normalizeWebVttCaption({
+      ...input,
+      contents: "WEBVTT\n\n00:00.000 --> 00:01.250\nHello\n",
+    });
+
+    expect(second).toEqual(first);
+  });
+
+  it("converts hour-form timestamps to integer source milliseconds", async () => {
+    const transcript = await normalizeWebVttCaption({
+      contents:
+        "WEBVTT\n\n01:02:03.004 --> 01:02:05.006 line:90%\nLong-form timing\n",
+      videoId: "M7lc1UVf-VE",
+      language: "es",
+      source: "youtube-auto",
+      provider: "yt-dlp",
+    });
+
+    expect(transcript.segments[0]).toMatchObject({
+      startMs: 3_723_004,
+      endMs: 3_725_006,
+    });
+  });
+
+  it.each([
+    ["missing header", "00:00.000 --> 00:01.000\nText"],
+    ["invalid timestamp", "WEBVTT\n\n00:61.000 --> 00:62.000\nText"],
+    ["backward cue", "WEBVTT\n\n00:02.000 --> 00:01.000\nText"],
+    ["empty cue", "WEBVTT\n\n00:00.000 --> 00:01.000\n<c.red></c>"],
+  ])("rejects %s", async (_label, contents) => {
+    await expect(
+      normalizeWebVttCaption({
+        contents,
+        videoId: "M7lc1UVf-VE",
+        language: "en",
+        source: "youtube-auto",
+        provider: "yt-dlp",
+      }),
+    ).rejects.toMatchObject({ code: "invalid_webvtt", retryable: false });
+  });
+});

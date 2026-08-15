@@ -1,0 +1,38 @@
+# Dependencies and generated build/test output
+node_modules/
+.pnpm-store/
+dist/
+coverage/
+playwright-report/
+test-results/
+.cache/
+.vite/
+.aws-sam/
+*.tsbuildinfo
+
+# Runtime configuration and credentials
+.env
+.env.*
+!.env.example
+credentials/
+secrets/
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Local runtime data and generated media
+data/
+exports/
+scratch/
+tmp/
+artifacts/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
+.DS_Store
+*.log

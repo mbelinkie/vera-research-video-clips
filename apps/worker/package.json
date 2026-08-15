@@ -1,0 +1,14 @@
+{
+  "name": "@research-video/worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@research-video/contracts": "*",
+    "@research-video/config": "*",
+    "@research-video/media": "*",
+    "@research-video/providers": "*",
+    "@research-video/sync": "*",
+    "@research-video/transcript": "*"
+  }
+}

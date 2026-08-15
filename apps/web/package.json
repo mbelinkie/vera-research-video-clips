@@ -1,0 +1,12 @@
+{
+  "name": "@research-video/web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "papaparse": "^5.5.4"
+  },
+  "devDependencies": {
+    "@types/papaparse": "^5.5.2"
+  }
+}

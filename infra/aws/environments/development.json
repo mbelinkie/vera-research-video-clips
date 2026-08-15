@@ -1,0 +1,6 @@
+{
+  "EnvironmentName": "development",
+  "TranscriptBucketName": "replace-with-development-bucket-name",
+  "AllowedUploadOrigins": "http://localhost:43112",
+  "CloudApiRoleArn": ""
+}

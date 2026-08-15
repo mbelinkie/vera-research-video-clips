@@ -1,0 +1,145 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Foundation skeleton for the Research Video Clip Tool shared control plane
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    AllowedValues:
+      - development
+      - production
+  TranscriptBucketName:
+    Type: String
+    Description: Globally unique private transcript bucket name
+  AllowedUploadOrigins:
+    Type: CommaDelimitedList
+    Default: http://localhost:43112
+    Description: Web origins allowed to use authorized transcript transfer URLs
+  CloudApiRoleArn:
+    Type: String
+    Default: ""
+    Description: Optional existing runtime role granted project-object access
+
+Conditions:
+  HasCloudApiRole: !Not [!Equals [!Ref CloudApiRoleArn, ""]]
+
+Resources:
+  TranscriptBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Ref TranscriptBucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      CorsConfiguration:
+        CorsRules:
+          - AllowedOrigins: !Ref AllowedUploadOrigins
+            AllowedMethods:
+              - GET
+              - HEAD
+              - PUT
+            AllowedHeaders:
+              - "*"
+            ExposedHeaders:
+              - ETag
+              - x-amz-version-id
+              - x-amz-checksum-sha256
+            MaxAge: 900
+      LifecycleConfiguration:
+        Rules:
+          - Id: AbortAbandonedMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+      Tags:
+        - Key: application
+          Value: research-video-clip-tool
+        - Key: environment
+          Value: !Ref EnvironmentName
+
+  TranscriptBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref TranscriptBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource:
+              - !GetAtt TranscriptBucket.Arn
+              - !Sub "${TranscriptBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+          - !If
+            - HasCloudApiRole
+            - Sid: AllowCloudApiProjectListing
+              Effect: Allow
+              Principal:
+                AWS: !Ref CloudApiRoleArn
+              Action: s3:ListBucket
+              Resource: !GetAtt TranscriptBucket.Arn
+              Condition:
+                StringLike:
+                  s3:prefix: projects/*
+            - !Ref AWS::NoValue
+          - !If
+            - HasCloudApiRole
+            - Sid: AllowCloudApiProjectObjects
+              Effect: Allow
+              Principal:
+                AWS: !Ref CloudApiRoleArn
+              Action:
+                - s3:GetObject
+                - s3:GetObjectVersion
+                - s3:PutObject
+                - s3:DeleteObject
+                - s3:DeleteObjectVersion
+              Resource: !Sub "${TranscriptBucket.Arn}/projects/*"
+            - !Ref AWS::NoValue
+
+  JobDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+      Tags:
+        - Key: environment
+          Value: !Ref EnvironmentName
+
+  JobQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 900
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt JobDeadLetterQueue.Arn
+        maxReceiveCount: 5
+      Tags:
+        - Key: environment
+          Value: !Ref EnvironmentName
+
+Outputs:
+  TranscriptBucketName:
+    Value: !Ref TranscriptBucket
+  TranscriptBucketArn:
+    Value: !GetAtt TranscriptBucket.Arn
+  JobQueueUrl:
+    Value: !Ref JobQueue
+  JobDeadLetterQueueUrl:
+    Value: !Ref JobDeadLetterQueue

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Research Video Clip Workflow"
+  short_description: "Build the shared transcript-to-clip tool"
+  default_prompt: "Use $research-video-clip-workflow to implement the next verified milestone in the shared research video tool."

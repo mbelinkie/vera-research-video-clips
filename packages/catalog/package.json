@@ -1,0 +1,13 @@
+{
+  "name": "@research-video/catalog",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": "./src/index.ts",
+  "dependencies": {
+    "@electric-sql/pglite": "^0.5.4",
+    "@research-video/auth": "*",
+    "@research-video/contracts": "*",
+    "@research-video/storage": "*"
+  }
+}
