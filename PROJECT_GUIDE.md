@@ -7,6 +7,37 @@ Last updated: 2026-08-13
 
 This document is the source of truth for product scope, architecture, sequencing, and acceptance criteria. Update it when a deliberate product or architectural decision changes. Use `outline.md` as the shorter execution checklist.
 
+## 0. Delivery workflow and durable records
+
+Every implementation task begins with exactly one bounded Markdown spec in
+`specs/active/`. Use one task/thread for that spec; do not combine unrelated
+implementation, debugging, review, or product-design work in the same task.
+The spec must name the user-visible outcome, affected boundaries, focused
+context, explicit non-goals, failure states, acceptance criteria, and the
+narrow tests to run first.
+
+Keep the task context to the active spec, this guide, the relevant contracts and
+implementation boundaries, and concrete evidence such as a failing test or
+reproduction. Start verification with the narrowest relevant test, then run
+broader checks proportional to the risk. Before committing, review the complete
+diff and retain the actual command output rather than recording that checks
+“should pass.”
+
+If two evidence-based debugging attempts do not make progress, stop extending
+that task. Record the confirmed facts and open a fresh task/thread with a
+focused reproduction and a new bounded spec or an explicit update to the active
+one.
+
+Move a spec to `specs/completed/` only after the work is complete. Its completion
+record must include the decision(s), files changed, checks and their actual
+results, remaining risks/follow-ups, and commit ID(s). Update `PROJECT_GUIDE.md`,
+`outline.md`, or `README.md` to describe work only after it is completed and
+verified; an active spec is the sole place for planned implementation details.
+
+Keep external findings and source links in `docs/research/`. Add a short record
+in `docs/decisions/` only for a durable architectural decision that needs its
+own rationale; do not create decision records for routine implementation notes.
+
 ## 1. Product promise
 
 Turn a YouTube video in any supported language into a searchable English transcript, let the user navigate the video from that transcript, and make any selected passage actionable in one step:
@@ -1138,6 +1169,8 @@ A slice is done only when:
 - errors are actionable and logs do not leak secrets
 - user data/cache compatibility is considered
 - documentation and `outline.md` status are updated
+- the active spec has been moved to `specs/completed/` with its completion
+  record, including decisions, checks/results, risks, and commit IDs
 
 ## 16. Known risks and mitigation
 

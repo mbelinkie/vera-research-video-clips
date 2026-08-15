@@ -2,6 +2,21 @@
 
 This is the short execution map. `PROJECT_GUIDE.md` contains the authoritative product, architecture, data, security, and acceptance details.
 
+## Delivery workflow
+
+- Create one bounded spec in `specs/active/` for each implementation task and
+  use one task/thread for that spec.
+- Give the task focused context: the active spec, relevant guide sections,
+  affected contracts/boundaries, and concrete failure evidence. State explicit
+  non-goals before editing.
+- Run narrow tests first, then broader checks appropriate to the change. Review
+  the complete diff and preserve actual test output before committing.
+- After two unsuccessful evidence-based debugging attempts, start a fresh task
+  with the confirmed facts and a focused reproduction.
+- Move only verified, completed specs to `specs/completed/`, including decisions,
+  checks/results, risks, and commit IDs. Update this outline and other durable
+  product documentation only for completed work.
+
 ## Product sentence
 
 In a shared project, load or batch-submit YouTube videos, reuse an online English transcript when available, transcribe and translate when necessary, navigate by transcript, and turn a highlighted passage into a project-logged candidate, a logged-and-exported clip, or an unlogged export.
@@ -174,6 +189,7 @@ Gate: logging requires a visible project and atomically preserves entered notes/
 
 ### 5. Clip export
 
+- [ ] M5-01: authorized full-source acquisition and verified job-scoped scratch lifecycle (`specs/active/M5-01-authorized-source-acquisition-and-scratch-lifecycle.md`).
 - [ ] Acquire the full authorized source when needed into isolated job-scoped scratch storage.
 - [ ] Group active same-source exports where practical so one download can cut many requested ranges.
 - [ ] Delete and verify source cleanup after success, failure, or cancellation.

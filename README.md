@@ -4,6 +4,23 @@ Shared-project research software for resolving English transcripts, navigating Y
 
 The authoritative product and architecture plan is in [`PROJECT_GUIDE.md`](./PROJECT_GUIDE.md). The active implementation checklist is in [`outline.md`](./outline.md).
 
+## Delivery workflow
+
+Each implementation task has one bounded spec in [`specs/active`](./specs/active)
+and one task/thread. The spec names the outcome, affected boundaries, focused
+context, non-goals, acceptance criteria, failure states, and verification plan.
+Start with narrow tests, then run broader checks appropriate to the risk; review
+the full diff and record actual command output before committing.
+
+When work is complete and verified, move its spec to
+[`specs/completed`](./specs/completed) with decisions, checks/results, risks, and
+commit IDs. Update product documentation only for completed work. External
+research belongs in [`docs/research`](./docs/research); create a
+[`docs/decisions`](./docs/decisions) record only when a durable architectural
+decision needs its own rationale. After two unsuccessful evidence-based
+debugging attempts, start a fresh task with the confirmed facts and a focused
+reproduction.
+
 ## Prerequisites
 
 - Node.js 22 or newer
