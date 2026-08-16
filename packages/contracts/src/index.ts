@@ -238,6 +238,14 @@ export const ExportSourceLanguageClassSchema = z.enum([
   "mixed",
   "unknown",
 ]);
+export const ExportSubtitleTrackReferenceSchema = z.object({
+  trackId: IdSchema,
+  trackVersion: z.number().int().positive(),
+});
+export const ExportSubtitleTrackSnapshotsSchema = z.object({
+  original: ExportSubtitleTrackReferenceSchema,
+  english: ExportSubtitleTrackReferenceSchema,
+});
 export const ExportVideoRateControlSchema = z.discriminatedUnion("mode", [
   z.object({ mode: z.literal("crf"), value: z.number().int().min(0).max(51) }),
   z.object({
@@ -279,16 +287,44 @@ export const ExportPresetSnapshotSchema = z.object({
   name: z.string().trim().min(1).max(160),
   settings: ExportSettingsSchema,
 });
-export const CreateClipExportRequestSchema = z.object({
+const createExportRequestBaseSchema = z.object({
   idempotencyKey: z.string().trim().min(1).max(512),
   sourceLanguageClass: ExportSourceLanguageClassSchema,
+  subtitleTracks: ExportSubtitleTrackSnapshotsSchema.optional(),
   preset: ExportPresetSnapshotSchema,
 });
-export const CreateExportOnlyRequestSchema =
-  CreateClipExportRequestSchema.extend({
+
+function requireBilingualSubtitleTrackSnapshots(
+  request: {
+    sourceLanguageClass: z.infer<typeof ExportSourceLanguageClassSchema>;
+    subtitleTracks?:
+      z.infer<typeof ExportSubtitleTrackSnapshotsSchema> | undefined;
+  },
+  context: z.RefinementCtx,
+) {
+  if (
+    request.sourceLanguageClass !== "confirmed_english" &&
+    !request.subtitleTracks
+  ) {
+    context.addIssue({
+      code: "custom",
+      path: ["subtitleTracks"],
+      message:
+        "Foreign, mixed, and unknown exports require immutable original and English subtitle track snapshots.",
+    });
+  }
+}
+
+export const CreateClipExportRequestSchema =
+  createExportRequestBaseSchema.superRefine(
+    requireBilingualSubtitleTrackSnapshots,
+  );
+export const CreateExportOnlyRequestSchema = createExportRequestBaseSchema
+  .extend({
     video: ClipVideoSnapshotSchema,
     selection: TranscriptSelectionSchema,
-  });
+  })
+  .superRefine(requireBilingualSubtitleTrackSnapshots);
 export const TranscriptArtifactSchema = z.object({
   type: z.enum([
     "manifest",
@@ -604,6 +640,80 @@ export const JobStateSchema = z.enum([
   "canceled",
 ]);
 
+export const ExportMediaProvenanceSchema = z.object({
+  durationMs: z.number().int().positive(),
+  containerFormat: z.string().trim().min(1).max(240).optional(),
+  videoCodec: z.string().trim().min(1).max(120).optional(),
+  audioCodec: z.string().trim().min(1).max(120).optional(),
+  ffprobeVersion: z.string().trim().min(1).max(120).optional(),
+});
+
+export const ResolvedExportBoundsSchema = z
+  .object({
+    startMs: z.number().int().nonnegative(),
+    endMs: z.number().int().positive(),
+    sourceAttempt: z.number().int().positive(),
+    resolvedAt: UtcTimestampSchema,
+  })
+  .refine((bounds) => bounds.endMs > bounds.startMs, {
+    message: "Resolved export end must be after its start.",
+  });
+
+export const RenderedExportMediaProvenanceSchema =
+  ExportMediaProvenanceSchema.extend({
+    sourceAttempt: z.number().int().positive(),
+    validatedAt: UtcTimestampSchema,
+  });
+
+export const SubtitleOmissionProvenanceSchema = z.object({
+  policy: z.literal("confirmed_english_user_setting"),
+  sourceAttempt: z.number().int().positive(),
+  validatedAt: UtcTimestampSchema,
+});
+
+export const EnglishSubtitleSidecarProvenanceSchema = z
+  .object({
+    trackId: IdSchema,
+    trackVersion: z.number().int().positive(),
+    cueCount: z.number().int().positive(),
+    byteSize: z.number().int().positive(),
+    contentSha256: z.string().regex(/^[a-f0-9]{64}$/),
+    startMs: z.number().int().nonnegative(),
+    endMs: z.number().int().positive(),
+    sourceAttempt: z.number().int().positive(),
+    validatedAt: UtcTimestampSchema,
+  })
+  .refine((sidecar) => sidecar.endMs > sidecar.startMs, {
+    message: "English subtitle timing bounds must be nonempty.",
+  });
+
+export const SubtitleSidecarProvenanceSchema = z
+  .object({
+    role: z.enum(["original", "english"]),
+    language: z.string().trim().min(2).max(35),
+    trackId: IdSchema,
+    trackVersion: z.number().int().positive(),
+    cueCount: z.number().int().positive(),
+    byteSize: z.number().int().positive(),
+    contentSha256: z.string().regex(/^[a-f0-9]{64}$/),
+    startMs: z.number().int().nonnegative(),
+    endMs: z.number().int().positive(),
+    sourceAttempt: z.number().int().positive(),
+    validatedAt: UtcTimestampSchema,
+  })
+  .refine((sidecar) => sidecar.endMs > sidecar.startMs, {
+    message: "Subtitle timing bounds must be nonempty.",
+  });
+
+export const FinalArtifactProvenanceSchema = z.object({
+  role: z.enum(["video_mp4", "english_srt", "original_srt"]),
+  packageIdentity: z.string().regex(/^clip-[a-f0-9-]{36}$/),
+  byteSize: z.number().int().positive(),
+  contentSha256: z.string().regex(/^[a-f0-9]{64}$/),
+  sourceAttempt: z.number().int().positive(),
+  validatedAt: UtcTimestampSchema,
+});
+
 export const ExportRequestSchema = z.object({
   id: IdSchema,
   jobId: IdSchema,
@@ -613,7 +723,19 @@ export const ExportRequestSchema = z.object({
   video: ClipVideoSnapshotSchema,
   selection: TranscriptSelectionSchema,
   sourceLanguageClass: ExportSourceLanguageClassSchema,
+  subtitleTracks: ExportSubtitleTrackSnapshotsSchema.optional(),
   preset: ExportPresetSnapshotSchema,
+  mediaProvenance: ExportMediaProvenanceSchema.optional(),
+  resolvedExportBounds: ResolvedExportBoundsSchema.optional(),
+  renderedMediaProvenance: RenderedExportMediaProvenanceSchema.optional(),
+  subtitleOmissionProvenance: SubtitleOmissionProvenanceSchema.optional(),
+  englishSubtitleProvenance: EnglishSubtitleSidecarProvenanceSchema.optional(),
+  subtitleSidecars: z.array(SubtitleSidecarProvenanceSchema).max(2).optional(),
+  finalArtifacts: z
+    .array(FinalArtifactProvenanceSchema)
+    .min(1)
+    .max(3)
+    .optional(),
   state: JobStateSchema,
   createdAt: UtcTimestampSchema,
   updatedAt: UtcTimestampSchema,
@@ -746,12 +868,20 @@ export type UpdateClipCandidateRequest = z.infer<
 >;
 export type ExportSettings = z.infer<typeof ExportSettingsSchema>;
 export type ExportPresetSnapshot = z.infer<typeof ExportPresetSnapshotSchema>;
+export type ExportSubtitleTrackSnapshots = z.infer<
+  typeof ExportSubtitleTrackSnapshotsSchema
+>;
+export type SubtitleSidecarProvenance = z.infer<
+  typeof SubtitleSidecarProvenanceSchema
+>;
 export type CreateClipExportRequest = z.infer<
   typeof CreateClipExportRequestSchema
 >;
 export type CreateExportOnlyRequest = z.infer<
   typeof CreateExportOnlyRequestSchema
 >;
+export type ExportMediaProvenance = z.infer<typeof ExportMediaProvenanceSchema>;
+export type ResolvedExportBounds = z.infer<typeof ResolvedExportBoundsSchema>;
 export type ExportRequest = z.infer<typeof ExportRequestSchema>;
 export type TranscriptArtifact = z.infer<typeof TranscriptArtifactSchema>;
 export type TranscriptManifest = z.infer<typeof TranscriptManifestSchema>;

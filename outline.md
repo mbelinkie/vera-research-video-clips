@@ -189,21 +189,43 @@ Gate: logging requires a visible project and atomically preserves entered notes/
 
 ### 5. Clip export
 
-- [ ] M5-01: authorized full-source acquisition and verified job-scoped scratch lifecycle (`specs/active/M5-01-authorized-source-acquisition-and-scratch-lifecycle.md`).
-- [ ] Acquire the full authorized source when needed into isolated job-scoped scratch storage.
+- [x] M5-01: authorized full-source acquisition and verified job-scoped scratch lifecycle (`specs/completed/M5-01-authorized-source-acquisition-and-scratch-lifecycle.md`).
+- [x] Acquire the full authorized source when needed into isolated job-scoped scratch storage.
 - [ ] Group active same-source exports where practical so one download can cut many requested ranges.
-- [ ] Delete and verify source cleanup after success, failure, or cancellation.
+- [x] Delete and verify source cleanup after success, failure, or cancellation.
 - [ ] Add cleanup retries plus an abandoned-scratch sweeper/lifecycle backstop for worker crashes.
-- [ ] Validate bounds and inspect input with FFprobe.
+- [x] M5-02: inspect verified local source with provider-neutral FFprobe and
+  persist duration-clamped resolved bounds (`specs/completed/M5-02-ffprobe-inspection-and-resolved-export-bounds.md`).
+- [x] Validate bounds and inspect input with FFprobe.
+- [x] M5-03: render and FFprobe-verify one resolved H.264/AAC MP4 range in
+  private attempt staging (`specs/completed/M5-03-ffmpeg-adapter-and-verified-single-range-render.md`).
+- [x] M5-04: derive, re-parse, and pair-validate one confirmed-English
+  clip-relative SRT in private attempt staging
+  (`specs/completed/M5-04-verified-confirmed-english-subtitle-sidecar-staging.md`).
+- [x] M5-05: derive, re-parse, and pair-validate required clip-relative
+  original-language and translated-English SRTs for foreign/mixed/unknown
+  snapshots in private attempt staging
+  (`specs/completed/M5-05-verified-foreign-language-bilingual-subtitle-sidecar-staging.md`).
+- [x] M5-06: honor a confirmed-English snapshot's explicit sidecar omission
+  after verified temporary-MP4 staging, without transcript lookup or staged SRT,
+  and retain only safe omission provenance
+  (`specs/completed/M5-06-verified-confirmed-english-subtitle-omission-staging.md`).
+- [x] M5-07: atomically promote only the already validated MP4 plus exact
+  language-policy sidecars into a deterministic sanitized local package,
+  re-verify safe artifact provenance, and complete only after source cleanup
+  succeeds (`specs/completed/M5-07-verified-final-clip-package-promotion.md`).
 - [ ] Add named personal/project conversion presets and immutable preset versions.
 - [ ] Add project/global defaults plus per-export overrides.
 - [ ] Add capability-aware settings for container, codecs, quality/bitrate, dimensions/frame rate, audio, subtitle embedding, padding, output, and supported acceleration.
 - [ ] Add `Omit subtitle files for English-language clips`, default off; snapshot it in presets/jobs and apply it only when source language is confidently English.
 - [ ] Store the fully resolved settings snapshot on every export job and retry.
 - [ ] Re-encode using an editing-friendly H.264/AAC MP4 default plus supported alternative settings.
-- [ ] Generate and validate a clip-specific English SRT by default for English-language exports; omit sidecars only through the explicit checkbox.
-- [ ] For foreign/mixed/unknown-language clips, always derive both original-language and translated-English SRTs even if the selected preset carries the English-only omission preference.
-- [ ] Trim/clamp cues to actual padded export bounds, zero-base timestamps, and block completion when required subtitles are missing or mismatched.
+- [x] Generate and validate a clip-specific English SRT by default for
+  confirmed-English exports; an explicit immutable confirmed-English omission
+  snapshot stages no SRT, while foreign/mixed/unknown requests continue to use
+  the mandatory bilingual path.
+- [x] For foreign/mixed/unknown-language clips, always derive both original-language and translated-English SRTs even if the selected preset carries the English-only omission preference.
+- [x] Trim/clamp required sidecar cues to actual padded export bounds, zero-base timestamps, and block this staging lifecycle when required subtitles are missing or mismatched.
 - [ ] Add optional embedded soft subtitle track.
 - [ ] Generate thumbnail, metadata JSON, and manifest.
 - [ ] Use staging plus atomic completion.
@@ -313,4 +335,6 @@ infra/aws        storage, API, database, queues, identity, monitoring
 
 ## Next action
 
-Begin Milestone 5 with authorized source acquisition, isolated scratch cleanup, and an FFprobe/FFmpeg export worker. Add optional alignment only where timing evidence requires it.
+Continue Milestone 5 with the next bounded manifest/metadata or other explicitly
+scoped slice; keep final package promotion separate from thumbnails, embedding,
+UI/preset changes, retries, grouping, cloud storage, and sweeping.

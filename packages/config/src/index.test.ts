@@ -11,6 +11,7 @@ describe("configuration", () => {
     expect(config.queueMode).toBe("memory");
     expect(config.captionProvider).toBe("disabled");
     expect(config.mediaProvider).toBe("disabled");
+    expect(config.exportSourceProvider).toBe("disabled");
     expect(config.ytDlpPath).toBe("yt-dlp");
     expect(config.speechToTextProvider).toBe("disabled");
     expect(config.whisperCppPath).toBe("whisper-cli");
@@ -28,6 +29,7 @@ describe("configuration", () => {
     const config = loadConfig({
       NODE_ENV: "test",
       MEDIA_PROVIDER: "yt-dlp-audio",
+      EXPORT_SOURCE_PROVIDER: "yt-dlp",
       YT_DLP_PATH: "/opt/tools/yt-dlp",
       SPEECH_TO_TEXT_PROVIDER: "whisper-cpp",
       WHISPER_CPP_PATH: "/opt/whisper/whisper-cli",
@@ -36,6 +38,7 @@ describe("configuration", () => {
     });
 
     expect(config.mediaProvider).toBe("yt-dlp-audio");
+    expect(config.exportSourceProvider).toBe("yt-dlp");
     expect(config.speechToTextProvider).toBe("whisper-cpp");
     expect(config.whisperCppModelName).toBe("large-v3-turbo");
   });

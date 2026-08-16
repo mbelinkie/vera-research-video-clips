@@ -514,6 +514,7 @@ export class SharedProjectCatalog {
       video: clip.video,
       selection: clip.selection,
       sourceLanguageClass: input.sourceLanguageClass,
+      ...(input.subtitleTracks ? { subtitleTracks: input.subtitleTracks } : {}),
       preset: input.preset,
     };
     await this.transaction(async () => {
@@ -526,10 +527,10 @@ export class SharedProjectCatalog {
       );
       await this.database.query(
         `INSERT INTO export_requests
-           (id, job_id, clip_id, project_id, mode, video_snapshot,
-            selection_snapshot, source_language_class, preset_snapshot,
+            (id, job_id, clip_id, project_id, mode, video_snapshot,
+            selection_snapshot, source_language_class, subtitle_tracks_snapshot, preset_snapshot,
             requested_by, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, 'logged', $5, $6, $7, $8, $9, $10, $10)`,
+         VALUES ($1, $2, $3, $4, 'logged', $5, $6, $7, $8, $9, $10, $11, $11)`,
         [
           requestId,
           jobId,
@@ -538,6 +539,7 @@ export class SharedProjectCatalog {
           JSON.stringify(clip.video),
           JSON.stringify(clip.selection),
           input.sourceLanguageClass,
+          input.subtitleTracks ? JSON.stringify(input.subtitleTracks) : null,
           JSON.stringify(input.preset),
           actor.userId,
           now,
@@ -2091,6 +2093,9 @@ function mapLoggedExportRequest(row: DbRow): ExportRequest {
     video: row.video_snapshot,
     selection: row.selection_snapshot,
     sourceLanguageClass: row.source_language_class,
+    ...(row.subtitle_tracks_snapshot
+      ? { subtitleTracks: row.subtitle_tracks_snapshot }
+      : {}),
     preset: row.preset_snapshot,
     state: row.state,
     createdAt: iso(row.created_at),

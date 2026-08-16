@@ -23,6 +23,7 @@ describe("cloud migrations", () => {
       "0005_batch_controls",
       "0006_clip_candidates",
       "0007_logged_export_requests",
+      "0008_export_subtitle_track_snapshots",
     ]);
     expect(await runCloudMigrations(database)).toEqual([]);
     const result = await database.query<{ table_name: string }>(

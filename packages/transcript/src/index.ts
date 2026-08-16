@@ -536,12 +536,160 @@ function validPositiveInteger(value: number, label: string) {
 
 export function transcriptToSrt(transcript: NormalizedTranscript): string {
   const normalized = NormalizedTranscriptSchema.parse(transcript);
-  return normalized.segments
-    .map(
-      (segment, index) =>
-        `${index + 1}\n${srtTimestamp(segment.startMs)} --> ${srtTimestamp(segment.endMs)}\n${segment.text}\n`,
+  return serializeSrtCues(normalized.segments);
+}
+
+export type ClipRelativeSrtCue = {
+  startMs: number;
+  endMs: number;
+  text: string;
+};
+
+export class SrtValidationError extends Error {
+  readonly code: string;
+  readonly retryable: boolean;
+
+  constructor(
+    message: string,
+    options: { code?: string; retryable?: boolean } = {},
+  ) {
+    super(message);
+    this.name = "SrtValidationError";
+    this.code = options.code ?? "srt_invalid";
+    this.retryable = options.retryable ?? true;
+  }
+}
+
+/**
+ * Produces source-order cues for exactly one export range. Source transcript
+ * timing remains untouched; only the returned sidecar representation is
+ * clipped and shifted to zero.
+ */
+export function deriveClipRelativeSrtCues(input: {
+  transcript: NormalizedTranscript;
+  startMs: number;
+  endMs: number;
+  missingCue?: { code: string; message: string };
+}): ClipRelativeSrtCue[] {
+  const transcript = NormalizedTranscriptSchema.parse(input.transcript);
+  assertSrtBounds(input.startMs, input.endMs, "export range");
+  const cues = transcript.segments
+    .filter(
+      (segment) =>
+        segment.endMs > input.startMs && segment.startMs < input.endMs,
     )
+    .map((segment) => ({
+      startMs: Math.max(segment.startMs, input.startMs) - input.startMs,
+      endMs: Math.min(segment.endMs, input.endMs) - input.startMs,
+      text: segment.text,
+      ordinal: segment.ordinal,
+    }))
+    .toSorted(
+      (left, right) =>
+        left.startMs - right.startMs ||
+        left.endMs - right.endMs ||
+        left.ordinal - right.ordinal,
+    )
+    .map(({ ordinal: _ordinal, ...cue }) => cue);
+  if (cues.length === 0) {
+    throw new SrtValidationError(
+      input.missingCue?.message ??
+        "The verified English transcript has no cue in the resolved export range. Adjust the range or retry after verifying the transcript.",
+      { code: input.missingCue?.code ?? "english_subtitle_cue_missing" },
+    );
+  }
+  validateClipRelativeSrtCues(cues, input.endMs - input.startMs);
+  return cues;
+}
+
+export function serializeSrtCues(cues: readonly ClipRelativeSrtCue[]): string {
+  if (cues.length === 0) {
+    throw new SrtValidationError("SRT output requires at least one cue.", {
+      code: "srt_empty",
+    });
+  }
+  return cues
+    .map((cue, index) => {
+      assertSrtCueText(cue.text);
+      return `${index + 1}\n${srtTimestamp(cue.startMs)} --> ${srtTimestamp(cue.endMs)}\n${cue.text.trim()}\n`;
+    })
     .join("\n");
+}
+
+export function parseSrt(input: string | Uint8Array): ClipRelativeSrtCue[] {
+  let source: string;
+  try {
+    source =
+      typeof input === "string"
+        ? input
+        : new TextDecoder("utf-8", { fatal: true }).decode(input);
+  } catch {
+    throw new SrtValidationError("SRT content is not valid UTF-8.", {
+      code: "srt_invalid_utf8",
+      retryable: false,
+    });
+  }
+  if (new TextEncoder().encode(source).byteLength > 20 * 1024 * 1024) {
+    throw new SrtValidationError("SRT content exceeds the 20 MB limit.", {
+      code: "srt_too_large",
+      retryable: false,
+    });
+  }
+  const blocks = source
+    .replace(/^\uFEFF/, "")
+    .replaceAll("\r\n", "\n")
+    .replaceAll("\r", "\n")
+    .trim()
+    .split(/\n{2,}/u);
+  if (blocks.length === 0 || (blocks.length === 1 && !blocks[0])) {
+    throw new SrtValidationError("SRT content contains no cues.", {
+      code: "srt_empty",
+      retryable: false,
+    });
+  }
+  if (blocks.length > maxWebVttCues) {
+    throw new SrtValidationError("SRT content contains too many cues.", {
+      code: "srt_too_many_cues",
+      retryable: false,
+    });
+  }
+  return blocks.map((block, index) => parseSrtBlock(block, index + 1));
+}
+
+export function validateClipRelativeSrtCues(
+  cues: readonly ClipRelativeSrtCue[],
+  renderedDurationMs: number,
+): void {
+  if (!Number.isSafeInteger(renderedDurationMs) || renderedDurationMs <= 0) {
+    throw new SrtValidationError("Verified rendered duration is invalid.", {
+      code: "subtitle_rendered_duration_invalid",
+      retryable: false,
+    });
+  }
+  if (cues.length === 0) {
+    throw new SrtValidationError("SRT output requires at least one cue.", {
+      code: "srt_empty",
+      retryable: false,
+    });
+  }
+  let previousStartMs = -1;
+  for (const cue of cues) {
+    assertSrtBounds(cue.startMs, cue.endMs, "SRT cue");
+    assertSrtCueText(cue.text);
+    if (cue.startMs < previousStartMs) {
+      throw new SrtValidationError("SRT cue ordering is invalid.", {
+        code: "srt_order_invalid",
+        retryable: false,
+      });
+    }
+    if (cue.endMs > renderedDurationMs) {
+      throw new SrtValidationError(
+        "SRT cue timing exceeds the verified rendered duration.",
+        { code: "srt_out_of_range", retryable: false },
+      );
+    }
+    previousStartMs = cue.startMs;
+  }
 }
 
 export function timedTranscriptTokens(
@@ -624,6 +772,75 @@ function srtTimestamp(milliseconds: number) {
     .padStart(2, "0")}:${seconds.toString().padStart(2, "0")},${millis
     .toString()
     .padStart(3, "0")}`;
+}
+
+function parseSrtBlock(
+  block: string,
+  expectedIndex: number,
+): ClipRelativeSrtCue {
+  const lines = block.split("\n");
+  const index = Number(lines.shift());
+  if (!Number.isSafeInteger(index) || index !== expectedIndex) {
+    throw new SrtValidationError("SRT cue indexes must be contiguous.", {
+      code: "srt_index_invalid",
+      retryable: false,
+    });
+  }
+  const timing = lines.shift();
+  const match =
+    timing === undefined
+      ? undefined
+      : /^(\d{2,}):([0-5]\d):([0-5]\d),(\d{3})\s+-->\s+(\d{2,}):([0-5]\d):([0-5]\d),(\d{3})$/u.exec(
+          timing,
+        );
+  if (!match) {
+    throw new SrtValidationError("SRT cue timing is malformed.", {
+      code: "srt_timing_invalid",
+      retryable: false,
+    });
+  }
+  const startMs = srtMilliseconds(match.slice(1, 5));
+  const endMs = srtMilliseconds(match.slice(5, 9));
+  const text = lines.join("\n").trim();
+  assertSrtBounds(startMs, endMs, "SRT cue");
+  assertSrtCueText(text);
+  return { startMs, endMs, text };
+}
+
+function srtMilliseconds(parts: readonly string[]) {
+  const [hours, minutes, seconds, milliseconds] = parts.map(Number);
+  const value =
+    hours! * 3_600_000 + minutes! * 60_000 + seconds! * 1_000 + milliseconds!;
+  if (!Number.isSafeInteger(value)) {
+    throw new SrtValidationError("SRT cue timing is invalid.", {
+      code: "srt_timing_invalid",
+      retryable: false,
+    });
+  }
+  return value;
+}
+
+function assertSrtBounds(startMs: number, endMs: number, label: string) {
+  if (
+    !Number.isSafeInteger(startMs) ||
+    !Number.isSafeInteger(endMs) ||
+    startMs < 0 ||
+    endMs <= startMs
+  ) {
+    throw new SrtValidationError(`${label} timing is invalid.`, {
+      code: "srt_timing_invalid",
+      retryable: false,
+    });
+  }
+}
+
+function assertSrtCueText(text: string) {
+  if (!text.trim() || text.includes("\0")) {
+    throw new SrtValidationError("SRT cue text is invalid.", {
+      code: "srt_text_invalid",
+      retryable: false,
+    });
+  }
 }
 
 function decodeWebVtt(input: string | Uint8Array) {

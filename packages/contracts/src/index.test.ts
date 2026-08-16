@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   BatchPreflightRequestSchema,
+  CreateClipExportRequestSchema,
   CreateTranscriptionBatchRequestSchema,
   ExportSettingsSchema,
   HealthResponseSchema,
@@ -114,5 +115,40 @@ describe("shared contracts", () => {
         videoCodec: "prores",
       }).error?.issues[0]?.message,
     ).toMatch(/requires MOV or MKV/u);
+  });
+
+  it("requires immutable bilingual track identities for foreign, mixed, and unknown exports", () => {
+    const request = {
+      idempotencyKey: "bilingual-fixture",
+      sourceLanguageClass: "foreign",
+      preset: {
+        presetVersion: 1,
+        name: "Editing MP4",
+        settings: {
+          container: "mp4",
+          videoCodec: "h264",
+          videoRateControl: { mode: "crf", value: 20 },
+          frameRate: "source",
+          audioCodec: "aac",
+          omitSubtitleFilesForConfirmedEnglish: true,
+          embedEnglishSubtitleTrack: false,
+        },
+      },
+    };
+    expect(CreateClipExportRequestSchema.safeParse(request).success).toBe(
+      false,
+    );
+    expect(
+      CreateClipExportRequestSchema.parse({
+        ...request,
+        subtitleTracks: {
+          original: { trackId: id, trackVersion: 1 },
+          english: {
+            trackId: "019fbb95-cd76-7920-93fa-e23ba755ee40",
+            trackVersion: 1,
+          },
+        },
+      }).subtitleTracks,
+    ).toBeDefined();
   });
 });

@@ -1,6 +1,6 @@
 # M5-01 — Authorized source acquisition and scratch lifecycle
 
-- Status: active
+- Status: completed
 - Task/thread: M5-01 only
 
 ## User-visible outcome
@@ -109,11 +109,27 @@ the two pipelines.
 
 ## Completion record
 
-Fill this section only when moving this file to `specs/completed/`.
-
-- Decisions made:
-- Files changed:
-- Checks run and actual results:
-- Manual verification:
-- Remaining risks/follow-ups:
-- Commit ID(s):
+- Decisions made: Added a separate `ExportSourceAcquisitionProvider` and
+  `EXPORT_SOURCE_PROVIDER` opt-in configuration; acquisition requires explicit
+  per-attempt authorization. Source lifecycle state is workstation-local in
+  SQLite because the media never leaves the local job scratch directory; the
+  cloud logged-export contract remains unchanged. Successful M5-01 handoff
+  returns the immutable request to `queued` because rendering is deliberately
+  deferred; `complete` is never set by acquisition.
+- Files changed: `packages/media/src/index.ts` and tests; `packages/config`
+  configuration and tests; local export lifecycle processor and tests;
+  `packages/db-local/migrations/0005_export_source_scratch_lifecycle.sql` and
+  queue persistence tests; `PROJECT_GUIDE.md` and `outline.md`.
+- Checks run and actual results: focused `vitest` suite: 19 passed; affected
+  migration and integration checks: local migrations 5 applied, cloud migrations
+  7 applied, 25 tests passed; `npm run typecheck`: passed; `npm run
+format:check`: passed; `npm test`: 108 passed, 1 skipped; `git diff --check`:
+  passed.
+- Manual verification: No live acquisition was run; it requires an explicitly
+  configured provider and caller authorization. Deterministic fake-provider
+  tests exercised each required lifecycle path without downloading media.
+- Remaining risks/follow-ups: M5-02 must retain the verified source only through
+  FFprobe/FFmpeg handoff, add output staging and finalization, and use the same
+  cleanup gate. Same-source grouping, independent cleanup retry, and the
+  abandoned-scratch sweeper remain explicitly deferred.
+- Commit ID(s): Not committed in this task.

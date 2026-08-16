@@ -7,17 +7,20 @@ import wordFixture from "../../../tests/fixtures/transcripts/english-word.json" 
 import bilingualFixture from "../../../tests/fixtures/transcripts/spanish-bilingual.json" with { type: "json" };
 
 import {
+  deriveClipRelativeSrtCues,
   deriveTranscriptSelection,
   normalizeTranscriptFixture,
   normalizeGeneratedTranscript,
   normalizeTranslatedTranscript,
   normalizeWebVttCaption,
+  parseSrt,
   searchTranscript,
   segmentAtTime,
   timedTranscriptTokens,
   tokenAtTime,
   transcriptVirtualWindow,
   transcriptToSrt,
+  validateClipRelativeSrtCues,
   updateTranscriptSelectionExportBounds,
   type TranscriptSegment,
 } from "./index.ts";
@@ -181,6 +184,61 @@ describe("SRT serialization", () => {
     const transcript = normalizeTranscriptFixture(fixture);
     expect(transcriptToSrt(transcript)).toContain(
       "1\n00:00:00,000 --> 00:00:01,800\nThis fixture is intentionally short.\n",
+    );
+  });
+
+  it("trims source cues and shifts them to clip-relative zero without changing source timing", () => {
+    const transcript = normalizeTranscriptFixture({
+      track: {
+        id: "019fbb95-cd76-7920-93fa-e23ba755e101",
+        videoId: "fixture-english",
+        language: "en",
+        kind: "english",
+        source: "youtube-manual",
+        provider: "fixture",
+        timingPrecision: "cue",
+        schemaVersion: 1,
+        contentSha256: "a".repeat(64),
+        version: 1,
+      },
+      segments: [
+        {
+          id: "019fbb95-cd76-7920-93fa-e23ba755e111",
+          ordinal: 0,
+          startMs: 500,
+          endMs: 1_500,
+          text: "Before",
+        },
+        {
+          id: "019fbb95-cd76-7920-93fa-e23ba755e112",
+          ordinal: 1,
+          startMs: 1_500,
+          endMs: 3_500,
+          text: "Inside",
+        },
+      ],
+    });
+    const cues = deriveClipRelativeSrtCues({
+      transcript,
+      startMs: 1_000,
+      endMs: 3_000,
+    });
+    expect(cues).toEqual([
+      { startMs: 0, endMs: 500, text: "Before" },
+      { startMs: 500, endMs: 2_000, text: "Inside" },
+    ]);
+    expect(transcript.segments[0]).toMatchObject({
+      startMs: 500,
+      endMs: 1_500,
+    });
+    expect(() =>
+      validateClipRelativeSrtCues(
+        [{ startMs: 0, endMs: 2_001, text: "Bad" }],
+        2_000,
+      ),
+    ).toThrow(/exceeds/u);
+    expect(() => parseSrt("1\nnot a timestamp\nMalformed")).toThrow(
+      /malformed/u,
     );
   });
 });
