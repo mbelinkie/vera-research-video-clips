@@ -214,6 +214,10 @@ Gate: logging requires a visible project and atomically preserves entered notes/
   language-policy sidecars into a deterministic sanitized local package,
   re-verify safe artifact provenance, and complete only after source cleanup
   succeeds (`specs/completed/M5-07-verified-final-clip-package-promotion.md`).
+- [x] M5-08: compose the existing local export lifecycle into one explicit,
+  authorization-confirmed `export:run-once` command and prove the complete
+  export-only media/package path with repository-owned fixture media plus real
+  FFmpeg/FFprobe (`specs/completed/M5-08-local-export-runtime-composition-and-real-tool-smoke.md`).
 - [ ] Add named personal/project conversion presets and immutable preset versions.
 - [ ] Add project/global defaults plus per-export overrides.
 - [ ] Add capability-aware settings for container, codecs, quality/bitrate, dimensions/frame rate, audio, subtitle embedding, padding, output, and supported acceleration.
@@ -231,7 +235,7 @@ Gate: logging requires a visible project and atomically preserves entered notes/
 - [ ] Use staging plus atomic completion.
 - [ ] Add progress, retry, safe cancellation, and batch export.
 
-Gate: representative presets produce the requested FFprobe properties, queued jobs survive preset edits unchanged, English clips get an SRT by default and can explicitly omit it, foreign/mixed/unknown clips always get original plus translated-English SRTs, a 30-second foreign-language range produces only cues within that 30-second clip, a real authorized smoke test succeeds, and no full source media remains after any terminal path.
+Gate: representative presets produce the requested FFprobe properties, queued jobs survive preset edits unchanged, English clips get an SRT by default and can explicitly omit it, foreign/mixed/unknown clips always get original plus translated-English SRTs, a 30-second foreign-language range produces only cues within that 30-second clip, a real authorized smoke test succeeds, and no full source media remains after any terminal path. M5-08 proves the local export-only composition path with authorized repository fixture media, not a live YouTube source or logged/cloud export delivery.
 
 ### 6. Google Sheets
 
@@ -335,6 +339,6 @@ infra/aws        storage, API, database, queues, identity, monitoring
 
 ## Next action
 
-Continue Milestone 5 with the next bounded manifest/metadata or other explicitly
-scoped slice; keep final package promotion separate from thumbnails, embedding,
-UI/preset changes, retries, grouping, cloud storage, and sweeping.
+Continue Milestone 5 with a bounded manifest/metadata or other explicitly
+scoped slice; keep logged/cloud export delivery, thumbnails, embedding,
+UI/preset changes, retries, grouping, cloud storage, and sweeping separate.

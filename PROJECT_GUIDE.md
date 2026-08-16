@@ -2,7 +2,7 @@
 
 ## Project guide and implementation plan
 
-Status: Milestones 1–4 core workflow complete; Milestone 5 verified clip-package promotion through the source-cleanup gate, complete
+Status: Milestones 1–4 core workflow complete; Milestone 5 local export-only runtime composition proven through M5-08; logged/cloud export delivery and the broader release gate remain open
 Last updated: 2026-08-15
 
 This document is the source of truth for product scope, architecture, sequencing, and acceptance criteria. Update it when a deliberate product or architectural decision changes. Use `outline.md` as the shorter execution checklist.
@@ -1134,6 +1134,8 @@ Deliver:
 - progress, cancellation where safe, retry, and batch export
 
 Exit when representative presets/overrides produce the requested media properties, queued jobs are unaffected by later preset edits, English clips include a validated clip-relative English SRT by default but can explicitly omit sidecars, every foreign/mixed/unknown-language clip has validated original and translated-English SRTs from the expected transcript versions, a 30-second foreign-language clip has accurate cues only within its 30-second duration, a real authorized video succeeds in a smoke test, and no full source media remains after any terminal job path.
+
+M5-08 completed 2026-08-15. `npm run export:run-once -- --request-id <uuid> --authorization-confirmed` now opens the configured local SQLite data root, composes exactly one existing `LocalExportSourceProcessor` attempt with the configured full-source provider and real FFprobe/FFmpeg adapters, then prints only a sanitized request state, package identity, and artifact hashes/sizes. The command has no server, polling, concurrency, or background work; confirmation is required on every run, and an already-complete request is reported without rerendering. A deterministic repository-owned four-second fixture smoke copied the source only into attempt-private scratch and verified a completed foreign-language H.264/AAC package with both clip-relative SRTs, persisted final provenance, atomic package visibility, and verified scratch deletion. This proves local `export_only` runtime composition only: logged export delivery, cloud/job relay, live authorized YouTube acquisition, manifests, thumbnails, retry/grouping, presets, and the full Milestone 5 exit criteria remain separate.
 
 ### Milestone 6 — Google Sheets control surface
 
