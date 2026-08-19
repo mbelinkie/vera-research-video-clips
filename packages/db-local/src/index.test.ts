@@ -1,6 +1,13 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import {
+  copyFileSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  rmSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -14,7 +21,49 @@ import {
   runLocalMigrations,
 } from "./index.ts";
 
+const localMigrationDirectory = fileURLToPath(
+  new URL("../migrations", import.meta.url),
+);
 const temporaryDirectories = new Set<string>();
+
+const fixtureExportInput = {
+  idempotencyKey: "fixture-export-only",
+  video: {
+    youtubeVideoId: "M7lc1UVf-VE",
+    canonicalUrl: "https://www.youtube.com/watch?v=M7lc1UVf-VE",
+    title: "Fixture video",
+  },
+  selection: {
+    trackId: "019fbb95-cd76-7920-93fa-e23ba755e301",
+    transcriptVersion: 1,
+    firstSegmentId: "019fbb95-cd76-7920-93fa-e23ba755e311",
+    lastSegmentId: "019fbb95-cd76-7920-93fa-e23ba755e312",
+    firstTokenId: "019fbb95-cd76-7920-93fa-e23ba755e322",
+    lastTokenId: "019fbb95-cd76-7920-93fa-e23ba755e326",
+    transcriptStartMs: 300,
+    transcriptEndMs: 2_900,
+    exportStartMs: 0,
+    exportEndMs: 3_400,
+    text: "fixture has accurate word timing. Click any word",
+    timingPrecision: "word" as const,
+  },
+  sourceLanguageClass: "confirmed_english" as const,
+  preset: {
+    presetVersion: 1,
+    name: "Editing MP4",
+    settings: {
+      container: "mp4" as const,
+      videoCodec: "h264" as const,
+      videoRateControl: { mode: "crf" as const, value: 20 },
+      maxWidth: 1_920,
+      frameRate: "source" as const,
+      audioCodec: "aac" as const,
+      audioKilobitsPerSecond: 192,
+      omitSubtitleFilesForConfirmedEnglish: false,
+      embedEnglishSubtitleTrack: false,
+    },
+  },
+};
 
 afterEach(() => {
   for (const directory of temporaryDirectories) {
@@ -43,6 +92,7 @@ describe("local migrations", () => {
       "0009_export_bilingual_sidecar_validation",
       "0010_export_confirmed_english_subtitle_omission",
       "0011_export_final_artifact_provenance",
+      "0012_export_clip_package_manifest",
     ]);
     expect(runLocalMigrations(database)).toEqual([]);
     expect(
@@ -67,48 +117,10 @@ describe("local migrations", () => {
       database,
       () => new Date("2026-08-01T12:00:00.000Z"),
     );
-    const exportInput = {
-      idempotencyKey: "fixture-export-only",
-      video: {
-        youtubeVideoId: "M7lc1UVf-VE",
-        canonicalUrl: "https://www.youtube.com/watch?v=M7lc1UVf-VE",
-        title: "Fixture video",
-      },
-      selection: {
-        trackId: "019fbb95-cd76-7920-93fa-e23ba755e301",
-        transcriptVersion: 1,
-        firstSegmentId: "019fbb95-cd76-7920-93fa-e23ba755e311",
-        lastSegmentId: "019fbb95-cd76-7920-93fa-e23ba755e312",
-        firstTokenId: "019fbb95-cd76-7920-93fa-e23ba755e322",
-        lastTokenId: "019fbb95-cd76-7920-93fa-e23ba755e326",
-        transcriptStartMs: 300,
-        transcriptEndMs: 2_900,
-        exportStartMs: 0,
-        exportEndMs: 3_400,
-        text: "fixture has accurate word timing. Click any word",
-        timingPrecision: "word" as const,
-      },
-      sourceLanguageClass: "confirmed_english" as const,
-      preset: {
-        presetVersion: 1,
-        name: "Editing MP4",
-        settings: {
-          container: "mp4" as const,
-          videoCodec: "h264" as const,
-          videoRateControl: { mode: "crf" as const, value: 20 },
-          maxWidth: 1_920,
-          frameRate: "source" as const,
-          audioCodec: "aac" as const,
-          audioKilobitsPerSecond: 192,
-          omitSubtitleFilesForConfirmedEnglish: false,
-          embedEnglishSubtitleTrack: false,
-        },
-      },
-    };
-    const exportRequest = exportQueue.createExportOnly(exportInput);
+    const exportRequest = exportQueue.createExportOnly(fixtureExportInput);
     const retry = exportQueue.createExportOnly({
-      ...exportInput,
-      preset: { ...exportInput.preset, name: "Changed retry" },
+      ...fixtureExportInput,
+      preset: { ...fixtureExportInput.preset, name: "Changed retry" },
     });
     expect(exportRequest).toMatchObject({
       mode: "export_only",
@@ -165,15 +177,21 @@ describe("local migrations", () => {
       videoCodec: "h264",
       audioCodec: "aac",
       ffprobeVersion: "7.1",
+      ffmpegVersion: "8.1.2",
     });
     expect(exportQueue.get(exportRequest.id)).toMatchObject({
       renderedMediaProvenance: {
         durationMs: 3_200,
         videoCodec: "h264",
         audioCodec: "aac",
+        ffprobeVersion: "7.1",
+        ffmpegVersion: "8.1.2",
         sourceAttempt: 1,
       },
     });
+    expect(
+      exportQueue.get(exportRequest.id)?.mediaProvenance,
+    ).not.toHaveProperty("ffmpegVersion");
     exportQueue.recordSourceCleanupStarted(exportRequest.jobId, 1);
     exportQueue.recordSourceCleanupSucceeded(exportRequest.jobId, 1);
     expect(exportQueue.get(exportRequest.id)).toMatchObject({
@@ -209,6 +227,166 @@ describe("local migrations", () => {
       lifecycleState: "cleanup_failed",
       cleanupErrorCode: "source_cleanup_failed",
     });
+    database.close();
+  });
+
+  it("widens the final-artifact role vocabulary in 0012 without rewriting existing rows", () => {
+    const directory = mkdtempSync(
+      join(tmpdir(), "research-video-sqlite-0012-"),
+    );
+    temporaryDirectories.add(directory);
+    const previousMigrations = join(directory, "migrations");
+    mkdirSync(previousMigrations);
+    for (const filename of readdirSync(localMigrationDirectory)) {
+      if (filename < "0012") {
+        copyFileSync(
+          resolve(localMigrationDirectory, filename),
+          join(previousMigrations, filename),
+        );
+      }
+    }
+    const database = openLocalDatabase(join(directory, "test.sqlite"));
+    expect(runLocalMigrations(database, previousMigrations)).toContain(
+      "0011_export_final_artifact_provenance",
+    );
+
+    const legacyRequestId = "019fbb95-cd76-7920-93fa-e23ba755e401";
+    const legacyJobId = "019fbb95-cd76-7920-93fa-e23ba755e402";
+    const legacyTimestamp = "2026-08-01T12:00:00.000Z";
+    database
+      .prepare(
+        `INSERT INTO jobs
+           (id, kind, state, idempotency_key, attempt, payload_json,
+            created_at, updated_at)
+         VALUES (?, 'export', 'queued', 'export-only:legacy', 0, '{}', ?, ?)`,
+      )
+      .run(legacyJobId, legacyTimestamp, legacyTimestamp);
+    database
+      .prepare(
+        `INSERT INTO export_requests
+           (id, job_id, mode, video_snapshot_json, selection_snapshot_json,
+            source_language_class, preset_snapshot_json, created_at, updated_at)
+         VALUES (?, ?, 'export_only', '{}', '{}', 'confirmed_english', '{}', ?, ?)`,
+      )
+      .run(legacyRequestId, legacyJobId, legacyTimestamp, legacyTimestamp);
+    const legacyArtifact = {
+      export_request_id: legacyRequestId,
+      role: "video_mp4",
+      package_identity: `clip-${legacyRequestId}`,
+      byte_size: 2_048,
+      content_sha256: "d".repeat(64),
+      source_attempt: 1,
+      validated_at: legacyTimestamp,
+    };
+    const insertArtifact = (role: string) =>
+      database
+        .prepare(
+          `INSERT INTO export_final_artifacts
+             (export_request_id, role, package_identity, byte_size,
+              content_sha256, source_attempt, validated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          legacyArtifact.export_request_id,
+          role,
+          legacyArtifact.package_identity,
+          legacyArtifact.byte_size,
+          legacyArtifact.content_sha256,
+          legacyArtifact.source_attempt,
+          legacyArtifact.validated_at,
+        );
+    insertArtifact("video_mp4");
+    expect(() => insertArtifact("manifest_json")).toThrow();
+
+    database.exec("CREATE TABLE export_final_artifacts_0012 (blocker TEXT);");
+    expect(() =>
+      runLocalMigrations(database, localMigrationDirectory),
+    ).toThrow();
+    expect(
+      database.prepare("SELECT * FROM export_final_artifacts").all(),
+    ).toEqual([legacyArtifact]);
+    expect(() => insertArtifact("manifest_json")).toThrow();
+    database.exec("DROP TABLE export_final_artifacts_0012;");
+
+    expect(runLocalMigrations(database, localMigrationDirectory)).toEqual([
+      "0012_export_clip_package_manifest",
+    ]);
+    expect(
+      database.prepare("SELECT * FROM export_final_artifacts").all(),
+    ).toEqual([legacyArtifact]);
+    expect(
+      database
+        .prepare(
+          `SELECT name FROM sqlite_master
+           WHERE type = 'index' AND name = 'idx_export_final_artifacts_request_attempt'`,
+        )
+        .get(),
+    ).toBeDefined();
+    insertArtifact("manifest_json");
+    expect(() => insertArtifact("thumbnail_jpg")).toThrow();
+    expect(
+      database
+        .prepare(
+          "SELECT count(*) AS count FROM export_final_artifacts WHERE export_request_id = ?",
+        )
+        .get(legacyRequestId),
+    ).toEqual({ count: 2 });
+    database.close();
+  });
+
+  it("requires a manifest artifact in every promoted package", () => {
+    const directory = mkdtempSync(
+      join(tmpdir(), "research-video-sqlite-manifest-"),
+    );
+    temporaryDirectories.add(directory);
+    const database = openLocalDatabase(join(directory, "test.sqlite"));
+    runLocalMigrations(database);
+    const queue = new LocalExportQueue(
+      database,
+      () => new Date("2026-08-01T12:00:00.000Z"),
+    );
+    const request = queue.createExportOnly(fixtureExportInput);
+    queue.beginSourceAcquisition(request.id);
+    queue.recordSourceReady(request.jobId, 1, {
+      provider: "fixture",
+      sourceIdentity: "M7lc1UVf-VE",
+      byteSize: 123,
+      contentSha256: "a".repeat(64),
+    });
+    queue.recordSourceInspection(
+      request.jobId,
+      1,
+      { durationMs: 3_200 },
+      { startMs: 0, endMs: 3_200 },
+    );
+    queue.recordRenderedOutputValidation(request.jobId, 1, {
+      durationMs: 3_200,
+    });
+    const artifact = (
+      role: "video_mp4" | "manifest_json",
+      byteSize: number,
+    ) => ({
+      role,
+      packageIdentity: `clip-${request.id}`,
+      byteSize,
+      contentSha256: role === "video_mp4" ? "e".repeat(64) : "f".repeat(64),
+      sourceAttempt: 1,
+      validatedAt: "2026-08-01T12:00:00.000Z",
+    });
+
+    expect(() =>
+      queue.recordFinalArtifactPromotion(request.jobId, 1, [
+        artifact("video_mp4", 2_048),
+      ]),
+    ).toThrow(/Final artifact provenance is invalid/u);
+    queue.recordFinalArtifactPromotion(request.jobId, 1, [
+      artifact("video_mp4", 2_048),
+      artifact("manifest_json", 512),
+    ]);
+    expect(queue.get(request.id)?.finalArtifacts).toEqual([
+      expect.objectContaining({ role: "manifest_json", byteSize: 512 }),
+      expect.objectContaining({ role: "video_mp4", byteSize: 2_048 }),
+    ]);
     database.close();
   });
 });

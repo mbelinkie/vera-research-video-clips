@@ -28,6 +28,7 @@ const localExportRequestSelect = `SELECT er.*, j.state,
   er.rendered_video_codec,
   er.rendered_audio_codec,
   er.rendered_ffprobe_version,
+  er.rendered_ffmpeg_version,
   er.rendered_source_attempt,
   er.rendered_validated_at,
   er.subtitle_omission_policy,
@@ -397,6 +398,7 @@ export class LocalExportQueue {
       videoCodec?: string;
       audioCodec?: string;
       ffprobeVersion?: string;
+      ffmpegVersion?: string;
     },
   ): void {
     if (
@@ -414,8 +416,9 @@ export class LocalExportQueue {
         `UPDATE export_requests
          SET rendered_duration_ms = ?, rendered_container_format = ?,
              rendered_video_codec = ?, rendered_audio_codec = ?,
-             rendered_ffprobe_version = ?, rendered_source_attempt = ?,
-             rendered_validated_at = ?, updated_at = ?
+             rendered_ffprobe_version = ?, rendered_ffmpeg_version = ?,
+             rendered_source_attempt = ?, rendered_validated_at = ?,
+             updated_at = ?
          WHERE job_id = ? AND resolved_source_attempt = ?`,
       )
       .run(
@@ -424,6 +427,7 @@ export class LocalExportQueue {
         safeProbeValue(inspection.videoCodec, 120),
         safeProbeValue(inspection.audioCodec, 120),
         safeProbeValue(inspection.ffprobeVersion, 120),
+        safeProbeValue(inspection.ffmpegVersion, 120),
         attempt,
         now,
         now,
@@ -602,10 +606,11 @@ export class LocalExportQueue {
   ): void {
     const roles = new Set(artifacts.map((artifact) => artifact.role));
     if (
-      artifacts.length < 1 ||
-      artifacts.length > 3 ||
+      artifacts.length < 2 ||
+      artifacts.length > 4 ||
       roles.size !== artifacts.length ||
       !roles.has("video_mp4") ||
+      !roles.has("manifest_json") ||
       artifacts.some((artifact) => !validFinalArtifact(artifact))
     ) {
       throw new LocalExportLifecycleError(
@@ -822,7 +827,7 @@ type LocalSubtitleSidecarValidation = {
 };
 
 type LocalFinalArtifactProvenance = {
-  role: "video_mp4" | "english_srt" | "original_srt";
+  role: "video_mp4" | "english_srt" | "original_srt" | "manifest_json";
   packageIdentity: string;
   byteSize: number;
   contentSha256: string;
@@ -944,6 +949,9 @@ function mapLocalExportRequest(
             ...(row.rendered_ffprobe_version === null
               ? {}
               : { ffprobeVersion: String(row.rendered_ffprobe_version) }),
+            ...(row.rendered_ffmpeg_version === null
+              ? {}
+              : { ffmpegVersion: String(row.rendered_ffmpeg_version) }),
             sourceAttempt: Number(row.rendered_source_attempt),
             validatedAt: String(row.rendered_validated_at),
           },

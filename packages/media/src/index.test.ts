@@ -202,6 +202,38 @@ describe("FfmpegH264AacRangeRenderer", () => {
       }),
     ).toThrow(FfmpegRenderError);
   });
+
+  it("reads a bounded encoder version without ever failing a render", async () => {
+    const runner = vi.fn<MediaCommandRunner["run"]>(async () => ({
+      stdout: "ffmpeg version 8.1.2 Copyright (c) 2000-2026\nbuilt with clang",
+      stderr: "",
+    }));
+    const renderer = new FfmpegH264AacRangeRenderer({
+      executable: "/opt/tools/ffmpeg",
+      runner: { run: runner },
+    });
+
+    await expect(renderer.readVersion()).resolves.toBe("8.1.2");
+    expect(runner).toHaveBeenCalledWith(
+      "/opt/tools/ffmpeg",
+      ["-version"],
+      expect.objectContaining({ timeoutMs: 5_000 }),
+    );
+    await expect(
+      new FfmpegH264AacRangeRenderer({
+        runner: {
+          run: async () => {
+            throw new Error("ffmpeg is unavailable");
+          },
+        },
+      }).readVersion(),
+    ).resolves.toBeUndefined();
+    await expect(
+      new FfmpegH264AacRangeRenderer({
+        runner: { run: async () => ({ stdout: "unexpected", stderr: "" }) },
+      }).readVersion(),
+    ).resolves.toBeUndefined();
+  });
 });
 
 describe("YtDlpAudioAcquisitionProvider", () => {

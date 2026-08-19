@@ -218,6 +218,10 @@ Gate: logging requires a visible project and atomically preserves entered notes/
   authorization-confirmed `export:run-once` command and prove the complete
   export-only media/package path with repository-owned fixture media plus real
   FFmpeg/FFprobe (`specs/completed/M5-08-local-export-runtime-composition-and-real-tool-smoke.md`).
+- [x] M5-09: promote one verified `manifest.json` provenance record inside every
+  clip package before it becomes visible, recording source identity, subtitle
+  policy, resolved bounds, FFprobe/FFmpeg versions, and each artifact's size and
+  SHA-256 (`specs/completed/M5-09-verified-clip-package-manifest.md`).
 - [ ] Add named personal/project conversion presets and immutable preset versions.
 - [ ] Add project/global defaults plus per-export overrides.
 - [ ] Add capability-aware settings for container, codecs, quality/bitrate, dimensions/frame rate, audio, subtitle embedding, padding, output, and supported acceleration.
@@ -231,7 +235,9 @@ Gate: logging requires a visible project and atomically preserves entered notes/
 - [x] For foreign/mixed/unknown-language clips, always derive both original-language and translated-English SRTs even if the selected preset carries the English-only omission preference.
 - [x] Trim/clamp required sidecar cues to actual padded export bounds, zero-base timestamps, and block this staging lifecycle when required subtitles are missing or mismatched.
 - [ ] Add optional embedded soft subtitle track.
-- [ ] Generate thumbnail, metadata JSON, and manifest.
+- [ ] Generate thumbnail, metadata JSON, and manifest. M5-09 completed the
+      manifest third only; the `clip-<id>.json` metadata sidecar and the `.jpg`
+      thumbnail remain open.
 - [ ] Use staging plus atomic completion.
 - [ ] Add progress, retry, safe cancellation, and batch export.
 
@@ -339,6 +345,7 @@ infra/aws        storage, API, database, queues, identity, monitoring
 
 ## Next action
 
-Continue Milestone 5 with a bounded manifest/metadata or other explicitly
-scoped slice; keep logged/cloud export delivery, thumbnails, embedding,
-UI/preset changes, retries, grouping, cloud storage, and sweeping separate.
+Continue Milestone 5 with the bounded descriptive `clip-<id>.json` metadata
+sidecar or another explicitly scoped slice; keep logged/cloud export delivery,
+thumbnails, embedding, UI/preset changes, retries, grouping, cloud storage, and
+sweeping separate.

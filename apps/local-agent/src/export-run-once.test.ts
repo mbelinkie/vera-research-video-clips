@@ -15,6 +15,7 @@ import { fileURLToPath } from "node:url";
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
 
 import { loadConfig } from "@research-video/config";
+import { ExportClipManifestSchema } from "@research-video/contracts";
 import {
   LocalExportQueue,
   LocalTranscriptIndex,
@@ -87,6 +88,7 @@ describe("one-shot local export runtime", () => {
             renderCalls += 1;
             return renderer.render(...args);
           },
+          readVersion: (signal) => renderer.readVersion(signal),
         },
       },
     );
@@ -118,6 +120,7 @@ describe("one-shot local export runtime", () => {
             renderCalls += 1;
             return renderer.render(...args);
           },
+          readVersion: (signal) => renderer.readVersion(signal),
         },
       },
     );
@@ -130,9 +133,11 @@ describe("one-shot local export runtime", () => {
     });
     expect(result.artifacts?.map((artifact) => artifact.role).sort()).toEqual([
       "english_srt",
+      "manifest_json",
       "original_srt",
       "video_mp4",
     ]);
+    expect(JSON.stringify(result)).not.toMatch(/\/|youtube\.com|Authorized/u);
     expect(acquisitionCalls).toBe(1);
     expect(inspectionCalls).toBeGreaterThanOrEqual(2);
     expect(renderCalls).toBe(1);
@@ -144,6 +149,7 @@ describe("one-shot local export runtime", () => {
       `${packageIdentity}.en.srt`,
       `${packageIdentity}.mp4`,
       `${packageIdentity}.original.srt`,
+      "manifest.json",
     ]);
     expect(
       (await readdir(join(root, "exports"))).filter((entry) =>
@@ -175,19 +181,47 @@ describe("one-shot local export runtime", () => {
       expect(cues[0]?.startMs).toBeGreaterThanOrEqual(0);
     }
 
+    const manifest = ExportClipManifestSchema.parse(
+      JSON.parse(
+        await readFile(join(packageDirectory, "manifest.json"), "utf8"),
+      ),
+    );
+    expect(manifest).toMatchObject({
+      schemaVersion: 1,
+      exportRequestId: firstAttempt.requestId,
+      packageIdentity,
+      sourceLanguageClass: "foreign",
+      subtitlePolicy: { requiredSidecars: ["original", "english"] },
+    });
+    expect(Math.abs(manifest.renderedDurationMs - 3_000)).toBeLessThanOrEqual(
+      RenderDurationToleranceMs,
+    );
+    expect(manifest.toolVersions.ffprobeVersion).toMatch(/^[0-9]/u);
+    expect(manifest.toolVersions.ffmpegVersion).toMatch(/^[0-9]/u);
+    for (const artifact of manifest.artifacts) {
+      const bytes = await readFile(join(packageDirectory, artifact.filename));
+      expect(artifact.byteSize).toBe(bytes.byteLength);
+      expect(artifact.contentSha256).toBe(sha256(bytes));
+    }
+
     const persisted = openLocalDatabase(join(root, "local.sqlite"));
     try {
       const queue = new LocalExportQueue(persisted);
       const request = queue.get(firstAttempt.requestId);
       expect(request?.state).toBe("complete");
-      expect(request?.finalArtifacts).toHaveLength(3);
+      expect(request?.finalArtifacts).toHaveLength(4);
+      expect(request?.renderedMediaProvenance?.ffmpegVersion).toBe(
+        manifest.toolVersions.ffmpegVersion,
+      );
       for (const artifact of request?.finalArtifacts ?? []) {
         const filename =
           artifact.role === "video_mp4"
             ? `${packageIdentity}.mp4`
             : artifact.role === "english_srt"
               ? `${packageIdentity}.en.srt`
-              : `${packageIdentity}.original.srt`;
+              : artifact.role === "manifest_json"
+                ? "manifest.json"
+                : `${packageIdentity}.original.srt`;
         const bytes = await readFile(join(packageDirectory, filename));
         expect(artifact.byteSize).toBe(bytes.byteLength);
         expect(artifact.contentSha256).toBe(sha256(bytes));

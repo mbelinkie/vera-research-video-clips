@@ -1135,6 +1135,26 @@ Deliver:
 
 Exit when representative presets/overrides produce the requested media properties, queued jobs are unaffected by later preset edits, English clips include a validated clip-relative English SRT by default but can explicitly omit sidecars, every foreign/mixed/unknown-language clip has validated original and translated-English SRTs from the expected transcript versions, a 30-second foreign-language clip has accurate cues only within its 30-second duration, a real authorized video succeeds in a smoke test, and no full source media remains after any terminal job path.
 
+M5-09 completed 2026-08-19. Every promoted clip package now also contains one
+`manifest.json`, written into attempt-private staging and promoted through the
+same copy-then-atomic-rename path, so it is never added to a visible package. It
+records schema version 1, the export request/job identity, package identity and
+source attempt, the request's video snapshot and source-language classification,
+resolved export bounds, the verified rendered duration, the resolved
+required-sidecar set plus `subtitleSidecarsOmittedReason` when a confirmed-English
+omission applied, the captured FFprobe and FFmpeg versions, and for every other
+promoted file its role, filename, byte size, and SHA-256 — with each SRT's
+language, transcript track ID/version, snapshotted timing precision, cue count,
+and clip-relative bounds. Every value comes from the immutable request snapshot,
+already-persisted provenance, or the staged bytes it names; timestamps come from
+persisted `validatedAt` provenance so a replay reproduces the same file. The MP4
+is hashed before promotion and re-verified after it, and any manifest write
+failure, policy mismatch, or promoted-byte mismatch aborts promotion, removes the
+package, and continues into the established cleanup path. Local migration `0012`
+rebuilds `export_final_artifacts` for the new `manifest_json` role and adds the
+rendered FFmpeg version column. The descriptive `clip-<id>.json` metadata sidecar
+and the `.jpg` thumbnail remain separate later slices.
+
 M5-08 completed 2026-08-15. `npm run export:run-once -- --request-id <uuid> --authorization-confirmed` now opens the configured local SQLite data root, composes exactly one existing `LocalExportSourceProcessor` attempt with the configured full-source provider and real FFprobe/FFmpeg adapters, then prints only a sanitized request state, package identity, and artifact hashes/sizes. The command has no server, polling, concurrency, or background work; confirmation is required on every run, and an already-complete request is reported without rerendering. A deterministic repository-owned four-second fixture smoke copied the source only into attempt-private scratch and verified a completed foreign-language H.264/AAC package with both clip-relative SRTs, persisted final provenance, atomic package visibility, and verified scratch deletion. This proves local `export_only` runtime composition only: logged export delivery, cloud/job relay, live authorized YouTube acquisition, manifests, thumbnails, retry/grouping, presets, and the full Milestone 5 exit criteria remain separate.
 
 ### Milestone 6 — Google Sheets control surface

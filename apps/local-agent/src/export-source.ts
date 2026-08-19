@@ -25,8 +25,13 @@ import {
 } from "@research-video/media";
 import { type LocalExportQueue } from "@research-video/db-local";
 import {
+  ExportClipManifestSchema,
+  ExportClipManifestSchemaVersion,
+  type ExportClipManifest,
   type ExportRequest,
   type NormalizedTranscript,
+  type RenderedExportMediaProvenance,
+  type ResolvedExportBounds,
 } from "@research-video/contracts";
 import {
   deriveClipRelativeSrtCues,
@@ -168,10 +173,17 @@ export class LocalExportSourceProcessor {
               ...(input.signal ? { signal: input.signal } : {}),
             },
           );
+          const ffmpegVersion = await readEncoderVersion(
+            this.renderer,
+            input.signal,
+          );
           this.queue.recordRenderedOutputValidation(
             started.request.jobId,
             started.attempt,
-            outputInspection,
+            {
+              ...outputInspection,
+              ...(ffmpegVersion ? { ffmpegVersion } : {}),
+            },
           );
           if (subtitlePlan.policy === "confirmed_english_omission") {
             await assertNoStagedSrtFiles(scratchDirectory);
@@ -280,13 +292,17 @@ type RequiredSidecar = {
 };
 
 type FinalArtifact = {
-  role: "video_mp4" | "english_srt" | "original_srt";
+  role: "video_mp4" | "english_srt" | "original_srt" | "manifest_json";
   packageIdentity: string;
   byteSize: number;
   contentSha256: string;
   sourceAttempt: number;
   validatedAt: string;
 };
+
+type StagedArtifactDigest = { byteSize: number; contentSha256: string };
+
+const ClipManifestName = "manifest.json";
 
 type SidecarValidation = {
   role: "original" | "english";
@@ -359,6 +375,22 @@ function resolveRequiredSubtitlePlan(
   };
 }
 
+/**
+ * Encoder provenance is best effort: a version read that fails on an otherwise
+ * working installation must never fail an already verified render, and requests
+ * exported before this provenance existed legitimately have none.
+ */
+async function readEncoderVersion(
+  renderer: FfmpegRangeRenderer,
+  signal: AbortSignal | undefined,
+): Promise<string | undefined> {
+  try {
+    return await renderer.readVersion?.(signal);
+  } catch {
+    return undefined;
+  }
+}
+
 async function assertNoStagedSrtFiles(stagingDirectory: string): Promise<void> {
   let entries;
   try {
@@ -420,12 +452,24 @@ async function promoteVerifiedFinalPackage(input: {
   let renamed = false;
   try {
     throwIfPromotionCanceled(input.signal);
-    await validateStagedPackage({
+    const stagedDigests = await validateStagedPackage({
       stagingDirectory: input.stagingDirectory,
       sourcePath: input.sourcePath,
       policy,
-      renderedDurationMs: input.request.renderedMediaProvenance!.durationMs,
     });
+    stagedDigests.set(
+      "manifest_json",
+      await stageVerifiedClipManifest(
+        input.stagingDirectory,
+        buildVerifiedClipManifest({
+          request: input.request,
+          policy,
+          packageIdentity,
+          attempt: input.attempt,
+          digests: stagedDigests,
+        }),
+      ),
+    );
     for (const artifact of policy.artifacts) {
       throwIfPromotionCanceled(input.signal);
       await copyFile(
@@ -444,6 +488,7 @@ async function promoteVerifiedFinalPackage(input: {
       packageIdentity,
       attempt: input.attempt,
     });
+    assertPromotedArtifactsMatchStagedBytes(artifacts, stagedDigests);
     throwIfPromotionCanceled(input.signal);
     return artifacts;
   } catch (error) {
@@ -455,33 +500,58 @@ async function promoteVerifiedFinalPackage(input: {
   }
 }
 
+type VerifiedPackageArtifact = {
+  role: FinalArtifact["role"];
+  stagedName: string;
+  finalName: string;
+  sidecar?: {
+    language: string;
+    trackId: string;
+    trackVersion: number;
+    cueCount: number;
+    byteSize: number;
+    contentSha256: string;
+    startMs: number;
+    endMs: number;
+    sourceAttempt: number;
+  };
+};
+
 type VerifiedPackagePolicy = {
-  artifacts: readonly {
-    role: FinalArtifact["role"];
-    stagedName: string;
-    finalName: string;
-    sidecar?: {
-      byteSize: number;
-      contentSha256: string;
-      sourceAttempt: number;
-    };
-  }[];
+  rendered: RenderedExportMediaProvenance;
+  bounds: ResolvedExportBounds;
+  requiredSidecars: readonly ("original" | "english")[];
+  omittedReason?: "confirmed_english_user_setting";
+  artifacts: readonly VerifiedPackageArtifact[];
 };
 
 function resolveVerifiedPackagePolicy(
   request: ExportRequest,
   attempt: number,
 ): VerifiedPackagePolicy {
-  if (request.renderedMediaProvenance?.sourceAttempt !== attempt) {
+  const rendered = request.renderedMediaProvenance;
+  if (rendered?.sourceAttempt !== attempt) {
     throw new ExportSourceAcquisitionError(
       "The validated rendered MP4 is unavailable for this source attempt. Retry this export.",
       { code: "rendered_package_provenance_missing", retryable: true },
+    );
+  }
+  const bounds = request.resolvedExportBounds;
+  if (bounds?.sourceAttempt !== attempt) {
+    throw new ExportSourceAcquisitionError(
+      "Resolved export bounds were not persisted for this source attempt. Retry this export.",
+      { code: "resolved_export_bounds_missing", retryable: true },
     );
   }
   const video = {
     role: "video_mp4" as const,
     stagedName: "rendered-range.mp4",
     finalName: `clip-${request.id}.mp4`,
+  };
+  const manifest = {
+    role: "manifest_json" as const,
+    stagedName: ClipManifestName,
+    finalName: ClipManifestName,
   };
   if (request.sourceLanguageClass === "confirmed_english") {
     if (request.preset.settings.omitSubtitleFilesForConfirmedEnglish) {
@@ -495,7 +565,13 @@ function resolveVerifiedPackagePolicy(
           { code: "subtitle_omission_provenance_missing", retryable: true },
         );
       }
-      return { artifacts: [video] };
+      return {
+        rendered,
+        bounds,
+        requiredSidecars: [],
+        omittedReason: "confirmed_english_user_setting",
+        artifacts: [video, manifest],
+      };
     }
     const english = request.englishSubtitleProvenance;
     if (!english || english.sourceAttempt !== attempt) {
@@ -505,14 +581,20 @@ function resolveVerifiedPackagePolicy(
       );
     }
     return {
+      rendered,
+      bounds,
+      requiredSidecars: ["english"],
       artifacts: [
         video,
         {
           role: "english_srt",
           stagedName: "english.srt",
           finalName: `clip-${request.id}.en.srt`,
-          sidecar: english,
+          // A confirmed-English request snapshots no sidecar language because
+          // its verified track is already proven English before derivation.
+          sidecar: { ...english, language: "en" },
         },
+        manifest,
       ],
     };
   }
@@ -537,6 +619,9 @@ function resolveVerifiedPackagePolicy(
     );
   }
   return {
+    rendered,
+    bounds,
+    requiredSidecars: ["original", "english"],
     artifacts: [
       video,
       {
@@ -551,16 +636,181 @@ function resolveVerifiedPackagePolicy(
         finalName: `clip-${request.id}.en.srt`,
         sidecar: english,
       },
+      manifest,
     ],
   };
+}
+
+/**
+ * The manifest is the package's auditable provenance record. It is derived only
+ * from the immutable request snapshot, persisted validation provenance, and the
+ * staged bytes it names, and it takes every timestamp from persisted
+ * provenance so replaying one request reproduces the same file.
+ */
+function buildVerifiedClipManifest(input: {
+  request: ExportRequest;
+  policy: VerifiedPackagePolicy;
+  packageIdentity: string;
+  attempt: number;
+  digests: ReadonlyMap<FinalArtifact["role"], StagedArtifactDigest>;
+}): ExportClipManifest {
+  const { policy, request } = input;
+  const manifest: ExportClipManifest = {
+    schemaVersion: ExportClipManifestSchemaVersion,
+    exportRequestId: request.id,
+    jobId: request.jobId,
+    mode: request.mode,
+    packageIdentity: input.packageIdentity,
+    sourceAttempt: input.attempt,
+    validatedAt: policy.rendered.validatedAt,
+    video: request.video,
+    sourceLanguageClass: request.sourceLanguageClass,
+    resolvedExportBounds: {
+      startMs: policy.bounds.startMs,
+      endMs: policy.bounds.endMs,
+      sourceAttempt: policy.bounds.sourceAttempt,
+    },
+    renderedDurationMs: policy.rendered.durationMs,
+    subtitlePolicy: {
+      requiredSidecars: [...policy.requiredSidecars],
+      ...(policy.omittedReason
+        ? { subtitleSidecarsOmittedReason: policy.omittedReason }
+        : {}),
+    },
+    toolVersions: {
+      ...(policy.rendered.ffprobeVersion
+        ? { ffprobeVersion: policy.rendered.ffprobeVersion }
+        : {}),
+      ...(policy.rendered.ffmpegVersion
+        ? { ffmpegVersion: policy.rendered.ffmpegVersion }
+        : {}),
+    },
+    artifacts: policy.artifacts.flatMap((artifact) => {
+      if (artifact.role === "manifest_json") return [];
+      const digest = input.digests.get(artifact.role);
+      if (!digest) {
+        throw new ExportSourceAcquisitionError(
+          "A validated clip artifact could not be recorded in its manifest. Retry this export.",
+          { code: "clip_manifest_artifact_missing", retryable: false },
+        );
+      }
+      return [
+        {
+          role: artifact.role,
+          filename: artifact.finalName,
+          byteSize: digest.byteSize,
+          contentSha256: digest.contentSha256,
+          ...(artifact.sidecar
+            ? {
+                subtitle: {
+                  language: artifact.sidecar.language,
+                  trackId: artifact.sidecar.trackId,
+                  trackVersion: artifact.sidecar.trackVersion,
+                  // The snapshotted selection carries the only honest timing
+                  // precision this slice persists; it is never upgraded here.
+                  timingPrecision: request.selection.timingPrecision,
+                  cueCount: artifact.sidecar.cueCount,
+                  startMs: artifact.sidecar.startMs,
+                  endMs: artifact.sidecar.endMs,
+                },
+              }
+            : {}),
+        },
+      ];
+    }),
+  };
+  assertManifestMatchesSubtitlePolicy(manifest, policy);
+  return manifest;
+}
+
+function assertManifestMatchesSubtitlePolicy(
+  manifest: ExportClipManifest,
+  policy: VerifiedPackagePolicy,
+) {
+  const listed = manifest.artifacts
+    .filter((artifact) => artifact.role !== "video_mp4")
+    .map((artifact) =>
+      artifact.role === "original_srt" ? "original" : "english",
+    );
+  if (
+    listed.length !== policy.requiredSidecars.length ||
+    policy.requiredSidecars.some((role, index) => listed[index] !== role)
+  ) {
+    throw new ExportSourceAcquisitionError(
+      "The clip manifest does not match the resolved subtitle policy. Retry this export.",
+      { code: "clip_manifest_subtitle_policy_mismatch", retryable: false },
+    );
+  }
+}
+
+async function stageVerifiedClipManifest(
+  stagingDirectory: string,
+  manifest: ExportClipManifest,
+): Promise<StagedArtifactDigest> {
+  const path = join(stagingDirectory, ClipManifestName);
+  if (!isInsideStaging(stagingDirectory, path)) {
+    throw new ExportSourceAcquisitionError(
+      "Clip manifest staging is invalid. Retry this export.",
+      { code: "clip_manifest_staging_invalid", retryable: false },
+    );
+  }
+  const validated = ExportClipManifestSchema.safeParse(manifest);
+  if (!validated.success) {
+    throw new ExportSourceAcquisitionError(
+      "The clip manifest failed its own provenance contract. Retry this export.",
+      { code: "clip_manifest_invalid", retryable: false },
+    );
+  }
+  try {
+    await writeFile(path, `${JSON.stringify(validated.data, null, 2)}\n`, {
+      encoding: "utf8",
+      flag: "wx",
+      mode: 0o600,
+    });
+  } catch {
+    throw new ExportSourceAcquisitionError(
+      "The clip manifest could not be staged. Retry this export.",
+      { code: "clip_manifest_staging_failed", retryable: true },
+    );
+  }
+  return digestStagedArtifact(
+    path,
+    "Clip manifest",
+    "staged_package_manifest_invalid",
+  );
+}
+
+function assertPromotedArtifactsMatchStagedBytes(
+  artifacts: readonly FinalArtifact[],
+  staged: ReadonlyMap<FinalArtifact["role"], StagedArtifactDigest>,
+) {
+  if (artifacts.length !== staged.size) {
+    throw promotedArtifactMismatch();
+  }
+  for (const artifact of artifacts) {
+    const digest = staged.get(artifact.role);
+    if (
+      !digest ||
+      digest.byteSize !== artifact.byteSize ||
+      digest.contentSha256 !== artifact.contentSha256
+    ) {
+      throw promotedArtifactMismatch();
+    }
+  }
+}
+
+function promotedArtifactMismatch() {
+  return new ExportSourceAcquisitionError(
+    "A promoted clip artifact no longer matches the verified bytes its manifest names. Retry this export.",
+    { code: "final_package_artifact_mismatched", retryable: false },
+  );
 }
 
 async function validateStagedPackage(input: {
   stagingDirectory: string;
   sourcePath: string;
   policy: VerifiedPackagePolicy;
-  renderedDurationMs: number;
-}) {
+}): Promise<Map<FinalArtifact["role"], StagedArtifactDigest>> {
   const expectedNames = new Set([
     basename(input.sourcePath),
     ...input.policy.artifacts.map((artifact) => artifact.stagedName),
@@ -581,7 +831,11 @@ async function validateStagedPackage(input: {
       { code: "staged_package_extra_artifact", retryable: false },
     );
   }
+  const digests = new Map<FinalArtifact["role"], StagedArtifactDigest>();
   for (const artifact of input.policy.artifacts) {
+    // The manifest names these verified bytes, so it is staged only after they
+    // are hashed and always before anything becomes a visible package.
+    if (artifact.role === "manifest_json") continue;
     const source = join(input.stagingDirectory, artifact.stagedName);
     if (!isInsideStaging(input.stagingDirectory, source)) {
       throw new ExportSourceAcquisitionError(
@@ -594,12 +848,13 @@ async function validateStagedPackage(input: {
       "Validated clip artifact",
       "staged_package_artifact_invalid",
     );
+    const contents = await readFile(source);
+    const contentSha256 = createHash("sha256").update(contents).digest("hex");
     if (artifact.sidecar) {
-      const contents = await readFile(source);
       try {
         validateClipRelativeSrtCues(
           parseSrt(contents),
-          input.renderedDurationMs,
+          input.policy.rendered.durationMs,
         );
       } catch {
         throw new ExportSourceAcquisitionError(
@@ -609,8 +864,7 @@ async function validateStagedPackage(input: {
       }
       if (
         info.size !== artifact.sidecar.byteSize ||
-        createHash("sha256").update(contents).digest("hex") !==
-          artifact.sidecar.contentSha256
+        contentSha256 !== artifact.sidecar.contentSha256
       ) {
         throw new ExportSourceAcquisitionError(
           "Validated subtitle staging no longer matches its verified provenance. Retry this export.",
@@ -618,7 +872,23 @@ async function validateStagedPackage(input: {
         );
       }
     }
+    digests.set(artifact.role, { byteSize: info.size, contentSha256 });
   }
+  return digests;
+}
+
+async function digestStagedArtifact(
+  path: string,
+  label: string,
+  code: string,
+): Promise<StagedArtifactDigest> {
+  const info = await regularNonemptyStagedFile(path, label, code);
+  return {
+    byteSize: info.size,
+    contentSha256: createHash("sha256")
+      .update(await readFile(path))
+      .digest("hex"),
+  };
 }
 
 async function verifyPromotedPackage(input: {

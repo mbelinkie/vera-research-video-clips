@@ -1,10 +1,18 @@
-import { mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
-import { chmod, readdir, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import {
+  existsSync,
+  mkdtempSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { chmod, readFile, readdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { ExportClipManifestSchema } from "@research-video/contracts";
 import {
   LocalExportQueue,
   LocalTranscriptIndex,
@@ -230,6 +238,20 @@ const fixtureRenderer = (
   },
 });
 
+const packageFile = (root: string, requestId: string, name: string) =>
+  join(root, "exports", `clip-${requestId}`, name);
+
+const sha256 = (value: Uint8Array) =>
+  createHash("sha256").update(value).digest("hex");
+
+async function readPromotedManifest(root: string, requestId: string) {
+  return ExportClipManifestSchema.parse(
+    JSON.parse(
+      await readFile(packageFile(root, requestId, "manifest.json"), "utf8"),
+    ),
+  );
+}
+
 const fixtureSourceProvider = (contentSha256 = "e".repeat(64)) => ({
   acquireAuthorizedFullSource: async ({
     videoId,
@@ -287,6 +309,11 @@ describe("LocalExportSourceProcessor", () => {
     expect(queue.get(request.id)?.subtitleSidecars).toBeUndefined();
     expect(queue.get(request.id)?.finalArtifacts).toEqual([
       expect.objectContaining({
+        role: "manifest_json",
+        packageIdentity: `clip-${request.id}`,
+        sourceAttempt: 1,
+      }),
+      expect.objectContaining({
         role: "video_mp4",
         packageIdentity: `clip-${request.id}`,
         sourceAttempt: 1,
@@ -294,6 +321,7 @@ describe("LocalExportSourceProcessor", () => {
     ]);
     expect(await readdir(join(root, "exports", `clip-${request.id}`))).toEqual([
       `clip-${request.id}.mp4`,
+      "manifest.json",
     ]);
     expect(
       database
@@ -396,11 +424,13 @@ describe("LocalExportSourceProcessor", () => {
     });
     expect(queue.get(request.id)?.finalArtifacts).toEqual([
       expect.objectContaining({ role: "english_srt", sourceAttempt: 1 }),
+      expect.objectContaining({ role: "manifest_json", sourceAttempt: 1 }),
       expect.objectContaining({ role: "video_mp4", sourceAttempt: 1 }),
     ]);
     expect(await readdir(join(root, "exports", `clip-${request.id}`))).toEqual([
       `clip-${request.id}.en.srt`,
       `clip-${request.id}.mp4`,
+      "manifest.json",
     ]);
     expect(
       database
@@ -475,6 +505,7 @@ describe("LocalExportSourceProcessor", () => {
         `clip-${request.id}.en.srt`,
         `clip-${request.id}.mp4`,
         `clip-${request.id}.original.srt`,
+        "manifest.json",
       ]);
       expect(
         await readdir(join(root, "jobs", "export-source-scratch")),
@@ -1090,6 +1121,11 @@ describe("LocalExportSourceProcessor", () => {
       state: "complete",
       finalArtifacts: [
         {
+          role: "manifest_json",
+          packageIdentity: `clip-${request.id}`,
+          sourceAttempt: 1,
+        },
+        {
           role: "video_mp4",
           packageIdentity: `clip-${request.id}`,
           sourceAttempt: 1,
@@ -1196,5 +1232,237 @@ describe("LocalExportSourceProcessor", () => {
       await chmod(join(root, "jobs", "export-source-scratch"), 0o700);
     }
     database.close();
+  });
+
+  it("promotes one manifest naming every verified artifact of a bilingual package", async () => {
+    const { root, database, queue, request } = fixtureQueue();
+    const tracks = configureBilingualFixture({
+      database,
+      requestId: request.id,
+      videoId: request.video.youtubeVideoId,
+    });
+    const processor = new LocalExportSourceProcessor(
+      queue,
+      fixtureSourceProvider(),
+      fixtureInspector(),
+      fixtureRenderer(),
+      root,
+    );
+
+    await processor.process({
+      requestId: request.id,
+      authorizationConfirmed: true,
+    });
+
+    const manifest = await readPromotedManifest(root, request.id);
+    expect(manifest).toMatchObject({
+      schemaVersion: 1,
+      exportRequestId: request.id,
+      jobId: request.jobId,
+      mode: "export_only",
+      packageIdentity: `clip-${request.id}`,
+      sourceAttempt: 1,
+      validatedAt: "2026-08-14T12:00:00.000Z",
+      video: {
+        youtubeVideoId: "M7lc1UVf-VE",
+        canonicalUrl: "https://www.youtube.com/watch?v=M7lc1UVf-VE",
+        title: "Fixture source",
+      },
+      sourceLanguageClass: "foreign",
+      resolvedExportBounds: { startMs: 0, endMs: 2_000, sourceAttempt: 1 },
+      renderedDurationMs: 2_000,
+      subtitlePolicy: { requiredSidecars: ["original", "english"] },
+      toolVersions: { ffprobeVersion: "7.1" },
+    });
+    expect(manifest.toolVersions).not.toHaveProperty("ffmpegVersion");
+    expect(manifest.subtitlePolicy).not.toHaveProperty(
+      "subtitleSidecarsOmittedReason",
+    );
+    expect(manifest.artifacts.map((artifact) => artifact.filename)).toEqual([
+      `clip-${request.id}.mp4`,
+      `clip-${request.id}.original.srt`,
+      `clip-${request.id}.en.srt`,
+    ]);
+    expect(manifest.artifacts[0]).not.toHaveProperty("subtitle");
+    expect(manifest.artifacts[1]?.subtitle).toEqual({
+      language: "es",
+      trackId: tracks.originalTrackId,
+      trackVersion: 1,
+      timingPrecision: "cue",
+      cueCount: 2,
+      startMs: 0,
+      endMs: 2_000,
+    });
+    expect(manifest.artifacts[2]?.subtitle).toMatchObject({
+      language: "en",
+      trackId: tracks.englishTrackId,
+      trackVersion: 1,
+    });
+    for (const artifact of manifest.artifacts) {
+      const bytes = await readFile(
+        packageFile(root, request.id, artifact.filename),
+      );
+      expect(artifact.byteSize).toBe(bytes.byteLength);
+      expect(artifact.contentSha256).toBe(sha256(bytes));
+    }
+
+    const promoted = queue.get(request.id)?.finalArtifacts ?? [];
+    const manifestBytes = await readFile(
+      packageFile(root, request.id, "manifest.json"),
+    );
+    expect(
+      promoted.find((artifact) => artifact.role === "manifest_json"),
+    ).toMatchObject({
+      packageIdentity: `clip-${request.id}`,
+      byteSize: manifestBytes.byteLength,
+      contentSha256: sha256(manifestBytes),
+      sourceAttempt: 1,
+    });
+    expect(JSON.stringify(manifest)).not.toContain(root);
+    database.close();
+  });
+
+  it("records the confirmed-English sidecar policy and its explicit omission", async () => {
+    const withSidecar = fixtureQueue();
+    const sidecarProcessor = new LocalExportSourceProcessor(
+      withSidecar.queue,
+      fixtureSourceProvider(),
+      fixtureInspector(),
+      fixtureRenderer(),
+      withSidecar.root,
+    );
+    await sidecarProcessor.process({
+      requestId: withSidecar.request.id,
+      authorizationConfirmed: true,
+    });
+
+    const englishManifest = await readPromotedManifest(
+      withSidecar.root,
+      withSidecar.request.id,
+    );
+    expect(englishManifest).toMatchObject({
+      sourceLanguageClass: "confirmed_english",
+      subtitlePolicy: { requiredSidecars: ["english"] },
+    });
+    expect(englishManifest.artifacts.map((artifact) => artifact.role)).toEqual([
+      "video_mp4",
+      "english_srt",
+    ]);
+    expect(englishManifest.artifacts[1]?.subtitle).toEqual({
+      language: "en",
+      trackId: withSidecar.request.selection.trackId,
+      trackVersion: 1,
+      timingPrecision: "cue",
+      cueCount: 2,
+      startMs: 0,
+      endMs: 2_000,
+    });
+    withSidecar.database.close();
+
+    const omitted = fixtureQueue();
+    enableConfirmedEnglishOmission(omitted.database, omitted.request.id);
+    const omissionProcessor = new LocalExportSourceProcessor(
+      omitted.queue,
+      fixtureSourceProvider(),
+      fixtureInspector(),
+      fixtureRenderer(),
+      omitted.root,
+    );
+    await omissionProcessor.process({
+      requestId: omitted.request.id,
+      authorizationConfirmed: true,
+    });
+
+    const omittedManifest = await readPromotedManifest(
+      omitted.root,
+      omitted.request.id,
+    );
+    expect(omittedManifest.subtitlePolicy).toEqual({
+      requiredSidecars: [],
+      subtitleSidecarsOmittedReason: "confirmed_english_user_setting",
+    });
+    expect(omittedManifest.artifacts.map((artifact) => artifact.role)).toEqual([
+      "video_mp4",
+    ]);
+    omitted.database.close();
+  });
+
+  it("leaves no package when the manifest cannot be staged or stops matching promoted bytes", async () => {
+    const squatted = fixtureQueue();
+    enableConfirmedEnglishOmission(squatted.database, squatted.request.id);
+    const squattedProcessor = new LocalExportSourceProcessor(
+      squatted.queue,
+      fixtureSourceProvider(),
+      fixtureInspector(),
+      fixtureRenderer(async ({ outputPath }) => {
+        await writeFile(outputPath, "fixture render");
+        await writeFile(
+          join(outputPath, "..", "manifest.json"),
+          "squatted manifest",
+        );
+      }),
+      squatted.root,
+    );
+    await expect(
+      squattedProcessor.process({
+        requestId: squatted.request.id,
+        authorizationConfirmed: true,
+      }),
+    ).rejects.toMatchObject({ code: "clip_manifest_staging_failed" });
+    expect(squatted.queue.get(squatted.request.id)).toMatchObject({
+      state: "needs_user_action",
+    });
+    expect(
+      squatted.queue.get(squatted.request.id)?.finalArtifacts,
+    ).toBeUndefined();
+    expect(
+      squatted.queue.getSourceAttempt(squatted.request.jobId, 1),
+    ).toMatchObject({ lifecycleState: "deleted" });
+    expect(await readdir(join(squatted.root, "exports"))).toEqual([]);
+    expect(
+      await readdir(join(squatted.root, "jobs", "export-source-scratch")),
+    ).toEqual([]);
+    squatted.database.close();
+
+    const tampered = fixtureQueue();
+    enableConfirmedEnglishOmission(tampered.database, tampered.request.id);
+    const promotedVideo = packageFile(
+      tampered.root,
+      tampered.request.id,
+      `clip-${tampered.request.id}.mp4`,
+    );
+    const signal = {
+      get aborted() {
+        if (existsSync(promotedVideo)) {
+          writeFileSync(promotedVideo, "tampered promoted bytes");
+        }
+        return false;
+      },
+    } as AbortSignal;
+    const tamperedProcessor = new LocalExportSourceProcessor(
+      tampered.queue,
+      fixtureSourceProvider(),
+      fixtureInspector(),
+      fixtureRenderer(),
+      tampered.root,
+    );
+    await expect(
+      tamperedProcessor.process({
+        requestId: tampered.request.id,
+        authorizationConfirmed: true,
+        signal,
+      }),
+    ).rejects.toMatchObject({ code: "final_package_artifact_mismatched" });
+    expect(
+      tampered.queue.get(tampered.request.id)?.finalArtifacts,
+    ).toBeUndefined();
+    expect(
+      tampered.queue.getSourceAttempt(tampered.request.jobId, 1),
+    ).toMatchObject({ lifecycleState: "deleted" });
+    expect(await readdir(join(tampered.root, "exports"))).toEqual([]);
+    expect(
+      await readdir(join(tampered.root, "jobs", "export-source-scratch")),
+    ).toEqual([]);
+    tampered.database.close();
   });
 });

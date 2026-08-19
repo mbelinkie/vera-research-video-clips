@@ -414,6 +414,12 @@ export type FfmpegRangeRenderInput = {
 /** A replaceable, deterministic-test-friendly boundary for one precise render. */
 export interface FfmpegRangeRenderer {
   render(input: FfmpegRangeRenderInput): Promise<void>;
+  /**
+   * Optional best-effort encoder provenance. A renderer that cannot report a
+   * version still produces verified media, so callers must treat a missing
+   * value as legal.
+   */
+  readVersion?(signal?: AbortSignal): Promise<string | undefined>;
 }
 
 export class FfmpegRenderError extends Error {
@@ -502,6 +508,21 @@ export class FfmpegH264AacRangeRenderer implements FfmpegRangeRenderer {
       );
     }
     if (input.signal?.aborted) throw renderCanceled();
+  }
+
+  async readVersion(signal?: AbortSignal): Promise<string | undefined> {
+    try {
+      const result = await this.#runner.run(this.#executable, ["-version"], {
+        timeoutMs: Math.min(this.#timeoutMs, 5_000),
+        ...(signal ? { signal } : {}),
+      });
+      if (signal?.aborted) throw renderCanceled();
+      return parseFfmpegVersion(result.stdout);
+    } catch (error) {
+      if (error instanceof FfmpegRenderError) throw error;
+      if (signal?.aborted) throw renderCanceled();
+      return undefined;
+    }
   }
 }
 
@@ -962,6 +983,13 @@ function parseFfprobeVersion(output: string): string | undefined {
   const line = output.split(/\r?\n/u)[0]?.trim();
   if (!line) return undefined;
   const match = /^ffprobe version\s+([^\s]+)(?:\s|$)/u.exec(line);
+  return match ? boundedProbeValue(match[1], 120) : undefined;
+}
+
+function parseFfmpegVersion(output: string): string | undefined {
+  const line = output.split(/\r?\n/u)[0]?.trim();
+  if (!line) return undefined;
+  const match = /^ffmpeg version\s+([^\s]+)(?:\s|$)/u.exec(line);
   return match ? boundedProbeValue(match[1], 120) : undefined;
 }
 

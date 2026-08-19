@@ -4,7 +4,9 @@ import {
   BatchPreflightRequestSchema,
   CreateClipExportRequestSchema,
   CreateTranscriptionBatchRequestSchema,
+  ExportClipManifestSchema,
   ExportSettingsSchema,
+  FinalArtifactProvenanceSchema,
   HealthResponseSchema,
   JobSchema,
   ProjectSchema,
@@ -150,5 +152,89 @@ describe("shared contracts", () => {
         },
       }).subtitleTracks,
     ).toBeDefined();
+  });
+
+  it("validates a versioned clip package manifest with per-sidecar provenance", () => {
+    const manifest = {
+      schemaVersion: 1,
+      exportRequestId: id,
+      jobId: "019fbb95-cd76-7920-93fa-e23ba755ee40",
+      mode: "export_only",
+      packageIdentity: `clip-${id}`,
+      sourceAttempt: 1,
+      validatedAt: now,
+      video: {
+        youtubeVideoId: "M7lc1UVf-VE",
+        canonicalUrl: "https://www.youtube.com/watch?v=M7lc1UVf-VE",
+        title: "Fixture video",
+        sourceLanguage: "es",
+      },
+      sourceLanguageClass: "foreign",
+      resolvedExportBounds: { startMs: 0, endMs: 2_000, sourceAttempt: 1 },
+      renderedDurationMs: 2_000,
+      subtitlePolicy: { requiredSidecars: ["original", "english"] },
+      toolVersions: { ffprobeVersion: "7.1", ffmpegVersion: "8.1.2" },
+      artifacts: [
+        {
+          role: "video_mp4",
+          filename: `clip-${id}.mp4`,
+          byteSize: 1_024,
+          contentSha256: "a".repeat(64),
+        },
+        {
+          role: "original_srt",
+          filename: `clip-${id}.original.srt`,
+          byteSize: 96,
+          contentSha256: "b".repeat(64),
+          subtitle: {
+            language: "es",
+            trackId: "019fbb95-cd76-7920-93fa-e23ba755ee41",
+            trackVersion: 1,
+            timingPrecision: "cue",
+            cueCount: 2,
+            startMs: 0,
+            endMs: 2_000,
+          },
+        },
+      ],
+    };
+
+    expect(ExportClipManifestSchema.parse(manifest)).toMatchObject({
+      schemaVersion: 1,
+      subtitlePolicy: { requiredSidecars: ["original", "english"] },
+    });
+    expect(
+      ExportClipManifestSchema.parse({
+        ...manifest,
+        subtitlePolicy: {
+          requiredSidecars: [],
+          subtitleSidecarsOmittedReason: "confirmed_english_user_setting",
+        },
+        artifacts: [manifest.artifacts[0]],
+      }).subtitlePolicy.subtitleSidecarsOmittedReason,
+    ).toBe("confirmed_english_user_setting");
+    expect(
+      ExportClipManifestSchema.safeParse({ ...manifest, schemaVersion: 2 })
+        .success,
+    ).toBe(false);
+    expect(
+      ExportClipManifestSchema.safeParse({
+        ...manifest,
+        artifacts: [{ ...manifest.artifacts[0], contentSha256: "not-a-hash" }],
+      }).success,
+    ).toBe(false);
+  });
+
+  it("records a promoted manifest as its own final artifact role", () => {
+    expect(
+      FinalArtifactProvenanceSchema.parse({
+        role: "manifest_json",
+        packageIdentity: `clip-${id}`,
+        byteSize: 512,
+        contentSha256: "c".repeat(64),
+        sourceAttempt: 1,
+        validatedAt: now,
+      }).role,
+    ).toBe("manifest_json");
   });
 });

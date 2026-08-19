@@ -661,6 +661,7 @@ export const ResolvedExportBoundsSchema = z
 
 export const RenderedExportMediaProvenanceSchema =
   ExportMediaProvenanceSchema.extend({
+    ffmpegVersion: z.string().trim().min(1).max(120).optional(),
     sourceAttempt: z.number().int().positive(),
     validatedAt: UtcTimestampSchema,
   });
@@ -705,13 +706,76 @@ export const SubtitleSidecarProvenanceSchema = z
     message: "Subtitle timing bounds must be nonempty.",
   });
 
+export const FinalArtifactRoleSchema = z.enum([
+  "video_mp4",
+  "english_srt",
+  "original_srt",
+  "manifest_json",
+]);
+
 export const FinalArtifactProvenanceSchema = z.object({
-  role: z.enum(["video_mp4", "english_srt", "original_srt"]),
+  role: FinalArtifactRoleSchema,
   packageIdentity: z.string().regex(/^clip-[a-f0-9-]{36}$/),
   byteSize: z.number().int().positive(),
   contentSha256: z.string().regex(/^[a-f0-9]{64}$/),
   sourceAttempt: z.number().int().positive(),
   validatedAt: UtcTimestampSchema,
+});
+
+export const ExportClipManifestSchemaVersion = 1;
+
+export const ExportClipManifestArtifactSchema = z.object({
+  role: z.enum(["video_mp4", "english_srt", "original_srt"]),
+  filename: z.string().trim().min(1).max(255),
+  byteSize: z.number().int().positive(),
+  contentSha256: z.string().regex(/^[a-f0-9]{64}$/),
+  subtitle: z
+    .object({
+      language: z.string().trim().min(2).max(35),
+      trackId: IdSchema,
+      trackVersion: z.number().int().positive(),
+      timingPrecision: TimingPrecisionSchema,
+      cueCount: z.number().int().positive(),
+      startMs: z.number().int().nonnegative(),
+      endMs: z.number().int().positive(),
+    })
+    .optional(),
+});
+
+/**
+ * The auditable provenance record promoted beside a verified clip package. It
+ * is derived only from the immutable request snapshot, persisted validation
+ * provenance, and the staged bytes it names, so replaying one request
+ * reproduces it exactly. It never contains its own hash, a filesystem path, a
+ * command line, or subtitle text.
+ */
+export const ExportClipManifestSchema = z.object({
+  schemaVersion: z.literal(ExportClipManifestSchemaVersion),
+  exportRequestId: IdSchema,
+  jobId: IdSchema,
+  mode: z.enum(["logged", "export_only"]),
+  packageIdentity: z.string().regex(/^clip-[a-f0-9-]{36}$/),
+  sourceAttempt: z.number().int().positive(),
+  validatedAt: UtcTimestampSchema,
+  video: ClipVideoSnapshotSchema,
+  sourceLanguageClass: ExportSourceLanguageClassSchema,
+  resolvedExportBounds: z.object({
+    startMs: z.number().int().nonnegative(),
+    endMs: z.number().int().positive(),
+    sourceAttempt: z.number().int().positive(),
+  }),
+  renderedDurationMs: z.number().int().positive(),
+  subtitlePolicy: z.object({
+    requiredSidecars: z.array(z.enum(["original", "english"])).max(2),
+    subtitleSidecarsOmittedReason: z
+      .literal("confirmed_english_user_setting")
+      .optional(),
+  }),
+  toolVersions: z.object({
+    ffprobeVersion: z.string().trim().min(1).max(120).optional(),
+    ffmpegVersion: z.string().trim().min(1).max(120).optional(),
+  }),
+  artifacts: z.array(ExportClipManifestArtifactSchema).min(1).max(3),
 });
 
 export const ExportRequestSchema = z.object({
@@ -734,7 +798,7 @@ export const ExportRequestSchema = z.object({
   finalArtifacts: z
     .array(FinalArtifactProvenanceSchema)
     .min(1)
-    .max(3)
+    .max(4)
     .optional(),
   state: JobStateSchema,
   createdAt: UtcTimestampSchema,
@@ -881,7 +945,18 @@ export type CreateExportOnlyRequest = z.infer<
   typeof CreateExportOnlyRequestSchema
 >;
 export type ExportMediaProvenance = z.infer<typeof ExportMediaProvenanceSchema>;
+export type RenderedExportMediaProvenance = z.infer<
+  typeof RenderedExportMediaProvenanceSchema
+>;
 export type ResolvedExportBounds = z.infer<typeof ResolvedExportBoundsSchema>;
+export type FinalArtifactRole = z.infer<typeof FinalArtifactRoleSchema>;
+export type FinalArtifactProvenance = z.infer<
+  typeof FinalArtifactProvenanceSchema
+>;
+export type ExportClipManifestArtifact = z.infer<
+  typeof ExportClipManifestArtifactSchema
+>;
+export type ExportClipManifest = z.infer<typeof ExportClipManifestSchema>;
 export type ExportRequest = z.infer<typeof ExportRequestSchema>;
 export type TranscriptArtifact = z.infer<typeof TranscriptArtifactSchema>;
 export type TranscriptManifest = z.infer<typeof TranscriptManifestSchema>;
