@@ -2,7 +2,7 @@
 
 ## Project guide and implementation plan
 
-Status: Milestones 1–4 core workflow complete; preferred-language logging and Milestone 5 local export capabilities including optional English soft subtitles are verified through M5-14B; logged/cloud delivery, operational recovery/grouping, and the final release gate remain open
+Status: Milestones 1–4 core workflow complete; preferred-language logging, local export capabilities, and registered local-worker availability are verified through M5-15; logged/cloud delivery, operational recovery/grouping, and the final release gate remain open
 Last updated: 2026-08-20
 
 This document is the source of truth for product scope, architecture, sequencing, and acceptance criteria. Update it when a deliberate product or architectural decision changes. Use `outline.md` as the shorter execution checklist.
@@ -1407,6 +1407,20 @@ These slices do not complete Milestone 5. Registered local-agent delivery of log
 result reconciliation and progress/retry/cancel controls, batch and same-source
 group execution, crash-recovery cleanup sweeping, the 30-second foreign fixture
 gate, and the user-authorized live YouTube smoke test remain open.
+
+M5-15 completed 2026-08-20. A local workstation now persists one stable worker
+ID and capability-registration epoch in SQLite, discovers the existing fixed
+FFmpeg support matrix, and advertises only the current immutable renderer
+profile plus a normalized, fingerprinted installed summary. The summary is
+conservative: a renderer is available only when its base encoder/muxer, scale,
+FPS, and fixed container-specific English soft-subtitle encoder are all
+installed. Registration is actor-owned and epoch-safe; equal epochs may replay
+only an identical advertisement, while a higher epoch replaces it. Independent
+owner-only heartbeats have a fixed 60-second expiry, revocation requires a
+higher epoch to return, and project reads report only a compatible worker count
+after joining the worker owner to project membership. This is availability
+advertisement only—no export delivery, claims, source acquisition, rendering,
+results, progress, retries, cancellation, grouping, or cleanup sweep is added.
 
 M5-09 completed 2026-08-19. Every promoted clip package now also contains one
 `manifest.json`, written into attempt-private staging and promoted through the

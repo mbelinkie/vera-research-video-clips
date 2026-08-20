@@ -417,6 +417,23 @@ describe("registered local export workers", () => {
     expect(await catalog.registerExportWorker(owner, registration)).toEqual(
       registered,
     );
+    const unsupportedCapability = {
+      ...advertisement.capability,
+      profileVersion: advertisement.capability.profileVersion + 1,
+    };
+    await expect(
+      catalog.registerExportWorker(owner, {
+        ...registration,
+        capability: unsupportedCapability,
+        advertisementFingerprint: exportWorkerAdvertisementFingerprint({
+          capability: unsupportedCapability,
+          installedCapabilities: advertisement.installedCapabilities,
+        }),
+      }),
+    ).rejects.toMatchObject({ statusCode: 422 });
+    await expect(
+      catalog.registerExportWorker(outsider, registration),
+    ).rejects.toMatchObject({ statusCode: 403 });
     await expect(
       catalog.registerExportWorker(owner, {
         ...registration,
@@ -468,6 +485,19 @@ describe("registered local export workers", () => {
         availabilityRequest,
       ),
     ).toEqual({ compatible: true, availableWorkerCount: 1 });
+    expect(
+      await catalog.compatibleExportWorkerAvailability(
+        collaborator,
+        project.id,
+        {
+          ...availabilityRequest,
+          capability: {
+            ...advertisement.capability,
+            profileVersion: advertisement.capability.profileVersion + 1,
+          },
+        },
+      ),
+    ).toEqual({ compatible: false, availableWorkerCount: 0 });
     await catalog.registerExportWorker(outsider, {
       ...registration,
       workerId: randomUUID(),
@@ -509,7 +539,12 @@ describe("registered local export workers", () => {
     ).rejects.toMatchObject({
       statusCode: 409,
     });
-    await catalog.registerExportWorker(owner, { ...changed, epoch: 2 });
+    expect(
+      await catalog.registerExportWorker(owner, { ...changed, epoch: 2 }),
+    ).toMatchObject({ id: workerId, epoch: 2 });
+    await expect(
+      catalog.registerExportWorker(outsider, { ...changed, epoch: 3 }),
+    ).rejects.toMatchObject({ statusCode: 403 });
     expect(
       await catalog.compatibleExportWorkerAvailability(
         collaborator,
@@ -521,6 +556,9 @@ describe("registered local export workers", () => {
       ),
     ).toEqual({ compatible: false, availableWorkerCount: 0 });
     now = new Date("2026-08-20T12:02:00.000Z");
+    await expect(
+      catalog.heartbeatExportWorker(owner, { workerId, epoch: 2 }),
+    ).rejects.toMatchObject({ statusCode: 409 });
     expect(
       await catalog.compatibleExportWorkerAvailability(
         collaborator,

@@ -288,6 +288,10 @@ produce preferred SRT artifacts.
   replacing any language-policy sidecar, with fixed MP4/MOV `mov_text` and MKV
   `subrip` mappings, exact English snapshots, and FFprobe conformance
   (`specs/completed/M5-14B-optional-embedded-english-soft-subtitles.md`).
+- [x] M5-15: persist one local worker identity/epoch, advertise only the typed
+  installed complete renderer profile to the authorized cloud catalog, and read
+  project-authorized compatible-worker availability without delivering work
+  (`specs/completed/M5-15-registered-local-worker-capability-advertisement.md`).
 - [x] Generate and verify thumbnail, metadata JSON, and manifest.
 - [x] Use private staging plus exact-artifact validation and atomic completion.
 - [ ] Deliver logged/cloud export requests to an authorized local worker and
@@ -462,7 +466,7 @@ infra/aws        storage, API, database, queues, identity, monitoring
 
 ## Next action
 
-Continue Milestone 5 with one bounded optional embedded-English soft-subtitle
-slice. Keep registered-agent logged/cloud delivery, result reconciliation,
-progress/retry/cancel, same-source grouping, cleanup sweeping, and the final
-30-second plus authorized-live release gate as separate slices.
+Continue Milestone 5 with one bounded logged/cloud export-delivery slice that
+uses registered-worker availability without broadening it into result
+reconciliation, progress/retry/cancel, same-source grouping, cleanup sweeping,
+or the final 30-second plus authorized-live release gate.
