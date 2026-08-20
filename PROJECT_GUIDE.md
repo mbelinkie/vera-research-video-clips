@@ -2,7 +2,7 @@
 
 ## Project guide and implementation plan
 
-Status: Milestones 1–4 core workflow complete; preferred-language logging, local export capabilities, and authorized logged-export success/failure reconciliation are verified through M5-18; cleanup recovery, operational controls/grouping, and the final release gate remain open
+Status: Milestones 1–4 core workflow complete; preferred-language logging, local export capabilities, authorized logged-export success/failure reconciliation, and safe local source-scratch cleanup recovery are verified through M5-19; operational controls/grouping and the final release gate remain open
 Last updated: 2026-08-20
 
 This document is the source of truth for product scope, architecture, sequencing, and acceptance criteria. Update it when a deliberate product or architectural decision changes. Use `outline.md` as the shorter execution checklist.
@@ -1485,9 +1485,24 @@ event. Exact replay is a no-op; divergent replay conflicts; database triggers
 and the delivery lock prevent success/failure coexistence. Cloud migration
 `0015` adds the immutable failure record. Errors are re-sanitized at the shared
 contract and local repository boundaries, including URL, Unix/Windows/UNC path,
-identifier/digest, key-value secret, and bearer-token redaction. The next slice
-is cleanup-failure recovery plus abandoned-scratch lifecycle/sweeping, not
-user-facing retry/progress/cancel, batching/grouping, or final release gates.
+identifier/digest, key-value secret, and bearer-token redaction.
+
+M5-19 completed 2026-08-20. An explicit bounded local maintenance command now
+claims `cleanup_failed` or expired abandoned deterministic source-scratch rows
+with a SQLite lease, deletes only the exact validated
+`<job UUID>/<positive attempt>` child under the configured scratch root, and
+durably records deletion. Missing exact children are idempotent cleanup success;
+symlinks, files, invalid roots, and containment failures fail closed with
+sanitized local evidence. Migration `0021` marks every preexisting random
+`mkdtemp` layout row manual/actionable rather than inferring a new directory;
+any corresponding processing job moves to `needs_user_action`. Verified exact
+package provenance can restore `complete` without media work, while absent or
+untrusted packages become only terminal-safe local failure evidence for M5-18.
+The sweeper has no cloud mutation, polling, scheduler, retry/rerender, or UI.
+Legacy random-layout bytes still require manual recovery; expiry remains the
+abandonment boundary until a future execution heartbeat/control slice, and
+M5-18 intentionally still rejects multi-attempt failure projection rather than
+guessing attempt ownership.
 
 M5-09 completed 2026-08-19. Every promoted clip package now also contains one
 `manifest.json`, written into attempt-private staging and promoted through the

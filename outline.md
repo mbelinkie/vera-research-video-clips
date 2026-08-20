@@ -305,6 +305,10 @@ produce preferred SRT artifacts.
   failure through exact pinned authorization, verified absent/deleted scratch,
   immutable success/failure exclusion, and exact-replay recovery
   (`specs/completed/M5-18-reconcile-accepted-logged-export-failure.md`).
+- [x] M5-19: safely recover cleanup failures and bounded abandoned deterministic
+  source scratch with exact-child deletion, durable SQLite claims, legacy-layout
+  manual handling, and package/failure recovery
+  (`specs/completed/M5-19-cleanup-recovery-and-abandoned-source-scratch-sweeper.md`).
 - [x] Generate and verify thumbnail, metadata JSON, and manifest.
 - [x] Use private staging plus exact-artifact validation and atomic completion.
 - [x] Execute accepted logged requests through the existing local processor and
@@ -312,7 +316,7 @@ produce preferred SRT artifacts.
 - [ ] Add durable progress, retry, safe cancellation, sibling isolation, and
   batch export.
 
-Gate: representative presets produce the requested FFprobe properties, queued jobs survive preset edits unchanged, English clips get an SRT by default and can explicitly omit it, foreign/mixed/unknown clips always get original plus translated-English SRTs, a 30-second foreign-language range produces only cues within that 30-second clip, a real authorized smoke test succeeds, and no full source media remains after any terminal path. M5-08 proves the local export-only composition path with authorized repository fixture media; M5-17 and M5-18 prove exact idempotent cloud success/failure reconciliation for one accepted logged request. Cleanup-failure recovery/sweeping and the remaining operational/release gates remain open.
+Gate: representative presets produce the requested FFprobe properties, queued jobs survive preset edits unchanged, English clips get an SRT by default and can explicitly omit it, foreign/mixed/unknown clips always get original plus translated-English SRTs, a 30-second foreign-language range produces only cues within that 30-second clip, a real authorized smoke test succeeds, and no full source media remains after any terminal path. M5-08 proves the local export-only composition path with authorized repository fixture media; M5-17 and M5-18 prove exact idempotent cloud success/failure reconciliation for one accepted logged request; M5-19 proves bounded local cleanup recovery without inferring legacy random-layout scratch paths. The remaining operational/release gates remain open.
 
 ### 6. Project Clip Library + authoring handoff
 
@@ -493,10 +497,8 @@ infra/aws        storage, API, database, queues, identity, monitoring
 
 ## Next action
 
-Continue Milestone 5 with one bounded slice for cleanup-failure recovery plus an
-abandoned source-scratch lifecycle/sweeper backstop. Preserve M5-18's rule that
-ordinary failure becomes terminal only after verified deletion, make cleanup
-retry independently actionable without rerendering, and define bounded
-restart/crash recovery. Do not yet broaden into user-facing retry/progress/
-cancel, batch/group execution, the 30-second foreign fixture gate, the
-authorized-live smoke test, M6, or M7.
+Continue Milestone 5 with one bounded M5-20 durable logged-export
+operational-control slice: safe cancellation plus retry ownership/state
+transition. Do not claim batch/group/progress work unless it is implemented;
+do not broaden into the 30-second foreign fixture gate, the authorized-live
+smoke test, M6, or M7.
