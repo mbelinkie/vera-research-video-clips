@@ -3,8 +3,13 @@ import { z, ZodError } from "zod";
 
 import {
   CreateExportOnlyRequestSchema,
+  ClaimLoggedExportDeliveryResponseSchema,
   ExportSettingsPreviewRequestSchema,
   type HeartbeatExportWorkerRequest,
+  type AcceptLoggedExportDeliveryRequest,
+  type ClaimLoggedExportDeliveryRequest,
+  type ClaimLoggedExportDeliveryResponse,
+  type LoggedExportDelivery,
   type RegisterExportWorkerRequest,
   type RegisteredExportWorker,
   type CreateExportOnlyRequest,
@@ -57,6 +62,18 @@ export interface LocalAgentDependencies {
     request: HeartbeatExportWorkerRequest;
     authorization: string;
   }): Promise<RegisteredExportWorker>;
+  claimLoggedExportDelivery?(input: {
+    request: ClaimLoggedExportDeliveryRequest;
+    authorization: string;
+  }): Promise<ClaimLoggedExportDeliveryResponse>;
+  acceptLoggedExportDelivery?(input: {
+    request: AcceptLoggedExportDeliveryRequest;
+    authorization: string;
+  }): Promise<LoggedExportDelivery>;
+  importLoggedDeliveryPending?(delivery: LoggedExportDelivery): ExportRequest;
+  activateLoggedDelivery?(delivery: LoggedExportDelivery): ExportRequest;
+  rejectPendingLoggedDelivery?(delivery: LoggedExportDelivery): void;
+  getPendingLoggedDelivery?(): LoggedExportDelivery | undefined;
 }
 
 const TranscriptParamsSchema = z.object({
@@ -284,6 +301,101 @@ export function createLocalAgent(
       return dependencies.heartbeatExportWorker!({
         authorization,
         request: { workerId: identity.workerId, epoch: identity.epoch },
+      });
+    });
+  }
+
+  if (
+    dependencies?.workerIdentity &&
+    dependencies.claimLoggedExportDelivery &&
+    dependencies.acceptLoggedExportDelivery &&
+    dependencies.importLoggedDeliveryPending &&
+    dependencies.activateLoggedDelivery &&
+    dependencies.rejectPendingLoggedDelivery &&
+    dependencies.getPendingLoggedDelivery
+  ) {
+    app.post("/api/export-deliveries/claim", async (request) => {
+      const authorization = request.headers.authorization;
+      if (!authorization) {
+        throw new LocalAuthenticationError(
+          "Authentication is required to deliver a logged export.",
+        );
+      }
+      const identity = dependencies.workerIdentity!.get();
+      if (!identity) {
+        throw new LocalExportSettingsError(
+          "Register this local export worker before claiming logged exports.",
+          "worker_registration_required",
+          409,
+        );
+      }
+      const pending = dependencies.getPendingLoggedDelivery!();
+      if (pending) {
+        try {
+          const accepted = await dependencies.acceptLoggedExportDelivery!({
+            authorization,
+            request: {
+              workerId: identity.workerId,
+              workerEpoch: identity.epoch,
+              deliveryId: pending.deliveryId,
+              generation: pending.generation,
+              reservationToken: pending.reservationToken,
+            },
+          });
+          dependencies.activateLoggedDelivery!(accepted);
+          return ClaimLoggedExportDeliveryResponseSchema.parse({
+            delivery: accepted,
+          });
+        } catch (error) {
+          if ((error as { statusCode?: number }).statusCode !== 409)
+            throw error;
+          dependencies.rejectPendingLoggedDelivery!(pending);
+        }
+      }
+      const claimed = ClaimLoggedExportDeliveryResponseSchema.parse(
+        await dependencies.claimLoggedExportDelivery!({
+          authorization,
+          request: {
+            workerId: identity.workerId,
+            workerEpoch: identity.epoch,
+          },
+        }),
+      );
+      if (!claimed.delivery) return claimed;
+      if (
+        claimed.delivery.workerId !== identity.workerId ||
+        claimed.delivery.workerEpoch !== identity.epoch
+      ) {
+        throw new LocalExportSettingsError(
+          "Cloud delivery ownership does not match this registered local worker.",
+          "export_delivery_ownership_mismatch",
+          409,
+        );
+      }
+
+      dependencies.importLoggedDeliveryPending!(claimed.delivery);
+      let accepted: LoggedExportDelivery;
+      try {
+        accepted = await dependencies.acceptLoggedExportDelivery!({
+          authorization,
+          request: {
+            workerId: identity.workerId,
+            workerEpoch: identity.epoch,
+            deliveryId: claimed.delivery.deliveryId,
+            generation: claimed.delivery.generation,
+            reservationToken: claimed.delivery.reservationToken,
+          },
+        });
+      } catch (error) {
+        const statusCode = (error as { statusCode?: number }).statusCode;
+        if (statusCode === 409) {
+          dependencies.rejectPendingLoggedDelivery!(claimed.delivery);
+        }
+        throw error;
+      }
+      dependencies.activateLoggedDelivery!(accepted);
+      return ClaimLoggedExportDeliveryResponseSchema.parse({
+        delivery: accepted,
       });
     });
   }

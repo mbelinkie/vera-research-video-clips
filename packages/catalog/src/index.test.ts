@@ -568,3 +568,414 @@ describe("registered local export workers", () => {
     ).toEqual({ compatible: false, availableWorkerCount: 0 });
   });
 });
+
+describe("logged export delivery", () => {
+  it("atomically reserves once, accepts idempotently, and does not replay accepted work as a new claim", async () => {
+    const database = new PGlite();
+    databases.add(database);
+    await runCloudMigrations(database);
+    let now = new Date("2026-08-20T12:00:00.000Z");
+    const catalog = new SharedProjectCatalog(
+      database,
+      new MemoryTranscriptObjectStore(),
+      () => now,
+    );
+    const owner = fixtureActor("delivery-owner");
+    const collaborator = fixtureActor("delivery-collaborator");
+    await catalog.registerUser(owner, "Delivery owner");
+    await catalog.registerUser(collaborator, "Delivery collaborator");
+    const { projectId, request } = await createLoggedExportFixture(
+      catalog,
+      owner,
+      "single",
+    );
+    await catalog.addMember(owner, projectId, collaborator.userId, "editor");
+    const advertisement = currentExportWorkerAdvertisement({
+      ffmpegVersion: "8.1.2",
+      encoders: ["libx264", "mov_text"],
+      muxers: ["mp4"],
+      filters: ["scale", "fps"],
+    });
+    const ownerWorker = { workerId: randomUUID(), epoch: 1, ...advertisement };
+    const collaboratorWorker = {
+      workerId: randomUUID(),
+      epoch: 1,
+      ...advertisement,
+    };
+    await catalog.registerExportWorker(owner, ownerWorker);
+    await catalog.registerExportWorker(collaborator, collaboratorWorker);
+    await expect(
+      catalog.claimLoggedExportDelivery(collaborator, {
+        workerId: ownerWorker.workerId,
+        workerEpoch: 1,
+      }),
+    ).rejects.toMatchObject({ statusCode: 403 });
+    await expect(
+      catalog.claimLoggedExportDelivery(owner, {
+        workerId: ownerWorker.workerId,
+        workerEpoch: 2,
+      }),
+    ).rejects.toMatchObject({ statusCode: 409 });
+    const revokedWorker = {
+      workerId: randomUUID(),
+      epoch: 1,
+      ...advertisement,
+    };
+    await catalog.registerExportWorker(owner, revokedWorker);
+    await catalog.revokeExportWorker(owner, {
+      workerId: revokedWorker.workerId,
+      epoch: 1,
+    });
+    await expect(
+      catalog.claimLoggedExportDelivery(owner, {
+        workerId: revokedWorker.workerId,
+        workerEpoch: 1,
+      }),
+    ).rejects.toMatchObject({ statusCode: 409 });
+
+    const claims = await Promise.all([
+      catalog.claimLoggedExportDelivery(owner, {
+        workerId: ownerWorker.workerId,
+        workerEpoch: 1,
+      }),
+      catalog.claimLoggedExportDelivery(collaborator, {
+        workerId: collaboratorWorker.workerId,
+        workerEpoch: 1,
+      }),
+    ]);
+    const winning = claims.find((claim) => claim.delivery)?.delivery!;
+    expect(claims.filter((claim) => claim.delivery)).toHaveLength(1);
+    expect(winning.request).toEqual(request);
+    expect(winning).not.toHaveProperty("ownerUserId");
+    expect(JSON.stringify(winning)).not.toMatch(
+      /\/private\/|presigned|credential/i,
+    );
+    const winningActor =
+      winning.workerId === ownerWorker.workerId ? owner : collaborator;
+    const otherActor = winningActor === owner ? collaborator : owner;
+    await expect(
+      catalog.acceptLoggedExportDelivery(otherActor, {
+        workerId: winning.workerId,
+        workerEpoch: winning.workerEpoch,
+        deliveryId: winning.deliveryId,
+        generation: winning.generation,
+        reservationToken: winning.reservationToken,
+      }),
+    ).rejects.toMatchObject({ statusCode: 403 });
+    await expect(
+      catalog.acceptLoggedExportDelivery(winningActor, {
+        workerId: winning.workerId,
+        workerEpoch: winning.workerEpoch + 1,
+        deliveryId: winning.deliveryId,
+        generation: winning.generation,
+        reservationToken: winning.reservationToken,
+      }),
+    ).rejects.toMatchObject({ statusCode: 409 });
+    const accepted = await catalog.acceptLoggedExportDelivery(winningActor, {
+      workerId: winning.workerId,
+      workerEpoch: winning.workerEpoch,
+      deliveryId: winning.deliveryId,
+      generation: winning.generation,
+      reservationToken: winning.reservationToken,
+    });
+    expect(accepted.status).toBe("accepted");
+    expect(
+      await catalog.acceptLoggedExportDelivery(winningActor, {
+        workerId: winning.workerId,
+        workerEpoch: winning.workerEpoch,
+        deliveryId: winning.deliveryId,
+        generation: winning.generation,
+        reservationToken: winning.reservationToken,
+      }),
+    ).toEqual(accepted);
+    now = new Date("2026-08-20T12:00:10.000Z");
+    expect(
+      await catalog.claimLoggedExportDelivery(winningActor, {
+        workerId: winning.workerId,
+        workerEpoch: winning.workerEpoch,
+      }),
+    ).toEqual({});
+    expect(
+      Number(
+        (
+          await database.query<{ count: string }>(
+            "SELECT count(*)::text AS count FROM logged_export_deliveries",
+          )
+        ).rows[0]!.count,
+      ),
+    ).toBe(1);
+    await catalog.revokeExportWorker(winningActor, {
+      workerId: winning.workerId,
+      epoch: winning.workerEpoch,
+    });
+    await expect(
+      catalog.acceptLoggedExportDelivery(winningActor, {
+        workerId: winning.workerId,
+        workerEpoch: winning.workerEpoch,
+        deliveryId: winning.deliveryId,
+        generation: winning.generation,
+        reservationToken: winning.reservationToken,
+      }),
+    ).rejects.toMatchObject({ statusCode: 409 });
+  });
+
+  it("uses one stable delivery ID with a new generation/token after expiry and rejects stale acceptance", async () => {
+    const database = new PGlite();
+    databases.add(database);
+    await runCloudMigrations(database);
+    let now = new Date("2026-08-20T12:00:00.000Z");
+    const catalog = new SharedProjectCatalog(
+      database,
+      new MemoryTranscriptObjectStore(),
+      () => now,
+    );
+    const owner = fixtureActor("redelivery-owner");
+    const other = fixtureActor("redelivery-other");
+    await catalog.registerUser(owner, "Redelivery owner");
+    await catalog.registerUser(other, "Redelivery other");
+    const { projectId } = await createLoggedExportFixture(
+      catalog,
+      owner,
+      "redelivery",
+    );
+    await catalog.addMember(owner, projectId, other.userId, "editor");
+    const advertisement = currentExportWorkerAdvertisement({
+      encoders: ["libx264", "mov_text"],
+      muxers: ["mp4"],
+      filters: ["scale", "fps"],
+    });
+    const firstWorker = { workerId: randomUUID(), epoch: 1, ...advertisement };
+    const secondWorker = { workerId: randomUUID(), epoch: 1, ...advertisement };
+    await catalog.registerExportWorker(owner, firstWorker);
+    await catalog.registerExportWorker(other, secondWorker);
+    const first = (
+      await catalog.claimLoggedExportDelivery(owner, {
+        workerId: firstWorker.workerId,
+        workerEpoch: 1,
+      })
+    ).delivery!;
+    now = new Date("2026-08-20T12:00:31.000Z");
+    const second = (
+      await catalog.claimLoggedExportDelivery(other, {
+        workerId: secondWorker.workerId,
+        workerEpoch: 1,
+      })
+    ).delivery!;
+    expect(second.deliveryId).toBe(first.deliveryId);
+    expect(second.generation).toBe(first.generation + 1);
+    expect(second.reservationToken).not.toBe(first.reservationToken);
+    await expect(
+      catalog.acceptLoggedExportDelivery(owner, {
+        workerId: first.workerId,
+        workerEpoch: first.workerEpoch,
+        deliveryId: first.deliveryId,
+        generation: first.generation,
+        reservationToken: first.reservationToken,
+      }),
+    ).rejects.toMatchObject({ statusCode: 409 });
+    await database.query(
+      "DELETE FROM project_members WHERE project_id = $1 AND user_id = $2",
+      [projectId, other.userId],
+    );
+    await expect(
+      catalog.acceptLoggedExportDelivery(other, {
+        workerId: second.workerId,
+        workerEpoch: second.workerEpoch,
+        deliveryId: second.deliveryId,
+        generation: second.generation,
+        reservationToken: second.reservationToken,
+      }),
+    ).rejects.toMatchObject({ statusCode: 409 });
+    expect(
+      await catalog.claimLoggedExportDelivery(other, {
+        workerId: second.workerId,
+        workerEpoch: second.workerEpoch,
+      }),
+    ).toEqual({});
+    await catalog.addMember(owner, projectId, other.userId, "editor");
+    expect(
+      (
+        await catalog.acceptLoggedExportDelivery(other, {
+          workerId: second.workerId,
+          workerEpoch: second.workerEpoch,
+          deliveryId: second.deliveryId,
+          generation: second.generation,
+          reservationToken: second.reservationToken,
+        })
+      ).status,
+    ).toBe("accepted");
+    now = new Date("2026-08-20T12:01:01.000Z");
+    await expect(
+      catalog.claimLoggedExportDelivery(other, {
+        workerId: secondWorker.workerId,
+        workerEpoch: 1,
+      }),
+    ).rejects.toMatchObject({ statusCode: 409 });
+  });
+
+  it("finds a compatible request after more than one hundred older incompatible requests", async () => {
+    const database = new PGlite();
+    databases.add(database);
+    await runCloudMigrations(database);
+    const catalog = new SharedProjectCatalog(
+      database,
+      new MemoryTranscriptObjectStore(),
+    );
+    const owner = fixtureActor("fair-claim-owner");
+    await catalog.registerUser(owner, "Fair claim owner");
+    const fixture = await createLoggedExportFixture(
+      catalog,
+      owner,
+      "incompatible-0",
+      "hevc",
+    );
+    for (let index = 1; index <= 100; index += 1) {
+      await createLoggedExportFromClip(
+        catalog,
+        owner,
+        fixture.projectId,
+        fixture.clipId,
+        `incompatible-${index}`,
+        "hevc",
+      );
+    }
+    const advertisement = currentExportWorkerAdvertisement({
+      encoders: ["libx264", "mov_text"],
+      muxers: ["mp4"],
+      filters: ["scale", "fps"],
+    });
+    const worker = { workerId: randomUUID(), epoch: 1, ...advertisement };
+    await catalog.registerExportWorker(owner, worker);
+    expect(
+      await catalog.claimLoggedExportDelivery(owner, {
+        workerId: worker.workerId,
+        workerEpoch: 1,
+      }),
+    ).toEqual({});
+    expect(
+      (
+        await database.query<{ count: string }>(
+          "SELECT count(*)::text AS count FROM logged_export_deliveries",
+        )
+      ).rows[0]!.count,
+    ).toBe("0");
+    expect(
+      (
+        await database.query<{ count: string }>(
+          `SELECT count(*)::text AS count FROM jobs
+           WHERE kind = 'export' AND state = 'queued'`,
+        )
+      ).rows[0]!.count,
+    ).toBe("101");
+    const compatible = await createLoggedExportFromClip(
+      catalog,
+      owner,
+      fixture.projectId,
+      fixture.clipId,
+      "compatible-last",
+      "h264",
+    );
+    const claim = await catalog.claimLoggedExportDelivery(owner, {
+      workerId: worker.workerId,
+      workerEpoch: 1,
+    });
+    expect(claim.delivery?.request.id).toBe(compatible.id);
+  });
+});
+
+function fixtureActor(name: string): AuthenticatedActor {
+  return { userId: randomUUID(), externalSubject: `fixture:${name}` };
+}
+
+async function createLoggedExportFixture(
+  catalog: SharedProjectCatalog,
+  actor: AuthenticatedActor,
+  idempotencyKey: string,
+  family: "h264" | "hevc" = "h264",
+) {
+  const project = await catalog.createProject(actor, {
+    name: `Delivery ${idempotencyKey}`,
+  });
+  const trackId = randomUUID();
+  const clip = await catalog.createClipCandidate(actor, project.id, {
+    idempotencyKey: `clip:${idempotencyKey}`,
+    video: {
+      youtubeVideoId: "M7lc1UVf-VE",
+      canonicalUrl: "https://www.youtube.com/watch?v=M7lc1UVf-VE",
+      title: "Delivery fixture",
+    },
+    selection: {
+      trackId,
+      transcriptVersion: 1,
+      firstSegmentId: randomUUID(),
+      lastSegmentId: randomUUID(),
+      firstTokenId: randomUUID(),
+      lastTokenId: randomUUID(),
+      transcriptStartMs: 300,
+      transcriptEndMs: 2_900,
+      exportStartMs: 0,
+      exportEndMs: 3_400,
+      text: "Delivery fixture selection",
+      timingPrecision: "word",
+    },
+    languageEvidence: {
+      schemaVersion: 2,
+      native: {
+        role: "native",
+        language: "en",
+        text: "Delivery fixture selection",
+        trackId,
+        trackVersion: 1,
+        timingPrecision: "word",
+      },
+      english: {
+        role: "english",
+        language: "en",
+        text: "Delivery fixture selection",
+        trackId,
+        trackVersion: 1,
+        timingPrecision: "word",
+      },
+    },
+    notes: "",
+    tags: [],
+  });
+  const request = await createLoggedExportFromClip(
+    catalog,
+    actor,
+    project.id,
+    clip.id,
+    idempotencyKey,
+    family,
+  );
+  return { projectId: project.id, clipId: clip.id, request };
+}
+
+async function createLoggedExportFromClip(
+  catalog: SharedProjectCatalog,
+  actor: AuthenticatedActor,
+  projectId: string,
+  clipId: string,
+  idempotencyKey: string,
+  family: "h264" | "hevc",
+) {
+  const overrides =
+    family === "hevc"
+      ? {
+          container: "mkv" as const,
+          videoCodec: "hevc" as const,
+          audioCodec: "aac" as const,
+        }
+      : {};
+  const selection = { base: "application_default" as const, overrides };
+  const preview = await catalog.previewProjectExportSettings(actor, projectId, {
+    sourceLanguageClass: "confirmed_english",
+    selection,
+  });
+  return catalog.createClipExport(actor, projectId, clipId, {
+    idempotencyKey,
+    sourceLanguageClass: "confirmed_english",
+    settingsSelection: selection,
+    expectedResolutionFingerprint: preview.snapshot.resolutionFingerprint!,
+  });
+}

@@ -87,6 +87,7 @@ export class LocalExportSourceProcessor {
         retryable: false,
       });
     }
+    this.queue.assertExportDeliveryAccepted(input.requestId);
     const resolvedSettingsSnapshot = request.resolvedSettingsSnapshot;
     if (!resolvedSettingsSnapshot) {
       const error = new ExportSourceAcquisitionError(

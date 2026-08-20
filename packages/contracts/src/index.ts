@@ -1843,6 +1843,107 @@ export const ExportRequestSchema = z.object({
   updatedAt: UtcTimestampSchema,
 });
 
+export const ClaimLoggedExportDeliveryRequestSchema = z
+  .object({
+    workerId: IdSchema,
+    workerEpoch: z.number().int().positive(),
+  })
+  .strict();
+
+export const LoggedExportDeliverySchema = z
+  .object({
+    deliveryId: IdSchema,
+    generation: z.number().int().positive(),
+    reservationToken: IdSchema,
+    workerId: IdSchema,
+    workerEpoch: z.number().int().positive(),
+    status: z.enum(["reserved", "accepted"]),
+    reservedAt: UtcTimestampSchema,
+    reservationExpiresAt: UtcTimestampSchema,
+    acceptedAt: UtcTimestampSchema.optional(),
+    request: ExportRequestSchema,
+  })
+  .strict()
+  .superRefine((delivery, context) => {
+    if (
+      delivery.request.mode !== "logged" ||
+      !delivery.request.projectId ||
+      !delivery.request.clipId ||
+      !delivery.request.resolvedSettingsSnapshot
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["request", "mode"],
+        message:
+          "A cloud delivery must contain one project-owned logged export request.",
+      });
+    }
+    const sourceUrl = new URL(delivery.request.video.canonicalUrl);
+    if (
+      sourceUrl.protocol !== "https:" ||
+      sourceUrl.hostname !== "www.youtube.com" ||
+      sourceUrl.username !== "" ||
+      sourceUrl.password !== "" ||
+      sourceUrl.port !== "" ||
+      sourceUrl.pathname !== "/watch" ||
+      sourceUrl.searchParams.get("v") !==
+        delivery.request.video.youtubeVideoId ||
+      [...sourceUrl.searchParams.keys()].length !== 1 ||
+      sourceUrl.hash !== ""
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["request", "video", "canonicalUrl"],
+        message:
+          "A cloud delivery may contain only the canonical public YouTube watch URL, never a private acquisition URL.",
+      });
+    }
+    if ((delivery.status === "accepted") !== Boolean(delivery.acceptedAt)) {
+      context.addIssue({
+        code: "custom",
+        path: ["acceptedAt"],
+        message: "Accepted delivery provenance is inconsistent.",
+      });
+    }
+    const reservedAt = Date.parse(delivery.reservedAt);
+    const expiresAt = Date.parse(delivery.reservationExpiresAt);
+    const acceptedAt = delivery.acceptedAt
+      ? Date.parse(delivery.acceptedAt)
+      : undefined;
+    if (expiresAt <= reservedAt) {
+      context.addIssue({
+        code: "custom",
+        path: ["reservationExpiresAt"],
+        message: "A delivery reservation must expire after it begins.",
+      });
+    }
+    if (
+      acceptedAt !== undefined &&
+      (acceptedAt < reservedAt || acceptedAt >= expiresAt)
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["acceptedAt"],
+        message:
+          "A delivery must be accepted during its exact reservation window.",
+      });
+    }
+  });
+
+export const ClaimLoggedExportDeliveryResponseSchema = z
+  .object({ delivery: LoggedExportDeliverySchema.optional() })
+  .strict();
+
+export const AcceptLoggedExportDeliveryRequestSchema = z
+  .object({
+    workerId: IdSchema,
+    workerEpoch: z.number().int().positive(),
+    deliveryId: IdSchema,
+    generation: z.number().int().positive(),
+    reservationToken: IdSchema,
+  })
+  .strict();
+
 export const JobSchema = z.object({
   id: IdSchema,
   kind: JobKindSchema,
@@ -2068,6 +2169,16 @@ export type ExportResolvedSubtitlePolicy = z.infer<
 >;
 export type ExportClipMetadata = z.infer<typeof ExportClipMetadataSchema>;
 export type ExportRequest = z.infer<typeof ExportRequestSchema>;
+export type ClaimLoggedExportDeliveryRequest = z.infer<
+  typeof ClaimLoggedExportDeliveryRequestSchema
+>;
+export type LoggedExportDelivery = z.infer<typeof LoggedExportDeliverySchema>;
+export type ClaimLoggedExportDeliveryResponse = z.infer<
+  typeof ClaimLoggedExportDeliveryResponseSchema
+>;
+export type AcceptLoggedExportDeliveryRequest = z.infer<
+  typeof AcceptLoggedExportDeliveryRequestSchema
+>;
 export type TranscriptArtifact = z.infer<typeof TranscriptArtifactSchema>;
 export type TranscriptManifest = z.infer<typeof TranscriptManifestSchema>;
 export type DerivedTranslationIdentity = z.infer<

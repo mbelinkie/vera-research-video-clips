@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  AcceptLoggedExportDeliveryRequestSchema,
   BatchPreflightRequestSchema,
   ClipLanguageEvidenceV2Schema,
   CreateClipExportRequestSchema,
@@ -12,6 +13,8 @@ import {
   ExportPresetSnapshotSchema,
   ExportSettingsSchema,
   InstalledExportWorkerCapabilitySummarySchema,
+  ClaimLoggedExportDeliveryRequestSchema,
+  LoggedExportDeliverySchema,
   FinalArtifactProvenanceSchema,
   HealthResponseSchema,
   JobSchema,
@@ -27,6 +30,72 @@ const now = "2026-08-01T12:00:00.000Z";
 const id = "019fbb95-cd76-7920-93fa-e23ba755ee3f";
 
 describe("shared contracts", () => {
+  it("requires exact worker epoch plus delivery generation and token for logged handoff", () => {
+    const claim = {
+      workerId: id,
+      workerEpoch: 3,
+    };
+    expect(ClaimLoggedExportDeliveryRequestSchema.parse(claim)).toEqual(claim);
+    const acceptance = {
+      ...claim,
+      deliveryId: "019fbb95-cd76-7920-93fa-e23ba755ee40",
+      generation: 4,
+      reservationToken: "019fbb95-cd76-7920-93fa-e23ba755ee41",
+    };
+    expect(AcceptLoggedExportDeliveryRequestSchema.parse(acceptance)).toEqual(
+      acceptance,
+    );
+    expect(
+      AcceptLoggedExportDeliveryRequestSchema.safeParse({
+        ...acceptance,
+        reservationToken: undefined,
+      }).success,
+    ).toBe(false);
+    expect(
+      AcceptLoggedExportDeliveryRequestSchema.safeParse({
+        ...acceptance,
+        generation: 0,
+      }).success,
+    ).toBe(false);
+  });
+
+  it("rejects invalid logged-delivery reservation and acceptance chronology", () => {
+    const delivery = deliveryContractFixture();
+    expect(LoggedExportDeliverySchema.safeParse(delivery).success).toBe(true);
+    expect(
+      LoggedExportDeliverySchema.safeParse({
+        ...delivery,
+        reservationExpiresAt: delivery.reservedAt,
+      }).success,
+    ).toBe(false);
+    expect(
+      LoggedExportDeliverySchema.safeParse({
+        ...delivery,
+        status: "accepted",
+        acceptedAt: "2026-08-20T11:59:59.999Z",
+      }).success,
+    ).toBe(false);
+    expect(
+      LoggedExportDeliverySchema.safeParse({
+        ...delivery,
+        status: "accepted",
+        acceptedAt: delivery.reservationExpiresAt,
+      }).success,
+    ).toBe(false);
+    expect(
+      LoggedExportDeliverySchema.safeParse({
+        ...delivery,
+        request: {
+          ...delivery.request,
+          video: {
+            ...delivery.request.video,
+            canonicalUrl: `${delivery.request.video.canonicalUrl}&token=private`,
+          },
+        },
+      }).success,
+    ).toBe(false);
+  });
+
   it("accepts a versioned project", () => {
     const project = ProjectSchema.parse({
       id,
@@ -520,3 +589,72 @@ describe("shared contracts", () => {
     ).toBe(false);
   });
 });
+
+function deliveryContractFixture() {
+  const settings = {
+    container: "mp4" as const,
+    videoCodec: "h264" as const,
+    videoRateControl: { mode: "crf" as const, value: 20 },
+    frameRate: "source" as const,
+    audioCodec: "aac" as const,
+    omitSubtitleFilesForConfirmedEnglish: false,
+    embedEnglishSubtitleTrack: false,
+  };
+  return {
+    deliveryId: "019fbb95-cd76-7920-93fa-e23ba755ee40",
+    generation: 1,
+    reservationToken: "019fbb95-cd76-7920-93fa-e23ba755ee41",
+    workerId: "019fbb95-cd76-7920-93fa-e23ba755ee42",
+    workerEpoch: 1,
+    status: "reserved" as const,
+    reservedAt: "2026-08-20T12:00:00.000Z",
+    reservationExpiresAt: "2026-08-20T12:00:30.000Z",
+    request: {
+      id: "019fbb95-cd76-7920-93fa-e23ba755ee43",
+      jobId: "019fbb95-cd76-7920-93fa-e23ba755ee44",
+      mode: "logged" as const,
+      projectId: "019fbb95-cd76-7920-93fa-e23ba755ee45",
+      clipId: "019fbb95-cd76-7920-93fa-e23ba755ee46",
+      video: {
+        youtubeVideoId: "M7lc1UVf-VE",
+        canonicalUrl: "https://www.youtube.com/watch?v=M7lc1UVf-VE",
+        title: "Fixture",
+      },
+      selection: {
+        trackId: "019fbb95-cd76-7920-93fa-e23ba755ee47",
+        transcriptVersion: 1,
+        firstSegmentId: "019fbb95-cd76-7920-93fa-e23ba755ee48",
+        lastSegmentId: "019fbb95-cd76-7920-93fa-e23ba755ee49",
+        transcriptStartMs: 0,
+        transcriptEndMs: 1_000,
+        exportStartMs: 0,
+        exportEndMs: 1_000,
+        text: "Fixture",
+        timingPrecision: "cue" as const,
+      },
+      sourceLanguageClass: "confirmed_english" as const,
+      preset: { presetVersion: 1, name: "Editing MP4", settings },
+      resolvedSettingsSnapshot: {
+        schemaVersion: 1 as const,
+        resolutionKind: "catalog" as const,
+        context: "logged" as const,
+        base: "application_default" as const,
+        applicationDefaultVersion: 1 as const,
+        overrides: {},
+        overrideFields: [],
+        settings,
+        capability: {
+          profileId: "local-editing-renderer",
+          profileVersion: 3,
+          fingerprint: "a".repeat(64),
+          validation: "validated" as const,
+        },
+        resolutionFingerprint: "b".repeat(64),
+        resolvedAt: "2026-08-20T11:59:00.000Z",
+      },
+      state: "queued" as const,
+      createdAt: "2026-08-20T11:59:00.000Z",
+      updatedAt: "2026-08-20T11:59:00.000Z",
+    },
+  };
+}

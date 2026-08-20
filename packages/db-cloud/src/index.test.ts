@@ -47,6 +47,7 @@ describe("cloud migrations", () => {
       "0010_export_preset_catalogs",
       "0011_resolved_export_settings_snapshots",
       "0012_registered_export_workers",
+      "0013_logged_export_deliveries",
     ]);
     expect(await runCloudMigrations(database)).toEqual([]);
     const result = await database.query<{ table_name: string }>(
@@ -66,6 +67,17 @@ describe("cloud migrations", () => {
        )`,
     );
     expect(presetTables.rows).toHaveLength(5);
+    const deliveryConstraints = await database.query<{ definition: string }>(
+      `SELECT pg_get_constraintdef(oid) AS definition
+       FROM pg_constraint
+       WHERE conrelid = 'logged_export_deliveries'::regclass
+         AND contype = 'c'`,
+    );
+    expect(
+      deliveryConstraints.rows.map((row) => row.definition).join(" "),
+    ).toContain(
+      "accepted_at >= reserved_at) AND (accepted_at < reservation_expires_at)",
+    );
   });
 
   it("backfills immutable legacy request/job snapshots from the 0010 schema", async () => {
@@ -199,6 +211,72 @@ describe("cloud migrations", () => {
         [requestId],
       ),
     ).rejects.toThrow(/immutable/);
+  });
+
+  it("adds delivery reservations to a populated 0012 catalog without changing worker registrations", async () => {
+    const directory = mkdtempSync(
+      join(tmpdir(), "research-video-pglite-0012-"),
+    );
+    temporaryDirectories.add(directory);
+    const migrations = join(directory, "migrations");
+    mkdirSync(migrations);
+    for (const filename of readdirSync(cloudMigrationDirectory)) {
+      if (filename < "0013") {
+        copyFileSync(
+          resolve(cloudMigrationDirectory, filename),
+          join(migrations, filename),
+        );
+      }
+    }
+    const database = new PGlite();
+    databases.add(database);
+    await runCloudMigrations(database, migrations);
+    const userId = randomUUID();
+    const workerId = randomUUID();
+    const at = "2026-08-20T12:00:00.000Z";
+    await database.query(
+      `INSERT INTO users
+         (id, external_subject, display_name, preferred_language, created_at, updated_at)
+       VALUES ($1, 'fixture:populated-worker', 'Populated worker', 'en', $2, $2)`,
+      [userId, at],
+    );
+    await database.query(
+      `INSERT INTO registered_export_workers
+         (id, owner_user_id, epoch, capability_json,
+          installed_capabilities_json, advertisement_fingerprint,
+          heartbeat_at, expires_at, created_at, updated_at)
+       VALUES ($1, $2, 7, '{}'::jsonb, '{}'::jsonb, $3, $4, $5, $4, $4)`,
+      [workerId, userId, "a".repeat(64), at, "2026-08-20T12:01:00.000Z"],
+    );
+    const before = (
+      await database.query(
+        "SELECT * FROM registered_export_workers WHERE id = $1",
+        [workerId],
+      )
+    ).rows[0];
+    copyFileSync(
+      resolve(cloudMigrationDirectory, "0013_logged_export_deliveries.sql"),
+      join(migrations, "0013_logged_export_deliveries.sql"),
+    );
+    expect(await runCloudMigrations(database, migrations)).toEqual([
+      "0013_logged_export_deliveries",
+    ]);
+    expect(
+      (
+        await database.query(
+          "SELECT * FROM registered_export_workers WHERE id = $1",
+          [workerId],
+        )
+      ).rows[0],
+    ).toEqual(before);
+    expect(
+      (
+        await database.query<{ table_name: string }>(
+          `SELECT table_name FROM information_schema.tables
+           WHERE table_name = 'logged_export_deliveries'`,
+        )
+      ).rows,
+    ).toHaveLength(1);
   });
 
   it("enforces preset ownership, scope names, fixed defaults, and immutable revisions", async () => {

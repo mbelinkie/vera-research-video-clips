@@ -1,6 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { HealthResponseSchema } from "@research-video/contracts";
+import {
+  HealthResponseSchema,
+  type LoggedExportDelivery,
+} from "@research-video/contracts";
 import {
   currentExportWorkerAdvertisement,
   resolveExportSettings,
@@ -259,6 +262,150 @@ describe("local agent", () => {
     expect(prepareRegistration).not.toHaveBeenCalled();
     expect(registerExportWorker).not.toHaveBeenCalled();
   });
+
+  it("imports pending, cloud-accepts, then activates one logged delivery", async () => {
+    const delivery = loggedDeliveryFixture();
+    const accepted = {
+      ...delivery,
+      status: "accepted" as const,
+      acceptedAt: "2026-08-20T12:00:05.000Z",
+    };
+    const identity = {
+      workerId: delivery.workerId,
+      epoch: delivery.workerEpoch,
+      advertisementFingerprint: "a".repeat(64),
+      createdAt: delivery.reservedAt,
+      updatedAt: delivery.reservedAt,
+    };
+    const importPending = vi.fn(() => ({ ok: true }) as never);
+    const activate = vi.fn(() => ({ ok: true }) as never);
+    const app = createLocalAgent({
+      workerIdentity: {
+        get: () => identity,
+        prepareRegistration: () => identity,
+      },
+      getPendingLoggedDelivery: () => undefined,
+      claimLoggedExportDelivery: vi.fn(async () => ({ delivery })),
+      importLoggedDeliveryPending: importPending,
+      acceptLoggedExportDelivery: vi.fn(async () => accepted),
+      activateLoggedDelivery: activate,
+      rejectPendingLoggedDelivery: vi.fn(),
+    });
+    apps.add(app);
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/export-deliveries/claim",
+      headers: { authorization: "Bearer fixture" },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      delivery: { status: "accepted", request: { mode: "logged" } },
+    });
+    expect(importPending).toHaveBeenCalledWith(delivery);
+    expect(activate).toHaveBeenCalledWith(accepted);
+  });
+
+  it("recovers a lost acceptance response from local pending provenance before claiming new work", async () => {
+    const pending = loggedDeliveryFixture();
+    const accepted = {
+      ...pending,
+      status: "accepted" as const,
+      acceptedAt: "2026-08-20T12:00:05.000Z",
+    };
+    const claim = vi.fn(async () => ({}));
+    const activate = vi.fn(() => ({ ok: true }) as never);
+    const app = createLocalAgent({
+      workerIdentity: {
+        get: () => ({
+          workerId: pending.workerId,
+          epoch: pending.workerEpoch,
+          advertisementFingerprint: "a".repeat(64),
+          createdAt: pending.reservedAt,
+          updatedAt: pending.reservedAt,
+        }),
+        prepareRegistration: () => {
+          throw new Error("not used");
+        },
+      },
+      getPendingLoggedDelivery: () => pending,
+      claimLoggedExportDelivery: claim,
+      importLoggedDeliveryPending: vi.fn(() => ({ ok: true }) as never),
+      acceptLoggedExportDelivery: vi.fn(async () => accepted),
+      activateLoggedDelivery: activate,
+      rejectPendingLoggedDelivery: vi.fn(),
+    });
+    apps.add(app);
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: "/api/export-deliveries/claim",
+          headers: { authorization: "Bearer fixture" },
+        })
+      ).json(),
+    ).toMatchObject({ delivery: { status: "accepted" } });
+    expect(claim).not.toHaveBeenCalled();
+    expect(activate).toHaveBeenCalledWith(accepted);
+  });
+
+  it("removes a stale pending generation before importing its authoritative redelivery", async () => {
+    const stale = loggedDeliveryFixture();
+    const replacement = {
+      ...stale,
+      generation: 2,
+      reservationToken: "019fbb95-cd76-7920-93fa-e23ba755ee19",
+      reservedAt: "2026-08-20T12:00:31.000Z",
+      reservationExpiresAt: "2026-08-20T12:01:01.000Z",
+    };
+    const accepted = {
+      ...replacement,
+      status: "accepted" as const,
+      acceptedAt: "2026-08-20T12:00:35.000Z",
+    };
+    const staleConflict = Object.assign(new Error("stale"), {
+      statusCode: 409,
+    });
+    const rejectPending = vi.fn();
+    const importPending = vi.fn(() => ({ ok: true }) as never);
+    const accept = vi
+      .fn()
+      .mockRejectedValueOnce(staleConflict)
+      .mockResolvedValueOnce(accepted);
+    const app = createLocalAgent({
+      workerIdentity: {
+        get: () => ({
+          workerId: stale.workerId,
+          epoch: stale.workerEpoch,
+          advertisementFingerprint: "a".repeat(64),
+          createdAt: stale.reservedAt,
+          updatedAt: stale.reservedAt,
+        }),
+        prepareRegistration: () => {
+          throw new Error("not used");
+        },
+      },
+      getPendingLoggedDelivery: () => stale,
+      claimLoggedExportDelivery: vi.fn(async () => ({
+        delivery: replacement,
+      })),
+      importLoggedDeliveryPending: importPending,
+      acceptLoggedExportDelivery: accept,
+      activateLoggedDelivery: vi.fn(() => ({ ok: true }) as never),
+      rejectPendingLoggedDelivery: rejectPending,
+    });
+    apps.add(app);
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/export-deliveries/claim",
+      headers: { authorization: "Bearer fixture" },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(rejectPending).toHaveBeenCalledWith(stale);
+    expect(importPending).toHaveBeenCalledWith(replacement);
+    expect(response.json()).toMatchObject({
+      delivery: { generation: 2, status: "accepted" },
+    });
+  });
 });
 
 function exportOnlyFixture() {
@@ -298,6 +445,44 @@ function exportOnlyFixture() {
         omitSubtitleFilesForConfirmedEnglish: false,
         embedEnglishSubtitleTrack: false,
       },
+    },
+  };
+}
+
+function loggedDeliveryFixture(): LoggedExportDelivery {
+  const base = exportOnlyFixture();
+  const resolved = resolveExportSettings({
+    context: "logged",
+    sourceLanguageClass: "confirmed_english",
+    resolvedAt: "2026-08-20T11:59:00.000Z",
+  }).snapshot;
+  return {
+    deliveryId: "019fbb95-cd76-7920-93fa-e23ba755ee11",
+    generation: 1,
+    reservationToken: "019fbb95-cd76-7920-93fa-e23ba755ee12",
+    workerId: "019fbb95-cd76-7920-93fa-e23ba755ee13",
+    workerEpoch: 1,
+    status: "reserved",
+    reservedAt: "2026-08-20T12:00:00.000Z",
+    reservationExpiresAt: "2026-08-20T12:00:30.000Z",
+    request: {
+      id: "019fbb95-cd76-7920-93fa-e23ba755ee14",
+      jobId: "019fbb95-cd76-7920-93fa-e23ba755ee15",
+      mode: "logged",
+      projectId: "019fbb95-cd76-7920-93fa-e23ba755ee16",
+      clipId: "019fbb95-cd76-7920-93fa-e23ba755ee17",
+      video: base.video,
+      selection: base.selection,
+      sourceLanguageClass: base.sourceLanguageClass,
+      preset: {
+        presetVersion: 1,
+        name: "Editing MP4",
+        settings: resolved.settings,
+      },
+      resolvedSettingsSnapshot: resolved,
+      state: "queued",
+      createdAt: "2026-08-20T11:59:00.000Z",
+      updatedAt: "2026-08-20T11:59:00.000Z",
     },
   };
 }

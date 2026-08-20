@@ -4,6 +4,7 @@ import type { PGlite } from "@electric-sql/pglite";
 import { AuthorizationError, requirePermission } from "@research-video/auth";
 import {
   ActiveTranscriptBundleSchema,
+  AcceptLoggedExportDeliveryRequestSchema,
   BatchPreflightSummarySchema,
   ClaimedTranscriptionJobSchema,
   ClipCandidateSchema,
@@ -17,6 +18,9 @@ import {
   RequestDerivedTranslationSchema,
   CreateTranscriptionBatchResponseSchema,
   ExportRequestSchema,
+  ClaimLoggedExportDeliveryRequestSchema,
+  ClaimLoggedExportDeliveryResponseSchema,
+  LoggedExportDeliverySchema,
   ExportSettingsSchema,
   ExportWorkerCompatibilityRequestSchema,
   HeartbeatExportWorkerRequestSchema,
@@ -42,6 +46,7 @@ import {
   languagesEquivalent,
   primaryLanguage,
   type ActiveTranscriptBundle,
+  type AcceptLoggedExportDeliveryRequest,
   type AuthenticatedActor,
   type BatchOptions,
   type BatchPreflightItem,
@@ -49,6 +54,8 @@ import {
   type ClipCandidate,
   type ClipLanguageEvidence,
   type CreateClipCandidateRequest,
+  type ClaimLoggedExportDeliveryRequest,
+  type ClaimLoggedExportDeliveryResponse,
   type CreateClipExportRequest,
   type CreateTranscriptionBatchResponse,
   type DerivedTranslation,
@@ -66,6 +73,7 @@ import {
   type HeartbeatExportWorkerRequest,
   type RegisterExportWorkerRequest,
   type RegisteredExportWorker,
+  type LoggedExportDelivery,
   type RevokeExportWorkerRequest,
   type ExportSettingsPreviewRequest,
   type PersonalExportPresetCatalog,
@@ -183,6 +191,7 @@ export type ProjectVideoTranscriptState = {
 type DbRow = Record<string, unknown>;
 
 export const ExportWorkerHeartbeatTtlMs = 60_000;
+export const LoggedExportDeliveryReservationTtlMs = 30_000;
 
 const iso = (value: unknown) =>
   value instanceof Date ? value.toISOString() : String(value);
@@ -193,6 +202,13 @@ const sha256 = (bytes: Uint8Array) =>
 const clipCandidateSelect = "SELECT c.* FROM clip_candidates c";
 const loggedExportRequestSelect = `SELECT er.*, j.state
  FROM export_requests er
+ JOIN jobs j ON j.id = er.job_id`;
+const loggedExportDeliverySelect = `SELECT
+   d.id AS delivery_id, d.generation AS delivery_generation,
+   d.reservation_token, d.worker_id, d.worker_epoch, d.reserved_at,
+   d.reservation_expires_at, d.accepted_at, er.*, j.state
+ FROM logged_export_deliveries d
+ JOIN export_requests er ON er.id = d.export_request_id
  JOIN jobs j ON j.id = er.job_id`;
 
 export class SharedProjectCatalog {
@@ -385,6 +401,242 @@ export class SharedProjectCatalog {
         "Worker revocation is stale, already revoked, or not owned by this actor.",
       );
     }
+  }
+
+  async claimLoggedExportDelivery(
+    actor: AuthenticatedActor,
+    input: ClaimLoggedExportDeliveryRequest,
+  ): Promise<ClaimLoggedExportDeliveryResponse> {
+    await this.requireRegistered(actor);
+    const parsed = ClaimLoggedExportDeliveryRequestSchema.parse(input);
+    const now = this.now();
+    const nowIso = now.toISOString();
+    const expiresAt = new Date(
+      now.getTime() + LoggedExportDeliveryReservationTtlMs,
+    ).toISOString();
+    let claimed: DbRow | undefined;
+
+    await this.transaction(async () => {
+      const workerResult = await this.database.query<DbRow>(
+        `SELECT * FROM registered_export_workers
+         WHERE id = $1
+         FOR UPDATE`,
+        [parsed.workerId],
+      );
+      const workerRow = workerResult.rows[0];
+      if (workerRow && String(workerRow.owner_user_id) !== actor.userId) {
+        throw new AuthorizationError(
+          "This worker identity belongs to another user.",
+        );
+      }
+      if (
+        !workerRow ||
+        Number(workerRow.epoch) !== parsed.workerEpoch ||
+        workerRow.revoked_at ||
+        new Date(iso(workerRow.expires_at)).getTime() <= now.getTime()
+      ) {
+        throw new CatalogConflictError(
+          "Worker registration is missing, stale, expired, or revoked.",
+        );
+      }
+      const worker = mapRegisteredExportWorker(workerRow);
+
+      const replay = await this.database.query<DbRow>(
+        `${loggedExportDeliverySelect}
+         JOIN project_members delivery_members
+           ON delivery_members.project_id = er.project_id
+          AND delivery_members.user_id = $1
+         WHERE d.worker_id = $2 AND d.worker_epoch = $3
+           AND d.accepted_at IS NULL AND d.reservation_expires_at > $4
+         ORDER BY d.reserved_at, d.id
+         LIMIT 1
+         FOR UPDATE OF d SKIP LOCKED`,
+        [actor.userId, parsed.workerId, parsed.workerEpoch, nowIso],
+      );
+      if (replay.rows[0]) {
+        claimed = replay.rows[0];
+        return;
+      }
+
+      const candidates = await this.database.query<DbRow>(
+        `${loggedExportRequestSelect}
+         JOIN project_members claim_members
+           ON claim_members.project_id = er.project_id
+          AND claim_members.user_id = $1
+         LEFT JOIN logged_export_deliveries existing_delivery
+           ON existing_delivery.export_request_id = er.id
+         WHERE j.state = 'queued'
+           AND (
+             existing_delivery.id IS NULL OR
+             (existing_delivery.accepted_at IS NULL
+              AND existing_delivery.reservation_expires_at <= $2)
+           )
+           AND er.resolved_settings_snapshot IS NOT NULL
+           AND er.resolved_settings_snapshot->'capability' = $3::jsonb
+           AND EXISTS (
+             SELECT 1
+             FROM jsonb_array_elements_text(
+               $4::jsonb->'availableRendererIds'
+             ) AS available(renderer_id)
+             WHERE available.renderer_id = CASE
+               WHEN er.resolved_settings_snapshot->'settings'->>'container' = 'mp4'
+                AND er.resolved_settings_snapshot->'settings'->>'videoCodec' = 'h264'
+                AND er.resolved_settings_snapshot->'settings'->>'audioCodec' = 'aac'
+                 THEN 'h264_mp4'
+               WHEN er.resolved_settings_snapshot->'settings'->>'container' = 'mkv'
+                AND er.resolved_settings_snapshot->'settings'->>'videoCodec' = 'hevc'
+                AND er.resolved_settings_snapshot->'settings'->>'audioCodec' = 'aac'
+                 THEN 'hevc_mkv'
+               WHEN er.resolved_settings_snapshot->'settings'->>'container' = 'mov'
+                AND er.resolved_settings_snapshot->'settings'->>'videoCodec' = 'prores'
+                AND er.resolved_settings_snapshot->'settings'->>'audioCodec' = 'pcm_s16le'
+                 THEN 'prores_mov'
+               ELSE NULL
+             END
+           )
+         ORDER BY er.created_at, er.id
+         LIMIT 1
+         FOR UPDATE OF er SKIP LOCKED`,
+        [
+          actor.userId,
+          nowIso,
+          JSON.stringify(worker.capability),
+          JSON.stringify(worker.installedCapabilities),
+        ],
+      );
+      const candidate = candidates.rows[0];
+      if (!candidate) return;
+
+      const priorDelivery = await this.database.query<{ id: string }>(
+        "SELECT id FROM logged_export_deliveries WHERE export_request_id = $1",
+        [candidate.id],
+      );
+      const deliveryId = priorDelivery.rows[0]?.id ?? randomUUID();
+      const reservationToken = randomUUID();
+      const saved = await this.database.query<DbRow>(
+        `INSERT INTO logged_export_deliveries
+           (id, export_request_id, generation, reservation_token, worker_id,
+            worker_epoch, reserved_at, reservation_expires_at, accepted_at,
+            created_at, updated_at)
+         VALUES ($1, $2, 1, $3, $4, $5, $6, $7, NULL, $6, $6)
+         ON CONFLICT (export_request_id) DO UPDATE SET
+           generation = logged_export_deliveries.generation + 1,
+           reservation_token = EXCLUDED.reservation_token,
+           worker_id = EXCLUDED.worker_id,
+           worker_epoch = EXCLUDED.worker_epoch,
+           reserved_at = EXCLUDED.reserved_at,
+           reservation_expires_at = EXCLUDED.reservation_expires_at,
+           accepted_at = NULL,
+           updated_at = EXCLUDED.updated_at
+         WHERE logged_export_deliveries.accepted_at IS NULL
+           AND logged_export_deliveries.reservation_expires_at <= $6
+         RETURNING id`,
+        [
+          deliveryId,
+          candidate.id,
+          reservationToken,
+          parsed.workerId,
+          parsed.workerEpoch,
+          nowIso,
+          expiresAt,
+        ],
+      );
+      if (!saved.rows[0]) return;
+      const result = await this.database.query<DbRow>(
+        `${loggedExportDeliverySelect} WHERE d.id = $1`,
+        [saved.rows[0].id],
+      );
+      claimed = result.rows[0];
+    });
+
+    return ClaimLoggedExportDeliveryResponseSchema.parse(
+      claimed ? { delivery: mapLoggedExportDelivery(claimed) } : {},
+    );
+  }
+
+  async acceptLoggedExportDelivery(
+    actor: AuthenticatedActor,
+    input: AcceptLoggedExportDeliveryRequest,
+  ): Promise<LoggedExportDelivery> {
+    await this.requireRegistered(actor);
+    const parsed = AcceptLoggedExportDeliveryRequestSchema.parse(input);
+    const now = this.now().toISOString();
+    let accepted: DbRow | undefined;
+
+    await this.transaction(async () => {
+      const worker = await this.database.query<DbRow>(
+        `SELECT * FROM registered_export_workers WHERE id = $1 FOR UPDATE`,
+        [parsed.workerId],
+      );
+      const workerRow = worker.rows[0];
+      if (workerRow && String(workerRow.owner_user_id) !== actor.userId) {
+        throw new AuthorizationError(
+          "This worker identity belongs to another user.",
+        );
+      }
+      if (
+        !workerRow ||
+        Number(workerRow.epoch) !== parsed.workerEpoch ||
+        workerRow.revoked_at ||
+        new Date(iso(workerRow.expires_at)).getTime() <= new Date(now).getTime()
+      ) {
+        throw new CatalogConflictError(
+          "Worker registration is missing, stale, expired, or revoked.",
+        );
+      }
+
+      const current = await this.database.query<DbRow>(
+        `${loggedExportDeliverySelect}
+         JOIN project_members delivery_members
+           ON delivery_members.project_id = er.project_id
+          AND delivery_members.user_id = $1
+         WHERE d.id = $2 AND d.worker_id = $3 AND d.worker_epoch = $4
+           AND d.generation = $5 AND d.reservation_token = $6
+         FOR UPDATE OF d`,
+        [
+          actor.userId,
+          parsed.deliveryId,
+          parsed.workerId,
+          parsed.workerEpoch,
+          parsed.generation,
+          parsed.reservationToken,
+        ],
+      );
+      const row = current.rows[0];
+      if (!row) {
+        throw new CatalogConflictError(
+          "Delivery reservation is stale, reassigned, or unauthorized.",
+        );
+      }
+      if (row.accepted_at) {
+        accepted = row;
+        return;
+      }
+      if (
+        new Date(iso(row.reservation_expires_at)).getTime() <=
+        new Date(now).getTime()
+      ) {
+        throw new CatalogConflictError(
+          "Delivery reservation expired before acceptance.",
+        );
+      }
+      await this.database.query(
+        `UPDATE logged_export_deliveries
+         SET accepted_at = $1, updated_at = $1
+         WHERE id = $2 AND generation = $3 AND reservation_token = $4
+           AND accepted_at IS NULL AND reservation_expires_at > $1`,
+        [now, parsed.deliveryId, parsed.generation, parsed.reservationToken],
+      );
+      const result = await this.database.query<DbRow>(
+        `${loggedExportDeliverySelect} WHERE d.id = $1`,
+        [parsed.deliveryId],
+      );
+      accepted = result.rows[0];
+    });
+    if (!accepted) {
+      throw new CatalogConflictError("Delivery acceptance did not persist.");
+    }
+    return mapLoggedExportDelivery(accepted);
   }
 
   async compatibleExportWorkerAvailability(
@@ -3650,6 +3902,21 @@ function mapRegisteredExportWorker(row: DbRow): RegisteredExportWorker {
     advertisementFingerprint: row.advertisement_fingerprint,
     heartbeatAt: iso(row.heartbeat_at),
     expiresAt: iso(row.expires_at),
+  });
+}
+
+function mapLoggedExportDelivery(row: DbRow): LoggedExportDelivery {
+  return LoggedExportDeliverySchema.parse({
+    deliveryId: row.delivery_id,
+    generation: Number(row.delivery_generation),
+    reservationToken: row.reservation_token,
+    workerId: row.worker_id,
+    workerEpoch: Number(row.worker_epoch),
+    status: row.accepted_at ? "accepted" : "reserved",
+    reservedAt: iso(row.reserved_at),
+    reservationExpiresAt: iso(row.reservation_expires_at),
+    ...(row.accepted_at ? { acceptedAt: iso(row.accepted_at) } : {}),
+    request: mapLoggedExportRequest(row),
   });
 }
 

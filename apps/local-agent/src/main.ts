@@ -4,6 +4,8 @@ import { join } from "node:path";
 import { loadConfig } from "@research-video/config";
 import {
   ExportSettingsPreviewSchema,
+  ClaimLoggedExportDeliveryResponseSchema,
+  LoggedExportDeliverySchema,
   RegisteredExportWorkerSchema,
 } from "@research-video/contracts";
 import {
@@ -57,6 +59,17 @@ const app = createLocalAgent({
       request,
       authorization,
     ),
+  claimLoggedExportDelivery: async ({ request, authorization }) =>
+    callCloudLoggedExportDeliveryClaim(request, authorization),
+  acceptLoggedExportDelivery: async ({ request, authorization }) =>
+    callCloudLoggedExportDeliveryAccept(request, authorization),
+  importLoggedDeliveryPending: (delivery) =>
+    exportQueue.importLoggedDeliveryPending(delivery),
+  activateLoggedDelivery: (delivery) =>
+    exportQueue.activateLoggedDelivery(delivery),
+  rejectPendingLoggedDelivery: (delivery) =>
+    exportQueue.rejectPendingLoggedDelivery(delivery),
+  getPendingLoggedDelivery: () => exportQueue.getPendingLoggedDelivery(),
   createExportOnly: (input, snapshot) =>
     exportQueue.createExportOnly(input, snapshot),
   findExportOnlyByIdempotencyKey: (idempotencyKey) =>
@@ -131,4 +144,56 @@ async function callCloudExportWorker(
     );
   }
   return RegisteredExportWorkerSchema.parse(payload);
+}
+
+async function callCloudLoggedExportDeliveryClaim(
+  request: unknown,
+  authorization: string,
+) {
+  const payload = await callCloudDelivery(
+    "/api/export-deliveries/claim",
+    request,
+    authorization,
+  );
+  return ClaimLoggedExportDeliveryResponseSchema.parse(payload);
+}
+
+async function callCloudLoggedExportDeliveryAccept(
+  request: unknown,
+  authorization: string,
+) {
+  const payload = await callCloudDelivery(
+    "/api/export-deliveries/accept",
+    request,
+    authorization,
+  );
+  return LoggedExportDeliverySchema.parse(payload);
+}
+
+async function callCloudDelivery(
+  path: string,
+  request: unknown,
+  authorization: string,
+) {
+  const response = await fetch(`${cloudApiUrl}${path}`, {
+    method: "POST",
+    headers: { authorization, "content-type": "application/json" },
+    body: JSON.stringify(request),
+  });
+  const payload = await response.json().catch(() => undefined);
+  if (!response.ok) {
+    const remote = payload as
+      { error?: { code?: string; message?: string } } | undefined;
+    throw Object.assign(
+      new Error(
+        remote?.error?.message ??
+          `Cloud export delivery failed with HTTP ${response.status}.`,
+      ),
+      {
+        statusCode: response.status,
+        code: remote?.error?.code ?? "export_delivery_unavailable",
+      },
+    );
+  }
+  return payload;
 }

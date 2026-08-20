@@ -8,6 +8,7 @@ import {
   CreateExportOnlyRequestSchema,
   ExportObservedMediaPropertiesSchema,
   ExportRequestSchema,
+  LoggedExportDeliverySchema,
   NormalizedTranscriptSchema,
   ResolvedExportSettingsSnapshotSchema,
   languagesEquivalent,
@@ -15,12 +16,14 @@ import {
   type CreateExportOnlyRequest,
   type DerivedTranslationIdentity,
   type ExportRequest,
+  type LoggedExportDelivery,
   type ExportObservedMediaProperties,
   type ResolvedExportSettingsSnapshot,
   type NormalizedTranscript,
 } from "@research-video/contracts";
 import {
   resolveExportSettings,
+  canonicalJson,
   resolvedPresetForCompatibility,
   sha256Fingerprint,
 } from "@research-video/export-settings";
@@ -221,6 +224,208 @@ export class LocalExportQueue {
     return this.get(requestId)!;
   }
 
+  importLoggedDeliveryPending(input: LoggedExportDelivery): ExportRequest {
+    const delivery = LoggedExportDeliverySchema.parse(input);
+    const request = delivery.request;
+    const physicalMode = "export_only";
+    this.database.exec("BEGIN IMMEDIATE;");
+    try {
+      const existing = this.database
+        .prepare(
+          `${localExportRequestSelect}
+           WHERE er.id = ? OR er.cloud_delivery_id = ?`,
+        )
+        .get(request.id, delivery.deliveryId) as
+        Record<string, unknown> | undefined;
+      if (existing) {
+        try {
+          this.assertExactLoggedDelivery(existing, delivery);
+          const replay = this.mapRequest(existing);
+          this.database.exec("COMMIT;");
+          return replay;
+        } catch (error) {
+          if (
+            !(error instanceof LocalLoggedExportDeliveryConflictError) ||
+            String(existing.cloud_delivery_state) !== "pending_acceptance" ||
+            String(existing.cloud_delivery_id) !== delivery.deliveryId ||
+            delivery.generation <= Number(existing.cloud_delivery_generation) ||
+            !this.sameImmutableLoggedRequest(existing, delivery)
+          ) {
+            throw error;
+          }
+          this.deletePendingLoggedRequestRows(
+            String(existing.id),
+            String(existing.job_id),
+          );
+        }
+      }
+
+      this.database
+        .prepare(
+          `INSERT INTO jobs
+             (id, project_id, kind, state, idempotency_key, attempt,
+              payload_json, created_at, updated_at)
+           VALUES (?, NULL, 'export', 'claimed', ?, 0, ?, ?, ?)`,
+        )
+        .run(
+          request.jobId,
+          `logged-delivery:${request.id}`,
+          JSON.stringify({
+            exportRequestId: request.id,
+            mode: "logged",
+            projectId: request.projectId,
+            clipId: request.clipId,
+            video: request.video,
+            selection: request.selection,
+            sourceLanguageClass: request.sourceLanguageClass,
+            ...(request.subtitleTracks
+              ? { subtitleTracks: request.subtitleTracks }
+              : {}),
+            preset: request.preset,
+            resolvedSettingsSnapshot: request.resolvedSettingsSnapshot,
+          }),
+          request.createdAt,
+          request.updatedAt,
+        );
+      this.database
+        .prepare(
+          `INSERT INTO export_requests
+             (id, job_id, mode, video_snapshot_json, selection_snapshot_json,
+              source_language_class, preset_snapshot_json,
+              resolved_settings_snapshot_json, subtitle_tracks_snapshot_json,
+              cloud_project_id, cloud_clip_id, cloud_delivery_id,
+              cloud_delivery_generation, cloud_reservation_token,
+              cloud_worker_id, cloud_worker_epoch, cloud_reserved_at,
+              cloud_reservation_expires_at, cloud_delivery_state,
+              created_at, updated_at)
+           VALUES ($id, $jobId, $mode, $video, $selection, $sourceLanguage,
+                   $preset, $resolved, $subtitleTracks, $projectId, $clipId,
+                   $deliveryId, $generation, $reservationToken, $workerId,
+                   $workerEpoch, $reservedAt, $reservationExpiresAt,
+                   'pending_acceptance', $createdAt, $updatedAt)`,
+        )
+        .run({
+          $id: request.id,
+          $jobId: request.jobId,
+          $mode: physicalMode,
+          $video: JSON.stringify(request.video),
+          $selection: JSON.stringify(request.selection),
+          $sourceLanguage: request.sourceLanguageClass,
+          $preset: JSON.stringify(request.preset),
+          $resolved: JSON.stringify(request.resolvedSettingsSnapshot),
+          $subtitleTracks: request.subtitleTracks
+            ? JSON.stringify(request.subtitleTracks)
+            : null,
+          $projectId: request.projectId!,
+          $clipId: request.clipId!,
+          $deliveryId: delivery.deliveryId,
+          $generation: delivery.generation,
+          $reservationToken: delivery.reservationToken,
+          $workerId: delivery.workerId,
+          $workerEpoch: delivery.workerEpoch,
+          $reservedAt: delivery.reservedAt,
+          $reservationExpiresAt: delivery.reservationExpiresAt,
+          $createdAt: request.createdAt,
+          $updatedAt: request.updatedAt,
+        });
+      this.database.exec("COMMIT;");
+    } catch (error) {
+      this.database.exec("ROLLBACK;");
+      throw error;
+    }
+    return this.get(request.id)!;
+  }
+
+  activateLoggedDelivery(input: LoggedExportDelivery): ExportRequest {
+    const delivery = LoggedExportDeliverySchema.parse(input);
+    if (delivery.status !== "accepted") {
+      throw new LocalLoggedExportDeliveryConflictError(
+        "Only a cloud-accepted delivery can become runnable locally.",
+      );
+    }
+    const acceptedAt = delivery.acceptedAt!;
+    const existing = this.database
+      .prepare(`${localExportRequestSelect} WHERE er.id = ?`)
+      .get(delivery.request.id) as Record<string, unknown> | undefined;
+    if (!existing) throw new LocalExportRequestNotFoundError();
+    this.assertExactLoggedDelivery(existing, delivery);
+    this.database.exec("BEGIN IMMEDIATE;");
+    try {
+      const activated = this.database
+        .prepare(
+          `UPDATE export_requests
+           SET cloud_delivery_state = 'accepted', updated_at = ?
+           WHERE id = ? AND cloud_delivery_state = 'pending_acceptance'
+             AND cloud_delivery_id = ? AND cloud_delivery_generation = ?
+             AND cloud_reservation_token = ?`,
+        )
+        .run(
+          acceptedAt,
+          delivery.request.id,
+          delivery.deliveryId,
+          delivery.generation,
+          delivery.reservationToken,
+        );
+      if (activated.changes === 1) {
+        this.database
+          .prepare(
+            `UPDATE jobs SET state = 'queued', updated_at = ?
+             WHERE id = ? AND state = 'claimed'`,
+          )
+          .run(acceptedAt, delivery.request.jobId);
+      } else if (String(existing.cloud_delivery_state) !== "accepted") {
+        throw new LocalLoggedExportDeliveryConflictError(
+          "The pending local delivery no longer matches the cloud acceptance.",
+        );
+      }
+      this.database.exec("COMMIT;");
+    } catch (error) {
+      this.database.exec("ROLLBACK;");
+      throw error;
+    }
+    return this.get(delivery.request.id)!;
+  }
+
+  rejectPendingLoggedDelivery(input: LoggedExportDelivery): void {
+    const delivery = LoggedExportDeliverySchema.parse(input);
+    const existing = this.database
+      .prepare(`${localExportRequestSelect} WHERE er.id = ?`)
+      .get(delivery.request.id) as Record<string, unknown> | undefined;
+    if (!existing) return;
+    this.assertExactLoggedDelivery(existing, delivery);
+    if (String(existing.cloud_delivery_state) === "accepted") {
+      throw new LocalLoggedExportDeliveryConflictError(
+        "An accepted local delivery cannot be rejected.",
+      );
+    }
+    this.removePendingLoggedRequest(
+      delivery.request.id,
+      delivery.request.jobId,
+    );
+  }
+
+  getPendingLoggedDelivery(): LoggedExportDelivery | undefined {
+    const row = this.database
+      .prepare(
+        `${localExportRequestSelect}
+         WHERE er.cloud_delivery_state = 'pending_acceptance'
+         ORDER BY er.created_at, er.id LIMIT 1`,
+      )
+      .get() as Record<string, unknown> | undefined;
+    if (!row) return undefined;
+    return LoggedExportDeliverySchema.parse({
+      deliveryId: row.cloud_delivery_id,
+      generation: Number(row.cloud_delivery_generation),
+      reservationToken: row.cloud_reservation_token,
+      workerId: row.cloud_worker_id,
+      workerEpoch: Number(row.cloud_worker_epoch),
+      status: "reserved",
+      reservedAt: row.cloud_reserved_at,
+      reservationExpiresAt: row.cloud_reservation_expires_at,
+      request: this.mapRequest(row),
+    });
+  }
+
   get(requestId: string): ExportRequest | undefined {
     const row = this.database
       .prepare(
@@ -276,6 +481,7 @@ export class LocalExportQueue {
         "export_already_complete",
       );
     }
+    this.assertExportDeliveryAccepted(requestId);
     const now = this.now().toISOString();
     const expiresAt = new Date(
       this.now().getTime() + 24 * 60 * 60 * 1_000,
@@ -306,6 +512,23 @@ export class LocalExportQueue {
       throw error;
     }
     return { request, attempt: nextAttempt };
+  }
+
+  assertExportDeliveryAccepted(requestId: string): void {
+    const request = this.get(requestId);
+    if (!request) throw new LocalExportRequestNotFoundError();
+    const deliveryState = this.database
+      .prepare("SELECT cloud_delivery_state FROM export_requests WHERE id = ?")
+      .get(requestId) as { cloud_delivery_state?: string | null } | undefined;
+    if (
+      request.mode === "logged" &&
+      deliveryState?.cloud_delivery_state !== "accepted"
+    ) {
+      throw new LocalExportLifecycleError(
+        "This logged export is pending authoritative cloud delivery acceptance.",
+        "logged_export_delivery_not_accepted",
+      );
+    }
   }
 
   recordSourceNotStartedFailure(
@@ -938,6 +1161,91 @@ export class LocalExportQueue {
     );
   }
 
+  private assertExactLoggedDelivery(
+    row: Record<string, unknown>,
+    delivery: LoggedExportDelivery,
+  ): void {
+    if (
+      !this.sameImmutableLoggedRequest(row, delivery) ||
+      String(row.cloud_delivery_id) !== delivery.deliveryId ||
+      Number(row.cloud_delivery_generation) !== delivery.generation ||
+      String(row.cloud_reservation_token) !== delivery.reservationToken ||
+      String(row.cloud_worker_id) !== delivery.workerId ||
+      Number(row.cloud_worker_epoch) !== delivery.workerEpoch ||
+      String(row.cloud_reserved_at) !== delivery.reservedAt ||
+      String(row.cloud_reservation_expires_at) !== delivery.reservationExpiresAt
+    ) {
+      throw new LocalLoggedExportDeliveryConflictError(
+        "The logged export delivery conflicts with an existing immutable local request.",
+      );
+    }
+  }
+
+  private sameImmutableLoggedRequest(
+    row: Record<string, unknown>,
+    delivery: LoggedExportDelivery,
+  ): boolean {
+    const existing = this.mapRequest(row);
+    const immutableExisting = {
+      id: existing.id,
+      jobId: existing.jobId,
+      mode: existing.mode,
+      projectId: existing.projectId,
+      clipId: existing.clipId,
+      video: existing.video,
+      selection: existing.selection,
+      sourceLanguageClass: existing.sourceLanguageClass,
+      subtitleTracks: existing.subtitleTracks,
+      preset: existing.preset,
+      resolvedSettingsSnapshot: existing.resolvedSettingsSnapshot,
+      createdAt: existing.createdAt,
+    };
+    const request = delivery.request;
+    const immutableIncoming = {
+      id: request.id,
+      jobId: request.jobId,
+      mode: request.mode,
+      projectId: request.projectId,
+      clipId: request.clipId,
+      video: request.video,
+      selection: request.selection,
+      sourceLanguageClass: request.sourceLanguageClass,
+      subtitleTracks: request.subtitleTracks,
+      preset: request.preset,
+      resolvedSettingsSnapshot: request.resolvedSettingsSnapshot,
+      createdAt: request.createdAt,
+    };
+    return (
+      canonicalJson(immutableExisting) === canonicalJson(immutableIncoming)
+    );
+  }
+
+  private removePendingLoggedRequest(requestId: string, jobId: string): void {
+    this.database.exec("BEGIN IMMEDIATE;");
+    try {
+      this.deletePendingLoggedRequestRows(requestId, jobId);
+      this.database.exec("COMMIT;");
+    } catch (error) {
+      this.database.exec("ROLLBACK;");
+      throw error;
+    }
+  }
+
+  private deletePendingLoggedRequestRows(requestId: string, jobId: string) {
+    this.database
+      .prepare(
+        `DELETE FROM export_requests
+         WHERE id = ? AND cloud_delivery_state = 'pending_acceptance'`,
+      )
+      .run(requestId);
+    this.database
+      .prepare(
+        `DELETE FROM jobs WHERE id = ?
+         AND NOT EXISTS (SELECT 1 FROM export_requests WHERE job_id = jobs.id)`,
+      )
+      .run(jobId);
+  }
+
   private markJobNeedsUserAction(
     jobId: string,
     code: string,
@@ -1020,6 +1328,15 @@ export class LocalExportRequestNotFoundError extends Error {
 
   constructor() {
     super("Export request not found.");
+  }
+}
+
+export class LocalLoggedExportDeliveryConflictError extends Error {
+  readonly code = "logged_export_delivery_conflict";
+  readonly statusCode = 409;
+
+  constructor(message: string) {
+    super(message);
   }
 }
 
@@ -1131,7 +1448,13 @@ function mapLocalExportRequest(
   return ExportRequestSchema.parse({
     id: row.id,
     jobId: row.job_id,
-    mode: row.mode,
+    mode: row.cloud_delivery_state ? "logged" : row.mode,
+    ...(row.cloud_delivery_state
+      ? {
+          projectId: row.cloud_project_id,
+          clipId: row.cloud_clip_id,
+        }
+      : {}),
     video: JSON.parse(String(row.video_snapshot_json)),
     selection: JSON.parse(String(row.selection_snapshot_json)),
     sourceLanguageClass: row.source_language_class,

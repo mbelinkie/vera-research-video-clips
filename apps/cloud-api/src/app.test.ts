@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 
 import { PGlite } from "@electric-sql/pglite";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { SharedProjectCatalog } from "@research-video/catalog";
 import { HealthResponseSchema } from "@research-video/contracts";
@@ -1873,5 +1873,71 @@ describe("registered export-worker API", () => {
         })
       ).statusCode,
     ).toBe(403);
+  });
+});
+
+describe("logged export delivery API", () => {
+  it("forwards the authenticated worker epoch and exact reservation generation/token", async () => {
+    const actor = {
+      userId: randomUUID(),
+      externalSubject: "fixture:delivery-api-owner",
+    };
+    const claimLoggedExportDelivery = vi.fn(async () => ({}));
+    const acceptLoggedExportDelivery = vi.fn(async () => ({ accepted: true }));
+    const catalog = {
+      claimLoggedExportDelivery,
+      acceptLoggedExportDelivery,
+    } as unknown as SharedProjectCatalog;
+    const app = createCloudApi({ catalog, authenticate: async () => actor });
+    apps.add(app);
+    const workerId = randomUUID();
+    const deliveryId = randomUUID();
+    const reservationToken = randomUUID();
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: "/api/export-deliveries/claim",
+          payload: { workerId, workerEpoch: 4 },
+        })
+      ).json(),
+    ).toEqual({});
+    expect(claimLoggedExportDelivery).toHaveBeenCalledWith(actor, {
+      workerId,
+      workerEpoch: 4,
+    });
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: "/api/export-deliveries/accept",
+          payload: {
+            workerId,
+            workerEpoch: 4,
+            deliveryId,
+            generation: 2,
+          },
+        })
+      ).statusCode,
+    ).toBe(400);
+    const accepted = await app.inject({
+      method: "POST",
+      url: "/api/export-deliveries/accept",
+      payload: {
+        workerId,
+        workerEpoch: 4,
+        deliveryId,
+        generation: 2,
+        reservationToken,
+      },
+    });
+    expect(accepted.json()).toEqual({ accepted: true });
+    expect(acceptLoggedExportDelivery).toHaveBeenCalledWith(actor, {
+      workerId,
+      workerEpoch: 4,
+      deliveryId,
+      generation: 2,
+      reservationToken,
+    });
   });
 });

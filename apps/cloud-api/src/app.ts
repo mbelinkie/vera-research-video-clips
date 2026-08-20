@@ -5,6 +5,7 @@ import { AuthenticationError } from "@research-video/auth";
 import type { SharedProjectCatalog } from "@research-video/catalog";
 import {
   AddProjectMemberRequestSchema,
+  AcceptLoggedExportDeliveryRequestSchema,
   AddProjectVideoRequestSchema,
   BatchPreflightRequestSchema,
   BatchPreflightResponseSchema,
@@ -15,6 +16,7 @@ import {
   ExportSettingsPreviewRequestSchema,
   CreateTranscriptionBatchRequestSchema,
   CreateProjectRequestSchema,
+  ClaimLoggedExportDeliveryRequestSchema,
   PublishDerivedTranslationRequestSchema,
   RequestDerivedTranslationSchema,
   TranscriptionBatchControlRequestSchema,
@@ -156,6 +158,20 @@ export function createCloudApi(
     );
     return reply.status(204).send();
   });
+
+  app.post("/api/export-deliveries/claim", async (request) =>
+    catalog.claimLoggedExportDelivery(
+      await authenticate(request),
+      ClaimLoggedExportDeliveryRequestSchema.parse(request.body),
+    ),
+  );
+
+  app.post("/api/export-deliveries/accept", async (request) =>
+    catalog.acceptLoggedExportDelivery(
+      await authenticate(request),
+      AcceptLoggedExportDeliveryRequestSchema.parse(request.body),
+    ),
+  );
 
   app.get("/api/session/profile", async (request) =>
     catalog.getCurrentUser(await authenticate(request)),

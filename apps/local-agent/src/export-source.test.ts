@@ -386,6 +386,67 @@ const fixtureSourceProvider = (contentSha256 = "e".repeat(64)) => ({
 });
 
 describe("LocalExportSourceProcessor", () => {
+  it("rejects a pending logged delivery before capability, transcript, or provider work", async () => {
+    const { root, database, queue, request } = fixtureQueue();
+    database.exec(
+      "DROP TRIGGER export_requests_cloud_delivery_state_forward_only;",
+    );
+    database.exec("DROP TRIGGER export_requests_cloud_delivery_immutable;");
+    database.exec("DROP TRIGGER export_requests_cloud_delivery_insert_only;");
+    database
+      .prepare(
+        `UPDATE export_requests SET
+           cloud_project_id = ?, cloud_clip_id = ?, cloud_delivery_id = ?,
+           cloud_delivery_generation = 1, cloud_reservation_token = ?,
+           cloud_worker_id = ?, cloud_worker_epoch = 1,
+           cloud_reserved_at = ?, cloud_reservation_expires_at = ?,
+           cloud_delivery_state = 'pending_acceptance'
+         WHERE id = ?`,
+      )
+      .run(
+        "019fbb95-cd76-7920-93fa-e23ba755ed01",
+        "019fbb95-cd76-7920-93fa-e23ba755ed02",
+        "019fbb95-cd76-7920-93fa-e23ba755ed03",
+        "019fbb95-cd76-7920-93fa-e23ba755ed04",
+        "019fbb95-cd76-7920-93fa-e23ba755ed05",
+        "2026-08-14T12:00:00.000Z",
+        "2026-08-14T12:00:30.000Z",
+        request.id,
+      );
+    database
+      .prepare("UPDATE jobs SET state = 'claimed' WHERE id = ?")
+      .run(request.jobId);
+    const acquireAuthorizedFullSource = vi.fn();
+    const discover = vi.fn();
+    const getEnglish = vi.spyOn(queue, "getVerifiedEnglishTranscript");
+    const processor = new LocalExportSourceProcessor(
+      queue,
+      { acquireAuthorizedFullSource },
+      fixtureInspector(),
+      fixtureRenderer(),
+      root,
+      fixtureThumbnailExtractor(),
+      fixtureThumbnailInspector(),
+      { discover },
+    );
+    await expect(
+      processor.process({
+        requestId: request.id,
+        authorizationConfirmed: true,
+      }),
+    ).rejects.toMatchObject({
+      code: "logged_export_delivery_not_accepted",
+    });
+    expect(discover).not.toHaveBeenCalled();
+    expect(getEnglish).not.toHaveBeenCalled();
+    expect(acquireAuthorizedFullSource).not.toHaveBeenCalled();
+    expect(queue.get(request.id)).toMatchObject({
+      mode: "logged",
+      state: "claimed",
+    });
+    database.close();
+  });
+
   it("rejects a changed resolved snapshot before transcript or provider work", async () => {
     const { root, database, queue, request } = fixtureQueue();
     const changed = structuredClone(

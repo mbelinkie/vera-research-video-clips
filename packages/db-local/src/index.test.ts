@@ -15,7 +15,11 @@ import { afterEach, describe, expect, it } from "vitest";
 import fixture from "../../../tests/fixtures/transcripts/english-cue.json" with { type: "json" };
 import multilingualFixture from "../../../tests/fixtures/transcripts/romanian-multilingual.json" with { type: "json" };
 import { normalizeTranscriptFixture } from "@research-video/transcript";
-import { sha256Fingerprint } from "@research-video/export-settings";
+import type { LoggedExportDelivery } from "@research-video/contracts";
+import {
+  resolveExportSettings,
+  sha256Fingerprint,
+} from "@research-video/export-settings";
 
 import {
   LocalExportQueue,
@@ -138,6 +142,7 @@ describe("local migrations", () => {
       "0016_resolved_export_settings_snapshots",
       "0017_alternative_render_conformance",
       "0018_registered_export_worker_identity",
+      "0019_logged_export_delivery_import",
     ]);
     expect(runLocalMigrations(database)).toEqual([]);
     expect(
@@ -448,6 +453,7 @@ describe("local migrations", () => {
       "0016_resolved_export_settings_snapshots",
       "0017_alternative_render_conformance",
       "0018_registered_export_worker_identity",
+      "0019_logged_export_delivery_import",
     ]);
     expect(
       database.prepare("SELECT * FROM export_final_artifacts").all(),
@@ -571,6 +577,7 @@ describe("local migrations", () => {
     expect(runLocalMigrations(database, localMigrationDirectory)).toEqual([
       "0017_alternative_render_conformance",
       "0018_registered_export_worker_identity",
+      "0019_logged_export_delivery_import",
     ]);
     expect(
       database
@@ -703,3 +710,279 @@ describe("durable local export-worker identity", () => {
     restartedDatabase.close();
   });
 });
+
+describe("logged export delivery import", () => {
+  it("keeps pending work non-runnable, imports once, and activates only the exact accepted generation", () => {
+    const directory = mkdtempSync(join(tmpdir(), "research-video-delivery-"));
+    temporaryDirectories.add(directory);
+    const database = openLocalDatabase(join(directory, "delivery.sqlite"));
+    runLocalMigrations(database);
+    const queue = new LocalExportQueue(database);
+    const delivery = fixtureLoggedDelivery();
+    const partialJobId = "019fbb95-cd76-7920-93fa-e23ba755ef21";
+    database
+      .prepare(
+        `INSERT INTO jobs
+           (id, kind, state, idempotency_key, attempt, payload_json,
+            created_at, updated_at)
+         VALUES (?, 'export', 'claimed', 'partial-cloud-provenance', 0, '{}', ?, ?)`,
+      )
+      .run(partialJobId, delivery.reservedAt, delivery.reservedAt);
+    expect(() =>
+      database
+        .prepare(
+          `INSERT INTO export_requests
+             (id, job_id, mode, video_snapshot_json, selection_snapshot_json,
+              source_language_class, preset_snapshot_json,
+              resolved_settings_snapshot_json, cloud_project_id,
+              created_at, updated_at)
+           VALUES ($id, $jobId, 'export_only', $video, $selection,
+                   'confirmed_english', $preset, $resolved, $projectId,
+                   $createdAt, $updatedAt)`,
+        )
+        .run({
+          $id: "019fbb95-cd76-7920-93fa-e23ba755ef22",
+          $jobId: partialJobId,
+          $video: JSON.stringify(delivery.request.video),
+          $selection: JSON.stringify(delivery.request.selection),
+          $preset: JSON.stringify(delivery.request.preset),
+          $resolved: JSON.stringify(delivery.request.resolvedSettingsSnapshot),
+          $projectId: delivery.request.projectId!,
+          $createdAt: delivery.request.createdAt,
+          $updatedAt: delivery.request.updatedAt,
+        }),
+    ).toThrow(/provenance must be complete/u);
+    database.prepare("DELETE FROM jobs WHERE id = ?").run(partialJobId);
+
+    const pending = queue.importLoggedDeliveryPending(delivery);
+    expect(pending).toMatchObject({
+      mode: "logged",
+      projectId: delivery.request.projectId,
+      clipId: delivery.request.clipId,
+      state: "claimed",
+    });
+    expect(queue.importLoggedDeliveryPending(delivery)).toEqual(pending);
+    expect(queue.list()).toHaveLength(1);
+    const payload = JSON.parse(
+      String(
+        (
+          database
+            .prepare("SELECT payload_json FROM jobs WHERE id = ?")
+            .get(delivery.request.jobId) as { payload_json: string }
+        ).payload_json,
+      ),
+    ) as Record<string, unknown>;
+    expect(payload).not.toHaveProperty("cloudDelivery");
+    expect(JSON.stringify(payload)).not.toContain(delivery.reservationToken);
+    expect(queue.getPendingLoggedDelivery()).toMatchObject({
+      reservationToken: delivery.reservationToken,
+    });
+    expect(() => queue.beginSourceAcquisition(pending.id)).toThrowError(
+      expect.objectContaining({ code: "logged_export_delivery_not_accepted" }),
+    );
+    expect(() =>
+      queue.importLoggedDeliveryPending({
+        ...delivery,
+        request: {
+          ...delivery.request,
+          video: { ...delivery.request.video, title: "Mutated title" },
+        },
+      }),
+    ).toThrowError(
+      expect.objectContaining({ code: "logged_export_delivery_conflict" }),
+    );
+    const aliasedDelivery: LoggedExportDelivery = {
+      ...delivery,
+      generation: 2,
+      reservationToken: "019fbb95-cd76-7920-93fa-e23ba755ef23",
+      request: {
+        ...delivery.request,
+        id: "019fbb95-cd76-7920-93fa-e23ba755ef24",
+        jobId: "019fbb95-cd76-7920-93fa-e23ba755ef25",
+        video: { ...delivery.request.video, title: "Aliased request" },
+      },
+    };
+    expect(() =>
+      queue.importLoggedDeliveryPending(aliasedDelivery),
+    ).toThrowError(
+      expect.objectContaining({ code: "logged_export_delivery_conflict" }),
+    );
+    expect(queue.get(aliasedDelivery.request.id)).toBeUndefined();
+    expect(queue.list()).toHaveLength(1);
+    expect(
+      database.prepare("SELECT count(*) AS count FROM jobs").get(),
+    ).toEqual({ count: 1 });
+
+    const accepted: LoggedExportDelivery = {
+      ...delivery,
+      status: "accepted",
+      acceptedAt: "2026-08-20T12:00:05.000Z",
+    };
+    expect(queue.activateLoggedDelivery(accepted)).toMatchObject({
+      mode: "logged",
+      state: "queued",
+      projectId: delivery.request.projectId,
+      clipId: delivery.request.clipId,
+    });
+    expect(queue.beginSourceAcquisition(pending.id).attempt).toBe(1);
+    database.close();
+  });
+
+  it("replaces an expired pending generation and removes a definitively stale copy", () => {
+    const directory = mkdtempSync(join(tmpdir(), "research-video-redelivery-"));
+    temporaryDirectories.add(directory);
+    const database = openLocalDatabase(join(directory, "redelivery.sqlite"));
+    runLocalMigrations(database);
+    const queue = new LocalExportQueue(database);
+    const first = fixtureLoggedDelivery();
+    queue.importLoggedDeliveryPending(first);
+    const second: LoggedExportDelivery = {
+      ...first,
+      generation: 2,
+      reservationToken: "019fbb95-cd76-7920-93fa-e23ba755ef12",
+      workerId: "019fbb95-cd76-7920-93fa-e23ba755ef13",
+      reservedAt: "2026-08-20T12:00:31.000Z",
+      reservationExpiresAt: "2026-08-20T12:01:01.000Z",
+    };
+    database.exec(`
+      CREATE TRIGGER fixture_fail_replacement_job_insert
+      BEFORE INSERT ON jobs
+      WHEN NEW.id = '${first.request.jobId}'
+      BEGIN
+        SELECT RAISE(ABORT, 'fixture replacement insert failure');
+      END;
+    `);
+    expect(() => queue.importLoggedDeliveryPending(second)).toThrow(
+      /fixture replacement insert failure/u,
+    );
+    expect(queue.getPendingLoggedDelivery()).toMatchObject({
+      deliveryId: first.deliveryId,
+      generation: first.generation,
+      reservationToken: first.reservationToken,
+      request: { id: first.request.id, jobId: first.request.jobId },
+    });
+    expect(
+      database.prepare("SELECT count(*) AS count FROM jobs").get(),
+    ).toEqual({ count: 1 });
+    database.exec("DROP TRIGGER fixture_fail_replacement_job_insert;");
+    expect(queue.importLoggedDeliveryPending(second)).toMatchObject({
+      id: first.request.id,
+      mode: "logged",
+      state: "claimed",
+    });
+    expect(queue.getPendingLoggedDelivery()).toMatchObject({
+      deliveryId: second.deliveryId,
+      generation: second.generation,
+      reservationToken: second.reservationToken,
+      workerId: second.workerId,
+      workerEpoch: second.workerEpoch,
+      request: {
+        id: second.request.id,
+        mode: "logged",
+        projectId: second.request.projectId,
+        clipId: second.request.clipId,
+        state: "claimed",
+      },
+    });
+    expect(
+      database.prepare("SELECT count(*) AS count FROM jobs").get(),
+    ).toEqual({ count: 1 });
+    queue.rejectPendingLoggedDelivery(second);
+    expect(queue.get(first.request.id)).toBeUndefined();
+    expect(queue.getPendingLoggedDelivery()).toBeUndefined();
+    expect(
+      database.prepare("SELECT count(*) AS count FROM jobs").get(),
+    ).toEqual({ count: 0 });
+    database.close();
+  });
+
+  it("upgrades a populated export-only queue without changing its logical mode or snapshots", () => {
+    const directory = mkdtempSync(
+      join(tmpdir(), "research-video-populated-0018-"),
+    );
+    temporaryDirectories.add(directory);
+    const through0018 = join(directory, "migrations");
+    mkdirSync(through0018);
+    for (const filename of readdirSync(localMigrationDirectory)) {
+      if (filename < "0019") {
+        copyFileSync(
+          resolve(localMigrationDirectory, filename),
+          join(through0018, filename),
+        );
+      }
+    }
+    const filename = join(directory, "populated.sqlite");
+    const database = openLocalDatabase(filename);
+    runLocalMigrations(database, through0018);
+    const before = new LocalExportQueue(database).createExportOnly(
+      fixtureExportInput,
+    );
+    const rawSnapshot = database
+      .prepare(
+        "SELECT resolved_settings_snapshot_json FROM export_requests WHERE id = ?",
+      )
+      .get(before.id);
+    expect(runLocalMigrations(database, localMigrationDirectory)).toEqual([
+      "0019_logged_export_delivery_import",
+    ]);
+    const after = new LocalExportQueue(database).get(before.id);
+    expect(after).toEqual(before);
+    expect(after).toMatchObject({ mode: "export_only", state: "queued" });
+    expect(() =>
+      database
+        .prepare(
+          `UPDATE export_requests
+           SET cloud_delivery_state = 'accepted'
+           WHERE id = ?`,
+        )
+        .run(before.id),
+    ).toThrow(/only transition from pending acceptance to accepted/u);
+    expect(new LocalExportQueue(database).get(before.id)).toEqual(before);
+    expect(
+      database
+        .prepare(
+          "SELECT resolved_settings_snapshot_json FROM export_requests WHERE id = ?",
+        )
+        .get(before.id),
+    ).toEqual(rawSnapshot);
+    database.close();
+  });
+});
+
+function fixtureLoggedDelivery(): LoggedExportDelivery {
+  const resolved = resolveExportSettings({
+    context: "logged",
+    sourceLanguageClass: "confirmed_english",
+    resolvedAt: "2026-08-20T11:59:00.000Z",
+  }).snapshot;
+  const request = {
+    id: "019fbb95-cd76-7920-93fa-e23ba755ef01",
+    jobId: "019fbb95-cd76-7920-93fa-e23ba755ef02",
+    mode: "logged" as const,
+    projectId: "019fbb95-cd76-7920-93fa-e23ba755ef03",
+    clipId: "019fbb95-cd76-7920-93fa-e23ba755ef04",
+    video: fixtureExportInput.video,
+    selection: fixtureExportInput.selection,
+    sourceLanguageClass: "confirmed_english" as const,
+    preset: {
+      presetVersion: 1,
+      name: "Editing MP4",
+      settings: resolved.settings,
+    },
+    resolvedSettingsSnapshot: resolved,
+    state: "queued" as const,
+    createdAt: "2026-08-20T11:59:00.000Z",
+    updatedAt: "2026-08-20T11:59:00.000Z",
+  };
+  return {
+    deliveryId: "019fbb95-cd76-7920-93fa-e23ba755ef05",
+    generation: 1,
+    reservationToken: "019fbb95-cd76-7920-93fa-e23ba755ef06",
+    workerId: "019fbb95-cd76-7920-93fa-e23ba755ef07",
+    workerEpoch: 1,
+    status: "reserved",
+    reservedAt: "2026-08-20T12:00:00.000Z",
+    reservationExpiresAt: "2026-08-20T12:00:30.000Z",
+    request,
+  };
+}
