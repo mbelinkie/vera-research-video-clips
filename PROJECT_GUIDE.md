@@ -2,7 +2,7 @@
 
 ## Project guide and implementation plan
 
-Status: Milestones 1–4 core workflow complete; preferred-language logging, local export capabilities, and registered local-worker availability are verified through M5-15; logged/cloud delivery, operational recovery/grouping, and the final release gate remain open
+Status: Milestones 1–4 core workflow complete; preferred-language logging, local export capabilities, and authorized logged-request delivery are verified through M5-16; logged execution/result reconciliation, operational recovery/grouping, and the final release gate remain open
 Last updated: 2026-08-20
 
 This document is the source of truth for product scope, architecture, sequencing, and acceptance criteria. Update it when a deliberate product or architectural decision changes. Use `outline.md` as the shorter execution checklist.
@@ -1403,8 +1403,9 @@ web build, 17 local and 11 cloud migrations, four Playwright flows, and real
 FFmpeg/FFprobe renders for all three families. Commits `2323a0f`, `fe1efed`,
 `38047c4`, `9c8d8c6`, and `75def13` contain the completed slices.
 
-These slices do not complete Milestone 5. Registered local-agent delivery of logged/cloud requests, durable
-result reconciliation and progress/retry/cancel controls, batch and same-source
+These slices do not complete Milestone 5. Durable execution and result
+reconciliation for delivered logged requests, progress/retry/cancel controls,
+batch and same-source
 group execution, crash-recovery cleanup sweeping, the 30-second foreign fixture
 gate, and the user-authorized live YouTube smoke test remain open.
 
@@ -1421,6 +1422,24 @@ higher epoch to return, and project reads report only a compatible worker count
 after joining the worker owner to project membership. This is availability
 advertisement only—no export delivery, claims, source acquisition, rendering,
 results, progress, retries, cancellation, grouping, or cleanup sweep is added.
+
+M5-16 completed 2026-08-20. An authenticated registered local worker can now
+claim one compatible queued logged export from a project where its owner remains
+a member, import the exact immutable cloud request into the existing SQLite
+export queue, and acknowledge durable acceptance without starting the processor.
+The cloud uses one stable delivery ID per request plus an increasing reservation
+generation and fresh token. Atomic `FOR UPDATE SKIP LOCKED` selection excludes
+active or accepted assignments, requires the exact snapshotted capability
+profile and conservative installed renderer, and leaves incompatible work
+queued. SQLite imports in a non-runnable `pending_acceptance` phase; only an
+idempotent cloud acceptance activates the request. A lost acceptance response is
+recovered from local pending provenance before claiming new work, while expiry
+and reassignment make stale acceptance conflict and remove the stale local copy.
+Cloud and local migrations `0013` and `0019` add the durable state. No owner
+identity, path, source-media acquisition credential, private source URL, source
+acquisition, rendering, execution lease/result, progress, retry/cancel,
+grouping, or cleanup behavior is added; the opaque reservation token remains
+part of the typed handoff.
 
 M5-09 completed 2026-08-19. Every promoted clip package now also contains one
 `manifest.json`, written into attempt-private staging and promoted through the
@@ -1442,7 +1461,7 @@ rebuilds `export_final_artifacts` for the new `manifest_json` role and adds the
 rendered FFmpeg version column. The descriptive `clip-<id>.json` metadata sidecar
 and the `.jpg` thumbnail remain separate later slices.
 
-M5-08 completed 2026-08-15. `npm run export:run-once -- --request-id <uuid> --authorization-confirmed` now opens the configured local SQLite data root, composes exactly one existing `LocalExportSourceProcessor` attempt with the configured full-source provider and real FFprobe/FFmpeg adapters, then prints only a sanitized request state, package identity, and artifact hashes/sizes. The command has no server, polling, concurrency, or background work; confirmation is required on every run, and an already-complete request is reported without rerendering. A deterministic repository-owned four-second fixture smoke copied the source only into attempt-private scratch and verified a completed foreign-language H.264/AAC package with both clip-relative SRTs, persisted final provenance, atomic package visibility, and verified scratch deletion. This proves local `export_only` runtime composition only: logged export delivery, cloud/job relay, live authorized YouTube acquisition, manifests, thumbnails, retry/grouping, presets, and the full Milestone 5 exit criteria remain separate.
+M5-08 completed 2026-08-15. `npm run export:run-once -- --request-id <uuid> --authorization-confirmed` now opens the configured local SQLite data root, composes exactly one existing `LocalExportSourceProcessor` attempt with the configured full-source provider and real FFprobe/FFmpeg adapters, then prints only a sanitized request state, package identity, and artifact hashes/sizes. The command has no server, polling, concurrency, or background work; confirmation is required on every run, and an already-complete request is reported without rerendering. A deterministic repository-owned four-second fixture smoke copied the source only into attempt-private scratch and verified a completed foreign-language H.264/AAC package with both clip-relative SRTs, persisted final provenance, atomic package visibility, and verified scratch deletion. This proves local `export_only` runtime composition only: execution of delivered logged work, cloud result reconciliation, live authorized YouTube acquisition, retry/grouping, and the full Milestone 5 exit criteria remain separate.
 
 ### Milestone 6 — Project Clip Library and authoring handoff
 

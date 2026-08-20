@@ -292,14 +292,19 @@ produce preferred SRT artifacts.
   installed complete renderer profile to the authorized cloud catalog, and read
   project-authorized compatible-worker availability without delivering work
   (`specs/completed/M5-15-registered-local-worker-capability-advertisement.md`).
+- [x] M5-16: atomically reserve one exact compatible queued logged export for an
+  active actor-owned project-member worker, import it two-phase into the existing
+  local queue, and recover lost acceptance or reject stale generations without
+  starting media work
+  (`specs/completed/M5-16-authorized-logged-export-delivery-to-local-worker.md`).
 - [x] Generate and verify thumbnail, metadata JSON, and manifest.
 - [x] Use private staging plus exact-artifact validation and atomic completion.
-- [ ] Deliver logged/cloud export requests to an authorized local worker and
+- [ ] Execute accepted logged requests through the existing local processor and
   reconcile immutable results with the shared catalog.
 - [ ] Add durable progress, retry, safe cancellation, sibling isolation, and
   batch export.
 
-Gate: representative presets produce the requested FFprobe properties, queued jobs survive preset edits unchanged, English clips get an SRT by default and can explicitly omit it, foreign/mixed/unknown clips always get original plus translated-English SRTs, a 30-second foreign-language range produces only cues within that 30-second clip, a real authorized smoke test succeeds, and no full source media remains after any terminal path. M5-08 proves the local export-only composition path with authorized repository fixture media, not a live YouTube source or logged/cloud export delivery.
+Gate: representative presets produce the requested FFprobe properties, queued jobs survive preset edits unchanged, English clips get an SRT by default and can explicitly omit it, foreign/mixed/unknown clips always get original plus translated-English SRTs, a 30-second foreign-language range produces only cues within that 30-second clip, a real authorized smoke test succeeds, and no full source media remains after any terminal path. M5-08 proves the local export-only composition path with authorized repository fixture media; M5-16 delivers logged requests durably but does not execute them or reconcile results.
 
 ### 6. Project Clip Library + authoring handoff
 
@@ -389,6 +394,7 @@ Project
             -> WorkerLease
   -> ClipCandidate
        -> ExportJob (optional)
+            -> LoggedExportDelivery (reservation generation + acceptance)
             -> ExportArtifact
                  -> ArtifactLocator (verified availability, not identity)
   -> ExportPreset
@@ -434,6 +440,9 @@ infra/aws        storage, API, database, queues, identity, monitoring
 - URL normalization and caption-source precedence.
 - Batch preflight dedupe, sibling failure isolation, pause/retry, and review transitions.
 - Duplicate queue delivery and expired worker-lease recovery.
+- Logged-export delivery authorization, exact capability eligibility, atomic
+  reservation, two-phase local acceptance, duplicate replay, lost-response
+  recovery, and stale-generation rejection before processor work.
 - Word/cue/estimated timing lookup and bilingual preservation.
 - Transcript selection to source/export bounds.
 - Queue creation without export side effects.
@@ -466,7 +475,8 @@ infra/aws        storage, API, database, queues, identity, monitoring
 
 ## Next action
 
-Continue Milestone 5 with one bounded logged/cloud export-delivery slice that
-uses registered-worker availability without broadening it into result
-reconciliation, progress/retry/cancel, same-source grouping, cleanup sweeping,
-or the final 30-second plus authorized-live release gate.
+Continue Milestone 5 with one bounded slice that executes an already accepted
+logged request through the existing local processor and reconciles its immutable
+result without broadening into user-facing progress/retry/cancel, same-source
+grouping, cleanup sweeping, or the final 30-second plus authorized-live release
+gate.
