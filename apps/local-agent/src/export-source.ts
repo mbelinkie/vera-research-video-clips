@@ -195,7 +195,8 @@ export class LocalExportSourceProcessor {
     try {
       return await withExportSourceScratch({
         scratchRoot: join(this.dataRoot, "jobs", "export-source-scratch"),
-        attemptId: `${started.request.jobId}-a${started.attempt}`,
+        jobId: started.request.jobId,
+        attempt: started.attempt,
         provider: this.sourceProvider,
         videoId: started.request.video.youtubeVideoId,
         authorizationConfirmed: input.authorizationConfirmed,

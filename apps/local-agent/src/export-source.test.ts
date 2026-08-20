@@ -1403,14 +1403,12 @@ describe("LocalExportSourceProcessor", () => {
       vi.spyOn(queue, "recordEnglishSubtitleValidation").mockImplementation(
         (...input) => {
           record(...input);
-          const attempt = readdirSync(
-            join(root, "jobs", "export-source-scratch"),
-          )[0]!;
           const sidecar = join(
             root,
             "jobs",
             "export-source-scratch",
-            attempt,
+            request.jobId,
+            "1",
             "english.srt",
           );
           if (mutation === "remove") rmSync(sidecar);

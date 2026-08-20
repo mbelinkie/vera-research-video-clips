@@ -722,7 +722,8 @@ describe("withExportSourceScratch", () => {
     try {
       const result = await withExportSourceScratch({
         scratchRoot: root,
-        attemptId: "job-a1",
+        jobId: "019fbb95-cd76-7920-93fa-e23ba755ef90",
+        attempt: 1,
         provider: sourceProvider(),
         videoId: "M7lc1UVf-VE",
         authorizationConfirmed: true,
@@ -749,6 +750,38 @@ describe("withExportSourceScratch", () => {
     }
   });
 
+  it("keeps sequential attempts under one validated job parent and cleans each exact child", async () => {
+    const root = await mkdtemp(join(tmpdir(), "export-source-lifecycle-"));
+    const jobId = "019fbb95-cd76-7920-93fa-e23ba755ef90";
+    try {
+      await withExportSourceScratch({
+        scratchRoot: root,
+        jobId,
+        attempt: 1,
+        provider: sourceProvider(),
+        videoId: "M7lc1UVf-VE",
+        authorizationConfirmed: true,
+        handoff: async () => {
+          await withExportSourceScratch({
+            scratchRoot: root,
+            jobId,
+            attempt: 2,
+            provider: sourceProvider(),
+            videoId: "M7lc1UVf-VE",
+            authorizationConfirmed: true,
+            handoff: async () => {
+              expect(await readdir(join(root, jobId))).toEqual(["1", "2"]);
+            },
+          });
+          expect(await readdir(join(root, jobId))).toEqual(["1"]);
+        },
+      });
+      expect(await readdir(root)).toEqual([]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("cleans attempt scratch after acquisition failure and cancellation", async () => {
     const root = await mkdtemp(join(tmpdir(), "export-source-lifecycle-"));
     const cleanupEvents: string[] = [];
@@ -758,7 +791,8 @@ describe("withExportSourceScratch", () => {
       await expect(
         withExportSourceScratch({
           scratchRoot: root,
-          attemptId: "job-a2",
+          jobId: "019fbb95-cd76-7920-93fa-e23ba755ef90",
+          attempt: 2,
           provider: {
             acquireAuthorizedFullSource: async ({ scratchDirectory }) => {
               await writeFile(join(scratchDirectory, "partial.mp4"), "partial");
@@ -776,7 +810,8 @@ describe("withExportSourceScratch", () => {
       await expect(
         withExportSourceScratch({
           scratchRoot: root,
-          attemptId: "job-a3",
+          jobId: "019fbb95-cd76-7920-93fa-e23ba755ef90",
+          attempt: 3,
           provider: sourceProvider(),
           videoId: "M7lc1UVf-VE",
           authorizationConfirmed: true,
@@ -801,7 +836,8 @@ describe("withExportSourceScratch", () => {
       await expect(
         withExportSourceScratch({
           scratchRoot: root,
-          attemptId: "job-a4",
+          jobId: "019fbb95-cd76-7920-93fa-e23ba755ef90",
+          attempt: 4,
           provider: sourceProvider(),
           videoId: "M7lc1UVf-VE",
           authorizationConfirmed: true,

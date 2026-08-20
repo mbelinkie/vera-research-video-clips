@@ -38,6 +38,10 @@ const defaultMigrationDirectory = fileURLToPath(
   new URL("../migrations", import.meta.url),
 );
 
+const SourceScratchLayoutVersion = 2;
+const SourceScratchCleanupClaimLeaseMs = 5 * 60 * 1_000;
+const MaxSourceScratchCleanupClaims = 25;
+
 const localExportRequestSelect = `SELECT er.*, j.state,
   ssa.duration_ms AS media_duration_ms,
   ssa.container_format AS media_container_format,
@@ -708,10 +712,19 @@ export class LocalExportQueue {
       this.database
         .prepare(
           `INSERT INTO source_scratch_assets
-             (id, job_id, attempt, lifecycle_state, created_at, expires_at, updated_at)
-           VALUES (?, ?, ?, 'acquiring', ?, ?, ?)`,
+             (id, job_id, attempt, lifecycle_state, scratch_layout_version,
+              created_at, expires_at, updated_at)
+           VALUES (?, ?, ?, 'acquiring', ?, ?, ?, ?)`,
         )
-        .run(randomUUID(), request.jobId, nextAttempt, now, expiresAt, now);
+        .run(
+          randomUUID(),
+          request.jobId,
+          nextAttempt,
+          SourceScratchLayoutVersion,
+          now,
+          expiresAt,
+          now,
+        );
       this.database.exec("COMMIT;");
     } catch (error) {
       this.database.exec("ROLLBACK;");
@@ -771,7 +784,8 @@ export class LocalExportQueue {
         `UPDATE source_scratch_assets
          SET provider = ?, source_identity = ?, byte_size = ?, content_sha256 = ?,
              lifecycle_state = 'ready', ready_at = ?, updated_at = ?
-         WHERE job_id = ? AND attempt = ? AND lifecycle_state = 'acquiring'`,
+         WHERE job_id = ? AND attempt = ? AND lifecycle_state = 'acquiring'
+           AND cleanup_claim_token IS NULL`,
       )
       .run(
         source.provider,
@@ -820,7 +834,8 @@ export class LocalExportQueue {
           `UPDATE source_scratch_assets
            SET duration_ms = ?, container_format = ?, video_codec = ?, audio_codec = ?,
                ffprobe_version = ?, updated_at = ?
-           WHERE job_id = ? AND attempt = ? AND lifecycle_state = 'ready'`,
+           WHERE job_id = ? AND attempt = ? AND lifecycle_state = 'ready'
+             AND cleanup_claim_token IS NULL`,
         )
         .run(
           inspection.durationMs,
@@ -863,7 +878,8 @@ export class LocalExportQueue {
         `UPDATE source_scratch_assets
          SET lifecycle_state = 'deleting', cleanup_started_at = ?, updated_at = ?
          WHERE job_id = ? AND attempt = ?
-           AND lifecycle_state IN ('acquiring', 'ready')`,
+           AND lifecycle_state IN ('acquiring', 'ready')
+           AND cleanup_claim_token IS NULL`,
       )
       .run(now, now, jobId, attempt);
     if (result.changes !== 1) throw new LocalExportLifecycleError();
@@ -1260,8 +1276,11 @@ export class LocalExportQueue {
         .prepare(
           `UPDATE source_scratch_assets
            SET lifecycle_state = 'deleted', deleted_at = ?, updated_at = ?,
-               cleanup_error_code = NULL, cleanup_error_message = NULL
-           WHERE job_id = ? AND attempt = ? AND lifecycle_state = 'deleting'`,
+               cleanup_error_code = NULL, cleanup_error_message = NULL,
+               cleanup_claim_token = NULL, cleanup_claim_expires_at = NULL,
+               cleanup_claim_previous_lifecycle_state = NULL
+           WHERE job_id = ? AND attempt = ? AND lifecycle_state = 'deleting'
+             AND cleanup_claim_token IS NULL`,
         )
         .run(now, now, jobId, attempt);
       if (deleted.changes !== 1) throw new LocalExportLifecycleError();
@@ -1294,13 +1313,302 @@ export class LocalExportQueue {
         .prepare(
           `UPDATE source_scratch_assets
            SET lifecycle_state = 'cleanup_failed', cleanup_error_code = 'source_cleanup_failed',
-               cleanup_error_message = ?, updated_at = ?
+               cleanup_error_message = ?, updated_at = ?,
+               cleanup_claim_token = NULL, cleanup_claim_expires_at = NULL,
+               cleanup_claim_previous_lifecycle_state = NULL
            WHERE job_id = ? AND attempt = ?
-             AND lifecycle_state IN ('acquiring', 'ready', 'deleting')`,
+             AND lifecycle_state IN ('acquiring', 'ready', 'deleting')
+             AND cleanup_claim_token IS NULL`,
         )
         .run(safeLocalError(message), now, jobId, attempt);
       if (result.changes !== 1) throw new LocalExportLifecycleError();
       this.markJobNeedsUserAction(jobId, "source_cleanup_failed", message, now);
+      this.database.exec("COMMIT;");
+    } catch (error) {
+      this.database.exec("ROLLBACK;");
+      throw error;
+    }
+  }
+
+  /**
+   * Reserves a bounded set of deterministic-layout scratch rows for one-shot
+   * local recovery. The claim is a short durable lease rather than an in-memory
+   * lock so a restart cannot strand a row forever or let two sweepers settle it.
+   */
+  claimSourceScratchCleanup(limit: number): LocalSourceScratchCleanupClaim[] {
+    if (
+      !Number.isSafeInteger(limit) ||
+      limit <= 0 ||
+      limit > MaxSourceScratchCleanupClaims
+    ) {
+      throw new LocalExportLifecycleError(
+        "Source scratch cleanup limit is invalid.",
+        "source_scratch_cleanup_limit_invalid",
+      );
+    }
+    const claimedAt = this.now();
+    const now = claimedAt.toISOString();
+    const claimExpiresAt = new Date(
+      claimedAt.getTime() + SourceScratchCleanupClaimLeaseMs,
+    ).toISOString();
+    this.database.exec("BEGIN IMMEDIATE;");
+    try {
+      const candidates = this.database
+        .prepare(
+          `SELECT ssa.job_id, ssa.attempt
+           FROM source_scratch_assets ssa
+           JOIN jobs j ON j.id = ssa.job_id
+           WHERE ssa.scratch_layout_version = ?
+             AND (ssa.cleanup_claim_expires_at IS NULL
+                  OR ssa.cleanup_claim_expires_at <= ?)
+             AND (
+               ssa.lifecycle_state = 'cleanup_failed'
+               OR (
+                 ssa.lifecycle_state IN ('acquiring', 'ready', 'deleting')
+                 AND ssa.expires_at <= ?
+                 AND NOT (
+                   j.state = 'processing'
+                   AND j.attempt = ssa.attempt
+                   AND ssa.expires_at > ?
+                 )
+               )
+             )
+           ORDER BY
+             CASE WHEN ssa.lifecycle_state = 'cleanup_failed' THEN 0 ELSE 1 END,
+             ssa.expires_at,
+             ssa.updated_at,
+             ssa.job_id,
+             ssa.attempt
+           LIMIT ?`,
+        )
+        .all(SourceScratchLayoutVersion, now, now, now, limit) as Array<{
+        job_id: string;
+        attempt: number;
+      }>;
+      const claimed: LocalSourceScratchCleanupClaim[] = [];
+      const update = this.database.prepare(
+        `UPDATE source_scratch_assets
+         SET lifecycle_state = 'deleting', cleanup_started_at = ?,
+             cleanup_claim_token = ?, cleanup_claim_expires_at = ?,
+             cleanup_claim_previous_lifecycle_state = COALESCE(
+               cleanup_claim_previous_lifecycle_state, lifecycle_state
+             ),
+             updated_at = ?
+         WHERE job_id = ? AND attempt = ?
+           AND scratch_layout_version = ?
+           AND (cleanup_claim_expires_at IS NULL OR cleanup_claim_expires_at <= ?)
+           AND (
+             lifecycle_state = 'cleanup_failed'
+             OR (
+               lifecycle_state IN ('acquiring', 'ready', 'deleting')
+               AND expires_at <= ?
+               AND NOT EXISTS (
+                 SELECT 1
+                 FROM jobs
+                 WHERE jobs.id = source_scratch_assets.job_id
+                   AND jobs.state = 'processing'
+                   AND jobs.attempt = source_scratch_assets.attempt
+                   AND source_scratch_assets.expires_at > ?
+               )
+             )
+           )`,
+      );
+      for (const candidate of candidates) {
+        const claimToken = randomUUID();
+        const result = update.run(
+          now,
+          claimToken,
+          claimExpiresAt,
+          now,
+          candidate.job_id,
+          candidate.attempt,
+          SourceScratchLayoutVersion,
+          now,
+          now,
+          now,
+        );
+        if (result.changes === 1) {
+          claimed.push({
+            jobId: candidate.job_id,
+            attempt: Number(candidate.attempt),
+            claimToken,
+          });
+        }
+      }
+      this.database.exec("COMMIT;");
+      return claimed;
+    } catch (error) {
+      this.database.exec("ROLLBACK;");
+      throw error;
+    }
+  }
+
+  countLegacySourceScratchRecoveryRows(): number {
+    const row = this.database
+      .prepare(
+        `SELECT count(*) AS count
+         FROM source_scratch_assets
+         WHERE scratch_layout_version IS NULL
+           AND lifecycle_state != 'deleted'`,
+      )
+      .get() as { count: number };
+    return Number(row.count);
+  }
+
+  completeSourceScratchCleanupClaim(
+    claim: LocalSourceScratchCleanupClaim,
+  ): LocalSourceScratchCleanupSettlement {
+    const now = this.now().toISOString();
+    this.database.exec("BEGIN IMMEDIATE;");
+    try {
+      const source = this.database
+        .prepare(
+          `SELECT cleanup_claim_previous_lifecycle_state
+           FROM source_scratch_assets
+           WHERE job_id = ? AND attempt = ?
+             AND scratch_layout_version = ?
+             AND cleanup_claim_token = ?`,
+        )
+        .get(
+          claim.jobId,
+          claim.attempt,
+          SourceScratchLayoutVersion,
+          claim.claimToken,
+        ) as
+        { cleanup_claim_previous_lifecycle_state: string | null } | undefined;
+      if (!source) {
+        throw new LocalExportLifecycleError(
+          "Source scratch cleanup claim is no longer current.",
+          "source_scratch_cleanup_claim_lost",
+        );
+      }
+      const deleted = this.database
+        .prepare(
+          `UPDATE source_scratch_assets
+           SET lifecycle_state = 'deleted', deleted_at = ?, updated_at = ?,
+               cleanup_error_code = NULL, cleanup_error_message = NULL,
+               cleanup_claim_token = NULL, cleanup_claim_expires_at = NULL,
+               cleanup_claim_previous_lifecycle_state = NULL
+           WHERE job_id = ? AND attempt = ?
+             AND scratch_layout_version = ?
+             AND cleanup_claim_token = ?`,
+        )
+        .run(
+          now,
+          now,
+          claim.jobId,
+          claim.attempt,
+          SourceScratchLayoutVersion,
+          claim.claimToken,
+        );
+      if (deleted.changes !== 1) {
+        throw new LocalExportLifecycleError(
+          "Source scratch cleanup claim is no longer current.",
+          "source_scratch_cleanup_claim_lost",
+        );
+      }
+      const job = this.database
+        .prepare("SELECT state, attempt, payload_json FROM jobs WHERE id = ?")
+        .get(claim.jobId) as
+        { state: string; attempt: number; payload_json: string } | undefined;
+      if (!job) throw new LocalExportLifecycleError();
+      const hasPackage = this.hasCompleteFinalArtifactProvenance(
+        claim.jobId,
+        claim.attempt,
+      );
+      let settlement: LocalSourceScratchCleanupSettlement = {
+        restoredComplete: false,
+        markedNeedsUserAction: false,
+      };
+      if (
+        hasPackage &&
+        (job.state === "needs_user_action" || job.state === "processing") &&
+        Number(job.attempt) === claim.attempt
+      ) {
+        const payload = parseLocalJobPayload(job.payload_json);
+        delete payload.lastError;
+        this.database
+          .prepare(
+            `UPDATE jobs
+             SET state = 'complete', payload_json = ?, updated_at = ?
+             WHERE id = ? AND state IN ('needs_user_action', 'processing')
+               AND attempt = ?`,
+          )
+          .run(JSON.stringify(payload), now, claim.jobId, claim.attempt);
+        settlement = { restoredComplete: true, markedNeedsUserAction: false };
+      } else if (
+        !hasPackage &&
+        Number(job.attempt) === claim.attempt &&
+        job.state === "processing"
+      ) {
+        this.markJobNeedsUserAction(
+          claim.jobId,
+          "source_scratch_abandoned",
+          "Expired source scratch was removed after interrupted local processing.",
+          now,
+        );
+        settlement = { restoredComplete: false, markedNeedsUserAction: true };
+      } else if (
+        !hasPackage &&
+        Number(job.attempt) === claim.attempt &&
+        job.state === "needs_user_action" &&
+        source.cleanup_claim_previous_lifecycle_state === "cleanup_failed"
+      ) {
+        this.markJobNeedsUserAction(
+          claim.jobId,
+          "source_scratch_cleanup_recovered",
+          "Source scratch cleanup completed after a prior cleanup failure.",
+          now,
+        );
+        settlement = { restoredComplete: false, markedNeedsUserAction: true };
+      }
+      this.database.exec("COMMIT;");
+      return settlement;
+    } catch (error) {
+      this.database.exec("ROLLBACK;");
+      throw error;
+    }
+  }
+
+  failSourceScratchCleanupClaim(
+    claim: LocalSourceScratchCleanupClaim,
+    message: string,
+  ): void {
+    const now = this.now().toISOString();
+    this.database.exec("BEGIN IMMEDIATE;");
+    try {
+      const failed = this.database
+        .prepare(
+          `UPDATE source_scratch_assets
+           SET lifecycle_state = 'cleanup_failed',
+               cleanup_error_code = 'source_cleanup_failed',
+               cleanup_error_message = ?, cleanup_claim_token = NULL,
+               cleanup_claim_expires_at = NULL,
+               cleanup_claim_previous_lifecycle_state = NULL, updated_at = ?
+           WHERE job_id = ? AND attempt = ?
+             AND scratch_layout_version = ?
+             AND cleanup_claim_token = ?`,
+        )
+        .run(
+          safeLocalError(message),
+          now,
+          claim.jobId,
+          claim.attempt,
+          SourceScratchLayoutVersion,
+          claim.claimToken,
+        );
+      if (failed.changes !== 1) {
+        throw new LocalExportLifecycleError(
+          "Source scratch cleanup claim is no longer current.",
+          "source_scratch_cleanup_claim_lost",
+        );
+      }
+      this.markJobNeedsUserAction(
+        claim.jobId,
+        "source_cleanup_failed",
+        message,
+        now,
+      );
       this.database.exec("COMMIT;");
     } catch (error) {
       this.database.exec("ROLLBACK;");
@@ -1342,6 +1650,67 @@ export class LocalExportQueue {
       )
       .get(jobId, attempt) as Record<string, unknown> | undefined;
     return row ? mapLocalSourceScratchAsset(row) : undefined;
+  }
+
+  private hasCompleteFinalArtifactProvenance(
+    jobId: string,
+    attempt: number,
+  ): boolean {
+    const artifacts = this.database
+      .prepare(
+        `SELECT er.id AS export_request_id, efa.role, efa.package_identity,
+                efa.byte_size, efa.content_sha256, efa.source_attempt,
+                efa.validated_at
+         FROM export_final_artifacts efa
+         JOIN export_requests er ON er.id = efa.export_request_id
+         WHERE er.job_id = ? AND efa.source_attempt = ?`,
+      )
+      .all(jobId, attempt) as Array<{
+      export_request_id: string;
+      role: string;
+      package_identity: string;
+      byte_size: number;
+      content_sha256: string;
+      source_attempt: number;
+      validated_at: string;
+    }>;
+    const roles = new Set(artifacts.map((artifact) => artifact.role));
+    const requestId = artifacts[0]?.export_request_id;
+    const packageIdentity = artifacts[0]?.package_identity;
+    const videoRoles = ["video_mp4", "video_mkv", "video_mov"];
+    const allowedRoles = new Set([
+      ...videoRoles,
+      "english_srt",
+      "original_srt",
+      "clip_metadata_json",
+      "thumbnail_jpg",
+      "manifest_json",
+    ]);
+    return (
+      artifacts.length >= 4 &&
+      artifacts.length <= 6 &&
+      roles.size === artifacts.length &&
+      Boolean(requestId) &&
+      packageIdentity === `clip-${requestId}` &&
+      artifacts.every(
+        (artifact) =>
+          artifact.export_request_id === requestId &&
+          artifact.package_identity === packageIdentity &&
+          Number(artifact.source_attempt) === attempt &&
+          allowedRoles.has(artifact.role) &&
+          validFinalArtifactFields({
+            packageIdentity: artifact.package_identity,
+            byteSize: Number(artifact.byte_size),
+            contentSha256: artifact.content_sha256,
+            sourceAttempt: Number(artifact.source_attempt),
+            validatedAt: artifact.validated_at,
+          }),
+      ) &&
+      videoRoles.filter((role) => roles.has(role)).length === 1 &&
+      roles.has("clip_metadata_json") &&
+      roles.has("thumbnail_jpg") &&
+      roles.has("manifest_json")
+    );
   }
 
   private mapRequest(row: Record<string, unknown>): ExportRequest {
@@ -1482,6 +1851,17 @@ export type LocalExportSourceAttempt = {
   attempt: number;
 };
 
+export type LocalSourceScratchCleanupClaim = {
+  jobId: string;
+  attempt: number;
+  claimToken: string;
+};
+
+export type LocalSourceScratchCleanupSettlement = {
+  restoredComplete: boolean;
+  markedNeedsUserAction: boolean;
+};
+
 type LocalSubtitleSidecarValidation = {
   role: "original" | "english";
   language: string;
@@ -1529,6 +1909,7 @@ export type LocalSourceScratchAsset = {
   cleanupErrorMessage?: string;
   deletedAt?: string;
   expiresAt: string;
+  scratchLayoutVersion?: number;
 };
 
 export class LocalExportRequestNotFoundError extends Error {
@@ -1887,11 +2268,30 @@ function mapLocalSourceScratchAsset(
       : { cleanupErrorMessage: String(row.cleanup_error_message) }),
     ...(row.deleted_at === null ? {} : { deletedAt: String(row.deleted_at) }),
     expiresAt: String(row.expires_at),
+    ...(row.scratch_layout_version === null ||
+    row.scratch_layout_version === undefined
+      ? {}
+      : { scratchLayoutVersion: Number(row.scratch_layout_version) }),
   };
 }
 
 function safeLocalError(message: string) {
   return sanitizeLoggedExportFailureMessage(message);
+}
+
+function parseLocalJobPayload(value: string): Record<string, unknown> {
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>;
+    }
+  } catch {
+    // Report the durable corruption through the ordinary lifecycle boundary.
+  }
+  throw new LocalExportLifecycleError(
+    "Persisted local job payload is invalid.",
+    "local_job_payload_invalid",
+  );
 }
 
 function safeProbeValue(value: string | undefined, maximumLength: number) {
@@ -1922,6 +2322,16 @@ function validSubtitleSidecar(sidecar: LocalSubtitleSidecarValidation) {
 }
 
 function validFinalArtifact(artifact: LocalFinalArtifactProvenance) {
+  return validFinalArtifactFields(artifact);
+}
+
+function validFinalArtifactFields(artifact: {
+  packageIdentity: string;
+  byteSize: number;
+  contentSha256: string;
+  sourceAttempt: number;
+  validatedAt: string;
+}) {
   return (
     /^clip-[a-f0-9-]{36}$/u.test(artifact.packageIdentity) &&
     Number.isSafeInteger(artifact.byteSize) &&
@@ -1929,8 +2339,20 @@ function validFinalArtifact(artifact: LocalFinalArtifactProvenance) {
     /^[a-f0-9]{64}$/u.test(artifact.contentSha256) &&
     Number.isSafeInteger(artifact.sourceAttempt) &&
     artifact.sourceAttempt > 0 &&
-    /^\d{4}-\d{2}-\d{2}T/u.test(artifact.validatedAt)
+    isCanonicalIsoTimestamp(artifact.validatedAt)
   );
+}
+
+function isCanonicalIsoTimestamp(value: string) {
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/u.test(value)) {
+    return false;
+  }
+  const timestamp = Date.parse(value);
+  if (!Number.isFinite(timestamp)) return false;
+  const normalized = value.includes(".")
+    ? value
+    : value.replace(/Z$/u, ".000Z");
+  return new Date(timestamp).toISOString() === normalized;
 }
 
 function safeSubtitleLanguage(language: string) {

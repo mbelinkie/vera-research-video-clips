@@ -7,10 +7,11 @@ import {
   lstat,
   mkdir,
   readdir,
+  rmdir,
   rm,
   stat,
 } from "node:fs/promises";
-import { join, resolve, sep } from "node:path";
+import { join, relative, resolve, sep } from "node:path";
 
 import {
   ExportObservedMediaPropertiesSchema,
@@ -321,7 +322,10 @@ export type ExportSourceLifecycleHooks = {
 
 export type ExportSourceLifecycleInput<T> = {
   scratchRoot: string;
-  attemptId: string;
+  /** Durable local job identity; it is the only scratch-directory namespace. */
+  jobId: string;
+  /** Positive, monotonically increasing source attempt for this job. */
+  attempt: number;
   provider: ExportSourceAcquisitionProvider;
   videoId: string;
   authorizationConfirmed: boolean;
@@ -339,12 +343,12 @@ export async function withExportSourceScratch<T>(
   input: ExportSourceLifecycleInput<T>,
 ): Promise<T> {
   validateScratchDirectory(input.scratchRoot);
-  validateAttemptId(input.attemptId);
-  await mkdir(input.scratchRoot, { recursive: true, mode: 0o700 });
-  await chmod(input.scratchRoot, 0o700);
+  validateExportJobId(input.jobId);
+  validateExportAttempt(input.attempt);
   const scratchDirectory = await createAttemptDirectory(
     input.scratchRoot,
-    input.attemptId,
+    input.jobId,
+    input.attempt,
   );
   let primaryError: unknown;
   try {
@@ -367,7 +371,11 @@ export async function withExportSourceScratch<T>(
   } finally {
     try {
       await input.hooks?.cleanupStarted?.();
-      await cleanupAttemptDirectory(scratchDirectory);
+      await cleanupAttemptDirectory(
+        scratchDirectory,
+        input.scratchRoot,
+        input.jobId,
+      );
       await input.hooks?.cleanupSucceeded?.();
     } catch (cleanupError) {
       const message = safeErrorMessage(cleanupError);
@@ -2017,14 +2025,84 @@ function thumbnailInspectionCanceled() {
   });
 }
 
-async function createAttemptDirectory(scratchRoot: string, attemptId: string) {
-  const { mkdtemp } = await import("node:fs/promises");
-  const directory = await mkdtemp(join(resolve(scratchRoot), `${attemptId}-`));
-  await chmod(directory, 0o700);
+/**
+ * Resolves the one exact directory permitted for a persisted export attempt.
+ * Both normal processing and crash recovery use this helper so a cleanup path
+ * can never be sourced from provider output or a persisted filesystem locator.
+ */
+export function resolveExportSourceScratchAttemptDirectory(input: {
+  scratchRoot: string;
+  jobId: string;
+  attempt: number;
+}): string {
+  validateScratchDirectory(input.scratchRoot);
+  validateExportJobId(input.jobId);
+  validateExportAttempt(input.attempt);
+  const root = resolve(input.scratchRoot);
+  const jobDirectory = join(root, input.jobId);
+  const directory = join(jobDirectory, String(input.attempt));
+  if (
+    !isDirectChild(root, jobDirectory) ||
+    !isDirectChild(jobDirectory, directory)
+  ) {
+    throw new ExportSourceAcquisitionError(
+      "Export scratch directory is invalid.",
+      { code: "invalid_export_attempt", retryable: false },
+    );
+  }
   return directory;
 }
 
-async function cleanupAttemptDirectory(path: string) {
+async function createAttemptDirectory(
+  scratchRoot: string,
+  jobId: string,
+  attempt: number,
+) {
+  const root = resolve(scratchRoot);
+  const directory = resolveExportSourceScratchAttemptDirectory({
+    scratchRoot: root,
+    jobId,
+    attempt,
+  });
+  const jobDirectory = join(root, jobId);
+  await ensurePrivateDirectory(root, true);
+  await ensurePrivateDirectory(jobDirectory, false);
+  try {
+    await mkdir(directory, { mode: 0o700 });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+      throw new ExportSourceAcquisitionError(
+        "This export attempt already has a scratch directory.",
+        { code: "export_scratch_attempt_exists", retryable: false },
+      );
+    }
+    throw error;
+  }
+  await ensurePrivateDirectory(directory, false);
+  return directory;
+}
+
+async function ensurePrivateDirectory(path: string, recursive: boolean) {
+  try {
+    await mkdir(path, { recursive, mode: 0o700 });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+  }
+  const entry = await lstat(path);
+  if (!entry.isDirectory() || entry.isSymbolicLink()) {
+    throw new ExportSourceAcquisitionError(
+      "Export scratch directory is invalid.",
+      { code: "invalid_export_attempt", retryable: false },
+    );
+  }
+  await chmod(path, 0o700);
+}
+
+async function cleanupAttemptDirectory(
+  path: string,
+  scratchRoot: string,
+  jobId: string,
+) {
   await rm(path, { recursive: true, force: true });
   const remains = await access(path).then(
     () => true,
@@ -2033,11 +2111,59 @@ async function cleanupAttemptDirectory(path: string) {
   if (remains) {
     throw new Error("scratch directory remains after deletion");
   }
+  await removeEmptyExportSourceScratchJobDirectory({
+    scratchRoot,
+    jobId,
+  });
+}
+
+/** Removes only an empty, validated job parent after its exact attempt child. */
+export async function removeEmptyExportSourceScratchJobDirectory(input: {
+  scratchRoot: string;
+  jobId: string;
+}): Promise<void> {
+  validateScratchDirectory(input.scratchRoot);
+  validateExportJobId(input.jobId);
+  const root = resolve(input.scratchRoot);
+  const jobDirectory = join(root, input.jobId);
+  if (!isDirectChild(root, jobDirectory)) {
+    throw new ExportSourceAcquisitionError(
+      "Export scratch directory is invalid.",
+      { code: "invalid_export_attempt", retryable: false },
+    );
+  }
+  let entry;
+  try {
+    entry = await lstat(jobDirectory);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw error;
+  }
+  if (!entry.isDirectory() || entry.isSymbolicLink()) {
+    throw new ExportSourceAcquisitionError(
+      "Export scratch directory is invalid.",
+      { code: "invalid_export_attempt", retryable: false },
+    );
+  }
+  try {
+    await rmdir(jobDirectory);
+  } catch (error) {
+    if (
+      (error as NodeJS.ErrnoException).code === "ENOENT" ||
+      (error as NodeJS.ErrnoException).code === "ENOTEMPTY"
+    )
+      return;
+    throw error;
+  }
 }
 
 function isInsideScratchDirectory(directory: string, path: string) {
-  const root = `${resolve(directory)}${sep}`;
-  return resolve(path).startsWith(root);
+  const candidate = relative(resolve(directory), resolve(path));
+  return (
+    Boolean(candidate) &&
+    candidate !== ".." &&
+    !candidate.startsWith(`..${sep}`)
+  );
 }
 
 async function sha256File(path: string) {
@@ -2058,13 +2184,36 @@ function validateScratchDirectory(directory: string) {
   }
 }
 
-function validateAttemptId(attemptId: string) {
-  if (!/^[A-Za-z0-9_-]{1,128}$/.test(attemptId)) {
+function validateExportJobId(jobId: string) {
+  if (
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(
+      jobId,
+    )
+  ) {
     throw new ExportSourceAcquisitionError("Export attempt ID is invalid.", {
       code: "invalid_export_attempt",
       retryable: false,
     });
   }
+}
+
+function validateExportAttempt(attempt: number) {
+  if (!Number.isSafeInteger(attempt) || attempt <= 0) {
+    throw new ExportSourceAcquisitionError("Export attempt ID is invalid.", {
+      code: "invalid_export_attempt",
+      retryable: false,
+    });
+  }
+}
+
+function isDirectChild(parent: string, child: string) {
+  const path = relative(resolve(parent), resolve(child));
+  return (
+    Boolean(path) &&
+    !path.startsWith(`..${sep}`) &&
+    path !== ".." &&
+    !path.includes(sep)
+  );
 }
 
 function validateExecutable(executable: string) {

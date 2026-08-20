@@ -144,6 +144,7 @@ describe("local migrations", () => {
       "0018_registered_export_worker_identity",
       "0019_logged_export_delivery_import",
       "0020_logged_export_delivery_acceptance_time",
+      "0021_source_scratch_recovery_claims",
     ]);
     expect(runLocalMigrations(database)).toEqual([]);
     expect(
@@ -291,6 +292,7 @@ describe("local migrations", () => {
       audioCodec: "aac",
       ffprobeVersion: "7.1",
       lifecycleState: "deleted",
+      scratchLayoutVersion: 2,
       deletedAt: "2026-08-01T12:00:00.000Z",
       expiresAt: "2026-08-02T12:00:00.000Z",
     });
@@ -307,6 +309,68 @@ describe("local migrations", () => {
     expect(exportQueue.getSourceAttempt(exportRequest.jobId, 2)).toMatchObject({
       lifecycleState: "cleanup_failed",
       cleanupErrorCode: "source_cleanup_failed",
+    });
+    database.close();
+  });
+
+  it("upgrades a populated legacy scratch row to manual cleanup instead of inferring a new path", () => {
+    const directory = mkdtempSync(
+      join(tmpdir(), "research-video-legacy-scratch-migration-"),
+    );
+    temporaryDirectories.add(directory);
+    const through0020 = join(directory, "through-0020");
+    mkdirSync(through0020);
+    for (const filename of readdirSync(localMigrationDirectory)) {
+      if (filename < "0021") {
+        copyFileSync(
+          resolve(localMigrationDirectory, filename),
+          join(through0020, filename),
+        );
+      }
+    }
+    const database = openLocalDatabase(join(directory, "legacy.sqlite"));
+    runLocalMigrations(database, through0020);
+    database.exec(`
+      INSERT INTO jobs
+        (id, kind, state, idempotency_key, attempt, payload_json, created_at, updated_at)
+      VALUES ('019fbb95-cd76-7920-93fa-e23ba755ef90', 'export', 'processing',
+              'legacy-scratch-job', 1, '{}', '2026-08-20T12:00:00.000Z',
+              '2026-08-20T12:00:00.000Z');
+      INSERT INTO source_scratch_assets
+        (id, job_id, attempt, lifecycle_state, created_at, expires_at, updated_at)
+      VALUES ('019fbb95-cd76-7920-93fa-e23ba755ef91',
+              '019fbb95-cd76-7920-93fa-e23ba755ef90', 1, 'ready',
+              '2026-08-20T12:00:00.000Z', '2026-08-20T12:05:00.000Z',
+              '2026-08-20T12:00:00.000Z');
+    `);
+
+    expect(runLocalMigrations(database, localMigrationDirectory)).toEqual([
+      "0021_source_scratch_recovery_claims",
+    ]);
+    expect(
+      database
+        .prepare(
+          `SELECT lifecycle_state, scratch_layout_version, cleanup_error_code,
+                  cleanup_error_message
+           FROM source_scratch_assets`,
+        )
+        .get(),
+    ).toEqual({
+      lifecycle_state: "cleanup_failed",
+      scratch_layout_version: null,
+      cleanup_error_code: "source_scratch_legacy_layout_unrecoverable",
+      cleanup_error_message: "Legacy source scratch requires manual cleanup.",
+    });
+    expect(
+      database.prepare("SELECT state, payload_json FROM jobs").get(),
+    ).toEqual({
+      state: "needs_user_action",
+      payload_json: JSON.stringify({
+        lastError: {
+          code: "source_scratch_legacy_layout_unrecoverable",
+          message: "Legacy source scratch requires manual cleanup.",
+        },
+      }),
     });
     database.close();
   });
@@ -456,6 +520,7 @@ describe("local migrations", () => {
       "0018_registered_export_worker_identity",
       "0019_logged_export_delivery_import",
       "0020_logged_export_delivery_acceptance_time",
+      "0021_source_scratch_recovery_claims",
     ]);
     expect(
       database.prepare("SELECT * FROM export_final_artifacts").all(),
@@ -581,6 +646,7 @@ describe("local migrations", () => {
       "0018_registered_export_worker_identity",
       "0019_logged_export_delivery_import",
       "0020_logged_export_delivery_acceptance_time",
+      "0021_source_scratch_recovery_claims",
     ]);
     expect(
       database
@@ -1102,6 +1168,63 @@ describe("logged export delivery import", () => {
     cleanupFailed.database.close();
   });
 
+  it("permits M5-18 failure projection only after a cleanup-recovery claim settles deleted", () => {
+    const directory = mkdtempSync(
+      join(tmpdir(), "research-video-recovered-cleanup-failure-"),
+    );
+    temporaryDirectories.add(directory);
+    const database = openLocalDatabase(join(directory, "recovered.sqlite"));
+    runLocalMigrations(database);
+    const queue = new LocalExportQueue(
+      database,
+      () => new Date("2026-08-21T12:00:00.000Z"),
+    );
+    const claimed = fixtureLoggedDelivery();
+    const accepted: LoggedExportDelivery = {
+      ...claimed,
+      status: "accepted",
+      acceptedAt: "2026-08-20T12:00:05.000Z",
+    };
+    queue.importLoggedDeliveryPending(claimed);
+    queue.activateLoggedDelivery(accepted);
+    const started = queue.beginSourceAcquisition(accepted.request.id);
+    queue.recordSourceCleanupFailed(
+      started.request.jobId,
+      started.attempt,
+      "Could not delete /private/source.mp4",
+    );
+    expect(() =>
+      queue.buildLoggedExportFailureResult(accepted.request.id),
+    ).toThrow(
+      expect.objectContaining({
+        code: "logged_export_failure_cleanup_incomplete",
+      }),
+    );
+
+    const [recovery] = queue.claimSourceScratchCleanup(1);
+    expect(recovery).toMatchObject({
+      jobId: started.request.jobId,
+      attempt: started.attempt,
+    });
+    expect(queue.completeSourceScratchCleanupClaim(recovery!)).toEqual({
+      restoredComplete: false,
+      markedNeedsUserAction: true,
+    });
+    expect(
+      queue.getSourceAttempt(started.request.jobId, started.attempt),
+    ).toMatchObject({
+      lifecycleState: "deleted",
+    });
+    expect(
+      queue.buildLoggedExportFailureResult(accepted.request.id),
+    ).toMatchObject({
+      error: { code: "source_scratch_cleanup_recovered" },
+      attempt: started.attempt,
+      sourceCleanup: { lifecycle: "deleted", deletedAt: expect.any(String) },
+    });
+    database.close();
+  });
+
   it("replaces an expired pending generation and removes a definitively stale copy", () => {
     const directory = mkdtempSync(join(tmpdir(), "research-video-redelivery-"));
     temporaryDirectories.add(directory);
@@ -1199,6 +1322,7 @@ describe("logged export delivery import", () => {
     expect(runLocalMigrations(database, localMigrationDirectory)).toEqual([
       "0019_logged_export_delivery_import",
       "0020_logged_export_delivery_acceptance_time",
+      "0021_source_scratch_recovery_claims",
     ]);
     const after = new LocalExportQueue(database).get(before.id);
     expect(after).toEqual(before);
@@ -1256,6 +1380,7 @@ describe("logged export delivery import", () => {
       .run(acceptedAt, delivery.request.jobId);
     expect(runLocalMigrations(database, localMigrationDirectory)).toEqual([
       "0020_logged_export_delivery_acceptance_time",
+      "0021_source_scratch_recovery_claims",
     ]);
     expect(
       new LocalExportQueue(database).getAcceptedLoggedDelivery(
