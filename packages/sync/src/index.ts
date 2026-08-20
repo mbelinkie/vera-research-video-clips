@@ -304,6 +304,66 @@ export class SharedFirstTranscriptResolver {
   }
 }
 
+export interface DerivedTranslationCatalogClient {
+  getDerivedTranslation(
+    identity: DerivedTranslationIdentity,
+  ): Promise<DerivedTranslation | undefined>;
+}
+
+export type DerivedTranslationResolution = {
+  transcript: NormalizedTranscript;
+  source: "verified-local-cache" | "shared-store";
+};
+
+export class SharedDerivedTranslationResolver {
+  constructor(
+    private readonly catalog: DerivedTranslationCatalogClient,
+    private readonly index: LocalTranscriptIndex,
+  ) {}
+
+  async resolve(
+    identity: DerivedTranslationIdentity,
+  ): Promise<DerivedTranslationResolution | undefined> {
+    const local = this.index.findDerivedTranslation(identity);
+    if (local) {
+      return {
+        source: "verified-local-cache",
+        transcript: local,
+      };
+    }
+    const shared = await this.catalog.getDerivedTranslation(identity);
+    if (!shared) return undefined;
+    const translation = DerivedTranslationSchema.parse(shared);
+    const normalizedArtifact = translation.manifest.artifacts.find(
+      (artifact) => artifact.type === "translated-normalized",
+    );
+    const normalizedEncoded = JSON.stringify(translation.transcript);
+    if (
+      !normalizedArtifact ||
+      createHash("sha256").update(normalizedEncoded).digest("hex") !==
+        normalizedArtifact.sha256 ||
+      translation.manifest.identity.baseTranscriptVersionId !==
+        identity.baseTranscriptVersionId ||
+      translation.manifest.identity.originalTrackId !== identity.originalTrackId
+    ) {
+      throw new LocalCacheIntegrityError(
+        "Shared derived translation failed identity or checksum verification.",
+      );
+    }
+    const manifestSha256 = createHash("sha256")
+      .update(JSON.stringify(translation.manifest))
+      .digest("hex");
+    this.index.promoteDerivedTranslation({
+      identity,
+      translationVersionId: translation.manifest.id,
+      manifestSha256,
+      normalizedSha256: normalizedArtifact.sha256,
+      transcript: translation.transcript,
+    });
+    return { source: "shared-store", transcript: translation.transcript };
+  }
+}
+
 export class CachedTranscriptDocumentReader {
   constructor(private readonly index: LocalTranscriptIndex) {}
 
@@ -443,6 +503,19 @@ export class OfflineOutbox {
     return existing.id;
   }
 
+  enqueueClipCandidate(
+    projectId: string,
+    input: CreateClipCandidateRequest,
+  ): string {
+    const command = CreateClipCandidateRequestSchema.parse(input);
+    return this.enqueue({
+      projectId,
+      commandType: "clip_candidate.create.v2",
+      idempotencyKey: command.idempotencyKey,
+      payload: command,
+    });
+  }
+
   due(limit = 50): OutboxCommand[] {
     const rows = this.database
       .prepare(
@@ -502,9 +575,14 @@ import { gunzipSync } from "node:zlib";
 
 import {
   ActiveTranscriptBundleSchema,
+  CreateClipCandidateRequestSchema,
+  DerivedTranslationSchema,
   NormalizedTranscriptSchema,
   TranscriptManifestSchema,
   type ActiveTranscriptBundle,
+  type CreateClipCandidateRequest,
+  type DerivedTranslation,
+  type DerivedTranslationIdentity,
   type NormalizedTranscript,
   type TranscriptDownloadTarget,
 } from "@research-video/contracts";

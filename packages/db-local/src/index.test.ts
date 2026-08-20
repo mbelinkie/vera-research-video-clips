@@ -5,6 +5,7 @@ import {
   readdirSync,
   rmSync,
 } from "node:fs";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -12,6 +13,7 @@ import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 
 import fixture from "../../../tests/fixtures/transcripts/english-cue.json" with { type: "json" };
+import multilingualFixture from "../../../tests/fixtures/transcripts/romanian-multilingual.json" with { type: "json" };
 import { normalizeTranscriptFixture } from "@research-video/transcript";
 
 import {
@@ -93,6 +95,7 @@ describe("local migrations", () => {
       "0010_export_confirmed_english_subtitle_omission",
       "0011_export_final_artifact_provenance",
       "0012_export_clip_package_manifest",
+      "0013_preferred_translation_cache",
     ]);
     expect(runLocalMigrations(database)).toEqual([]);
     expect(
@@ -230,6 +233,53 @@ describe("local migrations", () => {
     database.close();
   });
 
+  it("promotes and reuses only an exact verified derived translation", () => {
+    const directory = mkdtempSync(
+      join(tmpdir(), "research-video-derived-cache-test-"),
+    );
+    temporaryDirectories.add(directory);
+    const database = openLocalDatabase(join(directory, "test.sqlite"));
+    runLocalMigrations(database);
+    const index = new LocalTranscriptIndex(
+      database,
+      () => new Date("2026-08-20T12:00:00.000Z"),
+    );
+    const original = normalizeTranscriptFixture(multilingualFixture.original);
+    const spanish = normalizeTranscriptFixture(multilingualFixture.spanish);
+    const identity = {
+      projectId: "019fbb95-cd76-7920-93fa-e23ba755e601",
+      catalogVideoId: "019fbb95-cd76-7920-93fa-e23ba755e602",
+      baseTranscriptVersionId: "019fbb95-cd76-7920-93fa-e23ba755e603",
+      originalTrackId: original.track.id,
+      originalContentSha256: original.track.contentSha256,
+      targetLanguage: "es-MX",
+      provider: spanish.track.provider,
+      normalizationSchemaVersion: spanish.track.schemaVersion,
+    };
+    const encoded = JSON.stringify(spanish);
+    index.promoteDerivedTranslation({
+      identity,
+      translationVersionId: "019fbb95-cd76-7920-93fa-e23ba755e604",
+      manifestSha256: "a".repeat(64),
+      normalizedSha256: createHash("sha256").update(encoded).digest("hex"),
+      transcript: spanish,
+    });
+    expect(index.findDerivedTranslation(identity)).toEqual(spanish);
+    expect(
+      index.findDerivedTranslation({
+        ...identity,
+        baseTranscriptVersionId: "019fbb95-cd76-7920-93fa-e23ba755e605",
+      }),
+    ).toBeUndefined();
+    database
+      .prepare(
+        "UPDATE derived_translation_cache SET normalized_sha256 = ? WHERE translation_version_id = ?",
+      )
+      .run("b".repeat(64), "019fbb95-cd76-7920-93fa-e23ba755e604");
+    expect(index.findDerivedTranslation(identity)).toBeUndefined();
+    database.close();
+  });
+
   it("widens the final-artifact role vocabulary in 0012 without rewriting existing rows", () => {
     const directory = mkdtempSync(
       join(tmpdir(), "research-video-sqlite-0012-"),
@@ -310,6 +360,7 @@ describe("local migrations", () => {
 
     expect(runLocalMigrations(database, localMigrationDirectory)).toEqual([
       "0012_export_clip_package_manifest",
+      "0013_preferred_translation_cache",
     ]);
     expect(
       database.prepare("SELECT * FROM export_final_artifacts").all(),

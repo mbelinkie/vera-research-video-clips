@@ -7,21 +7,29 @@ import {
   ExportPresetSnapshotSchema,
   ExportRequestSchema,
   ProjectSchema,
+  TranscriptSelectionSchema,
+  UserSchema,
+  languagesEquivalent,
   type ClipCandidate,
+  type NormalizedTranscript,
   type Project,
   type TranscriptSelection,
+  type User,
 } from "@research-video/contracts";
 import { normalizeYouTubeUrl } from "@research-video/providers";
 import {
   deriveTranscriptSelection,
+  buildClipLanguageEvidence,
   normalizeTranscriptFixture,
   searchTranscript,
   segmentAtTime,
   timedTranscriptTokens,
+  transcriptTextForTimeRange,
   tokenAtTime,
   updateTranscriptSelectionExportBounds,
 } from "@research-video/transcript";
 import transcriptFixture from "../../../tests/fixtures/transcripts/english-word.json" with { type: "json" };
+import multilingualFixture from "../../../tests/fixtures/transcripts/romanian-multilingual.json" with { type: "json" };
 
 import "./styles.css";
 import { BatchWorkspace } from "./batch-workspace.tsx";
@@ -29,6 +37,7 @@ import { YouTubePlayer, type YouTubePlayerHandle } from "./youtube-player.tsx";
 import { VirtualTranscript } from "./virtual-transcript.tsx";
 
 const demoVideoId = "M7lc1UVf-VE";
+const multilingualDemoVideoId = "Romanian001";
 const demoUrl = `https://www.youtube.com/watch?v=${demoVideoId}`;
 
 function formatTime(milliseconds: number) {
@@ -40,6 +49,38 @@ function formatTime(milliseconds: number) {
 
 function formatPreciseTime(milliseconds: number) {
   return `${(milliseconds / 1_000).toFixed(3)}s`;
+}
+
+function mapSelectionToTranscript(
+  selection: TranscriptSelection,
+  transcript: NormalizedTranscript,
+): TranscriptSelection {
+  const segments = transcript.segments.filter(
+    (segment) =>
+      segment.endMs > selection.transcriptStartMs &&
+      segment.startMs < selection.transcriptEndMs,
+  );
+  const first = segments[0];
+  const last = segments.at(-1);
+  if (!first || !last) {
+    throw new Error("The selected time range is unavailable in this view.");
+  }
+  return TranscriptSelectionSchema.parse({
+    trackId: transcript.track.id,
+    transcriptVersion: transcript.track.version,
+    firstSegmentId: first.id,
+    lastSegmentId: last.id,
+    transcriptStartMs: selection.transcriptStartMs,
+    transcriptEndMs: selection.transcriptEndMs,
+    exportStartMs: selection.exportStartMs,
+    exportEndMs: selection.exportEndMs,
+    text: transcriptTextForTimeRange(
+      transcript,
+      selection.transcriptStartMs,
+      selection.transcriptEndMs,
+    ),
+    timingPrecision: transcript.track.timingPrecision,
+  });
 }
 
 function App() {
@@ -55,6 +96,14 @@ function App() {
   const [selectionError, setSelectionError] = useState<string>();
   const [previewingSelection, setPreviewingSelection] = useState(false);
   const [authorization, setAuthorization] = useState("");
+  const [user, setUser] = useState<User>();
+  const [preferredLanguageDraft, setPreferredLanguageDraft] = useState("en");
+  const [preferenceMessage, setPreferenceMessage] = useState(
+    "Connect a session to load your account preference.",
+  );
+  const [transcriptView, setTranscriptView] = useState<
+    "preferred" | "english" | "original"
+  >("preferred");
   const [projects, setProjects] = useState<Project[]>([]);
   const [projectId, setProjectId] = useState("");
   const [creatingProject, setCreatingProject] = useState(false);
@@ -87,13 +136,57 @@ function App() {
   const [omitEnglishSubtitles, setOmitEnglishSubtitles] = useState(false);
   const [embedEnglishSubtitles, setEmbedEnglishSubtitles] = useState(false);
   const playerRef = useRef<YouTubePlayerHandle>(null);
-  const transcript = useMemo(() => {
-    if (videoId !== demoVideoId) return undefined;
-    return normalizeTranscriptFixture({
-      ...transcriptFixture,
-      track: { ...transcriptFixture.track, videoId: demoVideoId },
-    });
+  const transcriptTracks = useMemo(() => {
+    if (videoId === demoVideoId) {
+      const english = normalizeTranscriptFixture({
+        ...transcriptFixture,
+        track: { ...transcriptFixture.track, videoId: demoVideoId },
+      });
+      return { original: english, english, translations: [] };
+    }
+    if (videoId === multilingualDemoVideoId) {
+      return {
+        original: normalizeTranscriptFixture(multilingualFixture.original),
+        english: normalizeTranscriptFixture(multilingualFixture.english),
+        translations: [normalizeTranscriptFixture(multilingualFixture.spanish)],
+      };
+    }
+    return undefined;
   }, [videoId]);
+  const preferredTranscript = useMemo(() => {
+    if (!transcriptTracks || !user) return undefined;
+    if (
+      languagesEquivalent(
+        transcriptTracks.original.track.language,
+        user.preferredLanguage,
+      )
+    ) {
+      return transcriptTracks.original;
+    }
+    if (languagesEquivalent(user.preferredLanguage, "en")) {
+      return transcriptTracks.english;
+    }
+    return transcriptTracks.translations.find((candidate) =>
+      languagesEquivalent(candidate.track.language, user.preferredLanguage),
+    );
+  }, [transcriptTracks, user]);
+  const transcript = useMemo(() => {
+    if (!transcriptTracks) return undefined;
+    if (transcriptView === "original") return transcriptTracks.original;
+    if (transcriptView === "english") return transcriptTracks.english;
+    return preferredTranscript ?? transcriptTracks.english;
+  }, [preferredTranscript, transcriptTracks, transcriptView]);
+  const preferredEvidenceRequired = Boolean(
+    transcriptTracks &&
+    user &&
+    !languagesEquivalent(user.preferredLanguage, "en") &&
+    !languagesEquivalent(
+      user.preferredLanguage,
+      transcriptTracks.original.track.language,
+    ),
+  );
+  const languageEvidenceReady =
+    !preferredEvidenceRequired || Boolean(preferredTranscript);
   const visibleSegments = useMemo(
     () => searchTranscript(transcript?.segments ?? [], query),
     [query, transcript],
@@ -159,6 +252,64 @@ function App() {
   useEffect(() => setMatchIndex(0), [query, videoId]);
 
   useEffect(() => {
+    if (!authorization) {
+      setUser(undefined);
+      setPreferredLanguageDraft("en");
+      return;
+    }
+    void fetch("/cloud-api/api/session/profile", {
+      headers: { accept: "application/json", authorization },
+    })
+      .then(async (response) => {
+        const payload = await response.json();
+        if (!response.ok) throw new Error("Unable to load account settings.");
+        return UserSchema.parse(payload);
+      })
+      .then((profile) => {
+        setUser(profile);
+        setPreferredLanguageDraft(profile.preferredLanguage);
+        setPreferenceMessage(
+          `Preferred transcript language: ${profile.preferredLanguage}.`,
+        );
+      })
+      .catch((caught: unknown) => {
+        setUser(undefined);
+        setPreferenceMessage(
+          caught instanceof Error
+            ? caught.message
+            : "Unable to load account settings.",
+        );
+      });
+  }, [authorization]);
+
+  const previousTranscriptTrackId = useRef<string | undefined>(undefined);
+  useEffect(() => {
+    const previous = previousTranscriptTrackId.current;
+    previousTranscriptTrackId.current = transcript?.track.id;
+    if (
+      !selection ||
+      !transcript ||
+      !previous ||
+      previous === transcript.track.id
+    )
+      return;
+    try {
+      setSelection(mapSelectionToTranscript(selection, transcript));
+      setSelectionError(undefined);
+      setSelectionCommandId(crypto.randomUUID());
+      setLoggedClipId(undefined);
+      setLoggedExportRequestId(undefined);
+    } catch (caught) {
+      setSelection(undefined);
+      setSelectionError(
+        caught instanceof Error
+          ? caught.message
+          : "Reselect this passage in the new language view.",
+      );
+    }
+  }, [selection, transcript]);
+
+  useEffect(() => {
     if (
       !previewingSelection ||
       !selection ||
@@ -174,6 +325,45 @@ function App() {
     loadVideoUrl(url);
   }
 
+  async function savePreferredLanguage() {
+    if (!authorization) return;
+    try {
+      const response = await fetch("/cloud-api/api/session/profile", {
+        method: "PATCH",
+        headers: {
+          accept: "application/json",
+          authorization,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ preferredLanguage: preferredLanguageDraft }),
+      });
+      const payload = await response.json().catch(() => undefined);
+      if (!response.ok) {
+        const parsed = ApiErrorSchema.safeParse(payload);
+        throw new Error(
+          parsed.success
+            ? parsed.data.error.message
+            : "Unable to save preferred language.",
+        );
+      }
+      const profile = UserSchema.parse(payload);
+      setUser(profile);
+      setPreferredLanguageDraft(profile.preferredLanguage);
+      setTranscriptView("preferred");
+      setSelection(undefined);
+      setSelectionCommandId(crypto.randomUUID());
+      setPreferenceMessage(
+        `Saved ${profile.preferredLanguage}. Existing logged clips are unchanged.`,
+      );
+    } catch (caught) {
+      setPreferenceMessage(
+        caught instanceof Error
+          ? caught.message
+          : "Unable to save preferred language.",
+      );
+    }
+  }
+
   function loadVideoUrl(nextUrl: string) {
     try {
       const normalized = normalizeYouTubeUrl(nextUrl);
@@ -182,6 +372,7 @@ function App() {
       setCurrentMs(0);
       setLastSeekMs(undefined);
       setQuery("");
+      setTranscriptView("preferred");
       setSelection(undefined);
       setSelectionError(undefined);
       setPreviewingSelection(false);
@@ -295,8 +486,25 @@ function App() {
   }
 
   async function queueClipOnly(): Promise<ClipCandidate | undefined> {
-    if (!authorization || !projectId || !videoId || !selection)
+    if (
+      !authorization ||
+      !projectId ||
+      !videoId ||
+      !selection ||
+      !transcriptTracks ||
+      !user ||
+      !languageEvidenceReady
+    )
       return undefined;
+    const languageEvidence = buildClipLanguageEvidence({
+      original: transcriptTracks.original,
+      english: transcriptTracks.english,
+      ...(preferredEvidenceRequired && preferredTranscript
+        ? { preferred: preferredTranscript }
+        : {}),
+      startMs: selection.transcriptStartMs,
+      endMs: selection.transcriptEndMs,
+    });
     setClipActionBusy(true);
     try {
       const response = await fetch(
@@ -316,10 +524,13 @@ function App() {
               title:
                 videoId === demoVideoId
                   ? "YouTube IFrame API demo"
-                  : `YouTube video ${videoId}`,
+                  : videoId === multilingualDemoVideoId
+                    ? "Romanian multilingual proof fixture"
+                    : `YouTube video ${videoId}`,
+              sourceLanguage: transcriptTracks.original.track.language,
             },
             selection,
-            englishText: selection.text,
+            languageEvidence,
             notes: clipNotes,
             tags: clipTags
               .split(/[,\n]/u)
@@ -352,7 +563,7 @@ function App() {
   }
 
   async function requestLoggedExport() {
-    if (!authorization || !projectId || !selection) return;
+    if (!authorization || !projectId || !selection || !transcriptTracks) return;
     const clipId =
       loggedClipId ?? (await queueClipOnly().then((clip) => clip?.id));
     if (!clipId) return;
@@ -369,7 +580,30 @@ function App() {
           },
           body: JSON.stringify({
             idempotencyKey: `logged-export:${selectionCommandId}`,
-            sourceLanguageClass: "confirmed_english",
+            sourceLanguageClass:
+              transcriptTracks.original.track.id ===
+                transcriptTracks.english.track.id &&
+              languagesEquivalent(
+                transcriptTracks.original.track.language,
+                "en",
+              )
+                ? "confirmed_english"
+                : "foreign",
+            ...(transcriptTracks.original.track.id ===
+            transcriptTracks.english.track.id
+              ? {}
+              : {
+                  subtitleTracks: {
+                    original: {
+                      trackId: transcriptTracks.original.track.id,
+                      trackVersion: transcriptTracks.original.track.version,
+                    },
+                    english: {
+                      trackId: transcriptTracks.english.track.id,
+                      trackVersion: transcriptTracks.english.track.version,
+                    },
+                  },
+                }),
             preset: exportPreset,
           }),
         },
@@ -400,7 +634,7 @@ function App() {
   }
 
   async function requestExportOnly() {
-    if (!videoId || !selection) return;
+    if (!videoId || !selection || !transcriptTracks) return;
     setClipActionBusy(true);
     try {
       const response = await fetch("/local-agent/api/exports", {
@@ -417,10 +651,33 @@ function App() {
             title:
               videoId === demoVideoId
                 ? "YouTube IFrame API demo"
-                : `YouTube video ${videoId}`,
+                : videoId === multilingualDemoVideoId
+                  ? "Romanian multilingual proof fixture"
+                  : `YouTube video ${videoId}`,
+            sourceLanguage: transcriptTracks.original.track.language,
           },
           selection,
-          sourceLanguageClass: "confirmed_english",
+          sourceLanguageClass:
+            transcriptTracks.original.track.id ===
+              transcriptTracks.english.track.id &&
+            languagesEquivalent(transcriptTracks.original.track.language, "en")
+              ? "confirmed_english"
+              : "foreign",
+          ...(transcriptTracks.original.track.id ===
+          transcriptTracks.english.track.id
+            ? {}
+            : {
+                subtitleTracks: {
+                  original: {
+                    trackId: transcriptTracks.original.track.id,
+                    trackVersion: transcriptTracks.original.track.version,
+                  },
+                  english: {
+                    trackId: transcriptTracks.english.track.id,
+                    trackVersion: transcriptTracks.english.track.version,
+                  },
+                },
+              }),
           preset: exportPreset,
         }),
       });
@@ -486,7 +743,7 @@ function App() {
           <p className="eyebrow">Research video workspace</p>
           <h1>Navigate video by transcript</h1>
         </div>
-        <span className="status">Milestone 4 in progress</span>
+        <span className="status">Multilingual clip logging</span>
       </header>
 
       <form
@@ -512,17 +769,80 @@ function App() {
         </p>
       </form>
 
+      <section
+        className="loader account-settings"
+        aria-label="Account settings"
+      >
+        <label htmlFor="preferred-language">
+          Preferred transcript language
+        </label>
+        <div className="loader-row">
+          <input
+            id="preferred-language"
+            value={preferredLanguageDraft}
+            maxLength={35}
+            disabled={!authorization}
+            onChange={(event) => setPreferredLanguageDraft(event.target.value)}
+            placeholder="en, fr-CA, zh-Hant…"
+          />
+          <button
+            type="button"
+            disabled={!authorization || !preferredLanguageDraft.trim()}
+            onClick={() => void savePreferredLanguage()}
+          >
+            Save preference
+          </button>
+        </div>
+        <p className="form-message" role="status">
+          {preferenceMessage}
+        </p>
+      </section>
+
       <section className="workspace" aria-label="Research workspace">
         <article className="panel transcript-panel">
           <div className="panel-heading">
             <div>
-              <span>English transcript</span>
+              <span>
+                {transcript
+                  ? `${transcript.track.language} transcript`
+                  : "Transcript"}
+              </span>
               {transcript ? (
                 <span className="precision">
                   {transcript.track.timingPrecision} timing
                 </span>
               ) : null}
             </div>
+            {transcriptTracks ? (
+              <label className="transcript-view-picker">
+                Language view
+                <select
+                  value={transcriptView}
+                  onChange={(event) =>
+                    setTranscriptView(
+                      event.target.value as
+                        "preferred" | "english" | "original",
+                    )
+                  }
+                >
+                  <option
+                    value="preferred"
+                    disabled={preferredEvidenceRequired && !preferredTranscript}
+                  >
+                    Preferred{user ? ` (${user.preferredLanguage})` : ""}
+                  </option>
+                  <option value="english">English</option>
+                  {!languagesEquivalent(
+                    transcriptTracks.original.track.language,
+                    "en",
+                  ) ? (
+                    <option value="original">
+                      Original ({transcriptTracks.original.track.language})
+                    </option>
+                  ) : null}
+                </select>
+              </label>
+            ) : null}
             <button
               className="quiet-button"
               type="button"
@@ -536,9 +856,17 @@ function App() {
           {transcript ? (
             <>
               <div className="fixture-warning">
-                Navigation fixture for the API demo—not a transcript of the
-                video.
+                {videoId === multilingualDemoVideoId
+                  ? "Romanian → English + Spanish deterministic proof fixture."
+                  : "Navigation fixture for the API demo—not a transcript of the video."}
               </div>
+              {preferredEvidenceRequired && !preferredTranscript ? (
+                <p className="form-message error" role="status">
+                  Preferred translation unavailable for{" "}
+                  {user?.preferredLanguage}. Original and English remain
+                  available; logging waits for the required preferred evidence.
+                </p>
+              ) : null}
               <div className="search-field">
                 <label htmlFor="transcript-search">Search transcript</label>
                 <input
@@ -974,7 +1302,9 @@ function App() {
                     clipActionBusy ||
                     Boolean(loggedClipId) ||
                     !authorization ||
-                    !projectId
+                    !projectId ||
+                    !user ||
+                    !languageEvidenceReady
                   }
                   onClick={() => void queueClipOnly()}
                 >
@@ -986,7 +1316,9 @@ function App() {
                     clipActionBusy ||
                     Boolean(loggedExportRequestId) ||
                     !authorization ||
-                    !projectId
+                    !projectId ||
+                    !user ||
+                    !languageEvidenceReady
                   }
                   onClick={() => void requestLoggedExport()}
                 >

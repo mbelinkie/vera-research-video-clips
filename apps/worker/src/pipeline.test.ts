@@ -11,10 +11,16 @@ import type {
   FinalizedObject,
   TranscriptUploadGrant,
 } from "@research-video/contracts";
-import { normalizeGeneratedTranscript } from "@research-video/transcript";
+import { DerivedTranslationSchema } from "@research-video/contracts";
+import {
+  normalizeGeneratedTranscript,
+  normalizeTranscriptFixture,
+} from "@research-video/transcript";
+import multilingualFixture from "../../../tests/fixtures/transcripts/romanian-multilingual.json" with { type: "json" };
 
 import {
   createTranscriptPipelineExecutor,
+  executeDerivedTranslation,
   type TranscriptPublicationClient,
 } from "./pipeline.ts";
 
@@ -27,6 +33,85 @@ afterEach(async () => {
     ),
   );
   temporaryDirectories.clear();
+});
+
+describe("supplemental preferred translation worker", () => {
+  it("translates directly from Romanian once and publishes a Spanish derivative", async () => {
+    const original = normalizeTranscriptFixture(multilingualFixture.original);
+    const projectId = randomUUID();
+    const catalogVideoId = randomUUID();
+    const baseTranscriptVersionId = randomUUID();
+    const identity = {
+      projectId,
+      catalogVideoId,
+      baseTranscriptVersionId,
+      originalTrackId: original.track.id,
+      originalContentSha256: original.track.contentSha256,
+      targetLanguage: "es",
+      provider: "fixture-translation",
+      normalizationSchemaVersion: 1,
+    };
+    const translate = vi.fn(
+      async (input: {
+        segments: ReadonlyArray<{ id: string; text: string }>;
+      }) => ({
+        provider: "fixture-translation",
+        segments: input.segments.map((segment, index) => ({
+          sourceSegmentId: segment.id,
+          text:
+            index === 0
+              ? "Este es un ejemplo rumano."
+              : "La selección permanece vinculada por tiempo.",
+        })),
+      }),
+    );
+    const publish = vi.fn(async (input) =>
+      DerivedTranslationSchema.parse({
+        manifest: {
+          schemaVersion: 1,
+          id: randomUUID(),
+          lineageId: randomUUID(),
+          version: 1,
+          identity,
+          translatedTrackId: input.transcript.track.id,
+          translatedTrackVersion: input.transcript.track.version,
+          sourceTrackId: original.track.id,
+          timingPrecision: "cue",
+          idempotencyKey: input.idempotencyKey,
+          createdBy: randomUUID(),
+          createdAt: new Date().toISOString(),
+          artifacts: [
+            {
+              type: "translated-normalized",
+              objectKey: "fixture/translated.normalized.json",
+              objectVersionId: "v1",
+              byteSize: 123,
+              sha256: "a".repeat(64),
+            },
+          ],
+        },
+        transcript: input.transcript,
+      }),
+    );
+    const result = await executeDerivedTranslation({
+      identity,
+      idempotencyKey: "preferred:romanian:spanish",
+      original,
+      translation: { translate },
+      publication: { publish },
+    });
+    expect(translate).toHaveBeenCalledOnce();
+    expect(translate.mock.calls[0]?.[0]).toMatchObject({
+      sourceLanguage: "ro",
+      targetLanguage: "es",
+    });
+    expect(result.transcript.track).toMatchObject({
+      kind: "translation",
+      language: "es",
+      sourceTrackId: original.track.id,
+    });
+    expect(publish).toHaveBeenCalledOnce();
+  });
 });
 
 function claimedJob(): ClaimedTranscriptionJob {

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   BatchPreflightRequestSchema,
+  ClipLanguageEvidenceV2Schema,
   CreateClipExportRequestSchema,
   CreateTranscriptionBatchRequestSchema,
   ExportClipManifestSchema,
@@ -10,8 +11,11 @@ import {
   HealthResponseSchema,
   JobSchema,
   ProjectSchema,
+  TranscriptTrackSchema,
   TranscriptionBatchControlRequestSchema,
   UpdateReviewStatusRequestSchema,
+  UpdatePreferredLanguageRequestSchema,
+  languagesEquivalent,
 } from "./index.ts";
 
 const now = "2026-08-01T12:00:00.000Z";
@@ -54,6 +58,85 @@ describe("shared contracts", () => {
         timestamp: now,
       }).success,
     ).toBe(true);
+  });
+
+  it("normalizes BCP-47 account preferences and compares primary languages", () => {
+    expect(
+      UpdatePreferredLanguageRequestSchema.parse({
+        preferredLanguage: "ES_mx",
+      }),
+    ).toEqual({ preferredLanguage: "es-MX" });
+    expect(languagesEquivalent("en-US", "en-GB")).toBe(true);
+    expect(
+      UpdatePreferredLanguageRequestSchema.safeParse({
+        preferredLanguage: "not a language",
+      }).success,
+    ).toBe(false);
+  });
+
+  it("requires strict native, English, and distinct direct preferred evidence", () => {
+    const nativeTrackId = id;
+    const englishTrackId = "019fbb95-cd76-7920-93fa-e23ba755ee40";
+    const preferredTrackId = "019fbb95-cd76-7920-93fa-e23ba755ee41";
+    const evidence = {
+      schemaVersion: 2,
+      native: {
+        role: "native",
+        language: "ro",
+        text: "Un exemplu",
+        trackId: nativeTrackId,
+        trackVersion: 1,
+        timingPrecision: "cue",
+      },
+      english: {
+        role: "english",
+        language: "en-GB",
+        text: "An example",
+        trackId: englishTrackId,
+        trackVersion: 1,
+        sourceTrackId: nativeTrackId,
+        timingPrecision: "cue",
+      },
+      preferred: {
+        role: "preferred",
+        language: "es-MX",
+        text: "Un ejemplo",
+        trackId: preferredTrackId,
+        trackVersion: 1,
+        sourceTrackId: nativeTrackId,
+        timingPrecision: "cue",
+      },
+    };
+    expect(ClipLanguageEvidenceV2Schema.parse(evidence)).toMatchObject({
+      preferred: { language: "es-MX" },
+    });
+    expect(
+      ClipLanguageEvidenceV2Schema.safeParse({
+        ...evidence,
+        preferred: { ...evidence.preferred, language: "en" },
+      }).success,
+    ).toBe(false);
+    expect(
+      ClipLanguageEvidenceV2Schema.safeParse({
+        ...evidence,
+        preferred: { ...evidence.preferred, sourceTrackId: englishTrackId },
+      }).success,
+    ).toBe(false);
+    expect(
+      TranscriptTrackSchema.parse({
+        id: preferredTrackId,
+        videoId: "Romanian001",
+        language: "es",
+        kind: "translation",
+        source: "translated",
+        provider: "fixture",
+        sourceTrackId: nativeTrackId,
+        timingPrecision: "cue",
+        schemaVersion: 1,
+        contentSha256: "a".repeat(64),
+        version: 1,
+      }).kind,
+    ).toBe("translation");
   });
 
   it("defaults bounded batch requests to local shared-first processing", () => {

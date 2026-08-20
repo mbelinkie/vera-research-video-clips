@@ -1,5 +1,5 @@
 import { readdirSync, readFileSync } from "node:fs";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { basename, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
@@ -8,7 +8,10 @@ import {
   CreateExportOnlyRequestSchema,
   ExportRequestSchema,
   NormalizedTranscriptSchema,
+  languagesEquivalent,
+  primaryLanguage,
   type CreateExportOnlyRequest,
+  type DerivedTranslationIdentity,
   type ExportRequest,
   type NormalizedTranscript,
 } from "@research-video/contracts";
@@ -1293,6 +1296,150 @@ export class LocalTranscriptIndex {
     videoId: string;
   }): NormalizedTranscript | undefined {
     return this.findExact(input, "original");
+  }
+
+  promoteDerivedTranslation(input: {
+    identity: DerivedTranslationIdentity;
+    translationVersionId: string;
+    manifestSha256: string;
+    normalizedSha256: string;
+    transcript: NormalizedTranscript;
+  }): NormalizedTranscript {
+    const transcript = NormalizedTranscriptSchema.parse(input.transcript);
+    if (
+      transcript.track.kind !== "translation" ||
+      transcript.track.sourceTrackId !== input.identity.originalTrackId ||
+      !languagesEquivalent(
+        transcript.track.language,
+        input.identity.targetLanguage,
+      ) ||
+      transcript.track.provider !== input.identity.provider ||
+      (transcript.track.model ?? null) !== (input.identity.model ?? null) ||
+      transcript.track.schemaVersion !==
+        input.identity.normalizationSchemaVersion
+    ) {
+      throw new Error(
+        "Derived translation does not match its exact cache identity.",
+      );
+    }
+    const encoded = JSON.stringify(transcript);
+    const encodedSha256 = createHash("sha256").update(encoded).digest("hex");
+    if (
+      !/^[a-f0-9]{64}$/u.test(input.manifestSha256) ||
+      encodedSha256 !== input.normalizedSha256
+    ) {
+      throw new Error("Derived translation checksum verification failed.");
+    }
+    this.database.exec("BEGIN IMMEDIATE;");
+    try {
+      this.database
+        .prepare(
+          `DELETE FROM derived_translation_cache
+           WHERE project_id = ? AND catalog_video_id = ?
+             AND base_transcript_version_id = ? AND original_track_id = ?
+             AND original_content_sha256 = ? AND target_primary_language = ?
+             AND provider = ? AND COALESCE(model, '') = COALESCE(?, '')
+             AND normalization_schema_version = ?`,
+        )
+        .run(
+          input.identity.projectId,
+          input.identity.catalogVideoId,
+          input.identity.baseTranscriptVersionId,
+          input.identity.originalTrackId,
+          input.identity.originalContentSha256,
+          primaryLanguage(input.identity.targetLanguage),
+          input.identity.provider,
+          input.identity.model ?? null,
+          input.identity.normalizationSchemaVersion,
+        );
+      this.database
+        .prepare(
+          `INSERT INTO derived_translation_cache
+             (translation_version_id, project_id, catalog_video_id,
+              base_transcript_version_id, original_track_id,
+              original_content_sha256, target_language,
+              target_primary_language, provider, model,
+              normalization_schema_version, translated_track_id,
+              translated_track_version, manifest_sha256, normalized_sha256,
+              normalized_transcript_json, promoted_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          input.translationVersionId,
+          input.identity.projectId,
+          input.identity.catalogVideoId,
+          input.identity.baseTranscriptVersionId,
+          input.identity.originalTrackId,
+          input.identity.originalContentSha256,
+          input.identity.targetLanguage,
+          primaryLanguage(input.identity.targetLanguage),
+          input.identity.provider,
+          input.identity.model ?? null,
+          input.identity.normalizationSchemaVersion,
+          transcript.track.id,
+          transcript.track.version,
+          input.manifestSha256,
+          input.normalizedSha256,
+          encoded,
+          this.now().toISOString(),
+        );
+      this.database.exec("COMMIT;");
+    } catch (error) {
+      this.database.exec("ROLLBACK;");
+      throw error;
+    }
+    return transcript;
+  }
+
+  findDerivedTranslation(
+    identity: DerivedTranslationIdentity,
+  ): NormalizedTranscript | undefined {
+    const row = this.database
+      .prepare(
+        `SELECT normalized_transcript_json, normalized_sha256,
+                translated_track_id, translated_track_version
+         FROM derived_translation_cache
+         WHERE project_id = ? AND catalog_video_id = ?
+           AND base_transcript_version_id = ? AND original_track_id = ?
+           AND original_content_sha256 = ? AND target_primary_language = ?
+           AND provider = ? AND COALESCE(model, '') = COALESCE(?, '')
+           AND normalization_schema_version = ?`,
+      )
+      .get(
+        identity.projectId,
+        identity.catalogVideoId,
+        identity.baseTranscriptVersionId,
+        identity.originalTrackId,
+        identity.originalContentSha256,
+        primaryLanguage(identity.targetLanguage),
+        identity.provider,
+        identity.model ?? null,
+        identity.normalizationSchemaVersion,
+      ) as Record<string, unknown> | undefined;
+    if (!row) return undefined;
+    const encoded = String(row.normalized_transcript_json);
+    if (
+      createHash("sha256").update(encoded).digest("hex") !==
+      row.normalized_sha256
+    ) {
+      return undefined;
+    }
+    let decoded: unknown;
+    try {
+      decoded = JSON.parse(encoded);
+    } catch {
+      return undefined;
+    }
+    const parsed = NormalizedTranscriptSchema.safeParse(decoded);
+    if (!parsed.success) return undefined;
+    const track = parsed.data.track;
+    return track.kind === "translation" &&
+      track.id === row.translated_track_id &&
+      track.version === Number(row.translated_track_version) &&
+      track.sourceTrackId === identity.originalTrackId &&
+      languagesEquivalent(track.language, identity.targetLanguage)
+      ? parsed.data
+      : undefined;
   }
 
   private findExact(

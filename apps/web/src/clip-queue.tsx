@@ -74,6 +74,15 @@ export function ClipQueue({
       return [
         clip.video.title,
         clip.englishText,
+        clip.originalText ?? "",
+        ...(clip.languageEvidence.schemaVersion === 2
+          ? [
+              clip.languageEvidence.native.text,
+              clip.languageEvidence.english.text,
+              clip.languageEvidence.preferred?.text ?? "",
+              clip.languageEvidence.preferred?.language ?? "",
+            ]
+          : []),
         clip.notes,
         ...clip.tags,
       ].some((value) => value.toLocaleLowerCase().includes(normalizedQuery));
@@ -248,7 +257,30 @@ export function ClipQueue({
                     </button>
                   </div>
                 </div>
-                <blockquote>{clip.englishText}</blockquote>
+                {clip.languageEvidence.schemaVersion === 2 ? (
+                  <div className="clip-language-evidence">
+                    <blockquote>
+                      <strong>
+                        Native ({clip.languageEvidence.native.language})
+                      </strong>
+                      {clip.languageEvidence.native.text}
+                    </blockquote>
+                    <blockquote>
+                      <strong>English</strong>
+                      {clip.languageEvidence.english.text}
+                    </blockquote>
+                    {clip.languageEvidence.preferred ? (
+                      <blockquote>
+                        <strong>
+                          Preferred ({clip.languageEvidence.preferred.language})
+                        </strong>
+                        {clip.languageEvidence.preferred.text}
+                      </blockquote>
+                    ) : null}
+                  </div>
+                ) : (
+                  <blockquote>{clip.englishText}</blockquote>
+                )}
                 {editing ? (
                   <div className="clip-edit-form">
                     <label>

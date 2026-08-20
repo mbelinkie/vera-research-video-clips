@@ -88,6 +88,21 @@ test("maps transcript text selection to stable source and export bounds", async 
   let loggedExportPostCount = 0;
   let exportOnlyPostCount = 0;
   let loggedClip: Record<string, unknown> | undefined;
+  let lastClipBody: Record<string, any> | undefined;
+  await page.route("**/cloud-api/api/session/profile", async (route) => {
+    const request = route.request();
+    const body = request.method() === "PATCH" ? request.postDataJSON() : {};
+    return route.fulfill({
+      json: {
+        id: "019fbb95-cd76-7920-93fa-e23ba755ee36",
+        externalSubject: "fixture:e2e-user",
+        displayName: "E2E User",
+        preferredLanguage: body.preferredLanguage ?? "en",
+        createdAt: now,
+        updatedAt: now,
+      },
+    });
+  });
   await page.route("**/cloud-api/api/projects**", async (route) => {
     const request = route.request();
     const path = new URL(request.url()).pathname;
@@ -121,13 +136,19 @@ test("maps transcript text selection to stable source and export bounds", async 
       }
       clipPostCount += 1;
       const body = request.postDataJSON();
+      lastClipBody = body;
       loggedClip = {
         id: "019fbb95-cd76-7920-93fa-e23ba755ee42",
         projectId: createdProjectId,
         catalogVideoId: "019fbb95-cd76-7920-93fa-e23ba755ee43",
         video: body.video,
         selection: body.selection,
-        englishText: body.englishText,
+        languageEvidence: body.languageEvidence,
+        englishText: body.languageEvidence.english.text,
+        ...(body.languageEvidence.native.trackId ===
+        body.languageEvidence.english.trackId
+          ? {}
+          : { originalText: body.languageEvidence.native.text }),
         notes: body.notes,
         tags: ["Opening", "Person: Ada"],
         researchStatus: "candidate",
@@ -363,6 +384,73 @@ test("maps transcript text selection to stable source and export bounds", async 
     page.getByRole("button", { name: "Export-only queued" }),
   ).toBeDisabled();
   expect(exportOnlyPostCount).toBe(1);
+
+  await page.getByLabel("Preferred transcript language").fill("es-MX");
+  await page.getByRole("button", { name: "Save preference" }).click();
+  await expect(page.getByLabel("Account settings")).toContainText(
+    "Saved es-MX. Existing logged clips are unchanged.",
+  );
+  await page.getByLabel("YouTube URL or video ID").fill("Romanian001");
+  await page.getByRole("button", { name: "Load video" }).click();
+  await expect(page.getByText("es transcript")).toBeVisible();
+  await expect(page.getByText(/Romanian → English \+ Spanish/u)).toBeVisible();
+  await page.getByLabel("Search transcript").fill("vinculada");
+  await expect(page.getByText(/La selección permanece/u)).toBeVisible();
+  await page.getByLabel("Search transcript").fill("");
+  await page.evaluate(() => {
+    const rows = Array.from(
+      document.querySelectorAll<HTMLElement>(
+        "[data-testid=transcript-window-row]",
+      ),
+    );
+    const anchor = rows[0]?.querySelector<HTMLElement>(".transcript-text span");
+    const focus = rows[1]?.querySelector<HTMLElement>(".transcript-text span");
+    if (!anchor?.firstChild || !focus?.firstChild || !focus.textContent) {
+      throw new Error("Expected multilingual cue rows.");
+    }
+    const range = document.createRange();
+    range.setStart(anchor.firstChild, 0);
+    range.setEnd(focus.firstChild, focus.textContent.length);
+    const selection = window.getSelection();
+    selection?.removeAllRanges();
+    selection?.addRange(range);
+    focus.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+  });
+  await expect(page.getByLabel("Clip selection")).toContainText(
+    "Este es un ejemplo rumano. La selección permanece vinculada por tiempo.",
+  );
+  await page.getByLabel("Language view").selectOption("english");
+  await expect(page.getByLabel("Clip selection")).toContainText(
+    "This is a Romanian example. The selection stays linked by time.",
+  );
+  await expect(page.getByLabel("Clip selection")).toContainText(
+    "Transcript selection: 0.000s–4.000s",
+  );
+  await page.getByLabel("Language view").selectOption("preferred");
+  await page.getByRole("button", { name: "Queue / log only" }).click();
+  expect(clipPostCount).toBe(2);
+  expect(lastClipBody?.languageEvidence).toMatchObject({
+    schemaVersion: 2,
+    native: { language: "ro" },
+    english: { language: "en" },
+    preferred: { language: "es" },
+  });
+  expect(lastClipBody?.selection.trackId).toBe(
+    lastClipBody?.languageEvidence.preferred.trackId,
+  );
+  await clipQueue.getByLabel("Filter tag").selectOption("");
+  await clipQueue.getByLabel("Search clips").fill("");
+  await clipQueue.getByRole("button", { name: "Refresh" }).click();
+  await expect(clipQueue).toContainText("Native (ro)");
+  await expect(clipQueue).toContainText("English");
+  await expect(clipQueue).toContainText("Preferred (es)");
+  await expect(clipQueue).toContainText(
+    "La selección permanece vinculada por tiempo.",
+  );
+  await page.getByLabel("Preferred transcript language").fill("en");
+  await page.getByRole("button", { name: "Save preference" }).click();
+  await clipQueue.getByRole("button", { name: "Refresh" }).click();
+  await expect(clipQueue).toContainText("Preferred (es)");
 });
 
 test("connects an explicit project, controls a batch, and updates review state", async ({

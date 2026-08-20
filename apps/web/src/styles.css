@@ -191,6 +191,19 @@ h1 {
   gap: 10px;
 }
 
+.transcript-view-picker {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: #aeb4bf;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.transcript-view-picker select {
+  min-width: 112px;
+}
+
 .precision {
   padding: 4px 8px;
   border-color: #4b4330;
@@ -806,6 +819,15 @@ h1 {
   border-left: 2px solid #c49b50;
   color: #e2dfd7;
   line-height: 1.5;
+}
+
+.clip-language-evidence blockquote strong {
+  display: block;
+  margin-bottom: 3px;
+  color: #d8bd86;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
 }
 
 .clip-notes {

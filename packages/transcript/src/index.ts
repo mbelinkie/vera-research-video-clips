@@ -1,7 +1,12 @@
 import {
+  ClipLanguageEvidenceV2Schema,
   NormalizedTranscriptSchema,
   TranscriptSelectionSchema,
+  languagesEquivalent,
+  normalizeLanguageTag,
+  type ClipLanguageEvidenceV2,
   type NormalizedTranscript,
+  type PreferredTranscriptResolution,
   type TranscriptSegment,
   type TranscriptSelection,
   type TranscriptToken,
@@ -189,7 +194,9 @@ export async function normalizeTranslatedTranscript(input: {
       videoId: source.track.videoId,
       language: input.targetLanguage,
       kind:
-        primaryLanguage(input.targetLanguage) === "en" ? "english" : "original",
+        primaryLanguage(input.targetLanguage) === "en"
+          ? "english"
+          : "translation",
       source: "translated",
       provider: input.provider,
       ...(input.model ? { model: input.model } : {}),
@@ -345,6 +352,159 @@ export function searchTranscript(
   return segments.filter((segment) =>
     segment.text.toLocaleLowerCase().includes(normalizedQuery),
   );
+}
+
+export function transcriptTextForTimeRange(
+  transcript: NormalizedTranscript,
+  startMs: number,
+  endMs: number,
+): string {
+  const parsed = NormalizedTranscriptSchema.parse(transcript);
+  if (
+    !Number.isSafeInteger(startMs) ||
+    !Number.isSafeInteger(endMs) ||
+    startMs < 0 ||
+    endMs <= startMs
+  ) {
+    throw new Error("Transcript evidence bounds are invalid.");
+  }
+  const text = parsed.segments
+    .filter((segment) => segment.endMs > startMs && segment.startMs < endMs)
+    .map((segment) => segment.text.trim())
+    .filter(Boolean)
+    .join(" ")
+    .trim();
+  if (!text) {
+    throw new Error("The selected range has no transcript evidence.");
+  }
+  return text;
+}
+
+export function buildClipLanguageEvidence(input: {
+  original: NormalizedTranscript;
+  english: NormalizedTranscript;
+  preferred?: NormalizedTranscript;
+  startMs: number;
+  endMs: number;
+}): ClipLanguageEvidenceV2 {
+  const original = NormalizedTranscriptSchema.parse(input.original);
+  const english = NormalizedTranscriptSchema.parse(input.english);
+  if (!languagesEquivalent(english.track.language, "en")) {
+    throw new Error("Clip logging requires a canonical English track.");
+  }
+  if (
+    english.track.id !== original.track.id &&
+    english.track.sourceTrackId !== original.track.id
+  ) {
+    throw new Error("The English track is not linked to the native track.");
+  }
+  const preferred = input.preferred
+    ? NormalizedTranscriptSchema.parse(input.preferred)
+    : undefined;
+  const includePreferred =
+    preferred &&
+    !languagesEquivalent(preferred.track.language, "en") &&
+    !languagesEquivalent(preferred.track.language, original.track.language);
+  if (
+    includePreferred &&
+    (preferred.track.kind !== "translation" ||
+      preferred.track.sourceTrackId !== original.track.id)
+  ) {
+    throw new Error(
+      "The preferred track must be a direct translation of the native track.",
+    );
+  }
+  const snapshot = (
+    role: "native" | "english" | "preferred",
+    transcript: NormalizedTranscript,
+  ) => ({
+    role,
+    language: transcript.track.language,
+    text: transcriptTextForTimeRange(transcript, input.startMs, input.endMs),
+    trackId: transcript.track.id,
+    trackVersion: transcript.track.version,
+    ...(transcript.track.sourceTrackId
+      ? { sourceTrackId: transcript.track.sourceTrackId }
+      : {}),
+    timingPrecision: transcript.track.timingPrecision,
+  });
+  return ClipLanguageEvidenceV2Schema.parse({
+    schemaVersion: 2,
+    native: snapshot("native", original),
+    english: snapshot("english", english),
+    ...(includePreferred
+      ? { preferred: snapshot("preferred", preferred) }
+      : {}),
+  });
+}
+
+export async function resolvePreferredTranscript(input: {
+  preferredLanguage: string;
+  original: NormalizedTranscript;
+  english: NormalizedTranscript;
+  findLocal?: (
+    targetLanguage: string,
+  ) => Promise<NormalizedTranscript | undefined>;
+  findShared?: (
+    targetLanguage: string,
+  ) => Promise<NormalizedTranscript | undefined>;
+  requestTranslation?: (
+    targetLanguage: string,
+  ) => Promise<NormalizedTranscript | undefined>;
+}): Promise<PreferredTranscriptResolution> {
+  const preferredLanguage = normalizeLanguageTag(input.preferredLanguage);
+  const original = NormalizedTranscriptSchema.parse(input.original);
+  const english = NormalizedTranscriptSchema.parse(input.english);
+  if (languagesEquivalent(original.track.language, preferredLanguage)) {
+    return { state: "ready", source: "original", transcript: original };
+  }
+  if (languagesEquivalent(preferredLanguage, "en")) {
+    if (!languagesEquivalent(english.track.language, "en")) {
+      return {
+        state: "preferred_translation_unavailable",
+        targetLanguage: preferredLanguage,
+        reason: "The canonical English track is unavailable.",
+      };
+    }
+    return { state: "ready", source: "english", transcript: english };
+  }
+  const usable = (candidate: NormalizedTranscript | undefined) => {
+    if (!candidate) return undefined;
+    const parsed = NormalizedTranscriptSchema.safeParse(candidate);
+    if (!parsed.success) return undefined;
+    const track = parsed.data.track;
+    return track.kind === "translation" &&
+      track.sourceTrackId === original.track.id &&
+      languagesEquivalent(track.language, preferredLanguage)
+      ? parsed.data
+      : undefined;
+  };
+  const local = usable(await input.findLocal?.(preferredLanguage));
+  if (local) return { state: "ready", source: "local", transcript: local };
+  const shared = usable(await input.findShared?.(preferredLanguage));
+  if (shared) return { state: "ready", source: "shared", transcript: shared };
+  if (!input.requestTranslation) {
+    return { state: "needs_translation", targetLanguage: preferredLanguage };
+  }
+  try {
+    const generated = usable(await input.requestTranslation(preferredLanguage));
+    return generated
+      ? { state: "ready", source: "generated", transcript: generated }
+      : {
+          state: "preferred_translation_unavailable",
+          targetLanguage: preferredLanguage,
+          reason: "The translation provider returned no usable track.",
+        };
+  } catch (error) {
+    return {
+      state: "preferred_translation_unavailable",
+      targetLanguage: preferredLanguage,
+      reason:
+        error instanceof Error
+          ? error.message
+          : "The preferred translation is unavailable.",
+    };
+  }
 }
 
 export type TranscriptSelectionBoundary = {

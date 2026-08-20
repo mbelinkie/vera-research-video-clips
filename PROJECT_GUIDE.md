@@ -1216,6 +1216,21 @@ Eighteenth slice completed 2026-08-13. The shared project workspace now loads it
 
 Nineteenth slice completed 2026-08-13. The authorized project queue now downloads a CSV catalog keyed by stable project and clip IDs. Each record carries research/export status, video and transcript provenance, transcript and render boundaries, timing precision, English and original text, notes, tags, and timestamps. The endpoint is scoped by the same project membership checks as the queue, emits an attachment with RFC 4180 quoting and CRLF rows, and hardens spreadsheet-formula-looking cells before download. Projectless export-only jobs are deliberately excluded: this export represents the shared research log, not local technical work. API and browser tests cover the content, attachment response, authorization failure, and visible queue control.
 
+PL-01 completed 2026-08-20. A normalized self-only account preference now
+resolves an equivalent native or English track before any supplemental work,
+then reuses a checksum-verified local/project derivative or requests one direct
+from the immutable original track. Non-English derivatives are shared,
+project-authorized, versioned artifacts keyed to the exact base/original and
+provider identity; they never advance the source-plus-English base pointer.
+New clip writes atomically freeze strict schema-version-2 native, English, and
+when distinct, preferred evidence by the same source-video time range. Queue
+display/search, offline replay, API reload, and CSV preserve those snapshots
+after later preference changes, while legacy schema-version-1 clips remain
+readable without invented provenance. The Romanian-to-Spanish browser path is a
+deterministic fixture proof only; production language contracts and provider
+resolution accept normalized BCP-47 targets generally. Preferred translations
+remain display/logging evidence and never add a preferred subtitle artifact.
+
 Twentieth slice completed 2026-08-14. Full export-source acquisition is now a separate opt-in `EXPORT_SOURCE_PROVIDER` boundary, distinct from transcription audio. The local export boundary requires caller-confirmed authorization before any tool call, uses a no-config argument-array `yt-dlp` invocation in a private `0700` attempt directory, validates a single regular nonempty output, and records only provider, source identity, size, checksum, lifecycle state, expiry, and deletion timestamp. Local migration `0005_export_source_scratch_lifecycle` makes acquisition, deletion, cleanup failure, and actionable retry state durable without retaining a usable source path. Every acquisition, provider failure, cancellation, and downstream handoff runs verified cleanup; cleanup failure transitions the request to `needs_user_action` and never permits export completion. Rendering, FFprobe, same-source grouping, cleanup retry/sweeping, and the user-facing export controls remain subsequent Milestone 5 slices.
 
 Twenty-first slice completed 2026-08-14. The local source handoff now validates the regular nonempty source inside its private attempt scratch directory and sends it through an injectable FFprobe adapter before any future renderer receives it. FFprobe invokes only argument arrays, bounds/sanitizes inspected data, supports cancellation, and records duration, container, video/audio codec, and optional tool version without retaining paths, URLs, commands, credentials, or raw output. Local migration `0006_export_probe_resolution` stores this safe provenance with the source attempt and stores the duration-clamped resolved export range separately from immutable transcript-selection and requested export-bound snapshots. Empty/invalid resolved ranges, malformed inspection, inspection failure, and cancellation are actionable and still run the established cleanup path; M5-01 cleanup failures remain terminal `needs_user_action` states. FFmpeg rendering, subtitle work, staging/finalization, presets/UI, source grouping, and scratch sweeping remain deferred.

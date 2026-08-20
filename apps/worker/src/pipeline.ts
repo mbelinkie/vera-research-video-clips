@@ -5,6 +5,7 @@ import { join } from "node:path";
 import {
   ActiveTranscriptBundleSchema,
   FinalizedObjectSchema,
+  NormalizedTranscriptSchema,
   TranscriptManifestSchema,
   TranscriptSourcePlanSchema,
   TranscriptUploadGrantSchema,
@@ -12,12 +13,15 @@ import {
   WorkerCreateTranscriptUploadRequestSchema,
   WorkerFinalizeTranscriptRequestSchema,
   type ActiveTranscriptBundle,
+  type DerivedTranslation,
+  type DerivedTranslationIdentity,
   type FinalizedObject,
   type NormalizedTranscript,
   type TranscriptArtifact,
   type TranscriptManifest,
   type TranscriptUploadGrant,
 } from "@research-video/contracts";
+import { languagesEquivalent } from "@research-video/contracts";
 import type { MediaAcquisitionProvider } from "@research-video/media";
 import {
   TranscriptSourceResolver,
@@ -71,6 +75,67 @@ export type TranscriptPipelineOptions = {
   scratchRoot: string;
   now?: () => Date;
 };
+
+export interface DerivedTranslationPublicationClient {
+  publish(input: {
+    identity: DerivedTranslationIdentity;
+    idempotencyKey: string;
+    transcript: NormalizedTranscript;
+  }): Promise<DerivedTranslation>;
+}
+
+export async function executeDerivedTranslation(input: {
+  identity: DerivedTranslationIdentity;
+  idempotencyKey: string;
+  original: NormalizedTranscript;
+  translation: TranslationProvider;
+  publication: DerivedTranslationPublicationClient;
+  signal?: AbortSignal;
+}): Promise<DerivedTranslation> {
+  const original = NormalizedTranscriptSchema.parse(input.original);
+  if (
+    original.track.id !== input.identity.originalTrackId ||
+    original.track.contentSha256 !== input.identity.originalContentSha256
+  ) {
+    throw new TranscriptPipelineError(
+      "The preferred translation job does not match its original track snapshot.",
+    );
+  }
+  if (
+    languagesEquivalent(
+      original.track.language,
+      input.identity.targetLanguage,
+    ) ||
+    languagesEquivalent(input.identity.targetLanguage, "en")
+  ) {
+    throw new TranscriptPipelineError(
+      "Supplemental translation work requires a distinct non-English target.",
+    );
+  }
+  const transcript = await translateCanonicalTranscript(
+    input.translation,
+    original,
+    input.identity.targetLanguage,
+    input.signal,
+  );
+  if (
+    transcript.track.kind !== "translation" ||
+    transcript.track.sourceTrackId !== original.track.id ||
+    !languagesEquivalent(
+      transcript.track.language,
+      input.identity.targetLanguage,
+    )
+  ) {
+    throw new TranscriptPipelineError(
+      "The translation provider returned the wrong preferred track.",
+    );
+  }
+  return input.publication.publish({
+    identity: input.identity,
+    idempotencyKey: input.idempotencyKey,
+    transcript,
+  });
+}
 
 export class TranscriptPipelineError extends Error {
   readonly code = "transcript_pipeline_failed";

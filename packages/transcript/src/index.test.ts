@@ -5,15 +5,18 @@ import { describe, expect, it } from "vitest";
 import fixture from "../../../tests/fixtures/transcripts/english-cue.json" with { type: "json" };
 import wordFixture from "../../../tests/fixtures/transcripts/english-word.json" with { type: "json" };
 import bilingualFixture from "../../../tests/fixtures/transcripts/spanish-bilingual.json" with { type: "json" };
+import multilingualFixture from "../../../tests/fixtures/transcripts/romanian-multilingual.json" with { type: "json" };
 
 import {
   deriveClipRelativeSrtCues,
+  buildClipLanguageEvidence,
   deriveTranscriptSelection,
   normalizeTranscriptFixture,
   normalizeGeneratedTranscript,
   normalizeTranslatedTranscript,
   normalizeWebVttCaption,
   parseSrt,
+  resolvePreferredTranscript,
   searchTranscript,
   segmentAtTime,
   timedTranscriptTokens,
@@ -147,6 +150,200 @@ describe("translated transcript normalization", () => {
         translations: [],
       }),
     ).rejects.toMatchObject({ code: "invalid_translation", retryable: false });
+  });
+
+  it("creates non-English supplemental tracks without relabeling them original", async () => {
+    const original = normalizeTranscriptFixture(multilingualFixture.original);
+    const translated = await normalizeTranslatedTranscript({
+      sourceTranscript: original,
+      targetLanguage: "es",
+      provider: "fixture",
+      translations: original.segments.map((segment, index) => ({
+        sourceSegmentId: segment.id,
+        text: index === 0 ? "Este es un ejemplo rumano." : "Sigue por tiempo.",
+      })),
+    });
+    expect(translated.track).toMatchObject({
+      kind: "translation",
+      language: "es",
+      sourceTrackId: original.track.id,
+    });
+  });
+
+  it("resolves preferred tracks in local, shared, then provider order", async () => {
+    const original = normalizeTranscriptFixture(multilingualFixture.original);
+    const english = normalizeTranscriptFixture(multilingualFixture.english);
+    const spanish = normalizeTranscriptFixture(multilingualFixture.spanish);
+    const calls: string[] = [];
+    const local = await resolvePreferredTranscript({
+      preferredLanguage: "es-MX",
+      original,
+      english,
+      findLocal: async () => {
+        calls.push("local");
+        return spanish;
+      },
+      findShared: async () => {
+        calls.push("shared");
+        return spanish;
+      },
+      requestTranslation: async () => {
+        calls.push("provider");
+        return spanish;
+      },
+    });
+    expect(local).toMatchObject({ state: "ready", source: "local" });
+    expect(calls).toEqual(["local"]);
+
+    calls.length = 0;
+    const generated = await resolvePreferredTranscript({
+      preferredLanguage: "es",
+      original,
+      english,
+      findLocal: async () => {
+        calls.push("local");
+        return undefined;
+      },
+      findShared: async () => {
+        calls.push("shared");
+        return undefined;
+      },
+      requestTranslation: async () => {
+        calls.push("provider");
+        return spanish;
+      },
+    });
+    expect(generated).toMatchObject({ state: "ready", source: "generated" });
+    expect(calls).toEqual(["local", "shared", "provider"]);
+    await expect(
+      resolvePreferredTranscript({
+        preferredLanguage: "ro",
+        original,
+        english,
+        requestTranslation: async () => {
+          throw new Error("must not run");
+        },
+      }),
+    ).resolves.toMatchObject({ state: "ready", source: "original" });
+  });
+
+  it("resolves a general English-to-French target and exposes provider capability failures", async () => {
+    const english = normalizeTranscriptFixture(wordFixture);
+    const requestedTargets: string[] = [];
+    const french = await resolvePreferredTranscript({
+      preferredLanguage: "fr_CA",
+      original: english,
+      english,
+      requestTranslation: async (targetLanguage) => {
+        requestedTargets.push(targetLanguage);
+        return normalizeTranslatedTranscript({
+          sourceTranscript: english,
+          targetLanguage,
+          provider: "fixture-general-target",
+          translations: english.segments.map((segment) => ({
+            sourceSegmentId: segment.id,
+            text: `Traduction ${segment.ordinal + 1}`,
+          })),
+        });
+      },
+    });
+    expect(requestedTargets).toEqual(["fr-CA"]);
+    expect(french).toMatchObject({
+      state: "ready",
+      source: "generated",
+      transcript: {
+        track: {
+          language: "fr-CA",
+          kind: "translation",
+          sourceTrackId: english.track.id,
+        },
+      },
+    });
+
+    await expect(
+      resolvePreferredTranscript({
+        preferredLanguage: "tlh",
+        original: english,
+        english,
+        requestTranslation: async () => {
+          throw new Error(
+            "The configured translation provider does not support Klingon.",
+          );
+        },
+      }),
+    ).resolves.toEqual({
+      state: "preferred_translation_unavailable",
+      targetLanguage: "tlh",
+      reason: "The configured translation provider does not support Klingon.",
+    });
+  });
+
+  it("builds Romanian, English, and Spanish clip evidence by source time", () => {
+    const original = normalizeTranscriptFixture(multilingualFixture.original);
+    const english = normalizeTranscriptFixture(multilingualFixture.english);
+    const preferred = normalizeTranscriptFixture(multilingualFixture.spanish);
+    expect(
+      buildClipLanguageEvidence({
+        original,
+        english,
+        preferred,
+        startMs: 1_000,
+        endMs: 2_500,
+      }),
+    ).toMatchObject({
+      schemaVersion: 2,
+      native: {
+        language: "ro",
+        text: "Acesta este un exemplu românesc. Selecția rămâne legată de timp.",
+      },
+      english: {
+        language: "en",
+        text: "This is a Romanian example. The selection stays linked by time.",
+      },
+      preferred: {
+        language: "es",
+        text: "Este es un ejemplo rumano. La selección permanece vinculada por tiempo.",
+      },
+    });
+  });
+
+  it("omits redundant preferred roles and allows English native/canonical to share a track", async () => {
+    const spanishOriginal = normalizeTranscriptFixture(
+      bilingualFixture.original,
+    );
+    const spanishEnglish = normalizeTranscriptFixture(bilingualFixture.english);
+    expect(
+      buildClipLanguageEvidence({
+        original: spanishOriginal,
+        english: spanishEnglish,
+        preferred: spanishOriginal,
+        startMs: 0,
+        endMs: 1_000,
+      }),
+    ).not.toHaveProperty("preferred");
+
+    const english = normalizeTranscriptFixture(fixture);
+    const french = await normalizeTranslatedTranscript({
+      sourceTranscript: english,
+      targetLanguage: "fr",
+      provider: "fixture-general-target",
+      translations: english.segments.map((segment) => ({
+        sourceSegmentId: segment.id,
+        text: `Traduction ${segment.ordinal + 1}`,
+      })),
+    });
+    const evidence = buildClipLanguageEvidence({
+      original: english,
+      english,
+      preferred: french,
+      startMs: 0,
+      endMs: 2_000,
+    });
+    expect(evidence.native.trackId).toBe(evidence.english.trackId);
+    expect(evidence.preferred).toMatchObject({
+      language: "fr",
+      sourceTrackId: english.track.id,
+    });
   });
 });
 

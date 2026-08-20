@@ -12,9 +12,12 @@ import {
   CreateClipExportRequestSchema,
   CreateTranscriptionBatchRequestSchema,
   CreateProjectRequestSchema,
+  PublishDerivedTranslationRequestSchema,
+  RequestDerivedTranslationSchema,
   TranscriptionBatchControlRequestSchema,
   UpdateReviewStatusRequestSchema,
   UpdateClipCandidateRequestSchema,
+  UpdatePreferredLanguageRequestSchema,
   FinalizeTranscriptRequestSchema,
   HealthResponseSchema,
   WorkerClaimRequestSchema,
@@ -118,6 +121,17 @@ export function createCloudApi(
     return catalog.registerUser(actor, body.displayName);
   });
 
+  app.get("/api/session/profile", async (request) =>
+    catalog.getCurrentUser(await authenticate(request)),
+  );
+
+  app.patch("/api/session/profile", async (request) =>
+    catalog.updatePreferredLanguage(
+      await authenticate(request),
+      UpdatePreferredLanguageRequestSchema.parse(request.body),
+    ),
+  );
+
   app.get("/api/projects", async (request) =>
     catalog.listProjects(await authenticate(request)),
   );
@@ -168,6 +182,63 @@ export function createCloudApi(
     const { projectId } = IdParamsSchema.parse(request.params);
     return catalog.listVideos(await authenticate(request), projectId);
   });
+
+  app.post(
+    "/api/projects/:projectId/videos/:videoId/derived-translations/resolve",
+    async (request, reply) => {
+      const { projectId, videoId } = ProjectVideoParamsSchema.parse(
+        request.params,
+      );
+      const actor = await authenticate(request);
+      const body = RequestDerivedTranslationSchema.parse(request.body);
+      if (body.identity.catalogVideoId !== videoId) {
+        return reply.status(400).send({
+          error: {
+            code: "invalid_request",
+            message: "Translation video identity does not match the route.",
+            retryable: false,
+          },
+        });
+      }
+      const ready = await catalog.getDerivedTranslation(
+        actor,
+        projectId,
+        body.identity,
+      );
+      if (ready) return ready;
+      const job = await catalog.requestDerivedTranslation(
+        actor,
+        projectId,
+        body,
+      );
+      return reply.status(202).send({ job });
+    },
+  );
+
+  app.post(
+    "/api/projects/:projectId/videos/:videoId/derived-translations/publish",
+    async (request, reply) => {
+      const { projectId, videoId } = ProjectVideoParamsSchema.parse(
+        request.params,
+      );
+      const body = PublishDerivedTranslationRequestSchema.parse(request.body);
+      if (body.identity.catalogVideoId !== videoId) {
+        return reply.status(400).send({
+          error: {
+            code: "invalid_request",
+            message: "Translation video identity does not match the route.",
+            retryable: false,
+          },
+        });
+      }
+      const translation = await catalog.publishDerivedTranslation(
+        await authenticate(request),
+        projectId,
+        body,
+      );
+      return reply.status(201).send(translation);
+    },
+  );
 
   app.post("/api/projects/:projectId/clips", async (request, reply) => {
     const { projectId } = IdParamsSchema.parse(request.params);

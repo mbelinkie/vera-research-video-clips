@@ -40,6 +40,12 @@ In a shared project, load or batch-submit YouTube videos, reuse an online Englis
 - A full authorized source may be downloaded behind the scenes, but only into isolated job-scoped scratch storage; reuse it for active dependent work and verify deletion before the job is complete.
 - Never log to a hidden or implicit project; a preselected project must remain visible and changeable.
 - Preserve original and English tracks, provenance, version, and timing precision.
+- Treat transcript language preference as personal account state. Resolve
+  equivalent native/English tracks first, then verified immutable translations
+  derived directly from the original track for any supported BCP-47 target.
+- Every new logged clip freezes schema-version-2 native and English language
+  evidence plus a distinct preferred-language role when required; preference
+  changes never rewrite existing clips.
 - Use stable IDs and integer source-video milliseconds.
 - Never regenerate or replace a completed version silently.
 - Keep platform, media, transcription, translation, alignment, object storage, dispatch, and sync details behind adapters.
@@ -187,6 +193,18 @@ Thirteenth slice completed 2026-08-01. The batch creation surface now imports CS
 
 Gate: logging requires a visible project and atomically preserves entered notes/tags; queue-only starts no media work; export-only creates no project/shared log entry or project research metadata.
 
+PL-01 completed 2026-08-20. Account language preferences normalize general
+BCP-47 tags and default to English. Exact verified non-English derivatives are
+reused local-first, then from the authorized project store, before one
+direct-from-original provider request; publication leaves the active
+source-plus-English transcript unchanged. A deterministic Romanian/English/
+Spanish proof exercises time-stable language views and search, strict
+three-role logging through API/database/reload/CSV, second-workstation reuse,
+offline evidence replay, and later preference changes without historical
+mutation. New clip writes use strict language-evidence schema version 2 while
+legacy version-1 reads remain conservative. Preferred display/logging does not
+produce preferred SRT artifacts.
+
 ### 5. Clip export
 
 - [x] M5-01: authorized full-source acquisition and verified job-scoped scratch lifecycle (`specs/completed/M5-01-authorized-source-acquisition-and-scratch-lifecycle.md`).
@@ -329,6 +347,12 @@ infra/aws        storage, API, database, queues, identity, monitoring
 - Transcript selection to source/export bounds.
 - Queue creation without export side effects.
 - Project enforcement for both logging actions.
+- Preferred-language resolution reuses verified local/shared derivatives before
+  one direct-from-original provider request, remains target-language-generic,
+  and exposes provider capability failures without a mislabeled fallback.
+- New clip logs atomically preserve exact native/English/optional-preferred
+  evidence across reload, offline replay, queue search, and CSV; legacy reads do
+  not invent track provenance.
 - Atomic note/tag persistence for both logging actions, project-scoped tag deduplication, offline replay, and collaborator edits.
 - Export-only creation without a project clip or spreadsheet row.
 - Conversion-preset precedence, capability validation, and immutable job snapshots.

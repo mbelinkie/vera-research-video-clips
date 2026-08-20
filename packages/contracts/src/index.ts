@@ -3,6 +3,46 @@ import { z } from "zod";
 const IdSchema = z.string().uuid();
 const UtcTimestampSchema = z.string().datetime({ offset: true });
 
+export function normalizeLanguageTag(value: string): string {
+  const candidate = value.trim().replaceAll("_", "-");
+  if (!candidate || candidate.length > 35) {
+    throw new Error("Language must be a valid BCP-47 tag.");
+  }
+  try {
+    return new Intl.Locale(candidate).toString();
+  } catch {
+    throw new Error("Language must be a valid BCP-47 tag.");
+  }
+}
+
+export function primaryLanguage(value: string): string {
+  return new Intl.Locale(normalizeLanguageTag(value)).language.toLowerCase();
+}
+
+export function languagesEquivalent(left: string, right: string): boolean {
+  return primaryLanguage(left) === primaryLanguage(right);
+}
+
+export const LanguageTagSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(35)
+  .transform((value, context) => {
+    try {
+      return normalizeLanguageTag(value);
+    } catch (error) {
+      context.addIssue({
+        code: "custom",
+        message:
+          error instanceof Error
+            ? error.message
+            : "Language must be a valid BCP-47 tag.",
+      });
+      return z.NEVER;
+    }
+  });
+
 export const ProjectRoleSchema = z.enum([
   "owner",
   "editor",
@@ -19,8 +59,13 @@ export const UserSchema = z.object({
   id: IdSchema,
   externalSubject: z.string().min(1).max(512),
   displayName: z.string().trim().min(1).max(160),
+  preferredLanguage: LanguageTagSchema,
   createdAt: UtcTimestampSchema,
   updatedAt: UtcTimestampSchema,
+});
+
+export const UpdatePreferredLanguageRequestSchema = z.object({
+  preferredLanguage: LanguageTagSchema,
 });
 
 export const CreateProjectRequestSchema = z.object({
@@ -93,8 +138,8 @@ export const TranscriptSourceSchema = z.enum([
 export const TranscriptTrackSchema = z.object({
   id: IdSchema,
   videoId: z.string().min(1).max(64),
-  language: z.string().min(2).max(35),
-  kind: z.enum(["original", "english"]),
+  language: LanguageTagSchema,
+  kind: z.enum(["original", "english", "translation"]),
   source: TranscriptSourceSchema,
   provider: z.string().min(1),
   model: z.string().min(1).optional(),
@@ -198,14 +243,91 @@ export const ClipVideoSnapshotSchema = z.object({
   canonicalUrl: z.url(),
   title: z.string().trim().min(1).max(500),
   channel: z.string().trim().min(1).max(300).optional(),
-  sourceLanguage: z.string().min(2).max(35).optional(),
+  sourceLanguage: LanguageTagSchema.optional(),
 });
+
+export const ClipLanguageSnapshotSchema = z.object({
+  role: z.enum(["native", "english", "preferred"]),
+  language: LanguageTagSchema,
+  text: z.string().trim().min(1).max(100_000),
+  trackId: IdSchema,
+  trackVersion: z.number().int().positive(),
+  sourceTrackId: IdSchema.optional(),
+  timingPrecision: TimingPrecisionSchema,
+});
+
+export const ClipLanguageEvidenceV2Schema = z
+  .object({
+    schemaVersion: z.literal(2),
+    native: ClipLanguageSnapshotSchema.extend({ role: z.literal("native") }),
+    english: ClipLanguageSnapshotSchema.extend({
+      role: z.literal("english"),
+    }),
+    preferred: ClipLanguageSnapshotSchema.extend({
+      role: z.literal("preferred"),
+      sourceTrackId: IdSchema,
+    }).optional(),
+  })
+  .superRefine((evidence, context) => {
+    if (!languagesEquivalent(evidence.english.language, "en")) {
+      context.addIssue({
+        code: "custom",
+        path: ["english", "language"],
+        message: "The English evidence role must contain English text.",
+      });
+    }
+    if (
+      evidence.english.trackId !== evidence.native.trackId &&
+      evidence.english.sourceTrackId !== evidence.native.trackId
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["english", "sourceTrackId"],
+        message: "A distinct English track must be linked to the native track.",
+      });
+    }
+    if (!evidence.preferred) return;
+    if (languagesEquivalent(evidence.preferred.language, "en")) {
+      context.addIssue({
+        code: "custom",
+        path: ["preferred", "language"],
+        message: "Preferred evidence must be a distinct non-English language.",
+      });
+    }
+    if (
+      languagesEquivalent(evidence.preferred.language, evidence.native.language)
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["preferred", "language"],
+        message: "Preferred evidence cannot duplicate the native language.",
+      });
+    }
+    if (evidence.preferred.sourceTrackId !== evidence.native.trackId) {
+      context.addIssue({
+        code: "custom",
+        path: ["preferred", "sourceTrackId"],
+        message: "Preferred evidence must be derived from the native track.",
+      });
+    }
+  });
+
+export const LegacyClipLanguageEvidenceSchema = z.object({
+  schemaVersion: z.literal(1),
+  englishText: z.string().min(1),
+  originalText: z.string().min(1).optional(),
+});
+
+export const ClipLanguageEvidenceSchema = z.union([
+  ClipLanguageEvidenceV2Schema,
+  LegacyClipLanguageEvidenceSchema,
+]);
+
 export const CreateClipCandidateRequestSchema = z.object({
   idempotencyKey: z.string().trim().min(1).max(512),
   video: ClipVideoSnapshotSchema,
   selection: TranscriptSelectionSchema,
-  englishText: z.string().trim().min(1).max(100_000),
-  originalText: z.string().trim().min(1).max(100_000).optional(),
+  languageEvidence: ClipLanguageEvidenceV2Schema,
   notes: z.string().trim().max(20_000).default(""),
   tags: z.array(ClipTagNameSchema).max(50).default([]),
 });
@@ -215,6 +337,7 @@ export const ClipCandidateSchema = z.object({
   catalogVideoId: IdSchema,
   video: ClipVideoSnapshotSchema,
   selection: TranscriptSelectionSchema,
+  languageEvidence: ClipLanguageEvidenceSchema,
   englishText: z.string().min(1),
   originalText: z.string().min(1).optional(),
   notes: z.string(),
@@ -359,6 +482,131 @@ export const TranscriptManifestSchema = z.object({
   createdAt: UtcTimestampSchema,
   artifacts: z.array(TranscriptArtifactSchema).min(1),
 });
+
+export const DerivedTranslationIdentitySchema = z
+  .object({
+    projectId: IdSchema,
+    catalogVideoId: IdSchema,
+    baseTranscriptVersionId: IdSchema,
+    originalTrackId: IdSchema,
+    originalContentSha256: z.string().regex(/^[a-f0-9]{64}$/),
+    targetLanguage: LanguageTagSchema,
+    provider: z.string().trim().min(1).max(160),
+    model: z.string().trim().min(1).max(160).optional(),
+    normalizationSchemaVersion: z.number().int().positive(),
+  })
+  .superRefine((identity, context) => {
+    if (languagesEquivalent(identity.targetLanguage, "en")) {
+      context.addIssue({
+        code: "custom",
+        path: ["targetLanguage"],
+        message:
+          "Supplemental derived translations must target a non-English language.",
+      });
+    }
+  });
+
+export const DerivedTranslationArtifactSchema = z.object({
+  type: z.enum(["manifest", "translated-normalized"]),
+  objectKey: z.string().min(1),
+  objectVersionId: z.string().min(1),
+  byteSize: z.number().int().nonnegative(),
+  sha256: z.string().regex(/^[a-f0-9]{64}$/),
+});
+
+export const DerivedTranslationManifestSchema = z.object({
+  schemaVersion: z.literal(1),
+  id: IdSchema,
+  lineageId: IdSchema,
+  version: z.number().int().positive(),
+  identity: DerivedTranslationIdentitySchema,
+  translatedTrackId: IdSchema,
+  translatedTrackVersion: z.number().int().positive(),
+  sourceTrackId: IdSchema,
+  timingPrecision: TimingPrecisionSchema,
+  idempotencyKey: z.string().trim().min(1).max(512),
+  createdBy: IdSchema,
+  createdAt: UtcTimestampSchema,
+  artifacts: z.array(DerivedTranslationArtifactSchema).min(1),
+});
+
+export const PublishDerivedTranslationRequestSchema = z
+  .object({
+    identity: DerivedTranslationIdentitySchema,
+    idempotencyKey: z.string().trim().min(1).max(512),
+    transcript: NormalizedTranscriptSchema,
+  })
+  .superRefine((request, context) => {
+    const track = request.transcript.track;
+    if (track.kind !== "translation") {
+      context.addIssue({
+        code: "custom",
+        path: ["transcript", "track", "kind"],
+        message: "A supplemental translation must use the translation kind.",
+      });
+    }
+    if (!languagesEquivalent(track.language, request.identity.targetLanguage)) {
+      context.addIssue({
+        code: "custom",
+        path: ["transcript", "track", "language"],
+        message:
+          "Translated track language does not match the requested target.",
+      });
+    }
+    if (track.sourceTrackId !== request.identity.originalTrackId) {
+      context.addIssue({
+        code: "custom",
+        path: ["transcript", "track", "sourceTrackId"],
+        message: "Translated track must link directly to the original track.",
+      });
+    }
+  });
+
+export const RequestDerivedTranslationSchema = z.object({
+  identity: DerivedTranslationIdentitySchema,
+  idempotencyKey: z.string().trim().min(1).max(512),
+});
+
+export const DerivedTranslationJobSchema = z.object({
+  id: IdSchema,
+  lineageId: IdSchema,
+  state: z.enum([
+    "queued",
+    "processing",
+    "complete",
+    "failed",
+    "canceled",
+    "superseded",
+  ]),
+  attempt: z.number().int().nonnegative(),
+  createdAt: UtcTimestampSchema,
+  updatedAt: UtcTimestampSchema,
+});
+
+export const DerivedTranslationSchema = z.object({
+  manifest: DerivedTranslationManifestSchema,
+  transcript: NormalizedTranscriptSchema,
+});
+
+export const PreferredTranscriptResolutionSchema = z.discriminatedUnion(
+  "state",
+  [
+    z.object({
+      state: z.literal("ready"),
+      source: z.enum(["original", "english", "local", "shared", "generated"]),
+      transcript: NormalizedTranscriptSchema,
+    }),
+    z.object({
+      state: z.literal("needs_translation"),
+      targetLanguage: LanguageTagSchema,
+    }),
+    z.object({
+      state: z.literal("preferred_translation_unavailable"),
+      targetLanguage: LanguageTagSchema,
+      reason: z.string().trim().min(1).max(2_000),
+    }),
+  ],
+);
 
 export const FinalizedObjectSchema = TranscriptArtifactSchema.extend({
   objectVersionId: z.string().min(1),
@@ -915,6 +1163,9 @@ export type Project = z.infer<typeof ProjectSchema>;
 export type ProjectRole = z.infer<typeof ProjectRoleSchema>;
 export type AuthenticatedActor = z.infer<typeof AuthenticatedActorSchema>;
 export type User = z.infer<typeof UserSchema>;
+export type UpdatePreferredLanguageRequest = z.infer<
+  typeof UpdatePreferredLanguageRequestSchema
+>;
 export type ProjectMember = z.infer<typeof ProjectMemberSchema>;
 export type Video = z.infer<typeof VideoSchema>;
 export type ProjectVideo = z.infer<typeof ProjectVideoSchema>;
@@ -923,6 +1174,11 @@ export type TranscriptSegment = z.infer<typeof TranscriptSegmentSchema>;
 export type TranscriptToken = z.infer<typeof TranscriptTokenSchema>;
 export type NormalizedTranscript = z.infer<typeof NormalizedTranscriptSchema>;
 export type TranscriptSelection = z.infer<typeof TranscriptSelectionSchema>;
+export type ClipLanguageSnapshot = z.infer<typeof ClipLanguageSnapshotSchema>;
+export type ClipLanguageEvidenceV2 = z.infer<
+  typeof ClipLanguageEvidenceV2Schema
+>;
+export type ClipLanguageEvidence = z.infer<typeof ClipLanguageEvidenceSchema>;
 export type ClipCandidate = z.infer<typeof ClipCandidateSchema>;
 export type CreateClipCandidateRequest = z.infer<
   typeof CreateClipCandidateRequestSchema
@@ -960,6 +1216,23 @@ export type ExportClipManifest = z.infer<typeof ExportClipManifestSchema>;
 export type ExportRequest = z.infer<typeof ExportRequestSchema>;
 export type TranscriptArtifact = z.infer<typeof TranscriptArtifactSchema>;
 export type TranscriptManifest = z.infer<typeof TranscriptManifestSchema>;
+export type DerivedTranslationIdentity = z.infer<
+  typeof DerivedTranslationIdentitySchema
+>;
+export type DerivedTranslationManifest = z.infer<
+  typeof DerivedTranslationManifestSchema
+>;
+export type PublishDerivedTranslationRequest = z.infer<
+  typeof PublishDerivedTranslationRequestSchema
+>;
+export type RequestDerivedTranslation = z.infer<
+  typeof RequestDerivedTranslationSchema
+>;
+export type DerivedTranslationJob = z.infer<typeof DerivedTranslationJobSchema>;
+export type DerivedTranslation = z.infer<typeof DerivedTranslationSchema>;
+export type PreferredTranscriptResolution = z.infer<
+  typeof PreferredTranscriptResolutionSchema
+>;
 export type FinalizedObject = z.infer<typeof FinalizedObjectSchema>;
 export type TranscriptUploadGrant = z.infer<typeof TranscriptUploadGrantSchema>;
 export type TranscriptDownloadTarget = z.infer<

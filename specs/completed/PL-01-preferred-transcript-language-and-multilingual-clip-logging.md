@@ -1,8 +1,9 @@
 # PL-01 — Preferred transcript language and multilingual clip logging
 
-- Status: active
+- Status: completed
 - Task/thread: PL-01 only
 - Product decision date: 2026-08-20
+- Completion date: 2026-08-20
 
 ## User-visible outcome
 
@@ -364,3 +365,121 @@ Use the following prompt in the dedicated implementation task:
 > preserve unrelated work, and update `PROJECT_GUIDE.md`/`outline.md` plus move
 > the spec to `specs/completed/` only after the entire slice is implemented and
 > verified with actual results.
+
+## Completion record
+
+### Decisions implemented
+
+- Account preferences preserve normalized BCP-47 display tags while initial
+  equivalence, derivative deduplication, and provider targeting use the primary
+  language. English remains the durable default and only the authenticated user
+  can update their profile.
+- The source-plus-English transcript remains the active collaboration base.
+  Supplemental non-English tracks use `kind: "translation"`, point directly to
+  the immutable original track, and live in separately versioned/checksummed
+  project derivatives keyed by the exact base, original content, language,
+  provider/model, and normalization schema.
+- Derived publication uses job-scoped immutable object keys and transactional
+  catalog finalization. Equivalent requests share one lineage/job and a losing
+  publisher adopts the already-active result without advancing the base pointer.
+- A project-shared derivative is accepted into SQLite only after exact identity,
+  schema, and SHA-256 verification. A second resolution uses the local cache and
+  does not call the shared catalog/provider again.
+- New clips use strict language-evidence schema version 2 with normalized child
+  rows for native, English, and an optional distinct preferred role. Evidence is
+  derived from overlapping source-video cue times, committed with the clip/tags/
+  sync event, included exactly in offline commands, and never recomputed from a
+  later preference. Legacy version-1 reads retain only their historical English/
+  optional original text and invent no track provenance.
+- The preferred display is language-generic. The Romanian/English/Spanish path
+  is a deterministic demo/test fixture, not a production option list. A separate
+  English-to-French-Canadian test proves general target handling; provider
+  capability failures return an actionable unavailable state without labeling
+  English as the requested language.
+- Preferred-language text changes display, search, logging, queue, and CSV only.
+  The established original-plus-English export subtitle snapshot and artifact
+  policy is unchanged, and no preferred SRT is generated.
+
+### Files changed
+
+- Shared language, derived-translation, account, and strict clip-evidence
+  contracts and tests in `packages/contracts`.
+- Time-based language evidence, preferred resolution, general supplemental
+  translation normalization, and tests in `packages/transcript`.
+- Forward-only cloud migration `0009` for account preference, immutable derived
+  lineages/versions/artifacts/jobs, and normalized clip evidence; forward-only
+  local migration `0013` for exact verified derivative cache identity.
+- Cloud catalog/API persistence, authorization, derivative publication/reuse,
+  clip dual-read/strict-write behavior, and CSV projection with integration
+  coverage.
+- Local cache promotion/verification and shared-to-local/offline-sync coverage.
+- Direct-from-original worker execution with deterministic provider/publication
+  fakes; the existing Amazon adapter and normal offline test policy did not need
+  a provider behavior change.
+- Workspace account setting, generic language resolution/view selector,
+  time-stable selection, logging validation, multilingual queue display/search,
+  fixture, and Playwright coverage.
+- `PROJECT_GUIDE.md`, `outline.md`, and this completion record.
+
+### Checks run and actual results
+
+- Focused contracts/transcript/database/catalog/API/worker/sync runs: all green;
+  the final focused run passed 40 tests across 4 files.
+- `npm run typecheck`: passed.
+- `npm run test`: 150 passed and 1 skipped across 24 test files (23 passed, 1
+  skipped).
+- `npm run build:web`: passed; Vite built 105 modules.
+- `npm run db:migrate:local:test`: `Local migrations valid (13 newly applied)`.
+- `npm run db:migrate:cloud:test`: `Cloud migrations valid (9 newly applied)`.
+- `npm run test:e2e`: 4 passed, including the extended Romanian/English/Spanish
+  selection, language-switch, strict log, queue reload/search, and preference-
+  change proof.
+- `git diff --check`: clean.
+- `npm run format:check` and therefore the aggregate `npm run check` stop on the
+  pre-existing unrelated dirty `docs/Script-to-Resolve Product Spec.md`. PL-01
+  files were formatted directly and that user-owned document was preserved
+  exactly as required; every later `check` stage was run individually and
+  passed with the results above.
+
+### Manual verification
+
+The browser-level interaction was verified through Playwright against the real
+workspace components and loopback Vite server: save `es-MX`, load the Romanian
+fixture, search Spanish, select 0–4 seconds, switch to English and back without
+losing the source-time range, log without export work, reload/search the queue,
+and then change the preference while the saved Spanish evidence remains. No
+live Amazon or YouTube call was required or made.
+
+### Compatibility impact
+
+- Cloud migration `0009` gives existing users the English default and existing
+  clip rows language-evidence schema version 1. It does not rewrite historical
+  text or provenance. New writes require schema version 2.
+- Local migration `0013` only adds the derivative cache and exact-identity
+  indexes. Existing base transcript cache rows and active base versions are
+  unchanged.
+- The compatibility `english_text`/`original_text` columns remain populated for
+  new clips and readable for old clips; structured evidence is authoritative
+  for new multilingual reads.
+- Existing M5 subtitle contracts, sidecar tests, manifests, and artifact roles
+  are unchanged.
+
+### Remaining risks and follow-ups
+
+- The current browser workspace still demonstrates transcripts from repository
+  fixtures; production transcript loading must supply its resolved translation
+  collection through the same generic view/evidence boundary.
+- The derived job table carries attempt and lease fields for durable execution,
+  while this bounded slice proves worker execution through the deterministic
+  direct-from-original function and idempotent publication rather than a new
+  unattended translation-only polling service. A dedicated control-plane loop
+  may be added when supplemental translation volume requires it.
+- Search across all clip languages is implemented in the loaded project queue;
+  server-side full-text multilingual indexing remains a later scale feature.
+- Google Sheets stays intentionally unimplemented; its future mapping is the
+  CSV mapping plus optional preferred language/text columns.
+
+### Commit ID(s)
+
+- Reported in the task handoff after the single PL-01 commit that also moved
+  this spec to `specs/completed/`.

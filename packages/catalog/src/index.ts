@@ -7,6 +7,14 @@ import {
   BatchPreflightSummarySchema,
   ClaimedTranscriptionJobSchema,
   ClipCandidateSchema,
+  ClipLanguageEvidenceV2Schema,
+  DerivedTranslationJobSchema,
+  DerivedTranslationIdentitySchema,
+  DerivedTranslationManifestSchema,
+  DerivedTranslationSchema,
+  NormalizedTranscriptSchema,
+  PublishDerivedTranslationRequestSchema,
+  RequestDerivedTranslationSchema,
   CreateTranscriptionBatchResponseSchema,
   ExportRequestSchema,
   JobSchema,
@@ -20,19 +28,27 @@ import {
   UserSchema,
   VideoSchema,
   WorkerLeaseSchema,
+  languagesEquivalent,
+  primaryLanguage,
   type ActiveTranscriptBundle,
   type AuthenticatedActor,
   type BatchOptions,
   type BatchPreflightItem,
   type ClaimedTranscriptionJob,
   type ClipCandidate,
+  type ClipLanguageEvidence,
   type CreateClipCandidateRequest,
   type CreateClipExportRequest,
   type CreateTranscriptionBatchResponse,
+  type DerivedTranslation,
+  type DerivedTranslationIdentity,
+  type DerivedTranslationJob,
   type FinalizeTranscriptRequest,
   type ExportRequest,
   type Project,
   type ProjectRole,
+  type PublishDerivedTranslationRequest,
+  type RequestDerivedTranslation,
   type TranscriptArtifact,
   type TranscriptUploadGrant,
   type TranscriptionBatchItem,
@@ -42,6 +58,7 @@ import {
   type ReviewInboxResponse,
   type UpdateReviewStatusRequest,
   type UpdateClipCandidateRequest,
+  type UpdatePreferredLanguageRequest,
   type TranscriptSourcePlan,
   type User,
   type Video,
@@ -68,6 +85,11 @@ export class CatalogConflictError extends Error {
 export class TranscriptIntegrityError extends Error {
   readonly statusCode = 422;
   readonly code = "transcript_integrity_failed";
+}
+
+export class CatalogValidationError extends Error {
+  readonly statusCode = 422;
+  readonly code = "invalid_language_evidence";
 }
 
 export type ArtifactType = TranscriptArtifact["type"];
@@ -134,8 +156,37 @@ export class SharedProjectCatalog {
        VALUES ($1, $2, $3, $4, $4)
        ON CONFLICT (external_subject) DO UPDATE
        SET display_name = EXCLUDED.display_name, updated_at = EXCLUDED.updated_at
-       RETURNING id, external_subject, display_name, created_at, updated_at`,
+       RETURNING id, external_subject, display_name, preferred_language,
+                 created_at, updated_at`,
       [actor.userId, actor.externalSubject, displayName.trim(), now],
+    );
+    return mapUser(result.rows[0]);
+  }
+
+  async getCurrentUser(actor: AuthenticatedActor): Promise<User> {
+    await this.requireRegistered(actor);
+    const result = await this.database.query<DbRow>(
+      `SELECT id, external_subject, display_name, preferred_language,
+              created_at, updated_at
+       FROM users WHERE id = $1 AND external_subject = $2`,
+      [actor.userId, actor.externalSubject],
+    );
+    return mapUser(result.rows[0]);
+  }
+
+  async updatePreferredLanguage(
+    actor: AuthenticatedActor,
+    input: UpdatePreferredLanguageRequest,
+  ): Promise<User> {
+    await this.requireRegistered(actor);
+    const now = this.now().toISOString();
+    const result = await this.database.query<DbRow>(
+      `UPDATE users
+       SET preferred_language = $1, updated_at = $2
+       WHERE id = $3 AND external_subject = $4
+       RETURNING id, external_subject, display_name, preferred_language,
+                 created_at, updated_at`,
+      [input.preferredLanguage, now, actor.userId, actor.externalSubject],
     );
     return mapUser(result.rows[0]);
   }
@@ -183,15 +234,370 @@ export class SharedProjectCatalog {
     return result.rows.map(mapProject);
   }
 
+  async requestDerivedTranslation(
+    actor: AuthenticatedActor,
+    projectId: string,
+    input: RequestDerivedTranslation,
+  ): Promise<DerivedTranslationJob> {
+    await this.authorize(actor, projectId, "write");
+    const request = RequestDerivedTranslationSchema.parse(input);
+    if (request.identity.projectId !== projectId) {
+      throw new CatalogValidationError(
+        "Derived translation project identity does not match the route.",
+      );
+    }
+    await this.assertDerivedTranslationIdentity(request.identity);
+    const now = this.now().toISOString();
+    let lineageId: string = randomUUID();
+    await this.transaction(async () => {
+      const inserted = await this.database.query<DbRow>(
+        `INSERT INTO transcript_translation_lineages
+           (id, project_id, video_id, base_transcript_version_id,
+            original_track_id, original_content_sha256, target_language,
+            target_primary_language, provider, model,
+            normalization_schema_version, idempotency_key, created_by,
+            created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+         ON CONFLICT DO NOTHING
+         RETURNING id`,
+        [
+          lineageId,
+          projectId,
+          request.identity.catalogVideoId,
+          request.identity.baseTranscriptVersionId,
+          request.identity.originalTrackId,
+          request.identity.originalContentSha256,
+          request.identity.targetLanguage,
+          primaryLanguage(request.identity.targetLanguage),
+          request.identity.provider,
+          request.identity.model ?? null,
+          request.identity.normalizationSchemaVersion,
+          request.idempotencyKey,
+          actor.userId,
+          now,
+        ],
+      );
+      if (!inserted.rows[0]) {
+        const existing = await this.findDerivedTranslationLineage(
+          request.identity,
+        );
+        if (!existing) {
+          throw new CatalogConflictError(
+            "The translation idempotency key belongs to different work.",
+          );
+        }
+        lineageId = String(existing.id);
+      }
+      await this.database.query(
+        `INSERT INTO transcript_translation_jobs
+           (id, lineage_id, state, attempt, requested_by, created_at, updated_at)
+         VALUES ($1, $2,
+                 CASE WHEN (SELECT active_version_id FROM transcript_translation_lineages WHERE id = $2) IS NULL
+                   THEN 'queued' ELSE 'complete' END,
+                 0, $3, $4, $4)
+         ON CONFLICT (lineage_id) DO NOTHING`,
+        [randomUUID(), lineageId, actor.userId, now],
+      );
+    });
+    const result = await this.database.query<DbRow>(
+      `SELECT * FROM transcript_translation_jobs WHERE lineage_id = $1`,
+      [lineageId],
+    );
+    return mapDerivedTranslationJob(result.rows[0]);
+  }
+
+  async publishDerivedTranslation(
+    actor: AuthenticatedActor,
+    projectId: string,
+    input: PublishDerivedTranslationRequest,
+  ): Promise<DerivedTranslation> {
+    const request = PublishDerivedTranslationRequestSchema.parse(input);
+    const job = await this.requestDerivedTranslation(actor, projectId, {
+      identity: request.identity,
+      idempotencyKey: request.idempotencyKey,
+    });
+    const existing = await this.getDerivedTranslation(
+      actor,
+      projectId,
+      request.identity,
+    );
+    if (existing) return existing;
+    const lineage = await this.findDerivedTranslationLineage(request.identity);
+    if (!lineage || String(lineage.id) !== job.lineageId) {
+      throw new CatalogConflictError("Derived translation lineage changed.");
+    }
+    const transcript = request.transcript;
+    const version = 1;
+    const translationVersionId = randomUUID();
+    const createdAt = this.now().toISOString();
+    const prefix = `projects/${projectId}/videos/${request.identity.catalogVideoId}/transcripts/${request.identity.baseTranscriptVersionId}/translations/${primaryLanguage(request.identity.targetLanguage)}/jobs/${job.id}/${translationVersionId}`;
+    const normalizedBytes = new TextEncoder().encode(
+      JSON.stringify(transcript),
+    );
+    const normalizedObject = await this.store.put({
+      key: `${prefix}/translated.normalized.json`,
+      bytes: normalizedBytes,
+      contentType: "application/json",
+      sha256: sha256(normalizedBytes),
+    });
+    const normalizedArtifact = {
+      type: "translated-normalized" as const,
+      objectKey: normalizedObject.key,
+      objectVersionId: normalizedObject.versionId,
+      byteSize: normalizedObject.bytes.byteLength,
+      sha256: normalizedObject.sha256,
+    };
+    const manifest = DerivedTranslationManifestSchema.parse({
+      schemaVersion: 1,
+      id: translationVersionId,
+      lineageId: lineage.id,
+      version,
+      identity: request.identity,
+      translatedTrackId: transcript.track.id,
+      translatedTrackVersion: transcript.track.version,
+      sourceTrackId: transcript.track.sourceTrackId,
+      timingPrecision: transcript.track.timingPrecision,
+      idempotencyKey: request.idempotencyKey,
+      createdBy: actor.userId,
+      createdAt,
+      artifacts: [normalizedArtifact],
+    });
+    const manifestBytes = new TextEncoder().encode(JSON.stringify(manifest));
+    const manifestObject = await this.store.put({
+      key: `${prefix}/manifest.json`,
+      bytes: manifestBytes,
+      contentType: "application/json",
+      sha256: sha256(manifestBytes),
+    });
+    await this.transaction(async () => {
+      const locked = await this.database.query<DbRow>(
+        `SELECT active_version_id FROM transcript_translation_lineages
+         WHERE id = $1 FOR UPDATE`,
+        [lineage.id],
+      );
+      if (locked.rows[0]?.active_version_id) {
+        await this.database.query(
+          `UPDATE transcript_translation_jobs
+           SET state = 'superseded', updated_at = $1 WHERE lineage_id = $2`,
+          [createdAt, lineage.id],
+        );
+        return;
+      }
+      await this.database.query(
+        `INSERT INTO transcript_translation_versions
+           (id, lineage_id, version, translated_track_id,
+            translated_track_version, source_track_id, language,
+            timing_precision, manifest_object_key,
+            manifest_object_version_id, manifest_sha256, status,
+            created_by, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
+                 'active', $12, $13)`,
+        [
+          translationVersionId,
+          lineage.id,
+          version,
+          transcript.track.id,
+          transcript.track.version,
+          transcript.track.sourceTrackId,
+          transcript.track.language,
+          transcript.track.timingPrecision,
+          manifestObject.key,
+          manifestObject.versionId,
+          manifestObject.sha256,
+          actor.userId,
+          createdAt,
+        ],
+      );
+      for (const artifact of [
+        normalizedArtifact,
+        {
+          type: "manifest" as const,
+          objectKey: manifestObject.key,
+          objectVersionId: manifestObject.versionId,
+          byteSize: manifestObject.bytes.byteLength,
+          sha256: manifestObject.sha256,
+        },
+      ]) {
+        await this.database.query(
+          `INSERT INTO transcript_translation_artifacts
+             (translation_version_id, artifact_type, object_key,
+              object_version_id, byte_size, sha256)
+           VALUES ($1, $2, $3, $4, $5, $6)`,
+          [
+            translationVersionId,
+            artifact.type,
+            artifact.objectKey,
+            artifact.objectVersionId,
+            artifact.byteSize,
+            artifact.sha256,
+          ],
+        );
+      }
+      await this.database.query(
+        `UPDATE transcript_translation_lineages SET active_version_id = $1
+         WHERE id = $2`,
+        [translationVersionId, lineage.id],
+      );
+      await this.database.query(
+        `UPDATE transcript_translation_jobs
+         SET state = 'complete', updated_at = $1 WHERE lineage_id = $2`,
+        [createdAt, lineage.id],
+      );
+      await this.database.query(
+        `INSERT INTO sync_events
+           (project_id, event_type, entity_id, server_version, payload, created_at)
+         VALUES ($1, 'transcript_translation.finalized', $2, 1, $3, $4)`,
+        [
+          projectId,
+          translationVersionId,
+          JSON.stringify({
+            translationVersionId,
+            baseTranscriptVersionId: request.identity.baseTranscriptVersionId,
+            targetLanguage: request.identity.targetLanguage,
+          }),
+          createdAt,
+        ],
+      );
+    });
+    const published = await this.getDerivedTranslation(
+      actor,
+      projectId,
+      request.identity,
+    );
+    if (!published) {
+      throw new TranscriptIntegrityError(
+        "Finalized derived translation could not be verified.",
+      );
+    }
+    return published;
+  }
+
+  async getDerivedTranslation(
+    actor: AuthenticatedActor,
+    projectId: string,
+    identity: DerivedTranslationIdentity,
+  ): Promise<DerivedTranslation | undefined> {
+    await this.authorize(actor, projectId, "read");
+    const parsedIdentity = DerivedTranslationIdentitySchema.parse(identity);
+    if (parsedIdentity.projectId !== projectId) {
+      throw new CatalogValidationError(
+        "Derived translation project identity does not match the route.",
+      );
+    }
+    const lineage = await this.findDerivedTranslationLineage(parsedIdentity);
+    if (!lineage?.active_version_id) return undefined;
+    const versionResult = await this.database.query<DbRow>(
+      `SELECT * FROM transcript_translation_versions
+       WHERE id = $1 AND lineage_id = $2 AND status = 'active'`,
+      [lineage.active_version_id, lineage.id],
+    );
+    const version = versionResult.rows[0];
+    if (!version) return undefined;
+    const artifactResult = await this.database.query<DbRow>(
+      `SELECT * FROM transcript_translation_artifacts
+       WHERE translation_version_id = $1`,
+      [version.id],
+    );
+    const artifacts = new Map(
+      artifactResult.rows.map((row) => [String(row.artifact_type), row]),
+    );
+    const manifestRow = artifacts.get("manifest");
+    const normalizedRow = artifacts.get("translated-normalized");
+    if (!manifestRow || !normalizedRow) return undefined;
+    const [manifestObject, normalizedObject] = await Promise.all([
+      this.store.get(
+        String(manifestRow.object_key),
+        String(manifestRow.object_version_id),
+      ),
+      this.store.get(
+        String(normalizedRow.object_key),
+        String(normalizedRow.object_version_id),
+      ),
+    ]);
+    if (
+      !manifestObject ||
+      !normalizedObject ||
+      sha256(manifestObject.bytes) !== manifestRow.sha256 ||
+      sha256(normalizedObject.bytes) !== normalizedRow.sha256
+    ) {
+      return undefined;
+    }
+    let manifestValue: unknown;
+    let transcriptValue: unknown;
+    try {
+      manifestValue = JSON.parse(
+        new TextDecoder().decode(manifestObject.bytes),
+      );
+      transcriptValue = JSON.parse(
+        new TextDecoder().decode(normalizedObject.bytes),
+      );
+    } catch {
+      return undefined;
+    }
+    const manifest = DerivedTranslationManifestSchema.safeParse(manifestValue);
+    const transcript = NormalizedTranscriptSchema.safeParse(transcriptValue);
+    if (!manifest.success || !transcript.success) return undefined;
+    if (
+      manifest.data.id !== version.id ||
+      manifest.data.lineageId !== lineage.id ||
+      transcript.data.track.id !== version.translated_track_id ||
+      transcript.data.track.version !==
+        Number(version.translated_track_version) ||
+      transcript.data.track.sourceTrackId !== parsedIdentity.originalTrackId ||
+      !languagesEquivalent(
+        transcript.data.track.language,
+        parsedIdentity.targetLanguage,
+      )
+    ) {
+      return undefined;
+    }
+    return DerivedTranslationSchema.parse({
+      manifest: manifest.data,
+      transcript: transcript.data,
+    });
+  }
+
   async createClipCandidate(
     actor: AuthenticatedActor,
     projectId: string,
     input: CreateClipCandidateRequest,
   ): Promise<ClipCandidate> {
     await this.authorize(actor, projectId, "write");
+    const user = await this.getCurrentUser(actor);
     const candidateId = randomUUID();
     const now = this.now().toISOString();
     let persistedCandidateId: string = candidateId;
+    const evidence = input.languageEvidence;
+    const preferredIsDistinct =
+      !languagesEquivalent(user.preferredLanguage, "en") &&
+      !languagesEquivalent(user.preferredLanguage, evidence.native.language);
+    if (
+      preferredIsDistinct !== Boolean(evidence.preferred) ||
+      (evidence.preferred &&
+        !languagesEquivalent(
+          evidence.preferred.language,
+          user.preferredLanguage,
+        ))
+    ) {
+      throw new CatalogValidationError(
+        "Clip evidence does not match the requesting user's snapshotted preference.",
+      );
+    }
+    const displayEvidence = preferredIsDistinct
+      ? evidence.preferred
+      : languagesEquivalent(user.preferredLanguage, evidence.native.language)
+        ? evidence.native
+        : evidence.english;
+    if (
+      !displayEvidence ||
+      input.selection.trackId !== displayEvidence.trackId ||
+      input.selection.transcriptVersion !== displayEvidence.trackVersion ||
+      input.selection.timingPrecision !== displayEvidence.timingPrecision
+    ) {
+      throw new CatalogValidationError(
+        "The selected display track changed. Re-resolve or reselect before logging.",
+      );
+    }
 
     await this.transaction(async () => {
       const videoId = randomUUID();
@@ -234,12 +640,13 @@ export class SharedProjectCatalog {
             transcript_track_id, transcript_version, first_segment_id,
             last_segment_id, first_token_id, last_token_id,
             transcript_start_ms, transcript_end_ms, export_start_ms,
-            export_end_ms, timing_precision, english_text, original_text, notes,
+            export_end_ms, timing_precision, english_text, original_text,
+            selection_text, language_evidence_schema_version, notes,
             research_status, export_status, created_by, version, created_at,
             updated_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
-                 $14, $15, $16, $17, $18, $19, $20, $21, $22, $23,
-                 'candidate', 'not_requested', $24, 1, $25, $25)
+                 $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, 2, $24,
+                 'candidate', 'not_requested', $25, 1, $26, $26)
          ON CONFLICT (project_id, idempotency_key) DO NOTHING
          RETURNING id`,
         [
@@ -263,8 +670,11 @@ export class SharedProjectCatalog {
           selection.exportStartMs,
           selection.exportEndMs,
           selection.timingPrecision,
-          input.englishText,
-          input.originalText ?? null,
+          evidence.english.text,
+          evidence.native.trackId === evidence.english.trackId
+            ? null
+            : evidence.native.text,
+          selection.text,
           input.notes,
           actor.userId,
           now,
@@ -279,6 +689,29 @@ export class SharedProjectCatalog {
         );
         persistedCandidateId = String(existing.rows[0]!.id);
         return;
+      }
+
+      for (const snapshot of [
+        evidence.native,
+        evidence.english,
+        ...(evidence.preferred ? [evidence.preferred] : []),
+      ]) {
+        await this.database.query(
+          `INSERT INTO clip_language_evidence
+             (clip_id, role, language, text, track_id, track_version,
+              source_track_id, timing_precision)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+          [
+            candidateId,
+            snapshot.role,
+            snapshot.language,
+            snapshot.text,
+            snapshot.trackId,
+            snapshot.trackVersion,
+            snapshot.sourceTrackId ?? null,
+            snapshot.timingPrecision,
+          ],
+        );
       }
 
       for (const tagName of uniqueTagNames(input.tags)) {
@@ -307,6 +740,7 @@ export class SharedProjectCatalog {
           JSON.stringify({
             clipId: candidateId,
             exportStatus: "not_requested",
+            languageEvidence: evidence,
           }),
           now,
         ],
@@ -330,7 +764,11 @@ export class SharedProjectCatalog {
     );
     return Promise.all(
       result.rows.map(async (row) =>
-        mapClipCandidate(row, await this.loadClipTags(String(row.id))),
+        mapClipCandidate(
+          row,
+          await this.loadClipTags(String(row.id)),
+          await this.loadClipLanguageEvidence(String(row.id)),
+        ),
       ),
     );
   }
@@ -362,6 +800,8 @@ export class SharedProjectCatalog {
       "timing_precision",
       "english_text",
       "original_text",
+      "preferred_language",
+      "preferred_text",
       "notes",
       "tags",
       "created_at",
@@ -386,6 +826,12 @@ export class SharedProjectCatalog {
       clip.selection.timingPrecision,
       clip.englishText,
       clip.originalText ?? "",
+      clip.languageEvidence.schemaVersion === 2
+        ? (clip.languageEvidence.preferred?.language ?? "")
+        : "",
+      clip.languageEvidence.schemaVersion === 2
+        ? (clip.languageEvidence.preferred?.text ?? "")
+        : "",
       clip.notes,
       clip.tags.join(" | "),
       clip.createdAt,
@@ -407,7 +853,11 @@ export class SharedProjectCatalog {
     );
     const row = result.rows[0];
     if (!row) throw new CatalogNotFoundError("Clip candidate not found.");
-    return mapClipCandidate(row, await this.loadClipTags(clipId));
+    return mapClipCandidate(
+      row,
+      await this.loadClipTags(clipId),
+      await this.loadClipLanguageEvidence(clipId),
+    );
   }
 
   async updateClipCandidate(
@@ -1962,6 +2412,96 @@ export class SharedProjectCatalog {
       throw new CatalogNotFoundError("User is not registered.");
   }
 
+  private async findDerivedTranslationLineage(
+    identity: DerivedTranslationIdentity,
+  ): Promise<DbRow | undefined> {
+    const result = await this.database.query<DbRow>(
+      `SELECT * FROM transcript_translation_lineages
+       WHERE project_id = $1 AND video_id = $2
+         AND base_transcript_version_id = $3 AND original_track_id = $4
+         AND original_content_sha256 = $5 AND target_primary_language = $6
+         AND provider = $7 AND COALESCE(model, '') = COALESCE($8, '')
+         AND normalization_schema_version = $9`,
+      [
+        identity.projectId,
+        identity.catalogVideoId,
+        identity.baseTranscriptVersionId,
+        identity.originalTrackId,
+        identity.originalContentSha256,
+        primaryLanguage(identity.targetLanguage),
+        identity.provider,
+        identity.model ?? null,
+        identity.normalizationSchemaVersion,
+      ],
+    );
+    return result.rows[0];
+  }
+
+  private async assertDerivedTranslationIdentity(
+    identity: DerivedTranslationIdentity,
+  ): Promise<void> {
+    const versionResult = await this.database.query<DbRow>(
+      `SELECT id FROM transcript_versions
+       WHERE id = $1 AND project_id = $2 AND video_id = $3
+         AND finalized_at IS NOT NULL`,
+      [
+        identity.baseTranscriptVersionId,
+        identity.projectId,
+        identity.catalogVideoId,
+      ],
+    );
+    if (!versionResult.rows[0]) {
+      throw new CatalogValidationError(
+        "Derived translation base transcript version is missing or not finalized.",
+      );
+    }
+    const artifactResult = await this.database.query<DbRow>(
+      `SELECT * FROM transcript_artifacts
+       WHERE transcript_version_id = $1
+         AND artifact_type IN ('original-normalized', 'english-normalized')
+       ORDER BY CASE artifact_type WHEN 'original-normalized' THEN 0 ELSE 1 END
+       LIMIT 1`,
+      [identity.baseTranscriptVersionId],
+    );
+    const artifact = artifactResult.rows[0];
+    if (!artifact) {
+      throw new CatalogValidationError(
+        "The base transcript has no native normalized track.",
+      );
+    }
+    const object = await this.store.get(
+      String(artifact.object_key),
+      String(artifact.object_version_id),
+    );
+    if (!object || sha256(object.bytes) !== artifact.sha256) {
+      throw new TranscriptIntegrityError(
+        "The base transcript native track failed checksum verification.",
+      );
+    }
+    let decoded: unknown;
+    try {
+      decoded = JSON.parse(new TextDecoder().decode(object.bytes));
+    } catch {
+      throw new TranscriptIntegrityError(
+        "The base transcript native track is not valid JSON.",
+      );
+    }
+    const original = NormalizedTranscriptSchema.parse(decoded);
+    if (
+      original.track.id !== identity.originalTrackId ||
+      original.track.contentSha256 !== identity.originalContentSha256
+    ) {
+      throw new CatalogValidationError(
+        "Derived translation original track identity does not match its base version.",
+      );
+    }
+    if (languagesEquivalent(original.track.language, identity.targetLanguage)) {
+      throw new CatalogValidationError(
+        "A supplemental translation cannot duplicate the native language.",
+      );
+    }
+  }
+
   private async loadClipTags(clipId: string): Promise<string[]> {
     const result = await this.database.query<{ name: string }>(
       `SELECT t.name
@@ -1972,6 +2512,45 @@ export class SharedProjectCatalog {
       [clipId],
     );
     return result.rows.map((row) => row.name);
+  }
+
+  private async loadClipLanguageEvidence(
+    clipId: string,
+  ): Promise<ClipLanguageEvidence | undefined> {
+    const result = await this.database.query<DbRow>(
+      `SELECT role, language, text, track_id, track_version,
+              source_track_id, timing_precision
+       FROM clip_language_evidence
+       WHERE clip_id = $1
+       ORDER BY CASE role
+         WHEN 'native' THEN 0 WHEN 'english' THEN 1 ELSE 2 END`,
+      [clipId],
+    );
+    if (!result.rows.length) return undefined;
+    const snapshots = new Map(
+      result.rows.map((row) => [
+        String(row.role),
+        {
+          role: row.role,
+          language: row.language,
+          text: row.text,
+          trackId: row.track_id,
+          trackVersion: Number(row.track_version),
+          ...(row.source_track_id
+            ? { sourceTrackId: row.source_track_id }
+            : {}),
+          timingPrecision: row.timing_precision,
+        },
+      ]),
+    );
+    return ClipLanguageEvidenceV2Schema.parse({
+      schemaVersion: 2,
+      native: snapshots.get("native"),
+      english: snapshots.get("english"),
+      ...(snapshots.has("preferred")
+        ? { preferred: snapshots.get("preferred") }
+        : {}),
+    });
   }
 
   private async requireActiveWorkerLease(
@@ -2028,6 +2607,7 @@ function mapUser(row: DbRow | undefined): User {
     id: row.id,
     externalSubject: row.external_subject,
     displayName: row.display_name,
+    preferredLanguage: row.preferred_language ?? "en",
     createdAt: iso(row.created_at),
     updatedAt: iso(row.updated_at),
   });
@@ -2044,7 +2624,32 @@ function mapProject(row: DbRow): Project {
   });
 }
 
-function mapClipCandidate(row: DbRow, tags: string[]): ClipCandidate {
+function mapDerivedTranslationJob(
+  row: DbRow | undefined,
+): DerivedTranslationJob {
+  if (!row) throw new CatalogNotFoundError("Translation job not found.");
+  return DerivedTranslationJobSchema.parse({
+    id: row.id,
+    lineageId: row.lineage_id,
+    state: row.state,
+    attempt: Number(row.attempt),
+    createdAt: iso(row.created_at),
+    updatedAt: iso(row.updated_at),
+  });
+}
+
+function mapClipCandidate(
+  row: DbRow,
+  tags: string[],
+  languageEvidence?: ClipLanguageEvidence,
+): ClipCandidate {
+  const evidence =
+    languageEvidence ??
+    ({
+      schemaVersion: 1,
+      englishText: String(row.english_text),
+      ...(row.original_text ? { originalText: String(row.original_text) } : {}),
+    } satisfies ClipLanguageEvidence);
   return ClipCandidateSchema.parse({
     id: row.id,
     projectId: row.project_id,
@@ -2067,9 +2672,10 @@ function mapClipCandidate(row: DbRow, tags: string[]): ClipCandidate {
       transcriptEndMs: Number(row.transcript_end_ms),
       exportStartMs: Number(row.export_start_ms),
       exportEndMs: Number(row.export_end_ms),
-      text: row.english_text,
+      text: row.selection_text ?? row.english_text,
       timingPrecision: row.timing_precision,
     },
+    languageEvidence: evidence,
     englishText: row.english_text,
     ...(row.original_text ? { originalText: row.original_text } : {}),
     notes: row.notes,

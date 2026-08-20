@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 import { PGlite } from "@electric-sql/pglite";
 import { afterEach, describe, expect, it } from "vitest";
@@ -8,6 +8,11 @@ import { HealthResponseSchema } from "@research-video/contracts";
 import { runCloudMigrations } from "@research-video/db-cloud";
 import type { VideoMetadataProvider } from "@research-video/providers";
 import { MemoryTranscriptObjectStore } from "@research-video/storage";
+import {
+  buildClipLanguageEvidence,
+  normalizeTranscriptFixture,
+} from "@research-video/transcript";
+import multilingualFixture from "../../../tests/fixtures/transcripts/romanian-multilingual.json" with { type: "json" };
 
 import { authenticateDevBearer, createCloudApi } from "./app.ts";
 
@@ -106,6 +111,7 @@ describe("cloud API", () => {
       payload: { name: "Clip research" },
     });
     const projectId = projectResponse.json<{ id: string }>().id;
+    const selectionTrackId = randomUUID();
     const payload = {
       idempotencyKey: "queue:fixture-selection-1",
       video: {
@@ -114,7 +120,7 @@ describe("cloud API", () => {
         title: "IFrame API demo",
       },
       selection: {
-        trackId: randomUUID(),
+        trackId: selectionTrackId,
         transcriptVersion: 1,
         firstSegmentId: randomUUID(),
         lastSegmentId: randomUUID(),
@@ -127,7 +133,25 @@ describe("cloud API", () => {
         text: "A useful selected passage",
         timingPrecision: "word",
       },
-      englishText: "A useful selected passage",
+      languageEvidence: {
+        schemaVersion: 2,
+        native: {
+          role: "native",
+          language: "en",
+          text: "A useful selected passage",
+          trackId: selectionTrackId,
+          trackVersion: 1,
+          timingPrecision: "word",
+        },
+        english: {
+          role: "english",
+          language: "en",
+          text: "A useful selected passage",
+          trackId: selectionTrackId,
+          trackVersion: 1,
+          timingPrecision: "word",
+        },
+      },
       notes: "Use this to establish the central argument.",
       tags: ["Person: Ada", "person: ada", "Opening"],
     };
@@ -300,6 +324,31 @@ describe("cloud API", () => {
       ).json(),
     ).toMatchObject([{ exportStatus: "queued", version: 3 }]);
 
+    const clipId = created.json<{ id: string }>().id;
+    await database.query(
+      "DELETE FROM clip_language_evidence WHERE clip_id = $1",
+      [clipId],
+    );
+    await database.query(
+      `UPDATE clip_candidates
+       SET language_evidence_schema_version = 1, selection_text = NULL
+       WHERE id = $1`,
+      [clipId],
+    );
+    const legacyRead = await app.inject({
+      method: "GET",
+      url: `/api/projects/${projectId}/clips/${clipId}`,
+      headers: { authorization },
+    });
+    expect(legacyRead.statusCode).toBe(200);
+    expect(legacyRead.json()).toMatchObject({
+      languageEvidence: {
+        schemaVersion: 1,
+        englishText: "A useful selected passage",
+      },
+    });
+    expect(legacyRead.json().languageEvidence).not.toHaveProperty("preferred");
+
     const outsiderId = randomUUID();
     const outsiderAuthorization = `Bearer ${outsiderId}|fixture:clip-outsider`;
     await app.inject({
@@ -324,6 +373,325 @@ describe("cloud API", () => {
           method: "GET",
           url: `/api/projects/${projectId}/clips.csv`,
           headers: { authorization: outsiderAuthorization },
+        })
+      ).statusCode,
+    ).toBe(403);
+  });
+
+  it("reuses a project-authorized Spanish derivative and freezes Romanian, English, and Spanish clip evidence", async () => {
+    const database = new PGlite();
+    databases.add(database);
+    await runCloudMigrations(database);
+    const store = new MemoryTranscriptObjectStore();
+    const catalog = new SharedProjectCatalog(database, store);
+    const app = createCloudApi({
+      catalog,
+      authenticate: authenticateDevBearer,
+    });
+    apps.add(app);
+    const userId = randomUUID();
+    const authorization = `Bearer ${userId}|fixture:multilingual-owner`;
+    await app.inject({
+      method: "POST",
+      url: "/api/session/register",
+      headers: { authorization },
+      payload: { displayName: "Multilingual Owner" },
+    });
+    const preference = await app.inject({
+      method: "PATCH",
+      url: "/api/session/profile",
+      headers: { authorization },
+      payload: { preferredLanguage: "es-MX" },
+    });
+    expect(preference.json()).toMatchObject({ preferredLanguage: "es-MX" });
+    expect(
+      (
+        await app.inject({
+          method: "PATCH",
+          url: "/api/session/profile",
+          headers: { authorization },
+          payload: { preferredLanguage: "not a language" },
+        })
+      ).statusCode,
+    ).toBe(400);
+    expect(
+      (
+        await app.inject({
+          method: "GET",
+          url: "/api/session/profile",
+          headers: { authorization },
+        })
+      ).json(),
+    ).toMatchObject({ preferredLanguage: "es-MX" });
+    const projectResponse = await app.inject({
+      method: "POST",
+      url: "/api/projects",
+      headers: { authorization },
+      payload: { name: "Multilingual proof" },
+    });
+    const projectId = projectResponse.json<{ id: string }>().id;
+    const actor = { userId, externalSubject: "fixture:multilingual-owner" };
+    const video = await catalog.addVideo(actor, projectId, {
+      youtubeVideoId: "Romanian001",
+      canonicalUrl: "https://www.youtube.com/watch?v=Romanian001",
+      title: "Romanian fixture",
+      sourceLanguage: "ro",
+    });
+    const original = normalizeTranscriptFixture(multilingualFixture.original);
+    const english = normalizeTranscriptFixture(multilingualFixture.english);
+    const spanish = normalizeTranscriptFixture(multilingualFixture.spanish);
+    const baseVersionId = randomUUID();
+    const lineageId = randomUUID();
+    const originalBytes = new TextEncoder().encode(JSON.stringify(original));
+    const originalStored = await store.put({
+      key: `fixtures/${baseVersionId}/original.normalized.json`,
+      bytes: originalBytes,
+      contentType: "application/json",
+      sha256: createHash("sha256").update(originalBytes).digest("hex"),
+    });
+    await database.query(
+      `INSERT INTO transcript_versions
+         (id, project_id, video_id, lineage_id, version, schema_version,
+          source_language, target_language, timing_precision,
+          manifest_object_key, manifest_object_version_id, manifest_sha256,
+          finalized_at, created_at)
+       VALUES ($1, $2, $3, $4, 1, 1, 'ro', 'en', 'cue', $5, $6, $7, now(), now())`,
+      [
+        baseVersionId,
+        projectId,
+        video.id,
+        lineageId,
+        `fixtures/${baseVersionId}/manifest.json`,
+        "fixture-version",
+        "a".repeat(64),
+      ],
+    );
+    await database.query(
+      `INSERT INTO transcript_artifacts
+         (transcript_version_id, artifact_type, object_key, object_version_id,
+          byte_size, sha256)
+       VALUES ($1, 'original-normalized', $2, $3, $4, $5)`,
+      [
+        baseVersionId,
+        originalStored.key,
+        originalStored.versionId,
+        originalStored.bytes.byteLength,
+        originalStored.sha256,
+      ],
+    );
+    await database.query(
+      `UPDATE project_videos SET active_transcript_version_id = $1
+       WHERE project_id = $2 AND video_id = $3`,
+      [baseVersionId, projectId, video.id],
+    );
+    const identity = {
+      projectId,
+      catalogVideoId: video.id,
+      baseTranscriptVersionId: baseVersionId,
+      originalTrackId: original.track.id,
+      originalContentSha256: original.track.contentSha256,
+      targetLanguage: "es-MX",
+      provider: spanish.track.provider,
+      normalizationSchemaVersion: spanish.track.schemaVersion,
+    };
+    const published = await app.inject({
+      method: "POST",
+      url: `/api/projects/${projectId}/videos/${video.id}/derived-translations/publish`,
+      headers: { authorization },
+      payload: {
+        identity,
+        idempotencyKey: `translation:${baseVersionId}:es`,
+        transcript: spanish,
+      },
+    });
+    expect(published.statusCode).toBe(201);
+    expect(published.json()).toMatchObject({
+      transcript: {
+        track: {
+          kind: "translation",
+          language: "es",
+          sourceTrackId: original.track.id,
+        },
+      },
+    });
+    const resolved = await app.inject({
+      method: "POST",
+      url: `/api/projects/${projectId}/videos/${video.id}/derived-translations/resolve`,
+      headers: { authorization },
+      payload: {
+        identity,
+        idempotencyKey: `translation:${baseVersionId}:es:retry`,
+      },
+    });
+    expect(resolved.statusCode).toBe(200);
+    expect(resolved.json()).toMatchObject({
+      manifest: { identity: { baseTranscriptVersionId: baseVersionId } },
+    });
+    expect(
+      (
+        await database.query<{ count: string }>(
+          "SELECT count(*)::text AS count FROM transcript_translation_jobs",
+        )
+      ).rows[0]?.count,
+    ).toBe("1");
+    expect(
+      (
+        await database.query<{ active_transcript_version_id: string }>(
+          `SELECT active_transcript_version_id FROM project_videos
+           WHERE project_id = $1 AND video_id = $2`,
+          [projectId, video.id],
+        )
+      ).rows[0]?.active_transcript_version_id,
+    ).toBe(baseVersionId);
+
+    const languageEvidence = buildClipLanguageEvidence({
+      original,
+      english,
+      preferred: spanish,
+      startMs: 0,
+      endMs: 4_000,
+    });
+    const clipPayload = {
+      idempotencyKey: "queue:romanian-spanish",
+      video: {
+        youtubeVideoId: "Romanian001",
+        canonicalUrl: "https://www.youtube.com/watch?v=Romanian001",
+        title: "Romanian fixture",
+        sourceLanguage: "ro",
+      },
+      selection: {
+        trackId: spanish.track.id,
+        transcriptVersion: spanish.track.version,
+        firstSegmentId: spanish.segments[0]!.id,
+        lastSegmentId: spanish.segments[1]!.id,
+        transcriptStartMs: 0,
+        transcriptEndMs: 4_000,
+        exportStartMs: 0,
+        exportEndMs: 4_000,
+        text: spanish.segments.map((segment) => segment.text).join(" "),
+        timingPrecision: "cue",
+      },
+      languageEvidence,
+      notes: "Preserve all three languages.",
+      tags: ["Multilingual"],
+    };
+    const rejected = await app.inject({
+      method: "POST",
+      url: `/api/projects/${projectId}/clips`,
+      headers: { authorization },
+      payload: {
+        ...clipPayload,
+        idempotencyKey: "queue:missing-spanish",
+        languageEvidence: {
+          schemaVersion: 2,
+          native: languageEvidence.native,
+          english: languageEvidence.english,
+        },
+      },
+    });
+    expect(rejected.statusCode).toBe(422);
+    const wrongTarget = await app.inject({
+      method: "POST",
+      url: `/api/projects/${projectId}/clips`,
+      headers: { authorization },
+      payload: {
+        ...clipPayload,
+        idempotencyKey: "queue:wrong-spanish-target",
+        languageEvidence: {
+          ...languageEvidence,
+          preferred: {
+            ...languageEvidence.preferred,
+            language: "fr",
+          },
+        },
+      },
+    });
+    expect(wrongTarget.statusCode).toBe(422);
+    expect(
+      (
+        await database.query<{ count: string }>(
+          `SELECT count(*)::text AS count FROM clip_candidates
+           WHERE project_id = $1`,
+          [projectId],
+        )
+      ).rows[0]?.count,
+    ).toBe("0");
+    expect(
+      (
+        await database.query<{ count: string }>(
+          `SELECT count(*)::text AS count FROM sync_events
+           WHERE project_id = $1 AND event_type = 'clip_candidate.created'`,
+          [projectId],
+        )
+      ).rows[0]?.count,
+    ).toBe("0");
+    expect(
+      (
+        await database.query<{ count: string }>(
+          `SELECT count(*)::text AS count FROM jobs
+           WHERE project_id = $1 AND kind = 'export'`,
+          [projectId],
+        )
+      ).rows[0]?.count,
+    ).toBe("0");
+    const created = await app.inject({
+      method: "POST",
+      url: `/api/projects/${projectId}/clips`,
+      headers: { authorization },
+      payload: clipPayload,
+    });
+    expect(created.statusCode).toBe(201);
+    const frozen = created.json<{
+      id: string;
+      languageEvidence: { preferred: { text: string } };
+    }>();
+    expect(frozen.languageEvidence).toEqual(languageEvidence);
+    expect(
+      (
+        await database.query<{ count: string }>(
+          "SELECT count(*)::text AS count FROM clip_language_evidence WHERE clip_id = $1",
+          [frozen.id],
+        )
+      ).rows[0]?.count,
+    ).toBe("3");
+    await app.inject({
+      method: "PATCH",
+      url: "/api/session/profile",
+      headers: { authorization },
+      payload: { preferredLanguage: "en" },
+    });
+    const reloaded = await app.inject({
+      method: "GET",
+      url: `/api/projects/${projectId}/clips/${frozen.id}`,
+      headers: { authorization },
+    });
+    expect(reloaded.json().languageEvidence).toEqual(languageEvidence);
+    const csv = await app.inject({
+      method: "GET",
+      url: `/api/projects/${projectId}/clips.csv`,
+      headers: { authorization },
+    });
+    expect(csv.body).toContain('"preferred_language","preferred_text"');
+    expect(csv.body).toContain('"es","Este es un ejemplo rumano.');
+
+    const outsiderId = randomUUID();
+    const outsiderAuthorization = `Bearer ${outsiderId}|fixture:outsider`;
+    await app.inject({
+      method: "POST",
+      url: "/api/session/register",
+      headers: { authorization: outsiderAuthorization },
+      payload: { displayName: "Outsider" },
+    });
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: `/api/projects/${projectId}/videos/${video.id}/derived-translations/resolve`,
+          headers: { authorization: outsiderAuthorization },
+          payload: {
+            identity,
+            idempotencyKey: "outsider-discovery",
+          },
         })
       ).statusCode,
     ).toBe(403);
