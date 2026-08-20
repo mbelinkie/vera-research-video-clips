@@ -15,7 +15,10 @@ import { fileURLToPath } from "node:url";
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
 
 import { loadConfig } from "@research-video/config";
-import { ExportClipManifestSchema } from "@research-video/contracts";
+import {
+  ExportClipManifestSchema,
+  ExportClipMetadataSchema,
+} from "@research-video/contracts";
 import {
   LocalExportQueue,
   LocalTranscriptIndex,
@@ -132,6 +135,7 @@ describe("one-shot local export runtime", () => {
       packageIdentity: `clip-${firstAttempt.requestId}`,
     });
     expect(result.artifacts?.map((artifact) => artifact.role).sort()).toEqual([
+      "clip_metadata_json",
       "english_srt",
       "manifest_json",
       "original_srt",
@@ -147,6 +151,7 @@ describe("one-shot local export runtime", () => {
     const packageEntries = await readdir(packageDirectory);
     expect(packageEntries.sort()).toEqual([
       `${packageIdentity}.en.srt`,
+      `${packageIdentity}.json`,
       `${packageIdentity}.mp4`,
       `${packageIdentity}.original.srt`,
       "manifest.json",
@@ -186,6 +191,25 @@ describe("one-shot local export runtime", () => {
         await readFile(join(packageDirectory, "manifest.json"), "utf8"),
       ),
     );
+    const metadata = ExportClipMetadataSchema.parse(
+      JSON.parse(
+        await readFile(
+          join(packageDirectory, `${packageIdentity}.json`),
+          "utf8",
+        ),
+      ),
+    );
+    expect(metadata).toMatchObject({
+      schemaVersion: 1,
+      exportRequestId: firstAttempt.requestId,
+      packageIdentity,
+      sourceLanguageClass: "foreign",
+      video: {
+        canonicalUrl: "https://www.youtube.com/watch?v=fixture-runtime-success",
+      },
+    });
+    expect(JSON.stringify(metadata)).not.toContain(root);
+    expect(JSON.stringify(metadata)).not.toMatch(/file:/u);
     expect(manifest).toMatchObject({
       schemaVersion: 1,
       exportRequestId: firstAttempt.requestId,
@@ -209,7 +233,7 @@ describe("one-shot local export runtime", () => {
       const queue = new LocalExportQueue(persisted);
       const request = queue.get(firstAttempt.requestId);
       expect(request?.state).toBe("complete");
-      expect(request?.finalArtifacts).toHaveLength(4);
+      expect(request?.finalArtifacts).toHaveLength(5);
       expect(request?.renderedMediaProvenance?.ffmpegVersion).toBe(
         manifest.toolVersions.ffmpegVersion,
       );
@@ -219,9 +243,11 @@ describe("one-shot local export runtime", () => {
             ? `${packageIdentity}.mp4`
             : artifact.role === "english_srt"
               ? `${packageIdentity}.en.srt`
-              : artifact.role === "manifest_json"
-                ? "manifest.json"
-                : `${packageIdentity}.original.srt`;
+              : artifact.role === "clip_metadata_json"
+                ? `${packageIdentity}.json`
+                : artifact.role === "manifest_json"
+                  ? "manifest.json"
+                  : `${packageIdentity}.original.srt`;
         const bytes = await readFile(join(packageDirectory, filename));
         expect(artifact.byteSize).toBe(bytes.byteLength);
         expect(artifact.contentSha256).toBe(sha256(bytes));

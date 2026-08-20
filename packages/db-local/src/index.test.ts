@@ -96,6 +96,7 @@ describe("local migrations", () => {
       "0011_export_final_artifact_provenance",
       "0012_export_clip_package_manifest",
       "0013_preferred_translation_cache",
+      "0014_export_clip_metadata_sidecar",
     ]);
     expect(runLocalMigrations(database)).toEqual([]);
     expect(
@@ -280,15 +281,15 @@ describe("local migrations", () => {
     database.close();
   });
 
-  it("widens the final-artifact role vocabulary in 0012 without rewriting existing rows", () => {
+  it("widens the final-artifact role vocabulary in 0014 without rewriting existing rows", () => {
     const directory = mkdtempSync(
-      join(tmpdir(), "research-video-sqlite-0012-"),
+      join(tmpdir(), "research-video-sqlite-0014-"),
     );
     temporaryDirectories.add(directory);
     const previousMigrations = join(directory, "migrations");
     mkdirSync(previousMigrations);
     for (const filename of readdirSync(localMigrationDirectory)) {
-      if (filename < "0012") {
+      if (filename < "0014") {
         copyFileSync(
           resolve(localMigrationDirectory, filename),
           join(previousMigrations, filename),
@@ -297,7 +298,7 @@ describe("local migrations", () => {
     }
     const database = openLocalDatabase(join(directory, "test.sqlite"));
     expect(runLocalMigrations(database, previousMigrations)).toContain(
-      "0011_export_final_artifact_provenance",
+      "0013_preferred_translation_cache",
     );
 
     const legacyRequestId = "019fbb95-cd76-7920-93fa-e23ba755e401";
@@ -346,25 +347,26 @@ describe("local migrations", () => {
           legacyArtifact.validated_at,
         );
     insertArtifact("video_mp4");
-    expect(() => insertArtifact("manifest_json")).toThrow();
+    insertArtifact("manifest_json");
+    expect(() => insertArtifact("clip_metadata_json")).toThrow();
 
-    database.exec("CREATE TABLE export_final_artifacts_0012 (blocker TEXT);");
+    database.exec("CREATE TABLE export_final_artifacts_0014 (blocker TEXT);");
     expect(() =>
       runLocalMigrations(database, localMigrationDirectory),
     ).toThrow();
+    const legacyManifestArtifact = { ...legacyArtifact, role: "manifest_json" };
     expect(
       database.prepare("SELECT * FROM export_final_artifacts").all(),
-    ).toEqual([legacyArtifact]);
-    expect(() => insertArtifact("manifest_json")).toThrow();
-    database.exec("DROP TABLE export_final_artifacts_0012;");
+    ).toEqual([legacyArtifact, legacyManifestArtifact]);
+    expect(() => insertArtifact("clip_metadata_json")).toThrow();
+    database.exec("DROP TABLE export_final_artifacts_0014;");
 
     expect(runLocalMigrations(database, localMigrationDirectory)).toEqual([
-      "0012_export_clip_package_manifest",
-      "0013_preferred_translation_cache",
+      "0014_export_clip_metadata_sidecar",
     ]);
     expect(
       database.prepare("SELECT * FROM export_final_artifacts").all(),
-    ).toEqual([legacyArtifact]);
+    ).toEqual([legacyArtifact, legacyManifestArtifact]);
     expect(
       database
         .prepare(
@@ -373,7 +375,7 @@ describe("local migrations", () => {
         )
         .get(),
     ).toBeDefined();
-    insertArtifact("manifest_json");
+    insertArtifact("clip_metadata_json");
     expect(() => insertArtifact("thumbnail_jpg")).toThrow();
     expect(
       database
@@ -381,11 +383,11 @@ describe("local migrations", () => {
           "SELECT count(*) AS count FROM export_final_artifacts WHERE export_request_id = ?",
         )
         .get(legacyRequestId),
-    ).toEqual({ count: 2 });
+    ).toEqual({ count: 3 });
     database.close();
   });
 
-  it("requires a manifest artifact in every promoted package", () => {
+  it("requires metadata and manifest artifacts in every promoted package", () => {
     const directory = mkdtempSync(
       join(tmpdir(), "research-video-sqlite-manifest-"),
     );
@@ -414,7 +416,7 @@ describe("local migrations", () => {
       durationMs: 3_200,
     });
     const artifact = (
-      role: "video_mp4" | "manifest_json",
+      role: "video_mp4" | "clip_metadata_json" | "manifest_json",
       byteSize: number,
     ) => ({
       role,
@@ -432,9 +434,11 @@ describe("local migrations", () => {
     ).toThrow(/Final artifact provenance is invalid/u);
     queue.recordFinalArtifactPromotion(request.jobId, 1, [
       artifact("video_mp4", 2_048),
+      artifact("clip_metadata_json", 384),
       artifact("manifest_json", 512),
     ]);
     expect(queue.get(request.id)?.finalArtifacts).toEqual([
+      expect.objectContaining({ role: "clip_metadata_json", byteSize: 384 }),
       expect.objectContaining({ role: "manifest_json", byteSize: 512 }),
       expect.objectContaining({ role: "video_mp4", byteSize: 2_048 }),
     ]);

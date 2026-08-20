@@ -27,7 +27,10 @@ import { type LocalExportQueue } from "@research-video/db-local";
 import {
   ExportClipManifestSchema,
   ExportClipManifestSchemaVersion,
+  ExportClipMetadataSchema,
+  ExportClipMetadataSchemaVersion,
   type ExportClipManifest,
+  type ExportClipMetadata,
   type ExportRequest,
   type NormalizedTranscript,
   type RenderedExportMediaProvenance,
@@ -292,7 +295,12 @@ type RequiredSidecar = {
 };
 
 type FinalArtifact = {
-  role: "video_mp4" | "english_srt" | "original_srt" | "manifest_json";
+  role:
+    | "video_mp4"
+    | "english_srt"
+    | "original_srt"
+    | "clip_metadata_json"
+    | "manifest_json";
   packageIdentity: string;
   byteSize: number;
   contentSha256: string;
@@ -458,6 +466,18 @@ async function promoteVerifiedFinalPackage(input: {
       policy,
     });
     stagedDigests.set(
+      "clip_metadata_json",
+      await stageVerifiedClipMetadata(
+        input.stagingDirectory,
+        buildVerifiedClipMetadata({
+          request: input.request,
+          policy,
+          packageIdentity,
+          attempt: input.attempt,
+        }),
+      ),
+    );
+    stagedDigests.set(
       "manifest_json",
       await stageVerifiedClipManifest(
         input.stagingDirectory,
@@ -553,6 +573,11 @@ function resolveVerifiedPackagePolicy(
     stagedName: ClipManifestName,
     finalName: ClipManifestName,
   };
+  const metadata = {
+    role: "clip_metadata_json" as const,
+    stagedName: `clip-${request.id}.json`,
+    finalName: `clip-${request.id}.json`,
+  };
   if (request.sourceLanguageClass === "confirmed_english") {
     if (request.preset.settings.omitSubtitleFilesForConfirmedEnglish) {
       if (
@@ -570,7 +595,7 @@ function resolveVerifiedPackagePolicy(
         bounds,
         requiredSidecars: [],
         omittedReason: "confirmed_english_user_setting",
-        artifacts: [video, manifest],
+        artifacts: [video, metadata, manifest],
       };
     }
     const english = request.englishSubtitleProvenance;
@@ -594,6 +619,7 @@ function resolveVerifiedPackagePolicy(
           // its verified track is already proven English before derivation.
           sidecar: { ...english, language: "en" },
         },
+        metadata,
         manifest,
       ],
     };
@@ -636,6 +662,7 @@ function resolveVerifiedPackagePolicy(
         finalName: `clip-${request.id}.en.srt`,
         sidecar: english,
       },
+      metadata,
       manifest,
     ],
   };
@@ -723,12 +750,59 @@ function buildVerifiedClipManifest(input: {
   return manifest;
 }
 
+/**
+ * The metadata sidecar is intentionally descriptive rather than a second hash
+ * ledger. It uses only immutable request fields and M5-02/M5-03/M5-04–M5-06
+ * persisted provenance. `request.video.canonicalUrl` is the canonical public
+ * YouTube watch URL; no acquisition, presigned, provider, local-file, or
+ * command-derived locator may enter this record.
+ */
+function buildVerifiedClipMetadata(input: {
+  request: ExportRequest;
+  policy: VerifiedPackagePolicy;
+  packageIdentity: string;
+  attempt: number;
+}): ExportClipMetadata {
+  const { policy, request } = input;
+  return {
+    schemaVersion: ExportClipMetadataSchemaVersion,
+    exportRequestId: request.id,
+    jobId: request.jobId,
+    mode: request.mode,
+    packageIdentity: input.packageIdentity,
+    sourceAttempt: input.attempt,
+    validatedAt: policy.rendered.validatedAt,
+    video: request.video,
+    sourceLanguageClass: request.sourceLanguageClass,
+    selection: request.selection,
+    resolvedExportBounds: {
+      startMs: policy.bounds.startMs,
+      endMs: policy.bounds.endMs,
+      sourceAttempt: policy.bounds.sourceAttempt,
+    },
+    renderedDurationMs: policy.rendered.durationMs,
+    preset: request.preset,
+    subtitlePolicy: {
+      requiredSidecars: [...policy.requiredSidecars],
+      ...(policy.omittedReason
+        ? { subtitleSidecarsOmittedReason: policy.omittedReason }
+        : {}),
+    },
+    ...(request.subtitleTracks
+      ? { subtitleTracks: request.subtitleTracks }
+      : {}),
+  };
+}
+
 function assertManifestMatchesSubtitlePolicy(
   manifest: ExportClipManifest,
   policy: VerifiedPackagePolicy,
 ) {
   const listed = manifest.artifacts
-    .filter((artifact) => artifact.role !== "video_mp4")
+    .filter(
+      (artifact) =>
+        artifact.role === "original_srt" || artifact.role === "english_srt",
+    )
     .map((artifact) =>
       artifact.role === "original_srt" ? "original" : "english",
     );
@@ -777,6 +851,43 @@ async function stageVerifiedClipManifest(
     path,
     "Clip manifest",
     "staged_package_manifest_invalid",
+  );
+}
+
+async function stageVerifiedClipMetadata(
+  stagingDirectory: string,
+  metadata: ExportClipMetadata,
+): Promise<StagedArtifactDigest> {
+  const path = join(stagingDirectory, `clip-${metadata.exportRequestId}.json`);
+  if (!isInsideStaging(stagingDirectory, path)) {
+    throw new ExportSourceAcquisitionError(
+      "Clip metadata staging is invalid. Retry this export.",
+      { code: "clip_metadata_staging_invalid", retryable: false },
+    );
+  }
+  const validated = ExportClipMetadataSchema.safeParse(metadata);
+  if (!validated.success) {
+    throw new ExportSourceAcquisitionError(
+      "The clip metadata failed its descriptive contract. Retry this export.",
+      { code: "clip_metadata_invalid", retryable: false },
+    );
+  }
+  try {
+    await writeFile(path, `${JSON.stringify(validated.data, null, 2)}\n`, {
+      encoding: "utf8",
+      flag: "wx",
+      mode: 0o600,
+    });
+  } catch {
+    throw new ExportSourceAcquisitionError(
+      "The clip metadata could not be staged. Retry this export.",
+      { code: "clip_metadata_staging_failed", retryable: true },
+    );
+  }
+  return digestStagedArtifact(
+    path,
+    "Clip metadata",
+    "staged_package_metadata_invalid",
   );
 }
 
@@ -835,7 +946,12 @@ async function validateStagedPackage(input: {
   for (const artifact of input.policy.artifacts) {
     // The manifest names these verified bytes, so it is staged only after they
     // are hashed and always before anything becomes a visible package.
-    if (artifact.role === "manifest_json") continue;
+    if (
+      artifact.role === "manifest_json" ||
+      artifact.role === "clip_metadata_json"
+    ) {
+      continue;
+    }
     const source = join(input.stagingDirectory, artifact.stagedName);
     if (!isInsideStaging(input.stagingDirectory, source)) {
       throw new ExportSourceAcquisitionError(

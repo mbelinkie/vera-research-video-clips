@@ -958,6 +958,7 @@ export const FinalArtifactRoleSchema = z.enum([
   "video_mp4",
   "english_srt",
   "original_srt",
+  "clip_metadata_json",
   "manifest_json",
 ]);
 
@@ -971,9 +972,70 @@ export const FinalArtifactProvenanceSchema = z.object({
 });
 
 export const ExportClipManifestSchemaVersion = 1;
+export const ExportClipMetadataSchemaVersion = 1;
+
+const PackageVideoSnapshotSchema = ClipVideoSnapshotSchema.superRefine(
+  (video, context) => {
+    const url = new URL(video.canonicalUrl);
+    if (
+      url.protocol !== "https:" ||
+      url.hostname !== "www.youtube.com" ||
+      url.pathname !== "/watch" ||
+      url.searchParams.get("v") !== video.youtubeVideoId
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["canonicalUrl"],
+        message:
+          "Package video identity must use the canonical public YouTube watch URL.",
+      });
+    }
+  },
+);
+
+export const ExportResolvedSubtitlePolicySchema = z.object({
+  requiredSidecars: z.array(z.enum(["original", "english"])).max(2),
+  subtitleSidecarsOmittedReason: z
+    .literal("confirmed_english_user_setting")
+    .optional(),
+});
+
+/**
+ * The descriptive clip sidecar is derived only from immutable request snapshot
+ * values and persisted validation provenance. `canonicalUrl` is deliberately
+ * limited to the canonical public YouTube watch URL in the video snapshot;
+ * acquisition, presigned, provider, local-file, and command-derived URLs are
+ * never package metadata.
+ */
+export const ExportClipMetadataSchema = z.object({
+  schemaVersion: z.literal(ExportClipMetadataSchemaVersion),
+  exportRequestId: IdSchema,
+  jobId: IdSchema,
+  mode: z.enum(["logged", "export_only"]),
+  packageIdentity: z.string().regex(/^clip-[a-f0-9-]{36}$/),
+  sourceAttempt: z.number().int().positive(),
+  validatedAt: UtcTimestampSchema,
+  video: PackageVideoSnapshotSchema,
+  sourceLanguageClass: ExportSourceLanguageClassSchema,
+  selection: TranscriptSelectionSchema,
+  resolvedExportBounds: z.object({
+    startMs: z.number().int().nonnegative(),
+    endMs: z.number().int().positive(),
+    sourceAttempt: z.number().int().positive(),
+  }),
+  renderedDurationMs: z.number().int().positive(),
+  preset: ExportPresetSnapshotSchema,
+  subtitlePolicy: ExportResolvedSubtitlePolicySchema,
+  subtitleTracks: ExportSubtitleTrackSnapshotsSchema.optional(),
+});
 
 export const ExportClipManifestArtifactSchema = z.object({
-  role: z.enum(["video_mp4", "english_srt", "original_srt"]),
+  role: z.enum([
+    "video_mp4",
+    "english_srt",
+    "original_srt",
+    "clip_metadata_json",
+  ]),
   filename: z.string().trim().min(1).max(255),
   byteSize: z.number().int().positive(),
   contentSha256: z.string().regex(/^[a-f0-9]{64}$/),
@@ -995,7 +1057,8 @@ export const ExportClipManifestArtifactSchema = z.object({
  * is derived only from the immutable request snapshot, persisted validation
  * provenance, and the staged bytes it names, so replaying one request
  * reproduces it exactly. It never contains its own hash, a filesystem path, a
- * command line, or subtitle text.
+ * command line, or subtitle text. Its canonical URL, when present, is only
+ * the immutable public YouTube watch URL from the request video snapshot.
  */
 export const ExportClipManifestSchema = z.object({
   schemaVersion: z.literal(ExportClipManifestSchemaVersion),
@@ -1005,7 +1068,7 @@ export const ExportClipManifestSchema = z.object({
   packageIdentity: z.string().regex(/^clip-[a-f0-9-]{36}$/),
   sourceAttempt: z.number().int().positive(),
   validatedAt: UtcTimestampSchema,
-  video: ClipVideoSnapshotSchema,
+  video: PackageVideoSnapshotSchema,
   sourceLanguageClass: ExportSourceLanguageClassSchema,
   resolvedExportBounds: z.object({
     startMs: z.number().int().nonnegative(),
@@ -1013,17 +1076,12 @@ export const ExportClipManifestSchema = z.object({
     sourceAttempt: z.number().int().positive(),
   }),
   renderedDurationMs: z.number().int().positive(),
-  subtitlePolicy: z.object({
-    requiredSidecars: z.array(z.enum(["original", "english"])).max(2),
-    subtitleSidecarsOmittedReason: z
-      .literal("confirmed_english_user_setting")
-      .optional(),
-  }),
+  subtitlePolicy: ExportResolvedSubtitlePolicySchema,
   toolVersions: z.object({
     ffprobeVersion: z.string().trim().min(1).max(120).optional(),
     ffmpegVersion: z.string().trim().min(1).max(120).optional(),
   }),
-  artifacts: z.array(ExportClipManifestArtifactSchema).min(1).max(3),
+  artifacts: z.array(ExportClipManifestArtifactSchema).min(1).max(4),
 });
 
 export const ExportRequestSchema = z.object({
@@ -1046,7 +1104,7 @@ export const ExportRequestSchema = z.object({
   finalArtifacts: z
     .array(FinalArtifactProvenanceSchema)
     .min(1)
-    .max(4)
+    .max(5)
     .optional(),
   state: JobStateSchema,
   createdAt: UtcTimestampSchema,
@@ -1213,6 +1271,10 @@ export type ExportClipManifestArtifact = z.infer<
   typeof ExportClipManifestArtifactSchema
 >;
 export type ExportClipManifest = z.infer<typeof ExportClipManifestSchema>;
+export type ExportResolvedSubtitlePolicy = z.infer<
+  typeof ExportResolvedSubtitlePolicySchema
+>;
+export type ExportClipMetadata = z.infer<typeof ExportClipMetadataSchema>;
 export type ExportRequest = z.infer<typeof ExportRequestSchema>;
 export type TranscriptArtifact = z.infer<typeof TranscriptArtifactSchema>;
 export type TranscriptManifest = z.infer<typeof TranscriptManifestSchema>;

@@ -12,7 +12,10 @@ import { join } from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { ExportClipManifestSchema } from "@research-video/contracts";
+import {
+  ExportClipManifestSchema,
+  ExportClipMetadataSchema,
+} from "@research-video/contracts";
 import {
   LocalExportQueue,
   LocalTranscriptIndex,
@@ -252,6 +255,17 @@ async function readPromotedManifest(root: string, requestId: string) {
   );
 }
 
+async function readPromotedMetadata(root: string, requestId: string) {
+  return ExportClipMetadataSchema.parse(
+    JSON.parse(
+      await readFile(
+        packageFile(root, requestId, `clip-${requestId}.json`),
+        "utf8",
+      ),
+    ),
+  );
+}
+
 const fixtureSourceProvider = (contentSha256 = "e".repeat(64)) => ({
   acquireAuthorizedFullSource: async ({
     videoId,
@@ -309,6 +323,11 @@ describe("LocalExportSourceProcessor", () => {
     expect(queue.get(request.id)?.subtitleSidecars).toBeUndefined();
     expect(queue.get(request.id)?.finalArtifacts).toEqual([
       expect.objectContaining({
+        role: "clip_metadata_json",
+        packageIdentity: `clip-${request.id}`,
+        sourceAttempt: 1,
+      }),
+      expect.objectContaining({
         role: "manifest_json",
         packageIdentity: `clip-${request.id}`,
         sourceAttempt: 1,
@@ -320,6 +339,7 @@ describe("LocalExportSourceProcessor", () => {
       }),
     ]);
     expect(await readdir(join(root, "exports", `clip-${request.id}`))).toEqual([
+      `clip-${request.id}.json`,
       `clip-${request.id}.mp4`,
       "manifest.json",
     ]);
@@ -423,12 +443,14 @@ describe("LocalExportSourceProcessor", () => {
       durationMs: 2_000,
     });
     expect(queue.get(request.id)?.finalArtifacts).toEqual([
+      expect.objectContaining({ role: "clip_metadata_json", sourceAttempt: 1 }),
       expect.objectContaining({ role: "english_srt", sourceAttempt: 1 }),
       expect.objectContaining({ role: "manifest_json", sourceAttempt: 1 }),
       expect.objectContaining({ role: "video_mp4", sourceAttempt: 1 }),
     ]);
     expect(await readdir(join(root, "exports", `clip-${request.id}`))).toEqual([
       `clip-${request.id}.en.srt`,
+      `clip-${request.id}.json`,
       `clip-${request.id}.mp4`,
       "manifest.json",
     ]);
@@ -503,6 +525,7 @@ describe("LocalExportSourceProcessor", () => {
         await readdir(join(root, "exports", `clip-${request.id}`)),
       ).toEqual([
         `clip-${request.id}.en.srt`,
+        `clip-${request.id}.json`,
         `clip-${request.id}.mp4`,
         `clip-${request.id}.original.srt`,
         "manifest.json",
@@ -1121,6 +1144,11 @@ describe("LocalExportSourceProcessor", () => {
       state: "complete",
       finalArtifacts: [
         {
+          role: "clip_metadata_json",
+          packageIdentity: `clip-${request.id}`,
+          sourceAttempt: 1,
+        },
+        {
           role: "manifest_json",
           packageIdentity: `clip-${request.id}`,
           sourceAttempt: 1,
@@ -1234,7 +1262,7 @@ describe("LocalExportSourceProcessor", () => {
     database.close();
   });
 
-  it("promotes one manifest naming every verified artifact of a bilingual package", async () => {
+  it("promotes descriptive metadata and a manifest naming every verified artifact of a bilingual package", async () => {
     const { root, database, queue, request } = fixtureQueue();
     const tracks = configureBilingualFixture({
       database,
@@ -1282,6 +1310,7 @@ describe("LocalExportSourceProcessor", () => {
       `clip-${request.id}.mp4`,
       `clip-${request.id}.original.srt`,
       `clip-${request.id}.en.srt`,
+      `clip-${request.id}.json`,
     ]);
     expect(manifest.artifacts[0]).not.toHaveProperty("subtitle");
     expect(manifest.artifacts[1]?.subtitle).toEqual({
@@ -1298,6 +1327,10 @@ describe("LocalExportSourceProcessor", () => {
       trackId: tracks.englishTrackId,
       trackVersion: 1,
     });
+    expect(manifest.artifacts[3]).toMatchObject({
+      role: "clip_metadata_json",
+      filename: `clip-${request.id}.json`,
+    });
     for (const artifact of manifest.artifacts) {
       const bytes = await readFile(
         packageFile(root, request.id, artifact.filename),
@@ -1307,6 +1340,20 @@ describe("LocalExportSourceProcessor", () => {
     }
 
     const promoted = queue.get(request.id)?.finalArtifacts ?? [];
+    const metadata = await readPromotedMetadata(root, request.id);
+    expect(metadata).toMatchObject({
+      schemaVersion: 1,
+      exportRequestId: request.id,
+      sourceLanguageClass: "foreign",
+      video: {
+        canonicalUrl: "https://www.youtube.com/watch?v=M7lc1UVf-VE",
+      },
+      subtitleTracks: {
+        original: { trackId: tracks.originalTrackId, trackVersion: 1 },
+        english: { trackId: tracks.englishTrackId, trackVersion: 1 },
+      },
+    });
+    expect(JSON.stringify(metadata)).not.toContain(root);
     const manifestBytes = await readFile(
       packageFile(root, request.id, "manifest.json"),
     );
@@ -1347,6 +1394,7 @@ describe("LocalExportSourceProcessor", () => {
     expect(englishManifest.artifacts.map((artifact) => artifact.role)).toEqual([
       "video_mp4",
       "english_srt",
+      "clip_metadata_json",
     ]);
     expect(englishManifest.artifacts[1]?.subtitle).toEqual({
       language: "en",
@@ -1383,11 +1431,12 @@ describe("LocalExportSourceProcessor", () => {
     });
     expect(omittedManifest.artifacts.map((artifact) => artifact.role)).toEqual([
       "video_mp4",
+      "clip_metadata_json",
     ]);
     omitted.database.close();
   });
 
-  it("leaves no package when the manifest cannot be staged or stops matching promoted bytes", async () => {
+  it("leaves no package when metadata cannot be staged or stops matching promoted bytes", async () => {
     const squatted = fixtureQueue();
     enableConfirmedEnglishOmission(squatted.database, squatted.request.id);
     const squattedProcessor = new LocalExportSourceProcessor(
@@ -1397,8 +1446,8 @@ describe("LocalExportSourceProcessor", () => {
       fixtureRenderer(async ({ outputPath }) => {
         await writeFile(outputPath, "fixture render");
         await writeFile(
-          join(outputPath, "..", "manifest.json"),
-          "squatted manifest",
+          join(outputPath, "..", `clip-${squatted.request.id}.json`),
+          "squatted metadata",
         );
       }),
       squatted.root,
@@ -1408,7 +1457,7 @@ describe("LocalExportSourceProcessor", () => {
         requestId: squatted.request.id,
         authorizationConfirmed: true,
       }),
-    ).rejects.toMatchObject({ code: "clip_manifest_staging_failed" });
+    ).rejects.toMatchObject({ code: "clip_metadata_staging_failed" });
     expect(squatted.queue.get(squatted.request.id)).toMatchObject({
       state: "needs_user_action",
     });
@@ -1426,15 +1475,15 @@ describe("LocalExportSourceProcessor", () => {
 
     const tampered = fixtureQueue();
     enableConfirmedEnglishOmission(tampered.database, tampered.request.id);
-    const promotedVideo = packageFile(
+    const promotedMetadata = packageFile(
       tampered.root,
       tampered.request.id,
-      `clip-${tampered.request.id}.mp4`,
+      `clip-${tampered.request.id}.json`,
     );
     const signal = {
       get aborted() {
-        if (existsSync(promotedVideo)) {
-          writeFileSync(promotedVideo, "tampered promoted bytes");
+        if (existsSync(promotedMetadata)) {
+          writeFileSync(promotedMetadata, "tampered promoted bytes");
         }
         return false;
       },

@@ -610,9 +610,10 @@ export class LocalExportQueue {
     const roles = new Set(artifacts.map((artifact) => artifact.role));
     if (
       artifacts.length < 2 ||
-      artifacts.length > 4 ||
+      artifacts.length > 5 ||
       roles.size !== artifacts.length ||
       !roles.has("video_mp4") ||
+      !roles.has("clip_metadata_json") ||
       !roles.has("manifest_json") ||
       artifacts.some((artifact) => !validFinalArtifact(artifact))
     ) {
@@ -830,7 +831,12 @@ type LocalSubtitleSidecarValidation = {
 };
 
 type LocalFinalArtifactProvenance = {
-  role: "video_mp4" | "english_srt" | "original_srt" | "manifest_json";
+  role:
+    | "video_mp4"
+    | "english_srt"
+    | "original_srt"
+    | "clip_metadata_json"
+    | "manifest_json";
   packageIdentity: string;
   byteSize: number;
   contentSha256: string;

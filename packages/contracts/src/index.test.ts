@@ -6,6 +6,7 @@ import {
   CreateClipExportRequestSchema,
   CreateTranscriptionBatchRequestSchema,
   ExportClipManifestSchema,
+  ExportClipMetadataSchema,
   ExportSettingsSchema,
   FinalArtifactProvenanceSchema,
   HealthResponseSchema,
@@ -279,6 +280,12 @@ describe("shared contracts", () => {
             endMs: 2_000,
           },
         },
+        {
+          role: "clip_metadata_json",
+          filename: `clip-${id}.json`,
+          byteSize: 512,
+          contentSha256: "c".repeat(64),
+        },
       ],
     };
 
@@ -293,13 +300,19 @@ describe("shared contracts", () => {
           requiredSidecars: [],
           subtitleSidecarsOmittedReason: "confirmed_english_user_setting",
         },
-        artifacts: [manifest.artifacts[0]],
+        artifacts: [manifest.artifacts[0], manifest.artifacts[2]],
       }).subtitlePolicy.subtitleSidecarsOmittedReason,
     ).toBe("confirmed_english_user_setting");
     expect(
       ExportClipManifestSchema.safeParse({ ...manifest, schemaVersion: 2 })
         .success,
     ).toBe(false);
+    expect(
+      ExportClipManifestSchema.safeParse({
+        ...manifest,
+        artifacts: manifest.artifacts.slice(0, 2),
+      }).success,
+    ).toBe(true);
     expect(
       ExportClipManifestSchema.safeParse({
         ...manifest,
@@ -319,5 +332,64 @@ describe("shared contracts", () => {
         validatedAt: now,
       }).role,
     ).toBe("manifest_json");
+  });
+
+  it("validates descriptive clip metadata with only the canonical public video URL", () => {
+    const metadata = {
+      schemaVersion: 1,
+      exportRequestId: id,
+      jobId: "019fbb95-cd76-7920-93fa-e23ba755ee40",
+      mode: "export_only",
+      packageIdentity: `clip-${id}`,
+      sourceAttempt: 1,
+      validatedAt: now,
+      video: {
+        youtubeVideoId: "M7lc1UVf-VE",
+        canonicalUrl: "https://www.youtube.com/watch?v=M7lc1UVf-VE",
+        title: "Fixture video",
+      },
+      sourceLanguageClass: "confirmed_english",
+      selection: {
+        trackId: id,
+        transcriptVersion: 1,
+        firstSegmentId: "019fbb95-cd76-7920-93fa-e23ba755ee41",
+        lastSegmentId: "019fbb95-cd76-7920-93fa-e23ba755ee42",
+        transcriptStartMs: 100,
+        transcriptEndMs: 900,
+        exportStartMs: 0,
+        exportEndMs: 1_000,
+        text: "Selected fixture text",
+        timingPrecision: "cue",
+      },
+      resolvedExportBounds: { startMs: 0, endMs: 1_000, sourceAttempt: 1 },
+      renderedDurationMs: 1_000,
+      preset: {
+        presetVersion: 1,
+        name: "Editing MP4",
+        settings: {
+          container: "mp4",
+          videoCodec: "h264",
+          videoRateControl: { mode: "crf", value: 20 },
+          frameRate: "source",
+          audioCodec: "aac",
+          omitSubtitleFilesForConfirmedEnglish: false,
+          embedEnglishSubtitleTrack: false,
+        },
+      },
+      subtitlePolicy: { requiredSidecars: ["english"] },
+    };
+    expect(ExportClipMetadataSchema.parse(metadata)).toMatchObject({
+      schemaVersion: 1,
+      video: { canonicalUrl: metadata.video.canonicalUrl },
+    });
+    expect(
+      ExportClipMetadataSchema.safeParse({
+        ...metadata,
+        video: {
+          ...metadata.video,
+          canonicalUrl: "file:///private/source.mp4",
+        },
+      }).success,
+    ).toBe(false);
   });
 });
