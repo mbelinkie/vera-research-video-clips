@@ -323,7 +323,43 @@ surface. Keep CSV; begin with one-way stable-ID publishing only if collaboration
 usage justifies it, and defer selective notes/tags sync until field ownership and
 conflict behavior are proven.
 
-### 7. Research + capacity expansion
+### 7. Pilot distribution + independent QA
+
+- [ ] Choose and document one supported pilot operating-system/provider/worker
+      profile.
+- [ ] Produce a versioned, checksummed, platform-trusted release artifact.
+- [ ] Add install, update, recovery/rollback, and uninstall flows that require no
+      source checkout, package manager, terminal, or cloud console.
+- [ ] Launch and supervise the web client plus loopback local agent automatically.
+- [ ] Add first-run sign-in/setup and readiness checks for tools, worker,
+      providers, permissions, network, disk, output/cache roots, and source
+      authorization.
+- [ ] Store credentials behind an operating-system or equivalently protected
+      secret boundary and redact all diagnostics/support output.
+- [ ] Preserve durable data across updates/reinstalls and test explicit
+      preserve/remove choices during uninstall.
+- [ ] Add understandable health/remediation screens and a user-created redacted
+      support bundle with build ID and bounded logs.
+- [ ] Publish version-matched shareable quick-start, operator, privacy/rights,
+      troubleshooting, known-issues, and issue-reporting documentation.
+- [ ] Prepare an outsourced-QA kit with rights-cleared fixtures, dedicated test
+      accounts/projects, acceptance matrix, severity rubric, issue template,
+      expected evidence, and reset instructions.
+- [ ] Complete independent clean-install, upgrade, core-workflow, restart/resume,
+      degraded-state, artifact, diagnostics, and uninstall/reinstall testing.
+- [ ] Fix all critical/high defects and publish triage for every accepted lower-
+      severity issue.
+
+Gate: a nontechnical collaborator uses only the release artifact and supplied
+documentation to install on the supported clean machine, complete setup, run
+fixture and authorized-real-source workflows, restart/update without data loss,
+recover from a seeded failure, find artifacts, produce a useful redacted support
+bundle, and uninstall or preserve data deliberately. No terminal, source code,
+package manager, cloud console, production secret, or live developer coaching is
+required. A separate outsourced tester completes the release matrix with no open
+critical/high defects.
+
+### 8. Research + capacity expansion
 
 - [ ] Bookmarks, timeline markers, and segment notes.
 - [ ] Fuzzy/regex/cross-video/semantic search.

@@ -210,6 +210,12 @@ rewrites an existing logged clip.
 - Show queue status and retry failed jobs.
 - Export the clip log as CSV.
 - Provide settings for tool paths, output paths, local/cloud worker choice, transcription/translation provider, and optional credentials.
+- Distribute one supported pilot build that a nontechnical collaborator can
+  install, update, launch, diagnose, and uninstall without a source checkout,
+  package manager, terminal, or cloud console.
+- Provide version-matched quick-start, operator, privacy/rights, troubleshooting,
+  and issue-reporting documentation suitable for sharing outside the development
+  team.
 
 ### 4.2 Deferred until the core loop is stable
 
@@ -1448,7 +1454,60 @@ optional one-way Sheets catalog publishing only after core usage demonstrates a
 collaboration need; two-way metadata sync remains a later evidence-driven
 integration.
 
-### Milestone 7 — Research and capacity enhancements
+### Milestone 7 — Pilot distribution, independent QA, and operator documentation
+
+Deliver:
+
+- one explicitly supported pilot platform and a versioned release artifact with
+  checksum/build identity and the platform's normal trust/signing requirements
+- installation, update, rollback/recovery, and uninstall flows that do not
+  require a source checkout, package manager, terminal, or cloud console
+- automatic launch/supervision of the web client and loopback local agent, with
+  bundled or guided acquisition of required runtimes/tools
+- first-run sign-in and setup for projects, output/cache locations, provider
+  choices, credentials, authorized-source acknowledgement, and a complete
+  readiness check before real work begins
+- operating-system credential storage or an equivalently protected secret
+  boundary; never place credentials in documentation, logs, support bundles, or
+  ordinary application data
+- safe database migration and data-directory handling across update/reinstall,
+  with explicit backup/recovery and preserve-versus-remove choices on uninstall
+- understandable health, disk, permissions, network, provider, worker, and tool
+  diagnostics plus a user-triggered redacted support bundle carrying build ID
+  and bounded logs
+- version-matched shareable documentation: system requirements, install/update/
+  uninstall, quick start, the three selection actions, batch preparation, Clip
+  Library use, provider/tool setup, storage/privacy/rights behavior,
+  troubleshooting/recovery, known limitations, and issue reporting
+- a release-candidate QA kit containing rights-cleared fixtures, dedicated test
+  accounts/projects, an acceptance matrix, severity definitions, issue template,
+  expected evidence, and reset instructions
+- independent human QA of clean install, upgrade, first run, the core workflows,
+  restart/resume, offline/provider/permission/disk failure recovery, artifact
+  opening, diagnostics, and uninstall/reinstall; automated CI alone cannot close
+  this milestone
+- a triaged release report with all release-blocking defects fixed and lesser
+  known issues documented
+
+Exit when a nontechnical collaborator on the supported clean machine can use
+only the release artifact and supplied documentation to install, sign in,
+complete readiness checks, run the fixture-backed core workflow and one
+authorized real-source workflow, restart/update without losing durable work,
+find the completed artifacts, recover from one seeded failure, create a useful
+redacted support bundle, and uninstall or preserve their data deliberately.
+They must not need live developer coaching, a terminal, source code, package
+manager, AWS console, or production secrets. A separate outsourced QA pass must
+complete the published matrix; all critical/high defects are closed, and every
+accepted lower-severity issue is recorded in the release notes or known-issues
+guide.
+
+The first pilot may support one operating system and one documented provider/
+worker profile. App-store publication, unattended enterprise deployment,
+multi-platform parity, 24/7 operations, public marketing documentation, and new
+research features are separate work unless a bounded M7 slice explicitly adds
+them.
+
+### Milestone 8 — Research and capacity enhancements
 
 Deliver in small vertical slices:
 
@@ -1510,6 +1569,9 @@ A slice is done only when:
 | Optional Sheets projection and shared catalog diverge | Stale external metadata or confusing links | Keep Sheets subordinate and one-way initially; stable IDs, field ownership, versions, and explicit sync logs before any selective write-back |
 | Local artifact links do not work remotely | External projections cannot open package bytes | Report locator availability honestly; add an authorized storage/download provider later rather than treating a local path as portable |
 | Cache consumes excessive disk | Workstation fills | Size reporting, configurable root, LRU/manual cleanup with protected records |
+| A pilot requires developer tools or undocumented setup | A nontechnical collaborator cannot begin or recover independently | One supported packaged release, first-run readiness checks, version-matched documentation, and an independent clean-machine acceptance gate |
+| Outsourced QA receives secrets or personal media | Credential or rights exposure | Dedicated least-privilege test accounts/projects, rights-cleared fixtures, redacted support bundles, reset instructions, and no production credentials |
+| An update or uninstall damages durable work | Lost projects, jobs, caches, or exports | Preflighted migrations, backup/recovery instructions, versioned release identity, tested update/rollback, and explicit preserve/remove choices |
 
 ## 17. Decisions intentionally left configurable
 

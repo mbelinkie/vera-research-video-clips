@@ -104,6 +104,9 @@ research package.
 ## Explicit non-goals
 
 - Building the script editor or Resolve compiler in this repository.
+- Packaging a nontechnical pilot installer, first-run operator experience,
+  shareable support documentation, or outsourced release QA; Milestone 7 owns
+  that handoff after this product workflow passes.
 - Moving canonical research packages into an authoring project.
 - Mutating or overwriting a package used by an earlier build.
 - Treating a filesystem path as artifact identity.
