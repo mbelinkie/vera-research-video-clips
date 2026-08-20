@@ -148,4 +148,4 @@ their durable checklist/status updates after this completion record.
 
 ### Commit ID(s)
 
-- `64c4145` — `feat: add verified clip metadata sidecar`
+- `2323a0f` — `feat: add verified clip metadata sidecar`
