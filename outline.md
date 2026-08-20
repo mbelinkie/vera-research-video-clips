@@ -33,7 +33,9 @@ In a shared project, load or batch-submit YouTube videos, reuse an online Englis
 - `Queue / log only` requires a visible project and never starts export work.
 - `Export + log` requires a visible project, creates the durable log entry first, then requests a job.
 - `Export only` creates a durable local technical job but no project clip/log/spreadsheet entry.
-- Both logging actions accept optional multiline usage notes and reusable project-scoped free-form tags, committed atomically with the clip and available to search/filter and CSV/Sheets.
+- Both logging actions accept optional multiline usage notes and reusable project-scoped free-form tags, committed atomically with the clip and available to search/filter, CSV, and optional external catalog projections.
+- A completed export record is not sufficient proof that package bytes are still reachable; reusable artifacts are resolved by immutable manifest/hash identity and verified locators.
+- Direct Clip Library exports and script-driven exports use the same durable request, worker, and immutable artifact boundaries.
 - Export actions use selectable named conversion presets and supported per-export overrides.
 - Every render job stores an immutable resolved-settings snapshot so later preset edits cannot change queued work or retries.
 - Foreign/mixed/unknown-language clips always get clip-relative original and English-translation SRTs; confirmed-English clips get an English SRT by default and may explicitly omit sidecar files.
@@ -79,6 +81,18 @@ Open project -> create named batch -> paste URLs/import CSV
   -> upload/finalize shared transcript versions
   -> ready items enter Ready for review
   -> failed/blocked items retain useful remediation + retry
+```
+
+### Later clip export and authoring handoff
+
+```text
+Open project -> Clips -> search/filter logged clips -> select one or many
+  -> choose resolved preset -> request durable export batch
+  -> verify immutable packages and independent status
+  -> reveal/retry/re-export as needed
+  -> scriptwriting client searches by stable clip ID
+       -> compatible reachable package? verify + reuse
+       -> locator missing? relink and verify, or request durable re-export
 ```
 
 ## Build order
@@ -240,41 +254,74 @@ produce preferred SRT artifacts.
   clip package before it becomes visible, recording source identity, subtitle
   policy, resolved bounds, FFprobe/FFmpeg versions, and each artifact's size and
   SHA-256 (`specs/completed/M5-09-verified-clip-package-manifest.md`).
-- [ ] Add named personal/project conversion presets and immutable preset versions.
-- [ ] Add project/global defaults plus per-export overrides.
-- [ ] Add capability-aware settings for container, codecs, quality/bitrate, dimensions/frame rate, audio, subtitle embedding, padding, output, and supported acceleration.
-- [ ] Add `Omit subtitle files for English-language clips`, default off; snapshot it in presets/jobs and apply it only when source language is confidently English.
-- [ ] Store the fully resolved settings snapshot on every export job and retry.
-- [ ] Re-encode using an editing-friendly H.264/AAC MP4 default plus supported alternative settings.
+- [x] M5-10: stage and verify a descriptive `clip-<id>.json` metadata sidecar,
+  include its hash in the manifest, and retain legacy manifest readers
+  (`specs/completed/M5-10-verified-clip-metadata-sidecar.md`).
+- [x] M5-11: derive a bounded midpoint JPEG from the verified rendered clip,
+  independently inspect it, and require it during atomic package finalization
+  (`specs/completed/M5-11-verified-clip-thumbnail-artifact.md`).
+- [x] M5-12: add authorized personal/project conversion preset catalogs with
+  append-only immutable versions, fixed-version defaults, optimistic updates,
+  idempotent commands, and exact saved-snapshot selection
+  (`specs/completed/M5-12-versioned-conversion-preset-catalogs.md`).
+- [x] M5-13: resolve application/default/preset/override settings through an
+  authoritative preview, snapshot deterministic fingerprints on requests and
+  jobs, and reject stale, changed, unsupported, or unavailable settings before
+  acquisition (`specs/completed/M5-13-resolved-export-settings-and-capability-validation.md`).
+- [x] M5-14A: render and FFprobe-verify the bounded software matrix of H.264
+  High/AAC MP4, HEVC Main/AAC MKV, and ProRes 422/PCM MOV, with installed
+  capability discovery, dynamic package roles, and backward-readable manifest/
+  metadata v2 (`specs/completed/M5-14A-capability-driven-alternative-rendering-and-ffprobe-conformance.md`).
+- [x] Add `Omit subtitle files for English-language clips`, default off;
+  snapshot it in presets/jobs and apply it only when source language is
+  confidently English.
+- [x] Store the fully resolved settings snapshot on every export job and retry.
+- [x] Re-encode using an editing-friendly H.264/AAC MP4 default plus the two
+  verified alternative families.
 - [x] Generate and validate a clip-specific English SRT by default for
   confirmed-English exports; an explicit immutable confirmed-English omission
   snapshot stages no SRT, while foreign/mixed/unknown requests continue to use
   the mandatory bilingual path.
 - [x] For foreign/mixed/unknown-language clips, always derive both original-language and translated-English SRTs even if the selected preset carries the English-only omission preference.
 - [x] Trim/clamp required sidecar cues to actual padded export bounds, zero-base timestamps, and block this staging lifecycle when required subtitles are missing or mismatched.
-- [ ] Add optional embedded soft subtitle track.
-- [ ] Generate thumbnail, metadata JSON, and manifest. M5-09 completed the
-      manifest third only; the `clip-<id>.json` metadata sidecar and the `.jpg`
-      thumbnail remain open.
-- [ ] Use staging plus atomic completion.
-- [ ] Add progress, retry, safe cancellation, and batch export.
+- [ ] M5-14B: add one optional embedded English soft subtitle track without
+  replacing any language-policy sidecar.
+- [x] Generate and verify thumbnail, metadata JSON, and manifest.
+- [x] Use private staging plus exact-artifact validation and atomic completion.
+- [ ] Deliver logged/cloud export requests to an authorized local worker and
+  reconcile immutable results with the shared catalog.
+- [ ] Add durable progress, retry, safe cancellation, sibling isolation, and
+  batch export.
 
 Gate: representative presets produce the requested FFprobe properties, queued jobs survive preset edits unchanged, English clips get an SRT by default and can explicitly omit it, foreign/mixed/unknown clips always get original plus translated-English SRTs, a 30-second foreign-language range produces only cues within that 30-second clip, a real authorized smoke test succeeds, and no full source media remains after any terminal path. M5-08 proves the local export-only composition path with authorized repository fixture media, not a live YouTube source or logged/cloud export delivery.
 
-### 6. Google Sheets
+### 6. Project Clip Library + authoring handoff
 
-- [ ] Configure OAuth and bind a sheet per project.
-- [ ] Keep project ID/name explicit in rows.
-- [ ] Upsert rows by stable clip ID.
-- [ ] Define cloud-owned and sheet-editable fields.
-- [ ] Add export-preset selection and resolve it into a job snapshot when a sheet request is claimed.
-- [ ] Add `Request Export` checkbox/menu action.
-- [ ] Poll requested rows locally or use a hosted relay.
-- [ ] Claim requests idempotently.
-- [ ] Write status/errors/artifact links back.
-- [ ] Add conflict and sync-event logs.
+- [ ] Promote logged clips into a dedicated project-level Clips surface.
+- [ ] Search/filter by transcript, video, notes, tags, research/export status,
+      and verified artifact availability.
+- [ ] Compose the Clip Library over Milestone 5's individual/batch request,
+      immutable settings, progress, sibling isolation, retry, safe cancellation,
+      and same-source grouping primitives; do not create a second executor.
+- [ ] List completed package versions with reveal/open, verify, and explicit
+      re-export actions.
+- [ ] Separate immutable artifact identity from local/cloud/consumer locators.
+- [ ] Add verified relink for relocated packages and explicit missing/invalid/
+      incompatible states.
+- [ ] Expose authorized clip search, exact artifact resolution, and durable
+      export requests to the separate scriptwriting client.
+- [ ] Record direct versus authoring request origin without creating separate
+      rendering paths.
 
-Gate: one sheet action requests exactly one export and status returns to the same row.
+Gate: several clips across multiple videos export as one durable batch with
+independent recovery; a simulated authoring client reuses verified compatible
+packages, while a missing locator produces relink or idempotent re-export rather
+than a false cache hit.
+
+Google Sheets is optional later catalog publishing, not an export control
+surface. Keep CSV; begin with one-way stable-ID publishing only if collaboration
+usage justifies it, and defer selective notes/tags sync until field ownership and
+conflict behavior are proven.
 
 ### 7. Research + capacity expansion
 
@@ -300,6 +347,8 @@ Project
             -> WorkerLease
   -> ClipCandidate
        -> ExportJob (optional)
+            -> ExportArtifact
+                 -> ArtifactLocator (verified availability, not identity)
   -> ExportPreset
        -> ExportPresetVersion
   -> IntegrationBinding
@@ -364,12 +413,18 @@ infra/aws        storage, API, database, queues, identity, monitoring
 - One source acquisition can serve multiple active clip ranges, then is deleted.
 - Source scratch is absent after success, failure, and cancellation; crash recovery retries and exposes cleanup failure.
 - SRT trim/clip-relative shift and FFmpeg fixture validation.
-- CSV/Sheets reconciliation by project and stable clip ID.
+- CSV/optional catalog projection reconciliation by project and stable clip ID.
+- Artifact resolution verifies the exact clip/export snapshot, package manifest,
+  required files, hashes, compatibility, and current locator availability.
+- Relocated artifacts are accepted only after verified relink; missing or invalid
+  locators fall back to a new immutable export request without overwriting history.
+- Direct and simulated authoring requests deduplicate through the same export
+  boundary and reuse compatible verified packages.
 - End-to-end batch -> shared transcript -> second workstation -> review -> select -> log/export.
 
 ## Next action
 
-Continue Milestone 5 with the bounded descriptive `clip-<id>.json` metadata
-sidecar or another explicitly scoped slice; keep logged/cloud export delivery,
-thumbnails, embedding, UI/preset changes, retries, grouping, cloud storage, and
-sweeping separate.
+Continue Milestone 5 with one bounded optional embedded-English soft-subtitle
+slice. Keep registered-agent logged/cloud delivery, result reconciliation,
+progress/retry/cancel, same-source grouping, cleanup sweeping, and the final
+30-second plus authorized-live release gate as separate slices.

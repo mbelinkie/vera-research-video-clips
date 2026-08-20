@@ -2,19 +2,36 @@
 
 Product and technical specification — working draft
 
-Working title: Assembly. Status: discovery / scope. Prepared 13 August 2026.
+Working title: Assembly. Status: discovery / scope. Prepared 13 August 2026;
+updated 20 August 2026.
 
 ## 1. Executive summary
 
-Build a web-based authoring system that feels as familiar as the current two-column Google Docs workflow, but stores enough structured information to compile a written script into a rough-cut DaVinci Resolve project. The output should include generated voiceover, research clips, B-roll, stills, and versioned Fusion graphics placed at intentional points on a timeline. The document must also state whether the host is on camera or speaking in voiceover at every point, and every off-camera span must identify what the audience sees. The authored script remains readable by a human; the machine-readable behavior lives beneath visible blocks and cards rather than in fragile formatting conventions.
+Build a web-based authoring system that feels as familiar as the current two-column Google Docs workflow, but stores enough structured information to compile a written script into a rough-cut DaVinci Resolve project. A script can begin as a per-script nested outline of research topics, questions, and ideas before any draft prose exists. As writing develops, the writer can promote those ideas into the active draft and move promising but currently unused script material into a separate **Extras** area instead of deleting it. The output should include generated voiceover, research clips, B-roll, stills, and versioned Fusion graphics placed at intentional points on a timeline. The document must also state whether the host is on camera or speaking in voiceover at every point, and every off-camera span must identify what the audience sees. The authored script remains readable by a human; the machine-readable behavior lives beneath visible blocks and cards rather than in fragile formatting conventions. A later recorded-performance phase can ingest long prompter line shoots, align repeated takes to stable script ranges, collect explicit keeper approvals, and compile a new timeline that replaces temporary narration while reflowing text-anchored visuals to the real performance.
 
 The product should be a compiler, not a replacement nonlinear editor. The authoring project is the source of truth. A DaVinci Resolve project or timeline is a generated, inspectable deliverable that an editor can refine. Rebuilding should be deterministic, incremental where practical, and must never erase manual editorial work without an explicit reconciliation step.
 
 Recommended first release: author narration plus structured visual cues, synthesize replaceable temporary narration at the narration-block level, resolve already-logged research clips from the existing clip project, use still-image placeholders for unresolved visuals, and generate one new Resolve timeline through a local bridge. A background draft-build action can also render a review MP4 and optionally upload the verified file to Google Drive. Defer automatic visual search/generation and a broad Fusion template library until the core script-to-timeline contract is proven.
 
+### 1.1 Suite phases
+
+1. The research tool logs transcript-backed source clips and prepares reusable
+   editing artifacts.
+2. This authoring platform compiles a structured script into a temp-narrated
+   Resolve rough cut and exports the frozen prompter script used for a shoot.
+3. The recorded-performance phase ingests the resulting long line-shoot media,
+   presents matched takes beside the script, records keeper approvals, and
+   creates a new recorded conform with B-roll retimed from verified word
+   alignment. Its discovery outline is maintained in
+   [Recorded-Performance-Conform Product Spec.md](./Recorded-Performance-Conform%20Product%20Spec.md).
+
+Part 3 shares this product's document, artifact, build, and Resolve contracts,
+but is intentionally a separate phase of work rather than an implied feature of
+the narration-led MVP.
+
 ## 2. Product promise
 
-A writer can author a normal-looking two-column script, assign or request media beside each passage, and click **Edit video** to receive a DaVinci Resolve timeline whose timing, media, graphics, and provenance can be understood and revised. **Update video** incrementally rebuilds from a later script revision. The same action can optionally render and upload a shareable review MP4, allowing the writer to leave the page and return to a completed artifact or an actionable failure. The narration remains the writer's primary surface: camera-state and visual events can begin or end inside a paragraph without forcing the writer to split that paragraph into edit-sized rows.
+A writer can collect and hierarchically organize research ideas before drafting, author a normal-looking two-column script, park unused passages without throwing them away, assign or request media beside each active passage, and click **Edit video** to receive a DaVinci Resolve timeline whose timing, media, graphics, and provenance can be understood and revised. **Update video** incrementally rebuilds from a later script revision. The same action can optionally render and upload a shareable review MP4, allowing the writer to leave the page and return to a completed artifact or an actionable failure. The narration remains the writer's primary surface: camera-state and visual events can begin or end inside a paragraph without forcing the writer to split that paragraph into edit-sized rows.
 
 ## 3. What the example script teaches us
 
@@ -28,6 +45,8 @@ The “OEV25 Finland” document is a useful real-world specimen. It is not simp
 - **When the host is off camera, visual coverage is required. The script must identify the clip, still, graphic, screen capture, or explicit unresolved placeholder visible for the entire VO span.**
 - A clip reference may include a title, YouTube URL, in/out points, translated or quoted dialogue, desired audio policy, and commentary about the moment.
 - Draft notes and abandoned material coexist with the active script. Build eligibility therefore cannot be inferred from document position alone.
+- Early research often begins as topics, questions, and fragments with parent/child relationships rather than finished prose. That planning structure should remain useful before and during drafting without becoming accidental narration.
+- Material removed from the current draft is not necessarily rejected. Writers need a deliberate holding area that preserves the full script fragment and makes restoration easy without relying on undo or revision-history archaeology.
 - The script is optimized for humans collaborating on meaning. Machine semantics should appear progressively through cards, status, and an inspector—not through visible JSON, tags, or syntax.
 
 ## 4. Product principles
@@ -35,6 +54,7 @@ The “OEV25 Finland” document is a useful real-world specimen. It is not simp
 1. Human-readable first. A printed or exported script should still make sense without the application.
 1. **Narration-first authoring. Paragraphs follow the flow of spoken language; camera changes and visual cuts attach to text ranges rather than dictating paragraph or row breaks.**
 1. Structure beneath the surface. Every build-relevant row and asset has a stable ID and typed data even when it renders as ordinary text.
+1. Active scope is explicit. The idea outline and Extras travel with the script but never enter narration, validation, prompter exports, duration estimates, voice generation, or video builds until the writer explicitly promotes or restores their content into the active draft.
 1. The script is canonical; Resolve is compiled output. Editorial refinements can be preserved, but the Resolve timeline is not the only copy of authoring intent.
 1. References before files. Reuse clip IDs, transcript versions, and asset identities. Do not duplicate downloads or silently create disconnected media.
 1. Immutable builds. Each build snapshots the script revision, media versions, voice model, template versions, settings, and tool versions.
@@ -47,6 +67,9 @@ The “OEV25 Finland” document is a useful real-world specimen. It is not simp
 ### 5.1 MVP
 
 - Create/open an authoring project with timeline settings, a script, and a local output workspace.
+- Create a script with no active draft yet and capture topics, questions, research leads, and writing tasks in a per-script outline with multi-level nesting, drag/reorder, indent/outdent, and open/incorporated state.
+- Promote an outline item into the active draft at a chosen location while retaining its planning identity and marking/linking it as incorporated rather than silently deleting it.
+- Move selected prose, complete rows, or structured script fragments from the active draft into a per-script **Extras** area; preserve rich text, typed cards, citations, and references, exclude the material from every build surface, and allow it to be restored at a chosen draft location.
 - Edit a two-column document with section rows, narration rows, production-only rows, and media/graphic cards.
 - **Mark narration ranges as on camera or voiceover without splitting the underlying paragraph; render on-camera words in a restrained semibold weight and voiceover words in normal weight.**
 - **Attach multiple visual events to exact word ranges within one narration paragraph and reveal the relationship in both directions: hovering/selecting a visual highlights its covered words, and selecting words reveals covering visuals.**
@@ -56,6 +79,12 @@ The “OEV25 Finland” document is a useful real-world specimen. It is not simp
 - **Export a narration-only plain-text prompter script with (OC) and (VO) inserted at every host-visibility transition.**
 - Import a legacy two-column Google Doc into a review queue using heuristics; require confirmation of inferred row types and links.
 - Insert clips already logged by the Research Video Transcript & Clip Extraction Tool and display their transcript text as the readable representation.
+- Before each build, resolve every research clip to an exact verified compatible
+  package; reuse reachable packages, offer verified relink for relocated media,
+  and request durable re-export for missing or incompatible packages.
+- Materialize research media into a persistent authoring-project media folder by
+  copy or filesystem-supported copy-on-write clone by default. Never move or
+  mutate the canonical research package.
 - Accept direct media files and manually entered URL/time-range references, while clearly distinguishing resolved from unresolved assets.
 - Generate computer voiceover for narration blocks with pronunciation and performance controls.
 - Generate and cache replaceable temporary speech clips per narration block when a draft build is requested; unchanged blocks reuse verified audio.
@@ -78,7 +107,7 @@ The “OEV25 Finland” document is a useful real-world specimen. It is not simp
 
 ### 6.1 Main document
 
-The default view should look intentionally close to Google Docs: a white page, Arial typography, familiar text controls, page-like margins, document outline, undo/redo, and unobtrusive status. The central content is a two-column grid with no spreadsheet chrome. Rows expand naturally and can contain ordinary paragraphs or structured cards. The left column is visually primary. On-camera text uses a subtle semibold treatment (target CSS font-weight 600; bold only as a fallback), while voiceover text stays normal weight. A small state control, accessible label, and inspector value accompany the styling so camera state is never communicated by weight alone.
+The default view should look intentionally close to Google Docs: a white page, Arial typography, familiar text controls, page-like margins, section navigation, undo/redo, and unobtrusive status. The central content is a two-column grid with no spreadsheet chrome. Rows expand naturally and can contain ordinary paragraphs or structured cards. The left column is visually primary. On-camera text uses a subtle semibold treatment (target CSS font-weight 600; bold only as a fallback), while voiceover text stays normal weight. A small state control, accessible label, and inspector value accompany the styling so camera state is never communicated by weight alone.
 
 | Left: spoken / performed                                    | Right: shown / heard / built                           |
 | ----------------------------------------------------------- | ------------------------------------------------------ |
@@ -88,7 +117,17 @@ The default view should look intentionally close to Google Docs: a white page, A
 | Blank                                                       | Production-only cue, music, transition, or clip        |
 | Scratch / excluded draft                                    | Optional reference notes and unused alternatives       |
 
-### 6.2 Progressive controls
+### 6.2 Idea outline and Extras
+
+Each script has three explicit content surfaces: **Ideas**, **Draft**, and **Extras**. The Draft remains the primary page and the only build-eligible surface. Ideas and Extras are available from a collapsible side panel or focused full view so early research can lead naturally into writing without crowding the two-column document.
+
+**Ideas is an outliner, not the document's section-navigation outline.** Every item can contain text and child items, and supports add-child/add-sibling, drag/reorder, indent/outdent, collapse/expand, and open/incorporated state. A script may exist with only Ideas populated. Promoting an item creates or inserts a chosen draft block, preserves a backlink to the originating idea, and marks the idea incorporated; the writer can reopen it or link it to a different block later. Incorporation state is informative and never controls build eligibility by itself.
+
+**Extras is a loss-averse holding area for authored material that is not in the current draft.** `Move to Extras` is a first-class action for selected text, rows, or structured fragments. It preserves readable content, formatting, typed cards, citations, media references, provenance, and the source revision/location where practical. Moving a whole block preserves its stable identity. Restoring inserts the material at a writer-selected Draft location; duplicating it into the Draft creates new identities so the stored alternate remains available. References or text anchors that are no longer valid return visibly stale and require review rather than being silently discarded or rebound.
+
+Ideas and Extras autosave and revision atomically with the Draft. Their counts and unresolved/stale state are visible, but they do not create host-visibility or visual-coverage errors. They are excluded from prompter/print exports by default, with an explicit appendix option for human-readable exports only. Ordinary delete still exists with undo and revision-history recovery; the application does not silently convert every deletion into an Extra.
+
+### 6.3 Progressive controls
 
 - Typing stays immediate. A blank right cell behaves like text until the writer types @, pastes a URL, drags an asset, or chooses Insert.
 - Insert opens clip search, upload, stock/generated image request, graphic template, music, placeholder, and citation choices.
@@ -98,9 +137,19 @@ The default view should look intentionally close to Google Docs: a white page, A
 - A Preview timing mode estimates duration from generated or recorded narration and displays row-level time spans without turning the document into a timeline.
 - A Resolve view shows the last build, track map, warnings, changed blocks, and the exact timeline/project destination.
 - The primary action reads **Edit video** before the first build and **Update video** afterward. Its menu exposes `Timeline only`, `Timeline + review MP4`, and `Timeline + review MP4 + Drive upload`, with the chosen destination and sharing policy visible before submission.
+- Build preparation summarizes how many media requirements will be reused,
+  materialized, exported, relinked, or left unresolved, plus estimated new disk
+  usage. It proceeds without interruption when policy resolves every item and
+  opens a focused remediation view only for missing, incompatible, invalid, or
+  authorization-blocked media.
+- Reuse policy and project-media policy are separate controls. The recommended
+  defaults are `Reuse verified; export missing/incompatible` and
+  `Make project self-contained by copy/clone`. Advanced alternatives may
+  reference verified media in place, forbid new exports, or explicitly
+  re-export all clips.
 - Each narration block shows its temporary-audio state—missing, queued, generating, ready, stale, locked, failed, or replaced by host recording—and can preview or regenerate only that block.
 
-### 6.3 Narration-first visual anchoring
+### 6.4 Narration-first visual anchoring
 
 **Recommended model: keep each narration paragraph intact and add independent, range-anchored event lanes. A host-visibility lane records OC/VO spans. A visual lane records clips, stills, graphics, and placeholders. Both lanes use stable text anchors—block ID plus start/end token IDs or resilient relative positions—rather than new table rows.**
 
@@ -119,7 +168,7 @@ The default view should look intentionally close to Google Docs: a white page, A
 - **A miniature timeline under every paragraph is precise, but visually heavy during drafting. Use it only in the secondary timing/refinement mode.**
 - **Sentence-level visual cards are easier to implement but cannot express mid-sentence cuts cleanly. They may be a prototype constraint, not the final data model.**
 
-### 6.4 Row and block types
+### 6.5 Row and block types
 
 | Type                 | Readable rendering                                         | Build behavior                                                        |
 | -------------------- | ---------------------------------------------------------- | --------------------------------------------------------------------- |
@@ -135,7 +184,7 @@ The default view should look intentionally close to Google Docs: a white page, A
 | host-visibility span | OC or VO state over a narration range                      | Emits prompter markers and validates host visibility                  |
 | visual event         | Right-column card linked to highlighted words              | Places a clip/still/graphic over the compiled time range              |
 
-### 6.5 Prompter export
+### 6.6 Prompter export
 
 **The prompter export contains only spoken host narration, in document order. It excludes direction blocks, citations, visual notes, asset transcripts, graphics data, and excluded drafts. It always begins with a state marker and adds a new marker only when host visibility changes.**
 
@@ -157,6 +206,12 @@ Do not compile directly from HTML, Google Docs table markup, or free-form prose.
 
 Illustrative row shape:
 
+**ScriptDocument { id, projectId, title, activeDraft, ideaOutline, extras, revision, version }**
+
+**IdeaItem { id, parentId, orderKey, text, state: open | incorporated, linkedDraftBlockIds[], collapsed, version }**
+
+**StoredFragment { id, orderKey, contentTree, sourceBlockIds[], sourceRevision, sourceLocation, state: stored | stale, version }**
+
 **NarrationBlock { id, orderKey, text, hostVisibilitySpans[], visualEvents[], timingPolicy, state, notes, version }**
 
 **TextAnchorRange { blockId, startTokenId, endTokenId, startAffinity, endAffinity, quotedText, anchorVersion }**
@@ -169,13 +224,21 @@ Illustrative row shape:
 
 MediaReference { id, kind, sourceSystem, sourceId, sourceUrl, versionSnapshot, transcriptSnapshot, requestedInOut, exportHandles, captureProfile, artifactId, provenance, status }
 
+ArtifactRequirement { id, mediaReferenceId, clipSnapshot, requiredBounds, requiredHandles, conversionRequirements, languageArtifactPolicy, reusePolicy }
+
+ResolvedArtifact { requirementId, artifactId, packageManifestHash, contentHashes, compatibility, availability, verifiedAt, sourceLocatorId }
+
+MaterializedMedia { id, projectId, requirementId, artifactId, mode: clone | copy | reference, projectRelativeLocator, contentHashes, verifiedAt }
+
 TransitionPolicy { presenterToBroll, brollToPresenter, brollToBroll }
 
 TransitionSpec { kind, durationFrames, easing, templateId, templateVersion, audioBehavior }
 
 GraphicInstance { id, templateId, templateVersion, data, styleOverrides, durationPolicy, validationState }
 
-BuildSnapshot { id, scriptRevision, rowVersions, assetVersions, voiceSettings, templateVersions, timelineSettings, target, status, manifestHash }
+BuildSnapshot { id, scriptRevision, activeDraftBlockVersions, assetVersions, voiceSettings, templateVersions, timelineSettings, target, status, manifestHash }
+
+The document transaction and revision cover Draft, Ideas, and Extras together, but the compiler receives only `activeDraft`. Moving a block between Draft and Extras is a reversible document operation, not destructive deletion. A build snapshot records the active block versions it compiled so later outline or Extra edits do not falsely imply that generated media is stale.
 
 ## 8. Integration with the research clip project
 
@@ -183,8 +246,18 @@ The existing project should remain authoritative for research clips, transcripts
 
 1. The writer searches project clips by project, tags, note, source title, or transcript text.
 1. Dropping a result onto selected narration creates a VisualEvent whose assetReference points to the stable project clip ID. It snapshots the readable transcript plus selected version/bounds while its TextAnchorRange states exactly which words the clip covers.
-1. If an editing-ready artifact exists and matches the snapshot, the build reuses it.
-1. If no artifact exists, the authoring build requests an export through the existing durable export boundary and waits, fails clearly, or builds with a placeholder according to policy.
+1. At build time, the authoring client asks the research artifact resolver for an
+   exact package matching the clip snapshot, required bounds/handles,
+   language-policy files, and conversion requirements.
+1. If a compatible artifact is reachable, the resolver verifies its manifest and
+   required hashes before the build reuses it. A catalog status of `complete`
+   alone is not a cache hit.
+1. If the expected locator is missing, the local agent searches only configured
+   artifact roots or asks the user to locate the package. A located candidate is
+   accepted only after its manifest, clip snapshot, and hashes verify.
+1. If no verified compatible artifact is reachable, the authoring build requests
+   a new immutable export through the existing durable export boundary and
+   waits, fails clearly, or builds with a placeholder according to policy.
 1. Script-specific choices—mute source audio, use only part of the exported range, crop, layer, speed, or placement duration—remain usage overrides and do not mutate the research clip.
 1. If the research record changes, the script shows “update available” and offers keep snapshot, update reference, or compare. It never silently retargets the edit.
 
@@ -193,6 +266,64 @@ The existing project should remain authoritative for research clips, transcripts
 - Research project owns source acquisition, transcripts, clip logging, rights/provenance notes, clip export, and reusable clip artifacts.
 - Authoring project owns narrative order, usage of a clip in a particular video, voiceover, graphics, visual requests, timeline placement, and build history.
 - Resolve bridge owns deterministic translation from one build snapshot into a local Resolve project/timeline and the reconciliation report.
+
+### 8.1 Build-time media resolution and materialization
+
+Artifact identity and file placement are separate concerns. The immutable
+research artifact/package ID, manifest, and content hashes identify reusable
+media. Local paths, object keys, temporary download grants, and project-local
+copies are locators. The build must verify actual bytes; it must not infer
+availability from a remembered path or a completed export record.
+
+When **Edit video** or **Update video** freezes a revision, create an
+`ArtifactRequirement` for every research clip and produce a media-preparation
+plan before timeline compilation:
+
+| Resolution state                                       | Default action                                                         |
+| ------------------------------------------------------ | ---------------------------------------------------------------------- |
+| Exact, compatible, reachable, and hash-verified        | Reuse and materialize into the authoring project                       |
+| Reachable but incompatible or lacking required handles | Request a new immutable export                                         |
+| Completed record with a missing locator                | Search configured roots, then offer verified `Locate`                  |
+| User-located package                                   | Accept only after manifest/snapshot/hash verification                  |
+| Still missing                                          | Request durable re-export from the frozen clip snapshot                |
+| Source unavailable or unauthorized                     | Block or use an explicit labeled placeholder according to build policy |
+
+Keep two settings independent:
+
+- **Reuse policy:** `Reuse verified; export missing/incompatible` (default),
+  `Re-export all`, or `Reuse only; do not start exports`.
+- **Project media policy:** `Make project self-contained by copy/clone` (default),
+  `Reference verified media in place`, or `Ask for each source`.
+
+The default authoring workspace keeps reusable media outside individual build
+directories so later builds can reuse it without multiplying copies:
+
+```text
+Authoring Project/
+  Media/
+    Research Clips/
+      <clip-id>/<artifact-id>/
+        <verified package files>
+  Builds/
+    <build-id>/
+      timeline-manifest.json
+      build-report.json
+```
+
+Prefer a filesystem-supported copy-on-write clone when it preserves independent
+consumer bytes; otherwise copy. Referencing in place is an advanced, less
+portable option. Do not move the research package. Do not use ordinary hard
+links when later mutation could alter canonical bytes. Record the materialized
+artifact ID, project-relative locator, hashes, and verification time in the
+build snapshot.
+
+`Re-export all` creates new immutable research artifact versions using the
+frozen requirements; it never overwrites prior packages or silently changes an
+earlier build. If a project-local copy is deleted later, the next build attempts
+verified rematerialization from the canonical package, then verified relink,
+then durable re-export. If reacquisition is impossible, preserve the clip
+reference and transcript and expose missing media rather than substituting
+unrelated footage.
 
 ## 9. Voiceover subsystem
 
@@ -298,7 +429,13 @@ This hybrid prevents the product from depending entirely on undocumented project
 ### 12.3 Build sequence
 
 1. Freeze an immutable script/build snapshot and validate row order, timeline rate, asset identities, graphics data, and voice settings.
-1. Resolve or generate changed narration, clip packages, stills, and graphics dependencies. Record hashes and actionable failures.
+1. Build the media-preparation plan. Resolve exact research artifact candidates,
+   verify manifests/hashes and compatibility, classify missing or invalid
+   locators, and freeze the effective reuse/project-media policies.
+1. Resolve or generate changed narration, clip packages, stills, and graphics
+   dependencies. Reuse or re-export according to the plan, then copy/clone or
+   reference verified packages into the authoring workspace. Record hashes,
+   materialization locators, and actionable failures.
 1. **Calculate durations. Narration is the default timing spine. Resolve text anchors to verified speech timing, compile OC/VO spans and visual-event ranges into integer frames, then apply explicit timing overrides and transitions. Report anchor/alignment precision rather than implying exactness.**
 1. Resolve every visual source into a verified immutable artifact. Logged clips use the research export boundary; webpage URLs use the capture adapter and motion preset; image URLs/files use full-resolution acquisition plus the chosen framing policy.
 1. Classify visual boundaries and compile effective presenter→B-roll, B-roll→presenter, and B-roll→B-roll transition specifications, validating available duration and handles.
@@ -333,7 +470,7 @@ Jobs use idempotency keys, attempts, progress, cancellation boundaries, and work
 
 - Web client: structured document editor, clip/asset search, inspectors, preview timing, and build/status UI.
 - Authoring API: projects, document revisions, media references, template registry, build snapshots, collaboration-ready optimistic versions, and permissions.
-- Local agent: filesystem, FFmpeg/FFprobe, voice provider credentials where local, downloads/imports, Resolve discovery and automation, and local artifact cache.
+- Local agent: filesystem, FFmpeg/FFprobe, voice provider credentials where local, downloads/imports, configured-root artifact lookup, manifest/hash verification, project-media materialization, Resolve discovery and automation, and local artifact cache.
 - Build orchestrator: persisted dependency graph and jobs for voice, clip export, image generation, media normalization, manifest compilation, and Resolve assembly.
 - Research clip adapter: versioned API client to the existing shared catalog and export worker.
 - Provider adapters: voice synthesis, image generation, stock/media search, review delivery/Google Drive, notifications, and future music/SFX providers.
@@ -347,26 +484,36 @@ Jobs use idempotency keys, attempts, progress, cancellation boundaries, and work
 - Use immutable artifact versions and content hashes. A path is a locator, not identity.
 - Represent long work as durable, observable, retryable jobs with idempotency keys, attempts, progress, cancellation boundaries, and leases where distributed.
 - Snapshot every external dependency in a build: research clip/version, exported artifact hash, voice/provider settings, graphic template version, generated image version, and Resolve/timeline settings.
+- Persist each artifact requirement, resolution result, and project-local
+  materialization separately. A missing locator can be repaired without
+  changing the research clip reference or pretending the old artifact never
+  completed.
+- Reuse policy, project-media policy, resolved compatibility decision, artifact
+  ID/manifest hash, and content hashes are frozen in the build snapshot. A later
+  `Re-export all` action produces new artifact dependencies and a new build.
 - Keep a build dependency graph so changing one narration paragraph regenerates only its voice asset and downstream timing, while unchanged assets are reused.
 - Persist `VideoBuildJob`, `ReviewRenderArtifact`, and `DeliveryAttempt` separately. A successful timeline or MP4 remains successful when a later upload attempt fails.
 
 ## 15. Failure and placeholder policy
 
-| Condition                                                       | Default behavior                                                                                                              |
-| --------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| Missing clip artifact                                           | Request export; block or place labeled slate according to build policy                                                        |
-| YouTube/source acquisition unavailable                          | Keep the clip reference and transcript; show remediation; never substitute unrelated footage                                  |
-| Voice generation fails                                          | Place duration-preserving tone/slate or block build; retain text and error                                                    |
-| Graphic data invalid                                            | Show field-level validation; optionally place template-named slate                                                            |
-| Image unresolved                                                | Place request text on a slate with stable row ID                                                                              |
-| Webpage capture is blocked, incomplete, or materially different | Keep the URL/card and capture diagnostics; require review, retry with a revised capture profile, or use a supplied screenshot |
-| Image aspect ratio differs from timeline                        | Use contain plus the selected project background; never crop or stretch unless explicitly overridden                          |
-| Transition lacks sufficient duration or media handles           | Block that transition with corrective choices; allow an explicit hard cut without moving narration anchors                    |
-| Resolve unavailable                                             | Finish assets and timeline manifest; leave Resolve assembly retryable                                                         |
-| Resolve output differs from manifest                            | Fail verification and retain both manifest and generated timeline for diagnosis                                               |
-| Review render fails                                             | Retain the verified timeline and earlier artifacts; retry render without regenerating unchanged dependencies                  |
-| Drive upload fails or authentication expires                    | Keep the verified local MP4, expose reauthentication/retry, and never rebuild merely to retry delivery                        |
-| Workstation sleeps, restarts, or Resolve is closed              | Persist state and resume from the last verified stage when the local agent and required application return                    |
+| Condition                                                       | Default behavior                                                                                                                  |
+| --------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| Completed clip record but package locator is missing            | Search configured roots, offer verified `Locate`, then request immutable re-export or apply the explicit placeholder/block policy |
+| Located package fails manifest/snapshot/hash verification       | Reject it as invalid; retain the clip reference and offer another location or durable re-export                                   |
+| Reachable clip package lacks required handles or compatibility  | Request a new immutable export; never stretch, silently substitute, or mutate the prior package                                   |
+| Project-local media copy was deleted                            | Rematerialize from a verified canonical package, then relink or re-export if necessary                                            |
+| YouTube/source acquisition unavailable                          | Keep the clip reference and transcript; show remediation; never substitute unrelated footage                                      |
+| Voice generation fails                                          | Place duration-preserving tone/slate or block build; retain text and error                                                        |
+| Graphic data invalid                                            | Show field-level validation; optionally place template-named slate                                                                |
+| Image unresolved                                                | Place request text on a slate with stable row ID                                                                                  |
+| Webpage capture is blocked, incomplete, or materially different | Keep the URL/card and capture diagnostics; require review, retry with a revised capture profile, or use a supplied screenshot     |
+| Image aspect ratio differs from timeline                        | Use contain plus the selected project background; never crop or stretch unless explicitly overridden                              |
+| Transition lacks sufficient duration or media handles           | Block that transition with corrective choices; allow an explicit hard cut without moving narration anchors                        |
+| Resolve unavailable                                             | Finish assets and timeline manifest; leave Resolve assembly retryable                                                             |
+| Resolve output differs from manifest                            | Fail verification and retain both manifest and generated timeline for diagnosis                                                   |
+| Review render fails                                             | Retain the verified timeline and earlier artifacts; retry render without regenerating unchanged dependencies                      |
+| Drive upload fails or authentication expires                    | Keep the verified local MP4, expose reauthentication/retry, and never rebuild merely to retry delivery                            |
+| Workstation sleeps, restarts, or Resolve is closed              | Persist state and resume from the last verified stage when the local agent and required application return                        |
 
 ## 16. Milestones
 
@@ -382,11 +529,13 @@ Gate: one deterministic local fixture becomes a correct, reopenable Resolve time
 ### Milestone 1 — Structured authoring prototype
 
 - Two-column editor with section, narration, direction, clip, visual, graphic, citation, and excluded-draft blocks.
+- Per-script Ideas outliner with nested items, reordering/indentation, open/incorporated state, and explicit promotion into a chosen Draft location.
+- Per-script Extras surface with lossless move, restore, and duplicate-to-Draft operations for text, rows, and structured fragments.
 - Stable IDs, undo/redo, copy/paste, selection across rows, autosave, revision snapshots, and printable/exportable human view.
 - **Continuous paragraphs with range-anchored OC/VO spans, multiple visual cards per paragraph, bidirectional hover highlighting, complete VO coverage validation, and deterministic prompter export.**
 - Legacy Google Doc table import for the example document, with an inference-review screen.
 
-Gate: the example script can be represented naturally, including left-only/right-only rows and an excluded notes section, without losing readable content; one uninterrupted narration paragraph can contain multiple picture cuts and camera-state changes without being split into rows.
+Gate: a new script can begin as a nested Ideas-only outline, promote one item into the Draft with a durable backlink, and keep incorporated planning history. The example script can then be represented naturally, including left-only/right-only rows, while unused rich content moves to Extras and restores without losing typed references. Ideas and Extras never affect validation, prompter output, or build input. One uninterrupted narration paragraph can contain multiple picture cuts and camera-state changes without being split into rows.
 
 ### Milestone 2 — Narration-led rough cut
 
@@ -407,10 +556,23 @@ Gate: from the script, one action creates a verified shareable MP4; with Drive e
 ### Milestone 3 — Research clip integration
 
 - Search and insert stable clip records from the existing project.
-- Reuse matching artifacts or request durable exports; propagate status and errors.
+- Resolve exact compatibility and current byte availability rather than trusting
+  completed catalog state alone.
+- Reuse matching verified artifacts, recover relocated packages through verified
+  relink, or request durable immutable exports; propagate status and errors.
+- Add a media-preparation summary plus independent reuse and project-media
+  policies, defaulting to reuse verified media and copy/clone it into a
+  self-contained authoring-project media folder.
+- Preserve missing clip/transcript references when reacquisition fails and apply
+  the project's explicit block-versus-placeholder policy.
 - Snapshot transcript/version/bounds and show update comparisons.
 
-Gate: a selected research clip appears as transcript text in the script and as the correct trimmed media—with handles and chosen audio policy—in Resolve.
+Gate: a selected research clip appears as transcript text in the script and as
+the correct trimmed media—with handles and chosen audio policy—in Resolve. A
+reachable verified package is reused without rendering; a relocated package can
+be verified and relinked; a missing or incompatible package creates one
+idempotent re-export; and the resulting bytes are copied/cloned into the
+authoring project without moving the canonical research package.
 
 ### Milestone 3B — Visual acquisition and transitions
 
@@ -439,14 +601,26 @@ Gate: changing a paragraph or visual choice updates a new or safely reconciled t
 
 ## 17. MVP acceptance path
 
+1. Create a new script with no Draft content, add a three-level Ideas outline, reorder and indent items, close/reopen the script, and confirm the hierarchy persists.
+1. Promote one idea at a chosen Draft location; confirm the idea remains linked and marked incorporated while only the new Draft block becomes build-eligible.
 1. Import a copy of the example two-column Google Doc and review inferred rows.
-1. Mark the notes/drafts tail excluded and confirm it does not affect the build.
+1. Move one rich-text passage and one structured card/row to Extras; confirm neither affects validation, duration, voice generation, prompter output, or build input, then restore one at a chosen Draft location without losing content or references.
+1. Move the imported notes/drafts tail to Extras and confirm it does not affect the build.
 1. Generate voiceover for a short chosen section, including one pronunciation override and one stage direction that remains unspoken.
 1. Confirm that narration is generated as separately cached block assets; edit one block, run **Update video**, and verify only that block and its timing dependents regenerate.
 1. **Keep one narration paragraph intact while adding at least two visual events that begin/end at different word anchors inside it; verify hover highlighting in both directions.**
 1. **Mark successive ranges OC, VO, and OC; verify OC words appear semibold, every VO range has visual coverage, and a deliberate unresolved placeholder is visible as such.**
 1. **Export a narration-only prompter text file; verify it begins with (OC) or (VO), emits markers only at transitions, preserves spoken wording/order, and excludes directions and production notes.**
 1. Insert one existing research clip by searching its transcript; preserve the clip ID, transcript version, selected bounds, export handles, and source audio choice.
+1. Build with an exact compatible research package already present; verify its
+   manifest/hashes, reuse it without rendering, and copy/clone it into the
+   authoring project's `Media/Research Clips` area.
+1. Move the canonical fixture package outside its recorded locator, run build
+   preparation, locate it explicitly, and verify that relink succeeds only after
+   the exact manifest/snapshot/hashes pass.
+1. Delete another fixture package and verify the build requests exactly one
+   durable re-export. Then choose `Re-export all` and verify new immutable
+   versions are created without overwriting prior artifact/build history.
 1. Add a public webpage URL, preview its capture viewport, and verify the finalized screenshot receives the default top-left drift for exactly the event duration.
 1. Add one direct or uploaded full-resolution image and verify the entire image remains visible with no animation by default, including when its aspect ratio differs from the timeline.
 1. Set different transitions for presenter→B-roll, B-roll→B-roll, and B-roll→presenter; verify each compiled boundary uses the correct versioned preset and that an event-level override affects only its selected boundary.
@@ -460,26 +634,31 @@ Gate: changing a paragraph or visual choice updates a new or safely reconciled t
 
 ## 18. Open questions and current recommendations
 
-| Question                                       | Current recommendation                                                                                                                                                                                 |
-| ---------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Separate repo or current monorepo?             | Treat this as a separate product/repository with a versioned API to the research project. Prototype code can temporarily share contracts, but avoid making either deployment depend on the other’s UI. |
-| Google Docs as canonical editor?               | No. Import legacy docs and export readable snapshots, but make the structured web document canonical. Perfect Docs round-trip would erase semantics or require brittle conventions.                    |
-| Timeline interchange or direct API?            | Hybrid: canonical internal manifest, OTIO/FCPXML where helpful, Resolve scripting for Resolve-specific placement and Fusion. Validate against the installed version.                                   |
-| Resolve project target?                        | Create a new project or new generated timeline by default. Never assume permission to overwrite an editor’s active timeline.                                                                           |
-| Timing spine?                                  | Narration duration by default, with explicit row policies for clip-led, fixed-duration, overlap, and montage regions.                                                                                  |
-| Voice provider?                                | Keep an adapter and compare at least one cloud and one local/offline option on quality, pronunciation, latency, cost, licensing, determinism, and data handling.                                       |
-| Speech asset granularity?                      | Narration block/row is the logical cache and replacement unit. Permit internal sentence chunks only as a provider implementation detail.                                                               |
-| What does Edit/Update video do?                | Freeze the current revision and start a durable incremental build. Default to a verified Resolve timeline; optionally continue to a review MP4 and Drive delivery using visible presets.               |
-| Drive upload semantics?                        | Upload a new immutable review version by default. Keep sharing permissions explicit and retry delivery independently of rendering.                                                                     |
-| Can a build finish after the browser closes?   | Yes, through the persisted local/background worker. The workstation and required local applications must remain available; otherwise the job waits and resumes.                                        |
-| Automated B-roll selection?                    | Start with writer-selected assets and explicit placeholders. Add suggestions only after provenance, replacement, and rejection workflows are strong.                                                   |
-| Does webpage capture require a browser plugin? | Not for public pages: use a local headless-browser capture adapter. Treat authenticated pages as a later explicit attached-browser/extension capability or accept a user-supplied screenshot.          |
-| Webpage capture default?                       | Capture a writer-previewed viewport/region as an immutable still and apply a slow top-left-anchored drift across the event duration. Do not embed a live webpage in Resolve.                           |
-| Image fit default?                             | Preserve the full-resolution source and use contain/no-crop with a project background. No animation unless explicitly selected.                                                                        |
-| Transition defaults?                           | Store independent presenter→B-roll, B-roll→presenter, and B-roll→B-roll policies. `Apply to everything` is a shortcut, not a fourth semantic category.                                                 |
-| Fusion template inputs?                        | Design semantic schemas independent of node/control names and generate or map to Fusion controls through a versioned package.                                                                          |
-| Manual Resolve edits?                          | Initial one-way compile to a new timeline. Add a managed-item reconciliation protocol only after stable IDs survive real editing sessions.                                                             |
-| Collaboration?                                 | Design optimistic versions and stable IDs now; defer presence, comments, and conflict-rich real-time coauthoring until single-writer builds are reliable.                                              |
+| Question                                       | Current recommendation                                                                                                                                                                                                             |
+| ---------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Separate repo or current monorepo?             | Treat this as a separate product/repository with a versioned API to the research project. Prototype code can temporarily share contracts, but avoid making either deployment depend on the other’s UI.                             |
+| Google Docs as canonical editor?               | No. Import legacy docs and export readable snapshots, but make the structured web document canonical. Perfect Docs round-trip would erase semantics or require brittle conventions.                                                |
+| Ideas versus Extras?                           | Ideas is a nested pre-draft planning/task outline; Extras holds already-authored material removed from the current Draft. Both belong to one script revision but are excluded from compilation until explicitly promoted/restored. |
+| What should deletion do?                       | Keep ordinary delete with undo/revision recovery, and make `Move to Extras` the visible loss-averse action for material the writer may reuse. Do not silently turn every deletion into an Extra.                                   |
+| Timeline interchange or direct API?            | Hybrid: canonical internal manifest, OTIO/FCPXML where helpful, Resolve scripting for Resolve-specific placement and Fusion. Validate against the installed version.                                                               |
+| Resolve project target?                        | Create a new project or new generated timeline by default. Never assume permission to overwrite an editor’s active timeline.                                                                                                       |
+| Timing spine?                                  | Narration duration by default, with explicit row policies for clip-led, fixed-duration, overlap, and montage regions.                                                                                                              |
+| Voice provider?                                | Keep an adapter and compare at least one cloud and one local/offline option on quality, pronunciation, latency, cost, licensing, determinism, and data handling.                                                                   |
+| Speech asset granularity?                      | Narration block/row is the logical cache and replacement unit. Permit internal sentence chunks only as a provider implementation detail.                                                                                           |
+| What does Edit/Update video do?                | Freeze the current revision and start a durable incremental build. Default to a verified Resolve timeline; optionally continue to a review MP4 and Drive delivery using visible presets.                                           |
+| Research media reuse policy?                   | Default to reusing exact compatible verified packages and exporting only missing/incompatible requirements. `Re-export all` is explicit and creates new immutable versions.                                                        |
+| Project media placement?                       | Default to a self-contained project media area populated by copy-on-write clone when safe, otherwise copy. Reference-in-place is advanced; never move canonical research packages.                                                 |
+| Missing previously exported media?             | Verify configured roots or an explicit user-located package, then re-export from the frozen clip snapshot. If reacquisition fails, retain the reference and block or use a labeled placeholder.                                    |
+| Drive upload semantics?                        | Upload a new immutable review version by default. Keep sharing permissions explicit and retry delivery independently of rendering.                                                                                                 |
+| Can a build finish after the browser closes?   | Yes, through the persisted local/background worker. The workstation and required local applications must remain available; otherwise the job waits and resumes.                                                                    |
+| Automated B-roll selection?                    | Start with writer-selected assets and explicit placeholders. Add suggestions only after provenance, replacement, and rejection workflows are strong.                                                                               |
+| Does webpage capture require a browser plugin? | Not for public pages: use a local headless-browser capture adapter. Treat authenticated pages as a later explicit attached-browser/extension capability or accept a user-supplied screenshot.                                      |
+| Webpage capture default?                       | Capture a writer-previewed viewport/region as an immutable still and apply a slow top-left-anchored drift across the event duration. Do not embed a live webpage in Resolve.                                                       |
+| Image fit default?                             | Preserve the full-resolution source and use contain/no-crop with a project background. No animation unless explicitly selected.                                                                                                    |
+| Transition defaults?                           | Store independent presenter→B-roll, B-roll→presenter, and B-roll→B-roll policies. `Apply to everything` is a shortcut, not a fourth semantic category.                                                                             |
+| Fusion template inputs?                        | Design semantic schemas independent of node/control names and generate or map to Fusion controls through a versioned package.                                                                                                      |
+| Manual Resolve edits?                          | Initial one-way compile to a new timeline. Add a managed-item reconciliation protocol only after stable IDs survive real editing sessions.                                                                                         |
+| Collaboration?                                 | Design optimistic versions and stable IDs now; defer presence, comments, and conflict-rich real-time coauthoring until single-writer builds are reliable.                                                                          |
 
 ## 19. Decisions required before implementation
 
@@ -501,18 +680,22 @@ Gate: changing a paragraph or visual choice updates a new or safely reconciled t
 
 ## 20. First implementation slice
 
-Build the smallest vertical proof, not the full web editor: a checked-in JSON script fixture containing two narration blocks, one continuous paragraph with OC → VO → OC spans, three range-anchored visual events (a fake logged-clip artifact, a webpage-capture fixture with top-left drift, and a mismatched-aspect image fixture using contain/no-crop), independent transition choices for all three boundary categories, one unresolved visual placeholder, and one lower third; deterministic per-block temporary speech generation and caching; a deterministic (OC)/(VO) prompter export; a local compiler that resolves anchors to a frame-based timeline manifest; and a durable build job that creates and verifies a new Resolve timeline, renders and verifies an MP4, and optionally uploads it through a fake Drive adapter. Change one block and prove that **Update video** reuses the unchanged audio and media. Use stable IDs, immutable artifacts, resumable stages, and marker custom data from the first spike. Once that boundary is reliable, build the two-column editor against the same schema.
+Build the smallest vertical proof, not the full web editor: a checked-in JSON script fixture containing a nested Ideas outline, one incorporated idea linked to the Draft, one stored Extra, two active narration blocks, one continuous paragraph with OC → VO → OC spans, three range-anchored visual events (a fake logged-clip artifact, a webpage-capture fixture with top-left drift, and a mismatched-aspect image fixture using contain/no-crop), independent transition choices for all three boundary categories, one unresolved visual placeholder, and one lower third; deterministic per-block temporary speech generation and caching; a deterministic (OC)/(VO) prompter export; a local compiler that accepts only the active Draft and proves Ideas/Extras are absent from voice, validation, manifest, and prompter outputs; and a durable build job that creates and verifies a new Resolve timeline, renders and verifies an MP4, and optionally uploads it through a fake Drive adapter. Make the fake logged clip cross the real media-preparation contract: verify and copy/clone one existing immutable package, simulate a missing locator and verified relink, then simulate deletion and one idempotent re-export without moving or overwriting prior artifacts. Change one active block and prove that **Update video** reuses the unchanged audio and media; change only an Idea or Extra and prove it does not invalidate build artifacts. Use stable IDs, immutable artifacts, resumable stages, and marker custom data from the first spike. Once that boundary is reliable, build the two-column editor against the same schema.
 
 ## 21. Technical risks
 
 - Resolve scripting coverage differs by version/edition and some operations may require the application to be fully running. Mitigation: capability probe, version matrix, fixtures, and hybrid interchange/API strategy.
 - Fusion templates can expose implementation-specific controls and break when renamed. Mitigation: semantic schema, immutable versions, installer validation, and reference renders.
 - Legacy Google Docs contain ambiguous free-form cues. Mitigation: heuristic import with visible confidence and mandatory review; never treat import guesses as production-ready automatically.
+- Planning and parked material can leak into production if scope is inferred from document position. Mitigation: persist Ideas, Draft, and Extras as explicit roots and expose only the active Draft to validation, voice, prompter, and build contracts.
+- Moving rich fragments out of the Draft can orphan text anchors or media relationships. Mitigation: move whole typed subtrees with stable IDs when possible, preserve source revision/location, mark invalid relationships stale, and require review before restoration or compilation.
 - Generated voice changes duration, shifting the entire edit. Mitigation: block-level assets, locked takes, change-impact preview, and immutable build snapshots.
 - **Word-level timing may be unavailable or change after voice regeneration. Mitigation: preserve timing precision, align when required, offer a secondary timing mode, and never claim frame accuracy from paragraph position alone.**
 - **Text edits can invalidate visual anchors or cause anchor drift. Mitigation: stable token/relative-position anchors, quoted-text checks, visible stale states, repair UI, and immutable build snapshots.**
 - Manual edits and generated rebuilds can diverge. Mitigation: new-timeline default, stable managed IDs, diff/reconciliation, and no silent overwrite.
 - Online media may be inaccessible or unauthorized. Mitigation: reuse the research project’s explicit authorization/provider boundaries and keep placeholders useful when export fails.
+- A completed research export may have been moved, deleted, or corrupted. Mitigation: separate artifact identity from locators, verify package manifests/hashes at build time, support bounded configured-root lookup and explicit verified relink, then request an immutable re-export when possible.
+- Copying all research packages can waste disk, while referencing them in place can make builds fragile. Mitigation: make reuse and materialization independent policies, prefer safe copy-on-write clones with copy fallback for self-contained projects, report estimated storage, and keep reference-in-place advanced.
 - Provider costs and privacy vary. Mitigation: adapters, per-project policy, previews/estimates, caching, and explicit disclosure of uploaded text/media.
 - Background builds depend on workstation availability and Resolve state. Mitigation: persisted waiting states, restart recovery, capability probes, optional sleep prevention, and clear indication of which stages can run unattended.
 - Review delivery can accidentally expose unfinished work. Mitigation: private-by-default Drive upload, explicit sharing controls, immutable revision naming, remote verification, and audit records.

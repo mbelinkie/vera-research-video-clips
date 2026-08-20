@@ -2,7 +2,7 @@
 
 ## Project guide and implementation plan
 
-Status: Milestones 1–4 core workflow complete; Milestone 5 local export-only runtime composition proven through M5-09; logged/cloud export delivery and the broader release gate remain open
+Status: Milestones 1–4 core workflow complete; preferred-language logging and Milestone 5 local export capabilities are verified through M5-14A; embedded subtitles, logged/cloud delivery, operational recovery/grouping, and the final release gate remain open
 Last updated: 2026-08-20
 
 This document is the source of truth for product scope, architecture, sequencing, and acceptance criteria. Update it when a deliberate product or architectural decision changes. Use `outline.md` as the shorter execution checklist.
@@ -89,7 +89,7 @@ Do not silently add research to a last-used or hidden default project. `Queue / 
 
 ### 3.4 Shared project state has explicit ownership
 
-The cloud project catalog is authoritative for project membership, project videos, published transcript manifests/active versions, shared transcription batches, and synchronized project records. Private object storage is authoritative for transcript bundle bytes. Local SQLite is a durable cache, local job store, and offline outbox—not a competing master for already-synchronized records. CSV and Google Sheets remain projections/integrations.
+The cloud project catalog is authoritative for project membership, project videos, published transcript manifests/active versions, shared transcription batches, and synchronized project records. Private object storage is authoritative for transcript bundle bytes. Local SQLite is a durable cache, local job store, and offline outbox—not a competing master for already-synchronized records. CSV and optional external catalog integrations remain projections, never job-control surfaces or alternate sources of truth.
 
 Every synchronized record needs a stable ID, server version, update timestamp, and sync state. Local work must remain usable offline and reconcile through idempotent commands when connectivity returns.
 
@@ -134,7 +134,7 @@ For a confidently English-language source, create the clip-specific English SRT 
 
 Both logging actions must let the researcher add an optional multiline note and zero or more free-form tags before committing the clip. Notes capture context or intended use; tags can represent a topic, person, organization, argument, visual motif, or any other project-specific taxonomy.
 
-Tags are reusable project-scoped labels: match them case-insensitively for uniqueness and filtering while preserving a display form. Offer existing project tags as suggestions without preventing a new tag. Persist the note and tag assignments in the same transaction as the clip so a queued candidate can never appear without the context entered for it. Allow authorized collaborators to edit them later using optimistic versions, and make both fields searchable/filterable and available to CSV and Google Sheets synchronization.
+Tags are reusable project-scoped labels: match them case-insensitively for uniqueness and filtering while preserving a display form. Offer existing project tags as suggestions without preventing a new tag. Persist the note and tag assignments in the same transaction as the clip so a queued candidate can never appear without the context entered for it. Allow authorized collaborators to edit them later using optimistic versions, and make both fields searchable/filterable and available to CSV and optional external catalog projections.
 
 `Export only` is not a project research log and therefore does not acquire project tags or a clip note. If the user later chooses `Add to project`, collect or confirm those fields as part of creating the logged clip.
 
@@ -213,7 +213,7 @@ rewrites an existing logged clip.
 
 ### 4.2 Deferred until the core loop is stable
 
-- Google Sheets two-way sync and export checkboxes.
+- Optional one-way Google Sheets publishing, followed by selective metadata sync only if real collaboration usage justifies its conflict and authorization cost.
 - Bookmarks and timeline overlays.
 - Notes attached to individual transcript segments.
 - Fuzzy, regex, semantic, and cross-video search.
@@ -322,7 +322,7 @@ After selection, show:
 - start/end handles or numeric fields
 - a short looping preview
 
-Disable the two logging actions until a project is selected. Allow quick project creation in the picker. A remembered project may be offered, but never conceal the destination. `Export only` bypasses project logging and spreadsheet synchronization.
+Disable the two logging actions until a project is selected. Allow quick project creation in the picker. A remembered project may be offered, but never conceal the destination. `Export only` bypasses project logging and every external catalog projection.
 
 Notes and tags belong to the logged clip rather than its render job. Commit them atomically with `Queue / log only` or the clip-creation phase of `Export + log`; a later render failure must not lose them. Let authorized collaborators edit them from the queue/review surface. Tag matching and suggestions are project-scoped and case-insensitive, while the chosen display capitalization remains visible.
 
@@ -347,7 +347,7 @@ Avoid overriding browser/operating-system shortcuts and provide a shortcut refer
 
 ### 5.6 Project behavior
 
-A project is a named, access-controlled research collection, not merely a tag. Let the user create a project with a required name and optional description, members/roles, output directory override, and spreadsheet binding.
+A project is a named, access-controlled research collection, not merely a tag. Let the user create a project with a required name and optional description, members/roles, output directory override, and optional external catalog bindings.
 
 - Show the current target project in the workspace toolbar and again in the selection action bar.
 - Permit browsing a video without choosing a project.
@@ -355,7 +355,7 @@ A project is a named, access-controlled research collection, not merely a tag. L
 - Let the user change or quick-create the project without discarding the selection.
 - Store a logged clip in exactly one project initially; add cross-project linking only if later usage proves it necessary.
 - Use the project's export directory/settings for logged exports and global defaults for `Export only`.
-- When a project has an enabled Sheets binding, enqueue its row upsert immediately after the local log commit. Do not fail or roll back the local log if Sheets is offline.
+- External catalog publishing is asynchronous and subordinate to the shared project record. Do not fail or roll back a local/shared clip command when an optional integration is offline.
 
 ### 5.7 Batch transcription and review inbox
 
@@ -418,6 +418,36 @@ Expose supported settings through capability-aware controls:
 Keep H.264/AAC MP4 plus language-policy SRT sidecars as the editing-friendly default. Model the checkbox as `omit_subtitle_sidecars_when_source_is_english`, so applying the same preset to a foreign-language source still generates both required files. Enable the checkbox only when the canonical original track is confidently English; for foreign, mixed, or unknown language, disable it and explain that both original and translated English files are required. Embedding or burning subtitles is a separate setting and does not satisfy or alter the sidecar rule. Expose only combinations the installed worker can actually produce; disable or explain incompatible choices such as a subtitle codec unsupported by the selected container.
 
 Allow personal/global presets and project presets. Project presets are shared, versioned project records; changing a preset creates a new version for future jobs rather than mutating queued or completed exports. Every export job stores the fully resolved conversion-settings snapshot, preset ID/version when applicable, and relevant encoder/tool versions. Retrying a job uses that snapshot unless the user explicitly creates a new export request.
+
+### 5.9 Project Clip Library
+
+Provide a dedicated project-level `Clips` surface for work that happens after
+transcript review. Do not force researchers to reopen the original transcript
+selection or use a spreadsheet to request a later export.
+
+- List logged clips by project with search across transcript text, video title,
+  notes, tags, research status, export status, and artifact availability.
+- Keep the transcript selection action bar optimized for the current selection;
+  put later individual and batch export controls in the Clip Library.
+- Let the user select one or many clips, choose a resolved conversion preset,
+  request exports, and observe independent progress, errors, retry, and safe
+  cancellation.
+- Reuse one source acquisition for compatible same-video work where practical,
+  without letting one failed clip block its siblings.
+- Show every completed immutable package version and whether its bytes are
+  currently verified and reachable. An `export_status = complete` catalog row
+  is not proof that a local locator still resolves.
+- Offer `Reveal/Open artifact`, `Verify`, and explicit `Re-export` actions.
+  Re-export creates a new immutable artifact version; it never overwrites or
+  silently regenerates the package used by an earlier consumer.
+- Expose the same authorized clip search, artifact-resolution, and durable
+  export-request capabilities to the separate scriptwriting product. Record the
+  request origin for observability, but use one export pipeline and one artifact
+  identity model for direct and script-driven work.
+
+The research project owns the canonical clip record and verified reusable clip
+packages. A script build may copy or clone a verified package into its own
+project workspace, but it must not move or mutate the canonical package.
 
 ## 6. Transcript acquisition and normalization
 
@@ -602,13 +632,13 @@ Use a unique idempotency key over project, video, source/target languages, sourc
 
 Implement the actions as distinct commands with explicit effects:
 
-| Action | Project required | Create project clip record | Request render | Eligible for Sheets sync |
+| Action | Project required | Create project clip record | Request render | Eligible for external catalog projection |
 |---|---:|---:|---:|---:|
 | Queue / log only | Yes | Yes | No | Yes |
 | Export + log | Yes | Yes, before render | Yes | Yes |
 | Export only | No | No | Yes | No |
 
-An export-only operation still creates a persisted technical job and artifact history so it can survive restart, report failure, and be retried. That job is not a research-log entry, does not appear in a project's clip catalog, and must not be sent to CSV/Google Sheets unless the user later chooses `Add to project`.
+An export-only operation still creates a persisted technical job and artifact history so it can survive restart, report failure, and be retried. That job is not a research-log entry, does not appear in a project's clip catalog, and must not be sent to CSV or any external catalog projection unless the user later chooses `Add to project`.
 
 ### 7.2 Logged clip lifecycle
 
@@ -645,7 +675,7 @@ At minimum persist:
 - export status and latest error
 - optional preferred export preset ID/version for later conversion
 - created/updated/exported timestamps
-- spreadsheet binding/row ID when synchronized
+- optional external integration binding/record ID when projected
 - export manifest path when complete
 
 ### 7.4 Export request snapshot
@@ -735,24 +765,65 @@ exports/
 
 The example shows the two-file package required for a foreign-language clip. An English clip normally has only `.en.srt`; when English omission is explicitly enabled, it has no SRT sidecar. Sanitize filenames, keep the stable clip ID in the name, and resolve collisions deterministically.
 
+### 7.8 Reusable artifact identity and resolution
+
+A completed export record means that a verified package version once finalized;
+it does not guarantee that its bytes are still reachable from the current
+workstation. Treat the immutable artifact ID, package manifest, and content
+hashes as identity. Treat local paths, object keys, download grants, and
+authoring-project copies as replaceable locators.
+
+When the Clip Library or an authorized authoring client asks to resolve media:
+
+1. Match the exact logged clip snapshot, export bounds, required handles,
+   language-policy artifacts, and conversion requirements.
+2. Prefer an already finalized compatible artifact version.
+3. Verify its manifest and every required byte before returning it as reusable.
+4. If its recorded locator is missing, search only configured artifact roots or
+   accept an explicit user-located package; verify identity and hashes before
+   relinking it.
+5. If no verified compatible package is reachable, return an explicit
+   `missing`, `invalid`, `remote_only`, or `incompatible` result. Never claim a
+   cache hit from catalog state alone.
+6. Let the caller request a new immutable export through the ordinary durable
+   export boundary. A forced re-export creates a new version and never replaces
+   an earlier package silently.
+
+An authoring build may materialize a verified package into its project media
+folder by copy or filesystem-supported copy-on-write clone. Moving the canonical
+package is prohibited. Script-specific trim, crop, layer, speed, audio, and
+timeline placement remain authoring usage choices and do not mutate the logged
+clip or reusable package.
+
 ## 8. Spreadsheet and external logging
 
 ### 8.1 MVP: CSV
 
 Export a consistent CSV view of project-logged clips and their completed artifacts. Include clip ID and project ID/name so rows can be reconciled after edits or reimports. Exclude export-only jobs unless the user explicitly adds them to a project.
 
-### 8.2 Google Sheets: one-click later export
+### 8.2 Google Sheets: optional catalog projection
 
-Implement after local queue/export reliability:
+Google Sheets is not an export control surface and is not on the critical path
+for the research or scriptwriting workflows. The Project Clip Library and the
+authorized API own individual/batch export requests, status, retries, and
+artifact resolution.
 
-1. Bind a project to a spreadsheet and sheet/tab; allow multiple projects to share a destination only when project IDs remain explicit.
-2. Push or upsert project-logged clip rows using stable clip IDs.
-3. Include `Export Preset`, `Request Export`, and `Status` columns; resolve the chosen preset into an immutable job snapshot when the request is claimed.
-4. Use an installable Apps Script edit trigger or explicit custom-menu action to turn a checkbox/edit into an authenticated export request.
-5. Send the request to a reachable worker endpoint, or let the local app poll for requested rows while it is running.
-6. Claim the request idempotently, render locally, then write status and artifact links back.
+If collaboration usage justifies it after the core workflow is stable:
 
-Sheets requests the job; it does not process the media. A purely local worker cannot be reached reliably from Google without a polling strategy, tunnel, or hosted relay. Start with authenticated local polling because it preserves workstation processing without exposing a workstation endpoint.
+1. Bind a project to a spreadsheet and sheet/tab; allow multiple projects to
+   share a destination only when project IDs remain explicit.
+2. Publish or upsert project-logged clip rows using stable clip IDs.
+3. Start with a one-way projection of catalog-owned fields and reachable
+   artifact links; a failed publish never rolls back or changes the project.
+4. Add selective sheet-to-project metadata sync only for clearly owned fields
+   such as notes or tags, with optimistic versions and conflict logs.
+5. Do not add `Request Export` checkboxes, Apps Script job triggers, local
+   polling, or hosted relay work unless repeated real usage demonstrates that
+   users must initiate exports from outside the product.
+
+CSV remains the immediate portable interchange format. A one-way Sheets publish
+may improve familiar sorting and sharing, but it must not become the bridge used
+by the scriptwriting product.
 
 Recommended sheet columns:
 
@@ -760,14 +831,14 @@ Recommended sheet columns:
 Project ID | Project | Clip ID | Clip Name | Source Video | YouTube URL | Channel | Start | End |
 Length | Topic | Notes | Tags | English Transcript | Original Transcript |
 Preferred Language | Preferred Transcript |
-Export Preset | Preset Version | Request Export | Status | Error | English Subtitle File |
+Export Preset | Preset Version | Status | Error | English Subtitle File |
 Original Subtitle File | Video File | Export Date
 ```
 
 Conflict policy:
 
 - The shared project catalog owns synchronized timing, transcript provenance, active versions, and shared job state; SQLite mirrors them and owns unsynced offline commands.
-- User-editable sheet fields such as topic, notes, tags, and export request may sync back.
+- User-editable sheet fields such as topic, notes, and tags may sync back only after their ownership and conflict policy are explicitly enabled.
 - Use clip ID plus update timestamps/version numbers; never reconcile by row number alone.
 - Log sync errors and never discard a local change silently.
 
@@ -875,6 +946,9 @@ POST   /api/projects/:projectId/clips
 GET    /api/projects/:projectId/clips
 PATCH  /api/projects/:projectId/clips/:id
 POST   /api/projects/:projectId/clips/:id/export
+POST   /api/projects/:projectId/clips/exports/batch
+GET    /api/projects/:projectId/clips/:id/artifacts
+POST   /api/projects/:projectId/clip-artifacts/resolve
 GET    /api/export-presets
 POST   /api/export-presets
 GET    /api/projects/:projectId/export-presets
@@ -918,7 +992,8 @@ Shared PostgreSQL tables or equivalent aggregates:
 - `bookmarks` (can precede UI)
 - `export_jobs` (may reference a logged clip or contain an export-only request snapshot)
 - `export_presets` and immutable preset versions
-- `export_artifacts`
+- `export_artifacts` (immutable package identity/provenance; no
+  workstation-private path as identity)
 - `integration_bindings`
 - `sync_events`
 
@@ -928,6 +1003,9 @@ Local SQLite tables mirror required shared records and add:
 - local `video_assets` and cache manifests
 - job-scoped `source_scratch_assets` lifecycle records without permanent media retention
 - local job/process history
+- `export_artifact_locators` with independently verified availability keyed to
+  an immutable artifact/package ID; keep workstation-private paths local
+- configured artifact roots used for bounded locate/relink checks
 - `sync_outbox` and `sync_cursors`
 - local settings/credential references
 - FTS indexes
@@ -956,6 +1034,13 @@ Important constraints:
 - Jobs have an idempotency key and attempt count.
 - Worker claims have an expiring lease/heartbeat and safe reassignment policy.
 - Artifacts record path, type, size, and content hash.
+- Export artifact identity is the immutable artifact/package ID plus its manifest
+  and content hashes. Local paths, object keys, grants, and consumer copies are
+  locators with independently verified availability; a completed catalog row is
+  never sufficient proof that the bytes are reachable.
+- An artifact relink or user-located package is accepted only after its manifest,
+  clip/export snapshot, required artifact set, and hashes verify. Missing or
+  invalid locators do not erase the completed provenance record.
 - Every completed export satisfies its snapshotted language-policy artifact set: foreign/mixed/unknown sources have original and English SRT artifacts; confirmed-English sources have an English SRT unless the explicit omission setting is recorded. Generated cues are clip-relative and cannot exceed the verified media duration.
 - Every acquired source scratch asset records its owning job/source group, size, lifecycle state (`acquiring`, `ready`, `deleting`, `deleted`, or `cleanup_failed`), expiry, and `deleted_at`; clear any usable source locator after verified deletion.
 - An export job cannot transition to `complete` until every associated source scratch asset is `deleted`.
@@ -1051,7 +1136,9 @@ Do not make the normal test suite depend on live YouTube availability. Keep live
 - batch/item/review state transitions
 - worker lease/heartbeat expiration
 - project-role authorization decisions
-- spreadsheet field mapping/conflict rules
+- optional external catalog field mapping/conflict rules
+- artifact compatibility, locator availability, manifest/hash verification, and
+  authoring-consumer resolution decisions
 
 ### 13.3 Integration tests
 
@@ -1080,6 +1167,10 @@ Do not make the normal test suite depend on live YouTube availability. Keep live
 - abandoned-scratch recovery after a simulated worker crash, including a visible `cleanup_failed` path
 - retry after a simulated job failure
 - CSV export and stable clip IDs
+- project Clip Library individual/batch request idempotency, sibling failure
+  isolation, same-source grouping, artifact verification, and re-export
+- simulated authoring-client search and compatible-artifact resolution, including
+  missing-locator relink and durable re-export fallback
 
 ### 13.4 End-to-end acceptance path
 
@@ -1096,7 +1187,7 @@ Do not make the normal test suite depend on live YouTube availability. Keep live
 11. Verify that the export has both original-language and translated-English SRTs, contains only cues for that clip, starts at or after zero, ends within the verified clip duration, and records the expected transcript versions/timing precision.
 12. Verify that the completed export has no retained source scratch media.
 13. Select an English-language phrase, use `Export + log`, leave omission off, and verify the project record exists before the render completes and its package has a matching English SRT.
-14. Select another English-language phrase, enable `Omit subtitle files for English-language clips`, use `Export only`, and verify no project clip/CSV/Sheets row or SRT sidecar is created while the intentional omission is recorded in the manifest.
+14. Select another English-language phrase, enable `Omit subtitle files for English-language clips`, use `Export only`, and verify no project clip/CSV/external catalog record or SRT sidecar is created while the intentional omission is recorded in the manifest.
 15. Set the test user preference to Spanish, open a Romanian fixture, and verify
     the displayed/searchable transcript is Spanish while the active shared base
     transcript remains Romanian plus English.
@@ -1280,6 +1371,32 @@ Deliver:
 
 Exit when representative presets/overrides produce the requested media properties, queued jobs are unaffected by later preset edits, English clips include a validated clip-relative English SRT by default but can explicitly omit sidecars, every foreign/mixed/unknown-language clip has validated original and translated-English SRTs from the expected transcript versions, a 30-second foreign-language clip has accurate cues only within its 30-second duration, a real authorized video succeeds in a smoke test, and no full source media remains after any terminal job path.
 
+M5-10 through M5-14A completed 2026-08-20. Every newly promoted package now
+includes a verified descriptive `clip-<id>.json` metadata sidecar and a
+midpoint-derived, independently probed JPEG thumbnail; both are staged, hashed,
+named by the manifest, and required by atomic finalization while legacy package
+schemas remain readable. Personal and project conversion presets now use
+authorized append-only immutable versions, fixed-version defaults, optimistic
+updates, and idempotent commands. The export UI resolves a preset/default plus
+bounded per-export overrides through an authoritative preview, snapshots the
+complete effective settings and deterministic fingerprint on the request and
+job, and revalidates that immutable snapshot before transcript lookup, source
+acquisition, or rendering. The renderer now supports exactly three
+software-only families—H.264 High/AAC in MP4, HEVC Main/AAC in MKV, and ProRes
+422/PCM in MOV—through fixed argument mappings, installed-capability discovery,
+dynamic package roles/extensions, and normalized FFprobe conformance. Manifest
+and metadata schema version 2 records remain backward-readable with version 1.
+The latest aggregate verification passed 173 tests with one declared skip, the
+web build, 17 local and 11 cloud migrations, four Playwright flows, and real
+FFmpeg/FFprobe renders for all three families. Commits `2323a0f`, `fe1efed`,
+`38047c4`, `9c8d8c6`, and `75def13` contain the completed slices.
+
+These slices do not complete Milestone 5. Optional embedded English soft
+subtitles, registered local-agent delivery of logged/cloud requests, durable
+result reconciliation and progress/retry/cancel controls, batch and same-source
+group execution, crash-recovery cleanup sweeping, the 30-second foreign fixture
+gate, and the user-authorized live YouTube smoke test remain open.
+
 M5-09 completed 2026-08-19. Every promoted clip package now also contains one
 `manifest.json`, written into attempt-private staging and promoted through the
 same copy-then-atomic-rename path, so it is never added to a visible package. It
@@ -1302,19 +1419,34 @@ and the `.jpg` thumbnail remain separate later slices.
 
 M5-08 completed 2026-08-15. `npm run export:run-once -- --request-id <uuid> --authorization-confirmed` now opens the configured local SQLite data root, composes exactly one existing `LocalExportSourceProcessor` attempt with the configured full-source provider and real FFprobe/FFmpeg adapters, then prints only a sanitized request state, package identity, and artifact hashes/sizes. The command has no server, polling, concurrency, or background work; confirmation is required on every run, and an already-complete request is reported without rerendering. A deterministic repository-owned four-second fixture smoke copied the source only into attempt-private scratch and verified a completed foreign-language H.264/AAC package with both clip-relative SRTs, persisted final provenance, atomic package visibility, and verified scratch deletion. This proves local `export_only` runtime composition only: logged export delivery, cloud/job relay, live authorized YouTube acquisition, manifests, thumbnails, retry/grouping, presets, and the full Milestone 5 exit criteria remain separate.
 
-### Milestone 6 — Google Sheets control surface
+### Milestone 6 — Project Clip Library and authoring handoff
 
 Deliver:
 
-- OAuth/configuration flow
-- stable-ID row upsert
-- notes/tags/request sync policy
-- `Request Export` checkbox or menu action
-- local polling worker or hosted relay
-- status/artifact write-back
-- conflict and retry log
+- dedicated project-level Clip Library with search/filter and artifact availability
+- Clip Library composition over Milestone 5's individual/batch export,
+  immutable settings, progress, sibling isolation, retry, safe cancellation,
+  and same-source grouping primitives; do not build a second executor
+- completed package version history plus reveal/open, verify, and explicit
+  re-export actions
+- stable authorized clip search and exact artifact-resolution API for the
+  separate scriptwriting product
+- manifest/hash verification that distinguishes a completed record from
+  reachable compatible bytes
+- missing/relocated/invalid artifact states plus verified relink and durable
+  re-export recovery
+- request-origin provenance without separate direct-versus-script export engines
 
-Exit when a queued row can request an export from Sheets with one action and duplicate edits cannot create duplicate renders.
+Exit when a researcher can select several logged clips across multiple source
+videos, export them as one durable batch with independent recovery, and reuse the
+verified packages from a simulated authoring client. A missing locator must
+produce an explicit relink/re-export path, and duplicate direct or authoring
+requests must not create duplicate renders.
+
+Google Sheets is no longer this milestone's control surface. Keep CSV, and add
+optional one-way Sheets catalog publishing only after core usage demonstrates a
+collaboration need; two-way metadata sync remains a later evidence-driven
+integration.
 
 ### Milestone 7 — Research and capacity enhancements
 
@@ -1373,8 +1505,10 @@ A slice is done only when:
 | Invalid or mutable conversion settings | Failed or irreproducible exports | Capability-aware validation, versioned presets, immutable resolved job snapshots, FFprobe assertions |
 | FFmpeg cut/subtitle edge cases | Bad edit or subtitle sync | Re-encode for precision, inspect outputs, test time-shifting thoroughly |
 | Clip subtitle is missing, uses full-source timing, or comes from the wrong transcript version | Foreign-language footage is unusable or misleading during editing | Require original plus English SRTs for foreign/uncertain language, snapshot language/transcript identity, restrict omission to confirmed English, clamp/zero-base cues, validate against media duration, and block finalization on mismatch |
-| Sheets and shared catalog diverge | Duplicate/lost work | Stable IDs, field ownership, versions, sync event log, idempotent requests |
-| Local file links do not work remotely | Sheet artifacts are inaccessible | Treat paths as local initially; add storage provider/upload later |
+| Artifact catalog says complete but bytes were moved, deleted, or corrupted | A direct or script build cannot reuse expected media | Separate identity from locators, verify manifests/hashes on resolution, support bounded root search and explicit relink, then request a new immutable export when needed |
+| Authoring build moves or mutates a reusable research package | Other projects or prior builds lose their media | Keep research packages immutable; copy or copy-on-write clone into the authoring project and snapshot hashes |
+| Optional Sheets projection and shared catalog diverge | Stale external metadata or confusing links | Keep Sheets subordinate and one-way initially; stable IDs, field ownership, versions, and explicit sync logs before any selective write-back |
+| Local artifact links do not work remotely | External projections cannot open package bytes | Report locator availability honestly; add an authorized storage/download provider later rather than treating a local path as portable |
 | Cache consumes excessive disk | Workstation fills | Size reporting, configurable root, LRU/manual cleanup with protected records |
 
 ## 17. Decisions intentionally left configurable
@@ -1389,7 +1523,8 @@ Resolve these during the relevant milestone with a small spike, not before:
 - forced-alignment provider for cue-only sources
 - packaged desktop wrapper versus browser + local service
 - exact editing bitrate/preset defaults
-- Apps Script polling versus a hosted relay for Sheets
+- whether real collaboration usage justifies one-way Sheets publishing or later
+  selective notes/tags sync; export requests remain in the product/API
 - cloud storage for exported clips; transcript bundles already use the object-store adapter with S3 as the AWS baseline
 - fuzzy/semantic search engine
 
@@ -1402,8 +1537,7 @@ The provider interfaces, canonical transcript bundle/manifest, stable IDs, sync 
 - [yt-dlp subtitle options](https://github.com/yt-dlp/yt-dlp/blob/master/README.md#subtitle-options) — optional local subtitle discovery/acquisition adapter; availability can still vary by video, authentication, region, and platform changes.
 - [whisper.cpp CLI](https://github.com/ggml-org/whisper.cpp/tree/master/examples/cli) — maintained local multilingual speech-recognition executable and full JSON/timestamp output used behind the speech adapter.
 - [W3C WebVTT specification](https://www.w3.org/TR/webvtt1/) — UTF-8 container, metadata blocks, cue timing/settings, cue text, and legal overlapping cue behavior used by the canonical caption parser.
-- [Google Apps Script installable triggers](https://developers.google.com/apps-script/guides/triggers/installable) — edit triggers can observe a user changing an export-request cell.
-- [Google Sheets values API](https://developers.google.com/workspace/sheets/api/reference/rest/v4/spreadsheets.values/update) — authenticated status and artifact write-back.
+- [Google Sheets values API](https://developers.google.com/workspace/sheets/api/reference/rest/v4/spreadsheets.values/update) — optional stable-ID catalog projection after the core workflow is reliable.
 - [Amazon S3 Versioning](https://docs.aws.amazon.com/AmazonS3/latest/userguide/versioning-workflows.html) — preserves object versions instead of overwriting the only transcript copy.
 - [Amazon S3 presigned URLs](https://docs.aws.amazon.com/AmazonS3/latest/userguide/using-presigned-url.html) — short-lived object-specific upload/download access without client AWS credentials.
 - [Amazon SQS visibility timeouts](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-visibility-timeout.html) — leases, heartbeat extension, retry behavior, and dead-letter handling for long jobs.
