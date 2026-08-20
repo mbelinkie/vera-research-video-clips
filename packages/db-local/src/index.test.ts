@@ -928,6 +928,180 @@ describe("logged export delivery import", () => {
     database.close();
   });
 
+  it("projects only sanitized not-started or verified-deleted logged failures", () => {
+    const directory = mkdtempSync(join(tmpdir(), "research-video-failure-"));
+    temporaryDirectories.add(directory);
+    const filename = join(directory, "failure.sqlite");
+    const database = openLocalDatabase(filename);
+    runLocalMigrations(database);
+    const queue = new LocalExportQueue(database);
+    const claimed = fixtureLoggedDelivery();
+    queue.importLoggedDeliveryPending(claimed);
+    const accepted: LoggedExportDelivery = {
+      ...claimed,
+      status: "accepted",
+      acceptedAt: "2026-08-20T12:00:05.000Z",
+    };
+    queue.activateLoggedDelivery(accepted);
+    queue.recordSourceNotStartedFailure(
+      accepted.request.id,
+      "Provider Failed!",
+      `failed /private/source.mp4 C:\\Users\\name\\source.mov \\\\server\\share\\source.mov file:///private/source.mov token=${accepted.reservationToken} Bearer private.jwt-token https://private.invalid/source`,
+    );
+    const notStarted = queue.buildLoggedExportFailureResult(
+      accepted.request.id,
+    );
+    expect(notStarted).toMatchObject({
+      requestId: accepted.request.id,
+      jobId: accepted.request.jobId,
+      projectId: accepted.request.projectId,
+      clipId: accepted.request.clipId,
+      error: {
+        code: "provider_failed",
+        message:
+          "failed <path> <path> <path> <path> token=<redacted> Bearer <redacted> <url>",
+      },
+      attempt: 0,
+      sourceCleanup: { lifecycle: "not_started" },
+    });
+    expect(JSON.stringify(notStarted)).not.toContain(accepted.reservationToken);
+    expect(JSON.stringify(notStarted)).not.toMatch(
+      /private|source\.mp4|private\.invalid/iu,
+    );
+
+    database.close();
+    const reopened = openLocalDatabase(filename);
+    runLocalMigrations(reopened);
+    expect(
+      new LocalExportQueue(reopened).buildLoggedExportFailureResult(
+        accepted.request.id,
+      ),
+    ).toEqual(notStarted);
+    reopened.close();
+
+    const cleanedDirectory = mkdtempSync(
+      join(tmpdir(), "research-video-cleaned-failure-"),
+    );
+    temporaryDirectories.add(cleanedDirectory);
+    const cleanedDatabase = openLocalDatabase(
+      join(cleanedDirectory, "cleaned.sqlite"),
+    );
+    runLocalMigrations(cleanedDatabase);
+    const cleanedQueue = new LocalExportQueue(cleanedDatabase);
+    cleanedQueue.importLoggedDeliveryPending(claimed);
+    cleanedQueue.activateLoggedDelivery(accepted);
+    const started = cleanedQueue.beginSourceAcquisition(accepted.request.id);
+    cleanedQueue.recordSourceCleanupStarted(
+      started.request.jobId,
+      started.attempt,
+    );
+    cleanedQueue.recordSourceCleanupSucceeded(
+      started.request.jobId,
+      started.attempt,
+    );
+    cleanedQueue.recordSourceAttemptFailure(
+      started.request.jobId,
+      started.attempt,
+      "render_failed",
+      "Renderer could not produce a valid package.",
+    );
+    expect(
+      cleanedQueue.buildLoggedExportFailureResult(accepted.request.id),
+    ).toMatchObject({
+      attempt: 1,
+      error: { code: "render_failed" },
+      sourceCleanup: {
+        lifecycle: "deleted",
+        deletedAt: expect.any(String),
+      },
+    });
+    cleanedDatabase.close();
+  });
+
+  it("rejects inconsistent or incomplete scratch cleanup as a terminal failure", () => {
+    const setup = () => {
+      const directory = mkdtempSync(
+        join(tmpdir(), "research-video-unsafe-failure-"),
+      );
+      temporaryDirectories.add(directory);
+      const database = openLocalDatabase(join(directory, "unsafe.sqlite"));
+      runLocalMigrations(database);
+      const queue = new LocalExportQueue(database);
+      const claimed = fixtureLoggedDelivery();
+      const accepted: LoggedExportDelivery = {
+        ...claimed,
+        status: "accepted",
+        acceptedAt: "2026-08-20T12:00:05.000Z",
+      };
+      queue.importLoggedDeliveryPending(claimed);
+      queue.activateLoggedDelivery(accepted);
+      return { database, queue, accepted };
+    };
+
+    const notStarted = setup();
+    notStarted.queue.recordSourceNotStartedFailure(
+      notStarted.accepted.request.id,
+      "provider_missing",
+      "Configure a provider.",
+    );
+    notStarted.database
+      .prepare(
+        `INSERT INTO source_scratch_assets
+           (id, job_id, attempt, lifecycle_state, created_at, expires_at, updated_at)
+         VALUES (?, ?, 1, 'deleted', ?, ?, ?)`,
+      )
+      .run(
+        "019fbb95-cd76-7920-93fa-e23ba755ef90",
+        notStarted.accepted.request.jobId,
+        "2026-08-20T12:00:06.000Z",
+        "2026-08-21T12:00:06.000Z",
+        "2026-08-20T12:00:06.000Z",
+      );
+    expect(() =>
+      notStarted.queue.buildLoggedExportFailureResult(
+        notStarted.accepted.request.id,
+      ),
+    ).toThrow(
+      expect.objectContaining({
+        code: "logged_export_failure_cleanup_inconsistent",
+      }),
+    );
+    notStarted.database.close();
+
+    const cleanupFailed = setup();
+    const started = cleanupFailed.queue.beginSourceAcquisition(
+      cleanupFailed.accepted.request.id,
+    );
+    cleanupFailed.queue.recordSourceCleanupStarted(
+      started.request.jobId,
+      started.attempt,
+    );
+    cleanupFailed.queue.recordSourceCleanupFailed(
+      started.request.jobId,
+      started.attempt,
+      "Could not delete /private/source.mp4",
+    );
+    expect(() =>
+      cleanupFailed.queue.buildLoggedExportFailureResult(
+        cleanupFailed.accepted.request.id,
+      ),
+    ).toThrow(
+      expect.objectContaining({
+        code: "logged_export_failure_cleanup_incomplete",
+      }),
+    );
+    const retained = cleanupFailed.queue.getSourceAttempt(
+      started.request.jobId,
+      1,
+    );
+    expect(retained).toMatchObject({
+      lifecycleState: "cleanup_failed",
+      cleanupErrorMessage: "Could not delete <path>",
+    });
+    expect(retained).not.toHaveProperty("deletedAt");
+    cleanupFailed.database.close();
+  });
+
   it("replaces an expired pending generation and removes a definitively stale copy", () => {
     const directory = mkdtempSync(join(tmpdir(), "research-video-redelivery-"));
     temporaryDirectories.add(directory);

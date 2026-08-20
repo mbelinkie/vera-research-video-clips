@@ -9,15 +9,19 @@ import {
   ExportObservedMediaPropertiesSchema,
   ExportRequestSchema,
   LoggedExportDeliverySchema,
+  LoggedExportFailureResultSchema,
   LoggedExportSuccessResultSchema,
   NormalizedTranscriptSchema,
   ResolvedExportSettingsSnapshotSchema,
   languagesEquivalent,
   primaryLanguage,
+  sanitizeLoggedExportFailureCode,
+  sanitizeLoggedExportFailureMessage,
   type CreateExportOnlyRequest,
   type DerivedTranslationIdentity,
   type ExportRequest,
   type LoggedExportDelivery,
+  type LoggedExportFailureResult,
   type LoggedExportSuccessResult,
   type ExportObservedMediaProperties,
   type ResolvedExportSettingsSnapshot,
@@ -509,6 +513,123 @@ export class LocalExportQueue {
       );
     }
     return result.data;
+  }
+
+  buildLoggedExportFailureResult(requestId: string): LoggedExportFailureResult {
+    const request = this.get(requestId);
+    if (!request || request.mode !== "logged") {
+      throw new LocalExportRequestNotFoundError();
+    }
+    if (!this.getAcceptedLoggedDelivery(requestId)) {
+      throw new LocalExportLifecycleError(
+        "Only an accepted logged delivery can reconcile a failure.",
+        "logged_export_delivery_not_accepted",
+      );
+    }
+    if (request.state !== "needs_user_action") {
+      throw new LocalExportLifecycleError(
+        "No persisted local failure is ready for reconciliation.",
+        "logged_export_failure_not_recorded",
+      );
+    }
+    if (request.finalArtifacts?.length) {
+      throw new LocalExportLifecycleError(
+        "A request with finalized package provenance cannot reconcile as failed.",
+        "logged_export_failure_has_package",
+      );
+    }
+    if (!request.projectId || !request.clipId) {
+      throw new LocalExportLifecycleError(
+        "Logged export failure identity is incomplete.",
+        "logged_export_failure_identity_invalid",
+      );
+    }
+
+    const job = this.database
+      .prepare("SELECT state, attempt, payload_json FROM jobs WHERE id = ?")
+      .get(request.jobId) as
+      { state: string; attempt: number; payload_json: string } | undefined;
+    if (!job || job.state !== "needs_user_action") {
+      throw new LocalExportLifecycleError(
+        "Persisted local failure state is inconsistent.",
+        "logged_export_failure_state_invalid",
+      );
+    }
+    const payload = JSON.parse(job.payload_json) as Record<string, unknown>;
+    const lastError = payload.lastError as
+      { code?: unknown; message?: unknown } | undefined;
+    if (
+      !lastError ||
+      typeof lastError.code !== "string" ||
+      typeof lastError.message !== "string"
+    ) {
+      throw new LocalExportLifecycleError(
+        "Persisted local failure error evidence is missing.",
+        "logged_export_failure_error_missing",
+      );
+    }
+
+    const attempt = Number(job.attempt);
+    if (!Number.isSafeInteger(attempt) || attempt < 0) {
+      throw new LocalExportLifecycleError(
+        "Persisted local failure attempt is invalid.",
+        "logged_export_failure_attempt_invalid",
+      );
+    }
+    const scratchRows = this.database
+      .prepare(
+        `SELECT attempt, lifecycle_state, deleted_at
+         FROM source_scratch_assets
+         WHERE job_id = ? ORDER BY attempt`,
+      )
+      .all(request.jobId) as {
+      attempt: number;
+      lifecycle_state: string;
+      deleted_at: string | null;
+    }[];
+
+    let sourceCleanup: LoggedExportFailureResult["sourceCleanup"];
+    if (attempt === 0) {
+      if (scratchRows.length !== 0) {
+        throw new LocalExportLifecycleError(
+          "A not-started failure cannot have source scratch provenance.",
+          "logged_export_failure_cleanup_inconsistent",
+        );
+      }
+      sourceCleanup = { lifecycle: "not_started" };
+    } else {
+      const source = scratchRows[0];
+      if (
+        scratchRows.length !== 1 ||
+        !source ||
+        Number(source.attempt) !== attempt ||
+        source.lifecycle_state !== "deleted" ||
+        !source.deleted_at
+      ) {
+        throw new LocalExportLifecycleError(
+          "Source cleanup is incomplete; resolve deletion before reconciling the processing failure.",
+          "logged_export_failure_cleanup_incomplete",
+        );
+      }
+      sourceCleanup = {
+        lifecycle: "deleted",
+        deletedAt: String(source.deleted_at),
+      };
+    }
+
+    return LoggedExportFailureResultSchema.parse({
+      schemaVersion: 1,
+      requestId: request.id,
+      jobId: request.jobId,
+      projectId: request.projectId,
+      clipId: request.clipId,
+      error: {
+        code: sanitizeLoggedExportFailureCode(lastError.code),
+        message: sanitizeLoggedExportFailureMessage(lastError.message),
+      },
+      attempt,
+      sourceCleanup,
+    });
   }
 
   get(requestId: string): ExportRequest | undefined {
@@ -1342,7 +1463,10 @@ export class LocalExportQueue {
       .get(jobId) as { payload_json: string } | undefined;
     if (!job) throw new LocalExportLifecycleError();
     const payload = JSON.parse(job.payload_json) as Record<string, unknown>;
-    payload.lastError = { code, message: safeLocalError(message) };
+    payload.lastError = {
+      code: sanitizeLoggedExportFailureCode(code),
+      message: sanitizeLoggedExportFailureMessage(message),
+    };
     this.database
       .prepare(
         `UPDATE jobs
@@ -1767,11 +1891,7 @@ function mapLocalSourceScratchAsset(
 }
 
 function safeLocalError(message: string) {
-  return message
-    .replaceAll(/(?:[A-Za-z]:)?\/(?:[^\s'"]+)/gu, "<path>")
-    .replaceAll(/[\r\n\t]+/gu, " ")
-    .trim()
-    .slice(0, 500);
+  return sanitizeLoggedExportFailureMessage(message);
 }
 
 function safeProbeValue(value: string | undefined, maximumLength: number) {

@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   HealthResponseSchema,
   type LoggedExportDelivery,
+  type LoggedExportFailureResult,
   type LoggedExportSuccessResult,
 } from "@research-video/contracts";
 import {
@@ -571,6 +572,234 @@ describe("local agent", () => {
       /reservationToken|Bearer fixture|\/private\/|sourceIdentity/i,
     );
   });
+
+  it("reconciles persisted terminal-safe failure before execution, including from a later local epoch", async () => {
+    const delivery = acceptedLoggedDeliveryFixture();
+    const result = localFailureResultFixture(delivery);
+    const identity = {
+      workerId: delivery.workerId,
+      epoch: delivery.workerEpoch + 1,
+      advertisementFingerprint: "a".repeat(64),
+      createdAt: delivery.reservedAt,
+      updatedAt: delivery.reservedAt,
+    };
+    const run = vi.fn();
+    const failure = {
+      id: "019fbb95-cd76-7920-93fa-e23ba755ee81",
+      deliveryId: delivery.deliveryId,
+      generation: delivery.generation,
+      workerId: delivery.workerId,
+      workerEpoch: delivery.workerEpoch,
+      result,
+      resultFingerprint: "f".repeat(64),
+      reconciledAt: "2026-08-20T12:00:20.000Z",
+    };
+    const unavailable = Object.assign(new Error("cloud unavailable"), {
+      statusCode: 503,
+      code: "export_failure_unavailable",
+    });
+    const reconcileFailure = vi
+      .fn()
+      .mockRejectedValueOnce(unavailable)
+      .mockResolvedValue(failure);
+    const buildFailure = vi.fn(() => result);
+    const app = createLocalAgent({
+      workerIdentity: {
+        get: () => identity,
+        prepareRegistration: () => identity,
+      },
+      getAcceptedLoggedDelivery: () => delivery,
+      buildLoggedExportSuccessResult: () => localSuccessResultFixture(delivery),
+      buildLoggedExportFailureResult: buildFailure,
+      runLoggedExportOnce: run,
+      reconcileLoggedExportSuccess: vi.fn(),
+      reconcileLoggedExportFailure: reconcileFailure,
+    });
+    apps.add(app);
+    const command = {
+      method: "POST" as const,
+      url: "/api/export-deliveries/process",
+      headers: { authorization: "Bearer fixture" },
+      payload: {
+        requestId: delivery.request.id,
+        authorizationConfirmed: true,
+      },
+    };
+    expect((await app.inject(command)).statusCode).toBe(503);
+    const recovered = await app.inject(command);
+    expect(recovered.statusCode).toBe(200);
+    expect(recovered.json()).toMatchObject({
+      execution: "failed",
+      failure: { id: failure.id, result },
+    });
+    expect(run).not.toHaveBeenCalled();
+    expect(buildFailure).toHaveBeenCalledTimes(2);
+    expect(reconcileFailure).toHaveBeenCalledTimes(2);
+    expect(reconcileFailure.mock.calls[0]![0].request).toMatchObject({
+      workerId: delivery.workerId,
+      workerEpoch: delivery.workerEpoch,
+      deliveryId: delivery.deliveryId,
+      generation: delivery.generation,
+      result,
+    });
+    expect(JSON.stringify(recovered.json())).not.toMatch(
+      /reservationToken|Bearer fixture|\/private\/|sourceIdentity/i,
+    );
+  });
+
+  it("builds a new failure only from persisted state and never executes old accepted work at a newer epoch", async () => {
+    const delivery = acceptedLoggedDeliveryFixture();
+    const result = localFailureResultFixture(delivery);
+    const exactIdentity = {
+      workerId: delivery.workerId,
+      epoch: delivery.workerEpoch,
+      advertisementFingerprint: "a".repeat(64),
+      createdAt: delivery.reservedAt,
+      updatedAt: delivery.reservedAt,
+    };
+    const noFailure = Object.assign(new Error("not recorded"), {
+      statusCode: 409,
+      code: "logged_export_failure_not_recorded",
+    });
+    const buildFailure = vi
+      .fn()
+      .mockImplementationOnce(() => {
+        throw noFailure;
+      })
+      .mockReturnValue(result);
+    const run = vi.fn(async () => ({
+      requestId: delivery.request.id,
+      status: "failed" as const,
+      state: "needs_user_action",
+      error: {
+        code: "transient_untrusted",
+        message: "/private/transient-output token=untrusted",
+      },
+    }));
+    const failure = {
+      id: "019fbb95-cd76-7920-93fa-e23ba755ee82",
+      deliveryId: delivery.deliveryId,
+      generation: delivery.generation,
+      workerId: delivery.workerId,
+      workerEpoch: delivery.workerEpoch,
+      result,
+      resultFingerprint: "e".repeat(64),
+      reconciledAt: "2026-08-20T12:00:20.000Z",
+    };
+    const reconcileFailure = vi.fn(async (_input: unknown) => failure);
+    const app = createLocalAgent({
+      workerIdentity: {
+        get: () => exactIdentity,
+        prepareRegistration: () => exactIdentity,
+      },
+      getAcceptedLoggedDelivery: () => delivery,
+      buildLoggedExportSuccessResult: () => localSuccessResultFixture(delivery),
+      buildLoggedExportFailureResult: buildFailure,
+      runLoggedExportOnce: run,
+      reconcileLoggedExportSuccess: vi.fn(),
+      reconcileLoggedExportFailure: reconcileFailure,
+    });
+    apps.add(app);
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/export-deliveries/process",
+      headers: { authorization: "Bearer fixture" },
+      payload: {
+        requestId: delivery.request.id,
+        authorizationConfirmed: true,
+      },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(buildFailure).toHaveBeenCalledTimes(2);
+    const reconciledInput = reconcileFailure.mock.calls[0]![0] as {
+      request: { result: LoggedExportFailureResult };
+    };
+    expect(reconciledInput.request.result).toEqual(result);
+    expect(JSON.stringify(reconciledInput)).not.toMatch(
+      /transient_untrusted|transient-output|untrusted/,
+    );
+
+    const laterIdentity = { ...exactIdentity, epoch: exactIdentity.epoch + 1 };
+    const laterRun = vi.fn();
+    const laterApp = createLocalAgent({
+      workerIdentity: {
+        get: () => laterIdentity,
+        prepareRegistration: () => laterIdentity,
+      },
+      getAcceptedLoggedDelivery: () => delivery,
+      buildLoggedExportSuccessResult: () => localSuccessResultFixture(delivery),
+      buildLoggedExportFailureResult: () => {
+        throw noFailure;
+      },
+      runLoggedExportOnce: laterRun,
+      reconcileLoggedExportSuccess: vi.fn(),
+      reconcileLoggedExportFailure: vi.fn(),
+    });
+    apps.add(laterApp);
+    const rejected = await laterApp.inject({
+      method: "POST",
+      url: "/api/export-deliveries/process",
+      headers: { authorization: "Bearer fixture" },
+      payload: {
+        requestId: delivery.request.id,
+        authorizationConfirmed: true,
+      },
+    });
+    expect(rejected.statusCode).toBe(409);
+    expect(laterRun).not.toHaveBeenCalled();
+  });
+
+  it("keeps cleanup failure actionable without processor replay or cloud terminal mutation", async () => {
+    const delivery = acceptedLoggedDeliveryFixture();
+    const identity = {
+      workerId: delivery.workerId,
+      epoch: delivery.workerEpoch,
+      advertisementFingerprint: "a".repeat(64),
+      createdAt: delivery.reservedAt,
+      updatedAt: delivery.reservedAt,
+    };
+    const run = vi.fn();
+    const reconcileFailure = vi.fn();
+    const app = createLocalAgent({
+      workerIdentity: {
+        get: () => identity,
+        prepareRegistration: () => identity,
+      },
+      getAcceptedLoggedDelivery: () => delivery,
+      buildLoggedExportSuccessResult: () => localSuccessResultFixture(delivery),
+      buildLoggedExportFailureResult: () => {
+        throw Object.assign(
+          new Error(
+            "Source cleanup is incomplete; resolve deletion before reconciling the processing failure.",
+          ),
+          {
+            statusCode: 409,
+            code: "logged_export_failure_cleanup_incomplete",
+          },
+        );
+      },
+      runLoggedExportOnce: run,
+      reconcileLoggedExportSuccess: vi.fn(),
+      reconcileLoggedExportFailure: reconcileFailure,
+    });
+    apps.add(app);
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/export-deliveries/process",
+      headers: { authorization: "Bearer fixture" },
+      payload: {
+        requestId: delivery.request.id,
+        authorizationConfirmed: true,
+      },
+    });
+    expect(response.statusCode).toBe(409);
+    expect(response.json()).toMatchObject({
+      error: { code: "logged_export_failure_cleanup_incomplete" },
+    });
+    expect(run).not.toHaveBeenCalled();
+    expect(reconcileFailure).not.toHaveBeenCalled();
+  });
 });
 
 function exportOnlyFixture() {
@@ -765,5 +994,23 @@ function localSuccessResultFixture(
       artifact("thumbnail_jpg", "4"),
       artifact("video_mp4", "5"),
     ],
+  };
+}
+
+function localFailureResultFixture(
+  delivery: LoggedExportDelivery,
+): LoggedExportFailureResult {
+  return {
+    schemaVersion: 1,
+    requestId: delivery.request.id,
+    jobId: delivery.request.jobId,
+    projectId: delivery.request.projectId!,
+    clipId: delivery.request.clipId!,
+    error: {
+      code: "export_source_provider_unconfigured",
+      message: "Configure an authorized source provider before retrying.",
+    },
+    attempt: 0,
+    sourceCleanup: { lifecycle: "not_started" },
   };
 }

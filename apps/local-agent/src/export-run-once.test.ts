@@ -412,6 +412,99 @@ describe("one-shot local export runtime", () => {
     expect(acquisitionCalls).toBe(1);
   });
 
+  it("projects processor-persisted accepted logged failures only after safe cleanup", async () => {
+    const root = await createFixtureWorkspace();
+    const notStarted = createFixtureRequest(
+      root,
+      "logged-not-started-failure",
+      editingSettings,
+      true,
+    );
+    expect(
+      await runConfiguredLocalExportOnce(
+        {
+          requestId: notStarted.requestId,
+          authorizationConfirmed: false,
+        },
+        {
+          config: fixtureConfig(root),
+          sourceProvider: fixtureSourceProvider(),
+        },
+      ),
+    ).toMatchObject({
+      status: "failed",
+      state: "needs_user_action",
+      error: { code: "source_authorization_required" },
+    });
+    const notStartedDatabase = openLocalDatabase(join(root, "local.sqlite"));
+    try {
+      expect(
+        new LocalExportQueue(notStartedDatabase).buildLoggedExportFailureResult(
+          notStarted.requestId,
+        ),
+      ).toMatchObject({
+        attempt: 0,
+        sourceCleanup: { lifecycle: "not_started" },
+        error: { code: "source_authorization_required" },
+      });
+    } finally {
+      notStartedDatabase.close();
+    }
+
+    const attempted = createFixtureRequest(
+      root,
+      "logged-cleaned-failure",
+      editingSettings,
+      true,
+    );
+    expect(
+      await runConfiguredLocalExportOnce(
+        { requestId: attempted.requestId, authorizationConfirmed: true },
+        {
+          config: fixtureConfig(root),
+          sourceProvider: {
+            acquireAuthorizedFullSource: async () => {
+              throw Object.assign(
+                new Error(
+                  "acquisition failed at C:\\Users\\name\\source.mp4 Bearer private.jwt-token",
+                ),
+                { code: "fixture_acquisition_failed" },
+              );
+            },
+          },
+        },
+      ),
+    ).toMatchObject({
+      status: "failed",
+      state: "needs_user_action",
+      error: { code: "fixture_acquisition_failed" },
+    });
+    const attemptedDatabase = openLocalDatabase(join(root, "local.sqlite"));
+    try {
+      const queue = new LocalExportQueue(attemptedDatabase);
+      const result = queue.buildLoggedExportFailureResult(attempted.requestId);
+      expect(result).toMatchObject({
+        attempt: 1,
+        sourceCleanup: {
+          lifecycle: "deleted",
+          deletedAt: expect.any(String),
+        },
+        error: {
+          code: "fixture_acquisition_failed",
+          message: "acquisition failed at <path> Bearer <redacted>",
+        },
+      });
+      expect(JSON.stringify(result)).not.toMatch(
+        /C:\\Users|private\.jwt|reservationToken|sourceIdentity/i,
+      );
+      expect(
+        queue.getSourceAttempt(queue.get(attempted.requestId)!.jobId, 1),
+      ).toMatchObject({ lifecycleState: "deleted" });
+    } finally {
+      attemptedDatabase.close();
+    }
+  });
+
   it.each([
     {
       label: "H.264/MP4 with English soft subtitles",

@@ -15,9 +15,13 @@ import {
   InstalledExportWorkerCapabilitySummarySchema,
   ClaimLoggedExportDeliveryRequestSchema,
   LoggedExportDeliverySchema,
+  LoggedExportFailureResultSchema,
+  LoggedExportFailureSchema,
   LoggedExportSuccessResultSchema,
   LoggedExportSuccessSchema,
   ProcessAcceptedLoggedExportRequestSchema,
+  ProcessAcceptedLoggedExportResponseSchema,
+  ReconcileLoggedExportFailureRequestSchema,
   ReconcileLoggedExportSuccessRequestSchema,
   FinalArtifactProvenanceSchema,
   HealthResponseSchema,
@@ -145,6 +149,71 @@ describe("shared contracts", () => {
         result,
         resultFingerprint: "a".repeat(64),
         reconciledAt: now,
+        reservationToken: reconcile.reservationToken,
+      }).success,
+    ).toBe(false);
+  });
+
+  it("sanitizes and binds terminal-safe logged-export failure provenance", () => {
+    const result = LoggedExportFailureResultSchema.parse({
+      schemaVersion: 1,
+      requestId: "019fbb95-cd76-7920-93fa-e23ba755ee51",
+      jobId: "019fbb95-cd76-7920-93fa-e23ba755ee52",
+      projectId: "019fbb95-cd76-7920-93fa-e23ba755ee53",
+      clipId: "019fbb95-cd76-7920-93fa-e23ba755ee54",
+      error: {
+        code: "Renderer Failed!",
+        message:
+          "failed at /private/source.mp4 C:\\Users\\name\\source.mov \\\\server\\share\\source.mov file:///private/source.mov token=secret Bearer abc.def-123 https://private.invalid/source 019fbb95-cd76-7920-93fa-e23ba755ee55",
+      },
+      attempt: 1,
+      sourceCleanup: { lifecycle: "deleted", deletedAt: now },
+    });
+    expect(result.error).toEqual({
+      code: "renderer_failed",
+      message:
+        "failed at <path> <path> <path> <path> token=<redacted> Bearer <redacted> <url> <id>",
+    });
+    expect(LoggedExportFailureResultSchema.parse(result)).toEqual(result);
+    const reconcile = ReconcileLoggedExportFailureRequestSchema.parse({
+      workerId: "019fbb95-cd76-7920-93fa-e23ba755ee42",
+      workerEpoch: 3,
+      deliveryId: "019fbb95-cd76-7920-93fa-e23ba755ee43",
+      generation: 2,
+      reservationToken: "019fbb95-cd76-7920-93fa-e23ba755ee44",
+      result,
+    });
+    const failure = LoggedExportFailureSchema.parse({
+      id,
+      deliveryId: reconcile.deliveryId,
+      generation: reconcile.generation,
+      workerId: reconcile.workerId,
+      workerEpoch: reconcile.workerEpoch,
+      result,
+      resultFingerprint: "a".repeat(64),
+      reconciledAt: now,
+    });
+    expect(
+      ProcessAcceptedLoggedExportResponseSchema.parse({
+        execution: "failed",
+        failure,
+      }),
+    ).toMatchObject({ execution: "failed", failure: { result } });
+    expect(
+      LoggedExportFailureResultSchema.safeParse({
+        ...result,
+        attempt: 0,
+      }).success,
+    ).toBe(false);
+    expect(
+      LoggedExportFailureResultSchema.safeParse({
+        ...result,
+        sourceCleanup: { lifecycle: "not_started" },
+      }).success,
+    ).toBe(false);
+    expect(
+      LoggedExportFailureSchema.safeParse({
+        ...failure,
         reservationToken: reconcile.reservationToken,
       }).success,
     ).toBe(false);

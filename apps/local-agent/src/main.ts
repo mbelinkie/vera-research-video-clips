@@ -6,6 +6,7 @@ import {
   ExportSettingsPreviewSchema,
   ClaimLoggedExportDeliveryResponseSchema,
   LoggedExportDeliverySchema,
+  LoggedExportFailureSchema,
   LoggedExportSuccessSchema,
   RegisteredExportWorkerSchema,
 } from "@research-video/contracts";
@@ -88,6 +89,8 @@ const app = createLocalAgent({
     exportQueue.getAcceptedLoggedDelivery(requestId),
   buildLoggedExportSuccessResult: (requestId) =>
     exportQueue.buildLoggedExportSuccessResult(requestId),
+  buildLoggedExportFailureResult: (requestId) =>
+    exportQueue.buildLoggedExportFailureResult(requestId),
   runLoggedExportOnce: (input) =>
     runLocalExportOnce(input, {
       queue: exportQueue,
@@ -101,6 +104,8 @@ const app = createLocalAgent({
     }),
   reconcileLoggedExportSuccess: async ({ request, authorization }) =>
     callCloudLoggedExportSuccessReconcile(request, authorization),
+  reconcileLoggedExportFailure: async ({ request, authorization }) =>
+    callCloudLoggedExportFailureReconcile(request, authorization),
   createExportOnly: (input, snapshot) =>
     exportQueue.createExportOnly(input, snapshot),
   findExportOnlyByIdempotencyKey: (idempotencyKey) =>
@@ -211,6 +216,18 @@ async function callCloudLoggedExportSuccessReconcile(
     authorization,
   );
   return LoggedExportSuccessSchema.parse(payload);
+}
+
+async function callCloudLoggedExportFailureReconcile(
+  request: unknown,
+  authorization: string,
+) {
+  const payload = await callCloudDelivery(
+    "/api/export-deliveries/reconcile-failure",
+    request,
+    authorization,
+  );
+  return LoggedExportFailureSchema.parse(payload);
 }
 
 async function callCloudDelivery(

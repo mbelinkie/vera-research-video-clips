@@ -1885,10 +1885,12 @@ describe("logged export delivery API", () => {
     const claimLoggedExportDelivery = vi.fn(async () => ({}));
     const acceptLoggedExportDelivery = vi.fn(async () => ({ accepted: true }));
     const reconcileLoggedExportSuccess = vi.fn(async () => ({ ok: true }));
+    const reconcileLoggedExportFailure = vi.fn(async () => ({ failed: true }));
     const catalog = {
       claimLoggedExportDelivery,
       acceptLoggedExportDelivery,
       reconcileLoggedExportSuccess,
+      reconcileLoggedExportFailure,
     } as unknown as SharedProjectCatalog;
     const app = createCloudApi({ catalog, authenticate: async () => actor });
     apps.add(app);
@@ -1962,6 +1964,37 @@ describe("logged export delivery API", () => {
       generation: 2,
       reservationToken,
       result,
+    });
+    const failureResult = {
+      schemaVersion: 1,
+      requestId: result.requestId,
+      jobId: result.jobId,
+      projectId: result.projectId,
+      clipId: result.clipId,
+      error: { code: "provider_failed", message: "Provider failed." },
+      attempt: 0,
+      sourceCleanup: { lifecycle: "not_started" },
+    };
+    const failed = await app.inject({
+      method: "POST",
+      url: "/api/export-deliveries/reconcile-failure",
+      payload: {
+        workerId,
+        workerEpoch: 4,
+        deliveryId,
+        generation: 2,
+        reservationToken,
+        result: failureResult,
+      },
+    });
+    expect(failed.json()).toEqual({ failed: true });
+    expect(reconcileLoggedExportFailure).toHaveBeenCalledWith(actor, {
+      workerId,
+      workerEpoch: 4,
+      deliveryId,
+      generation: 2,
+      reservationToken,
+      result: failureResult,
     });
   });
 });

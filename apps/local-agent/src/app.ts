@@ -12,8 +12,11 @@ import {
   type ClaimLoggedExportDeliveryRequest,
   type ClaimLoggedExportDeliveryResponse,
   type LoggedExportDelivery,
+  type LoggedExportFailure,
+  type LoggedExportFailureResult,
   type LoggedExportSuccess,
   type LoggedExportSuccessResult,
+  type ReconcileLoggedExportFailureRequest,
   type ReconcileLoggedExportSuccessRequest,
   type RegisterExportWorkerRequest,
   type RegisteredExportWorker,
@@ -85,6 +88,7 @@ export interface LocalAgentDependencies {
     requestId: string,
   ): LoggedExportDelivery | undefined;
   buildLoggedExportSuccessResult?(requestId: string): LoggedExportSuccessResult;
+  buildLoggedExportFailureResult?(requestId: string): LoggedExportFailureResult;
   runLoggedExportOnce?(input: {
     requestId: string;
     authorizationConfirmed: boolean;
@@ -93,6 +97,10 @@ export interface LocalAgentDependencies {
     request: ReconcileLoggedExportSuccessRequest;
     authorization: string;
   }): Promise<LoggedExportSuccess>;
+  reconcileLoggedExportFailure?(input: {
+    request: ReconcileLoggedExportFailureRequest;
+    authorization: string;
+  }): Promise<LoggedExportFailure>;
 }
 
 const TranscriptParamsSchema = z.object({
@@ -454,12 +462,53 @@ export function createLocalAgent(
           409,
         );
       }
-      if (
-        delivery.workerId !== identity.workerId ||
-        delivery.workerEpoch !== identity.epoch
-      ) {
+      if (delivery.workerId !== identity.workerId) {
         throw new LocalExportSettingsError(
-          "The accepted delivery belongs to a different local worker identity or epoch.",
+          "The accepted delivery belongs to a different local worker identity.",
+          "export_delivery_ownership_mismatch",
+          409,
+        );
+      }
+
+      if (
+        dependencies.buildLoggedExportFailureResult &&
+        dependencies.reconcileLoggedExportFailure
+      ) {
+        let persistedFailure: LoggedExportFailureResult | undefined;
+        try {
+          persistedFailure = dependencies.buildLoggedExportFailureResult(
+            command.requestId,
+          );
+        } catch (error) {
+          if (
+            (error as { code?: string }).code !==
+            "logged_export_failure_not_recorded"
+          ) {
+            throw error;
+          }
+        }
+        if (persistedFailure) {
+          const failure = await dependencies.reconcileLoggedExportFailure({
+            authorization,
+            request: {
+              workerId: delivery.workerId,
+              workerEpoch: delivery.workerEpoch,
+              deliveryId: delivery.deliveryId,
+              generation: delivery.generation,
+              reservationToken: delivery.reservationToken,
+              result: persistedFailure,
+            },
+          });
+          return ProcessAcceptedLoggedExportResponseSchema.parse({
+            execution: "failed",
+            failure,
+          });
+        }
+      }
+
+      if (delivery.workerEpoch !== identity.epoch) {
+        throw new LocalExportSettingsError(
+          "The accepted delivery belongs to a different local worker epoch.",
           "export_delivery_ownership_mismatch",
           409,
         );
@@ -470,6 +519,29 @@ export function createLocalAgent(
         authorizationConfirmed: command.authorizationConfirmed,
       });
       if (execution.status === "failed") {
+        if (
+          dependencies.buildLoggedExportFailureResult &&
+          dependencies.reconcileLoggedExportFailure
+        ) {
+          const result = dependencies.buildLoggedExportFailureResult(
+            command.requestId,
+          );
+          const failure = await dependencies.reconcileLoggedExportFailure({
+            authorization,
+            request: {
+              workerId: delivery.workerId,
+              workerEpoch: delivery.workerEpoch,
+              deliveryId: delivery.deliveryId,
+              generation: delivery.generation,
+              reservationToken: delivery.reservationToken,
+              result,
+            },
+          });
+          return ProcessAcceptedLoggedExportResponseSchema.parse({
+            execution: "failed",
+            failure,
+          });
+        }
         throw new LocalExportSettingsError(
           execution.error?.message ?? "Local export processing failed.",
           execution.error?.code ?? "export_runtime_failed",

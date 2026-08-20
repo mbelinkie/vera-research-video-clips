@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import type {
   AuthenticatedActor,
   ExportRequest,
+  LoggedExportFailureResult,
   LoggedExportSuccessResult,
   TranscriptManifest,
 } from "@research-video/contracts";
@@ -991,6 +992,275 @@ describe("logged export delivery", () => {
         ["0".repeat(64), first.id],
       ),
     ).rejects.toThrow(/immutable/u);
+    await expect(
+      fixture.catalog.reconcileLoggedExportFailure(
+        fixture.owner,
+        reconcileFailureCommand(fixture),
+      ),
+    ).rejects.toMatchObject({ statusCode: 409 });
+    const failureResult = loggedExportFailureFixture(fixture.accepted.request);
+    await expect(
+      fixture.database.query(
+        `INSERT INTO logged_export_failure_results
+           (id, export_request_id, delivery_id, delivery_generation,
+            worker_id, worker_epoch, result_schema_version, result_json,
+            result_fingerprint, reconciled_at)
+         VALUES ($1, $2, $3, $4, $5, $6, 1, $7, $8, $9)`,
+        [
+          randomUUID(),
+          fixture.accepted.request.id,
+          fixture.accepted.deliveryId,
+          fixture.accepted.generation,
+          fixture.accepted.workerId,
+          fixture.accepted.workerEpoch,
+          JSON.stringify(failureResult),
+          sha256Fingerprint(failureResult),
+          "2026-08-20T12:00:20.000Z",
+        ],
+      ),
+    ).rejects.toThrow(/mutually exclusive/u);
+  });
+
+  it("atomically reconciles one sanitized immutable failure and replays it without another event or version", async () => {
+    const fixture = await createAcceptedLoggedExportResultFixture();
+    const unsafeResult: LoggedExportFailureResult = {
+      ...loggedExportFailureFixture(fixture.accepted.request),
+      error: {
+        code: "Renderer Failed!",
+        message: `failed /private/source.mp4 C:\\Users\\name\\source.mov \\\\server\\share\\source.mov file:///private/source.mov token=${fixture.accepted.reservationToken} Bearer private.jwt-token https://private.invalid/source`,
+      },
+    };
+    const command = {
+      ...reconcileFailureCommand(fixture),
+      result: unsafeResult,
+    };
+    const first = await fixture.catalog.reconcileLoggedExportFailure(
+      fixture.owner,
+      command,
+    );
+    expect(first.result.error).toEqual({
+      code: "renderer_failed",
+      message:
+        "failed <path> <path> <path> <path> token=<redacted> Bearer <redacted> <url>",
+    });
+    expect(first.resultFingerprint).toBe(sha256Fingerprint(first.result));
+    const forbidden =
+      /reservation_?token|owner_?user_?id|authorization|\/private\/|private\.invalid|source_?identity|C:\\Users|\\\\server|file:\/\/|private\.jwt/i;
+    expect(JSON.stringify(first)).not.toMatch(forbidden);
+    const persisted = await fixture.database.query<Record<string, unknown>>(
+      `SELECT result.*, event.payload AS event_payload
+       FROM logged_export_failure_results result
+       JOIN sync_events event
+         ON event.entity_id = $1
+        AND event.event_type = 'clip_candidate.export_failed'
+       WHERE result.export_request_id = $2`,
+      [fixture.accepted.request.clipId, fixture.accepted.request.id],
+    );
+    expect(JSON.stringify(persisted.rows[0])).not.toMatch(forbidden);
+    const afterFirst = await fixture.database.query<{
+      state: string;
+      export_status: string;
+      version: number;
+    }>(
+      `SELECT j.state, c.export_status, c.version
+       FROM jobs j
+       JOIN export_requests er ON er.job_id = j.id
+       JOIN clip_candidates c ON c.id = er.clip_id
+       WHERE er.id = $1`,
+      [fixture.accepted.request.id],
+    );
+    expect(afterFirst.rows[0]).toMatchObject({
+      state: "failed",
+      export_status: "failed",
+    });
+    const failedVersion = Number(afterFirst.rows[0]!.version);
+    expect(
+      await fixture.catalog.reconcileLoggedExportFailure(
+        fixture.owner,
+        command,
+      ),
+    ).toEqual(first);
+    await expect(
+      fixture.catalog.reconcileLoggedExportFailure(fixture.owner, {
+        ...command,
+        result: {
+          ...unsafeResult,
+          error: { code: "different_failure", message: "Different failure." },
+        },
+      }),
+    ).rejects.toMatchObject({ statusCode: 409 });
+    expect(
+      (
+        await fixture.database.query<{ count: string }>(
+          "SELECT count(*)::text AS count FROM logged_export_failure_results",
+        )
+      ).rows[0]!.count,
+    ).toBe("1");
+    expect(
+      (
+        await fixture.database.query<{ count: string }>(
+          `SELECT count(*)::text AS count FROM sync_events
+           WHERE event_type = 'clip_candidate.export_failed'
+             AND entity_id = $1`,
+          [fixture.accepted.request.clipId],
+        )
+      ).rows[0]!.count,
+    ).toBe("1");
+    expect(
+      Number(
+        (
+          await fixture.database.query<{ version: number }>(
+            "SELECT version FROM clip_candidates WHERE id = $1",
+            [fixture.accepted.request.clipId],
+          )
+        ).rows[0]!.version,
+      ),
+    ).toBe(failedVersion);
+    await expect(
+      fixture.catalog.reconcileLoggedExportSuccess(
+        fixture.owner,
+        reconcileSuccessCommand(fixture),
+      ),
+    ).rejects.toMatchObject({ statusCode: 409 });
+    await expect(
+      fixture.database.query(
+        `INSERT INTO logged_export_success_results
+           (id, export_request_id, delivery_id, delivery_generation,
+            worker_id, worker_epoch, result_schema_version, result_json,
+            result_fingerprint, reconciled_at)
+         VALUES ($1, $2, $3, $4, $5, $6, 1, $7, $8, $9)`,
+        [
+          randomUUID(),
+          fixture.accepted.request.id,
+          fixture.accepted.deliveryId,
+          fixture.accepted.generation,
+          fixture.accepted.workerId,
+          fixture.accepted.workerEpoch,
+          JSON.stringify(fixture.result),
+          sha256Fingerprint(fixture.result),
+          "2026-08-20T12:00:20.000Z",
+        ],
+      ),
+    ).rejects.toThrow(/mutually exclusive/u);
+    await expect(
+      fixture.database.query(
+        `UPDATE logged_export_failure_results
+         SET result_fingerprint = $1 WHERE id = $2`,
+        ["0".repeat(64), first.id],
+      ),
+    ).rejects.toThrow(/immutable/u);
+  });
+
+  it("permits the original owner to close pinned failures after expiry, revocation, or a newer registration epoch", async () => {
+    const expiredClock = { now: new Date("2026-08-20T12:00:00.000Z") };
+    const expired = await createAcceptedLoggedExportResultFixture(expiredClock);
+    expiredClock.now = new Date("2026-08-20T12:01:01.000Z");
+    expect(
+      (
+        await expired.catalog.reconcileLoggedExportFailure(
+          expired.owner,
+          reconcileFailureCommand(expired),
+        )
+      ).result.requestId,
+    ).toBe(expired.accepted.request.id);
+
+    const revoked = await createAcceptedLoggedExportResultFixture();
+    await revoked.catalog.revokeExportWorker(revoked.owner, {
+      workerId: revoked.worker.workerId,
+      epoch: revoked.worker.epoch,
+    });
+    const revokedCommand = reconcileFailureCommand(revoked);
+    const revokedResult = await revoked.catalog.reconcileLoggedExportFailure(
+      revoked.owner,
+      revokedCommand,
+    );
+    expect(
+      await revoked.catalog.reconcileLoggedExportFailure(
+        revoked.owner,
+        revokedCommand,
+      ),
+    ).toEqual(revokedResult);
+
+    const advanced = await createAcceptedLoggedExportResultFixture();
+    await advanced.catalog.registerExportWorker(advanced.owner, {
+      ...advanced.worker,
+      epoch: advanced.worker.epoch + 1,
+    });
+    expect(
+      (
+        await advanced.catalog.reconcileLoggedExportFailure(
+          advanced.owner,
+          reconcileFailureCommand(advanced),
+        )
+      ).workerEpoch,
+    ).toBe(advanced.accepted.workerEpoch);
+  });
+
+  it("rejects forged pinned failure credentials and membership loss without mutation", async () => {
+    const fixture = await createAcceptedLoggedExportResultFixture();
+    const command = reconcileFailureCommand(fixture);
+    for (const mutation of [
+      { workerEpoch: command.workerEpoch + 1 },
+      { generation: command.generation + 1 },
+      { reservationToken: randomUUID() },
+      { workerId: randomUUID() },
+    ]) {
+      await expect(
+        fixture.catalog.reconcileLoggedExportFailure(fixture.owner, {
+          ...command,
+          ...mutation,
+        }),
+      ).rejects.toMatchObject({ statusCode: expect.any(Number) });
+    }
+    for (const resultMutation of [
+      { requestId: randomUUID() },
+      { jobId: randomUUID() },
+      { projectId: randomUUID() },
+      { clipId: randomUUID() },
+    ]) {
+      await expect(
+        fixture.catalog.reconcileLoggedExportFailure(fixture.owner, {
+          ...command,
+          result: { ...command.result, ...resultMutation },
+        }),
+      ).rejects.toMatchObject({ statusCode: 409 });
+    }
+    const other = fixtureActor("failure-other");
+    await fixture.catalog.registerUser(other, "Failure other");
+    await fixture.database.query(
+      `INSERT INTO project_members (project_id, user_id, role, created_at)
+       VALUES ($1, $2, 'editor', $3)`,
+      [
+        fixture.accepted.request.projectId,
+        other.userId,
+        new Date().toISOString(),
+      ],
+    );
+    await expect(
+      fixture.catalog.reconcileLoggedExportFailure(other, command),
+    ).rejects.toMatchObject({ statusCode: 403 });
+    await fixture.database.query(
+      "DELETE FROM project_members WHERE project_id = $1 AND user_id = $2",
+      [fixture.accepted.request.projectId, fixture.owner.userId],
+    );
+    await expect(
+      fixture.catalog.reconcileLoggedExportFailure(fixture.owner, command),
+    ).rejects.toMatchObject({ statusCode: 409 });
+    expect(
+      (
+        await fixture.database.query<{ count: string }>(
+          "SELECT count(*)::text AS count FROM logged_export_failure_results",
+        )
+      ).rows[0]!.count,
+    ).toBe("0");
+    expect(
+      (
+        await fixture.database.query<{ state: string }>(
+          "SELECT state FROM jobs WHERE id = $1",
+          [fixture.accepted.request.jobId],
+        )
+      ).rows[0]!.state,
+    ).toBe("queued");
   });
 
   it("rejects shaped but request-inconsistent result provenance without any partial authoritative mutation", async () => {
@@ -1445,6 +1715,37 @@ function reconcileSuccessCommand(
     generation: fixture.accepted.generation,
     reservationToken: fixture.accepted.reservationToken,
     result: fixture.result,
+  };
+}
+
+function reconcileFailureCommand(
+  fixture: Awaited<ReturnType<typeof createAcceptedLoggedExportResultFixture>>,
+) {
+  return {
+    workerId: fixture.accepted.workerId,
+    workerEpoch: fixture.accepted.workerEpoch,
+    deliveryId: fixture.accepted.deliveryId,
+    generation: fixture.accepted.generation,
+    reservationToken: fixture.accepted.reservationToken,
+    result: loggedExportFailureFixture(fixture.accepted.request),
+  };
+}
+
+function loggedExportFailureFixture(
+  request: ExportRequest,
+): LoggedExportFailureResult {
+  return {
+    schemaVersion: 1,
+    requestId: request.id,
+    jobId: request.jobId,
+    projectId: request.projectId!,
+    clipId: request.clipId!,
+    error: {
+      code: "export_source_provider_unconfigured",
+      message: "Configure an authorized source provider before retrying.",
+    },
+    attempt: 0,
+    sourceCleanup: { lifecycle: "not_started" },
   };
 }
 

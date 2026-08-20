@@ -21,8 +21,10 @@ import {
   ClaimLoggedExportDeliveryRequestSchema,
   ClaimLoggedExportDeliveryResponseSchema,
   LoggedExportDeliverySchema,
+  LoggedExportFailureSchema,
   LoggedExportSuccessResultSchema,
   LoggedExportSuccessSchema,
+  ReconcileLoggedExportFailureRequestSchema,
   ReconcileLoggedExportSuccessRequestSchema,
   ExportSettingsSchema,
   ExportWorkerCompatibilityRequestSchema,
@@ -77,8 +79,11 @@ import {
   type RegisterExportWorkerRequest,
   type RegisteredExportWorker,
   type LoggedExportDelivery,
+  type LoggedExportFailure,
+  type LoggedExportFailureResult,
   type LoggedExportSuccess,
   type LoggedExportSuccessResult,
+  type ReconcileLoggedExportFailureRequest,
   type ReconcileLoggedExportSuccessRequest,
   type RevokeExportWorkerRequest,
   type ExportSettingsPreviewRequest,
@@ -714,6 +719,18 @@ export class SharedProjectCatalog {
       }
       assertLoggedExportSuccessMatchesRequest(delivery, parsed.result);
 
+      const existingFailure = await this.database.query<DbRow>(
+        `SELECT id FROM logged_export_failure_results
+         WHERE export_request_id = $1 OR delivery_id = $2
+         FOR UPDATE`,
+        [delivery.id, parsed.deliveryId],
+      );
+      if (existingFailure.rows[0]) {
+        throw new CatalogConflictError(
+          "An immutable failure is already reconciled for this export.",
+        );
+      }
+
       const existingResult = await this.database.query<DbRow>(
         `SELECT * FROM logged_export_success_results
          WHERE export_request_id = $1 OR delivery_id = $2
@@ -829,6 +846,178 @@ export class SharedProjectCatalog {
       throw new CatalogConflictError("Export result reconciliation failed.");
     }
     return mapLoggedExportSuccess(reconciled);
+  }
+
+  async reconcileLoggedExportFailure(
+    actor: AuthenticatedActor,
+    input: ReconcileLoggedExportFailureRequest,
+  ): Promise<LoggedExportFailure> {
+    await this.requireRegistered(actor);
+    const parsed = ReconcileLoggedExportFailureRequestSchema.parse(input);
+    const nowIso = this.now().toISOString();
+    const resultFingerprint = sha256Fingerprint(parsed.result);
+    let reconciled: DbRow | undefined;
+
+    await this.transaction(async () => {
+      const worker = await this.database.query<DbRow>(
+        "SELECT * FROM registered_export_workers WHERE id = $1 FOR UPDATE",
+        [parsed.workerId],
+      );
+      const workerRow = worker.rows[0];
+      if (!workerRow || String(workerRow.owner_user_id) !== actor.userId) {
+        throw new AuthorizationError(
+          "This accepted delivery belongs to another worker owner.",
+        );
+      }
+
+      const deliveryResult = await this.database.query<DbRow>(
+        `${loggedExportDeliverySelect}
+         JOIN project_members failure_members
+           ON failure_members.project_id = er.project_id
+          AND failure_members.user_id = $1
+         WHERE d.id = $2 AND d.worker_id = $3 AND d.worker_epoch = $4
+           AND d.generation = $5 AND d.reservation_token = $6
+           AND d.accepted_at IS NOT NULL
+         FOR UPDATE OF d, er, j, delivery_clip`,
+        [
+          actor.userId,
+          parsed.deliveryId,
+          parsed.workerId,
+          parsed.workerEpoch,
+          parsed.generation,
+          parsed.reservationToken,
+        ],
+      );
+      const delivery = deliveryResult.rows[0];
+      if (!delivery) {
+        throw new CatalogConflictError(
+          "The accepted export delivery is stale, mismatched, or unauthorized.",
+        );
+      }
+      assertLoggedExportFailureMatchesRequest(delivery, parsed.result);
+
+      const existingSuccess = await this.database.query<DbRow>(
+        `SELECT id FROM logged_export_success_results
+         WHERE export_request_id = $1 OR delivery_id = $2
+         FOR UPDATE`,
+        [delivery.id, parsed.deliveryId],
+      );
+      if (existingSuccess.rows[0]) {
+        throw new CatalogConflictError(
+          "An immutable success is already reconciled for this export.",
+        );
+      }
+
+      const existingFailure = await this.database.query<DbRow>(
+        `SELECT * FROM logged_export_failure_results
+         WHERE export_request_id = $1 OR delivery_id = $2
+         FOR UPDATE`,
+        [delivery.id, parsed.deliveryId],
+      );
+      const existing = existingFailure.rows[0];
+      if (existing) {
+        const mapped = mapLoggedExportFailure(existing);
+        if (
+          String(existing.export_request_id) !== String(delivery.id) ||
+          String(existing.delivery_id) !== parsed.deliveryId ||
+          String(existing.result_fingerprint) !== resultFingerprint ||
+          canonicalJson(mapped.result) !== canonicalJson(parsed.result)
+        ) {
+          throw new CatalogConflictError(
+            "A different immutable failure is already reconciled for this export.",
+          );
+        }
+        if (
+          String(delivery.state) !== "failed" ||
+          String(delivery.delivery_clip_export_status) !== "failed"
+        ) {
+          throw new CatalogConflictError(
+            "The existing export failure has inconsistent authoritative state.",
+          );
+        }
+        reconciled = existing;
+        return;
+      }
+
+      if (
+        String(delivery.state) !== "queued" ||
+        String(delivery.delivery_clip_export_status) !== "queued"
+      ) {
+        throw new CatalogConflictError(
+          "Only the exact queued accepted export can record its first failure.",
+        );
+      }
+
+      const resultId = randomUUID();
+      const inserted = await this.database.query<DbRow>(
+        `INSERT INTO logged_export_failure_results
+           (id, export_request_id, delivery_id, delivery_generation,
+            worker_id, worker_epoch, result_schema_version, result_json,
+            result_fingerprint, reconciled_at)
+         VALUES ($1, $2, $3, $4, $5, $6, 1, $7, $8, $9)
+         RETURNING *`,
+        [
+          resultId,
+          delivery.id,
+          parsed.deliveryId,
+          parsed.generation,
+          parsed.workerId,
+          parsed.workerEpoch,
+          JSON.stringify(parsed.result),
+          resultFingerprint,
+          nowIso,
+        ],
+      );
+      const failedJob = await this.database.query<DbRow>(
+        `UPDATE jobs SET state = 'failed', updated_at = $1
+         WHERE id = $2 AND kind = 'export' AND state = 'queued'
+         RETURNING id`,
+        [nowIso, parsed.result.jobId],
+      );
+      if (!failedJob.rows[0]) {
+        throw new CatalogConflictError(
+          "The exact export job is no longer queued for failure reconciliation.",
+        );
+      }
+      const failedClip = await this.database.query<DbRow>(
+        `UPDATE clip_candidates
+         SET export_status = 'failed', version = version + 1, updated_at = $1
+         WHERE id = $2 AND project_id = $3 AND export_status = 'queued'
+         RETURNING version`,
+        [nowIso, parsed.result.clipId, parsed.result.projectId],
+      );
+      if (!failedClip.rows[0]) {
+        throw new CatalogConflictError(
+          "The exact logged clip is no longer queued for failure reconciliation.",
+        );
+      }
+      await this.database.query(
+        `INSERT INTO sync_events
+           (project_id, event_type, entity_id, server_version, payload, created_at)
+         VALUES ($1, 'clip_candidate.export_failed', $2, $3, $4, $5)`,
+        [
+          parsed.result.projectId,
+          parsed.result.clipId,
+          failedClip.rows[0].version,
+          JSON.stringify({
+            clipId: parsed.result.clipId,
+            exportRequestId: parsed.result.requestId,
+            jobId: parsed.result.jobId,
+            failureResultId: resultId,
+            error: parsed.result.error,
+            attempt: parsed.result.attempt,
+            sourceCleanup: parsed.result.sourceCleanup,
+          }),
+          nowIso,
+        ],
+      );
+      reconciled = inserted.rows[0];
+    });
+
+    if (!reconciled) {
+      throw new CatalogConflictError("Export failure reconciliation failed.");
+    }
+    return mapLoggedExportFailure(reconciled);
   }
 
   async compatibleExportWorkerAvailability(
@@ -4126,6 +4315,42 @@ function mapLoggedExportSuccess(row: DbRow): LoggedExportSuccess {
     resultFingerprint: row.result_fingerprint,
     reconciledAt: iso(row.reconciled_at),
   });
+}
+
+function mapLoggedExportFailure(row: DbRow): LoggedExportFailure {
+  return LoggedExportFailureSchema.parse({
+    id: row.id,
+    deliveryId: row.delivery_id,
+    generation: Number(row.delivery_generation),
+    workerId: row.worker_id,
+    workerEpoch: Number(row.worker_epoch),
+    result:
+      typeof row.result_json === "string"
+        ? JSON.parse(row.result_json)
+        : row.result_json,
+    resultFingerprint: row.result_fingerprint,
+    reconciledAt: iso(row.reconciled_at),
+  });
+}
+
+function assertLoggedExportFailureMatchesRequest(
+  row: DbRow,
+  result: LoggedExportFailureResult,
+): void {
+  const request = mapLoggedExportRequest({
+    ...row,
+    export_success_result_json: undefined,
+  });
+  if (
+    result.requestId !== request.id ||
+    result.jobId !== request.jobId ||
+    result.projectId !== request.projectId ||
+    result.clipId !== request.clipId
+  ) {
+    throw new CatalogConflictError(
+      "Export failure identity does not match the immutable queued request.",
+    );
+  }
 }
 
 function assertLoggedExportSuccessMatchesRequest(

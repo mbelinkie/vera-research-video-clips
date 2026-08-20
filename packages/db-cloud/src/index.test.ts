@@ -49,6 +49,7 @@ describe("cloud migrations", () => {
       "0012_registered_export_workers",
       "0013_logged_export_deliveries",
       "0014_logged_export_success_results",
+      "0015_logged_export_failure_results",
     ]);
     expect(await runCloudMigrations(database)).toEqual([]);
     const result = await database.query<{ table_name: string }>(
@@ -84,6 +85,11 @@ describe("cloud migrations", () => {
        WHERE table_name = 'logged_export_success_results'`,
     );
     expect(resultTable.rows).toHaveLength(1);
+    const failureResultTable = await database.query<{ table_name: string }>(
+      `SELECT table_name FROM information_schema.tables
+       WHERE table_name = 'logged_export_failure_results'`,
+    );
+    expect(failureResultTable.rows).toHaveLength(1);
   });
 
   it("backfills immutable legacy request/job snapshots from the 0010 schema", async () => {
@@ -306,6 +312,32 @@ describe("cloud migrations", () => {
         await database.query<{ table_name: string }>(
           `SELECT table_name FROM information_schema.tables
            WHERE table_name = 'logged_export_success_results'`,
+        )
+      ).rows,
+    ).toHaveLength(1);
+    copyFileSync(
+      resolve(
+        cloudMigrationDirectory,
+        "0015_logged_export_failure_results.sql",
+      ),
+      join(migrations, "0015_logged_export_failure_results.sql"),
+    );
+    expect(await runCloudMigrations(database, migrations)).toEqual([
+      "0015_logged_export_failure_results",
+    ]);
+    expect(
+      (
+        await database.query(
+          "SELECT * FROM registered_export_workers WHERE id = $1",
+          [workerId],
+        )
+      ).rows[0],
+    ).toEqual(before);
+    expect(
+      (
+        await database.query<{ table_name: string }>(
+          `SELECT table_name FROM information_schema.tables
+           WHERE table_name = 'logged_export_failure_results'`,
         )
       ).rows,
     ).toHaveLength(1);

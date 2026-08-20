@@ -2131,6 +2131,119 @@ export const LoggedExportSuccessSchema = z
   })
   .strict();
 
+export function sanitizeLoggedExportFailureCode(value: string): string {
+  const sanitized = value
+    .trim()
+    .toLowerCase()
+    .replaceAll(/[^a-z0-9_]+/gu, "_")
+    .replaceAll(/^_+|_+$/gu, "")
+    .slice(0, 120);
+  return /^[a-z][a-z0-9_]*$/u.test(sanitized)
+    ? sanitized
+    : "export_runtime_failed";
+}
+
+export function sanitizeLoggedExportFailureMessage(value: string): string {
+  const sanitized = value
+    .replaceAll(/https?:\/\/[^\s'"<>]+/giu, "<url>")
+    .replaceAll(/file:\/\/[^\s'"<>]+/giu, "<path>")
+    .replaceAll(/\\\\[^\s'"]+/gu, "<path>")
+    .replaceAll(/\b[A-Za-z]:\\[^\s'"]+/gu, "<path>")
+    .replaceAll(/(?:[A-Za-z]:)?\/(?:[^\s'"]+)/gu, "<path>")
+    .replaceAll(/\bBearer\s+[A-Za-z0-9._~+\/-]+={0,2}/giu, "Bearer <redacted>")
+    .replaceAll(
+      /\b[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b/giu,
+      "<id>",
+    )
+    .replaceAll(/\b[a-f0-9]{64}\b/giu, "<digest>")
+    .replaceAll(
+      /\b(token|secret|credential|authorization)=\S+/giu,
+      "$1=<redacted>",
+    )
+    .replaceAll(/[\u0000-\u001f\u007f]+/gu, " ")
+    .replaceAll(/\s+/gu, " ")
+    .trim()
+    .slice(0, 500);
+  return sanitized || "Local export processing failed.";
+}
+
+const LoggedExportFailureCodeSchema = z
+  .string()
+  .min(1)
+  .max(240)
+  .transform(sanitizeLoggedExportFailureCode)
+  .pipe(z.string().regex(/^[a-z][a-z0-9_]{0,119}$/u));
+
+const LoggedExportFailureMessageSchema = z
+  .string()
+  .min(1)
+  .max(2_000)
+  .transform(sanitizeLoggedExportFailureMessage)
+  .pipe(z.string().min(1).max(500));
+
+export const LoggedExportFailureResultSchema = z
+  .object({
+    schemaVersion: z.literal(1),
+    requestId: IdSchema,
+    jobId: IdSchema,
+    projectId: IdSchema,
+    clipId: IdSchema,
+    error: z
+      .object({
+        code: LoggedExportFailureCodeSchema,
+        message: LoggedExportFailureMessageSchema,
+      })
+      .strict(),
+    attempt: z.number().int().nonnegative(),
+    sourceCleanup: z.discriminatedUnion("lifecycle", [
+      z.object({ lifecycle: z.literal("not_started") }).strict(),
+      z
+        .object({
+          lifecycle: z.literal("deleted"),
+          deletedAt: UtcTimestampSchema,
+        })
+        .strict(),
+    ]),
+  })
+  .strict()
+  .superRefine((result, context) => {
+    if (
+      (result.attempt === 0) !==
+      (result.sourceCleanup.lifecycle === "not_started")
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["sourceCleanup"],
+        message:
+          "A not-started failure has attempt zero; an attempted failure requires verified deletion.",
+      });
+    }
+  });
+
+export const ReconcileLoggedExportFailureRequestSchema = z
+  .object({
+    workerId: IdSchema,
+    workerEpoch: z.number().int().positive(),
+    deliveryId: IdSchema,
+    generation: z.number().int().positive(),
+    reservationToken: IdSchema,
+    result: LoggedExportFailureResultSchema,
+  })
+  .strict();
+
+export const LoggedExportFailureSchema = z
+  .object({
+    id: IdSchema,
+    deliveryId: IdSchema,
+    generation: z.number().int().positive(),
+    workerId: IdSchema,
+    workerEpoch: z.number().int().positive(),
+    result: LoggedExportFailureResultSchema,
+    resultFingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+    reconciledAt: UtcTimestampSchema,
+  })
+  .strict();
+
 export const ProcessAcceptedLoggedExportRequestSchema = z
   .object({
     requestId: IdSchema,
@@ -2138,12 +2251,20 @@ export const ProcessAcceptedLoggedExportRequestSchema = z
   })
   .strict();
 
-export const ProcessAcceptedLoggedExportResponseSchema = z
-  .object({
-    execution: z.enum(["complete", "already_complete"]),
-    reconciliation: LoggedExportSuccessSchema,
-  })
-  .strict();
+export const ProcessAcceptedLoggedExportResponseSchema = z.union([
+  z
+    .object({
+      execution: z.enum(["complete", "already_complete"]),
+      reconciliation: LoggedExportSuccessSchema,
+    })
+    .strict(),
+  z
+    .object({
+      execution: z.literal("failed"),
+      failure: LoggedExportFailureSchema,
+    })
+    .strict(),
+]);
 
 export const JobSchema = z.object({
   id: IdSchema,
@@ -2387,6 +2508,13 @@ export type ReconcileLoggedExportSuccessRequest = z.infer<
   typeof ReconcileLoggedExportSuccessRequestSchema
 >;
 export type LoggedExportSuccess = z.infer<typeof LoggedExportSuccessSchema>;
+export type LoggedExportFailureResult = z.infer<
+  typeof LoggedExportFailureResultSchema
+>;
+export type ReconcileLoggedExportFailureRequest = z.infer<
+  typeof ReconcileLoggedExportFailureRequestSchema
+>;
+export type LoggedExportFailure = z.infer<typeof LoggedExportFailureSchema>;
 export type ProcessAcceptedLoggedExportRequest = z.infer<
   typeof ProcessAcceptedLoggedExportRequestSchema
 >;
