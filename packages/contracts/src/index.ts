@@ -375,6 +375,7 @@ export const ExportVideoRateControlSchema = z.discriminatedUnion("mode", [
     mode: z.literal("bitrate"),
     kilobitsPerSecond: z.number().int().min(500).max(200_000),
   }),
+  z.object({ mode: z.literal("codec_default") }),
 ]);
 export const ExportSettingsSchema = z
   .object({
@@ -385,9 +386,12 @@ export const ExportSettingsSchema = z
     frameRate: z.enum(["source", "23.976", "24", "25", "29.97", "30"]),
     audioCodec: z.enum(["aac", "pcm_s16le"]),
     audioKilobitsPerSecond: z.number().int().min(64).max(1_536).optional(),
+    audioSampleRate: z.enum(["source", "44100", "48000"]).optional(),
+    audioChannels: z.enum(["source", "1", "2"]).optional(),
     omitSubtitleFilesForConfirmedEnglish: z.boolean(),
     embedEnglishSubtitleTrack: z.boolean(),
   })
+  .strict()
   .superRefine((settings, context) => {
     if (settings.container === "mp4" && settings.videoCodec === "prores") {
       context.addIssue({
@@ -566,6 +570,8 @@ export const ExportSettingsOverrideSchema = z
       .max(1_536)
       .nullable()
       .optional(),
+    audioSampleRate: z.enum(["source", "44100", "48000"]).nullable().optional(),
+    audioChannels: z.enum(["source", "1", "2"]).nullable().optional(),
     omitSubtitleFilesForConfirmedEnglish: z.boolean().optional(),
     embedEnglishSubtitleTrack: z.boolean().optional(),
   })
@@ -607,6 +613,19 @@ export const ExportWorkerCapabilityReferenceSchema = z
     profileVersion: z.number().int().positive(),
     fingerprint: z.string().regex(/^[a-f0-9]{64}$/),
     validation: z.enum(["validated", "legacy_unvalidated"]),
+  })
+  .strict();
+export const ExportRendererCapabilityIdSchema = z.enum([
+  "h264_mp4",
+  "hevc_mkv",
+  "prores_mov",
+]);
+export const ExportWorkerAvailabilitySchema = z
+  .object({
+    discovery: z.enum(["canonical_only", "installed"]),
+    availableRendererIds: z.array(ExportRendererCapabilityIdSchema).max(3),
+    unavailableRendererIds: z.array(ExportRendererCapabilityIdSchema).max(3),
+    ffmpegVersion: z.string().trim().min(1).max(120).optional(),
   })
   .strict();
 export const ResolvedExportSettingsSnapshotSchema = z
@@ -707,6 +726,7 @@ export const ExportSettingsPreviewSchema = z
   .object({
     snapshot: ResolvedExportSettingsSnapshotSchema,
     issues: z.array(ExportCapabilityIssueSchema),
+    workerAvailability: ExportWorkerAvailabilitySchema.optional(),
     effectiveSubtitlePolicy: z.object({
       requiredSidecars: z.array(z.enum(["original", "english"])).max(2),
       subtitleSidecarsOmittedReason: z
@@ -1243,9 +1263,67 @@ export const ResolvedExportBoundsSchema = z
     message: "Resolved export end must be after its start.",
   });
 
+export const ExportMediaRationalSchema = z
+  .object({
+    numerator: z.number().int().nonnegative(),
+    denominator: z.number().int().positive(),
+  })
+  .strict();
+
+export const ExportObservedMediaPropertiesSchema = z
+  .object({
+    schemaVersion: z.literal(1),
+    container: z
+      .object({
+        formatNames: z.array(z.string().trim().min(1).max(64)).min(1).max(16),
+        majorBrand: z.string().trim().min(1).max(64).optional(),
+      })
+      .strict(),
+    streamCounts: z
+      .object({
+        total: z.number().int().nonnegative(),
+        video: z.number().int().nonnegative(),
+        audio: z.number().int().nonnegative(),
+        subtitle: z.number().int().nonnegative(),
+        data: z.number().int().nonnegative(),
+        other: z.number().int().nonnegative(),
+      })
+      .strict(),
+    video: z
+      .object({
+        codec: z.string().trim().min(1).max(120),
+        profile: z.string().trim().min(1).max(120),
+        pixelFormat: z.string().trim().min(1).max(120),
+        width: z.number().int().positive().max(7_680),
+        height: z.number().int().positive().max(4_320),
+        sampleAspectRatio: ExportMediaRationalSchema,
+        displayAspectRatio: ExportMediaRationalSchema,
+        averageFrameRate: ExportMediaRationalSchema,
+      })
+      .strict(),
+    audio: z
+      .object({
+        codec: z.string().trim().min(1).max(120),
+        sampleRate: z.number().int().positive().max(384_000),
+        channels: z.number().int().positive().max(32),
+        channelLayout: z.string().trim().min(1).max(120),
+        reportedBitRate: z.number().int().positive().optional(),
+      })
+      .strict(),
+    durationMs: z.number().int().positive(),
+    ffprobeVersion: z.string().trim().min(1).max(120).optional(),
+  })
+  .strict();
+
 export const RenderedExportMediaProvenanceSchema =
   ExportMediaProvenanceSchema.extend({
     ffmpegVersion: z.string().trim().min(1).max(120).optional(),
+    verificationSchemaVersion: z.literal(1).optional(),
+    settingsSha256: z
+      .string()
+      .regex(/^[a-f0-9]{64}$/)
+      .optional(),
+    observedProperties: ExportObservedMediaPropertiesSchema.optional(),
     sourceAttempt: z.number().int().positive(),
     validatedAt: UtcTimestampSchema,
   });
@@ -1319,6 +1397,8 @@ export const SubtitleSidecarProvenanceSchema = z
 
 export const FinalArtifactRoleSchema = z.enum([
   "video_mp4",
+  "video_mkv",
+  "video_mov",
   "english_srt",
   "original_srt",
   "clip_metadata_json",
@@ -1335,8 +1415,10 @@ export const FinalArtifactProvenanceSchema = z.object({
   validatedAt: UtcTimestampSchema,
 });
 
-export const ExportClipManifestSchemaVersion = 1;
-export const ExportClipMetadataSchemaVersion = 1;
+export const ExportClipManifestV1SchemaVersion = 1;
+export const ExportClipManifestSchemaVersion = 2;
+export const ExportClipMetadataV1SchemaVersion = 1;
+export const ExportClipMetadataSchemaVersion = 2;
 
 const PackageVideoSnapshotSchema = ClipVideoSnapshotSchema.superRefine(
   (video, context) => {
@@ -1371,8 +1453,7 @@ export const ExportResolvedSubtitlePolicySchema = z.object({
  * acquisition, presigned, provider, local-file, and command-derived URLs are
  * never package metadata.
  */
-export const ExportClipMetadataSchema = z.object({
-  schemaVersion: z.literal(ExportClipMetadataSchemaVersion),
+const ExportClipMetadataBaseSchema = z.object({
   exportRequestId: IdSchema,
   jobId: IdSchema,
   mode: z.enum(["logged", "export_only"]),
@@ -1393,9 +1474,43 @@ export const ExportClipMetadataSchema = z.object({
   subtitleTracks: ExportSubtitleTrackSnapshotsSchema.optional(),
 });
 
+export const ExportClipMetadataV1Schema = ExportClipMetadataBaseSchema.extend({
+  schemaVersion: z.literal(ExportClipMetadataV1SchemaVersion),
+});
+
+export const ExportClipConversionSummarySchema = z
+  .object({
+    rendererCapabilityId: ExportRendererCapabilityIdSchema,
+    videoRole: z.enum(["video_mp4", "video_mkv", "video_mov"]),
+    videoFilename: z.string().regex(/^clip-[a-f0-9-]{36}\.(?:mp4|mkv|mov)$/),
+    container: z.enum(["mp4", "mkv", "mov"]),
+    videoCodec: z.enum(["h264", "hevc", "prores"]),
+    videoProfile: z.string().trim().min(1).max(120),
+    pixelFormat: z.string().trim().min(1).max(120),
+    width: z.number().int().positive(),
+    height: z.number().int().positive(),
+    frameRate: ExportMediaRationalSchema,
+    audioCodec: z.enum(["aac", "pcm_s16le"]),
+    audioSampleRate: z.number().int().positive(),
+    audioChannels: z.number().int().positive(),
+  })
+  .strict();
+
+export const ExportClipMetadataV2Schema = ExportClipMetadataBaseSchema.extend({
+  schemaVersion: z.literal(ExportClipMetadataSchemaVersion),
+  conversion: ExportClipConversionSummarySchema,
+});
+
+export const ExportClipMetadataSchema = z.union([
+  ExportClipMetadataV1Schema,
+  ExportClipMetadataV2Schema,
+]);
+
 export const ExportClipManifestArtifactSchema = z.object({
   role: z.enum([
     "video_mp4",
+    "video_mkv",
+    "video_mov",
     "english_srt",
     "original_srt",
     "clip_metadata_json",
@@ -1418,6 +1533,17 @@ export const ExportClipManifestArtifactSchema = z.object({
   thumbnail: ExportClipManifestThumbnailSchema.optional(),
 });
 
+export const ExportClipManifestArtifactV1Schema =
+  ExportClipManifestArtifactSchema.extend({
+    role: z.enum([
+      "video_mp4",
+      "english_srt",
+      "original_srt",
+      "clip_metadata_json",
+      "thumbnail_jpg",
+    ]),
+  });
+
 /**
  * The auditable provenance record promoted beside a verified clip package. It
  * is derived only from the immutable request snapshot, persisted validation
@@ -1426,8 +1552,7 @@ export const ExportClipManifestArtifactSchema = z.object({
  * command line, or subtitle text. Its canonical URL, when present, is only
  * the immutable public YouTube watch URL from the request video snapshot.
  */
-export const ExportClipManifestSchema = z.object({
-  schemaVersion: z.literal(ExportClipManifestSchemaVersion),
+const ExportClipManifestBaseSchema = z.object({
   exportRequestId: IdSchema,
   jobId: IdSchema,
   mode: z.enum(["logged", "export_only"]),
@@ -1449,6 +1574,120 @@ export const ExportClipManifestSchema = z.object({
   }),
   artifacts: z.array(ExportClipManifestArtifactSchema).min(1).max(5),
 });
+
+export const ExportClipManifestV1Schema = ExportClipManifestBaseSchema.extend({
+  schemaVersion: z.literal(ExportClipManifestV1SchemaVersion),
+  artifacts: z.array(ExportClipManifestArtifactV1Schema).min(1).max(5),
+});
+
+export const ExportClipManifestV2Schema = ExportClipManifestBaseSchema.extend({
+  schemaVersion: z.literal(ExportClipManifestSchemaVersion),
+  verificationSchemaVersion: z.literal(1),
+  settingsSha256: z.string().regex(/^[a-f0-9]{64}$/),
+  resolvedSettingsSnapshot: ResolvedExportSettingsSnapshotSchema,
+  rendererCapabilityId: ExportRendererCapabilityIdSchema,
+  observedMedia: ExportObservedMediaPropertiesSchema,
+  toolVersions: z
+    .object({
+      ffprobeVersion: z.string().trim().min(1).max(120),
+      ffmpegVersion: z.string().trim().min(1).max(120).optional(),
+    })
+    .strict(),
+  videoArtifact: z
+    .object({
+      role: z.enum(["video_mp4", "video_mkv", "video_mov"]),
+      filename: z.string().regex(/^clip-[a-f0-9-]{36}\.(?:mp4|mkv|mov)$/),
+    })
+    .strict(),
+}).superRefine((manifest, context) => {
+  const videos = manifest.artifacts.filter((artifact) =>
+    ["video_mp4", "video_mkv", "video_mov"].includes(artifact.role),
+  );
+  if (
+    videos.length !== 1 ||
+    videos[0]?.role !== manifest.videoArtifact.role ||
+    videos[0]?.filename !== manifest.videoArtifact.filename
+  ) {
+    context.addIssue({
+      code: "custom",
+      path: ["videoArtifact"],
+      message:
+        "The dynamic video artifact must identify the manifest's one packaged video.",
+    });
+  }
+  const expectedExtension = {
+    video_mp4: ".mp4",
+    video_mkv: ".mkv",
+    video_mov: ".mov",
+  }[manifest.videoArtifact.role];
+  if (!manifest.videoArtifact.filename.endsWith(expectedExtension)) {
+    context.addIssue({
+      code: "custom",
+      path: ["videoArtifact", "filename"],
+      message: "The packaged video role and extension must agree.",
+    });
+  }
+  const expectedFamily = {
+    h264_mp4: {
+      container: "mp4",
+      videoCodec: "h264",
+      audioCodec: "aac",
+      videoRole: "video_mp4",
+      observedVideoCodec: "h264",
+      pixelFormat: "yuv420p",
+    },
+    hevc_mkv: {
+      container: "mkv",
+      videoCodec: "hevc",
+      audioCodec: "aac",
+      videoRole: "video_mkv",
+      observedVideoCodec: "hevc",
+      pixelFormat: "yuv420p",
+    },
+    prores_mov: {
+      container: "mov",
+      videoCodec: "prores",
+      audioCodec: "pcm_s16le",
+      videoRole: "video_mov",
+      observedVideoCodec: "prores",
+      pixelFormat: "yuv422p10le",
+    },
+  }[manifest.rendererCapabilityId];
+  const settings = manifest.resolvedSettingsSnapshot.settings;
+  if (
+    settings.container !== expectedFamily.container ||
+    settings.videoCodec !== expectedFamily.videoCodec ||
+    settings.audioCodec !== expectedFamily.audioCodec ||
+    manifest.videoArtifact.role !== expectedFamily.videoRole ||
+    manifest.observedMedia.video.codec !== expectedFamily.observedVideoCodec ||
+    manifest.observedMedia.video.pixelFormat !== expectedFamily.pixelFormat ||
+    manifest.observedMedia.audio.codec !== expectedFamily.audioCodec
+  ) {
+    context.addIssue({
+      code: "custom",
+      path: ["rendererCapabilityId"],
+      message:
+        "Renderer capability, resolved settings, observed codecs, and video role must identify one family.",
+    });
+  }
+  if (
+    manifest.observedMedia.durationMs !== manifest.renderedDurationMs ||
+    manifest.observedMedia.ffprobeVersion !==
+      manifest.toolVersions.ffprobeVersion
+  ) {
+    context.addIssue({
+      code: "custom",
+      path: ["observedMedia"],
+      message:
+        "Observed duration and FFprobe version must match manifest provenance.",
+    });
+  }
+});
+
+export const ExportClipManifestSchema = z.union([
+  ExportClipManifestV1Schema,
+  ExportClipManifestV2Schema,
+]);
 
 export const ExportRequestSchema = z.object({
   id: IdSchema,
@@ -1627,6 +1866,12 @@ export type ExportCapabilityIssue = z.infer<typeof ExportCapabilityIssueSchema>;
 export type ExportWorkerCapabilityReference = z.infer<
   typeof ExportWorkerCapabilityReferenceSchema
 >;
+export type ExportRendererCapabilityId = z.infer<
+  typeof ExportRendererCapabilityIdSchema
+>;
+export type ExportWorkerAvailability = z.infer<
+  typeof ExportWorkerAvailabilitySchema
+>;
 export type ResolvedExportSettingsSnapshot = z.infer<
   typeof ResolvedExportSettingsSnapshotSchema
 >;
@@ -1669,6 +1914,9 @@ export type CreateExportOnlyRequest = z.infer<
   typeof CreateExportOnlyRequestSchema
 >;
 export type ExportMediaProvenance = z.infer<typeof ExportMediaProvenanceSchema>;
+export type ExportObservedMediaProperties = z.infer<
+  typeof ExportObservedMediaPropertiesSchema
+>;
 export type RenderedExportMediaProvenance = z.infer<
   typeof RenderedExportMediaProvenanceSchema
 >;

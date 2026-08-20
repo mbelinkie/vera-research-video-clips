@@ -182,12 +182,25 @@ function App() {
   const [exportVideoCodec, setExportVideoCodec] = useState<
     "h264" | "hevc" | "prores"
   >("h264");
+  const [exportAudioCodec, setExportAudioCodec] = useState<"aac" | "pcm_s16le">(
+    "aac",
+  );
+  const [exportRateControlMode, setExportRateControlMode] = useState<
+    "crf" | "bitrate" | "codec_default"
+  >("crf");
   const [exportCrf, setExportCrf] = useState(20);
+  const [exportVideoBitrate, setExportVideoBitrate] = useState(8_000);
   const [exportMaxWidth, setExportMaxWidth] = useState<number>();
   const [exportFrameRate, setExportFrameRate] = useState<
     "source" | "23.976" | "24" | "25" | "29.97" | "30"
   >("source");
   const [exportAudioBitrate, setExportAudioBitrate] = useState<number>();
+  const [exportAudioSampleRate, setExportAudioSampleRate] = useState<
+    "source" | "44100" | "48000"
+  >("source");
+  const [exportAudioChannels, setExportAudioChannels] = useState<
+    "source" | "1" | "2"
+  >("source");
   const [omitEnglishSubtitles, setOmitEnglishSubtitles] = useState(false);
   const [embedEnglishSubtitles, setEmbedEnglishSubtitles] = useState(false);
   const playerRef = useRef<YouTubePlayerHandle>(null);
@@ -260,12 +273,26 @@ function App() {
     if (overrideFields.has("videoCodec"))
       override.videoCodec = exportVideoCodec;
     if (overrideFields.has("videoRateControl"))
-      override.videoRateControl = { mode: "crf", value: exportCrf };
+      override.videoRateControl =
+        exportRateControlMode === "crf"
+          ? { mode: "crf", value: exportCrf }
+          : exportRateControlMode === "bitrate"
+            ? {
+                mode: "bitrate",
+                kilobitsPerSecond: exportVideoBitrate,
+              }
+            : { mode: "codec_default" };
     if (overrideFields.has("maxWidth"))
       override.maxWidth = exportMaxWidth ?? null;
     if (overrideFields.has("frameRate")) override.frameRate = exportFrameRate;
+    if (overrideFields.has("audioCodec"))
+      override.audioCodec = exportAudioCodec;
     if (overrideFields.has("audioKilobitsPerSecond"))
       override.audioKilobitsPerSecond = exportAudioBitrate ?? null;
+    if (overrideFields.has("audioSampleRate"))
+      override.audioSampleRate = exportAudioSampleRate;
+    if (overrideFields.has("audioChannels"))
+      override.audioChannels = exportAudioChannels;
     if (overrideFields.has("omitSubtitleFilesForConfirmedEnglish"))
       override.omitSubtitleFilesForConfirmedEnglish = omitEnglishSubtitles;
     if (overrideFields.has("embedEnglishSubtitleTrack"))
@@ -274,11 +301,16 @@ function App() {
   }, [
     embedEnglishSubtitles,
     exportAudioBitrate,
+    exportAudioChannels,
+    exportAudioCodec,
+    exportAudioSampleRate,
     exportContainer,
     exportCrf,
+    exportRateControlMode,
     exportFrameRate,
     exportMaxWidth,
     exportVideoCodec,
+    exportVideoBitrate,
     omitEnglishSubtitles,
     overrideFields,
   ]);
@@ -360,6 +392,20 @@ function App() {
     languagesEquivalent(transcriptTracks.original.track.language, "en")
       ? ("confirmed_english" as const)
       : ("foreign" as const);
+  const selectedRendererCapabilityId =
+    exportContainer === "mp4" && exportVideoCodec === "h264"
+      ? "h264_mp4"
+      : exportContainer === "mkv" && exportVideoCodec === "hevc"
+        ? "hevc_mkv"
+        : exportContainer === "mov" && exportVideoCodec === "prores"
+          ? "prores_mov"
+          : "unsupported";
+  const installedRendererIds =
+    exportOnlySettingsPreview?.workerAvailability?.discovery === "installed"
+      ? new Set(
+          exportOnlySettingsPreview.workerAvailability.availableRendererIds,
+        )
+      : undefined;
   const selectionForKey = (
     key: string,
     selected: ExportPresetSnapshot | undefined,
@@ -1710,63 +1756,126 @@ function App() {
                 </p>
                 <div className="export-settings-grid">
                   <label>
-                    Container
+                    Rendering family
                     <select
-                      value={exportContainer}
+                      value={selectedRendererCapabilityId}
                       onChange={(event) => {
-                        const container = event.target.value as
-                          "mp4" | "mov" | "mkv";
-                        setOverrideFields((current) =>
-                          new Set(current).add("container"),
+                        const rendererCapabilityId = event.target.value;
+                        setOverrideFields(
+                          (current) =>
+                            new Set([
+                              ...current,
+                              "container",
+                              "videoCodec",
+                              "videoRateControl",
+                              "audioCodec",
+                              "audioKilobitsPerSecond",
+                            ]),
                         );
-                        setExportContainer(container);
-                        if (
-                          container === "mp4" &&
-                          exportVideoCodec === "prores"
-                        )
+                        if (rendererCapabilityId === "h264_mp4") {
+                          setExportContainer("mp4");
                           setExportVideoCodec("h264");
+                          setExportAudioCodec("aac");
+                          if (exportRateControlMode === "codec_default")
+                            setExportRateControlMode("crf");
+                          return;
+                        }
+                        if (rendererCapabilityId === "hevc_mkv") {
+                          setExportContainer("mkv");
+                          setExportVideoCodec("hevc");
+                          setExportAudioCodec("aac");
+                          if (exportRateControlMode === "codec_default")
+                            setExportRateControlMode("crf");
+                          return;
+                        }
+                        setExportContainer("mov");
+                        setExportVideoCodec("prores");
+                        setExportAudioCodec("pcm_s16le");
+                        setExportRateControlMode("codec_default");
+                        setExportAudioBitrate(undefined);
                       }}
                     >
-                      <option value="mp4">MP4</option>
-                      <option value="mov">MOV</option>
-                      <option value="mkv">MKV</option>
+                      <option value="h264_mp4">
+                        MP4 · H.264 High · AAC
+                        {installedRendererIds &&
+                        !installedRendererIds.has("h264_mp4")
+                          ? " — unavailable for local export-only"
+                          : ""}
+                      </option>
+                      <option value="hevc_mkv">
+                        MKV · HEVC Main · AAC
+                        {installedRendererIds &&
+                        !installedRendererIds.has("hevc_mkv")
+                          ? " — unavailable for local export-only"
+                          : ""}
+                      </option>
+                      <option value="prores_mov">
+                        MOV · ProRes 422 · PCM
+                        {installedRendererIds &&
+                        !installedRendererIds.has("prores_mov")
+                          ? " — unavailable for local export-only"
+                          : ""}
+                      </option>
                     </select>
                   </label>
                   <label>
-                    Video codec
+                    Rate control
                     <select
-                      value={exportVideoCodec}
+                      value={exportRateControlMode}
+                      disabled={exportVideoCodec === "prores"}
                       onChange={(event) => {
-                        const codec = event.target.value as
-                          "h264" | "hevc" | "prores";
                         setOverrideFields((current) =>
-                          new Set(current).add("videoCodec"),
+                          new Set(current).add("videoRateControl"),
                         );
-                        setExportVideoCodec(codec);
-                        if (codec === "prores" && exportContainer === "mp4")
-                          setExportContainer("mov");
+                        setExportRateControlMode(
+                          event.target.value as "crf" | "bitrate",
+                        );
                       }}
                     >
-                      <option value="h264">H.264</option>
-                      <option value="hevc">HEVC</option>
-                      <option value="prores">ProRes</option>
+                      {exportVideoCodec === "prores" ? (
+                        <option value="codec_default">Codec fixed</option>
+                      ) : (
+                        <>
+                          <option value="crf">CRF</option>
+                          <option value="bitrate">Target bitrate</option>
+                        </>
+                      )}
                     </select>
                   </label>
                   <label>
-                    Quality (CRF)
+                    {exportRateControlMode === "bitrate"
+                      ? "Video bitrate (kbps)"
+                      : exportRateControlMode === "crf"
+                        ? "Quality (CRF)"
+                        : "Codec profile"}
                     <input
                       type="number"
-                      min="0"
-                      max="51"
-                      value={exportCrf}
+                      min={exportRateControlMode === "bitrate" ? 500 : 0}
+                      max={exportRateControlMode === "bitrate" ? 200_000 : 51}
+                      disabled={exportRateControlMode === "codec_default"}
+                      value={
+                        exportRateControlMode === "bitrate"
+                          ? exportVideoBitrate
+                          : exportRateControlMode === "crf"
+                            ? exportCrf
+                            : ""
+                      }
+                      placeholder="ProRes 422"
                       onChange={(event) => {
                         const value = Number(event.target.value);
+                        if (!Number.isInteger(value)) return;
                         if (
-                          Number.isInteger(value) &&
+                          exportRateControlMode === "crf" &&
                           value >= 0 &&
                           value <= 51
                         )
                           setExportCrf(value);
+                        if (
+                          exportRateControlMode === "bitrate" &&
+                          value >= 500 &&
+                          value <= 200_000
+                        )
+                          setExportVideoBitrate(value);
                         setOverrideFields((current) =>
                           new Set(current).add("videoRateControl"),
                         );
@@ -1775,30 +1884,25 @@ function App() {
                   </label>
                   <label>
                     Maximum width
-                    <input
-                      type="number"
-                      min="320"
-                      max="7680"
-                      step="2"
-                      value={exportMaxWidth ?? ""}
-                      placeholder="Source width"
+                    <select
+                      value={exportMaxWidth ?? "source"}
                       onChange={(event) => {
                         setOverrideFields((current) =>
                           new Set(current).add("maxWidth"),
                         );
-                        if (!event.target.value) {
+                        if (event.target.value === "source") {
                           setExportMaxWidth(undefined);
                           return;
                         }
-                        const value = Number(event.target.value);
-                        if (
-                          Number.isInteger(value) &&
-                          value >= 320 &&
-                          value <= 7_680
-                        )
-                          setExportMaxWidth(value);
+                        setExportMaxWidth(Number(event.target.value));
                       }}
-                    />
+                    >
+                      <option value="source">Source</option>
+                      <option value="640">640</option>
+                      <option value="1280">1280</option>
+                      <option value="1920">1920</option>
+                      <option value="3840">3840</option>
+                    </select>
                   </label>
                   <label>
                     Frame rate
@@ -1823,33 +1927,81 @@ function App() {
                     </select>
                   </label>
                   <label>
-                    AAC audio (kbps)
-                    <input
-                      type="number"
-                      min="64"
-                      max="1536"
-                      step="16"
-                      value={exportAudioBitrate ?? ""}
-                      placeholder="Adapter default"
+                    {exportAudioCodec === "aac"
+                      ? "AAC audio (kbps)"
+                      : "PCM audio bitrate"}
+                    <select
+                      value={exportAudioBitrate ?? "default"}
+                      disabled={exportAudioCodec !== "aac"}
                       onChange={(event) => {
                         setOverrideFields((current) =>
                           new Set(current).add("audioKilobitsPerSecond"),
                         );
-                        if (!event.target.value) {
+                        if (event.target.value === "default") {
                           setExportAudioBitrate(undefined);
                           return;
                         }
-                        const value = Number(event.target.value);
-                        if (
-                          Number.isInteger(value) &&
-                          value >= 64 &&
-                          value <= 1_536
-                        )
-                          setExportAudioBitrate(value);
+                        setExportAudioBitrate(Number(event.target.value));
                       }}
-                    />
+                    >
+                      {exportAudioCodec === "aac" ? (
+                        <>
+                          <option value="default">Adapter default</option>
+                          <option value="96">96</option>
+                          <option value="128">128</option>
+                          <option value="192">192</option>
+                          <option value="256">256</option>
+                          <option value="320">320</option>
+                        </>
+                      ) : (
+                        <option value="default">Not applicable</option>
+                      )}
+                    </select>
+                  </label>
+                  <label>
+                    Audio sample rate
+                    <select
+                      value={exportAudioSampleRate}
+                      onChange={(event) => {
+                        setOverrideFields((current) =>
+                          new Set(current).add("audioSampleRate"),
+                        );
+                        setExportAudioSampleRate(
+                          event.target.value as "source" | "44100" | "48000",
+                        );
+                      }}
+                    >
+                      <option value="source">Source</option>
+                      <option value="44100">44.1 kHz</option>
+                      <option value="48000">48 kHz</option>
+                    </select>
+                  </label>
+                  <label>
+                    Audio channels
+                    <select
+                      value={exportAudioChannels}
+                      onChange={(event) => {
+                        setOverrideFields((current) =>
+                          new Set(current).add("audioChannels"),
+                        );
+                        setExportAudioChannels(
+                          event.target.value as "source" | "1" | "2",
+                        );
+                      }}
+                    >
+                      <option value="source">Source</option>
+                      <option value="1">Mono</option>
+                      <option value="2">Stereo</option>
+                    </select>
                   </label>
                 </div>
+                {installedRendererIds ? (
+                  <p className="muted">
+                    Export-only availability reflects this local worker. Logged
+                    export availability remains canonical until a worker is
+                    registered for delivery.
+                  </p>
+                ) : null}
                 <label className="export-checkbox">
                   <input
                     type="checkbox"
@@ -1876,15 +2028,12 @@ function App() {
                 <label className="export-checkbox">
                   <input
                     type="checkbox"
-                    checked={embedEnglishSubtitles}
-                    onChange={(event) => {
-                      setOverrideFields((current) =>
-                        new Set(current).add("embedEnglishSubtitleTrack"),
-                      );
-                      setEmbedEnglishSubtitles(event.target.checked);
-                    }}
+                    checked={false}
+                    disabled
+                    onChange={() => setEmbedEnglishSubtitles(false)}
                   />
-                  Embed an English soft-subtitle track
+                  Embed an English soft-subtitle track (not available in this
+                  milestone)
                 </label>
               </details>
               <div className="selection-actions">

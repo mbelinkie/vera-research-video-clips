@@ -2,7 +2,9 @@ import { describe, expect, it } from "vitest";
 
 import {
   CURRENT_EXPORT_WORKER_CAPABILITY,
+  LEGACY_EDITING_EXPORT_WORKER_CAPABILITY,
   resolveExportSettings,
+  sha256Fingerprint,
   validateStoredResolvedSettingsSnapshot,
 } from "./index.js";
 
@@ -85,7 +87,23 @@ describe("resolved export settings", () => {
     }
   });
 
-  it("reports every contract-valid renderer alternative as a field issue", () => {
+  it("accepts the explicit HEVC/MKV family and rejects crossed tuples", () => {
+    const supported = resolveExportSettings({
+      context: "export_only",
+      sourceLanguageClass: "confirmed_english",
+      resolvedAt: at,
+      overrides: {
+        container: "mkv",
+        videoCodec: "hevc",
+        videoRateControl: { mode: "bitrate", kilobitsPerSecond: 8_000 },
+        maxWidth: 1_920,
+        frameRate: "24",
+        audioCodec: "aac",
+        audioKilobitsPerSecond: 192,
+      },
+    });
+    expect(supported.issues).toEqual([]);
+
     const preview = resolveExportSettings({
       context: "export_only",
       sourceLanguageClass: "confirmed_english",
@@ -103,11 +121,6 @@ describe("resolved export settings", () => {
     });
     expect(preview.issues.map((issue) => issue.field)).toEqual([
       "container",
-      "videoCodec",
-      "videoRateControl",
-      "maxWidth",
-      "frameRate",
-      "audioCodec",
       "audioKilobitsPerSecond",
       "embedEnglishSubtitleTrack",
     ]);
@@ -131,6 +144,18 @@ describe("resolved export settings", () => {
       second.snapshot.resolutionFingerprint,
     );
     expect(validateStoredResolvedSettingsSnapshot(first.snapshot)).toEqual([]);
+    const legacyEditing = structuredClone(first.snapshot);
+    legacyEditing.capability = {
+      ...LEGACY_EDITING_EXPORT_WORKER_CAPABILITY,
+      validation: "validated",
+    };
+    const {
+      resolutionFingerprint: _legacyFingerprint,
+      resolvedAt: _legacyResolvedAt,
+      ...legacyUnsigned
+    } = legacyEditing;
+    legacyEditing.resolutionFingerprint = sha256Fingerprint(legacyUnsigned);
+    expect(validateStoredResolvedSettingsSnapshot(legacyEditing)).toEqual([]);
     const changed = structuredClone(first.snapshot);
     changed.settings.videoRateControl = { mode: "crf", value: 19 };
     expect(validateStoredResolvedSettingsSnapshot(changed)).toContainEqual(

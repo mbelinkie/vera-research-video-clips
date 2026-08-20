@@ -6,7 +6,9 @@ import { describe, expect, it, vi } from "vitest";
 
 import {
   assertEditingFriendlyH264AacMp4Settings,
+  buildFfmpegRenderArguments,
   ExportSourceAcquisitionError,
+  FfmpegCapabilityDiscoveryProvider,
   FfmpegH264AacRangeRenderer,
   FfmpegJpegThumbnailExtractor,
   FfmpegRenderError,
@@ -37,10 +39,31 @@ describe("FfprobeMediaInspector", () => {
                 format: {
                   duration: "12.3456",
                   format_name: "mov,mp4,m4a,3gp,3g2,mj2",
+                  nb_streams: 2,
+                  tags: { major_brand: "isom" },
                 },
                 streams: [
-                  { codec_type: "video", codec_name: "h264" },
-                  { codec_type: "audio", codec_name: "aac" },
+                  {
+                    index: 0,
+                    codec_type: "video",
+                    codec_name: "h264",
+                    profile: "High",
+                    pix_fmt: "yuv420p",
+                    width: 640,
+                    height: 360,
+                    sample_aspect_ratio: "1:1",
+                    display_aspect_ratio: "16:9",
+                    avg_frame_rate: "30/1",
+                  },
+                  {
+                    index: 1,
+                    codec_type: "audio",
+                    codec_name: "aac",
+                    sample_rate: "48000",
+                    channels: 1,
+                    channel_layout: "mono",
+                    bit_rate: "128000",
+                  },
                 ],
               }),
               stderr: "",
@@ -57,19 +80,24 @@ describe("FfprobeMediaInspector", () => {
           scratchDirectory: scratch,
           inspector,
         }),
-      ).resolves.toEqual({
+      ).resolves.toMatchObject({
         durationMs: 12_346,
         containerFormat: "mov,mp4,m4a,3gp,3g2,mj2",
         videoCodec: "h264",
         audioCodec: "aac",
         ffprobeVersion: "7.1",
+        observedProperties: {
+          streamCounts: { total: 2, video: 1, audio: 1 },
+          video: { profile: "High", pixelFormat: "yuv420p" },
+          audio: { sampleRate: 48_000, channels: 1 },
+        },
       });
       expect(runner.mock.calls[0]?.[0]).toBe("/opt/tools/ffprobe");
       expect(runner.mock.calls[0]?.[1]).toEqual([
         "-v",
         "error",
         "-show_entries",
-        "format=duration,format_name:stream=codec_type,codec_name",
+        "format=duration,format_name,nb_streams:format_tags=major_brand:stream=index,codec_type,codec_name,profile,pix_fmt,width,height,sample_aspect_ratio,display_aspect_ratio,avg_frame_rate,sample_rate,channels,channel_layout,bit_rate",
         "-of",
         "json",
         "--",
@@ -127,6 +155,104 @@ describe("FfprobeMediaInspector", () => {
 });
 
 describe("FfmpegH264AacRangeRenderer", () => {
+  it("discovers the fixed installed encoder, muxer, and filter vocabulary", async () => {
+    const runner = vi.fn<MediaCommandRunner["run"]>(
+      async (_executable, args) => {
+        if (args.includes("-encoders"))
+          return {
+            stdout:
+              " V..... libx264 fixture\n V..... libx265 fixture\n V..... prores_ks fixture\n",
+            stderr: "",
+          };
+        if (args.includes("-muxers"))
+          return {
+            stdout: " E mp4 fixture\n E matroska fixture\n E mov fixture\n",
+            stderr: "",
+          };
+        if (args.includes("-filters"))
+          return { stdout: " .. scale fixture\n .. fps fixture\n", stderr: "" };
+        return { stdout: "ffmpeg version 8.1.2 Copyright", stderr: "" };
+      },
+    );
+    const provider = new FfmpegCapabilityDiscoveryProvider({
+      executable: "/opt/tools/ffmpeg",
+      runner: { run: runner },
+    });
+
+    await expect(provider.discover()).resolves.toEqual({
+      ffmpegVersion: "8.1.2",
+      encoders: ["libx264", "libx265", "prores_ks"],
+      muxers: ["matroska", "mov", "mp4"],
+      filters: ["fps", "scale"],
+    });
+    expect(runner).toHaveBeenCalledTimes(4);
+  });
+
+  it("maps alternative stable IDs to fixed HEVC and ProRes arguments", () => {
+    const base = {
+      sourcePath: "/private/tmp/source.mp4",
+      stagingDirectory: "/private/tmp",
+      startMs: 1_000,
+      endMs: 2_000,
+    };
+    const hevc = buildFfmpegRenderArguments({
+      ...base,
+      outputPath: "/private/tmp/output.mkv",
+      settings: {
+        container: "mkv",
+        videoCodec: "hevc",
+        videoRateControl: { mode: "bitrate", kilobitsPerSecond: 8_000 },
+        maxWidth: 1_280,
+        frameRate: "23.976",
+        audioCodec: "aac",
+        audioKilobitsPerSecond: 192,
+        audioSampleRate: "48000",
+        audioChannels: "2",
+        omitSubtitleFilesForConfirmedEnglish: false,
+        embedEnglishSubtitleTrack: false,
+      },
+    });
+    expect(hevc).toEqual(
+      expect.arrayContaining([
+        "libx265",
+        "main",
+        "yuv420p",
+        "scale=w='min(iw,1280)':h=-2:flags=lanczos,fps=fps=24000/1001:round=near",
+        "8000k",
+        "192k",
+        "matroska",
+      ]),
+    );
+    const prores = buildFfmpegRenderArguments({
+      ...base,
+      outputPath: "/private/tmp/output.mov",
+      settings: {
+        container: "mov",
+        videoCodec: "prores",
+        videoRateControl: { mode: "codec_default" },
+        frameRate: "source",
+        audioCodec: "pcm_s16le",
+        audioSampleRate: "44100",
+        audioChannels: "1",
+        omitSubtitleFilesForConfirmedEnglish: false,
+        embedEnglishSubtitleTrack: false,
+      },
+    });
+    expect(prores).toEqual(
+      expect.arrayContaining([
+        "prores_ks",
+        "2",
+        "yuv422p10le",
+        "pcm_s16le",
+        "44100",
+        "mov",
+      ]),
+    );
+    expect(prores).not.toContain("-crf");
+    expect(prores).not.toContain("-b:v");
+    expect(prores).not.toContain("-b:a");
+  });
+
   it("builds a precise, bounded H.264/AAC MP4 argument array", async () => {
     const scratch = await mkdtemp(join(tmpdir(), "ffmpeg-render-"));
     const source = join(scratch, "source.mp4");
@@ -153,6 +279,7 @@ describe("FfmpegH264AacRangeRenderer", () => {
           videoRateControl: { mode: "crf", value: 20 },
           frameRate: "source",
           audioCodec: "aac",
+          omitSubtitleFilesForConfirmedEnglish: false,
           embedEnglishSubtitleTrack: false,
         },
       });
@@ -171,12 +298,20 @@ describe("FfmpegH264AacRangeRenderer", () => {
           "0:v:0",
           "-map",
           "0:a:0",
+          "-sn",
+          "-dn",
+          "-map_metadata",
+          "-1",
+          "-map_chapters",
+          "-1",
           "-c:v",
           "libx264",
-          "-crf",
-          "20",
+          "-profile:v",
+          "high",
           "-pix_fmt",
           "yuv420p",
+          "-crf",
+          "20",
           "-c:a",
           "aac",
           "-movflags",
@@ -201,6 +336,7 @@ describe("FfmpegH264AacRangeRenderer", () => {
         videoRateControl: { mode: "crf", value: 20 },
         frameRate: "source",
         audioCodec: "aac",
+        omitSubtitleFilesForConfirmedEnglish: false,
         embedEnglishSubtitleTrack: false,
       }),
     ).toThrow(FfmpegRenderError);
@@ -255,7 +391,7 @@ describe("FfmpegJpegThumbnailExtractor", () => {
         runner: { run: runner },
       });
       await extractor.extract({
-        renderedMp4Path: rendered,
+        renderedVideoPath: rendered,
         stagingDirectory: scratch,
         outputPath: output,
         extractionTimeMs: 1_500,

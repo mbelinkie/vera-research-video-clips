@@ -8,7 +8,8 @@ import {
 } from "@research-video/db-local";
 import {
   createExportSourceAcquisitionProvider,
-  FfmpegH264AacRangeRenderer,
+  FfmpegCapabilityDiscoveryProvider,
+  FfmpegCapabilityRangeRenderer,
   FfmpegJpegThumbnailExtractor,
   FfprobeJpegThumbnailInspector,
   FfprobeMediaInspector,
@@ -18,6 +19,7 @@ import {
   type FfmpegJpegThumbnailExtractionAdapter,
   type JpegThumbnailInspector,
 } from "@research-video/media";
+import type { ExportWorkerCapabilityProvider } from "@research-video/export-settings";
 
 import { LocalExportSourceProcessor } from "./export-source.ts";
 
@@ -41,6 +43,7 @@ export type LocalExportRuntimeDependencies = {
   renderer?: FfmpegRangeRenderer;
   thumbnailExtractor?: FfmpegJpegThumbnailExtractionAdapter;
   thumbnailInspector?: JpegThumbnailInspector;
+  capabilityProvider?: ExportWorkerCapabilityProvider;
   dataRoot: string;
 };
 
@@ -66,10 +69,11 @@ export async function runLocalExportOnce(
     dependencies.queue,
     dependencies.sourceProvider,
     dependencies.inspector ?? new FfprobeMediaInspector(),
-    dependencies.renderer ?? new FfmpegH264AacRangeRenderer(),
+    dependencies.renderer ?? new FfmpegCapabilityRangeRenderer(),
     dependencies.dataRoot,
     dependencies.thumbnailExtractor ?? new FfmpegJpegThumbnailExtractor(),
     dependencies.thumbnailInspector ?? new FfprobeJpegThumbnailInspector(),
+    dependencies.capabilityProvider ?? new FfmpegCapabilityDiscoveryProvider(),
   );
   try {
     await processor.process(input);
@@ -101,6 +105,7 @@ export async function runConfiguredLocalExportOnce(
     renderer?: FfmpegRangeRenderer;
     thumbnailExtractor?: FfmpegJpegThumbnailExtractionAdapter;
     thumbnailInspector?: JpegThumbnailInspector;
+    capabilityProvider?: ExportWorkerCapabilityProvider;
   } = {},
 ): Promise<LocalExportOnceResult> {
   const config = options.config ?? loadConfig();
@@ -123,6 +128,9 @@ export async function runConfiguredLocalExportOnce(
         : {}),
       ...(options.thumbnailInspector
         ? { thumbnailInspector: options.thumbnailInspector }
+        : {}),
+      ...(options.capabilityProvider
+        ? { capabilityProvider: options.capabilityProvider }
         : {}),
       dataRoot: config.dataDir,
     });

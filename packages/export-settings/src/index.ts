@@ -7,11 +7,13 @@ import {
   type ExportCapabilityIssue,
   type ExportPresetScope,
   type ExportPresetSnapshot,
+  type ExportRendererCapabilityId,
   type ExportResolvedSubtitlePolicy,
   type ExportSettings,
   type ExportSettingsOverride,
   type ExportSettingsPreview,
   type ExportSourceLanguageClass,
+  type ExportWorkerCapabilityReference,
   type ResolvedExportSettingsSnapshot,
 } from "@research-video/contracts";
 
@@ -28,17 +30,66 @@ export const APPLICATION_EDITING_EXPORT_SETTINGS: ExportSettings = {
 
 const capabilityDescriptor = {
   profileId: "local-editing-renderer",
-  profileVersion: 1,
-  container: ["mp4"],
-  videoCodec: ["h264"],
-  videoRateControl: ["crf"],
-  frameRate: ["source"],
-  scaling: false,
-  audioCodec: ["aac"],
-  audioRate: "adapter_default",
+  profileVersion: 2,
+  renderers: [
+    {
+      id: "h264_mp4",
+      container: "mp4",
+      videoCodec: "h264",
+      profile: "high",
+      pixelFormat: "yuv420p",
+      rateControl: ["crf", "bitrate"],
+      audioCodec: "aac",
+    },
+    {
+      id: "hevc_mkv",
+      container: "mkv",
+      videoCodec: "hevc",
+      profile: "main",
+      pixelFormat: "yuv420p",
+      rateControl: ["crf", "bitrate"],
+      audioCodec: "aac",
+    },
+    {
+      id: "prores_mov",
+      container: "mov",
+      videoCodec: "prores",
+      profile: "prores_422",
+      pixelFormat: "yuv422p10le",
+      rateControl: ["codec_default"],
+      audioCodec: "pcm_s16le",
+    },
+  ],
+  fitWidths: [640, 1280, 1920, 3840],
+  frameRate: ["source", "23.976", "24", "25", "29.97", "30"],
+  aacBitratesKbps: [96, 128, 192, 256, 320],
+  audioSampleRate: ["source", "44100", "48000"],
+  audioChannels: ["source", "1", "2"],
   subtitleEmbedding: false,
   acceleration: ["software"],
 } as const;
+
+export const EXPORT_RENDERER_CAPABILITIES = capabilityDescriptor.renderers;
+export const EXPORT_FIT_WIDTHS = capabilityDescriptor.fitWidths;
+export const EXPORT_AAC_BITRATES_KBPS = capabilityDescriptor.aacBitratesKbps;
+
+export type InstalledExportWorkerCapabilities = {
+  ffmpegVersion?: string;
+  encoders: readonly string[];
+  muxers: readonly string[];
+  filters: readonly string[];
+};
+
+export interface ExportWorkerCapabilityProvider {
+  discover(signal?: AbortSignal): Promise<InstalledExportWorkerCapabilities>;
+}
+
+export const FULLY_AVAILABLE_EXPORT_WORKER_CAPABILITIES: InstalledExportWorkerCapabilities =
+  {
+    encoders: ["libx264", "libx265", "prores_ks"],
+    muxers: ["mp4", "matroska", "mov"],
+    filters: ["scale", "fps"],
+  };
 
 function normalize(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(normalize);
@@ -67,6 +118,14 @@ export const CURRENT_EXPORT_WORKER_CAPABILITY = {
   fingerprint: sha256Fingerprint(capabilityDescriptor),
   validation: "validated" as const,
 };
+
+/** The M5-13 profile remains executable for already-queued Editing MP4 work. */
+export const LEGACY_EDITING_EXPORT_WORKER_CAPABILITY = {
+  profileId: "local-editing-renderer",
+  profileVersion: 1,
+  fingerprint:
+    "08f7b71d54b157ee151f91a0a43a58b426484e0cd9dd91a9579d9baa3559a5a9",
+} as const;
 
 export interface ResolvedPresetLayer {
   snapshot: ExportPresetSnapshot;
@@ -105,47 +164,73 @@ export function validateExportSettingsCapabilities(
   const issues: ExportCapabilityIssue[] = [];
   const reject = (field: string, code: string, message: string) =>
     issues.push({ field, code, message });
-  if (settings.container !== "mp4")
+  const renderer = rendererCapabilityForSettings(settings);
+  if (!renderer)
     reject(
       "container",
-      "unsupported_container",
-      "The current renderer supports MP4 only.",
+      "unsupported_render_tuple",
+      "Choose MP4/H.264/AAC, MKV/HEVC/AAC, or MOV/ProRes/PCM.",
     );
-  if (settings.videoCodec !== "h264")
-    reject(
-      "videoCodec",
-      "unsupported_video_codec",
-      "The current renderer supports H.264 only.",
-    );
-  if (settings.videoRateControl.mode !== "crf")
+  if (
+    renderer &&
+    !renderer.rateControl.includes(settings.videoRateControl.mode as never)
+  )
     reject(
       "videoRateControl",
       "unsupported_rate_control",
-      "The current renderer supports CRF rate control only.",
+      renderer.id === "prores_mov"
+        ? "ProRes 422 uses codec-fixed rate control."
+        : "H.264 and HEVC support CRF or target bitrate rate control.",
     );
-  if (settings.maxWidth !== undefined)
+  if (
+    settings.maxWidth !== undefined &&
+    !EXPORT_FIT_WIDTHS.includes(settings.maxWidth as never)
+  )
     reject(
       "maxWidth",
       "unsupported_scaling",
-      "The current renderer does not support scaling.",
+      `Maximum width must be one of ${EXPORT_FIT_WIDTHS.join(", ")} pixels.`,
     );
-  if (settings.frameRate !== "source")
-    reject(
-      "frameRate",
-      "unsupported_frame_rate",
-      "The current renderer preserves source frame rate only.",
-    );
-  if (settings.audioCodec !== "aac")
-    reject(
-      "audioCodec",
-      "unsupported_audio_codec",
-      "The current renderer supports AAC audio only.",
-    );
-  if (settings.audioKilobitsPerSecond !== undefined)
+  if (
+    settings.audioCodec === "aac" &&
+    settings.audioKilobitsPerSecond !== undefined &&
+    !EXPORT_AAC_BITRATES_KBPS.includes(settings.audioKilobitsPerSecond as never)
+  )
     reject(
       "audioKilobitsPerSecond",
       "unsupported_audio_rate",
-      "The current renderer uses the adapter default audio rate.",
+      `AAC bitrate must be one of ${EXPORT_AAC_BITRATES_KBPS.join(", ")} kbps.`,
+    );
+  if (
+    settings.audioCodec === "pcm_s16le" &&
+    settings.audioKilobitsPerSecond !== undefined
+  )
+    reject(
+      "audioKilobitsPerSecond",
+      "pcm_bitrate_forbidden",
+      "PCM uses its fixed sample format and cannot request a target bitrate.",
+    );
+  if (
+    settings.audioSampleRate !== undefined &&
+    !capabilityDescriptor.audioSampleRate.includes(
+      settings.audioSampleRate as never,
+    )
+  )
+    reject(
+      "audioSampleRate",
+      "unsupported_audio_sample_rate",
+      "Audio sample rate must preserve source, use 44100 Hz, or use 48000 Hz.",
+    );
+  if (
+    settings.audioChannels !== undefined &&
+    !capabilityDescriptor.audioChannels.includes(
+      settings.audioChannels as never,
+    )
+  )
+    reject(
+      "audioChannels",
+      "unsupported_audio_channels",
+      "Audio channels must preserve source, use mono, or use stereo.",
     );
   if (settings.embedEnglishSubtitleTrack)
     reject(
@@ -154,6 +239,111 @@ export function validateExportSettingsCapabilities(
       "The current renderer does not support embedded subtitle tracks.",
     );
   return issues;
+}
+
+export function rendererCapabilityForSettings(
+  settings: ExportSettings,
+): (typeof EXPORT_RENDERER_CAPABILITIES)[number] | undefined {
+  return EXPORT_RENDERER_CAPABILITIES.find(
+    (renderer) =>
+      renderer.container === settings.container &&
+      renderer.videoCodec === settings.videoCodec &&
+      renderer.audioCodec === settings.audioCodec,
+  );
+}
+
+export function rendererCapabilityIdForSettings(
+  settings: ExportSettings,
+): ExportRendererCapabilityId | undefined {
+  return rendererCapabilityForSettings(settings)?.id;
+}
+
+const installedRequirements: Record<
+  ExportRendererCapabilityId,
+  { encoder: string; muxer: string; filters: readonly string[] }
+> = {
+  h264_mp4: { encoder: "libx264", muxer: "mp4", filters: [] },
+  hevc_mkv: { encoder: "libx265", muxer: "matroska", filters: [] },
+  prores_mov: { encoder: "prores_ks", muxer: "mov", filters: [] },
+};
+
+export function availableRendererCapabilityIds(
+  installed: InstalledExportWorkerCapabilities,
+): ExportRendererCapabilityId[] {
+  const encoders = new Set(installed.encoders);
+  const muxers = new Set(installed.muxers);
+  const filters = new Set(installed.filters);
+  return EXPORT_RENDERER_CAPABILITIES.map((renderer) => renderer.id).filter(
+    (id) => {
+      const required = installedRequirements[id];
+      return (
+        encoders.has(required.encoder) &&
+        muxers.has(required.muxer) &&
+        required.filters.every((filter) => filters.has(filter))
+      );
+    },
+  );
+}
+
+export function validateInstalledExportCapabilities(
+  settings: ExportSettings,
+  installed: InstalledExportWorkerCapabilities,
+): ExportCapabilityIssue[] {
+  const rendererId = rendererCapabilityIdForSettings(settings);
+  if (!rendererId) return [];
+  const required = installedRequirements[rendererId];
+  const missing: string[] = [];
+  if (!installed.encoders.includes(required.encoder))
+    missing.push(`encoder ${required.encoder}`);
+  if (!installed.muxers.includes(required.muxer))
+    missing.push(`muxer ${required.muxer}`);
+  const filters = new Set(installed.filters);
+  if (settings.maxWidth !== undefined && !filters.has("scale"))
+    missing.push("filter scale");
+  if (settings.frameRate !== "source" && !filters.has("fps"))
+    missing.push("filter fps");
+  return missing.length
+    ? [
+        {
+          field: "capability",
+          code: "installed_renderer_unavailable",
+          message: `The installed FFmpeg cannot run ${rendererId}: missing ${missing.join(", ")}.`,
+        },
+      ]
+    : [];
+}
+
+export function withInstalledExportWorkerAvailability(
+  preview: ExportSettingsPreview,
+  installed: InstalledExportWorkerCapabilities,
+): ExportSettingsPreview {
+  const all = EXPORT_RENDERER_CAPABILITIES.map((renderer) => renderer.id);
+  const available = availableRendererCapabilityIds(installed);
+  const issues = [
+    ...preview.issues,
+    ...validateInstalledExportCapabilities(
+      preview.snapshot.settings,
+      installed,
+    ),
+  ];
+  return ExportSettingsPreviewSchema.parse({
+    ...preview,
+    issues: issues.filter(
+      (issue, index) =>
+        issues.findIndex(
+          (candidate) =>
+            candidate.field === issue.field && candidate.code === issue.code,
+        ) === index,
+    ),
+    workerAvailability: {
+      discovery: "installed",
+      availableRendererIds: available,
+      unavailableRendererIds: all.filter((id) => !available.includes(id)),
+      ...(installed.ffmpegVersion
+        ? { ffmpegVersion: installed.ffmpegVersion }
+        : {}),
+    },
+  });
 }
 
 export function resolveSubtitlePolicy(
@@ -221,6 +411,13 @@ export function resolveExportSettings(
   return ExportSettingsPreviewSchema.parse({
     snapshot,
     issues: validateExportSettingsCapabilities(settings),
+    workerAvailability: {
+      discovery: "canonical_only",
+      availableRendererIds: EXPORT_RENDERER_CAPABILITIES.map(
+        (renderer) => renderer.id,
+      ),
+      unavailableRendererIds: [],
+    },
     effectiveSubtitlePolicy: resolveSubtitlePolicy(
       input.sourceLanguageClass,
       settings,
@@ -233,13 +430,41 @@ export function validateStoredResolvedSettingsSnapshot(
 ): ExportCapabilityIssue[] {
   const snapshot = ResolvedExportSettingsSnapshotSchema.parse(snapshotInput);
   const issues = validateExportSettingsCapabilities(snapshot.settings);
+  const matchesCapability = (
+    capability: Pick<
+      ExportWorkerCapabilityReference,
+      "profileId" | "profileVersion" | "fingerprint"
+    >,
+  ) =>
+    snapshot.capability.profileId === capability.profileId &&
+    snapshot.capability.profileVersion === capability.profileVersion &&
+    snapshot.capability.fingerprint === capability.fingerprint;
+  const matchesLegacyCapability = matchesCapability(
+    LEGACY_EDITING_EXPORT_WORKER_CAPABILITY,
+  );
   if (
-    snapshot.capability.profileId !==
-      CURRENT_EXPORT_WORKER_CAPABILITY.profileId ||
-    snapshot.capability.profileVersion !==
-      CURRENT_EXPORT_WORKER_CAPABILITY.profileVersion ||
-    snapshot.capability.fingerprint !==
-      CURRENT_EXPORT_WORKER_CAPABILITY.fingerprint
+    matchesLegacyCapability &&
+    (snapshot.settings.container !== "mp4" ||
+      snapshot.settings.videoCodec !== "h264" ||
+      snapshot.settings.videoRateControl.mode !== "crf" ||
+      snapshot.settings.maxWidth !== undefined ||
+      snapshot.settings.frameRate !== "source" ||
+      snapshot.settings.audioCodec !== "aac" ||
+      snapshot.settings.audioKilobitsPerSecond !== undefined ||
+      snapshot.settings.audioSampleRate !== undefined ||
+      snapshot.settings.audioChannels !== undefined ||
+      snapshot.settings.embedEnglishSubtitleTrack)
+  ) {
+    issues.unshift({
+      field: "capability",
+      code: "capability_profile_unavailable",
+      message:
+        "The legacy worker capability is valid only for its original Editing H.264/AAC MP4 settings.",
+    });
+  }
+  if (
+    !matchesCapability(CURRENT_EXPORT_WORKER_CAPABILITY) &&
+    !matchesLegacyCapability
   ) {
     issues.unshift({
       field: "capability",

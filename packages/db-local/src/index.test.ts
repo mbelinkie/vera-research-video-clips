@@ -15,6 +15,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import fixture from "../../../tests/fixtures/transcripts/english-cue.json" with { type: "json" };
 import multilingualFixture from "../../../tests/fixtures/transcripts/romanian-multilingual.json" with { type: "json" };
 import { normalizeTranscriptFixture } from "@research-video/transcript";
+import { sha256Fingerprint } from "@research-video/export-settings";
 
 import {
   LocalExportQueue,
@@ -67,6 +68,41 @@ const fixtureExportInput = {
   },
 };
 
+const fixtureObservedProperties = {
+  schemaVersion: 1 as const,
+  container: {
+    formatNames: ["mov", "mp4", "m4a", "3gp", "3g2", "mj2"],
+    majorBrand: "isom",
+  },
+  streamCounts: {
+    total: 2,
+    video: 1,
+    audio: 1,
+    subtitle: 0,
+    data: 0,
+    other: 0,
+  },
+  video: {
+    codec: "h264",
+    profile: "High",
+    pixelFormat: "yuv420p",
+    width: 640,
+    height: 360,
+    sampleAspectRatio: { numerator: 1, denominator: 1 },
+    displayAspectRatio: { numerator: 16, denominator: 9 },
+    averageFrameRate: { numerator: 30, denominator: 1 },
+  },
+  audio: {
+    codec: "aac",
+    sampleRate: 48_000,
+    channels: 1,
+    channelLayout: "mono",
+    reportedBitRate: 128_000,
+  },
+  durationMs: 3_200,
+  ffprobeVersion: "7.1",
+};
+
 afterEach(() => {
   for (const directory of temporaryDirectories) {
     rmSync(directory, { recursive: true, force: true });
@@ -99,6 +135,7 @@ describe("local migrations", () => {
       "0014_export_clip_metadata_sidecar",
       "0015_export_clip_thumbnail_artifact",
       "0016_resolved_export_settings_snapshots",
+      "0017_alternative_render_conformance",
     ]);
     expect(runLocalMigrations(database)).toEqual([]);
     expect(
@@ -209,6 +246,11 @@ describe("local migrations", () => {
       audioCodec: "aac",
       ffprobeVersion: "7.1",
       ffmpegVersion: "8.1.2",
+      verificationSchemaVersion: 1,
+      settingsSha256: sha256Fingerprint(
+        exportRequest.resolvedSettingsSnapshot!.settings,
+      ),
+      observedProperties: fixtureObservedProperties,
     });
     expect(exportQueue.get(exportRequest.id)).toMatchObject({
       renderedMediaProvenance: {
@@ -402,6 +444,7 @@ describe("local migrations", () => {
     expect(runLocalMigrations(database, localMigrationDirectory)).toEqual([
       "0015_export_clip_thumbnail_artifact",
       "0016_resolved_export_settings_snapshots",
+      "0017_alternative_render_conformance",
     ]);
     expect(
       database.prepare("SELECT * FROM export_final_artifacts").all(),
@@ -446,6 +489,106 @@ describe("local migrations", () => {
     database.close();
   });
 
+  it("upgrades 0016 through 0017 without rewriting any established artifact role", () => {
+    const directory = mkdtempSync(
+      join(tmpdir(), "research-video-sqlite-0016-"),
+    );
+    temporaryDirectories.add(directory);
+    const migrationsThrough0016 = join(directory, "migrations");
+    mkdirSync(migrationsThrough0016);
+    for (const filename of readdirSync(localMigrationDirectory)) {
+      if (filename < "0017") {
+        copyFileSync(
+          resolve(localMigrationDirectory, filename),
+          join(migrationsThrough0016, filename),
+        );
+      }
+    }
+    const database = openLocalDatabase(join(directory, "test.sqlite"));
+    runLocalMigrations(database, migrationsThrough0016);
+    const requestId = "019fbb95-cd76-7920-93fa-e23ba755e501";
+    const jobId = "019fbb95-cd76-7920-93fa-e23ba755e502";
+    const timestamp = "2026-08-01T12:00:00.000Z";
+    database
+      .prepare(
+        `INSERT INTO jobs
+           (id, kind, state, idempotency_key, attempt, payload_json,
+            created_at, updated_at)
+         VALUES (?, 'export', 'queued', 'export-only:0017-role-preservation',
+                 0, '{}', ?, ?)`,
+      )
+      .run(jobId, timestamp, timestamp);
+    database
+      .prepare(
+        `INSERT INTO export_requests
+           (id, job_id, mode, video_snapshot_json, selection_snapshot_json,
+            source_language_class, preset_snapshot_json,
+            resolved_settings_snapshot_json, created_at, updated_at)
+         VALUES (?, ?, 'export_only', '{}', '{}', 'confirmed_english', ?, '{}', ?, ?)`,
+      )
+      .run(
+        requestId,
+        jobId,
+        JSON.stringify(fixtureExportInput.preset),
+        timestamp,
+        timestamp,
+      );
+    const packageIdentity = `clip-${requestId}`;
+    const insertArtifact = (role: string) =>
+      database
+        .prepare(
+          `INSERT INTO export_final_artifacts
+             (export_request_id, role, package_identity, byte_size,
+              content_sha256, source_attempt, validated_at)
+           VALUES (?, ?, ?, 1024, ?, 1, ?)`,
+        )
+        .run(
+          requestId,
+          role,
+          packageIdentity,
+          "d".repeat(64),
+          "2026-08-01T12:00:00.000Z",
+        );
+    for (const role of [
+      "video_mp4",
+      "english_srt",
+      "original_srt",
+      "clip_metadata_json",
+      "thumbnail_jpg",
+      "manifest_json",
+    ]) {
+      insertArtifact(role);
+    }
+    const establishedRows = database
+      .prepare(
+        "SELECT * FROM export_final_artifacts WHERE export_request_id = ? ORDER BY role",
+      )
+      .all(requestId);
+
+    expect(runLocalMigrations(database, localMigrationDirectory)).toEqual([
+      "0017_alternative_render_conformance",
+    ]);
+    expect(
+      database
+        .prepare(
+          "SELECT * FROM export_final_artifacts WHERE export_request_id = ? ORDER BY role",
+        )
+        .all(requestId),
+    ).toEqual(establishedRows);
+    expect(() => insertArtifact("video_mkv")).not.toThrow();
+    expect(() => insertArtifact("video_mov")).not.toThrow();
+    expect(() => insertArtifact("arbitrary_video")).toThrow();
+    expect(
+      database
+        .prepare(
+          `SELECT name FROM sqlite_master
+           WHERE type = 'index' AND name = 'idx_export_final_artifacts_request_attempt'`,
+        )
+        .get(),
+    ).toBeDefined();
+    database.close();
+  });
+
   it("requires metadata, thumbnail, and manifest artifacts in every promoted package", () => {
     const directory = mkdtempSync(
       join(tmpdir(), "research-video-sqlite-manifest-"),
@@ -473,6 +616,12 @@ describe("local migrations", () => {
     );
     queue.recordRenderedOutputValidation(request.jobId, 1, {
       durationMs: 3_200,
+      ffprobeVersion: "7.1",
+      verificationSchemaVersion: 1,
+      settingsSha256: sha256Fingerprint(
+        request.resolvedSettingsSnapshot!.settings,
+      ),
+      observedProperties: fixtureObservedProperties,
     });
     queue.recordThumbnailValidation(request.jobId, 1, {
       extractionTimeMs: 1_600,

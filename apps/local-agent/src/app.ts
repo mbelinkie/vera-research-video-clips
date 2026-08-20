@@ -11,7 +11,11 @@ import {
   type ResolvedExportSettingsSnapshot,
   HealthResponseSchema,
 } from "@research-video/contracts";
-import { validateStoredResolvedSettingsSnapshot } from "@research-video/export-settings";
+import {
+  validateStoredResolvedSettingsSnapshot,
+  withInstalledExportWorkerAvailability,
+  type ExportWorkerCapabilityProvider,
+} from "@research-video/export-settings";
 import type { WorkspaceTranscriptResolution } from "@research-video/sync";
 
 export interface LocalAgentDependencies {
@@ -24,6 +28,7 @@ export interface LocalAgentDependencies {
     request: ExportSettingsPreviewRequest;
     authorization: string;
   }): Promise<ExportSettingsPreview>;
+  capabilityProvider?: ExportWorkerCapabilityProvider;
   createExportOnly?(
     input: CreateExportOnlyRequest,
     snapshot?: ResolvedExportSettingsSnapshot,
@@ -55,9 +60,10 @@ class LocalExportSettingsError extends Error {
   }
 }
 
-function withLocalWorkerCapability(
+async function withLocalWorkerCapability(
   preview: ExportSettingsPreview,
-): ExportSettingsPreview {
+  provider?: ExportWorkerCapabilityProvider,
+): Promise<ExportSettingsPreview> {
   const localIssues = validateStoredResolvedSettingsSnapshot(preview.snapshot);
   const issues = [...preview.issues];
   for (const issue of localIssues) {
@@ -69,7 +75,13 @@ function withLocalWorkerCapability(
     )
       issues.push(issue);
   }
-  return { ...preview, issues };
+  const validated = { ...preview, issues };
+  return provider
+    ? withInstalledExportWorkerAvailability(
+        validated,
+        await provider.discover(),
+      )
+    : validated;
 }
 
 export function createLocalAgent(
@@ -149,6 +161,7 @@ export function createLocalAgent(
             request: ExportSettingsPreviewRequestSchema.parse(request.body),
             authorization,
           }),
+          dependencies.capabilityProvider,
         );
       });
     }
@@ -166,7 +179,7 @@ export function createLocalAgent(
             "Authentication is required to create an export from catalog settings.",
           );
         }
-        const preview = withLocalWorkerCapability(
+        const preview = await withLocalWorkerCapability(
           await dependencies.previewExportSettings({
             request: {
               sourceLanguageClass: parsed.sourceLanguageClass,
@@ -174,6 +187,7 @@ export function createLocalAgent(
             },
             authorization,
           }),
+          dependencies.capabilityProvider,
         );
         if (
           preview.snapshot.resolutionFingerprint !==

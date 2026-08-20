@@ -12,6 +12,18 @@ import {
 } from "node:fs/promises";
 import { join, resolve, sep } from "node:path";
 
+import {
+  ExportObservedMediaPropertiesSchema,
+  type ExportObservedMediaProperties,
+  type ExportSettings,
+} from "@research-video/contracts";
+import {
+  rendererCapabilityForSettings,
+  validateExportSettingsCapabilities,
+  type ExportWorkerCapabilityProvider,
+  type InstalledExportWorkerCapabilities,
+} from "@research-video/export-settings";
+
 export type AcquiredMedia = {
   scratchPath: string;
   videoId: string;
@@ -384,22 +396,14 @@ export type ExportSourceInspection = {
   videoCodec?: string;
   audioCodec?: string;
   ffprobeVersion?: string;
+  observedProperties?: ExportObservedMediaProperties;
 };
 
 export interface ExportSourceInspector {
   inspect(path: string, signal?: AbortSignal): Promise<ExportSourceInspection>;
 }
 
-export type EditingMp4RenderSettings = {
-  container: string;
-  videoCodec: string;
-  videoRateControl: { mode: string; value?: number };
-  maxWidth?: number | undefined;
-  frameRate: string;
-  audioCodec: string;
-  audioKilobitsPerSecond?: number | undefined;
-  embedEnglishSubtitleTrack: boolean;
-};
+export type EditingMp4RenderSettings = ExportSettings;
 
 export type FfmpegRangeRenderInput = {
   sourcePath: string;
@@ -427,7 +431,7 @@ export const ClipThumbnailMaxHeight = 720;
 export const ClipThumbnailJpegQuality = 3;
 
 export type FfmpegJpegThumbnailExtractionInput = {
-  renderedMp4Path: string;
+  renderedVideoPath: string;
   stagingDirectory: string;
   outputPath: string;
   extractionTimeMs: number;
@@ -486,6 +490,67 @@ export type FfmpegH264AacRangeRendererOptions = {
   timeoutMs?: number;
 };
 
+export type FfmpegCapabilityDiscoveryProviderOptions = {
+  executable?: string;
+  runner?: MediaCommandRunner;
+  timeoutMs?: number;
+};
+
+/** Discovers only the installed FFmpeg primitives used by the fixed allowlist. */
+export class FfmpegCapabilityDiscoveryProvider implements ExportWorkerCapabilityProvider {
+  readonly #executable: string;
+  readonly #runner: MediaCommandRunner;
+  readonly #timeoutMs: number;
+
+  constructor(options: FfmpegCapabilityDiscoveryProviderOptions = {}) {
+    this.#executable = options.executable ?? "ffmpeg";
+    validateExecutable(this.#executable);
+    this.#runner = options.runner ?? new SpawnMediaCommandRunner();
+    this.#timeoutMs = options.timeoutMs ?? 10_000;
+  }
+
+  async discover(
+    signal?: AbortSignal,
+  ): Promise<InstalledExportWorkerCapabilities> {
+    if (signal?.aborted) throw renderCanceled();
+    try {
+      const [encoders, muxers, filters, version] = await Promise.all([
+        this.#runner.run(this.#executable, ["-hide_banner", "-encoders"], {
+          timeoutMs: this.#timeoutMs,
+          ...(signal ? { signal } : {}),
+        }),
+        this.#runner.run(this.#executable, ["-hide_banner", "-muxers"], {
+          timeoutMs: this.#timeoutMs,
+          ...(signal ? { signal } : {}),
+        }),
+        this.#runner.run(this.#executable, ["-hide_banner", "-filters"], {
+          timeoutMs: this.#timeoutMs,
+          ...(signal ? { signal } : {}),
+        }),
+        this.#runner.run(this.#executable, ["-version"], {
+          timeoutMs: Math.min(this.#timeoutMs, 5_000),
+          ...(signal ? { signal } : {}),
+        }),
+      ]);
+      if (signal?.aborted) throw renderCanceled();
+      const ffmpegVersion = parseFfmpegVersion(version.stdout);
+      return {
+        encoders: parseFfmpegListing(encoders.stdout, "encoder"),
+        muxers: parseFfmpegListing(muxers.stdout, "muxer"),
+        filters: parseFfmpegListing(filters.stdout, "filter"),
+        ...(ffmpegVersion ? { ffmpegVersion } : {}),
+      };
+    } catch (error) {
+      if (error instanceof FfmpegRenderError) throw error;
+      if (signal?.aborted) throw renderCanceled();
+      throw new FfmpegRenderError(
+        "Installed FFmpeg capabilities could not be discovered. Check the configured media tool before retrying.",
+        { code: "capability_discovery_failed", retryable: true },
+      );
+    }
+  }
+}
+
 export type FfmpegJpegThumbnailExtractorOptions = {
   executable?: string;
   runner?: MediaCommandRunner;
@@ -514,7 +579,7 @@ export class FfmpegJpegThumbnailExtractor implements FfmpegJpegThumbnailExtracti
           "-hide_banner",
           "-nostdin",
           "-i",
-          resolve(input.renderedMp4Path),
+          resolve(input.renderedVideoPath),
           "-ss",
           formatFfmpegTime(input.extractionTimeMs),
           "-map",
@@ -550,12 +615,8 @@ export class FfmpegJpegThumbnailExtractor implements FfmpegJpegThumbnailExtracti
   }
 }
 
-/**
- * The first render adapter deliberately supports only the immutable
- * editing-friendly H.264/AAC MP4 snapshot. New presets belong in a later
- * capability-aware slice, not as raw FFmpeg arguments here.
- */
-export class FfmpegH264AacRangeRenderer implements FfmpegRangeRenderer {
+/** One software-only renderer whose pure builder maps stable settings to fixed literals. */
+export class FfmpegCapabilityRangeRenderer implements FfmpegRangeRenderer {
   readonly #executable: string;
   readonly #runner: MediaCommandRunner;
   readonly #timeoutMs: number;
@@ -568,40 +629,13 @@ export class FfmpegH264AacRangeRenderer implements FfmpegRangeRenderer {
   }
 
   async render(input: FfmpegRangeRenderInput): Promise<void> {
-    assertEditingFriendlyH264AacMp4Settings(input.settings);
+    assertSupportedExportRenderSettings(input.settings);
     await validateRenderInput(input);
     if (input.signal?.aborted) throw renderCanceled();
     try {
       await this.#runner.run(
         this.#executable,
-        [
-          "-hide_banner",
-          "-nostdin",
-          "-i",
-          resolve(input.sourcePath),
-          "-ss",
-          formatFfmpegTime(input.startMs),
-          "-t",
-          formatFfmpegTime(input.endMs - input.startMs),
-          "-map",
-          "0:v:0",
-          "-map",
-          "0:a:0",
-          "-c:v",
-          "libx264",
-          "-crf",
-          String(input.settings.videoRateControl.value),
-          "-pix_fmt",
-          "yuv420p",
-          "-c:a",
-          "aac",
-          "-movflags",
-          "+faststart",
-          "-f",
-          "mp4",
-          "-n",
-          resolve(input.outputPath),
-        ],
+        buildFfmpegRenderArguments(input),
         {
           timeoutMs: this.#timeoutMs,
           ...(input.signal ? { signal: input.signal } : {}),
@@ -633,6 +667,9 @@ export class FfmpegH264AacRangeRenderer implements FfmpegRangeRenderer {
   }
 }
 
+/** Historical class name retained for callers; it now serves the full allowlist. */
+export class FfmpegH264AacRangeRenderer extends FfmpegCapabilityRangeRenderer {}
+
 export const RenderDurationToleranceMs = 250;
 
 export function assertEditingFriendlyH264AacMp4Settings(
@@ -649,6 +686,8 @@ export function assertEditingFriendlyH264AacMp4Settings(
     settings.frameRate !== "source" ||
     settings.audioCodec !== "aac" ||
     settings.audioKilobitsPerSecond !== undefined ||
+    settings.audioSampleRate !== undefined ||
+    settings.audioChannels !== undefined ||
     settings.embedEnglishSubtitleTrack
   ) {
     throw new FfmpegRenderError(
@@ -656,6 +695,118 @@ export function assertEditingFriendlyH264AacMp4Settings(
       { code: "export_settings_unsupported", retryable: true },
     );
   }
+}
+
+export function assertSupportedExportRenderSettings(
+  settings: EditingMp4RenderSettings,
+): void {
+  const issues = validateExportSettingsCapabilities(settings);
+  if (issues.length || !rendererCapabilityForSettings(settings)) {
+    throw new FfmpegRenderError(
+      `Resolved export settings are unsupported: ${issues
+        .map((issue) => `${issue.field}: ${issue.message}`)
+        .join(" ")}`,
+      {
+        code: issues[0]?.code ?? "export_settings_unsupported",
+        retryable: false,
+      },
+    );
+  }
+}
+
+const frameRateLiterals: Record<
+  Exclude<ExportSettings["frameRate"], "source">,
+  string
+> = {
+  "23.976": "24000/1001",
+  "24": "24/1",
+  "25": "25/1",
+  "29.97": "30000/1001",
+  "30": "30/1",
+};
+
+/** Pure, allowlist-only FFmpeg argument construction. */
+export function buildFfmpegRenderArguments(
+  input: FfmpegRangeRenderInput,
+): string[] {
+  assertSupportedExportRenderSettings(input.settings);
+  const family = rendererCapabilityForSettings(input.settings)!;
+  const args = [
+    "-hide_banner",
+    "-nostdin",
+    "-i",
+    resolve(input.sourcePath),
+    "-ss",
+    formatFfmpegTime(input.startMs),
+    "-t",
+    formatFfmpegTime(input.endMs - input.startMs),
+    "-map",
+    "0:v:0",
+    "-map",
+    "0:a:0",
+    "-sn",
+    "-dn",
+    "-map_metadata",
+    "-1",
+    "-map_chapters",
+    "-1",
+  ];
+  const filters: string[] = [];
+  if (input.settings.maxWidth !== undefined) {
+    filters.push(
+      `scale=w='min(iw,${input.settings.maxWidth})':h=-2:flags=lanczos`,
+    );
+  }
+  if (input.settings.frameRate !== "source") {
+    filters.push(
+      `fps=fps=${frameRateLiterals[input.settings.frameRate]}:round=near`,
+    );
+  }
+  if (filters.length) args.push("-vf", filters.join(","));
+  if (family.id === "h264_mp4") {
+    args.push("-c:v", "libx264", "-profile:v", "high", "-pix_fmt", "yuv420p");
+  } else if (family.id === "hevc_mkv") {
+    args.push("-c:v", "libx265", "-profile:v", "main", "-pix_fmt", "yuv420p");
+  } else {
+    args.push(
+      "-c:v",
+      "prores_ks",
+      "-profile:v",
+      "2",
+      "-pix_fmt",
+      "yuv422p10le",
+    );
+  }
+  if (input.settings.videoRateControl.mode === "crf") {
+    args.push("-crf", String(input.settings.videoRateControl.value));
+  } else if (input.settings.videoRateControl.mode === "bitrate") {
+    args.push("-b:v", `${input.settings.videoRateControl.kilobitsPerSecond}k`);
+  }
+  args.push("-c:a", input.settings.audioCodec === "aac" ? "aac" : "pcm_s16le");
+  if (input.settings.audioKilobitsPerSecond !== undefined) {
+    args.push("-b:a", `${input.settings.audioKilobitsPerSecond}k`);
+  }
+  if (
+    input.settings.audioSampleRate !== undefined &&
+    input.settings.audioSampleRate !== "source"
+  ) {
+    args.push("-ar", input.settings.audioSampleRate);
+  }
+  if (
+    input.settings.audioChannels !== undefined &&
+    input.settings.audioChannels !== "source"
+  ) {
+    args.push("-ac", input.settings.audioChannels);
+  }
+  if (family.id === "h264_mp4") {
+    args.push("-movflags", "+faststart", "-f", "mp4");
+  } else if (family.id === "hevc_mkv") {
+    args.push("-f", "matroska");
+  } else {
+    args.push("-f", "mov");
+  }
+  args.push("-n", resolve(input.outputPath));
+  return args;
 }
 
 export function assertEditingFriendlySourceCompatibility(
@@ -682,9 +833,10 @@ export async function inspectAndValidateRenderedExportOutput(input: {
   startMs: number;
   endMs: number;
   settings: EditingMp4RenderSettings;
+  sourceInspection: ExportSourceInspection;
   signal?: AbortSignal;
 }): Promise<ExportSourceInspection> {
-  assertEditingFriendlyH264AacMp4Settings(input.settings);
+  assertSupportedExportRenderSettings(input.settings);
   validateScratchDirectory(input.stagingDirectory);
   if (!isInsideScratchDirectory(input.stagingDirectory, input.outputPath)) {
     throw new FfmpegRenderError(
@@ -719,25 +871,181 @@ export async function inspectAndValidateRenderedExportOutput(input: {
       { code: "render_output_duration_mismatch" },
     );
   }
-  if (!inspection.containerFormat?.split(",").includes("mp4")) {
+  const observed = inspection.observedProperties;
+  const source = input.sourceInspection.observedProperties;
+  if (!observed || !source) {
     throw new FfmpegRenderError(
-      "Rendered output is not an MP4 container. Retry this export.",
-      { code: "render_output_container_mismatch" },
+      "FFprobe did not return normalized conformance evidence for the rendered output and source.",
+      { code: "render_output_conformance_missing", retryable: true },
     );
   }
-  if (inspection.videoCodec !== "h264") {
-    throw new FfmpegRenderError(
-      "Rendered output video codec does not match the requested H.264 setting. Retry this export.",
-      { code: "render_output_video_codec_mismatch" },
-    );
-  }
-  if (inspection.audioCodec !== "aac") {
-    throw new FfmpegRenderError(
-      "Rendered output audio codec does not match the requested AAC setting. Retry this export.",
-      { code: "render_output_audio_codec_mismatch" },
-    );
-  }
+  assertObservedMediaConformance({
+    observed,
+    source,
+    settings: input.settings,
+    expectedDurationMs,
+  });
   return inspection;
+}
+
+const FrameRateTolerance = 0.001;
+const AspectRatioTolerance = 0.005;
+
+function assertObservedMediaConformance(input: {
+  observed: ExportObservedMediaProperties;
+  source: ExportObservedMediaProperties;
+  settings: ExportSettings;
+  expectedDurationMs: number;
+}): void {
+  const { observed, source, settings } = input;
+  const fail = (code: string, property: string) => {
+    throw new FfmpegRenderError(
+      `Rendered output ${property} does not match the immutable export settings. Retry after checking the selected renderer.`,
+      { code, retryable: false },
+    );
+  };
+  if (
+    observed.streamCounts.total !== 2 ||
+    observed.streamCounts.video !== 1 ||
+    observed.streamCounts.audio !== 1 ||
+    observed.streamCounts.subtitle !== 0 ||
+    observed.streamCounts.data !== 0 ||
+    observed.streamCounts.other !== 0
+  ) {
+    fail("render_output_stream_count_mismatch", "stream counts");
+  }
+  const formats = new Set(observed.container.formatNames);
+  if (
+    (settings.container === "mp4" &&
+      (!formats.has("mp4") ||
+        !observed.container.majorBrand ||
+        observed.container.majorBrand === "qt")) ||
+    (settings.container === "mkv" && !formats.has("matroska")) ||
+    (settings.container === "mov" &&
+      (!formats.has("mov") || observed.container.majorBrand !== "qt"))
+  ) {
+    fail("render_output_container_mismatch", "container or major brand");
+  }
+  const family = rendererCapabilityForSettings(settings)!;
+  const expectedVideo =
+    family.id === "h264_mp4"
+      ? { codec: "h264", profiles: ["high"], pixel: "yuv420p" }
+      : family.id === "hevc_mkv"
+        ? { codec: "hevc", profiles: ["main"], pixel: "yuv420p" }
+        : {
+            codec: "prores",
+            profiles: ["standard", "prores 422"],
+            pixel: "yuv422p10le",
+          };
+  if (observed.video.codec !== expectedVideo.codec)
+    fail("render_output_video_codec_mismatch", "video codec");
+  if (!expectedVideo.profiles.includes(observed.video.profile.toLowerCase()))
+    fail("render_output_video_profile_mismatch", "video profile");
+  if (observed.video.pixelFormat !== expectedVideo.pixel)
+    fail("render_output_pixel_format_mismatch", "pixel format");
+  const expectedWidth =
+    settings.maxWidth === undefined
+      ? source.video.width
+      : Math.min(source.video.width, settings.maxWidth);
+  const expectedHeight =
+    expectedWidth === source.video.width
+      ? source.video.height
+      : Math.max(
+          2,
+          Math.round(
+            (source.video.height * expectedWidth) / source.video.width / 2,
+          ) * 2,
+        );
+  if (
+    observed.video.width !== expectedWidth ||
+    observed.video.height !== expectedHeight
+  ) {
+    fail("render_output_dimensions_mismatch", "dimensions");
+  }
+  if (
+    relativeDifference(
+      rationalValue(observed.video.sampleAspectRatio),
+      rationalValue(source.video.sampleAspectRatio),
+    ) > AspectRatioTolerance
+  ) {
+    fail("render_output_sample_aspect_ratio_mismatch", "sample aspect ratio");
+  }
+  if (
+    relativeDifference(
+      rationalValue(observed.video.displayAspectRatio),
+      rationalValue(source.video.displayAspectRatio),
+    ) > AspectRatioTolerance
+  ) {
+    fail("render_output_aspect_ratio_mismatch", "display aspect ratio");
+  }
+  const expectedFrameRate =
+    settings.frameRate === "source"
+      ? rationalValue(source.video.averageFrameRate)
+      : rationalLiteralValue(frameRateLiterals[settings.frameRate]);
+  if (
+    Math.abs(
+      rationalValue(observed.video.averageFrameRate) - expectedFrameRate,
+    ) > FrameRateTolerance
+  ) {
+    fail("render_output_frame_rate_mismatch", "average frame rate");
+  }
+  const expectedAudioCodec =
+    settings.audioCodec === "aac" ? "aac" : "pcm_s16le";
+  if (observed.audio.codec !== expectedAudioCodec)
+    fail("render_output_audio_codec_mismatch", "audio codec");
+  const sourceRate = source.audio.sampleRate;
+  const expectedSampleRate =
+    settings.audioSampleRate === undefined ||
+    settings.audioSampleRate === "source"
+      ? sourceRate
+      : Number(settings.audioSampleRate);
+  if (observed.audio.sampleRate !== expectedSampleRate)
+    fail("render_output_audio_sample_rate_mismatch", "audio sample rate");
+  const expectedChannels =
+    settings.audioChannels === undefined || settings.audioChannels === "source"
+      ? source.audio.channels
+      : Number(settings.audioChannels);
+  if (observed.audio.channels !== expectedChannels)
+    fail("render_output_audio_channels_mismatch", "audio channel count");
+  const expectedLayout =
+    expectedChannels === 1
+      ? "mono"
+      : expectedChannels === 2
+        ? "stereo"
+        : source.audio.channelLayout;
+  if (observed.audio.channelLayout !== expectedLayout)
+    fail("render_output_audio_layout_mismatch", "audio channel layout");
+  if (
+    settings.audioKilobitsPerSecond !== undefined &&
+    observed.audio.reportedBitRate !== undefined
+  ) {
+    const expected = settings.audioKilobitsPerSecond * 1_000;
+    const tolerance = Math.max(32_000, expected * 0.2);
+    if (Math.abs(observed.audio.reportedBitRate - expected) > tolerance)
+      fail("render_output_audio_bitrate_mismatch", "reported audio bitrate");
+  }
+  if (
+    Math.abs(observed.durationMs - input.expectedDurationMs) >
+    RenderDurationToleranceMs
+  ) {
+    fail("render_output_duration_mismatch", "duration");
+  }
+  if (!observed.ffprobeVersion) {
+    fail("render_output_tool_version_missing", "FFprobe tool version");
+  }
+}
+
+function rationalValue(value: { numerator: number; denominator: number }) {
+  return value.numerator / value.denominator;
+}
+
+function rationalLiteralValue(value: string) {
+  const [numerator, denominator] = value.split("/").map(Number);
+  return numerator! / denominator!;
+}
+
+function relativeDifference(left: number, right: number) {
+  return Math.abs(left - right) / Math.max(Math.abs(right), Number.EPSILON);
 }
 
 export class ExportSourceInspectionError extends Error {
@@ -788,7 +1096,7 @@ export class FfprobeMediaInspector implements ExportSourceInspector {
           "-v",
           "error",
           "-show_entries",
-          "format=duration,format_name:stream=codec_type,codec_name",
+          "format=duration,format_name,nb_streams:format_tags=major_brand:stream=index,codec_type,codec_name,profile,pix_fmt,width,height,sample_aspect_ratio,display_aspect_ratio,avg_frame_rate,sample_rate,channels,channel_layout,bit_rate",
           "-of",
           "json",
           "--",
@@ -809,7 +1117,18 @@ export class FfprobeMediaInspector implements ExportSourceInspector {
     if (signal?.aborted) throw inspectionCanceled();
     const inspection = parseFfprobeOutput(result.stdout);
     const ffprobeVersion = await this.#readVersion(signal);
-    return { ...inspection, ...(ffprobeVersion ? { ffprobeVersion } : {}) };
+    return {
+      ...inspection,
+      ...(ffprobeVersion ? { ffprobeVersion } : {}),
+      ...(inspection.observedProperties
+        ? {
+            observedProperties: {
+              ...inspection.observedProperties,
+              ...(ffprobeVersion ? { ffprobeVersion } : {}),
+            },
+          }
+        : {}),
+    };
   }
 
   async #readVersion(signal?: AbortSignal): Promise<string | undefined> {
@@ -1091,9 +1410,9 @@ async function validateRenderInput(
       { code: "render_output_path_invalid", retryable: false },
     );
   }
-  if (!resolve(input.outputPath).endsWith(".mp4")) {
+  if (!resolve(input.outputPath).endsWith(`.${input.settings.container}`)) {
     throw new FfmpegRenderError(
-      "The editing-friendly render output must use an MP4 filename.",
+      "The rendered output filename must use the selected container extension.",
       { code: "render_output_path_invalid", retryable: false },
     );
   }
@@ -1124,7 +1443,10 @@ async function validateThumbnailInput(
     });
   }
   if (
-    !isInsideScratchDirectory(input.stagingDirectory, input.renderedMp4Path) ||
+    !isInsideScratchDirectory(
+      input.stagingDirectory,
+      input.renderedVideoPath,
+    ) ||
     !isInsideScratchDirectory(input.stagingDirectory, input.outputPath)
   ) {
     throw new FfmpegThumbnailError(
@@ -1132,9 +1454,9 @@ async function validateThumbnailInput(
       { code: "thumbnail_path_outside_staging", retryable: false },
     );
   }
-  if (resolve(input.renderedMp4Path) === resolve(input.outputPath)) {
+  if (resolve(input.renderedVideoPath) === resolve(input.outputPath)) {
     throw new FfmpegThumbnailError(
-      "Thumbnail output path must differ from the rendered MP4.",
+      "Thumbnail output path must differ from the rendered video.",
       { code: "thumbnail_output_path_invalid", retryable: false },
     );
   }
@@ -1144,7 +1466,7 @@ async function validateThumbnailInput(
       { code: "thumbnail_output_path_invalid", retryable: false },
     );
   }
-  await validateRegularNonemptySource(input.renderedMp4Path);
+  await validateRegularNonemptySource(input.renderedVideoPath);
   const exists = await access(input.outputPath).then(
     () => true,
     () => false,
@@ -1197,7 +1519,7 @@ function formatFfmpegTime(milliseconds: number) {
   return (milliseconds / 1_000).toFixed(3);
 }
 
-function parseFfprobeOutput(output: string): ExportSourceInspection {
+export function parseFfprobeOutput(output: string): ExportSourceInspection {
   if (Buffer.byteLength(output, "utf8") > 512 * 1024) {
     throw new ExportSourceInspectionError(
       "FFprobe returned too much inspection data for this source.",
@@ -1240,12 +1562,137 @@ function parseFfprobeOutput(output: string): ExportSourceInspection {
     (format as { format_name?: unknown }).format_name,
     240,
   );
+  const observedProperties = parseObservedMediaProperties({
+    format: format as Record<string, unknown>,
+    streams: streamRows,
+    durationMs,
+  });
   return {
     durationMs,
     ...(containerFormat ? { containerFormat } : {}),
     ...(videoCodec ? { videoCodec } : {}),
     ...(audioCodec ? { audioCodec } : {}),
+    observedProperties,
   };
+}
+
+function parseObservedMediaProperties(input: {
+  format: Record<string, unknown>;
+  streams: unknown[];
+  durationMs: number;
+}): ExportObservedMediaProperties {
+  const rows = input.streams.filter(
+    (stream): stream is Record<string, unknown> =>
+      Boolean(stream) && typeof stream === "object" && !Array.isArray(stream),
+  );
+  const videoRows = rows.filter((row) => row.codec_type === "video");
+  const audioRows = rows.filter((row) => row.codec_type === "audio");
+  const subtitleCount = rows.filter(
+    (row) => row.codec_type === "subtitle",
+  ).length;
+  const dataCount = rows.filter((row) => row.codec_type === "data").length;
+  const otherCount =
+    rows.length -
+    videoRows.length -
+    audioRows.length -
+    subtitleCount -
+    dataCount;
+  const video = videoRows[0];
+  const audio = audioRows[0];
+  const formatNames = boundedProbeValue(input.format.format_name, 240)
+    ?.split(",")
+    .filter(Boolean);
+  const tags =
+    input.format.tags &&
+    typeof input.format.tags === "object" &&
+    !Array.isArray(input.format.tags)
+      ? (input.format.tags as Record<string, unknown>)
+      : undefined;
+  const majorBrand = boundedProbeText(tags?.major_brand, 64);
+  const profile = boundedProbeText(video?.profile, 120);
+  const pixelFormat = boundedProbeValue(video?.pix_fmt, 120);
+  const width = Number(video?.width);
+  const height = Number(video?.height);
+  const videoCodec = boundedProbeValue(video?.codec_name, 120);
+  const audioCodec = boundedProbeValue(audio?.codec_name, 120);
+  const sampleRate = Number(audio?.sample_rate);
+  const channels = Number(audio?.channels);
+  const channelLayout = boundedProbeText(audio?.channel_layout, 120);
+  const reportedBitRate = positiveSafeInteger(audio?.bit_rate);
+  const sampleAspectRatio = parseProbeRational(video?.sample_aspect_ratio);
+  const displayAspectRatio = parseProbeRational(video?.display_aspect_ratio);
+  const averageFrameRate = parseProbeRational(video?.avg_frame_rate);
+  if (
+    !formatNames?.length ||
+    !videoCodec ||
+    !audioCodec ||
+    !profile ||
+    !pixelFormat ||
+    !channelLayout ||
+    !Number.isSafeInteger(width) ||
+    !Number.isSafeInteger(height) ||
+    !Number.isSafeInteger(sampleRate) ||
+    !Number.isSafeInteger(channels) ||
+    !sampleAspectRatio ||
+    !displayAspectRatio ||
+    !averageFrameRate
+  ) {
+    throw malformedFfprobeOutput();
+  }
+  const parsed = ExportObservedMediaPropertiesSchema.safeParse({
+    schemaVersion: 1,
+    container: {
+      formatNames,
+      ...(majorBrand ? { majorBrand } : {}),
+    },
+    streamCounts: {
+      total: rows.length,
+      video: videoRows.length,
+      audio: audioRows.length,
+      subtitle: subtitleCount,
+      data: dataCount,
+      other: otherCount,
+    },
+    video: {
+      codec: videoCodec,
+      profile,
+      pixelFormat,
+      width,
+      height,
+      sampleAspectRatio,
+      displayAspectRatio,
+      averageFrameRate,
+    },
+    audio: {
+      codec: audioCodec,
+      sampleRate,
+      channels,
+      channelLayout,
+      ...(reportedBitRate ? { reportedBitRate } : {}),
+    },
+    durationMs: input.durationMs,
+  });
+  if (!parsed.success) throw malformedFfprobeOutput();
+  return parsed.data;
+}
+
+function parseProbeRational(value: unknown) {
+  if (typeof value !== "string") return undefined;
+  const match = /^(\d+)[/:](\d+)$/u.exec(value.trim());
+  if (!match) return undefined;
+  const numerator = Number(match[1]);
+  const denominator = Number(match[2]);
+  return Number.isSafeInteger(numerator) &&
+    Number.isSafeInteger(denominator) &&
+    numerator >= 0 &&
+    denominator > 0
+    ? { numerator, denominator }
+    : undefined;
+}
+
+function positiveSafeInteger(value: unknown) {
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : undefined;
 }
 
 function parseFfprobeJpegThumbnailOutput(
@@ -1324,6 +1771,40 @@ function boundedProbeValue(value: unknown, maximumLength: number) {
     normalized.length <= maximumLength
     ? normalized
     : undefined;
+}
+
+function boundedProbeText(value: unknown, maximumLength: number) {
+  if (typeof value !== "string") return undefined;
+  const normalized = value.trim().replaceAll(/\s+/gu, " ");
+  return normalized.length > 0 &&
+    normalized.length <= maximumLength &&
+    !/[\u0000-\u001f\u007f]/u.test(normalized)
+    ? normalized
+    : undefined;
+}
+
+function parseFfmpegListing(
+  output: string,
+  kind: "encoder" | "muxer" | "filter",
+): string[] {
+  if (Buffer.byteLength(output, "utf8") > 4 * 1024 * 1024) {
+    throw new FfmpegRenderError(
+      "FFmpeg capability output exceeded its bound.",
+      {
+        code: "capability_output_too_large",
+        retryable: true,
+      },
+    );
+  }
+  const names = new Set<string>();
+  const expression =
+    kind === "encoder"
+      ? /^\s*[A-Z.]{6}\s+([A-Za-z0-9_]+)\s/gmu
+      : kind === "muxer"
+        ? /^\s*[D. ]?E\s+([A-Za-z0-9_]+)\s/gmu
+        : /^\s*[A-Z.|]{2,8}\s+([A-Za-z0-9_]+)\s/gmu;
+  for (const match of output.matchAll(expression)) names.add(match[1]!);
+  return [...names].sort();
 }
 
 function malformedFfprobeOutput() {

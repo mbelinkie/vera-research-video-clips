@@ -17,6 +17,7 @@ import {
   SharedTranscriptWorkspaceService,
   VerifiedTranscriptCache,
 } from "@research-video/sync";
+import { FfmpegCapabilityDiscoveryProvider } from "@research-video/media";
 
 import { createLocalAgent } from "./app.ts";
 
@@ -35,6 +36,7 @@ const reader = new CachedTranscriptDocumentReader(
 );
 const cloudApiUrl = `http://${config.cloudApiHost}:${config.cloudApiPort}`;
 const app = createLocalAgent({
+  capabilityProvider: new FfmpegCapabilityDiscoveryProvider(),
   createExportOnly: (input, snapshot) =>
     exportQueue.createExportOnly(input, snapshot),
   findExportOnlyByIdempotencyKey: (idempotencyKey) =>

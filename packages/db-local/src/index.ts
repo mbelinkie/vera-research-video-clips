@@ -6,19 +6,23 @@ import { DatabaseSync } from "node:sqlite";
 
 import {
   CreateExportOnlyRequestSchema,
+  ExportObservedMediaPropertiesSchema,
   ExportRequestSchema,
   NormalizedTranscriptSchema,
+  ResolvedExportSettingsSnapshotSchema,
   languagesEquivalent,
   primaryLanguage,
   type CreateExportOnlyRequest,
   type DerivedTranslationIdentity,
   type ExportRequest,
+  type ExportObservedMediaProperties,
   type ResolvedExportSettingsSnapshot,
   type NormalizedTranscript,
 } from "@research-video/contracts";
 import {
   resolveExportSettings,
   resolvedPresetForCompatibility,
+  sha256Fingerprint,
 } from "@research-video/export-settings";
 
 const defaultMigrationDirectory = fileURLToPath(
@@ -37,6 +41,9 @@ const localExportRequestSelect = `SELECT er.*, j.state,
   er.rendered_audio_codec,
   er.rendered_ffprobe_version,
   er.rendered_ffmpeg_version,
+  er.rendered_conformance_schema_version,
+  er.rendered_settings_sha256,
+  er.rendered_observed_properties_json,
   er.rendered_source_attempt,
   er.rendered_validated_at,
   er.subtitle_omission_policy,
@@ -443,11 +450,47 @@ export class LocalExportQueue {
       audioCodec?: string;
       ffprobeVersion?: string;
       ffmpegVersion?: string;
+      verificationSchemaVersion: 1;
+      settingsSha256: string;
+      observedProperties?: ExportObservedMediaProperties;
     },
   ): void {
+    const observed = ExportObservedMediaPropertiesSchema.safeParse(
+      inspection.observedProperties,
+    );
+    const snapshotRow = this.database
+      .prepare(
+        `SELECT resolved_settings_snapshot_json
+         FROM export_requests
+         WHERE job_id = ? AND resolved_source_attempt = ?`,
+      )
+      .get(jobId, attempt) as
+      { resolved_settings_snapshot_json: string | null } | undefined;
+    let settingsSha256: string | undefined;
+    if (snapshotRow?.resolved_settings_snapshot_json) {
+      try {
+        const snapshot = ResolvedExportSettingsSnapshotSchema.parse(
+          JSON.parse(snapshotRow.resolved_settings_snapshot_json),
+        );
+        settingsSha256 = sha256Fingerprint(snapshot.settings);
+      } catch {
+        settingsSha256 = undefined;
+      }
+    }
     if (
       !Number.isSafeInteger(inspection.durationMs) ||
-      inspection.durationMs <= 0
+      inspection.durationMs <= 0 ||
+      inspection.verificationSchemaVersion !== 1 ||
+      !/^[a-f0-9]{64}$/u.test(inspection.settingsSha256) ||
+      inspection.settingsSha256 !== settingsSha256 ||
+      !observed.success ||
+      observed.data.durationMs !== inspection.durationMs ||
+      !observed.data.ffprobeVersion ||
+      (inspection.videoCodec !== undefined &&
+        observed.data.video.codec !== inspection.videoCodec) ||
+      (inspection.audioCodec !== undefined &&
+        observed.data.audio.codec !== inspection.audioCodec) ||
+      inspection.ffprobeVersion !== observed.data.ffprobeVersion
     ) {
       throw new LocalExportLifecycleError(
         "Rendered output provenance is invalid.",
@@ -461,6 +504,9 @@ export class LocalExportQueue {
          SET rendered_duration_ms = ?, rendered_container_format = ?,
              rendered_video_codec = ?, rendered_audio_codec = ?,
              rendered_ffprobe_version = ?, rendered_ffmpeg_version = ?,
+             rendered_conformance_schema_version = ?,
+             rendered_settings_sha256 = ?,
+             rendered_observed_properties_json = ?,
              rendered_source_attempt = ?, rendered_validated_at = ?,
              updated_at = ?
          WHERE job_id = ? AND resolved_source_attempt = ?`,
@@ -472,6 +518,9 @@ export class LocalExportQueue {
         safeProbeValue(inspection.audioCodec, 120),
         safeProbeValue(inspection.ffprobeVersion, 120),
         safeProbeValue(inspection.ffmpegVersion, 120),
+        inspection.verificationSchemaVersion,
+        inspection.settingsSha256,
+        JSON.stringify(observed.data),
         attempt,
         now,
         now,
@@ -706,7 +755,9 @@ export class LocalExportQueue {
       artifacts.length < 4 ||
       artifacts.length > 6 ||
       roles.size !== artifacts.length ||
-      !roles.has("video_mp4") ||
+      [...roles].filter((role) =>
+        ["video_mp4", "video_mkv", "video_mov"].includes(role),
+      ).length !== 1 ||
       !roles.has("clip_metadata_json") ||
       !roles.has("thumbnail_jpg") ||
       !roles.has("manifest_json") ||
@@ -929,6 +980,8 @@ type LocalSubtitleSidecarValidation = {
 type LocalFinalArtifactProvenance = {
   role:
     | "video_mp4"
+    | "video_mkv"
+    | "video_mov"
     | "english_srt"
     | "original_srt"
     | "clip_metadata_json"
@@ -1065,6 +1118,26 @@ function mapLocalExportRequest(
             ...(row.rendered_ffmpeg_version === null
               ? {}
               : { ffmpegVersion: String(row.rendered_ffmpeg_version) }),
+            ...(row.rendered_conformance_schema_version === null ||
+            row.rendered_conformance_schema_version === undefined
+              ? {}
+              : {
+                  verificationSchemaVersion: Number(
+                    row.rendered_conformance_schema_version,
+                  ),
+                }),
+            ...(row.rendered_settings_sha256 === null ||
+            row.rendered_settings_sha256 === undefined
+              ? {}
+              : { settingsSha256: String(row.rendered_settings_sha256) }),
+            ...(row.rendered_observed_properties_json === null ||
+            row.rendered_observed_properties_json === undefined
+              ? {}
+              : {
+                  observedProperties: JSON.parse(
+                    String(row.rendered_observed_properties_json),
+                  ),
+                }),
             sourceAttempt: Number(row.rendered_source_attempt),
             validatedAt: String(row.rendered_validated_at),
           },

@@ -253,14 +253,64 @@ const fixtureInspection = (durationMs = 2_000) => ({
   videoCodec: "h264",
   audioCodec: "aac",
   ffprobeVersion: "7.1",
+  observedProperties: {
+    schemaVersion: 1 as const,
+    container: {
+      formatNames: ["mov", "mp4", "m4a", "3gp", "3g2", "mj2"],
+      majorBrand: "isom",
+    },
+    streamCounts: {
+      total: 2,
+      video: 1,
+      audio: 1,
+      subtitle: 0,
+      data: 0,
+      other: 0,
+    },
+    video: {
+      codec: "h264",
+      profile: "High",
+      pixelFormat: "yuv420p",
+      width: 640,
+      height: 360,
+      sampleAspectRatio: { numerator: 1, denominator: 1 },
+      displayAspectRatio: { numerator: 16, denominator: 9 },
+      averageFrameRate: { numerator: 30, denominator: 1 },
+    },
+    audio: {
+      codec: "aac",
+      sampleRate: 48_000,
+      channels: 1,
+      channelLayout: "mono",
+      reportedBitRate: 128_000,
+    },
+    durationMs,
+    ffprobeVersion: "7.1",
+  },
 });
 
 const fixtureInspector = (
   source = fixtureInspection(),
   output = fixtureInspection(),
 ) => ({
-  inspect: async (path: string) =>
-    path.endsWith("rendered-range.mp4") ? output : source,
+  inspect: async (path: string) => {
+    const selected = path.endsWith("rendered-range.mp4") ? output : source;
+    return {
+      ...selected,
+      observedProperties: {
+        ...selected.observedProperties,
+        durationMs: selected.durationMs,
+        video: {
+          ...selected.observedProperties.video,
+          codec: selected.videoCodec ?? selected.observedProperties.video.codec,
+        },
+        audio: {
+          ...selected.observedProperties.audio,
+          codec: selected.audioCodec ?? selected.observedProperties.audio.codec,
+        },
+      },
+    };
+  },
   thumbnailInspector: {
     inspect: async () => ({ codecName: "mjpeg", width: 640, height: 360 }),
   },
@@ -369,6 +419,44 @@ describe("LocalExportSourceProcessor", () => {
         authorizationConfirmed: true,
       }),
     ).rejects.toMatchObject({ code: "resolved_settings_snapshot_changed" });
+    expect(acquireAuthorizedFullSource).not.toHaveBeenCalled();
+    expect(getEnglish).not.toHaveBeenCalled();
+    expect(queue.getSourceAttempt(request.jobId, 1)).toBeUndefined();
+    expect(queue.get(request.id)).toMatchObject({ state: "needs_user_action" });
+    database.close();
+  });
+
+  it("rejects an unavailable installed renderer before source acquisition", async () => {
+    const { root, database, queue, request } = fixtureQueue();
+    const acquireAuthorizedFullSource = vi.fn();
+    const discover = vi.fn(async () => ({
+      ffmpegVersion: "fixture-8.1",
+      encoders: ["libx265", "prores_ks"],
+      muxers: ["mp4", "matroska", "mov"],
+      filters: ["scale", "fps"],
+    }));
+    const getEnglish = vi.spyOn(queue, "getVerifiedEnglishTranscript");
+    const processor = new LocalExportSourceProcessor(
+      queue,
+      { acquireAuthorizedFullSource },
+      fixtureInspector(),
+      fixtureRenderer(),
+      root,
+      fixtureThumbnailExtractor(),
+      fixtureThumbnailInspector(),
+      { discover },
+    );
+
+    await expect(
+      processor.process({
+        requestId: request.id,
+        authorizationConfirmed: true,
+      }),
+    ).rejects.toMatchObject({
+      code: "installed_renderer_unavailable",
+      retryable: false,
+    });
+    expect(discover).toHaveBeenCalledOnce();
     expect(acquireAuthorizedFullSource).not.toHaveBeenCalled();
     expect(getEnglish).not.toHaveBeenCalled();
     expect(queue.getSourceAttempt(request.jobId, 1)).toBeUndefined();
@@ -1475,7 +1563,7 @@ describe("LocalExportSourceProcessor", () => {
 
     const manifest = await readPromotedManifest(root, request.id);
     expect(manifest).toMatchObject({
-      schemaVersion: 1,
+      schemaVersion: 2,
       exportRequestId: request.id,
       jobId: request.jobId,
       mode: "export_only",
@@ -1544,7 +1632,7 @@ describe("LocalExportSourceProcessor", () => {
     const promoted = queue.get(request.id)?.finalArtifacts ?? [];
     const metadata = await readPromotedMetadata(root, request.id);
     expect(metadata).toMatchObject({
-      schemaVersion: 1,
+      schemaVersion: 2,
       exportRequestId: request.id,
       sourceLanguageClass: "foreign",
       video: {

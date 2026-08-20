@@ -13,7 +13,7 @@ import { basename, join, resolve, sep } from "node:path";
 
 import {
   ClipThumbnailJpegQuality,
-  assertEditingFriendlyH264AacMp4Settings,
+  assertSupportedExportRenderSettings,
   assertEditingFriendlySourceCompatibility,
   ExportSourceAcquisitionError,
   inspectAndValidateJpegThumbnail,
@@ -40,7 +40,14 @@ import {
   type RenderedExportMediaProvenance,
   type ResolvedExportBounds,
 } from "@research-video/contracts";
-import { validateStoredResolvedSettingsSnapshot } from "@research-video/export-settings";
+import {
+  FULLY_AVAILABLE_EXPORT_WORKER_CAPABILITIES,
+  rendererCapabilityForSettings,
+  sha256Fingerprint,
+  validateInstalledExportCapabilities,
+  validateStoredResolvedSettingsSnapshot,
+  type ExportWorkerCapabilityProvider,
+} from "@research-video/export-settings";
 import {
   deriveClipRelativeSrtCues,
   parseSrt,
@@ -63,6 +70,9 @@ export class LocalExportSourceProcessor {
     private readonly dataRoot: string,
     private readonly thumbnailExtractor: FfmpegJpegThumbnailExtractionAdapter,
     private readonly thumbnailInspector: JpegThumbnailInspector,
+    private readonly capabilityProvider: ExportWorkerCapabilityProvider = {
+      discover: async () => FULLY_AVAILABLE_EXPORT_WORKER_CAPABILITIES,
+    },
   ) {}
 
   async process(input: {
@@ -107,6 +117,29 @@ export class LocalExportSourceProcessor {
       );
       throw error;
     }
+    try {
+      const installedCapabilities = await this.capabilityProvider.discover(
+        input.signal,
+      );
+      const installedIssues = validateInstalledExportCapabilities(
+        resolvedSettingsSnapshot.settings,
+        installedCapabilities,
+      );
+      if (installedIssues.length) {
+        const issue = installedIssues[0]!;
+        throw new ExportSourceAcquisitionError(issue.message, {
+          code: issue.code,
+          retryable: false,
+        });
+      }
+    } catch (error) {
+      this.queue.recordSourceNotStartedFailure(
+        input.requestId,
+        errorCode(error),
+        safeErrorMessage(error),
+      );
+      throw error;
+    }
     let subtitlePlan: RequiredSubtitlePlan;
     try {
       subtitlePlan = resolveRequiredSubtitlePlan(
@@ -147,9 +180,7 @@ export class LocalExportSourceProcessor {
       throw error;
     }
     try {
-      assertEditingFriendlyH264AacMp4Settings(
-        resolvedSettingsSnapshot.settings,
-      );
+      assertSupportedExportRenderSettings(resolvedSettingsSnapshot.settings);
     } catch (error) {
       this.queue.recordSourceNotStartedFailure(
         input.requestId,
@@ -198,7 +229,10 @@ export class LocalExportSourceProcessor {
               { code: "resolved_export_bounds_missing" },
             );
           }
-          const outputPath = join(scratchDirectory, "rendered-range.mp4");
+          const outputPath = join(
+            scratchDirectory,
+            `rendered-range.${resolvedSettingsSnapshot.settings.container}`,
+          );
           await this.renderer.render({
             sourcePath: source.scratchPath,
             stagingDirectory: scratchDirectory,
@@ -216,6 +250,7 @@ export class LocalExportSourceProcessor {
               startMs: persistedBounds.startMs,
               endMs: persistedBounds.endMs,
               settings: resolvedSettingsSnapshot.settings,
+              sourceInspection: inspection,
               ...(input.signal ? { signal: input.signal } : {}),
             },
           );
@@ -229,12 +264,16 @@ export class LocalExportSourceProcessor {
             {
               ...outputInspection,
               ...(ffmpegVersion ? { ffmpegVersion } : {}),
+              verificationSchemaVersion: 1,
+              settingsSha256: sha256Fingerprint(
+                resolvedSettingsSnapshot.settings,
+              ),
             },
           );
           const thumbnailPath = join(scratchDirectory, "thumbnail.jpg");
           const extractionTimeMs = Math.floor(outputInspection.durationMs / 2);
           await this.thumbnailExtractor.extract({
-            renderedMp4Path: outputPath,
+            renderedVideoPath: outputPath,
             stagingDirectory: scratchDirectory,
             outputPath: thumbnailPath,
             extractionTimeMs,
@@ -364,6 +403,8 @@ type RequiredSidecar = {
 type FinalArtifact = {
   role:
     | "video_mp4"
+    | "video_mkv"
+    | "video_mov"
     | "english_srt"
     | "original_srt"
     | "clip_metadata_json"
@@ -628,7 +669,7 @@ function resolveVerifiedPackagePolicy(
   const rendered = request.renderedMediaProvenance;
   if (rendered?.sourceAttempt !== attempt) {
     throw new ExportSourceAcquisitionError(
-      "The validated rendered MP4 is unavailable for this source attempt. Retry this export.",
+      "The validated rendered video is unavailable for this source attempt. Retry this export.",
       { code: "rendered_package_provenance_missing", retryable: true },
     );
   }
@@ -650,10 +691,16 @@ function resolveVerifiedPackagePolicy(
       { code: "thumbnail_provenance_missing", retryable: true },
     );
   }
+  const container = request.resolvedSettingsSnapshot!.settings.container;
   const video = {
-    role: "video_mp4" as const,
-    stagedName: "rendered-range.mp4",
-    finalName: `clip-${request.id}.mp4`,
+    role:
+      container === "mp4"
+        ? ("video_mp4" as const)
+        : container === "mkv"
+          ? ("video_mkv" as const)
+          : ("video_mov" as const),
+    stagedName: `rendered-range.${container}`,
+    finalName: `clip-${request.id}.${container}`,
   };
   const manifest = {
     role: "manifest_json" as const,
@@ -783,6 +830,30 @@ function buildVerifiedClipManifest(input: {
   digests: ReadonlyMap<FinalArtifact["role"], StagedArtifactDigest>;
 }): ExportClipManifest {
   const { policy, request } = input;
+  const resolved = request.resolvedSettingsSnapshot;
+  const observed = policy.rendered.observedProperties;
+  const settingsSha256 = policy.rendered.settingsSha256;
+  const renderer = resolved
+    ? rendererCapabilityForSettings(resolved.settings)
+    : undefined;
+  const videoArtifact = policy.artifacts.find((artifact) =>
+    artifact.role.startsWith("video_"),
+  );
+  if (
+    !resolved ||
+    !observed ||
+    !settingsSha256 ||
+    settingsSha256 !== sha256Fingerprint(resolved.settings) ||
+    !policy.rendered.ffprobeVersion ||
+    policy.rendered.verificationSchemaVersion !== 1 ||
+    !renderer ||
+    !videoArtifact
+  ) {
+    throw new ExportSourceAcquisitionError(
+      "Verified render conformance is missing from the package provenance. Retry this export.",
+      { code: "render_conformance_provenance_missing", retryable: false },
+    );
+  }
   const manifest: ExportClipManifest = {
     schemaVersion: ExportClipManifestSchemaVersion,
     exportRequestId: request.id,
@@ -806,12 +877,19 @@ function buildVerifiedClipManifest(input: {
         : {}),
     },
     toolVersions: {
-      ...(policy.rendered.ffprobeVersion
-        ? { ffprobeVersion: policy.rendered.ffprobeVersion }
-        : {}),
+      ffprobeVersion: policy.rendered.ffprobeVersion,
       ...(policy.rendered.ffmpegVersion
         ? { ffmpegVersion: policy.rendered.ffmpegVersion }
         : {}),
+    },
+    verificationSchemaVersion: 1,
+    settingsSha256,
+    resolvedSettingsSnapshot: resolved,
+    rendererCapabilityId: renderer.id,
+    observedMedia: observed,
+    videoArtifact: {
+      role: videoArtifact.role as "video_mp4" | "video_mkv" | "video_mov",
+      filename: videoArtifact.finalName,
     },
     artifacts: policy.artifacts.flatMap((artifact) => {
       if (artifact.role === "manifest_json") return [];
@@ -875,6 +953,20 @@ function buildVerifiedClipMetadata(input: {
   attempt: number;
 }): ExportClipMetadata {
   const { policy, request } = input;
+  const resolved = request.resolvedSettingsSnapshot;
+  const observed = policy.rendered.observedProperties;
+  const renderer = resolved
+    ? rendererCapabilityForSettings(resolved.settings)
+    : undefined;
+  const videoArtifact = policy.artifacts.find((artifact) =>
+    artifact.role.startsWith("video_"),
+  );
+  if (!resolved || !observed || !renderer || !videoArtifact) {
+    throw new ExportSourceAcquisitionError(
+      "Verified conversion summary is unavailable for clip metadata. Retry this export.",
+      { code: "clip_metadata_conversion_missing", retryable: false },
+    );
+  }
   return {
     schemaVersion: ExportClipMetadataSchemaVersion,
     exportRequestId: request.id,
@@ -893,6 +985,21 @@ function buildVerifiedClipMetadata(input: {
     },
     renderedDurationMs: policy.rendered.durationMs,
     preset: request.preset,
+    conversion: {
+      rendererCapabilityId: renderer.id,
+      videoRole: videoArtifact.role as "video_mp4" | "video_mkv" | "video_mov",
+      videoFilename: videoArtifact.finalName,
+      container: resolved.settings.container,
+      videoCodec: resolved.settings.videoCodec,
+      videoProfile: observed.video.profile,
+      pixelFormat: observed.video.pixelFormat,
+      width: observed.video.width,
+      height: observed.video.height,
+      frameRate: observed.video.averageFrameRate,
+      audioCodec: resolved.settings.audioCodec,
+      audioSampleRate: observed.audio.sampleRate,
+      audioChannels: observed.audio.channels,
+    },
     subtitlePolicy: {
       requiredSidecars: [...policy.requiredSidecars],
       ...(policy.omittedReason

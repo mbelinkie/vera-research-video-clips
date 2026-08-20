@@ -512,8 +512,20 @@ test("maps transcript text selection to stable source and export bounds", async 
   await page.route(
     "**/local-agent/api/export-settings/preview",
     async (route) => {
+      const preview = settingsPreview(
+        route.request().postDataJSON(),
+        "export_only",
+      );
       return route.fulfill({
-        json: settingsPreview(route.request().postDataJSON(), "export_only"),
+        json: {
+          ...preview,
+          workerAvailability: {
+            discovery: "installed",
+            availableRendererIds: ["h264_mp4", "prores_mov"],
+            unavailableRendererIds: ["hevc_mkv"],
+            ffmpegVersion: "8.1.2",
+          },
+        },
       });
     },
   );
@@ -682,6 +694,31 @@ test("maps transcript text selection to stable source and export bounds", async 
   );
 
   await page.getByText("Per-export overrides").click();
+  await expect(
+    page.getByLabel("Rendering family").locator("option"),
+  ).toHaveText([
+    "MP4 · H.264 High · AAC",
+    "MKV · HEVC Main · AAC — unavailable for local export-only",
+    "MOV · ProRes 422 · PCM",
+  ]);
+  await expect(
+    page.getByLabel("Rendering family").locator("option[disabled]"),
+  ).toHaveCount(0);
+  await expect(
+    page.getByText("Logged export availability remains canonical"),
+  ).toBeVisible();
+  await expect(page.getByLabel("Maximum width").locator("option")).toHaveText([
+    "Source",
+    "640",
+    "1280",
+    "1920",
+    "3840",
+  ]);
+  await expect(
+    page.getByLabel(
+      "Embed an English soft-subtitle track (not available in this milestone)",
+    ),
+  ).toBeDisabled();
   await expect(
     page.getByLabel("Omit subtitle files for confirmed-English videos"),
   ).not.toBeChecked();

@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   access,
   copyFile,
@@ -18,6 +18,7 @@ import { loadConfig } from "@research-video/config";
 import {
   ExportClipManifestSchema,
   ExportClipMetadataSchema,
+  type ExportSettings,
 } from "@research-video/contracts";
 import {
   LocalExportQueue,
@@ -26,11 +27,16 @@ import {
   runLocalMigrations,
 } from "@research-video/db-local";
 import {
-  FfmpegH264AacRangeRenderer,
+  FfmpegCapabilityDiscoveryProvider,
+  FfmpegCapabilityRangeRenderer,
   FfprobeJpegThumbnailInspector,
   FfprobeMediaInspector,
   RenderDurationToleranceMs,
 } from "@research-video/media";
+import {
+  availableRendererCapabilityIds,
+  rendererCapabilityIdForSettings,
+} from "@research-video/export-settings";
 import {
   normalizeTranscriptFixture,
   parseSrt,
@@ -68,7 +74,9 @@ describe("one-shot local export runtime", () => {
     const root = await createFixtureWorkspace();
     const firstAttempt = createFixtureRequest(root);
     const inspection = new FfprobeMediaInspector({ executable: ffprobePath });
-    const renderer = new FfmpegH264AacRangeRenderer({ executable: ffmpegPath });
+    const renderer = new FfmpegCapabilityRangeRenderer({
+      executable: ffmpegPath,
+    });
     let acquisitionCalls = 0;
     let inspectionCalls = 0;
     let renderCalls = 0;
@@ -207,7 +215,7 @@ describe("one-shot local export runtime", () => {
       ),
     );
     expect(metadata).toMatchObject({
-      schemaVersion: 1,
+      schemaVersion: 2,
       exportRequestId: firstAttempt.requestId,
       packageIdentity,
       sourceLanguageClass: "foreign",
@@ -218,7 +226,7 @@ describe("one-shot local export runtime", () => {
     expect(JSON.stringify(metadata)).not.toContain(root);
     expect(JSON.stringify(metadata)).not.toMatch(/file:/u);
     expect(manifest).toMatchObject({
-      schemaVersion: 1,
+      schemaVersion: 2,
       exportRequestId: firstAttempt.requestId,
       packageIdentity,
       sourceLanguageClass: "foreign",
@@ -328,6 +336,121 @@ describe("one-shot local export runtime", () => {
     });
     expect(await readdir(join(root, "exports"))).toEqual([packageIdentity]);
   });
+
+  it.each([
+    {
+      label: "HEVC/MKV",
+      settings: {
+        container: "mkv",
+        videoCodec: "hevc",
+        videoRateControl: { mode: "crf", value: 28 },
+        maxWidth: 640,
+        frameRate: "24",
+        audioCodec: "aac",
+        audioKilobitsPerSecond: 192,
+        audioSampleRate: "48000",
+        audioChannels: "2",
+        omitSubtitleFilesForConfirmedEnglish: false,
+        embedEnglishSubtitleTrack: false,
+      } satisfies ExportSettings,
+      extension: "mkv",
+      role: "video_mkv",
+      videoCodec: "hevc",
+      audioCodec: "aac",
+    },
+    {
+      label: "ProRes/MOV",
+      settings: {
+        container: "mov",
+        videoCodec: "prores",
+        videoRateControl: { mode: "codec_default" },
+        frameRate: "25",
+        audioCodec: "pcm_s16le",
+        audioSampleRate: "48000",
+        audioChannels: "2",
+        omitSubtitleFilesForConfirmedEnglish: false,
+        embedEnglishSubtitleTrack: false,
+      } satisfies ExportSettings,
+      extension: "mov",
+      role: "video_mov",
+      videoCodec: "prores",
+      audioCodec: "pcm_s16le",
+    },
+  ])(
+    "renders and verifies installed $label conformance",
+    async (fixture, context) => {
+      const capabilityProvider = new FfmpegCapabilityDiscoveryProvider({
+        executable: ffmpegPath,
+      });
+      const discovered = await capabilityProvider.discover();
+      const rendererId = rendererCapabilityIdForSettings(fixture.settings)!;
+      if (!availableRendererCapabilityIds(discovered).includes(rendererId)) {
+        (context as unknown as { skip: () => void }).skip();
+        return;
+      }
+      const root = await createFixtureWorkspace();
+      const request = createFixtureRequest(
+        root,
+        fixture.extension,
+        fixture.settings,
+      );
+      const result = await runConfiguredLocalExportOnce(
+        { requestId: request.requestId, authorizationConfirmed: true },
+        {
+          config: fixtureConfig(root),
+          sourceProvider: fixtureSourceProvider(),
+          inspector: new FfprobeMediaInspector({ executable: ffprobePath }),
+          renderer: new FfmpegCapabilityRangeRenderer({
+            executable: ffmpegPath,
+          }),
+          capabilityProvider,
+        },
+      );
+      expect(result.status, JSON.stringify(result)).toBe("complete");
+      expect(result.state).toBe("complete");
+      expect(result.artifacts?.map((artifact) => artifact.role)).toContain(
+        fixture.role,
+      );
+      const packageIdentity = `clip-${request.requestId}`;
+      const packageDirectory = join(root, "exports", packageIdentity);
+      const videoPath = join(
+        packageDirectory,
+        `${packageIdentity}.${fixture.extension}`,
+      );
+      const observed = await new FfprobeMediaInspector({
+        executable: ffprobePath,
+      }).inspect(videoPath);
+      expect(observed).toMatchObject({
+        videoCodec: fixture.videoCodec,
+        audioCodec: fixture.audioCodec,
+        observedProperties: {
+          streamCounts: {
+            total: 2,
+            video: 1,
+            audio: 1,
+            subtitle: 0,
+            data: 0,
+            other: 0,
+          },
+          audio: { sampleRate: 48_000, channels: 2, channelLayout: "stereo" },
+        },
+      });
+      const manifest = ExportClipManifestSchema.parse(
+        JSON.parse(
+          await readFile(join(packageDirectory, "manifest.json"), "utf8"),
+        ),
+      );
+      expect(manifest).toMatchObject({
+        schemaVersion: 2,
+        rendererCapabilityId: rendererId,
+        videoArtifact: {
+          role: fixture.role,
+          filename: `${packageIdentity}.${fixture.extension}`,
+        },
+        observedMedia: observed.observedProperties,
+      });
+    },
+  );
 });
 
 async function createFixtureWorkspace() {
@@ -339,35 +462,34 @@ async function createFixtureWorkspace() {
   return root;
 }
 
-function createFixtureRequest(root: string, suffix = "success") {
+const editingSettings: ExportSettings = {
+  container: "mp4",
+  videoCodec: "h264",
+  videoRateControl: { mode: "crf", value: 20 },
+  frameRate: "source",
+  audioCodec: "aac",
+  omitSubtitleFilesForConfirmedEnglish: false,
+  embedEnglishSubtitleTrack: false,
+};
+
+function createFixtureRequest(
+  root: string,
+  suffix = "success",
+  settings: ExportSettings = editingSettings,
+) {
   const database = openLocalDatabase(join(root, "local.sqlite"));
   try {
     const queue = new LocalExportQueue(database);
-    const originalTrackId =
-      suffix === "success"
-        ? "019fbb95-cd76-7920-93fa-e23ba755e201"
-        : "019fbb95-cd76-7920-93fa-e23ba755e221";
-    const englishTrackId =
-      suffix === "success"
-        ? "019fbb95-cd76-7920-93fa-e23ba755e202"
-        : "019fbb95-cd76-7920-93fa-e23ba755e222";
-    const originalSegmentId =
-      suffix === "success"
-        ? "019fbb95-cd76-7920-93fa-e23ba755e211"
-        : "019fbb95-cd76-7920-93fa-e23ba755e231";
-    const englishSegmentId =
-      suffix === "success"
-        ? "019fbb95-cd76-7920-93fa-e23ba755e212"
-        : "019fbb95-cd76-7920-93fa-e23ba755e232";
+    const originalTrackId = randomUUID();
+    const englishTrackId = randomUUID();
+    const originalSegmentId = randomUUID();
+    const englishSegmentId = randomUUID();
     const videoId = `fixture-runtime-${suffix}`;
     const index = new LocalTranscriptIndex(database);
     index.replace({
       projectId: "019fbb95-cd76-7920-93fa-e23ba755e101",
       catalogVideoId: "019fbb95-cd76-7920-93fa-e23ba755e102",
-      transcriptVersionId:
-        suffix === "success"
-          ? "019fbb95-cd76-7920-93fa-e23ba755e103"
-          : "019fbb95-cd76-7920-93fa-e23ba755e105",
+      transcriptVersionId: randomUUID(),
       transcript: normalizeTranscriptFixture({
         track: {
           id: originalTrackId,
@@ -395,10 +517,7 @@ function createFixtureRequest(root: string, suffix = "success") {
     index.replace({
       projectId: "019fbb95-cd76-7920-93fa-e23ba755e101",
       catalogVideoId: "019fbb95-cd76-7920-93fa-e23ba755e102",
-      transcriptVersionId:
-        suffix === "success"
-          ? "019fbb95-cd76-7920-93fa-e23ba755e104"
-          : "019fbb95-cd76-7920-93fa-e23ba755e106",
+      transcriptVersionId: randomUUID(),
       transcript: normalizeTranscriptFixture({
         track: {
           id: englishTrackId,
@@ -451,15 +570,7 @@ function createFixtureRequest(root: string, suffix = "success") {
       preset: {
         presetVersion: 1,
         name: "Editing MP4",
-        settings: {
-          container: "mp4",
-          videoCodec: "h264",
-          videoRateControl: { mode: "crf", value: 20 },
-          frameRate: "source",
-          audioCodec: "aac",
-          omitSubtitleFilesForConfirmedEnglish: false,
-          embedEnglishSubtitleTrack: false,
-        },
+        settings,
       },
     });
     return { requestId: request.id };
@@ -472,7 +583,7 @@ function fixtureConfig(root: string) {
   return loadConfig({ NODE_ENV: "test", DATA_DIR: root });
 }
 
-function fixtureSourceProvider(onAcquisition: () => void) {
+function fixtureSourceProvider(onAcquisition: () => void = () => undefined) {
   return {
     acquireAuthorizedFullSource: async (input: {
       videoId: string;

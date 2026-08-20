@@ -3,5 +3,9 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "exports": "./src/index.ts"
+  "exports": "./src/index.ts",
+  "dependencies": {
+    "@research-video/contracts": "0.1.0",
+    "@research-video/export-settings": "0.1.0"
+  }
 }
