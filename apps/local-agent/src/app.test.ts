@@ -1,7 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { HealthResponseSchema } from "@research-video/contracts";
-import { resolveExportSettings } from "@research-video/export-settings";
+import {
+  currentExportWorkerAdvertisement,
+  resolveExportSettings,
+} from "@research-video/export-settings";
 import type { WorkspaceTranscriptResolution } from "@research-video/sync";
 import { normalizeTranscriptFixture } from "@research-video/transcript";
 import transcriptFixture from "../../../tests/fixtures/transcripts/english-word.json" with { type: "json" };
@@ -144,6 +147,117 @@ describe("local agent", () => {
         })
       ).statusCode,
     ).toBe(409);
+  });
+
+  it("registers only a discovered durable local advertisement and heartbeats without rediscovery", async () => {
+    const advertisement = currentExportWorkerAdvertisement({
+      ffmpegVersion: "8.1.2",
+      encoders: ["libx264", "libx265", "prores_ks", "mov_text", "srt"],
+      muxers: ["mp4", "matroska", "mov"],
+      filters: ["scale", "fps"],
+    });
+    const identity = {
+      workerId: "019fbb95-cd76-7920-93fa-e23ba755ee91",
+      epoch: 4,
+      advertisementFingerprint: advertisement.advertisementFingerprint,
+      createdAt: "2026-08-20T12:00:00.000Z",
+      updatedAt: "2026-08-20T12:00:00.000Z",
+    };
+    const prepareRegistration = vi.fn(() => identity);
+    const discover = vi.fn(async () => ({
+      ffmpegVersion: "8.1.2",
+      encoders: ["libx264", "libx265", "prores_ks", "mov_text", "srt"],
+      muxers: ["mp4", "matroska", "mov"],
+      filters: ["scale", "fps"],
+    }));
+    const registerExportWorker = vi.fn(async ({ request }) => ({
+      id: request.workerId,
+      epoch: request.epoch,
+      capability: request.capability,
+      installedCapabilities: request.installedCapabilities,
+      advertisementFingerprint: request.advertisementFingerprint,
+      heartbeatAt: "2026-08-20T12:00:00.000Z",
+      expiresAt: "2026-08-20T12:01:00.000Z",
+    }));
+    const heartbeatExportWorker = vi.fn(async ({ request }) => ({
+      id: request.workerId,
+      epoch: request.epoch,
+      capability: advertisement.capability,
+      installedCapabilities: advertisement.installedCapabilities,
+      advertisementFingerprint: advertisement.advertisementFingerprint,
+      heartbeatAt: "2026-08-20T12:00:30.000Z",
+      expiresAt: "2026-08-20T12:01:30.000Z",
+    }));
+    const app = createLocalAgent({
+      capabilityProvider: { discover },
+      workerIdentity: { get: () => identity, prepareRegistration },
+      registerExportWorker,
+      heartbeatExportWorker,
+    });
+    apps.add(app);
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: "/api/export-workers/register",
+        })
+      ).statusCode,
+    ).toBe(401);
+    const registered = await app.inject({
+      method: "POST",
+      url: "/api/export-workers/register",
+      headers: { authorization: "Bearer fixture" },
+    });
+    expect(registered.statusCode).toBe(200);
+    expect(registered.json()).not.toHaveProperty("ownerUserId");
+    expect(prepareRegistration).toHaveBeenCalledWith(
+      advertisement.advertisementFingerprint,
+    );
+    expect(registerExportWorker).toHaveBeenCalledWith({
+      authorization: "Bearer fixture",
+      request: {
+        workerId: identity.workerId,
+        epoch: identity.epoch,
+        ...advertisement,
+      },
+    });
+    const heartbeat = await app.inject({
+      method: "POST",
+      url: "/api/export-workers/heartbeat",
+      headers: { authorization: "Bearer fixture" },
+    });
+    expect(heartbeat.statusCode).toBe(200);
+    expect(heartbeatExportWorker).toHaveBeenCalledWith({
+      authorization: "Bearer fixture",
+      request: { workerId: identity.workerId, epoch: identity.epoch },
+    });
+    expect(discover).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not persist or advertise anything when local capability discovery fails", async () => {
+    const prepareRegistration = vi.fn();
+    const registerExportWorker = vi.fn();
+    const app = createLocalAgent({
+      capabilityProvider: {
+        discover: async () => {
+          throw new Error("FFmpeg discovery unavailable");
+        },
+      },
+      workerIdentity: { get: () => undefined, prepareRegistration },
+      registerExportWorker,
+    });
+    apps.add(app);
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: "/api/export-workers/register",
+          headers: { authorization: "Bearer fixture" },
+        })
+      ).statusCode,
+    ).toBe(500);
+    expect(prepareRegistration).not.toHaveBeenCalled();
+    expect(registerExportWorker).not.toHaveBeenCalled();
   });
 });
 

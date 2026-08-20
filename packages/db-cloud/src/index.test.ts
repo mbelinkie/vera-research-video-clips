@@ -46,6 +46,7 @@ describe("cloud migrations", () => {
       "0009_preferred_language_translations_clip_evidence",
       "0010_export_preset_catalogs",
       "0011_resolved_export_settings_snapshots",
+      "0012_registered_export_workers",
     ]);
     expect(await runCloudMigrations(database)).toEqual([]);
     const result = await database.query<{ table_name: string }>(

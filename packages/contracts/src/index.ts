@@ -620,12 +620,117 @@ export const ExportRendererCapabilityIdSchema = z.enum([
   "hevc_mkv",
   "prores_mov",
 ]);
+const ExportRendererCapabilityIds = ExportRendererCapabilityIdSchema.options;
+
 export const ExportWorkerAvailabilitySchema = z
   .object({
     discovery: z.enum(["canonical_only", "installed"]),
     availableRendererIds: z.array(ExportRendererCapabilityIdSchema).max(3),
     unavailableRendererIds: z.array(ExportRendererCapabilityIdSchema).max(3),
     ffmpegVersion: z.string().trim().min(1).max(120).optional(),
+  })
+  .strict();
+
+/** Safe, normalized result of the local fixed FFmpeg capability discovery. */
+export const InstalledExportWorkerCapabilitySummarySchema = z
+  .object({
+    schemaVersion: z.literal(1),
+    availableRendererIds: z.array(ExportRendererCapabilityIdSchema).max(3),
+    unavailableRendererIds: z.array(ExportRendererCapabilityIdSchema).max(3),
+    ffmpegVersion: z
+      .string()
+      .regex(/^[0-9]+(?:\.[0-9]+){0,3}(?:[-+][A-Za-z0-9._-]+)?$/)
+      .optional(),
+  })
+  .strict()
+  .superRefine((summary, context) => {
+    const available = new Set(summary.availableRendererIds);
+    const unavailable = new Set(summary.unavailableRendererIds);
+    if (available.size !== summary.availableRendererIds.length) {
+      context.addIssue({
+        code: "custom",
+        path: ["availableRendererIds"],
+        message: "Available renderer IDs must be unique.",
+      });
+    }
+    if (unavailable.size !== summary.unavailableRendererIds.length) {
+      context.addIssue({
+        code: "custom",
+        path: ["unavailableRendererIds"],
+        message: "Unavailable renderer IDs must be unique.",
+      });
+    }
+    if ([...available].some((id) => unavailable.has(id))) {
+      context.addIssue({
+        code: "custom",
+        message: "Renderer IDs cannot be both available and unavailable.",
+      });
+    }
+    const expectedAvailable = ExportRendererCapabilityIds.filter((id) =>
+      available.has(id),
+    );
+    const expectedUnavailable = ExportRendererCapabilityIds.filter((id) =>
+      unavailable.has(id),
+    );
+    if (
+      available.size + unavailable.size !==
+      ExportRendererCapabilityIds.length
+    ) {
+      context.addIssue({
+        code: "custom",
+        message:
+          "Renderer availability must partition every known renderer ID.",
+      });
+    }
+    if (
+      summary.availableRendererIds.join("|") !== expectedAvailable.join("|") ||
+      summary.unavailableRendererIds.join("|") !== expectedUnavailable.join("|")
+    ) {
+      context.addIssue({
+        code: "custom",
+        message:
+          "Renderer availability arrays must use the canonical renderer order.",
+      });
+    }
+  });
+export const RegisteredExportWorkerSchema = z
+  .object({
+    id: IdSchema,
+    epoch: z.number().int().positive(),
+    capability: ExportWorkerCapabilityReferenceSchema,
+    installedCapabilities: InstalledExportWorkerCapabilitySummarySchema,
+    advertisementFingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+    heartbeatAt: UtcTimestampSchema,
+    expiresAt: UtcTimestampSchema,
+  })
+  .strict();
+export const RegisterExportWorkerRequestSchema = z
+  .object({
+    workerId: IdSchema,
+    epoch: z.number().int().positive(),
+    capability: ExportWorkerCapabilityReferenceSchema,
+    installedCapabilities: InstalledExportWorkerCapabilitySummarySchema,
+    advertisementFingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+  })
+  .strict();
+export const HeartbeatExportWorkerRequestSchema = z
+  .object({
+    workerId: IdSchema,
+    epoch: z.number().int().positive(),
+  })
+  .strict();
+export const RevokeExportWorkerRequestSchema =
+  HeartbeatExportWorkerRequestSchema;
+export const ExportWorkerCompatibilityRequestSchema = z
+  .object({
+    capability: ExportWorkerCapabilityReferenceSchema,
+    rendererId: ExportRendererCapabilityIdSchema,
+  })
+  .strict();
+export const ExportWorkerAvailabilityResponseSchema = z
+  .object({
+    compatible: z.boolean(),
+    availableWorkerCount: z.number().int().nonnegative().max(100),
   })
   .strict();
 export const ResolvedExportSettingsSnapshotSchema = z
@@ -1892,6 +1997,12 @@ export type ExportRendererCapabilityId = z.infer<
 export type ExportWorkerAvailability = z.infer<
   typeof ExportWorkerAvailabilitySchema
 >;
+export type InstalledExportWorkerCapabilitySummary = z.infer<
+  typeof InstalledExportWorkerCapabilitySummarySchema
+>;
+export type ExportWorkerCompatibilityRequest = z.infer<
+  typeof ExportWorkerCompatibilityRequestSchema
+>;
 export type ResolvedExportSettingsSnapshot = z.infer<
   typeof ResolvedExportSettingsSnapshotSchema
 >;
@@ -2036,3 +2147,15 @@ export type TranscriptionJobPayload = z.infer<
   typeof TranscriptionJobPayloadSchema
 >;
 export type HealthResponse = z.infer<typeof HealthResponseSchema>;
+export type RegisteredExportWorker = z.infer<
+  typeof RegisteredExportWorkerSchema
+>;
+export type RegisterExportWorkerRequest = z.infer<
+  typeof RegisterExportWorkerRequestSchema
+>;
+export type HeartbeatExportWorkerRequest = z.infer<
+  typeof HeartbeatExportWorkerRequestSchema
+>;
+export type RevokeExportWorkerRequest = z.infer<
+  typeof RevokeExportWorkerRequestSchema
+>;

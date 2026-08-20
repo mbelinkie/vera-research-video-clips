@@ -2,6 +2,9 @@ import { describe, expect, it } from "vitest";
 
 import {
   CURRENT_EXPORT_WORKER_CAPABILITY,
+  currentExportWorkerAdvertisement,
+  exportWorkerAdvertisementFingerprint,
+  isRegisterableExportWorkerCapability,
   LEGACY_EDITING_EXPORT_WORKER_CAPABILITY,
   resolveExportSettings,
   sha256Fingerprint,
@@ -165,5 +168,77 @@ describe("resolved export settings", () => {
     expect(validateStoredResolvedSettingsSnapshot(unavailable)).toContainEqual(
       expect.objectContaining({ code: "capability_profile_unavailable" }),
     );
+  });
+});
+
+describe("registered local worker advertisements", () => {
+  it("derives a canonical, fingerprinted installed summary without raw FFmpeg vocabulary", () => {
+    const advertisement = currentExportWorkerAdvertisement({
+      ffmpegVersion: "8.1.2",
+      encoders: ["libx264", "prores_ks", "mov_text", "unrelated_encoder"],
+      muxers: ["mov", "mp4", "unrelated_muxer"],
+      filters: ["scale", "fps", "unrelated_filter"],
+    });
+    expect(advertisement).toMatchObject({
+      capability: CURRENT_EXPORT_WORKER_CAPABILITY,
+      installedCapabilities: {
+        schemaVersion: 1,
+        availableRendererIds: ["h264_mp4", "prores_mov"],
+        unavailableRendererIds: ["hevc_mkv"],
+        ffmpegVersion: "8.1.2",
+      },
+    });
+    expect(advertisement.advertisementFingerprint).toBe(
+      exportWorkerAdvertisementFingerprint({
+        capability: advertisement.capability,
+        installedCapabilities: advertisement.installedCapabilities,
+      }),
+    );
+    expect(JSON.stringify(advertisement)).not.toContain("unrelated_encoder");
+    expect(isRegisterableExportWorkerCapability(advertisement.capability)).toBe(
+      true,
+    );
+    expect(
+      isRegisterableExportWorkerCapability({
+        ...advertisement.capability,
+        profileVersion: 999,
+      }),
+    ).toBe(false);
+  });
+
+  it("advertises a renderer only when every current-profile feature is installed", () => {
+    const installed = {
+      encoders: ["libx264", "libx265", "prores_ks", "mov_text", "srt"],
+      muxers: ["mp4", "matroska", "mov"],
+      filters: ["scale", "fps"],
+    };
+    expect(
+      currentExportWorkerAdvertisement(installed).installedCapabilities
+        .availableRendererIds,
+    ).toEqual(["h264_mp4", "hevc_mkv", "prores_mov"]);
+    expect(
+      currentExportWorkerAdvertisement({
+        ...installed,
+        encoders: installed.encoders.filter(
+          (encoder) => encoder !== "mov_text",
+        ),
+      }).installedCapabilities.availableRendererIds,
+    ).toEqual(["hevc_mkv"]);
+    expect(
+      currentExportWorkerAdvertisement({
+        ...installed,
+        encoders: installed.encoders.filter((encoder) => encoder !== "srt"),
+      }).installedCapabilities.availableRendererIds,
+    ).toEqual(["h264_mp4", "prores_mov"]);
+    for (const filter of ["scale", "fps"]) {
+      expect(
+        currentExportWorkerAdvertisement({
+          ...installed,
+          filters: installed.filters.filter(
+            (candidate) => candidate !== filter,
+          ),
+        }).installedCapabilities.availableRendererIds,
+      ).toEqual([]);
+    }
   });
 });

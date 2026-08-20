@@ -19,6 +19,7 @@ import { sha256Fingerprint } from "@research-video/export-settings";
 
 import {
   LocalExportQueue,
+  LocalExportWorkerIdentityRepository,
   LocalTranscriptIndex,
   openLocalDatabase,
   runLocalMigrations,
@@ -136,6 +137,7 @@ describe("local migrations", () => {
       "0015_export_clip_thumbnail_artifact",
       "0016_resolved_export_settings_snapshots",
       "0017_alternative_render_conformance",
+      "0018_registered_export_worker_identity",
     ]);
     expect(runLocalMigrations(database)).toEqual([]);
     expect(
@@ -445,6 +447,7 @@ describe("local migrations", () => {
       "0015_export_clip_thumbnail_artifact",
       "0016_resolved_export_settings_snapshots",
       "0017_alternative_render_conformance",
+      "0018_registered_export_worker_identity",
     ]);
     expect(
       database.prepare("SELECT * FROM export_final_artifacts").all(),
@@ -567,6 +570,7 @@ describe("local migrations", () => {
 
     expect(runLocalMigrations(database, localMigrationDirectory)).toEqual([
       "0017_alternative_render_conformance",
+      "0018_registered_export_worker_identity",
     ]);
     expect(
       database
@@ -659,5 +663,43 @@ describe("local migrations", () => {
       expect.objectContaining({ role: "video_mp4", byteSize: 2_048 }),
     ]);
     database.close();
+  });
+});
+
+describe("durable local export-worker identity", () => {
+  it("keeps one worker ID and epoch across restart while advancing only for a changed advertisement", () => {
+    const directory = mkdtempSync(join(tmpdir(), "research-video-worker-id-"));
+    temporaryDirectories.add(directory);
+    const filename = join(directory, "worker.sqlite");
+    const initial = "a".repeat(64);
+    const changed = "b".repeat(64);
+    const firstDatabase = openLocalDatabase(filename);
+    runLocalMigrations(firstDatabase);
+    const first = new LocalExportWorkerIdentityRepository(
+      firstDatabase,
+      () => new Date("2026-08-20T12:00:00.000Z"),
+    ).prepareRegistration(initial);
+    expect(first).toMatchObject({
+      epoch: 1,
+      advertisementFingerprint: initial,
+    });
+    firstDatabase.close();
+
+    const restartedDatabase = openLocalDatabase(filename);
+    runLocalMigrations(restartedDatabase);
+    const restarted = new LocalExportWorkerIdentityRepository(
+      restartedDatabase,
+      () => new Date("2026-08-20T12:01:00.000Z"),
+    );
+    expect(restarted.prepareRegistration(initial)).toEqual(first);
+    expect(restarted.prepareRegistration(changed)).toMatchObject({
+      workerId: first.workerId,
+      epoch: 2,
+      advertisementFingerprint: changed,
+    });
+    expect(() => restarted.prepareRegistration("invalid")).toThrow(
+      /fingerprint/i,
+    );
+    restartedDatabase.close();
   });
 });

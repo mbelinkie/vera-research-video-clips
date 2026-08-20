@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { SharedProjectCatalog } from "@research-video/catalog";
 import { HealthResponseSchema } from "@research-video/contracts";
 import { runCloudMigrations } from "@research-video/db-cloud";
+import { currentExportWorkerAdvertisement } from "@research-video/export-settings";
 import type { VideoMetadataProvider } from "@research-video/providers";
 import { MemoryTranscriptObjectStore } from "@research-video/storage";
 import {
@@ -1744,5 +1745,133 @@ describe("cloud API", () => {
         })
       ).statusCode,
     ).toBe(204);
+  });
+});
+
+describe("registered export-worker API", () => {
+  it("enforces strict advertisements, owner-only heartbeat, and project membership availability", async () => {
+    const database = new PGlite();
+    databases.add(database);
+    await runCloudMigrations(database);
+    const catalog = new SharedProjectCatalog(
+      database,
+      new MemoryTranscriptObjectStore(),
+    );
+    const app = createCloudApi({
+      catalog,
+      authenticate: authenticateDevBearer,
+    });
+    apps.add(app);
+    const ownerId = randomUUID();
+    const outsiderId = randomUUID();
+    const ownerAuthorization = `Bearer ${ownerId}|fixture:worker-api-owner`;
+    const outsiderAuthorization = `Bearer ${outsiderId}|fixture:worker-api-outsider`;
+    for (const [authorization, displayName] of [
+      [ownerAuthorization, "Worker owner"],
+      [outsiderAuthorization, "Worker outsider"],
+    ]) {
+      expect(
+        (
+          await app.inject({
+            method: "POST",
+            url: "/api/session/register",
+            headers: { authorization },
+            payload: { displayName },
+          })
+        ).statusCode,
+      ).toBe(200);
+    }
+    const project = await app.inject({
+      method: "POST",
+      url: "/api/projects",
+      headers: { authorization: ownerAuthorization },
+      payload: { name: "Worker availability" },
+    });
+    const projectId = project.json<{ id: string }>().id;
+    const advertisement = currentExportWorkerAdvertisement({
+      ffmpegVersion: "8.1.2",
+      encoders: ["libx264", "libx265", "prores_ks", "mov_text", "srt"],
+      muxers: ["mp4", "matroska", "mov"],
+      filters: ["scale", "fps"],
+    });
+    const workerId = randomUUID();
+    expect(
+      (
+        await app.inject({
+          method: "PUT",
+          url: "/api/export-workers/self",
+          payload: {
+            workerId,
+            epoch: 1,
+            capability: advertisement.capability,
+            availability: {
+              discovery: "canonical_only",
+              availableRendererIds: ["h264_mp4"],
+              unavailableRendererIds: ["hevc_mkv", "prores_mov"],
+            },
+          },
+        })
+      ).statusCode,
+    ).toBe(401);
+    expect(
+      (
+        await app.inject({
+          method: "PUT",
+          url: "/api/export-workers/self",
+          headers: { authorization: ownerAuthorization },
+          payload: {
+            workerId,
+            epoch: 1,
+            capability: advertisement.capability,
+            availability: {
+              discovery: "canonical_only",
+              availableRendererIds: ["h264_mp4"],
+              unavailableRendererIds: ["hevc_mkv", "prores_mov"],
+            },
+          },
+        })
+      ).statusCode,
+    ).toBe(400);
+    const registered = await app.inject({
+      method: "PUT",
+      url: "/api/export-workers/self",
+      headers: { authorization: ownerAuthorization },
+      payload: { workerId, epoch: 1, ...advertisement },
+    });
+    expect(registered.statusCode).toBe(200);
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: "/api/export-workers/self/heartbeat",
+          headers: { authorization: outsiderAuthorization },
+          payload: { workerId, epoch: 1 },
+        })
+      ).statusCode,
+    ).toBe(403);
+    const availability = await app.inject({
+      method: "POST",
+      url: `/api/projects/${projectId}/export-workers/availability`,
+      headers: { authorization: ownerAuthorization },
+      payload: { capability: advertisement.capability, rendererId: "h264_mp4" },
+    });
+    expect(availability.json()).toEqual({
+      compatible: true,
+      availableWorkerCount: 1,
+    });
+    expect(availability.json()).not.toHaveProperty("workers");
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: `/api/projects/${projectId}/export-workers/availability`,
+          headers: { authorization: outsiderAuthorization },
+          payload: {
+            capability: advertisement.capability,
+            rendererId: "h264_mp4",
+          },
+        })
+      ).statusCode,
+    ).toBe(403);
   });
 });

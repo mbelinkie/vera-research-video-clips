@@ -1023,6 +1023,81 @@ export class LocalExportRequestNotFoundError extends Error {
   }
 }
 
+export type LocalExportWorkerIdentity = {
+  workerId: string;
+  epoch: number;
+  advertisementFingerprint: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+/** Durable single-workstation identity used only for cloud worker registration. */
+export class LocalExportWorkerIdentityRepository {
+  constructor(
+    private readonly database: DatabaseSync,
+    private readonly now: () => Date = () => new Date(),
+  ) {}
+
+  get(): LocalExportWorkerIdentity | undefined {
+    const row = this.database
+      .prepare("SELECT * FROM local_export_worker_identity WHERE singleton = 1")
+      .get() as Record<string, unknown> | undefined;
+    return row ? mapLocalExportWorkerIdentity(row) : undefined;
+  }
+
+  prepareRegistration(
+    advertisementFingerprint: string,
+  ): LocalExportWorkerIdentity {
+    if (!/^[a-f0-9]{64}$/u.test(advertisementFingerprint)) {
+      throw new LocalExportLifecycleError(
+        "The local worker advertisement fingerprint is invalid.",
+        "invalid_worker_advertisement",
+      );
+    }
+    const current = this.get();
+    const now = this.now().toISOString();
+    if (!current) {
+      const identity: LocalExportWorkerIdentity = {
+        workerId: randomUUID(),
+        epoch: 1,
+        advertisementFingerprint,
+        createdAt: now,
+        updatedAt: now,
+      };
+      this.database
+        .prepare(
+          `INSERT INTO local_export_worker_identity
+             (singleton, worker_id, epoch, advertisement_fingerprint, created_at, updated_at)
+           VALUES (1, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          identity.workerId,
+          identity.epoch,
+          identity.advertisementFingerprint,
+          identity.createdAt,
+          identity.updatedAt,
+        );
+      return identity;
+    }
+    if (current.advertisementFingerprint === advertisementFingerprint)
+      return current;
+    const next = {
+      ...current,
+      epoch: current.epoch + 1,
+      advertisementFingerprint,
+      updatedAt: now,
+    };
+    this.database
+      .prepare(
+        `UPDATE local_export_worker_identity
+         SET epoch = ?, advertisement_fingerprint = ?, updated_at = ?
+         WHERE singleton = 1`,
+      )
+      .run(next.epoch, next.advertisementFingerprint, next.updatedAt);
+    return next;
+  }
+}
+
 export class LocalExportLifecycleError extends Error {
   readonly code: string = "export_source_lifecycle_conflict";
   readonly statusCode = 409;
@@ -1034,6 +1109,18 @@ export class LocalExportLifecycleError extends Error {
     super(message);
     this.code = code;
   }
+}
+
+function mapLocalExportWorkerIdentity(
+  row: Record<string, unknown>,
+): LocalExportWorkerIdentity {
+  return {
+    workerId: String(row.worker_id),
+    epoch: Number(row.epoch),
+    advertisementFingerprint: String(row.advertisement_fingerprint),
+    createdAt: String(row.created_at),
+    updatedAt: String(row.updated_at),
+  };
 }
 
 function mapLocalExportRequest(

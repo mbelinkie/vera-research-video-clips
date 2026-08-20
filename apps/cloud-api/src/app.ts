@@ -31,6 +31,10 @@ import {
   WorkerFinalizeTranscriptRequestSchema,
   WorkerHeartbeatRequestSchema,
   WorkerSourcePlanRequestSchema,
+  ExportWorkerCompatibilityRequestSchema,
+  HeartbeatExportWorkerRequestSchema,
+  RegisterExportWorkerRequestSchema,
+  RevokeExportWorkerRequestSchema,
   type AuthenticatedActor,
   type BatchOptions,
   type BatchPreflightItem,
@@ -131,6 +135,28 @@ export function createCloudApi(
     return catalog.registerUser(actor, body.displayName);
   });
 
+  app.put("/api/export-workers/self", async (request) =>
+    catalog.registerExportWorker(
+      await authenticate(request),
+      RegisterExportWorkerRequestSchema.parse(request.body),
+    ),
+  );
+
+  app.post("/api/export-workers/self/heartbeat", async (request) =>
+    catalog.heartbeatExportWorker(
+      await authenticate(request),
+      HeartbeatExportWorkerRequestSchema.parse(request.body),
+    ),
+  );
+
+  app.post("/api/export-workers/self/revoke", async (request, reply) => {
+    await catalog.revokeExportWorker(
+      await authenticate(request),
+      RevokeExportWorkerRequestSchema.parse(request.body),
+    );
+    return reply.status(204).send();
+  });
+
   app.get("/api/session/profile", async (request) =>
     catalog.getCurrentUser(await authenticate(request)),
   );
@@ -214,6 +240,18 @@ export function createCloudApi(
         await authenticate(request),
         projectId,
         ExportSettingsPreviewRequestSchema.parse(request.body),
+      );
+    },
+  );
+
+  app.post(
+    "/api/projects/:projectId/export-workers/availability",
+    async (request) => {
+      const { projectId } = IdParamsSchema.parse(request.params);
+      return catalog.compatibleExportWorkerAvailability(
+        await authenticate(request),
+        projectId,
+        ExportWorkerCompatibilityRequestSchema.parse(request.body),
       );
     },
   );

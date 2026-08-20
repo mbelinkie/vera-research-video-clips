@@ -11,6 +11,7 @@ import {
   ExportPresetDefaultSchema,
   ExportPresetSnapshotSchema,
   ExportSettingsSchema,
+  InstalledExportWorkerCapabilitySummarySchema,
   FinalArtifactProvenanceSchema,
   HealthResponseSchema,
   JobSchema,
@@ -62,6 +63,38 @@ describe("shared contracts", () => {
         timestamp: now,
       }).success,
     ).toBe(true);
+  });
+
+  it("requires an ordered complete partition for installed renderer advertisements", () => {
+    const complete = {
+      schemaVersion: 1,
+      availableRendererIds: ["h264_mp4", "prores_mov"],
+      unavailableRendererIds: ["hevc_mkv"],
+      ffmpegVersion: "8.1.2",
+    };
+    expect(
+      InstalledExportWorkerCapabilitySummarySchema.parse(complete),
+    ).toEqual(complete);
+    for (const invalid of [
+      {
+        ...complete,
+        availableRendererIds: ["h264_mp4", "h264_mp4"],
+      },
+      {
+        ...complete,
+        unavailableRendererIds: ["h264_mp4", "hevc_mkv"],
+      },
+      {
+        ...complete,
+        availableRendererIds: ["prores_mov", "h264_mp4"],
+      },
+      { ...complete, unavailableRendererIds: [] },
+      { ...complete, ffmpegVersion: "/usr/local/bin/ffmpeg 8.1" },
+    ]) {
+      expect(
+        InstalledExportWorkerCapabilitySummarySchema.safeParse(invalid).success,
+      ).toBe(false);
+    }
   });
 
   it("normalizes BCP-47 account preferences and compares primary languages", () => {

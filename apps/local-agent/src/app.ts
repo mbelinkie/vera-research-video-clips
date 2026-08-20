@@ -4,6 +4,9 @@ import { z, ZodError } from "zod";
 import {
   CreateExportOnlyRequestSchema,
   ExportSettingsPreviewRequestSchema,
+  type HeartbeatExportWorkerRequest,
+  type RegisterExportWorkerRequest,
+  type RegisteredExportWorker,
   type CreateExportOnlyRequest,
   type ExportRequest,
   type ExportSettingsPreview,
@@ -12,10 +15,15 @@ import {
   HealthResponseSchema,
 } from "@research-video/contracts";
 import {
+  currentExportWorkerAdvertisement,
   validateStoredResolvedSettingsSnapshot,
   withInstalledExportWorkerAvailability,
   type ExportWorkerCapabilityProvider,
 } from "@research-video/export-settings";
+import type {
+  LocalExportWorkerIdentity,
+  LocalExportWorkerIdentityRepository,
+} from "@research-video/db-local";
 import type { WorkspaceTranscriptResolution } from "@research-video/sync";
 
 export interface LocalAgentDependencies {
@@ -37,6 +45,18 @@ export interface LocalAgentDependencies {
     idempotencyKey: string,
   ): ExportRequest | undefined;
   listExportRequests?(): ExportRequest[];
+  workerIdentity?: Pick<
+    LocalExportWorkerIdentityRepository,
+    "get" | "prepareRegistration"
+  >;
+  registerExportWorker?(input: {
+    request: RegisterExportWorkerRequest;
+    authorization: string;
+  }): Promise<RegisteredExportWorker>;
+  heartbeatExportWorker?(input: {
+    request: HeartbeatExportWorkerRequest;
+    authorization: string;
+  }): Promise<RegisteredExportWorker>;
 }
 
 const TranscriptParamsSchema = z.object({
@@ -211,6 +231,60 @@ export function createLocalAgent(
       }
       const created = dependencies.createExportOnly!(parsed, resolved);
       return reply.status(201).send(created);
+    });
+  }
+
+  if (
+    dependencies?.workerIdentity &&
+    dependencies.capabilityProvider &&
+    dependencies.registerExportWorker
+  ) {
+    app.post("/api/export-workers/register", async (request) => {
+      const authorization = request.headers.authorization;
+      if (!authorization) {
+        throw new LocalAuthenticationError(
+          "Authentication is required to register a local export worker.",
+        );
+      }
+      // Discovery is the only source of advertised installed capability data.
+      const advertisement = currentExportWorkerAdvertisement(
+        await dependencies.capabilityProvider!.discover(),
+      );
+      const identity = dependencies.workerIdentity!.prepareRegistration(
+        advertisement.advertisementFingerprint,
+      );
+      return dependencies.registerExportWorker!({
+        authorization,
+        request: {
+          workerId: identity.workerId,
+          epoch: identity.epoch,
+          ...advertisement,
+        },
+      });
+    });
+  }
+
+  if (dependencies?.workerIdentity && dependencies.heartbeatExportWorker) {
+    app.post("/api/export-workers/heartbeat", async (request) => {
+      const authorization = request.headers.authorization;
+      if (!authorization) {
+        throw new LocalAuthenticationError(
+          "Authentication is required to heartbeat a local export worker.",
+        );
+      }
+      const identity: LocalExportWorkerIdentity | undefined =
+        dependencies.workerIdentity!.get();
+      if (!identity) {
+        throw new LocalExportSettingsError(
+          "Register this local export worker before sending a heartbeat.",
+          "worker_registration_required",
+          409,
+        );
+      }
+      return dependencies.heartbeatExportWorker!({
+        authorization,
+        request: { workerId: identity.workerId, epoch: identity.epoch },
+      });
     });
   }
 

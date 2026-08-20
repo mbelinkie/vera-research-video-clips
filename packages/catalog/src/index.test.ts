@@ -8,6 +8,10 @@ import type {
   TranscriptManifest,
 } from "@research-video/contracts";
 import { runCloudMigrations } from "@research-video/db-cloud";
+import {
+  currentExportWorkerAdvertisement,
+  exportWorkerAdvertisementFingerprint,
+} from "@research-video/export-settings";
 import { MemoryTranscriptObjectStore } from "@research-video/storage";
 
 import { SharedProjectCatalog } from "./index.ts";
@@ -362,5 +366,167 @@ describe("versioned export preset catalogs", () => {
       "export_preset.default_set",
     ]);
     expect(JSON.stringify(events.rows)).not.toContain("Owner private");
+  });
+});
+
+describe("registered local export workers", () => {
+  it("keeps immutable epochs, bounded owner heartbeats, revocation, and project-authorized availability", async () => {
+    const database = new PGlite();
+    databases.add(database);
+    await runCloudMigrations(database);
+    let now = new Date("2026-08-20T12:00:00.000Z");
+    const catalog = new SharedProjectCatalog(
+      database,
+      new MemoryTranscriptObjectStore(),
+      () => now,
+    );
+    const owner: AuthenticatedActor = {
+      userId: randomUUID(),
+      externalSubject: "fixture:registered-worker-owner",
+    };
+    const collaborator: AuthenticatedActor = {
+      userId: randomUUID(),
+      externalSubject: "fixture:registered-worker-collaborator",
+    };
+    const outsider: AuthenticatedActor = {
+      userId: randomUUID(),
+      externalSubject: "fixture:registered-worker-outsider",
+    };
+    for (const [actor, name] of [
+      [owner, "Owner"],
+      [collaborator, "Collaborator"],
+      [outsider, "Outsider"],
+    ] as const) {
+      await catalog.registerUser(actor, name);
+    }
+    const project = await catalog.createProject(owner, {
+      name: "Worker project",
+    });
+    await catalog.addMember(owner, project.id, collaborator.userId, "viewer");
+    const advertisement = currentExportWorkerAdvertisement({
+      ffmpegVersion: "8.1.2",
+      encoders: ["libx264", "libx265", "prores_ks", "mov_text", "srt"],
+      muxers: ["mp4", "matroska", "mov"],
+      filters: ["scale", "fps"],
+    });
+    const workerId = randomUUID();
+    const registration = { workerId, epoch: 1, ...advertisement };
+    const registered = await catalog.registerExportWorker(owner, registration);
+    expect(registered).toMatchObject({ id: workerId, epoch: 1 });
+    expect(registered).not.toHaveProperty("ownerUserId");
+    expect(await catalog.registerExportWorker(owner, registration)).toEqual(
+      registered,
+    );
+    await expect(
+      catalog.registerExportWorker(owner, {
+        ...registration,
+        installedCapabilities: {
+          ...advertisement.installedCapabilities,
+          availableRendererIds: ["h264_mp4"],
+          unavailableRendererIds: ["hevc_mkv", "prores_mov"],
+        },
+      }),
+    ).rejects.toMatchObject({ statusCode: 422 });
+    const changedSummary = {
+      ...advertisement.installedCapabilities,
+      availableRendererIds: ["h264_mp4"],
+      unavailableRendererIds: ["hevc_mkv", "prores_mov"],
+    } satisfies typeof advertisement.installedCapabilities;
+    const changed = {
+      ...registration,
+      installedCapabilities: changedSummary,
+      advertisementFingerprint: exportWorkerAdvertisementFingerprint({
+        capability: advertisement.capability,
+        installedCapabilities: changedSummary,
+      }),
+    };
+    await expect(
+      catalog.registerExportWorker(owner, changed),
+    ).rejects.toMatchObject({
+      statusCode: 409,
+    });
+    await expect(
+      catalog.heartbeatExportWorker(outsider, { workerId, epoch: 1 }),
+    ).rejects.toMatchObject({ statusCode: 403 });
+    now = new Date("2026-08-20T12:00:30.000Z");
+    const heartbeat = await catalog.heartbeatExportWorker(owner, {
+      workerId,
+      epoch: 1,
+    });
+    expect(heartbeat.heartbeatAt).toBe(now.toISOString());
+    expect(heartbeat.installedCapabilities).toEqual(
+      advertisement.installedCapabilities,
+    );
+    const availabilityRequest = {
+      capability: advertisement.capability,
+      rendererId: "h264_mp4" as const,
+    };
+    expect(
+      await catalog.compatibleExportWorkerAvailability(
+        collaborator,
+        project.id,
+        availabilityRequest,
+      ),
+    ).toEqual({ compatible: true, availableWorkerCount: 1 });
+    await catalog.registerExportWorker(outsider, {
+      ...registration,
+      workerId: randomUUID(),
+    });
+    expect(
+      await catalog.compatibleExportWorkerAvailability(
+        collaborator,
+        project.id,
+        availabilityRequest,
+      ),
+    ).toEqual({ compatible: true, availableWorkerCount: 1 });
+    await expect(
+      catalog.compatibleExportWorkerAvailability(
+        outsider,
+        project.id,
+        availabilityRequest,
+      ),
+    ).rejects.toMatchObject({ statusCode: 403 });
+    expect(
+      await catalog.compatibleExportWorkerAvailability(
+        collaborator,
+        project.id,
+        {
+          ...availabilityRequest,
+          rendererId: "hevc_mkv",
+        },
+      ),
+    ).toEqual({ compatible: true, availableWorkerCount: 1 });
+    await catalog.revokeExportWorker(owner, { workerId, epoch: 1 });
+    expect(
+      await catalog.compatibleExportWorkerAvailability(
+        collaborator,
+        project.id,
+        availabilityRequest,
+      ),
+    ).toEqual({ compatible: false, availableWorkerCount: 0 });
+    await expect(
+      catalog.registerExportWorker(owner, registration),
+    ).rejects.toMatchObject({
+      statusCode: 409,
+    });
+    await catalog.registerExportWorker(owner, { ...changed, epoch: 2 });
+    expect(
+      await catalog.compatibleExportWorkerAvailability(
+        collaborator,
+        project.id,
+        {
+          ...availabilityRequest,
+          rendererId: "hevc_mkv",
+        },
+      ),
+    ).toEqual({ compatible: false, availableWorkerCount: 0 });
+    now = new Date("2026-08-20T12:02:00.000Z");
+    expect(
+      await catalog.compatibleExportWorkerAvailability(
+        collaborator,
+        project.id,
+        availabilityRequest,
+      ),
+    ).toEqual({ compatible: false, availableWorkerCount: 0 });
   });
 });

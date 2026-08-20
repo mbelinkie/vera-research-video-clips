@@ -18,6 +18,12 @@ import {
   CreateTranscriptionBatchResponseSchema,
   ExportRequestSchema,
   ExportSettingsSchema,
+  ExportWorkerCompatibilityRequestSchema,
+  HeartbeatExportWorkerRequestSchema,
+  RegisterExportWorkerRequestSchema,
+  RegisteredExportWorkerSchema,
+  RevokeExportWorkerRequestSchema,
+  ExportWorkerAvailabilityResponseSchema,
   ExportPresetCatalogEntrySchema,
   ExportPresetDefaultSchema,
   PersonalExportPresetCatalogSchema,
@@ -56,6 +62,11 @@ import {
   type ExportPresetReference,
   type ExportPresetSnapshot,
   type ExportSettingsPreview,
+  type ExportWorkerCompatibilityRequest,
+  type HeartbeatExportWorkerRequest,
+  type RegisterExportWorkerRequest,
+  type RegisteredExportWorker,
+  type RevokeExportWorkerRequest,
   type ExportSettingsPreviewRequest,
   type PersonalExportPresetCatalog,
   type ProjectExportPresetCatalog,
@@ -84,6 +95,8 @@ import {
   type WorkerProgressStage,
 } from "@research-video/contracts";
 import {
+  exportWorkerAdvertisementFingerprint,
+  isRegisterableExportWorkerCapability,
   resolveExportSettings,
   resolvedPresetForCompatibility,
 } from "@research-video/export-settings";
@@ -169,6 +182,8 @@ export type ProjectVideoTranscriptState = {
 
 type DbRow = Record<string, unknown>;
 
+export const ExportWorkerHeartbeatTtlMs = 60_000;
+
 const iso = (value: unknown) =>
   value instanceof Date ? value.toISOString() : String(value);
 
@@ -214,6 +229,216 @@ export class SharedProjectCatalog {
       [actor.userId, actor.externalSubject],
     );
     return mapUser(result.rows[0]);
+  }
+
+  async registerExportWorker(
+    actor: AuthenticatedActor,
+    input: RegisterExportWorkerRequest,
+  ): Promise<RegisteredExportWorker> {
+    await this.requireRegistered(actor);
+    const parsed = RegisterExportWorkerRequestSchema.parse(input);
+    this.assertRegisterableExportWorkerAdvertisement(parsed);
+    const now = this.now();
+    const expires = new Date(now.getTime() + ExportWorkerHeartbeatTtlMs);
+    const existing = await this.database.query<DbRow>(
+      "SELECT * FROM registered_export_workers WHERE id = $1",
+      [parsed.workerId],
+    );
+    const current = existing.rows[0];
+    if (current && String(current.owner_user_id) !== actor.userId)
+      throw new AuthorizationError(
+        "This worker identity belongs to another user.",
+      );
+    if (current && Number(current.epoch) > parsed.epoch)
+      throw new CatalogConflictError("Worker registration epoch is stale.");
+    if (
+      current &&
+      current.revoked_at &&
+      Number(current.epoch) >= parsed.epoch
+    ) {
+      throw new CatalogConflictError(
+        "A revoked worker must use a higher registration epoch.",
+      );
+    }
+    if (
+      current &&
+      Number(current.epoch) === parsed.epoch &&
+      !sameExportWorkerAdvertisement(current, parsed)
+    ) {
+      throw new CatalogConflictError(
+        "A registration epoch can only replay its original capability advertisement.",
+      );
+    }
+    const result = await this.database.query<DbRow>(
+      `INSERT INTO registered_export_workers
+         (id, owner_user_id, epoch, capability_json, installed_capabilities_json,
+          advertisement_fingerprint, heartbeat_at, expires_at, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $7, $7)
+       ON CONFLICT (id) DO UPDATE SET
+         epoch = EXCLUDED.epoch,
+         capability_json = EXCLUDED.capability_json,
+         installed_capabilities_json = EXCLUDED.installed_capabilities_json,
+         advertisement_fingerprint = EXCLUDED.advertisement_fingerprint,
+         heartbeat_at = EXCLUDED.heartbeat_at,
+         expires_at = EXCLUDED.expires_at,
+         revoked_at = NULL,
+         updated_at = EXCLUDED.updated_at
+       WHERE registered_export_workers.owner_user_id = EXCLUDED.owner_user_id
+         AND (
+           registered_export_workers.epoch < EXCLUDED.epoch
+           OR (
+             registered_export_workers.epoch = EXCLUDED.epoch
+             AND registered_export_workers.revoked_at IS NULL
+             AND registered_export_workers.capability_json = EXCLUDED.capability_json
+             AND registered_export_workers.installed_capabilities_json = EXCLUDED.installed_capabilities_json
+             AND registered_export_workers.advertisement_fingerprint = EXCLUDED.advertisement_fingerprint
+           )
+         )
+       RETURNING *`,
+      [
+        parsed.workerId,
+        actor.userId,
+        parsed.epoch,
+        JSON.stringify(parsed.capability),
+        JSON.stringify(parsed.installedCapabilities),
+        parsed.advertisementFingerprint,
+        now.toISOString(),
+        expires.toISOString(),
+      ],
+    );
+    if (!result.rows[0])
+      throw new CatalogConflictError("Worker registration epoch is stale.");
+    return mapRegisteredExportWorker(result.rows[0]);
+  }
+
+  async heartbeatExportWorker(
+    actor: AuthenticatedActor,
+    input: HeartbeatExportWorkerRequest,
+  ): Promise<RegisteredExportWorker> {
+    await this.requireRegistered(actor);
+    const parsed = HeartbeatExportWorkerRequestSchema.parse(input);
+    const now = this.now();
+    const expires = new Date(now.getTime() + ExportWorkerHeartbeatTtlMs);
+    const existing = await this.database.query<DbRow>(
+      "SELECT owner_user_id FROM registered_export_workers WHERE id = $1",
+      [parsed.workerId],
+    );
+    if (
+      existing.rows[0] &&
+      String(existing.rows[0].owner_user_id) !== actor.userId
+    ) {
+      throw new AuthorizationError(
+        "This worker identity belongs to another user.",
+      );
+    }
+    const result = await this.database.query<DbRow>(
+      `UPDATE registered_export_workers
+       SET heartbeat_at = $1, expires_at = $2, updated_at = $1
+       WHERE id = $3 AND owner_user_id = $4 AND epoch = $5
+         AND revoked_at IS NULL AND expires_at > $1
+       RETURNING *`,
+      [
+        now.toISOString(),
+        expires.toISOString(),
+        parsed.workerId,
+        actor.userId,
+        parsed.epoch,
+      ],
+    );
+    if (!result.rows[0]) {
+      throw new CatalogConflictError(
+        "Worker heartbeat is stale, expired, revoked, or not owned by this actor.",
+      );
+    }
+    return mapRegisteredExportWorker(result.rows[0]);
+  }
+
+  async revokeExportWorker(
+    actor: AuthenticatedActor,
+    input: RevokeExportWorkerRequest,
+  ): Promise<void> {
+    await this.requireRegistered(actor);
+    const parsed = RevokeExportWorkerRequestSchema.parse(input);
+    const now = this.now().toISOString();
+    const existing = await this.database.query<DbRow>(
+      "SELECT owner_user_id FROM registered_export_workers WHERE id = $1",
+      [parsed.workerId],
+    );
+    if (
+      existing.rows[0] &&
+      String(existing.rows[0].owner_user_id) !== actor.userId
+    ) {
+      throw new AuthorizationError(
+        "This worker identity belongs to another user.",
+      );
+    }
+    const result = await this.database.query<DbRow>(
+      `UPDATE registered_export_workers
+       SET revoked_at = $1, updated_at = $1
+       WHERE id = $2 AND owner_user_id = $3 AND epoch = $4
+         AND revoked_at IS NULL
+       RETURNING id`,
+      [now, parsed.workerId, actor.userId, parsed.epoch],
+    );
+    if (!result.rows[0]) {
+      throw new CatalogConflictError(
+        "Worker revocation is stale, already revoked, or not owned by this actor.",
+      );
+    }
+  }
+
+  async compatibleExportWorkerAvailability(
+    actor: AuthenticatedActor,
+    projectId: string,
+    input: ExportWorkerCompatibilityRequest,
+  ): Promise<{ compatible: boolean; availableWorkerCount: number }> {
+    await this.authorize(actor, projectId, "read");
+    const parsed = ExportWorkerCompatibilityRequestSchema.parse(input);
+    const rows = await this.database.query<DbRow>(
+      `SELECT w.* FROM registered_export_workers w
+       JOIN project_members members
+         ON members.user_id = w.owner_user_id AND members.project_id = $1
+       WHERE w.revoked_at IS NULL AND w.expires_at > $2`,
+      [projectId, this.now().toISOString()],
+    );
+    const availableWorkerCount = rows.rows
+      .map(mapRegisteredExportWorker)
+      .filter(
+        (worker) =>
+          worker.capability.profileId === parsed.capability.profileId &&
+          worker.capability.profileVersion ===
+            parsed.capability.profileVersion &&
+          worker.capability.fingerprint === parsed.capability.fingerprint &&
+          worker.capability.validation === "validated" &&
+          worker.installedCapabilities.availableRendererIds.includes(
+            parsed.rendererId,
+          ),
+      ).length;
+    return ExportWorkerAvailabilityResponseSchema.parse({
+      compatible: availableWorkerCount > 0,
+      availableWorkerCount,
+    });
+  }
+
+  private assertRegisterableExportWorkerAdvertisement(
+    input: RegisterExportWorkerRequest,
+  ): void {
+    if (!isRegisterableExportWorkerCapability(input.capability)) {
+      throw new CatalogValidationError(
+        "The worker capability profile is not an explicitly supported registered profile.",
+      );
+    }
+    if (
+      input.advertisementFingerprint !==
+      exportWorkerAdvertisementFingerprint({
+        capability: input.capability,
+        installedCapabilities: input.installedCapabilities,
+      })
+    ) {
+      throw new CatalogValidationError(
+        "The worker installed capability summary does not match its advertisement fingerprint.",
+      );
+    }
   }
 
   async updatePreferredLanguage(
@@ -3408,6 +3633,33 @@ function mapUser(row: DbRow | undefined): User {
     createdAt: iso(row.created_at),
     updatedAt: iso(row.updated_at),
   });
+}
+
+function mapRegisteredExportWorker(row: DbRow): RegisteredExportWorker {
+  return RegisteredExportWorkerSchema.parse({
+    id: row.id,
+    epoch: Number(row.epoch),
+    capability:
+      typeof row.capability_json === "string"
+        ? JSON.parse(row.capability_json)
+        : row.capability_json,
+    installedCapabilities:
+      typeof row.installed_capabilities_json === "string"
+        ? JSON.parse(row.installed_capabilities_json)
+        : row.installed_capabilities_json,
+    advertisementFingerprint: row.advertisement_fingerprint,
+    heartbeatAt: iso(row.heartbeat_at),
+    expiresAt: iso(row.expires_at),
+  });
+}
+
+function sameExportWorkerAdvertisement(
+  row: DbRow,
+  input: RegisterExportWorkerRequest,
+): boolean {
+  return (
+    String(row.advertisement_fingerprint) === input.advertisementFingerprint
+  );
 }
 
 function mapExportPresetEntry(row: DbRow): ExportPresetCatalogEntry {

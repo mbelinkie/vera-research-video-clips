@@ -2,9 +2,13 @@ import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 
 import { loadConfig } from "@research-video/config";
-import { ExportSettingsPreviewSchema } from "@research-video/contracts";
+import {
+  ExportSettingsPreviewSchema,
+  RegisteredExportWorkerSchema,
+} from "@research-video/contracts";
 import {
   LocalExportQueue,
+  LocalExportWorkerIdentityRepository,
   LocalTranscriptIndex,
   openLocalDatabase,
   runLocalMigrations,
@@ -26,6 +30,7 @@ await mkdir(config.dataDir, { recursive: true });
 const database = openLocalDatabase(join(config.dataDir, "local.sqlite"));
 runLocalMigrations(database);
 const exportQueue = new LocalExportQueue(database);
+const workerIdentity = new LocalExportWorkerIdentityRepository(database);
 const cache = new VerifiedTranscriptCache(
   database,
   new HttpArtifactDownloader(),
@@ -37,6 +42,21 @@ const reader = new CachedTranscriptDocumentReader(
 const cloudApiUrl = `http://${config.cloudApiHost}:${config.cloudApiPort}`;
 const app = createLocalAgent({
   capabilityProvider: new FfmpegCapabilityDiscoveryProvider(),
+  workerIdentity,
+  registerExportWorker: async ({ request, authorization }) =>
+    callCloudExportWorker(
+      "PUT",
+      "/api/export-workers/self",
+      request,
+      authorization,
+    ),
+  heartbeatExportWorker: async ({ request, authorization }) =>
+    callCloudExportWorker(
+      "POST",
+      "/api/export-workers/self/heartbeat",
+      request,
+      authorization,
+    ),
   createExportOnly: (input, snapshot) =>
     exportQueue.createExportOnly(input, snapshot),
   findExportOnlyByIdempotencyKey: (idempotencyKey) =>
@@ -83,3 +103,32 @@ await app.listen({ host: config.localAgentHost, port: config.localAgentPort });
 app.log.info(
   `Local agent listening on http://${config.localAgentHost}:${config.localAgentPort}`,
 );
+
+async function callCloudExportWorker(
+  method: "PUT" | "POST",
+  path: string,
+  request: unknown,
+  authorization: string,
+) {
+  const response = await fetch(`${cloudApiUrl}${path}`, {
+    method,
+    headers: { authorization, "content-type": "application/json" },
+    body: JSON.stringify(request),
+  });
+  const payload = await response.json().catch(() => undefined);
+  if (!response.ok) {
+    const remote = payload as
+      { error?: { code?: string; message?: string } } | undefined;
+    throw Object.assign(
+      new Error(
+        remote?.error?.message ??
+          `Cloud export-worker request failed with HTTP ${response.status}.`,
+      ),
+      {
+        statusCode: response.status,
+        code: remote?.error?.code ?? "export_worker_registration_unavailable",
+      },
+    );
+  }
+  return RegisteredExportWorkerSchema.parse(payload);
+}

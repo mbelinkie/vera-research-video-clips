@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import {
   ExportSettingsPreviewSchema,
   ExportSettingsSchema,
+  InstalledExportWorkerCapabilitySummarySchema,
   ResolvedExportSettingsSnapshotSchema,
   type ExportCapabilityIssue,
   type ExportPresetScope,
@@ -14,6 +15,7 @@ import {
   type ExportSettingsPreview,
   type ExportSourceLanguageClass,
   type ExportWorkerCapabilityReference,
+  type InstalledExportWorkerCapabilitySummary,
   type ResolvedExportSettingsSnapshot,
 } from "@research-video/contracts";
 
@@ -129,6 +131,84 @@ export const CURRENT_EXPORT_WORKER_CAPABILITY = {
   fingerprint: sha256Fingerprint(capabilityDescriptor),
   validation: "validated" as const,
 };
+
+/**
+ * M5-15 registers only the current, explicitly implemented local renderer
+ * profile. Historical snapshots remain locally readable but are not cloud
+ * worker advertisements.
+ */
+export function isRegisterableExportWorkerCapability(
+  capability: ExportWorkerCapabilityReference,
+): boolean {
+  return (
+    capability.validation === "validated" &&
+    capability.profileId === CURRENT_EXPORT_WORKER_CAPABILITY.profileId &&
+    capability.profileVersion ===
+      CURRENT_EXPORT_WORKER_CAPABILITY.profileVersion &&
+    capability.fingerprint === CURRENT_EXPORT_WORKER_CAPABILITY.fingerprint
+  );
+}
+
+export function installedExportWorkerCapabilitySummary(
+  installed: InstalledExportWorkerCapabilities,
+): InstalledExportWorkerCapabilitySummary {
+  // The shared availability read has only a renderer ID, not a mutable local
+  // tool inventory. Advertise a renderer only when this installation supports
+  // every currently allowed feature for that family, never merely its base
+  // codec/muxer tuple.
+  const encoders = new Set(installed.encoders);
+  const filters = new Set(installed.filters);
+  const availableRendererIds = availableRendererCapabilityIds(installed).filter(
+    (rendererId) => {
+      const subtitleEncoder = rendererId === "hevc_mkv" ? "srt" : "mov_text";
+      return (
+        filters.has("scale") &&
+        filters.has("fps") &&
+        encoders.has(subtitleEncoder)
+      );
+    },
+  );
+  const allRendererIds = EXPORT_RENDERER_CAPABILITIES.map(
+    (renderer) => renderer.id,
+  );
+  return InstalledExportWorkerCapabilitySummarySchema.parse({
+    schemaVersion: 1,
+    availableRendererIds,
+    unavailableRendererIds: allRendererIds.filter(
+      (rendererId) => !availableRendererIds.includes(rendererId),
+    ),
+    ...(installed.ffmpegVersion
+      ? { ffmpegVersion: installed.ffmpegVersion }
+      : {}),
+  });
+}
+
+export function exportWorkerAdvertisementFingerprint(input: {
+  capability: ExportWorkerCapabilityReference;
+  installedCapabilities: InstalledExportWorkerCapabilitySummary;
+}): string {
+  return sha256Fingerprint(input);
+}
+
+export function currentExportWorkerAdvertisement(
+  installed: InstalledExportWorkerCapabilities,
+): {
+  capability: ExportWorkerCapabilityReference;
+  installedCapabilities: InstalledExportWorkerCapabilitySummary;
+  advertisementFingerprint: string;
+} {
+  const capability = { ...CURRENT_EXPORT_WORKER_CAPABILITY };
+  const installedCapabilities =
+    installedExportWorkerCapabilitySummary(installed);
+  return {
+    capability,
+    installedCapabilities,
+    advertisementFingerprint: exportWorkerAdvertisementFingerprint({
+      capability,
+      installedCapabilities,
+    }),
+  };
+}
 
 /** The M5-13 profile remains executable for already-queued Editing MP4 work. */
 export const LEGACY_EDITING_EXPORT_WORKER_CAPABILITY = {
