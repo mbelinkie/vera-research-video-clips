@@ -301,6 +301,10 @@ produce preferred SRT artifacts.
   local processor and atomically reconcile one immutable sanitized success with
   exact-replay recovery
   (`specs/completed/M5-17-execute-and-reconcile-logged-export-success.md`).
+- [x] M5-18: reconcile one persisted terminal-safe accepted logged-export
+  failure through exact pinned authorization, verified absent/deleted scratch,
+  immutable success/failure exclusion, and exact-replay recovery
+  (`specs/completed/M5-18-reconcile-accepted-logged-export-failure.md`).
 - [x] Generate and verify thumbnail, metadata JSON, and manifest.
 - [x] Use private staging plus exact-artifact validation and atomic completion.
 - [x] Execute accepted logged requests through the existing local processor and
@@ -308,7 +312,7 @@ produce preferred SRT artifacts.
 - [ ] Add durable progress, retry, safe cancellation, sibling isolation, and
   batch export.
 
-Gate: representative presets produce the requested FFprobe properties, queued jobs survive preset edits unchanged, English clips get an SRT by default and can explicitly omit it, foreign/mixed/unknown clips always get original plus translated-English SRTs, a 30-second foreign-language range produces only cues within that 30-second clip, a real authorized smoke test succeeds, and no full source media remains after any terminal path. M5-08 proves the local export-only composition path with authorized repository fixture media; M5-17 proves success-only execution and exact idempotent cloud reconciliation for one accepted logged request. Authenticated failure reconciliation and recovery remain open.
+Gate: representative presets produce the requested FFprobe properties, queued jobs survive preset edits unchanged, English clips get an SRT by default and can explicitly omit it, foreign/mixed/unknown clips always get original plus translated-English SRTs, a 30-second foreign-language range produces only cues within that 30-second clip, a real authorized smoke test succeeds, and no full source media remains after any terminal path. M5-08 proves the local export-only composition path with authorized repository fixture media; M5-17 and M5-18 prove exact idempotent cloud success/failure reconciliation for one accepted logged request. Cleanup-failure recovery/sweeping and the remaining operational/release gates remain open.
 
 ### 6. Project Clip Library + authoring handoff
 
@@ -451,6 +455,12 @@ infra/aws        storage, API, database, queues, identity, monitoring
   live registration, current membership, exact request/settings/media/subtitle
   provenance, immutable sanitized results, and idempotent recovery across both
   local-complete/cloud-call and cloud-commit/response-loss windows.
+- Accepted logged-export failure requires the authenticated original worker
+  owner, current membership, exact pinned delivery credentials, persisted
+  bounded error/attempt evidence, and either no started source attempt or one
+  exact verified-deleted scratch row. Expiry/revocation/newer registration epoch
+  may report existing terminal evidence but may not execute old accepted work;
+  cleanup failure stays actionable and success/failure cannot coexist.
 - Word/cue/estimated timing lookup and bilingual preservation.
 - Transcript selection to source/export bounds.
 - Queue creation without export side effects.
@@ -483,9 +493,10 @@ infra/aws        storage, API, database, queues, identity, monitoring
 
 ## Next action
 
-Continue Milestone 5 with one bounded slice for authenticated logged-export
-failure reconciliation and recovery. Preserve the accepted delivery and local
-failure evidence, define safe cloud failure identity/idempotency and pinned
-worker/epoch recovery, and do not broaden into user-facing retry/progress/cancel,
-batch/group execution, polling/supervision, cleanup sweeping, or the final
-30-second plus authorized-live release gate.
+Continue Milestone 5 with one bounded slice for cleanup-failure recovery plus an
+abandoned source-scratch lifecycle/sweeper backstop. Preserve M5-18's rule that
+ordinary failure becomes terminal only after verified deletion, make cleanup
+retry independently actionable without rerendering, and define bounded
+restart/crash recovery. Do not yet broaden into user-facing retry/progress/
+cancel, batch/group execution, the 30-second foreign fixture gate, the
+authorized-live smoke test, M6, or M7.

@@ -2,7 +2,7 @@
 
 ## Project guide and implementation plan
 
-Status: Milestones 1–4 core workflow complete; preferred-language logging, local export capabilities, and successful authorized logged-export execution/result reconciliation are verified through M5-17; authenticated failure reconciliation, operational recovery/grouping, and the final release gate remain open
+Status: Milestones 1–4 core workflow complete; preferred-language logging, local export capabilities, and authorized logged-export success/failure reconciliation are verified through M5-18; cleanup recovery, operational controls/grouping, and the final release gate remain open
 Last updated: 2026-08-20
 
 This document is the source of truth for product scope, architecture, sequencing, and acceptance criteria. Update it when a deliberate product or architectural decision changes. Use `outline.md` as the shorter execution checklist.
@@ -997,8 +997,9 @@ Shared PostgreSQL tables or equivalent aggregates:
 - `clip_tags`
 - `bookmarks` (can precede UI)
 - `export_jobs` (may reference a logged clip or contain an export-only request snapshot)
-- `logged_export_deliveries` and immutable sanitized success results bound to one
-  accepted request, delivery generation, worker, and epoch
+- `logged_export_deliveries` and mutually exclusive immutable sanitized success
+  or failure results bound to one accepted request, delivery generation, worker,
+  and epoch
 - `export_presets` and immutable preset versions
 - `export_artifacts` (immutable package identity/provenance; no
   workstation-private path as identity)
@@ -1042,6 +1043,10 @@ Important constraints:
 - A first logged-export success may transition only its exact accepted queued
   request/job/clip; canonical replay of the same immutable result is a no-op,
   while divergent bytes or provenance conflict without another event/version.
+- A first logged-export failure may transition only its exact accepted queued
+  request/job/clip after local evidence proves source work never started or the
+  exact attempt's scratch was deleted. Success and failure are mutually
+  exclusive; canonical failure replay is a no-op.
 - Jobs have an idempotency key and attempt count.
 - Worker claims have an expiring lease/heartbeat and safe reassignment policy.
 - Artifacts record path, type, size, and content hash.
@@ -1408,11 +1413,10 @@ web build, 17 local and 11 cloud migrations, four Playwright flows, and real
 FFmpeg/FFprobe renders for all three families. Commits `2323a0f`, `fe1efed`,
 `38047c4`, `9c8d8c6`, and `75def13` contain the completed slices.
 
-These slices do not complete Milestone 5. Authenticated failure reconciliation
-and recovery for delivered logged requests, progress/retry/cancel controls,
-batch and same-source
-group execution, crash-recovery cleanup sweeping, the 30-second foreign fixture
-gate, and the user-authorized live YouTube smoke test remain open.
+These slices do not complete Milestone 5. Cleanup-failure recovery,
+progress/retry/cancel controls, batch and same-source group execution,
+crash-recovery cleanup sweeping, the 30-second foreign fixture gate, and the
+user-authorized live YouTube smoke test remain open.
 
 M5-15 completed 2026-08-20. A local workstation now persists one stable worker
 ID and capability-registration epoch in SQLite, discovers the existing fixed
@@ -1462,10 +1466,28 @@ or version; divergent replay conflicts. Cloud migration `0014` and local
 migration `0020` add the immutable success row and exact acceptance timestamp.
 The result row/event/response omit local paths/locators, acquisition identity,
 private URLs, credentials, raw tool arguments/output, owner identity, and the
-reservation token used only for verification. This is successful completion
-only: the next bounded slice is authenticated failure reconciliation/recovery,
-without claiming user-facing retry/progress/cancel, batching/grouping, polling,
-cleanup sweeping, or final release gates.
+reservation token used only for verification. This slice remains successful
+completion only; M5-18 below adds the separate failure boundary.
+
+M5-18 completed 2026-08-20. An accepted logged request that durably reaches
+local `needs_user_action` without a complete package can now project one strict,
+sanitized failure from persisted SQLite state. Attempt zero requires no scratch
+rows; a positive attempt requires exactly one matching scratch row already
+verified `deleted`. `cleanup_failed` and every incomplete lifecycle remain local
+actionable work and cannot falsely mark the cloud request terminal. The cloud
+catalog binds the current authenticated original worker owner and project
+membership to the exact accepted delivery ID/generation/token/worker/epoch, but
+correctly treats registration expiry, revocation, or a later registered epoch as
+a scheduling stop rather than a reason to strand already persisted terminal
+evidence. One transaction inserts one immutable failure, marks only the exact
+queued job and clip `failed`, increments the clip once, and emits one sanitized
+event. Exact replay is a no-op; divergent replay conflicts; database triggers
+and the delivery lock prevent success/failure coexistence. Cloud migration
+`0015` adds the immutable failure record. Errors are re-sanitized at the shared
+contract and local repository boundaries, including URL, Unix/Windows/UNC path,
+identifier/digest, key-value secret, and bearer-token redaction. The next slice
+is cleanup-failure recovery plus abandoned-scratch lifecycle/sweeping, not
+user-facing retry/progress/cancel, batching/grouping, or final release gates.
 
 M5-09 completed 2026-08-19. Every promoted clip package now also contains one
 `manifest.json`, written into attempt-private staging and promoted through the
