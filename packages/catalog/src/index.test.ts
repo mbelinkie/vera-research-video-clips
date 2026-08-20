@@ -5,12 +5,15 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import type {
   AuthenticatedActor,
+  ExportRequest,
+  LoggedExportSuccessResult,
   TranscriptManifest,
 } from "@research-video/contracts";
 import { runCloudMigrations } from "@research-video/db-cloud";
 import {
   currentExportWorkerAdvertisement,
   exportWorkerAdvertisementFingerprint,
+  sha256Fingerprint,
 } from "@research-video/export-settings";
 import { MemoryTranscriptObjectStore } from "@research-video/storage";
 
@@ -881,6 +884,395 @@ describe("logged export delivery", () => {
     });
     expect(claim.delivery?.request.id).toBe(compatible.id);
   });
+
+  it("atomically reconciles one immutable success and replays it without another event or clip version", async () => {
+    const fixture = await createAcceptedLoggedExportResultFixture();
+    const command = reconcileSuccessCommand(fixture);
+    const first = await fixture.catalog.reconcileLoggedExportSuccess(
+      fixture.owner,
+      command,
+    );
+    expect(first.result).toEqual(fixture.result);
+    expect(first.resultFingerprint).toBe(sha256Fingerprint(fixture.result));
+    const forbiddenCloudResultFields =
+      /reservation_?token|owner_?user_?id|authorization|\/private\/|ffmpeg_?args|source_?identity/i;
+    expect(JSON.stringify(first)).not.toMatch(forbiddenCloudResultFields);
+    const persistedResultAndEvent = await fixture.database.query<
+      Record<string, unknown>
+    >(
+      `SELECT result.*, event.payload AS event_payload
+       FROM logged_export_success_results result
+       JOIN sync_events event
+         ON event.entity_id = $1
+        AND event.event_type = 'clip_candidate.export_completed'
+       WHERE result.export_request_id = $2`,
+      [fixture.accepted.request.clipId, fixture.accepted.request.id],
+    );
+    expect(JSON.stringify(persistedResultAndEvent.rows[0])).not.toMatch(
+      forbiddenCloudResultFields,
+    );
+    const afterFirst = await fixture.database.query<{
+      state: string;
+      export_status: string;
+      version: number;
+    }>(
+      `SELECT j.state, c.export_status, c.version
+       FROM jobs j
+       JOIN export_requests er ON er.job_id = j.id
+       JOIN clip_candidates c ON c.id = er.clip_id
+       WHERE er.id = $1`,
+      [fixture.accepted.request.id],
+    );
+    expect(afterFirst.rows[0]).toMatchObject({
+      state: "complete",
+      export_status: "complete",
+    });
+    const completedVersion = Number(afterFirst.rows[0]!.version);
+    expect(
+      await fixture.catalog.reconcileLoggedExportSuccess(
+        fixture.owner,
+        command,
+      ),
+    ).toEqual(first);
+    const divergentResult: LoggedExportSuccessResult = {
+      ...fixture.result,
+      artifacts: fixture.result.artifacts.map((artifact, index) =>
+        index === 0 ? { ...artifact, contentSha256: "9".repeat(64) } : artifact,
+      ),
+    };
+    await expect(
+      fixture.catalog.reconcileLoggedExportSuccess(fixture.owner, {
+        ...command,
+        result: divergentResult,
+      }),
+    ).rejects.toMatchObject({ statusCode: 409 });
+    expect(
+      (
+        await fixture.database.query<{ count: string }>(
+          "SELECT count(*)::text AS count FROM logged_export_success_results",
+        )
+      ).rows[0]!.count,
+    ).toBe("1");
+    expect(
+      (
+        await fixture.database.query<{ count: string }>(
+          `SELECT count(*)::text AS count FROM sync_events
+           WHERE event_type = 'clip_candidate.export_completed'
+             AND entity_id = $1`,
+          [fixture.accepted.request.clipId],
+        )
+      ).rows[0]!.count,
+    ).toBe("1");
+    expect(
+      Number(
+        (
+          await fixture.database.query<{ version: number }>(
+            "SELECT version FROM clip_candidates WHERE id = $1",
+            [fixture.accepted.request.clipId],
+          )
+        ).rows[0]!.version,
+      ),
+    ).toBe(completedVersion);
+    expect(
+      await fixture.catalog.getLoggedExportRequest(
+        fixture.owner,
+        fixture.accepted.request.projectId!,
+        fixture.accepted.request.id,
+      ),
+    ).toMatchObject({
+      state: "complete",
+      resolvedExportBounds: fixture.result.resolvedExportBounds,
+      finalArtifacts: fixture.result.artifacts,
+    });
+    await expect(
+      fixture.database.query(
+        `UPDATE logged_export_success_results
+         SET result_fingerprint = $1 WHERE id = $2`,
+        ["0".repeat(64), first.id],
+      ),
+    ).rejects.toThrow(/immutable/u);
+  });
+
+  it("rejects shaped but request-inconsistent result provenance without any partial authoritative mutation", async () => {
+    const fixture = await createAcceptedLoggedExportResultFixture();
+    const differentRequestId = randomUUID();
+    const differentPackageIdentity = `clip-${differentRequestId}`;
+    const mutations: LoggedExportSuccessResult[] = [
+      {
+        ...fixture.result,
+        requestId: differentRequestId,
+        artifacts: fixture.result.artifacts.map((artifact) => ({
+          ...artifact,
+          packageIdentity: differentPackageIdentity,
+        })),
+      },
+      {
+        ...fixture.result,
+        renderedMediaProvenance: {
+          ...fixture.result.renderedMediaProvenance,
+          settingsSha256: "f".repeat(64),
+        },
+      },
+      {
+        ...fixture.result,
+        renderedMediaProvenance: {
+          ...fixture.result.renderedMediaProvenance,
+          observedProperties: {
+            ...fixture.result.renderedMediaProvenance.observedProperties!,
+            video: {
+              ...fixture.result.renderedMediaProvenance.observedProperties!
+                .video,
+              codec: "hevc",
+            },
+          },
+        },
+      },
+      {
+        ...fixture.result,
+        resolvedExportBounds: {
+          ...fixture.result.resolvedExportBounds,
+          startMs: fixture.result.resolvedExportBounds.startMs + 1,
+        },
+      },
+      {
+        ...fixture.result,
+        englishSubtitleProvenance: {
+          ...fixture.result.englishSubtitleProvenance!,
+          trackId: randomUUID(),
+        },
+      },
+    ];
+    for (const result of mutations) {
+      await expect(
+        fixture.catalog.reconcileLoggedExportSuccess(fixture.owner, {
+          ...reconcileSuccessCommand(fixture),
+          result,
+        }),
+      ).rejects.toMatchObject({ statusCode: 409 });
+    }
+    expect(
+      (
+        await fixture.database.query<{ count: string }>(
+          "SELECT count(*)::text AS count FROM logged_export_success_results",
+        )
+      ).rows[0]!.count,
+    ).toBe("0");
+    expect(
+      (
+        await fixture.database.query<{ count: string }>(
+          `SELECT count(*)::text AS count FROM sync_events
+           WHERE event_type = 'clip_candidate.export_completed'`,
+        )
+      ).rows[0]!.count,
+    ).toBe("0");
+    expect(
+      (
+        await fixture.database.query<{ state: string }>(
+          "SELECT state FROM jobs WHERE id = $1",
+          [fixture.accepted.request.jobId],
+        )
+      ).rows[0]!.state,
+    ).toBe("queued");
+    expect(
+      (
+        await fixture.database.query<{ export_status: string }>(
+          "SELECT export_status FROM clip_candidates WHERE id = $1",
+          [fixture.accepted.request.clipId],
+        )
+      ).rows[0]!.export_status,
+    ).toBe("queued");
+  });
+
+  it("binds bilingual sidecar identities, versions, and English language to the immutable snapshots", async () => {
+    const fixture = await createAcceptedLoggedExportResultFixture(
+      undefined,
+      "foreign",
+    );
+    const command = reconcileSuccessCommand(fixture);
+    const englishIndex = fixture.result.subtitleSidecars!.findIndex(
+      (sidecar) => sidecar.role === "english",
+    );
+    const inconsistentResults: LoggedExportSuccessResult[] = [
+      {
+        ...fixture.result,
+        subtitleSidecars: fixture.result.subtitleSidecars!.map(
+          (sidecar, index) =>
+            index === englishIndex
+              ? { ...sidecar, trackId: randomUUID() }
+              : sidecar,
+        ),
+      },
+      {
+        ...fixture.result,
+        subtitleSidecars: fixture.result.subtitleSidecars!.map(
+          (sidecar, index) =>
+            index === englishIndex
+              ? { ...sidecar, trackVersion: sidecar.trackVersion + 1 }
+              : sidecar,
+        ),
+      },
+      {
+        ...fixture.result,
+        subtitleSidecars: fixture.result.subtitleSidecars!.map(
+          (sidecar, index) =>
+            index === englishIndex ? { ...sidecar, language: "fr" } : sidecar,
+        ),
+      },
+    ];
+    for (const result of inconsistentResults) {
+      await expect(
+        fixture.catalog.reconcileLoggedExportSuccess(fixture.owner, {
+          ...command,
+          result,
+        }),
+      ).rejects.toMatchObject({ statusCode: 409 });
+    }
+    expect(
+      (
+        await fixture.database.query<{ count: string }>(
+          "SELECT count(*)::text AS count FROM logged_export_success_results",
+        )
+      ).rows[0]!.count,
+    ).toBe("0");
+    expect(
+      (
+        await fixture.database.query<{ state: string; export_status: string }>(
+          `SELECT j.state, c.export_status
+           FROM jobs j
+           JOIN export_requests er ON er.job_id = j.id
+           JOIN clip_candidates c ON c.id = er.clip_id
+           WHERE er.id = $1`,
+          [fixture.accepted.request.id],
+        )
+      ).rows[0],
+    ).toMatchObject({ state: "queued", export_status: "queued" });
+    expect(
+      (
+        await fixture.database.query<{ count: string }>(
+          `SELECT count(*)::text AS count FROM sync_events
+           WHERE event_type = 'clip_candidate.export_completed'`,
+        )
+      ).rows[0]!.count,
+    ).toBe("0");
+    expect(
+      (
+        await fixture.catalog.reconcileLoggedExportSuccess(
+          fixture.owner,
+          command,
+        )
+      ).result,
+    ).toEqual(fixture.result);
+  });
+
+  it("requires the current owner epoch, live registration, and project membership at reconciliation", async () => {
+    const clock = { now: new Date("2026-08-20T12:00:00.000Z") };
+    const fixture = await createAcceptedLoggedExportResultFixture(clock);
+    const command = reconcileSuccessCommand(fixture);
+    await expect(
+      fixture.catalog.reconcileLoggedExportSuccess(fixture.owner, {
+        ...command,
+        workerEpoch: command.workerEpoch + 1,
+      }),
+    ).rejects.toMatchObject({ statusCode: 409 });
+    const differentWorker = {
+      ...fixture.worker,
+      workerId: randomUUID(),
+    };
+    await fixture.catalog.registerExportWorker(fixture.owner, differentWorker);
+    await expect(
+      fixture.catalog.reconcileLoggedExportSuccess(fixture.owner, {
+        ...command,
+        workerId: differentWorker.workerId,
+      }),
+    ).rejects.toMatchObject({ statusCode: 409 });
+    const nonOwner = fixtureActor("result-non-owner");
+    await fixture.catalog.registerUser(nonOwner, "Result non-owner");
+    await fixture.database.query(
+      `INSERT INTO project_members (project_id, user_id, role, created_at)
+       VALUES ($1, $2, 'editor', $3)`,
+      [
+        fixture.accepted.request.projectId,
+        nonOwner.userId,
+        clock.now.toISOString(),
+      ],
+    );
+    await expect(
+      fixture.catalog.reconcileLoggedExportSuccess(nonOwner, command),
+    ).rejects.toMatchObject({ statusCode: 403 });
+    await fixture.database.query(
+      "DELETE FROM project_members WHERE project_id = $1 AND user_id = $2",
+      [fixture.accepted.request.projectId, fixture.owner.userId],
+    );
+    await expect(
+      fixture.catalog.reconcileLoggedExportSuccess(fixture.owner, command),
+    ).rejects.toMatchObject({ statusCode: 409 });
+    await fixture.database.query(
+      `INSERT INTO project_members (project_id, user_id, role, created_at)
+       VALUES ($1, $2, 'owner', $3)`,
+      [
+        fixture.accepted.request.projectId,
+        fixture.owner.userId,
+        clock.now.toISOString(),
+      ],
+    );
+    clock.now = new Date("2026-08-20T12:01:01.000Z");
+    await expect(
+      fixture.catalog.reconcileLoggedExportSuccess(fixture.owner, command),
+    ).rejects.toMatchObject({ statusCode: 409 });
+    expect(
+      (
+        await fixture.database.query<{ state: string }>(
+          "SELECT state FROM jobs WHERE id = $1",
+          [fixture.accepted.request.jobId],
+        )
+      ).rows[0]!.state,
+    ).toBe("queued");
+    expect(
+      (
+        await fixture.database.query<{ count: string }>(
+          "SELECT count(*)::text AS count FROM logged_export_success_results",
+        )
+      ).rows[0]!.count,
+    ).toBe("0");
+    await fixture.catalog.registerExportWorker(fixture.owner, fixture.worker);
+    expect(
+      (
+        await fixture.catalog.reconcileLoggedExportSuccess(
+          fixture.owner,
+          command,
+        )
+      ).result.requestId,
+    ).toBe(fixture.accepted.request.id);
+  });
+
+  it("rejects a revoked pinned worker without changing the accepted export", async () => {
+    const fixture = await createAcceptedLoggedExportResultFixture();
+    await fixture.catalog.revokeExportWorker(fixture.owner, {
+      workerId: fixture.worker.workerId,
+      epoch: fixture.worker.epoch,
+    });
+    await expect(
+      fixture.catalog.reconcileLoggedExportSuccess(
+        fixture.owner,
+        reconcileSuccessCommand(fixture),
+      ),
+    ).rejects.toMatchObject({ statusCode: 409 });
+    expect(
+      (
+        await fixture.database.query<{ state: string }>(
+          "SELECT state FROM jobs WHERE id = $1",
+          [fixture.accepted.request.jobId],
+        )
+      ).rows[0]!.state,
+    ).toBe("queued");
+    expect(
+      (
+        await fixture.database.query<{ count: string }>(
+          "SELECT count(*)::text AS count FROM logged_export_success_results",
+        )
+      ).rows[0]!.count,
+    ).toBe("0");
+  });
 });
 
 function fixtureActor(name: string): AuthenticatedActor {
@@ -892,6 +1284,7 @@ async function createLoggedExportFixture(
   actor: AuthenticatedActor,
   idempotencyKey: string,
   family: "h264" | "hevc" = "h264",
+  sourceLanguageClass: "confirmed_english" | "foreign" = "confirmed_english",
 ) {
   const project = await catalog.createProject(actor, {
     name: `Delivery ${idempotencyKey}`,
@@ -947,6 +1340,7 @@ async function createLoggedExportFixture(
     clip.id,
     idempotencyKey,
     family,
+    sourceLanguageClass,
   );
   return { projectId: project.id, clipId: clip.id, request };
 }
@@ -958,6 +1352,7 @@ async function createLoggedExportFromClip(
   clipId: string,
   idempotencyKey: string,
   family: "h264" | "hevc",
+  sourceLanguageClass: "confirmed_english" | "foreign" = "confirmed_english",
 ) {
   const overrides =
     family === "hevc"
@@ -969,13 +1364,243 @@ async function createLoggedExportFromClip(
       : {};
   const selection = { base: "application_default" as const, overrides };
   const preview = await catalog.previewProjectExportSettings(actor, projectId, {
-    sourceLanguageClass: "confirmed_english",
+    sourceLanguageClass,
     selection,
   });
+  const subtitleTracks =
+    sourceLanguageClass === "foreign"
+      ? {
+          original: { trackId: randomUUID(), trackVersion: 3 },
+          english: { trackId: randomUUID(), trackVersion: 4 },
+        }
+      : undefined;
   return catalog.createClipExport(actor, projectId, clipId, {
     idempotencyKey,
-    sourceLanguageClass: "confirmed_english",
+    sourceLanguageClass,
+    ...(subtitleTracks ? { subtitleTracks } : {}),
     settingsSelection: selection,
     expectedResolutionFingerprint: preview.snapshot.resolutionFingerprint!,
   });
+}
+
+async function createAcceptedLoggedExportResultFixture(
+  clock: { now: Date } = { now: new Date("2026-08-20T12:00:00.000Z") },
+  sourceLanguageClass: "confirmed_english" | "foreign" = "confirmed_english",
+) {
+  const database = new PGlite();
+  databases.add(database);
+  await runCloudMigrations(database);
+  const catalog = new SharedProjectCatalog(
+    database,
+    new MemoryTranscriptObjectStore(),
+    () => clock.now,
+  );
+  const owner = fixtureActor("result-owner");
+  await catalog.registerUser(owner, "Result owner");
+  const { request } = await createLoggedExportFixture(
+    catalog,
+    owner,
+    randomUUID(),
+    "h264",
+    sourceLanguageClass,
+  );
+  const advertisement = currentExportWorkerAdvertisement({
+    ffmpegVersion: "8.1.2",
+    encoders: ["libx264", "mov_text"],
+    muxers: ["mp4"],
+    filters: ["scale", "fps"],
+  });
+  const worker = { workerId: randomUUID(), epoch: 1, ...advertisement };
+  await catalog.registerExportWorker(owner, worker);
+  const reserved = (
+    await catalog.claimLoggedExportDelivery(owner, {
+      workerId: worker.workerId,
+      workerEpoch: worker.epoch,
+    })
+  ).delivery!;
+  const accepted = await catalog.acceptLoggedExportDelivery(owner, {
+    workerId: worker.workerId,
+    workerEpoch: worker.epoch,
+    deliveryId: reserved.deliveryId,
+    generation: reserved.generation,
+    reservationToken: reserved.reservationToken,
+  });
+  return {
+    database,
+    catalog,
+    owner,
+    worker,
+    accepted,
+    result: loggedExportSuccessFixture(request, clock.now.toISOString()),
+  };
+}
+
+function reconcileSuccessCommand(
+  fixture: Awaited<ReturnType<typeof createAcceptedLoggedExportResultFixture>>,
+) {
+  return {
+    workerId: fixture.accepted.workerId,
+    workerEpoch: fixture.accepted.workerEpoch,
+    deliveryId: fixture.accepted.deliveryId,
+    generation: fixture.accepted.generation,
+    reservationToken: fixture.accepted.reservationToken,
+    result: fixture.result,
+  };
+}
+
+function loggedExportSuccessFixture(
+  request: ExportRequest,
+  validatedAt: string,
+): LoggedExportSuccessResult {
+  const packageIdentity = `clip-${request.id}`;
+  const sourceAttempt = 1;
+  const artifact = (
+    role:
+      | "clip_metadata_json"
+      | "english_srt"
+      | "manifest_json"
+      | "original_srt"
+      | "thumbnail_jpg"
+      | "video_mp4",
+    digit: string,
+  ) => ({
+    role,
+    packageIdentity,
+    byteSize: 128,
+    contentSha256: digit.repeat(64),
+    sourceAttempt,
+    validatedAt,
+  });
+  return {
+    schemaVersion: 1,
+    requestId: request.id,
+    jobId: request.jobId,
+    projectId: request.projectId!,
+    clipId: request.clipId!,
+    sourceLanguageClass: request.sourceLanguageClass,
+    resolvedExportBounds: {
+      startMs: request.selection.exportStartMs,
+      endMs: request.selection.exportEndMs,
+      sourceAttempt,
+      resolvedAt: validatedAt,
+    },
+    renderedMediaProvenance: {
+      durationMs:
+        request.selection.exportEndMs - request.selection.exportStartMs,
+      containerFormat: "mp4",
+      videoCodec: "h264",
+      audioCodec: "aac",
+      ffprobeVersion: "8.1.2",
+      ffmpegVersion: "8.1.2",
+      verificationSchemaVersion: 1,
+      settingsSha256: sha256Fingerprint(
+        request.resolvedSettingsSnapshot!.settings,
+      ),
+      observedProperties: {
+        schemaVersion: 1,
+        container: { formatNames: ["mp4"] },
+        streamCounts: {
+          total: 2,
+          video: 1,
+          audio: 1,
+          subtitle: 0,
+          data: 0,
+          other: 0,
+        },
+        video: {
+          codec: "h264",
+          profile: "High",
+          pixelFormat: "yuv420p",
+          width: 1_920,
+          height: 1_080,
+          sampleAspectRatio: { numerator: 1, denominator: 1 },
+          displayAspectRatio: { numerator: 16, denominator: 9 },
+          averageFrameRate: { numerator: 30, denominator: 1 },
+        },
+        audio: {
+          codec: "aac",
+          sampleRate: 48_000,
+          channels: 2,
+          channelLayout: "stereo",
+        },
+        durationMs:
+          request.selection.exportEndMs - request.selection.exportStartMs,
+        ffprobeVersion: "8.1.2",
+      },
+      sourceAttempt,
+      validatedAt,
+    },
+    thumbnailProvenance: {
+      extractionTimeMs: Math.floor(
+        (request.selection.exportEndMs - request.selection.exportStartMs) / 2,
+      ),
+      width: 640,
+      height: 360,
+      sourceAttempt,
+      validatedAt,
+    },
+    ...(request.sourceLanguageClass === "confirmed_english"
+      ? {
+          englishSubtitleProvenance: {
+            trackId:
+              request.subtitleTracks?.english.trackId ??
+              request.selection.trackId,
+            trackVersion:
+              request.subtitleTracks?.english.trackVersion ??
+              request.selection.transcriptVersion,
+            cueCount: 1,
+            byteSize: 64,
+            contentSha256: "e".repeat(64),
+            startMs: 0,
+            endMs: request.selection.transcriptEndMs,
+            sourceAttempt,
+            validatedAt,
+          },
+          artifacts: [
+            artifact("clip_metadata_json", "1"),
+            artifact("english_srt", "2"),
+            artifact("manifest_json", "3"),
+            artifact("thumbnail_jpg", "4"),
+            artifact("video_mp4", "5"),
+          ],
+        }
+      : {
+          subtitleSidecars: [
+            {
+              role: "english" as const,
+              language: "en",
+              trackId: request.subtitleTracks!.english.trackId,
+              trackVersion: request.subtitleTracks!.english.trackVersion,
+              cueCount: 1,
+              byteSize: 64,
+              contentSha256: "e".repeat(64),
+              startMs: 0,
+              endMs: request.selection.transcriptEndMs,
+              sourceAttempt,
+              validatedAt,
+            },
+            {
+              role: "original" as const,
+              language: "es",
+              trackId: request.subtitleTracks!.original.trackId,
+              trackVersion: request.subtitleTracks!.original.trackVersion,
+              cueCount: 1,
+              byteSize: 64,
+              contentSha256: "d".repeat(64),
+              startMs: 0,
+              endMs: request.selection.transcriptEndMs,
+              sourceAttempt,
+              validatedAt,
+            },
+          ],
+          artifacts: [
+            artifact("clip_metadata_json", "1"),
+            artifact("english_srt", "2"),
+            artifact("manifest_json", "3"),
+            artifact("original_srt", "4"),
+            artifact("thumbnail_jpg", "5"),
+            artifact("video_mp4", "6"),
+          ],
+        }),
+  };
 }

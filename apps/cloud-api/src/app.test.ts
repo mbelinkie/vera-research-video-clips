@@ -1884,9 +1884,11 @@ describe("logged export delivery API", () => {
     };
     const claimLoggedExportDelivery = vi.fn(async () => ({}));
     const acceptLoggedExportDelivery = vi.fn(async () => ({ accepted: true }));
+    const reconcileLoggedExportSuccess = vi.fn(async () => ({ ok: true }));
     const catalog = {
       claimLoggedExportDelivery,
       acceptLoggedExportDelivery,
+      reconcileLoggedExportSuccess,
     } as unknown as SharedProjectCatalog;
     const app = createCloudApi({ catalog, authenticate: async () => actor });
     apps.add(app);
@@ -1939,5 +1941,115 @@ describe("logged export delivery API", () => {
       generation: 2,
       reservationToken,
     });
+    const result = apiSuccessResultFixture();
+    const reconciled = await app.inject({
+      method: "POST",
+      url: "/api/export-deliveries/reconcile-success",
+      payload: {
+        workerId,
+        workerEpoch: 4,
+        deliveryId,
+        generation: 2,
+        reservationToken,
+        result,
+      },
+    });
+    expect(reconciled.json()).toEqual({ ok: true });
+    expect(reconcileLoggedExportSuccess).toHaveBeenCalledWith(actor, {
+      workerId,
+      workerEpoch: 4,
+      deliveryId,
+      generation: 2,
+      reservationToken,
+      result,
+    });
   });
 });
+
+function apiSuccessResultFixture() {
+  const at = "2026-08-20T12:00:00.000Z";
+  const requestId = randomUUID();
+  const packageIdentity = `clip-${requestId}`;
+  const artifact = (role: string, digit: string) => ({
+    role,
+    packageIdentity,
+    byteSize: 128,
+    contentSha256: digit.repeat(64),
+    sourceAttempt: 1,
+    validatedAt: at,
+  });
+  return {
+    schemaVersion: 1,
+    requestId,
+    jobId: randomUUID(),
+    projectId: randomUUID(),
+    clipId: randomUUID(),
+    sourceLanguageClass: "confirmed_english",
+    resolvedExportBounds: {
+      startMs: 0,
+      endMs: 1_000,
+      sourceAttempt: 1,
+      resolvedAt: at,
+    },
+    renderedMediaProvenance: {
+      durationMs: 1_000,
+      containerFormat: "mp4",
+      videoCodec: "h264",
+      audioCodec: "aac",
+      ffprobeVersion: "8.1.2",
+      ffmpegVersion: "8.1.2",
+      verificationSchemaVersion: 1,
+      settingsSha256: "a".repeat(64),
+      observedProperties: {
+        schemaVersion: 1,
+        container: { formatNames: ["mp4"] },
+        streamCounts: {
+          total: 2,
+          video: 1,
+          audio: 1,
+          subtitle: 0,
+          data: 0,
+          other: 0,
+        },
+        video: {
+          codec: "h264",
+          profile: "High",
+          pixelFormat: "yuv420p",
+          width: 1_920,
+          height: 1_080,
+          sampleAspectRatio: { numerator: 1, denominator: 1 },
+          displayAspectRatio: { numerator: 16, denominator: 9 },
+          averageFrameRate: { numerator: 30, denominator: 1 },
+        },
+        audio: {
+          codec: "aac",
+          sampleRate: 48_000,
+          channels: 2,
+          channelLayout: "stereo",
+        },
+        durationMs: 1_000,
+        ffprobeVersion: "8.1.2",
+      },
+      sourceAttempt: 1,
+      validatedAt: at,
+    },
+    thumbnailProvenance: {
+      extractionTimeMs: 500,
+      width: 640,
+      height: 360,
+      sourceAttempt: 1,
+      validatedAt: at,
+    },
+    subtitleOmissionProvenance: {
+      policy: "confirmed_english_user_setting",
+      sourceAttempt: 1,
+      validatedAt: at,
+    },
+    artifacts: [
+      artifact("clip_metadata_json", "1"),
+      artifact("manifest_json", "2"),
+      artifact("thumbnail_jpg", "3"),
+      artifact("video_mp4", "4"),
+    ],
+  };
+}

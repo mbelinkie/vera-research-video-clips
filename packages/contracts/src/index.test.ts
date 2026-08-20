@@ -15,6 +15,10 @@ import {
   InstalledExportWorkerCapabilitySummarySchema,
   ClaimLoggedExportDeliveryRequestSchema,
   LoggedExportDeliverySchema,
+  LoggedExportSuccessResultSchema,
+  LoggedExportSuccessSchema,
+  ProcessAcceptedLoggedExportRequestSchema,
+  ReconcileLoggedExportSuccessRequestSchema,
   FinalArtifactProvenanceSchema,
   HealthResponseSchema,
   JobSchema,
@@ -92,6 +96,56 @@ describe("shared contracts", () => {
             canonicalUrl: `${delivery.request.video.canonicalUrl}&token=private`,
           },
         },
+      }).success,
+    ).toBe(false);
+  });
+
+  it("accepts only canonical sanitized logged-export success provenance", () => {
+    const result = successResultContractFixture();
+    expect(LoggedExportSuccessResultSchema.parse(result)).toEqual(result);
+    const reconcile = {
+      workerId: "019fbb95-cd76-7920-93fa-e23ba755ee42",
+      workerEpoch: 3,
+      deliveryId: "019fbb95-cd76-7920-93fa-e23ba755ee43",
+      generation: 2,
+      reservationToken: "019fbb95-cd76-7920-93fa-e23ba755ee44",
+      result,
+    };
+    expect(ReconcileLoggedExportSuccessRequestSchema.parse(reconcile)).toEqual(
+      reconcile,
+    );
+    expect(
+      LoggedExportSuccessResultSchema.safeParse({
+        ...result,
+        artifacts: [...result.artifacts].reverse(),
+      }).success,
+    ).toBe(false);
+    expect(
+      LoggedExportSuccessResultSchema.safeParse({
+        ...result,
+        artifacts: result.artifacts.map((artifact, index) => ({
+          ...artifact,
+          sourceAttempt: index === 0 ? 2 : artifact.sourceAttempt,
+        })),
+      }).success,
+    ).toBe(false);
+    expect(
+      ProcessAcceptedLoggedExportRequestSchema.safeParse({
+        requestId: result.requestId,
+        authorizationConfirmed: false,
+      }).success,
+    ).toBe(false);
+    expect(
+      LoggedExportSuccessSchema.safeParse({
+        id,
+        deliveryId: reconcile.deliveryId,
+        generation: reconcile.generation,
+        workerId: reconcile.workerId,
+        workerEpoch: reconcile.workerEpoch,
+        result,
+        resultFingerprint: "a".repeat(64),
+        reconciledAt: now,
+        reservationToken: reconcile.reservationToken,
       }).success,
     ).toBe(false);
   });
@@ -656,5 +710,92 @@ function deliveryContractFixture() {
       createdAt: "2026-08-20T11:59:00.000Z",
       updatedAt: "2026-08-20T11:59:00.000Z",
     },
+  };
+}
+
+function successResultContractFixture() {
+  const requestId = "019fbb95-cd76-7920-93fa-e23ba755ee51";
+  const packageIdentity = `clip-${requestId}`;
+  const artifact = (role: string, hash: string) => ({
+    role,
+    packageIdentity,
+    byteSize: 128,
+    contentSha256: hash.repeat(64),
+    sourceAttempt: 1,
+    validatedAt: now,
+  });
+  return {
+    schemaVersion: 1 as const,
+    requestId,
+    jobId: "019fbb95-cd76-7920-93fa-e23ba755ee52",
+    projectId: "019fbb95-cd76-7920-93fa-e23ba755ee53",
+    clipId: "019fbb95-cd76-7920-93fa-e23ba755ee54",
+    sourceLanguageClass: "confirmed_english" as const,
+    resolvedExportBounds: {
+      startMs: 0,
+      endMs: 1_000,
+      sourceAttempt: 1,
+      resolvedAt: now,
+    },
+    renderedMediaProvenance: {
+      durationMs: 1_000,
+      containerFormat: "mp4",
+      videoCodec: "h264",
+      audioCodec: "aac",
+      ffprobeVersion: "8.1.2",
+      ffmpegVersion: "8.1.2",
+      verificationSchemaVersion: 1 as const,
+      settingsSha256: "a".repeat(64),
+      observedProperties: {
+        schemaVersion: 1 as const,
+        container: { formatNames: ["mp4"] },
+        streamCounts: {
+          total: 2,
+          video: 1,
+          audio: 1,
+          subtitle: 0,
+          data: 0,
+          other: 0,
+        },
+        video: {
+          codec: "h264",
+          profile: "High",
+          pixelFormat: "yuv420p",
+          width: 1_920,
+          height: 1_080,
+          sampleAspectRatio: { numerator: 1, denominator: 1 },
+          displayAspectRatio: { numerator: 16, denominator: 9 },
+          averageFrameRate: { numerator: 30, denominator: 1 },
+        },
+        audio: {
+          codec: "aac",
+          sampleRate: 48_000,
+          channels: 2,
+          channelLayout: "stereo",
+        },
+        durationMs: 1_000,
+        ffprobeVersion: "8.1.2",
+      },
+      sourceAttempt: 1,
+      validatedAt: now,
+    },
+    thumbnailProvenance: {
+      extractionTimeMs: 500,
+      width: 640,
+      height: 360,
+      sourceAttempt: 1,
+      validatedAt: now,
+    },
+    subtitleOmissionProvenance: {
+      policy: "confirmed_english_user_setting" as const,
+      sourceAttempt: 1,
+      validatedAt: now,
+    },
+    artifacts: [
+      artifact("clip_metadata_json", "1"),
+      artifact("manifest_json", "2"),
+      artifact("thumbnail_jpg", "3"),
+      artifact("video_mp4", "4"),
+    ],
   };
 }

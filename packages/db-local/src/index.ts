@@ -9,6 +9,7 @@ import {
   ExportObservedMediaPropertiesSchema,
   ExportRequestSchema,
   LoggedExportDeliverySchema,
+  LoggedExportSuccessResultSchema,
   NormalizedTranscriptSchema,
   ResolvedExportSettingsSnapshotSchema,
   languagesEquivalent,
@@ -17,6 +18,7 @@ import {
   type DerivedTranslationIdentity,
   type ExportRequest,
   type LoggedExportDelivery,
+  type LoggedExportSuccessResult,
   type ExportObservedMediaProperties,
   type ResolvedExportSettingsSnapshot,
   type NormalizedTranscript,
@@ -354,12 +356,14 @@ export class LocalExportQueue {
       const activated = this.database
         .prepare(
           `UPDATE export_requests
-           SET cloud_delivery_state = 'accepted', updated_at = ?
+           SET cloud_delivery_state = 'accepted', cloud_accepted_at = ?,
+               updated_at = ?
            WHERE id = ? AND cloud_delivery_state = 'pending_acceptance'
              AND cloud_delivery_id = ? AND cloud_delivery_generation = ?
              AND cloud_reservation_token = ?`,
         )
         .run(
+          acceptedAt,
           acceptedAt,
           delivery.request.id,
           delivery.deliveryId,
@@ -424,6 +428,87 @@ export class LocalExportQueue {
       reservationExpiresAt: row.cloud_reservation_expires_at,
       request: this.mapRequest(row),
     });
+  }
+
+  getAcceptedLoggedDelivery(
+    requestId: string,
+  ): LoggedExportDelivery | undefined {
+    const row = this.database
+      .prepare(
+        `${localExportRequestSelect}
+         WHERE er.id = ? AND er.cloud_delivery_state = 'accepted'`,
+      )
+      .get(requestId) as Record<string, unknown> | undefined;
+    if (!row || !row.cloud_accepted_at) return undefined;
+    return LoggedExportDeliverySchema.parse({
+      deliveryId: row.cloud_delivery_id,
+      generation: Number(row.cloud_delivery_generation),
+      reservationToken: row.cloud_reservation_token,
+      workerId: row.cloud_worker_id,
+      workerEpoch: Number(row.cloud_worker_epoch),
+      status: "accepted",
+      reservedAt: row.cloud_reserved_at,
+      reservationExpiresAt: row.cloud_reservation_expires_at,
+      acceptedAt: row.cloud_accepted_at,
+      request: this.mapRequest(row),
+    });
+  }
+
+  buildLoggedExportSuccessResult(requestId: string): LoggedExportSuccessResult {
+    const request = this.get(requestId);
+    if (!request || request.mode !== "logged") {
+      throw new LocalExportRequestNotFoundError();
+    }
+    if (
+      request.state !== "complete" ||
+      !request.projectId ||
+      !request.clipId ||
+      !request.resolvedExportBounds ||
+      !request.renderedMediaProvenance ||
+      !request.thumbnailProvenance ||
+      !request.finalArtifacts
+    ) {
+      throw new LocalExportLifecycleError(
+        "Only a verified, cleanup-complete logged export can be reconciled.",
+        "logged_export_result_not_complete",
+      );
+    }
+    const artifacts = [...request.finalArtifacts].sort((left, right) =>
+      left.role < right.role ? -1 : left.role > right.role ? 1 : 0,
+    );
+    const subtitleSidecars = request.subtitleSidecars
+      ? [...request.subtitleSidecars].sort((left, right) =>
+          left.role < right.role ? -1 : left.role > right.role ? 1 : 0,
+        )
+      : undefined;
+    const result = LoggedExportSuccessResultSchema.safeParse({
+      schemaVersion: 1,
+      requestId: request.id,
+      jobId: request.jobId,
+      projectId: request.projectId,
+      clipId: request.clipId,
+      sourceLanguageClass: request.sourceLanguageClass,
+      resolvedExportBounds: request.resolvedExportBounds,
+      renderedMediaProvenance: request.renderedMediaProvenance,
+      thumbnailProvenance: request.thumbnailProvenance,
+      ...(request.subtitleOmissionProvenance
+        ? {
+            subtitleOmissionProvenance: request.subtitleOmissionProvenance,
+          }
+        : {}),
+      ...(request.englishSubtitleProvenance
+        ? { englishSubtitleProvenance: request.englishSubtitleProvenance }
+        : {}),
+      ...(subtitleSidecars ? { subtitleSidecars } : {}),
+      artifacts,
+    });
+    if (!result.success) {
+      throw new LocalExportLifecycleError(
+        "Completed local export provenance is not safe to reconcile.",
+        "logged_export_result_invalid",
+      );
+    }
+    return result.data;
   }
 
   get(requestId: string): ExportRequest | undefined {

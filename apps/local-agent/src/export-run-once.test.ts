@@ -20,7 +20,9 @@ import { loadConfig } from "@research-video/config";
 import {
   ExportClipManifestSchema,
   ExportClipMetadataSchema,
+  type CreateExportOnlyRequest,
   type ExportSettings,
+  type LoggedExportDelivery,
 } from "@research-video/contracts";
 import {
   LocalExportQueue,
@@ -38,6 +40,7 @@ import {
 import {
   availableRendererCapabilityIds,
   rendererCapabilityIdForSettings,
+  resolveExportSettings,
 } from "@research-video/export-settings";
 import {
   normalizeTranscriptFixture,
@@ -340,6 +343,75 @@ describe("one-shot local export runtime", () => {
     expect(await readdir(join(root, "exports"))).toEqual([packageIdentity]);
   });
 
+  it("executes one accepted logged delivery through the same processor and projects a replay-stable safe result", async () => {
+    const root = await createFixtureWorkspace();
+    const request = createFixtureRequest(
+      root,
+      "logged-success",
+      editingSettings,
+      true,
+    );
+    let acquisitionCalls = 0;
+    const options = {
+      config: fixtureConfig(root),
+      sourceProvider: fixtureSourceProvider(() => {
+        acquisitionCalls += 1;
+      }),
+      inspector: new FfprobeMediaInspector({ executable: ffprobePath }),
+      renderer: new FfmpegCapabilityRangeRenderer({ executable: ffmpegPath }),
+    };
+    expect(
+      await runConfiguredLocalExportOnce(
+        { requestId: request.requestId, authorizationConfirmed: true },
+        options,
+      ),
+    ).toMatchObject({ status: "complete", state: "complete" });
+    const database = openLocalDatabase(join(root, "local.sqlite"));
+    let firstResult;
+    try {
+      const queue = new LocalExportQueue(database);
+      expect(queue.getAcceptedLoggedDelivery(request.requestId)).toMatchObject({
+        status: "accepted",
+        request: { id: request.requestId, state: "complete" },
+      });
+      firstResult = queue.buildLoggedExportSuccessResult(request.requestId);
+      expect(firstResult).toMatchObject({
+        requestId: request.requestId,
+        sourceLanguageClass: "foreign",
+        artifacts: [
+          { role: "clip_metadata_json" },
+          { role: "english_srt" },
+          { role: "manifest_json" },
+          { role: "original_srt" },
+          { role: "thumbnail_jpg" },
+          { role: "video_mp4" },
+        ],
+      });
+      expect(JSON.stringify(firstResult)).not.toMatch(
+        /repository-synthetic-4s|reservationToken|sourceIdentity|\/private\//i,
+      );
+    } finally {
+      database.close();
+    }
+    expect(
+      await runConfiguredLocalExportOnce(
+        { requestId: request.requestId, authorizationConfirmed: true },
+        options,
+      ),
+    ).toMatchObject({ status: "already_complete", state: "complete" });
+    const replayDatabase = openLocalDatabase(join(root, "local.sqlite"));
+    try {
+      expect(
+        new LocalExportQueue(replayDatabase).buildLoggedExportSuccessResult(
+          request.requestId,
+        ),
+      ).toEqual(firstResult);
+    } finally {
+      replayDatabase.close();
+    }
+    expect(acquisitionCalls).toBe(1);
+  });
+
   it.each([
     {
       label: "H.264/MP4 with English soft subtitles",
@@ -529,6 +601,7 @@ function createFixtureRequest(
   root: string,
   suffix = "success",
   settings: ExportSettings = editingSettings,
+  logged = false,
 ) {
   const database = openLocalDatabase(join(root, "local.sqlite"));
   try {
@@ -596,7 +669,7 @@ function createFixtureRequest(
         ],
       }),
     });
-    const request = queue.createExportOnly({
+    const input: CreateExportOnlyRequest = {
       idempotencyKey: `runtime-${suffix}`,
       video: {
         youtubeVideoId: videoId,
@@ -625,7 +698,59 @@ function createFixtureRequest(
         name: "Editing MP4",
         settings,
       },
-    });
+    };
+    if (logged) {
+      const preset = input.preset;
+      if (!preset) {
+        throw new Error("Logged export fixture requires an explicit preset");
+      }
+      const at = "2026-08-20T12:00:00.000Z";
+      const resolved = resolveExportSettings({
+        context: "logged",
+        sourceLanguageClass: "foreign",
+        resolvedAt: at,
+      }).snapshot;
+      const delivery: LoggedExportDelivery = {
+        deliveryId: randomUUID(),
+        generation: 1,
+        reservationToken: randomUUID(),
+        workerId: randomUUID(),
+        workerEpoch: 1,
+        status: "reserved",
+        reservedAt: at,
+        reservationExpiresAt: "2026-08-20T12:00:30.000Z",
+        request: {
+          id: randomUUID(),
+          jobId: randomUUID(),
+          mode: "logged",
+          projectId: "019fbb95-cd76-7920-93fa-e23ba755e101",
+          clipId: randomUUID(),
+          video: input.video,
+          selection: input.selection,
+          sourceLanguageClass: input.sourceLanguageClass,
+          subtitleTracks: input.subtitleTracks,
+          preset: {
+            presetId: preset.presetId,
+            presetVersion: preset.presetVersion ?? 1,
+            name: preset.name ?? "Editing MP4",
+            settings: resolved.settings,
+          },
+          resolvedSettingsSnapshot: resolved,
+          state: "queued",
+          createdAt: at,
+          updatedAt: at,
+        },
+      };
+      queue.importLoggedDeliveryPending(delivery);
+      const accepted: LoggedExportDelivery = {
+        ...delivery,
+        status: "accepted",
+        acceptedAt: "2026-08-20T12:00:05.000Z",
+      };
+      const request = queue.activateLoggedDelivery(accepted);
+      return { requestId: request.id };
+    }
+    const request = queue.createExportOnly(input);
     return { requestId: request.id };
   } finally {
     database.close();

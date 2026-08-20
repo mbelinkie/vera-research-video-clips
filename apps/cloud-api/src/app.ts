@@ -36,6 +36,7 @@ import {
   ExportWorkerCompatibilityRequestSchema,
   HeartbeatExportWorkerRequestSchema,
   RegisterExportWorkerRequestSchema,
+  ReconcileLoggedExportSuccessRequestSchema,
   RevokeExportWorkerRequestSchema,
   type AuthenticatedActor,
   type BatchOptions,
@@ -170,6 +171,13 @@ export function createCloudApi(
     catalog.acceptLoggedExportDelivery(
       await authenticate(request),
       AcceptLoggedExportDeliveryRequestSchema.parse(request.body),
+    ),
+  );
+
+  app.post("/api/export-deliveries/reconcile-success", async (request) =>
+    catalog.reconcileLoggedExportSuccess(
+      await authenticate(request),
+      ReconcileLoggedExportSuccessRequestSchema.parse(request.body),
     ),
   );
 

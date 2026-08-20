@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   HealthResponseSchema,
   type LoggedExportDelivery,
+  type LoggedExportSuccessResult,
 } from "@research-video/contracts";
 import {
   currentExportWorkerAdvertisement,
@@ -406,6 +407,170 @@ describe("local agent", () => {
       delivery: { generation: 2, status: "accepted" },
     });
   });
+
+  it("rejects missing authorization, confirmation, or local delivery ownership before processor work", async () => {
+    const delivery = acceptedLoggedDeliveryFixture();
+    const run = vi.fn(async () => ({
+      requestId: delivery.request.id,
+      status: "complete" as const,
+      state: "complete",
+    }));
+    const app = createLocalAgent({
+      workerIdentity: {
+        get: () => ({
+          workerId: "019fbb95-cd76-7920-93fa-e23ba755ee99",
+          epoch: delivery.workerEpoch,
+          advertisementFingerprint: "a".repeat(64),
+          createdAt: delivery.reservedAt,
+          updatedAt: delivery.reservedAt,
+        }),
+        prepareRegistration: () => {
+          throw new Error("not used");
+        },
+      },
+      getAcceptedLoggedDelivery: () => delivery,
+      buildLoggedExportSuccessResult: () => localSuccessResultFixture(delivery),
+      runLoggedExportOnce: run,
+      reconcileLoggedExportSuccess: vi.fn(),
+    });
+    apps.add(app);
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: "/api/export-deliveries/process",
+          payload: {
+            requestId: delivery.request.id,
+            authorizationConfirmed: true,
+          },
+        })
+      ).statusCode,
+    ).toBe(401);
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: "/api/export-deliveries/process",
+          headers: { authorization: "Bearer fixture" },
+          payload: {
+            requestId: delivery.request.id,
+            authorizationConfirmed: false,
+          },
+        })
+      ).statusCode,
+    ).toBe(400);
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: "/api/export-deliveries/process",
+          headers: { authorization: "Bearer fixture" },
+          payload: {
+            requestId: delivery.request.id,
+            authorizationConfirmed: true,
+          },
+        })
+      ).statusCode,
+    ).toBe(409);
+    expect(run).not.toHaveBeenCalled();
+  });
+
+  it("retries both cloud crash windows from the same locally completed result without rerendering", async () => {
+    const delivery = acceptedLoggedDeliveryFixture();
+    const result = localSuccessResultFixture(delivery);
+    const identity = {
+      workerId: delivery.workerId,
+      epoch: delivery.workerEpoch,
+      advertisementFingerprint: "a".repeat(64),
+      createdAt: delivery.reservedAt,
+      updatedAt: delivery.reservedAt,
+    };
+    const run = vi
+      .fn()
+      .mockResolvedValueOnce({
+        requestId: delivery.request.id,
+        status: "complete",
+        state: "complete",
+      })
+      .mockResolvedValue({
+        requestId: delivery.request.id,
+        status: "already_complete",
+        state: "complete",
+      });
+    const unavailable = Object.assign(new Error("cloud unavailable"), {
+      statusCode: 503,
+      code: "export_result_unavailable",
+    });
+    const lostResponse = Object.assign(new Error("response lost"), {
+      statusCode: 503,
+      code: "export_result_response_lost",
+    });
+    const reconciled = {
+      id: "019fbb95-cd76-7920-93fa-e23ba755ee81",
+      deliveryId: delivery.deliveryId,
+      generation: delivery.generation,
+      workerId: delivery.workerId,
+      workerEpoch: delivery.workerEpoch,
+      result,
+      resultFingerprint: "f".repeat(64),
+      reconciledAt: "2026-08-20T12:00:20.000Z",
+    };
+    const reconcile = vi
+      .fn()
+      .mockRejectedValueOnce(unavailable)
+      .mockRejectedValueOnce(lostResponse)
+      .mockResolvedValueOnce(reconciled);
+    const buildResult = vi.fn(() => result);
+    const app = createLocalAgent({
+      workerIdentity: {
+        get: () => identity,
+        prepareRegistration: () => identity,
+      },
+      getAcceptedLoggedDelivery: () => delivery,
+      buildLoggedExportSuccessResult: buildResult,
+      runLoggedExportOnce: run,
+      reconcileLoggedExportSuccess: reconcile,
+    });
+    apps.add(app);
+    const command = {
+      method: "POST" as const,
+      url: "/api/export-deliveries/process",
+      headers: { authorization: "Bearer fixture" },
+      payload: {
+        requestId: delivery.request.id,
+        authorizationConfirmed: true,
+      },
+    };
+    expect((await app.inject(command)).statusCode).toBe(503);
+    expect((await app.inject(command)).statusCode).toBe(503);
+    const recovered = await app.inject(command);
+    expect(recovered.statusCode).toBe(200);
+    expect(recovered.json()).toMatchObject({
+      execution: "already_complete",
+      reconciliation: { id: reconciled.id },
+    });
+    expect(run.mock.calls.map((call) => call[0])).toEqual([
+      {
+        requestId: delivery.request.id,
+        authorizationConfirmed: true,
+      },
+      {
+        requestId: delivery.request.id,
+        authorizationConfirmed: true,
+      },
+      {
+        requestId: delivery.request.id,
+        authorizationConfirmed: true,
+      },
+    ]);
+    expect(buildResult).toHaveBeenCalledTimes(3);
+    expect(reconcile).toHaveBeenCalledTimes(3);
+    expect(reconcile.mock.calls[0]![0]).toEqual(reconcile.mock.calls[1]![0]);
+    expect(reconcile.mock.calls[1]![0]).toEqual(reconcile.mock.calls[2]![0]);
+    expect(JSON.stringify(recovered.json())).not.toMatch(
+      /reservationToken|Bearer fixture|\/private\/|sourceIdentity/i,
+    );
+  });
 });
 
 function exportOnlyFixture() {
@@ -484,5 +649,121 @@ function loggedDeliveryFixture(): LoggedExportDelivery {
       createdAt: "2026-08-20T11:59:00.000Z",
       updatedAt: "2026-08-20T11:59:00.000Z",
     },
+  };
+}
+
+function acceptedLoggedDeliveryFixture(): LoggedExportDelivery {
+  return {
+    ...loggedDeliveryFixture(),
+    status: "accepted",
+    acceptedAt: "2026-08-20T12:00:05.000Z",
+  };
+}
+
+function localSuccessResultFixture(
+  delivery: LoggedExportDelivery,
+): LoggedExportSuccessResult {
+  const at = "2026-08-20T12:00:10.000Z";
+  const packageIdentity = `clip-${delivery.request.id}`;
+  const artifact = (
+    role:
+      | "clip_metadata_json"
+      | "english_srt"
+      | "manifest_json"
+      | "thumbnail_jpg"
+      | "video_mp4",
+    digit: string,
+  ) => ({
+    role,
+    packageIdentity,
+    byteSize: 128,
+    contentSha256: digit.repeat(64),
+    sourceAttempt: 1,
+    validatedAt: at,
+  });
+  return {
+    schemaVersion: 1,
+    requestId: delivery.request.id,
+    jobId: delivery.request.jobId,
+    projectId: delivery.request.projectId!,
+    clipId: delivery.request.clipId!,
+    sourceLanguageClass: "confirmed_english",
+    resolvedExportBounds: {
+      startMs: delivery.request.selection.exportStartMs,
+      endMs: delivery.request.selection.exportEndMs,
+      sourceAttempt: 1,
+      resolvedAt: at,
+    },
+    renderedMediaProvenance: {
+      durationMs:
+        delivery.request.selection.exportEndMs -
+        delivery.request.selection.exportStartMs,
+      containerFormat: "mp4",
+      videoCodec: "h264",
+      audioCodec: "aac",
+      ffprobeVersion: "8.1.2",
+      ffmpegVersion: "8.1.2",
+      verificationSchemaVersion: 1,
+      settingsSha256: "a".repeat(64),
+      observedProperties: {
+        schemaVersion: 1,
+        container: { formatNames: ["mp4"] },
+        streamCounts: {
+          total: 2,
+          video: 1,
+          audio: 1,
+          subtitle: 0,
+          data: 0,
+          other: 0,
+        },
+        video: {
+          codec: "h264",
+          profile: "High",
+          pixelFormat: "yuv420p",
+          width: 1_920,
+          height: 1_080,
+          sampleAspectRatio: { numerator: 1, denominator: 1 },
+          displayAspectRatio: { numerator: 16, denominator: 9 },
+          averageFrameRate: { numerator: 30, denominator: 1 },
+        },
+        audio: {
+          codec: "aac",
+          sampleRate: 48_000,
+          channels: 2,
+          channelLayout: "stereo",
+        },
+        durationMs:
+          delivery.request.selection.exportEndMs -
+          delivery.request.selection.exportStartMs,
+        ffprobeVersion: "8.1.2",
+      },
+      sourceAttempt: 1,
+      validatedAt: at,
+    },
+    thumbnailProvenance: {
+      extractionTimeMs: 1_700,
+      width: 640,
+      height: 360,
+      sourceAttempt: 1,
+      validatedAt: at,
+    },
+    englishSubtitleProvenance: {
+      trackId: delivery.request.selection.trackId,
+      trackVersion: delivery.request.selection.transcriptVersion,
+      cueCount: 1,
+      byteSize: 64,
+      contentSha256: "e".repeat(64),
+      startMs: 0,
+      endMs: 2_900,
+      sourceAttempt: 1,
+      validatedAt: at,
+    },
+    artifacts: [
+      artifact("clip_metadata_json", "1"),
+      artifact("english_srt", "2"),
+      artifact("manifest_json", "3"),
+      artifact("thumbnail_jpg", "4"),
+      artifact("video_mp4", "5"),
+    ],
   };
 }

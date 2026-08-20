@@ -48,6 +48,7 @@ describe("cloud migrations", () => {
       "0011_resolved_export_settings_snapshots",
       "0012_registered_export_workers",
       "0013_logged_export_deliveries",
+      "0014_logged_export_success_results",
     ]);
     expect(await runCloudMigrations(database)).toEqual([]);
     const result = await database.query<{ table_name: string }>(
@@ -78,6 +79,11 @@ describe("cloud migrations", () => {
     ).toContain(
       "accepted_at >= reserved_at) AND (accepted_at < reservation_expires_at)",
     );
+    const resultTable = await database.query<{ table_name: string }>(
+      `SELECT table_name FROM information_schema.tables
+       WHERE table_name = 'logged_export_success_results'`,
+    );
+    expect(resultTable.rows).toHaveLength(1);
   });
 
   it("backfills immutable legacy request/job snapshots from the 0010 schema", async () => {
@@ -213,7 +219,7 @@ describe("cloud migrations", () => {
     ).rejects.toThrow(/immutable/);
   });
 
-  it("adds delivery reservations to a populated 0012 catalog without changing worker registrations", async () => {
+  it("adds delivery and result tables to a populated worker catalog without changing registrations", async () => {
     const directory = mkdtempSync(
       join(tmpdir(), "research-video-pglite-0012-"),
     );
@@ -274,6 +280,32 @@ describe("cloud migrations", () => {
         await database.query<{ table_name: string }>(
           `SELECT table_name FROM information_schema.tables
            WHERE table_name = 'logged_export_deliveries'`,
+        )
+      ).rows,
+    ).toHaveLength(1);
+    copyFileSync(
+      resolve(
+        cloudMigrationDirectory,
+        "0014_logged_export_success_results.sql",
+      ),
+      join(migrations, "0014_logged_export_success_results.sql"),
+    );
+    expect(await runCloudMigrations(database, migrations)).toEqual([
+      "0014_logged_export_success_results",
+    ]);
+    expect(
+      (
+        await database.query(
+          "SELECT * FROM registered_export_workers WHERE id = $1",
+          [workerId],
+        )
+      ).rows[0],
+    ).toEqual(before);
+    expect(
+      (
+        await database.query<{ table_name: string }>(
+          `SELECT table_name FROM information_schema.tables
+           WHERE table_name = 'logged_export_success_results'`,
         )
       ).rows,
     ).toHaveLength(1);

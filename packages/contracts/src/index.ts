@@ -1944,6 +1944,207 @@ export const AcceptLoggedExportDeliveryRequestSchema = z
   })
   .strict();
 
+export const LoggedExportSuccessResultSchema = z
+  .object({
+    schemaVersion: z.literal(1),
+    requestId: IdSchema,
+    jobId: IdSchema,
+    projectId: IdSchema,
+    clipId: IdSchema,
+    sourceLanguageClass: ExportSourceLanguageClassSchema,
+    resolvedExportBounds: ResolvedExportBoundsSchema,
+    renderedMediaProvenance: RenderedExportMediaProvenanceSchema,
+    thumbnailProvenance: ExportThumbnailProvenanceSchema,
+    subtitleOmissionProvenance: SubtitleOmissionProvenanceSchema.optional(),
+    englishSubtitleProvenance:
+      EnglishSubtitleSidecarProvenanceSchema.optional(),
+    subtitleSidecars: z
+      .array(SubtitleSidecarProvenanceSchema)
+      .max(2)
+      .optional(),
+    artifacts: z.array(FinalArtifactProvenanceSchema).min(4).max(6),
+  })
+  .strict()
+  .superRefine((result, context) => {
+    const attempts = [
+      result.resolvedExportBounds.sourceAttempt,
+      result.renderedMediaProvenance.sourceAttempt,
+      result.thumbnailProvenance.sourceAttempt,
+      ...(result.subtitleOmissionProvenance
+        ? [result.subtitleOmissionProvenance.sourceAttempt]
+        : []),
+      ...(result.englishSubtitleProvenance
+        ? [result.englishSubtitleProvenance.sourceAttempt]
+        : []),
+      ...(result.subtitleSidecars ?? []).map(
+        (sidecar) => sidecar.sourceAttempt,
+      ),
+      ...result.artifacts.map((artifact) => artifact.sourceAttempt),
+    ];
+    if (attempts.some((attempt) => attempt !== attempts[0])) {
+      context.addIssue({
+        code: "custom",
+        path: ["artifacts"],
+        message:
+          "A reconciled export result must come from one exact local source attempt.",
+      });
+    }
+    if (
+      !result.renderedMediaProvenance.settingsSha256 ||
+      result.renderedMediaProvenance.verificationSchemaVersion !== 1 ||
+      !result.renderedMediaProvenance.observedProperties
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["renderedMediaProvenance"],
+        message:
+          "A reconciled export requires normalized settings and media-conformance provenance.",
+      });
+    }
+
+    const roles = result.artifacts.map((artifact) => artifact.role);
+    const sortedRoles = [...roles].sort((left, right) =>
+      left < right ? -1 : left > right ? 1 : 0,
+    );
+    if (
+      new Set(roles).size !== roles.length ||
+      roles.some((role, index) => role !== sortedRoles[index])
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["artifacts"],
+        message:
+          "Reconciled artifact roles must be unique and canonically sorted.",
+      });
+    }
+    const requiredCore = [
+      "clip_metadata_json",
+      "manifest_json",
+      "thumbnail_jpg",
+    ] as const;
+    const videoRoles = roles.filter((role) =>
+      ["video_mp4", "video_mkv", "video_mov"].includes(role),
+    );
+    if (
+      videoRoles.length !== 1 ||
+      requiredCore.some((role) => !roles.includes(role))
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["artifacts"],
+        message:
+          "A reconciled export requires one video, metadata, thumbnail, and manifest artifact.",
+      });
+    }
+    const packageIdentity = `clip-${result.requestId}`;
+    if (
+      result.artifacts.some(
+        (artifact) => artifact.packageIdentity !== packageIdentity,
+      )
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["artifacts"],
+        message:
+          "Reconciled artifact identity must match the exact export request.",
+      });
+    }
+
+    const sidecars = result.subtitleSidecars ?? [];
+    const sidecarRolesInOrder = sidecars.map((sidecar) => sidecar.role);
+    if (
+      sidecarRolesInOrder.some(
+        (role, index) =>
+          role !==
+          [...sidecarRolesInOrder].sort((left, right) =>
+            left < right ? -1 : left > right ? 1 : 0,
+          )[index],
+      )
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["subtitleSidecars"],
+        message: "Subtitle result roles must be canonically sorted.",
+      });
+    }
+    if (result.sourceLanguageClass === "confirmed_english") {
+      const omitted = Boolean(result.subtitleOmissionProvenance);
+      if (
+        sidecars.length > 0 ||
+        (omitted &&
+          (result.englishSubtitleProvenance ||
+            roles.includes("english_srt"))) ||
+        (!omitted &&
+          (!result.englishSubtitleProvenance ||
+            !roles.includes("english_srt"))) ||
+        roles.includes("original_srt")
+      ) {
+        context.addIssue({
+          code: "custom",
+          path: ["artifacts"],
+          message:
+            "Confirmed-English result artifacts do not match the recorded sidecar policy.",
+        });
+      }
+    } else {
+      const sidecarRoles = sidecars.map((sidecar) => sidecar.role).sort();
+      if (
+        result.subtitleOmissionProvenance ||
+        result.englishSubtitleProvenance ||
+        sidecars.length !== 2 ||
+        sidecarRoles[0] !== "english" ||
+        sidecarRoles[1] !== "original" ||
+        !roles.includes("english_srt") ||
+        !roles.includes("original_srt")
+      ) {
+        context.addIssue({
+          code: "custom",
+          path: ["artifacts"],
+          message:
+            "Foreign or uncertain-language results require exact original and English sidecar provenance.",
+        });
+      }
+    }
+  });
+
+export const ReconcileLoggedExportSuccessRequestSchema = z
+  .object({
+    workerId: IdSchema,
+    workerEpoch: z.number().int().positive(),
+    deliveryId: IdSchema,
+    generation: z.number().int().positive(),
+    reservationToken: IdSchema,
+    result: LoggedExportSuccessResultSchema,
+  })
+  .strict();
+
+export const LoggedExportSuccessSchema = z
+  .object({
+    id: IdSchema,
+    deliveryId: IdSchema,
+    generation: z.number().int().positive(),
+    workerId: IdSchema,
+    workerEpoch: z.number().int().positive(),
+    result: LoggedExportSuccessResultSchema,
+    resultFingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+    reconciledAt: UtcTimestampSchema,
+  })
+  .strict();
+
+export const ProcessAcceptedLoggedExportRequestSchema = z
+  .object({
+    requestId: IdSchema,
+    authorizationConfirmed: z.literal(true),
+  })
+  .strict();
+
+export const ProcessAcceptedLoggedExportResponseSchema = z
+  .object({
+    execution: z.enum(["complete", "already_complete"]),
+    reconciliation: LoggedExportSuccessSchema,
+  })
+  .strict();
+
 export const JobSchema = z.object({
   id: IdSchema,
   kind: JobKindSchema,
@@ -2178,6 +2379,19 @@ export type ClaimLoggedExportDeliveryResponse = z.infer<
 >;
 export type AcceptLoggedExportDeliveryRequest = z.infer<
   typeof AcceptLoggedExportDeliveryRequestSchema
+>;
+export type LoggedExportSuccessResult = z.infer<
+  typeof LoggedExportSuccessResultSchema
+>;
+export type ReconcileLoggedExportSuccessRequest = z.infer<
+  typeof ReconcileLoggedExportSuccessRequestSchema
+>;
+export type LoggedExportSuccess = z.infer<typeof LoggedExportSuccessSchema>;
+export type ProcessAcceptedLoggedExportRequest = z.infer<
+  typeof ProcessAcceptedLoggedExportRequestSchema
+>;
+export type ProcessAcceptedLoggedExportResponse = z.infer<
+  typeof ProcessAcceptedLoggedExportResponseSchema
 >;
 export type TranscriptArtifact = z.infer<typeof TranscriptArtifactSchema>;
 export type TranscriptManifest = z.infer<typeof TranscriptManifestSchema>;

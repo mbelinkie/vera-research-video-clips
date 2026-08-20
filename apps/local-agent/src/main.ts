@@ -6,6 +6,7 @@ import {
   ExportSettingsPreviewSchema,
   ClaimLoggedExportDeliveryResponseSchema,
   LoggedExportDeliverySchema,
+  LoggedExportSuccessSchema,
   RegisteredExportWorkerSchema,
 } from "@research-video/contracts";
 import {
@@ -23,9 +24,17 @@ import {
   SharedTranscriptWorkspaceService,
   VerifiedTranscriptCache,
 } from "@research-video/sync";
-import { FfmpegCapabilityDiscoveryProvider } from "@research-video/media";
+import {
+  createExportSourceAcquisitionProvider,
+  FfmpegCapabilityDiscoveryProvider,
+  FfmpegCapabilityRangeRenderer,
+  FfmpegJpegThumbnailExtractor,
+  FfprobeJpegThumbnailInspector,
+  FfprobeMediaInspector,
+} from "@research-video/media";
 
 import { createLocalAgent } from "./app.ts";
+import { runLocalExportOnce } from "./export-run-once.ts";
 
 const config = loadConfig();
 await mkdir(config.dataDir, { recursive: true });
@@ -33,6 +42,11 @@ const database = openLocalDatabase(join(config.dataDir, "local.sqlite"));
 runLocalMigrations(database);
 const exportQueue = new LocalExportQueue(database);
 const workerIdentity = new LocalExportWorkerIdentityRepository(database);
+const capabilityProvider = new FfmpegCapabilityDiscoveryProvider();
+const sourceProvider = createExportSourceAcquisitionProvider({
+  mode: config.exportSourceProvider,
+  ytDlpPath: config.ytDlpPath,
+});
 const cache = new VerifiedTranscriptCache(
   database,
   new HttpArtifactDownloader(),
@@ -43,7 +57,7 @@ const reader = new CachedTranscriptDocumentReader(
 );
 const cloudApiUrl = `http://${config.cloudApiHost}:${config.cloudApiPort}`;
 const app = createLocalAgent({
-  capabilityProvider: new FfmpegCapabilityDiscoveryProvider(),
+  capabilityProvider,
   workerIdentity,
   registerExportWorker: async ({ request, authorization }) =>
     callCloudExportWorker(
@@ -70,6 +84,23 @@ const app = createLocalAgent({
   rejectPendingLoggedDelivery: (delivery) =>
     exportQueue.rejectPendingLoggedDelivery(delivery),
   getPendingLoggedDelivery: () => exportQueue.getPendingLoggedDelivery(),
+  getAcceptedLoggedDelivery: (requestId) =>
+    exportQueue.getAcceptedLoggedDelivery(requestId),
+  buildLoggedExportSuccessResult: (requestId) =>
+    exportQueue.buildLoggedExportSuccessResult(requestId),
+  runLoggedExportOnce: (input) =>
+    runLocalExportOnce(input, {
+      queue: exportQueue,
+      ...(sourceProvider ? { sourceProvider } : {}),
+      inspector: new FfprobeMediaInspector(),
+      renderer: new FfmpegCapabilityRangeRenderer(),
+      thumbnailExtractor: new FfmpegJpegThumbnailExtractor(),
+      thumbnailInspector: new FfprobeJpegThumbnailInspector(),
+      capabilityProvider,
+      dataRoot: config.dataDir,
+    }),
+  reconcileLoggedExportSuccess: async ({ request, authorization }) =>
+    callCloudLoggedExportSuccessReconcile(request, authorization),
   createExportOnly: (input, snapshot) =>
     exportQueue.createExportOnly(input, snapshot),
   findExportOnlyByIdempotencyKey: (idempotencyKey) =>
@@ -168,6 +199,18 @@ async function callCloudLoggedExportDeliveryAccept(
     authorization,
   );
   return LoggedExportDeliverySchema.parse(payload);
+}
+
+async function callCloudLoggedExportSuccessReconcile(
+  request: unknown,
+  authorization: string,
+) {
+  const payload = await callCloudDelivery(
+    "/api/export-deliveries/reconcile-success",
+    request,
+    authorization,
+  );
+  return LoggedExportSuccessSchema.parse(payload);
 }
 
 async function callCloudDelivery(

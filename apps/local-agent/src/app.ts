@@ -5,11 +5,16 @@ import {
   CreateExportOnlyRequestSchema,
   ClaimLoggedExportDeliveryResponseSchema,
   ExportSettingsPreviewRequestSchema,
+  ProcessAcceptedLoggedExportRequestSchema,
+  ProcessAcceptedLoggedExportResponseSchema,
   type HeartbeatExportWorkerRequest,
   type AcceptLoggedExportDeliveryRequest,
   type ClaimLoggedExportDeliveryRequest,
   type ClaimLoggedExportDeliveryResponse,
   type LoggedExportDelivery,
+  type LoggedExportSuccess,
+  type LoggedExportSuccessResult,
+  type ReconcileLoggedExportSuccessRequest,
   type RegisterExportWorkerRequest,
   type RegisteredExportWorker,
   type CreateExportOnlyRequest,
@@ -30,6 +35,8 @@ import type {
   LocalExportWorkerIdentityRepository,
 } from "@research-video/db-local";
 import type { WorkspaceTranscriptResolution } from "@research-video/sync";
+
+import type { LocalExportOnceResult } from "./export-run-once.ts";
 
 export interface LocalAgentDependencies {
   resolveTranscript?(input: {
@@ -74,6 +81,18 @@ export interface LocalAgentDependencies {
   activateLoggedDelivery?(delivery: LoggedExportDelivery): ExportRequest;
   rejectPendingLoggedDelivery?(delivery: LoggedExportDelivery): void;
   getPendingLoggedDelivery?(): LoggedExportDelivery | undefined;
+  getAcceptedLoggedDelivery?(
+    requestId: string,
+  ): LoggedExportDelivery | undefined;
+  buildLoggedExportSuccessResult?(requestId: string): LoggedExportSuccessResult;
+  runLoggedExportOnce?(input: {
+    requestId: string;
+    authorizationConfirmed: boolean;
+  }): Promise<LocalExportOnceResult>;
+  reconcileLoggedExportSuccess?(input: {
+    request: ReconcileLoggedExportSuccessRequest;
+    authorization: string;
+  }): Promise<LoggedExportSuccess>;
 }
 
 const TranscriptParamsSchema = z.object({
@@ -396,6 +415,84 @@ export function createLocalAgent(
       dependencies.activateLoggedDelivery!(accepted);
       return ClaimLoggedExportDeliveryResponseSchema.parse({
         delivery: accepted,
+      });
+    });
+  }
+
+  if (
+    dependencies?.workerIdentity &&
+    dependencies.getAcceptedLoggedDelivery &&
+    dependencies.buildLoggedExportSuccessResult &&
+    dependencies.runLoggedExportOnce &&
+    dependencies.reconcileLoggedExportSuccess
+  ) {
+    app.post("/api/export-deliveries/process", async (request) => {
+      const authorization = request.headers.authorization;
+      if (!authorization) {
+        throw new LocalAuthenticationError(
+          "Authentication is required to process a delivered logged export.",
+        );
+      }
+      const command = ProcessAcceptedLoggedExportRequestSchema.parse(
+        request.body,
+      );
+      const identity = dependencies.workerIdentity!.get();
+      if (!identity) {
+        throw new LocalExportSettingsError(
+          "Register this local export worker before processing logged exports.",
+          "worker_registration_required",
+          409,
+        );
+      }
+      const delivery = dependencies.getAcceptedLoggedDelivery!(
+        command.requestId,
+      );
+      if (!delivery) {
+        throw new LocalExportSettingsError(
+          "This logged export has not been durably accepted by the local worker.",
+          "logged_export_delivery_not_accepted",
+          409,
+        );
+      }
+      if (
+        delivery.workerId !== identity.workerId ||
+        delivery.workerEpoch !== identity.epoch
+      ) {
+        throw new LocalExportSettingsError(
+          "The accepted delivery belongs to a different local worker identity or epoch.",
+          "export_delivery_ownership_mismatch",
+          409,
+        );
+      }
+
+      const execution = await dependencies.runLoggedExportOnce!({
+        requestId: command.requestId,
+        authorizationConfirmed: command.authorizationConfirmed,
+      });
+      if (execution.status === "failed") {
+        throw new LocalExportSettingsError(
+          execution.error?.message ?? "Local export processing failed.",
+          execution.error?.code ?? "export_runtime_failed",
+          409,
+        );
+      }
+      const result = dependencies.buildLoggedExportSuccessResult!(
+        command.requestId,
+      );
+      const reconciliation = await dependencies.reconcileLoggedExportSuccess!({
+        authorization,
+        request: {
+          workerId: identity.workerId,
+          workerEpoch: identity.epoch,
+          deliveryId: delivery.deliveryId,
+          generation: delivery.generation,
+          reservationToken: delivery.reservationToken,
+          result,
+        },
+      });
+      return ProcessAcceptedLoggedExportResponseSchema.parse({
+        execution: execution.status,
+        reconciliation,
       });
     });
   }

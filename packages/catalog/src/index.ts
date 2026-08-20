@@ -21,6 +21,9 @@ import {
   ClaimLoggedExportDeliveryRequestSchema,
   ClaimLoggedExportDeliveryResponseSchema,
   LoggedExportDeliverySchema,
+  LoggedExportSuccessResultSchema,
+  LoggedExportSuccessSchema,
+  ReconcileLoggedExportSuccessRequestSchema,
   ExportSettingsSchema,
   ExportWorkerCompatibilityRequestSchema,
   HeartbeatExportWorkerRequestSchema,
@@ -74,6 +77,9 @@ import {
   type RegisterExportWorkerRequest,
   type RegisteredExportWorker,
   type LoggedExportDelivery,
+  type LoggedExportSuccess,
+  type LoggedExportSuccessResult,
+  type ReconcileLoggedExportSuccessRequest,
   type RevokeExportWorkerRequest,
   type ExportSettingsPreviewRequest,
   type PersonalExportPresetCatalog,
@@ -103,10 +109,12 @@ import {
   type WorkerProgressStage,
 } from "@research-video/contracts";
 import {
+  canonicalJson,
   exportWorkerAdvertisementFingerprint,
   isRegisterableExportWorkerCapability,
   resolveExportSettings,
   resolvedPresetForCompatibility,
+  sha256Fingerprint,
 } from "@research-video/export-settings";
 import {
   MemoryStagedUploadUrlIssuer,
@@ -200,16 +208,24 @@ const sha256 = (bytes: Uint8Array) =>
   createHash("sha256").update(bytes).digest("hex");
 
 const clipCandidateSelect = "SELECT c.* FROM clip_candidates c";
-const loggedExportRequestSelect = `SELECT er.*, j.state
+const loggedExportRequestSelect = `SELECT er.*, j.state,
+   export_success.result_json AS export_success_result_json
  FROM export_requests er
- JOIN jobs j ON j.id = er.job_id`;
+ JOIN jobs j ON j.id = er.job_id
+ LEFT JOIN logged_export_success_results export_success
+   ON export_success.export_request_id = er.id`;
 const loggedExportDeliverySelect = `SELECT
    d.id AS delivery_id, d.generation AS delivery_generation,
    d.reservation_token, d.worker_id, d.worker_epoch, d.reserved_at,
-   d.reservation_expires_at, d.accepted_at, er.*, j.state
+   d.reservation_expires_at, d.accepted_at, er.*, j.state,
+   export_success.result_json AS export_success_result_json,
+   delivery_clip.export_status AS delivery_clip_export_status
  FROM logged_export_deliveries d
  JOIN export_requests er ON er.id = d.export_request_id
- JOIN jobs j ON j.id = er.job_id`;
+ JOIN jobs j ON j.id = er.job_id
+ JOIN clip_candidates delivery_clip ON delivery_clip.id = er.clip_id
+ LEFT JOIN logged_export_success_results export_success
+   ON export_success.export_request_id = er.id`;
 
 export class SharedProjectCatalog {
   constructor(
@@ -637,6 +653,182 @@ export class SharedProjectCatalog {
       throw new CatalogConflictError("Delivery acceptance did not persist.");
     }
     return mapLoggedExportDelivery(accepted);
+  }
+
+  async reconcileLoggedExportSuccess(
+    actor: AuthenticatedActor,
+    input: ReconcileLoggedExportSuccessRequest,
+  ): Promise<LoggedExportSuccess> {
+    await this.requireRegistered(actor);
+    const parsed = ReconcileLoggedExportSuccessRequestSchema.parse(input);
+    const now = this.now();
+    const nowIso = now.toISOString();
+    const resultFingerprint = sha256Fingerprint(parsed.result);
+    let reconciled: DbRow | undefined;
+
+    await this.transaction(async () => {
+      const worker = await this.database.query<DbRow>(
+        "SELECT * FROM registered_export_workers WHERE id = $1 FOR UPDATE",
+        [parsed.workerId],
+      );
+      const workerRow = worker.rows[0];
+      if (workerRow && String(workerRow.owner_user_id) !== actor.userId) {
+        throw new AuthorizationError(
+          "This worker identity belongs to another user.",
+        );
+      }
+      if (
+        !workerRow ||
+        Number(workerRow.epoch) !== parsed.workerEpoch ||
+        workerRow.revoked_at ||
+        new Date(iso(workerRow.expires_at)).getTime() <= now.getTime()
+      ) {
+        throw new CatalogConflictError(
+          "Worker registration is missing, stale, expired, or revoked.",
+        );
+      }
+
+      const deliveryResult = await this.database.query<DbRow>(
+        `${loggedExportDeliverySelect}
+         JOIN project_members result_members
+           ON result_members.project_id = er.project_id
+          AND result_members.user_id = $1
+         WHERE d.id = $2 AND d.worker_id = $3 AND d.worker_epoch = $4
+           AND d.generation = $5 AND d.reservation_token = $6
+           AND d.accepted_at IS NOT NULL
+         FOR UPDATE OF d, er, j, delivery_clip`,
+        [
+          actor.userId,
+          parsed.deliveryId,
+          parsed.workerId,
+          parsed.workerEpoch,
+          parsed.generation,
+          parsed.reservationToken,
+        ],
+      );
+      const delivery = deliveryResult.rows[0];
+      if (!delivery) {
+        throw new CatalogConflictError(
+          "The accepted export delivery is stale, mismatched, or unauthorized.",
+        );
+      }
+      assertLoggedExportSuccessMatchesRequest(delivery, parsed.result);
+
+      const existingResult = await this.database.query<DbRow>(
+        `SELECT * FROM logged_export_success_results
+         WHERE export_request_id = $1 OR delivery_id = $2
+         FOR UPDATE`,
+        [delivery.id, parsed.deliveryId],
+      );
+      const existing = existingResult.rows[0];
+      if (existing) {
+        const mapped = mapLoggedExportSuccess(existing);
+        if (
+          String(existing.export_request_id) !== String(delivery.id) ||
+          String(existing.delivery_id) !== parsed.deliveryId ||
+          String(existing.result_fingerprint) !== resultFingerprint ||
+          canonicalJson(mapped.result) !== canonicalJson(parsed.result)
+        ) {
+          throw new CatalogConflictError(
+            "A different immutable result is already reconciled for this export.",
+          );
+        }
+        if (
+          String(delivery.state) !== "complete" ||
+          String(delivery.delivery_clip_export_status) !== "complete"
+        ) {
+          throw new CatalogConflictError(
+            "The existing export result has inconsistent authoritative state.",
+          );
+        }
+        reconciled = existing;
+        return;
+      }
+
+      if (
+        String(delivery.state) !== "queued" ||
+        String(delivery.delivery_clip_export_status) !== "queued"
+      ) {
+        throw new CatalogConflictError(
+          "Only the exact queued accepted export can record its first result.",
+        );
+      }
+
+      const resultId = randomUUID();
+      const inserted = await this.database.query<DbRow>(
+        `INSERT INTO logged_export_success_results
+           (id, export_request_id, delivery_id, delivery_generation,
+            worker_id, worker_epoch, result_schema_version, result_json,
+            result_fingerprint, reconciled_at)
+         VALUES ($1, $2, $3, $4, $5, $6, 1, $7, $8, $9)
+         RETURNING *`,
+        [
+          resultId,
+          delivery.id,
+          parsed.deliveryId,
+          parsed.generation,
+          parsed.workerId,
+          parsed.workerEpoch,
+          JSON.stringify(parsed.result),
+          resultFingerprint,
+          nowIso,
+        ],
+      );
+      const completedJob = await this.database.query<DbRow>(
+        `UPDATE jobs SET state = 'complete', updated_at = $1
+         WHERE id = $2 AND kind = 'export' AND state = 'queued'
+         RETURNING id`,
+        [nowIso, parsed.result.jobId],
+      );
+      if (!completedJob.rows[0]) {
+        throw new CatalogConflictError(
+          "The exact export job is no longer queued for completion.",
+        );
+      }
+      const completedClip = await this.database.query<DbRow>(
+        `UPDATE clip_candidates
+         SET export_status = 'complete', version = version + 1, updated_at = $1
+         WHERE id = $2 AND project_id = $3 AND export_status = 'queued'
+         RETURNING version`,
+        [nowIso, parsed.result.clipId, parsed.result.projectId],
+      );
+      if (!completedClip.rows[0]) {
+        throw new CatalogConflictError(
+          "The exact logged clip is no longer queued for completion.",
+        );
+      }
+      await this.database.query(
+        `INSERT INTO sync_events
+           (project_id, event_type, entity_id, server_version, payload, created_at)
+         VALUES ($1, 'clip_candidate.export_completed', $2, $3, $4, $5)`,
+        [
+          parsed.result.projectId,
+          parsed.result.clipId,
+          completedClip.rows[0].version,
+          JSON.stringify({
+            clipId: parsed.result.clipId,
+            exportRequestId: parsed.result.requestId,
+            jobId: parsed.result.jobId,
+            resultId,
+            packageIdentity: parsed.result.artifacts[0]!.packageIdentity,
+            artifacts: parsed.result.artifacts.map(
+              ({ role, byteSize, contentSha256 }) => ({
+                role,
+                byteSize,
+                contentSha256,
+              }),
+            ),
+          }),
+          nowIso,
+        ],
+      );
+      reconciled = inserted.rows[0];
+    });
+
+    if (!reconciled) {
+      throw new CatalogConflictError("Export result reconciliation failed.");
+    }
+    return mapLoggedExportSuccess(reconciled);
   }
 
   async compatibleExportWorkerAvailability(
@@ -3920,6 +4112,138 @@ function mapLoggedExportDelivery(row: DbRow): LoggedExportDelivery {
   });
 }
 
+function mapLoggedExportSuccess(row: DbRow): LoggedExportSuccess {
+  return LoggedExportSuccessSchema.parse({
+    id: row.id,
+    deliveryId: row.delivery_id,
+    generation: Number(row.delivery_generation),
+    workerId: row.worker_id,
+    workerEpoch: Number(row.worker_epoch),
+    result:
+      typeof row.result_json === "string"
+        ? JSON.parse(row.result_json)
+        : row.result_json,
+    resultFingerprint: row.result_fingerprint,
+    reconciledAt: iso(row.reconciled_at),
+  });
+}
+
+function assertLoggedExportSuccessMatchesRequest(
+  row: DbRow,
+  result: LoggedExportSuccessResult,
+): void {
+  const request = mapLoggedExportRequest({
+    ...row,
+    export_success_result_json: undefined,
+  });
+  if (
+    result.requestId !== request.id ||
+    result.jobId !== request.jobId ||
+    result.projectId !== request.projectId ||
+    result.clipId !== request.clipId ||
+    result.sourceLanguageClass !== request.sourceLanguageClass
+  ) {
+    throw new CatalogConflictError(
+      "Export result identity does not match the immutable queued request.",
+    );
+  }
+  const snapshot = request.resolvedSettingsSnapshot;
+  const observed = result.renderedMediaProvenance.observedProperties;
+  if (
+    !snapshot ||
+    !observed ||
+    result.renderedMediaProvenance.settingsSha256 !==
+      sha256Fingerprint(snapshot.settings)
+  ) {
+    throw new CatalogConflictError(
+      "Export result settings provenance does not match the immutable queued request.",
+    );
+  }
+  const expectedFormat =
+    snapshot.settings.container === "mkv"
+      ? "matroska"
+      : snapshot.settings.container;
+  const expectedVideoRole = `video_${snapshot.settings.container}`;
+  const videoArtifacts = result.artifacts.filter((artifact) =>
+    artifact.role.startsWith("video_"),
+  );
+  if (
+    !observed.container.formatNames.includes(expectedFormat) ||
+    observed.video.codec !== snapshot.settings.videoCodec ||
+    observed.audio.codec !== snapshot.settings.audioCodec ||
+    videoArtifacts.length !== 1 ||
+    videoArtifacts[0]!.role !== expectedVideoRole
+  ) {
+    throw new CatalogConflictError(
+      "Export result media family does not match the immutable resolved settings.",
+    );
+  }
+  const bounds = result.resolvedExportBounds;
+  const expectedDuration = bounds.endMs - bounds.startMs;
+  if (
+    bounds.startMs !== request.selection.exportStartMs ||
+    bounds.endMs > request.selection.exportEndMs ||
+    Math.abs(result.renderedMediaProvenance.durationMs - expectedDuration) >
+      250 ||
+    observed.durationMs !== result.renderedMediaProvenance.durationMs ||
+    result.thumbnailProvenance.extractionTimeMs >=
+      result.renderedMediaProvenance.durationMs
+  ) {
+    throw new CatalogConflictError(
+      "Export result bounds or duration do not match the immutable requested range.",
+    );
+  }
+
+  if (request.sourceLanguageClass === "confirmed_english") {
+    const shouldOmit = snapshot.settings.omitSubtitleFilesForConfirmedEnglish;
+    const omitted = Boolean(result.subtitleOmissionProvenance);
+    if (omitted !== shouldOmit) {
+      throw new CatalogConflictError(
+        "Confirmed-English result omission does not match the immutable setting.",
+      );
+    }
+    if (!shouldOmit) {
+      const expectedEnglish = request.subtitleTracks?.english ?? {
+        trackId: request.selection.trackId,
+        trackVersion: request.selection.transcriptVersion,
+      };
+      const actualEnglish = result.englishSubtitleProvenance;
+      if (
+        !actualEnglish ||
+        actualEnglish.trackId !== expectedEnglish.trackId ||
+        actualEnglish.trackVersion !== expectedEnglish.trackVersion
+      ) {
+        throw new CatalogConflictError(
+          "English subtitle result does not match the immutable transcript snapshot.",
+        );
+      }
+    }
+    return;
+  }
+
+  const snapshots = request.subtitleTracks;
+  const original = result.subtitleSidecars?.find(
+    (sidecar) => sidecar.role === "original",
+  );
+  const english = result.subtitleSidecars?.find(
+    (sidecar) => sidecar.role === "english",
+  );
+  if (
+    !snapshots ||
+    !original ||
+    !english ||
+    original.trackId !== snapshots.original.trackId ||
+    original.trackVersion !== snapshots.original.trackVersion ||
+    english.trackId !== snapshots.english.trackId ||
+    english.trackVersion !== snapshots.english.trackVersion ||
+    primaryLanguage(english.language) !== "en"
+  ) {
+    throw new CatalogConflictError(
+      "Bilingual result does not match the immutable transcript snapshots.",
+    );
+  }
+}
+
 function sameExportWorkerAdvertisement(
   row: DbRow,
   input: RegisterExportWorkerRequest,
@@ -4060,6 +4384,13 @@ function mapClipCandidate(
 }
 
 function mapLoggedExportRequest(row: DbRow): ExportRequest {
+  const success = row.export_success_result_json
+    ? LoggedExportSuccessResultSchema.parse(
+        typeof row.export_success_result_json === "string"
+          ? JSON.parse(row.export_success_result_json)
+          : row.export_success_result_json,
+      )
+    : undefined;
   return ExportRequestSchema.parse({
     id: row.id,
     jobId: row.job_id,
@@ -4074,6 +4405,27 @@ function mapLoggedExportRequest(row: DbRow): ExportRequest {
       : {}),
     preset: row.preset_snapshot,
     resolvedSettingsSnapshot: row.resolved_settings_snapshot,
+    ...(success
+      ? {
+          resolvedExportBounds: success.resolvedExportBounds,
+          renderedMediaProvenance: success.renderedMediaProvenance,
+          thumbnailProvenance: success.thumbnailProvenance,
+          ...(success.subtitleOmissionProvenance
+            ? {
+                subtitleOmissionProvenance: success.subtitleOmissionProvenance,
+              }
+            : {}),
+          ...(success.englishSubtitleProvenance
+            ? {
+                englishSubtitleProvenance: success.englishSubtitleProvenance,
+              }
+            : {}),
+          ...(success.subtitleSidecars
+            ? { subtitleSidecars: success.subtitleSidecars }
+            : {}),
+          finalArtifacts: success.artifacts,
+        }
+      : {}),
     state: row.state,
     createdAt: iso(row.created_at),
     updatedAt: iso(row.updated_at),

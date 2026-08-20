@@ -143,6 +143,7 @@ describe("local migrations", () => {
       "0017_alternative_render_conformance",
       "0018_registered_export_worker_identity",
       "0019_logged_export_delivery_import",
+      "0020_logged_export_delivery_acceptance_time",
     ]);
     expect(runLocalMigrations(database)).toEqual([]);
     expect(
@@ -454,6 +455,7 @@ describe("local migrations", () => {
       "0017_alternative_render_conformance",
       "0018_registered_export_worker_identity",
       "0019_logged_export_delivery_import",
+      "0020_logged_export_delivery_acceptance_time",
     ]);
     expect(
       database.prepare("SELECT * FROM export_final_artifacts").all(),
@@ -578,6 +580,7 @@ describe("local migrations", () => {
       "0017_alternative_render_conformance",
       "0018_registered_export_worker_identity",
       "0019_logged_export_delivery_import",
+      "0020_logged_export_delivery_acceptance_time",
     ]);
     expect(
       database
@@ -717,7 +720,10 @@ describe("logged export delivery import", () => {
     temporaryDirectories.add(directory);
     const database = openLocalDatabase(join(directory, "delivery.sqlite"));
     runLocalMigrations(database);
-    const queue = new LocalExportQueue(database);
+    const queue = new LocalExportQueue(
+      database,
+      () => new Date("2026-08-20T12:00:10.000Z"),
+    );
     const delivery = fixtureLoggedDelivery();
     const partialJobId = "019fbb95-cd76-7920-93fa-e23ba755ef21";
     database
@@ -824,7 +830,101 @@ describe("logged export delivery import", () => {
       projectId: delivery.request.projectId,
       clipId: delivery.request.clipId,
     });
-    expect(queue.beginSourceAcquisition(pending.id).attempt).toBe(1);
+    expect(queue.getAcceptedLoggedDelivery(pending.id)).toMatchObject({
+      status: "accepted",
+      acceptedAt: accepted.acceptedAt,
+      reservationToken: delivery.reservationToken,
+      request: { id: pending.id, state: "queued" },
+    });
+    const attempt = queue.beginSourceAcquisition(pending.id).attempt;
+    expect(attempt).toBe(1);
+    queue.recordSourceReady(pending.jobId, attempt, {
+      provider: "fixture",
+      sourceIdentity: "private-source-identity-not-for-cloud",
+      byteSize: 123,
+      contentSha256: "a".repeat(64),
+    });
+    queue.recordSourceInspection(
+      pending.jobId,
+      attempt,
+      { durationMs: 3_200 },
+      { startMs: 0, endMs: 3_200 },
+    );
+    queue.recordRenderedOutputValidation(pending.jobId, attempt, {
+      durationMs: 3_200,
+      ffprobeVersion: "7.1",
+      ffmpegVersion: "7.1",
+      verificationSchemaVersion: 1,
+      settingsSha256: sha256Fingerprint(
+        pending.resolvedSettingsSnapshot!.settings,
+      ),
+      observedProperties: fixtureObservedProperties,
+    });
+    queue.recordThumbnailValidation(pending.jobId, attempt, {
+      extractionTimeMs: 1_600,
+      width: 640,
+      height: 360,
+    });
+    queue.recordEnglishSubtitleValidation(pending.jobId, attempt, {
+      trackId: pending.selection.trackId,
+      trackVersion: pending.selection.transcriptVersion,
+      cueCount: 1,
+      byteSize: 64,
+      contentSha256: "b".repeat(64),
+      startMs: 300,
+      endMs: 2_900,
+    });
+    const packageIdentity = `clip-${pending.id}`;
+    const finalArtifact = (
+      role:
+        | "video_mp4"
+        | "english_srt"
+        | "clip_metadata_json"
+        | "thumbnail_jpg"
+        | "manifest_json",
+      digit: string,
+    ) => ({
+      role,
+      packageIdentity,
+      byteSize: 128,
+      contentSha256: digit.repeat(64),
+      sourceAttempt: attempt,
+      validatedAt: "2026-08-20T12:00:10.000Z",
+    });
+    queue.recordFinalArtifactPromotion(pending.jobId, attempt, [
+      finalArtifact("video_mp4", "1"),
+      finalArtifact("english_srt", "2"),
+      finalArtifact("clip_metadata_json", "3"),
+      finalArtifact("thumbnail_jpg", "4"),
+      finalArtifact("manifest_json", "5"),
+    ]);
+    queue.recordSourceCleanupStarted(pending.jobId, attempt);
+    queue.recordSourceCleanupSucceeded(pending.jobId, attempt);
+    const result = queue.buildLoggedExportSuccessResult(pending.id);
+    expect(result).toMatchObject({
+      requestId: pending.id,
+      jobId: pending.jobId,
+      projectId: pending.projectId,
+      clipId: pending.clipId,
+      sourceLanguageClass: "confirmed_english",
+      artifacts: [
+        { role: "clip_metadata_json" },
+        { role: "english_srt" },
+        { role: "manifest_json" },
+        { role: "thumbnail_jpg" },
+        { role: "video_mp4" },
+      ],
+    });
+    expect(JSON.stringify(result)).not.toMatch(
+      /private-source-identity|reservationToken|cloudAcceptedAt|path/i,
+    );
+    expect(() =>
+      database
+        .prepare(
+          "UPDATE export_requests SET cloud_accepted_at = ? WHERE id = ?",
+        )
+        .run("2026-08-20T12:00:06.000Z", pending.id),
+    ).toThrow(/acceptance time is immutable/u);
     database.close();
   });
 
@@ -924,6 +1024,7 @@ describe("logged export delivery import", () => {
       .get(before.id);
     expect(runLocalMigrations(database, localMigrationDirectory)).toEqual([
       "0019_logged_export_delivery_import",
+      "0020_logged_export_delivery_acceptance_time",
     ]);
     const after = new LocalExportQueue(database).get(before.id);
     expect(after).toEqual(before);
@@ -936,7 +1037,7 @@ describe("logged export delivery import", () => {
            WHERE id = ?`,
         )
         .run(before.id),
-    ).toThrow(/only transition from pending acceptance to accepted/u);
+    ).toThrow(/acceptance/u);
     expect(new LocalExportQueue(database).get(before.id)).toEqual(before);
     expect(
       database
@@ -945,6 +1046,53 @@ describe("logged export delivery import", () => {
         )
         .get(before.id),
     ).toEqual(rawSnapshot);
+    database.close();
+  });
+
+  it("backfills the exact accepted-at value for a populated M5-16 delivery", () => {
+    const directory = mkdtempSync(
+      join(tmpdir(), "research-video-populated-0019-"),
+    );
+    temporaryDirectories.add(directory);
+    const through0019 = join(directory, "migrations");
+    mkdirSync(through0019);
+    for (const filename of readdirSync(localMigrationDirectory)) {
+      if (filename < "0020") {
+        copyFileSync(
+          resolve(localMigrationDirectory, filename),
+          join(through0019, filename),
+        );
+      }
+    }
+    const database = openLocalDatabase(join(directory, "populated.sqlite"));
+    runLocalMigrations(database, through0019);
+    const delivery = fixtureLoggedDelivery();
+    const queue = new LocalExportQueue(database);
+    queue.importLoggedDeliveryPending(delivery);
+    const acceptedAt = "2026-08-20T12:00:05.000Z";
+    database
+      .prepare(
+        `UPDATE export_requests
+         SET cloud_delivery_state = 'accepted', updated_at = ?
+         WHERE id = ?`,
+      )
+      .run(acceptedAt, delivery.request.id);
+    database
+      .prepare("UPDATE jobs SET state = 'queued', updated_at = ? WHERE id = ?")
+      .run(acceptedAt, delivery.request.jobId);
+    expect(runLocalMigrations(database, localMigrationDirectory)).toEqual([
+      "0020_logged_export_delivery_acceptance_time",
+    ]);
+    expect(
+      new LocalExportQueue(database).getAcceptedLoggedDelivery(
+        delivery.request.id,
+      ),
+    ).toMatchObject({
+      deliveryId: delivery.deliveryId,
+      generation: delivery.generation,
+      acceptedAt,
+      request: { id: delivery.request.id, state: "queued" },
+    });
     database.close();
   });
 });
