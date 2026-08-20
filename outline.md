@@ -297,14 +297,18 @@ produce preferred SRT artifacts.
   local queue, and recover lost acceptance or reject stale generations without
   starting media work
   (`specs/completed/M5-16-authorized-logged-export-delivery-to-local-worker.md`).
+- [x] M5-17: execute one already accepted logged export through the existing
+  local processor and atomically reconcile one immutable sanitized success with
+  exact-replay recovery
+  (`specs/completed/M5-17-execute-and-reconcile-logged-export-success.md`).
 - [x] Generate and verify thumbnail, metadata JSON, and manifest.
 - [x] Use private staging plus exact-artifact validation and atomic completion.
-- [ ] Execute accepted logged requests through the existing local processor and
+- [x] Execute accepted logged requests through the existing local processor and
   reconcile immutable results with the shared catalog.
 - [ ] Add durable progress, retry, safe cancellation, sibling isolation, and
   batch export.
 
-Gate: representative presets produce the requested FFprobe properties, queued jobs survive preset edits unchanged, English clips get an SRT by default and can explicitly omit it, foreign/mixed/unknown clips always get original plus translated-English SRTs, a 30-second foreign-language range produces only cues within that 30-second clip, a real authorized smoke test succeeds, and no full source media remains after any terminal path. M5-08 proves the local export-only composition path with authorized repository fixture media; M5-16 delivers logged requests durably but does not execute them or reconcile results.
+Gate: representative presets produce the requested FFprobe properties, queued jobs survive preset edits unchanged, English clips get an SRT by default and can explicitly omit it, foreign/mixed/unknown clips always get original plus translated-English SRTs, a 30-second foreign-language range produces only cues within that 30-second clip, a real authorized smoke test succeeds, and no full source media remains after any terminal path. M5-08 proves the local export-only composition path with authorized repository fixture media; M5-17 proves success-only execution and exact idempotent cloud reconciliation for one accepted logged request. Authenticated failure reconciliation and recovery remain open.
 
 ### 6. Project Clip Library + authoring handoff
 
@@ -443,6 +447,10 @@ infra/aws        storage, API, database, queues, identity, monitoring
 - Logged-export delivery authorization, exact capability eligibility, atomic
   reservation, two-phase local acceptance, duplicate replay, lost-response
   recovery, and stale-generation rejection before processor work.
+- Accepted logged-export success requires the current actor-owned worker/epoch,
+  live registration, current membership, exact request/settings/media/subtitle
+  provenance, immutable sanitized results, and idempotent recovery across both
+  local-complete/cloud-call and cloud-commit/response-loss windows.
 - Word/cue/estimated timing lookup and bilingual preservation.
 - Transcript selection to source/export bounds.
 - Queue creation without export side effects.
@@ -475,8 +483,9 @@ infra/aws        storage, API, database, queues, identity, monitoring
 
 ## Next action
 
-Continue Milestone 5 with one bounded slice that executes an already accepted
-logged request through the existing local processor and reconciles its immutable
-result without broadening into user-facing progress/retry/cancel, same-source
-grouping, cleanup sweeping, or the final 30-second plus authorized-live release
-gate.
+Continue Milestone 5 with one bounded slice for authenticated logged-export
+failure reconciliation and recovery. Preserve the accepted delivery and local
+failure evidence, define safe cloud failure identity/idempotency and pinned
+worker/epoch recovery, and do not broaden into user-facing retry/progress/cancel,
+batch/group execution, polling/supervision, cleanup sweeping, or the final
+30-second plus authorized-live release gate.

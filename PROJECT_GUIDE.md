@@ -2,7 +2,7 @@
 
 ## Project guide and implementation plan
 
-Status: Milestones 1–4 core workflow complete; preferred-language logging, local export capabilities, and authorized logged-request delivery are verified through M5-16; logged execution/result reconciliation, operational recovery/grouping, and the final release gate remain open
+Status: Milestones 1–4 core workflow complete; preferred-language logging, local export capabilities, and successful authorized logged-export execution/result reconciliation are verified through M5-17; authenticated failure reconciliation, operational recovery/grouping, and the final release gate remain open
 Last updated: 2026-08-20
 
 This document is the source of truth for product scope, architecture, sequencing, and acceptance criteria. Update it when a deliberate product or architectural decision changes. Use `outline.md` as the shorter execution checklist.
@@ -997,6 +997,8 @@ Shared PostgreSQL tables or equivalent aggregates:
 - `clip_tags`
 - `bookmarks` (can precede UI)
 - `export_jobs` (may reference a logged clip or contain an export-only request snapshot)
+- `logged_export_deliveries` and immutable sanitized success results bound to one
+  accepted request, delivery generation, worker, and epoch
 - `export_presets` and immutable preset versions
 - `export_artifacts` (immutable package identity/provenance; no
   workstation-private path as identity)
@@ -1037,6 +1039,9 @@ Important constraints:
   normalized target language, provider/model, and schema version. It never
   changes the active base transcript pointer.
 - Every export job contains a validated, immutable resolved-settings snapshot.
+- A first logged-export success may transition only its exact accepted queued
+  request/job/clip; canonical replay of the same immutable result is a no-op,
+  while divergent bytes or provenance conflict without another event/version.
 - Jobs have an idempotency key and attempt count.
 - Worker claims have an expiring lease/heartbeat and safe reassignment policy.
 - Artifacts record path, type, size, and content hash.
@@ -1403,8 +1408,8 @@ web build, 17 local and 11 cloud migrations, four Playwright flows, and real
 FFmpeg/FFprobe renders for all three families. Commits `2323a0f`, `fe1efed`,
 `38047c4`, `9c8d8c6`, and `75def13` contain the completed slices.
 
-These slices do not complete Milestone 5. Durable execution and result
-reconciliation for delivered logged requests, progress/retry/cancel controls,
+These slices do not complete Milestone 5. Authenticated failure reconciliation
+and recovery for delivered logged requests, progress/retry/cancel controls,
 batch and same-source
 group execution, crash-recovery cleanup sweeping, the 30-second foreign fixture
 gate, and the user-authorized live YouTube smoke test remain open.
@@ -1440,6 +1445,27 @@ identity, path, source-media acquisition credential, private source URL, source
 acquisition, rendering, execution lease/result, progress, retry/cancel,
 grouping, or cleanup behavior is added; the opaque reservation token remains
 part of the typed handoff.
+
+M5-17 completed 2026-08-20. The owning current registered worker can now run one
+already accepted logged request through the existing one-shot
+`LocalExportSourceProcessor` boundary with explicit source authorization. A
+verified cleanup-complete local package projects one deterministic sanitized
+success result; the authenticated cloud catalog rechecks the exact accepted
+delivery generation/token, actor-owned worker/epoch/live registration, current
+project membership, immutable request/settings/media/bounds/subtitle
+provenance, and sorted artifact roles before one transaction inserts the
+immutable result, changes only the exact queued export job and clip to
+`complete`, increments the clip once, and emits one completion event. Local
+completion followed by a cloud-call failure retries without rendering, while a
+lost cloud response replays the exact fingerprint without a second row, event,
+or version; divergent replay conflicts. Cloud migration `0014` and local
+migration `0020` add the immutable success row and exact acceptance timestamp.
+The result row/event/response omit local paths/locators, acquisition identity,
+private URLs, credentials, raw tool arguments/output, owner identity, and the
+reservation token used only for verification. This is successful completion
+only: the next bounded slice is authenticated failure reconciliation/recovery,
+without claiming user-facing retry/progress/cancel, batching/grouping, polling,
+cleanup sweeping, or final release gates.
 
 M5-09 completed 2026-08-19. Every promoted clip package now also contains one
 `manifest.json`, written into attempt-private staging and promoted through the
