@@ -1,4 +1,8 @@
 import { expect, test } from "@playwright/test";
+import {
+  CURRENT_EXPORT_WORKER_CAPABILITY,
+  sha256Fingerprint,
+} from "@research-video/export-settings";
 
 test.beforeEach(async ({ page }) => {
   await page.addInitScript(() => {
@@ -144,6 +148,97 @@ test("maps transcript text selection to stable source and export bounds", async 
     createdAt: now,
     updatedAt: now,
   });
+  const settingsPreview = (
+    body: Record<string, any>,
+    context: "logged" | "export_only",
+    projectPresetId?: string,
+  ) => {
+    const selected = body.selection.selectedPreset as
+      | {
+          scope: "personal" | "project";
+          presetId: string;
+          presetVersion: number;
+        }
+      | undefined;
+    const selectedName =
+      selected?.presetId === personalPresetId
+        ? "Personal Documentary"
+        : selected?.presetId === createdProjectPresetId
+          ? "New Essay Edit"
+          : selected?.presetId === existingProjectPresetId
+            ? "Existing Project Edit"
+            : undefined;
+    const settings = {
+      container: "mp4",
+      videoCodec: "h264",
+      videoRateControl: { mode: "crf", value: 20 },
+      frameRate: "source",
+      audioCodec: "aac",
+      omitSubtitleFilesForConfirmedEnglish:
+        body.selection.overrides.omitSubtitleFilesForConfirmedEnglish ?? false,
+      embedEnglishSubtitleTrack: false,
+    };
+    const snapshot = {
+      schemaVersion: 1,
+      resolutionKind: "catalog",
+      context,
+      base: body.selection.base,
+      applicationDefaultVersion: 1,
+      ...(projectPresetId
+        ? {
+            contextDefault: {
+              presetId: projectPresetId,
+              presetVersion: 1,
+              name:
+                projectPresetId === createdProjectPresetId
+                  ? "New Essay Edit"
+                  : "Existing Project Edit",
+              settings: presetSettings,
+            },
+          }
+        : {}),
+      ...(selected
+        ? {
+            selectedPreset: {
+              presetId: selected.presetId,
+              presetVersion: selected.presetVersion,
+              name: selectedName,
+              settings: presetSettings,
+            },
+            selectedPresetScope: selected.scope,
+          }
+        : {}),
+      overrides: body.selection.overrides,
+      overrideFields: Object.keys(body.selection.overrides),
+      settings,
+      capability: {
+        ...CURRENT_EXPORT_WORKER_CAPABILITY,
+        validation: "validated",
+      },
+      resolvedAt: now,
+    };
+    const { resolvedAt: _resolvedAt, ...stableSnapshot } = snapshot;
+    return {
+      snapshot: {
+        ...snapshot,
+        resolutionFingerprint: sha256Fingerprint(stableSnapshot),
+      },
+      issues: [],
+      effectiveSubtitlePolicy:
+        body.sourceLanguageClass === "confirmed_english" &&
+        settings.omitSubtitleFilesForConfirmedEnglish
+          ? {
+              requiredSidecars: [],
+              subtitleSidecarsOmittedReason: "confirmed_english_user_setting",
+            }
+          : {
+              requiredSidecars:
+                body.sourceLanguageClass === "confirmed_english"
+                  ? ["english"]
+                  : ["original", "english"],
+            },
+    };
+  };
   let clipPostCount = 0;
   let loggedExportPostCount = 0;
   let exportOnlyPostCount = 0;
@@ -249,6 +344,18 @@ test("maps transcript text selection to stable source and export bounds", async 
         },
       });
     }
+    if (
+      path ===
+      `/cloud-api/api/projects/${existingProjectId}/export-settings/preview`
+    ) {
+      return route.fulfill({
+        json: settingsPreview(
+          request.postDataJSON(),
+          "logged",
+          existingProjectPresetId,
+        ),
+      });
+    }
     if (path === `/cloud-api/api/projects/${createdProjectId}/export-presets`) {
       return route.fulfill({
         json: {
@@ -275,6 +382,18 @@ test("maps transcript text selection to stable source and export bounds", async 
             "Personal Documentary",
           ),
         },
+      });
+    }
+    if (
+      path ===
+      `/cloud-api/api/projects/${createdProjectId}/export-settings/preview`
+    ) {
+      return route.fulfill({
+        json: settingsPreview(
+          request.postDataJSON(),
+          "logged",
+          createdProjectPresetId,
+        ),
       });
     }
     if (path === `/cloud-api/api/projects/${createdProjectId}/clips`) {
@@ -370,7 +489,12 @@ test("maps transcript text selection to stable source and export bounds", async 
             timingPrecision: "word",
           },
           sourceLanguageClass: body.sourceLanguageClass,
-          preset: body.preset,
+          preset: {
+            presetId: createdProjectPresetId,
+            presetVersion: 1,
+            name: "New Essay Edit",
+            settings: presetSettings,
+          },
           state: "queued",
           createdAt: now,
           updatedAt: now,
@@ -385,6 +509,14 @@ test("maps transcript text selection to stable source and export bounds", async 
     }
     return route.fulfill({ status: 404, json: { error: "not found" } });
   });
+  await page.route(
+    "**/local-agent/api/export-settings/preview",
+    async (route) => {
+      return route.fulfill({
+        json: settingsPreview(route.request().postDataJSON(), "export_only"),
+      });
+    },
+  );
   await page.route("**/local-agent/api/exports", async (route) => {
     exportOnlyPostCount += 1;
     const body = route.request().postDataJSON();
@@ -398,7 +530,12 @@ test("maps transcript text selection to stable source and export bounds", async 
         video: body.video,
         selection: body.selection,
         sourceLanguageClass: body.sourceLanguageClass,
-        preset: body.preset,
+        preset: {
+          presetId: personalPresetId,
+          presetVersion: 1,
+          name: "Personal Documentary",
+          settings: presetSettings,
+        },
         state: "queued",
         createdAt: now,
         updatedAt: now,
@@ -544,7 +681,7 @@ test("maps transcript text selection to stable source and export bounds", async 
     "Downloaded the project clip log as CSV.",
   );
 
-  await page.getByText("Built-in Editing MP4 settings").click();
+  await page.getByText("Per-export overrides").click();
   await expect(
     page.getByLabel("Omit subtitle files for confirmed-English videos"),
   ).not.toBeChecked();
@@ -559,12 +696,18 @@ test("maps transcript text selection to stable source and export bounds", async 
     page.getByRole("button", { name: "Export queued" }),
   ).toBeDisabled();
   expect(loggedExportPostCount).toBe(1);
-  expect(lastLoggedExportBody?.preset).toEqual({
-    presetId: createdProjectPresetId,
-    presetVersion: 1,
-    name: "New Essay Edit",
-    settings: presetSettings,
+  expect(lastLoggedExportBody?.preset).toBeUndefined();
+  expect(lastLoggedExportBody?.settingsSelection).toMatchObject({
+    selectedPreset: {
+      scope: "project",
+      presetId: createdProjectPresetId,
+      presetVersion: 1,
+    },
+    overrides: { omitSubtitleFilesForConfirmedEnglish: true },
   });
+  expect(lastLoggedExportBody?.expectedResolutionFingerprint).toMatch(
+    /^[a-f0-9]{64}$/,
+  );
 
   await page.getByRole("button", { name: "Export only" }).click();
   await expect(panel).toContainText(
@@ -574,11 +717,14 @@ test("maps transcript text selection to stable source and export bounds", async 
     page.getByRole("button", { name: "Export-only queued" }),
   ).toBeDisabled();
   expect(exportOnlyPostCount).toBe(1);
-  expect(lastExportOnlyBody?.preset).toEqual({
-    presetId: personalPresetId,
-    presetVersion: 1,
-    name: "Personal Documentary",
-    settings: presetSettings,
+  expect(lastExportOnlyBody?.preset).toBeUndefined();
+  expect(lastExportOnlyBody?.settingsSelection).toMatchObject({
+    selectedPreset: {
+      scope: "personal",
+      presetId: personalPresetId,
+      presetVersion: 1,
+    },
+    overrides: { omitSubtitleFilesForConfirmedEnglish: true },
   });
 
   await page.getByLabel("Preferred transcript language").fill("es-MX");

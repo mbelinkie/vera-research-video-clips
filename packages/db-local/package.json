@@ -5,6 +5,7 @@
   "type": "module",
   "exports": "./src/index.ts",
   "dependencies": {
-    "@research-video/contracts": "*"
+    "@research-video/contracts": "*",
+    "@research-video/export-settings": "*"
   }
 }

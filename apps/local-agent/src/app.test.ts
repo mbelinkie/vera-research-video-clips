@@ -1,6 +1,7 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { HealthResponseSchema } from "@research-video/contracts";
+import { resolveExportSettings } from "@research-video/export-settings";
 import type { WorkspaceTranscriptResolution } from "@research-video/sync";
 import { normalizeTranscriptFixture } from "@research-video/transcript";
 import transcriptFixture from "../../../tests/fixtures/transcripts/english-word.json" with { type: "json" };
@@ -88,6 +89,61 @@ describe("local agent", () => {
     });
     expect(response.json()).not.toHaveProperty("projectId");
     expect(response.json()).not.toHaveProperty("clipId");
+  });
+
+  it("requires an authoritative ready preview and forwards its immutable snapshot", async () => {
+    const snapshotPreview = resolveExportSettings({
+      context: "export_only",
+      sourceLanguageClass: "confirmed_english",
+      resolvedAt: "2026-08-20T12:00:00.000Z",
+    });
+    const createExportOnly = vi.fn(() => ({ ok: true }));
+    const app = createLocalAgent({
+      previewExportSettings: async () => snapshotPreview,
+      createExportOnly,
+    });
+    apps.add(app);
+    const legacy = exportOnlyFixture();
+    const { preset: _preset, ...base } = legacy;
+    const payload = {
+      ...base,
+      settingsSelection: { base: "application_default", overrides: {} },
+      expectedResolutionFingerprint:
+        snapshotPreview.snapshot.resolutionFingerprint,
+    };
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: "/api/exports",
+          payload,
+        })
+      ).statusCode,
+    ).toBe(401);
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/exports",
+      headers: { authorization: "Bearer fixture" },
+      payload,
+    });
+    expect(response.statusCode).toBe(201);
+    expect(createExportOnly).toHaveBeenCalledWith(
+      expect.objectContaining({ settingsSelection: payload.settingsSelection }),
+      snapshotPreview.snapshot,
+    );
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: "/api/exports",
+          headers: { authorization: "Bearer fixture" },
+          payload: {
+            ...payload,
+            expectedResolutionFingerprint: "0".repeat(64),
+          },
+        })
+      ).statusCode,
+    ).toBe(409);
   });
 });
 

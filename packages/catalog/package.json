@@ -8,6 +8,7 @@
     "@electric-sql/pglite": "^0.5.4",
     "@research-video/auth": "*",
     "@research-video/contracts": "*",
+    "@research-video/export-settings": "*",
     "@research-video/storage": "*"
   }
 }

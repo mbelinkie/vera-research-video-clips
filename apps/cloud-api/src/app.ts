@@ -12,6 +12,7 @@ import {
   CreateClipExportRequestSchema,
   CreateExportPresetRequestSchema,
   ExportPresetDefaultResponseSchema,
+  ExportSettingsPreviewRequestSchema,
   CreateTranscriptionBatchRequestSchema,
   CreateProjectRequestSchema,
   PublishDerivedTranslationRequestSchema,
@@ -89,7 +90,11 @@ export function createCloudApi(
   const app = Fastify({ logger: false });
 
   app.setErrorHandler((error, _request, reply) => {
-    const candidate = error as Error & { statusCode?: number; code?: string };
+    const candidate = error as Error & {
+      statusCode?: number;
+      code?: string;
+      issues?: unknown;
+    };
     const statusCode =
       error instanceof ZodError ? 400 : (candidate.statusCode ?? 500);
     return reply.status(statusCode).send({
@@ -101,6 +106,7 @@ export function createCloudApi(
         message:
           statusCode === 500 ? "Internal server error." : candidate.message,
         retryable: statusCode >= 500,
+        ...(candidate.issues ? { issues: candidate.issues } : {}),
       },
     });
   });
@@ -138,6 +144,13 @@ export function createCloudApi(
 
   app.get("/api/export-presets", async (request) =>
     catalog.listPersonalExportPresets(await authenticate(request)),
+  );
+
+  app.post("/api/export-settings/preview", async (request) =>
+    catalog.previewPersonalExportSettings(
+      await authenticate(request),
+      ExportSettingsPreviewRequestSchema.parse(request.body),
+    ),
   );
 
   app.post("/api/export-presets", async (request, reply) => {
@@ -192,6 +205,18 @@ export function createCloudApi(
       projectId,
     );
   });
+
+  app.post(
+    "/api/projects/:projectId/export-settings/preview",
+    async (request) => {
+      const { projectId } = IdParamsSchema.parse(request.params);
+      return catalog.previewProjectExportSettings(
+        await authenticate(request),
+        projectId,
+        ExportSettingsPreviewRequestSchema.parse(request.body),
+      );
+    },
+  );
 
   app.post(
     "/api/projects/:projectId/export-presets",

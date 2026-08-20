@@ -232,6 +232,44 @@ describe("cloud API", () => {
       personalPresets: [{ currentVersion: 2 }],
       personalDefault: { presetVersion: 1 },
     });
+    const preview = await app.inject({
+      method: "POST",
+      url: `/api/projects/${projectId}/export-settings/preview`,
+      headers: { authorization },
+      payload: {
+        sourceLanguageClass: "foreign",
+        selection: {
+          base: "context_default",
+          selectedPreset: {
+            scope: "personal",
+            presetId: personalId,
+            presetVersion: 1,
+          },
+          overrides: {
+            maxWidth: null,
+            audioKilobitsPerSecond: null,
+            omitSubtitleFilesForConfirmedEnglish: true,
+          },
+        },
+      },
+    });
+    expect(preview.statusCode).toBe(200);
+    expect(preview.json()).toMatchObject({
+      snapshot: {
+        contextDefault: { presetId: projectPresetId, presetVersion: 1 },
+        selectedPreset: { presetId: personalId, presetVersion: 1 },
+        selectedPresetScope: "personal",
+        settings: { omitSubtitleFilesForConfirmedEnglish: true },
+      },
+      issues: [],
+      effectiveSubtitlePolicy: {
+        requiredSidecars: ["original", "english"],
+      },
+    });
+    expect(preview.json().snapshot.settings).not.toHaveProperty("maxWidth");
+    expect(preview.json().snapshot.resolutionFingerprint).toMatch(
+      /^[a-f0-9]{64}$/,
+    );
     expect(
       (
         await app.inject({
@@ -485,6 +523,100 @@ describe("cloud API", () => {
     ).toMatchObject([{ exportStatus: "queued", version: 3 }]);
 
     const clipId = created.json<{ id: string }>().id;
+    const settingsPreview = await app.inject({
+      method: "POST",
+      url: `/api/projects/${projectId}/export-settings/preview`,
+      headers: { authorization },
+      payload: {
+        sourceLanguageClass: "confirmed_english",
+        selection: { base: "application_default", overrides: {} },
+      },
+    });
+    expect(settingsPreview.statusCode).toBe(200);
+    const expectedResolutionFingerprint = settingsPreview.json<{
+      snapshot: { resolutionFingerprint: string };
+    }>().snapshot.resolutionFingerprint;
+    const catalogExport = await app.inject({
+      method: "POST",
+      url: `/api/projects/${projectId}/clips/${clipId}/exports`,
+      headers: { authorization },
+      payload: {
+        idempotencyKey: "catalog-resolved-export",
+        sourceLanguageClass: "confirmed_english",
+        settingsSelection: { base: "application_default", overrides: {} },
+        expectedResolutionFingerprint,
+      },
+    });
+    expect(catalogExport.statusCode).toBe(201);
+    expect(catalogExport.json()).toMatchObject({
+      resolvedSettingsSnapshot: {
+        resolutionKind: "catalog",
+        settings: {
+          container: "mp4",
+          videoCodec: "h264",
+          frameRate: "source",
+          omitSubtitleFilesForConfirmedEnglish: false,
+        },
+        resolutionFingerprint: expectedResolutionFingerprint,
+      },
+    });
+    const stored = await database.query<{
+      request_snapshot: Record<string, unknown>;
+      job_snapshot: Record<string, unknown>;
+    }>(
+      `SELECT er.resolved_settings_snapshot AS request_snapshot,
+              j.payload->'resolvedSettingsSnapshot' AS job_snapshot
+       FROM export_requests er JOIN jobs j ON j.id = er.job_id
+       WHERE er.id = $1`,
+      [catalogExport.json<{ id: string }>().id],
+    );
+    expect(stored.rows[0]!.job_snapshot).toEqual(
+      stored.rows[0]!.request_snapshot,
+    );
+    const catalogReplay = await app.inject({
+      method: "POST",
+      url: `/api/projects/${projectId}/clips/${clipId}/exports`,
+      headers: { authorization },
+      payload: {
+        idempotencyKey: "catalog-resolved-export",
+        sourceLanguageClass: "confirmed_english",
+        settingsSelection: {
+          base: "context_default",
+          selectedPreset: {
+            scope: "project",
+            presetId: randomUUID(),
+            presetVersion: 99,
+          },
+          overrides: {},
+        },
+        expectedResolutionFingerprint: "f".repeat(64),
+      },
+    });
+    expect(catalogReplay.statusCode).toBe(201);
+    expect(catalogReplay.json<{ id: string }>().id).toBe(
+      catalogExport.json<{ id: string }>().id,
+    );
+    expect(catalogReplay.json().resolvedSettingsSnapshot).toEqual(
+      catalogExport.json().resolvedSettingsSnapshot,
+    );
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: `/api/projects/${projectId}/clips/${clipId}/exports`,
+          headers: { authorization },
+          payload: {
+            idempotencyKey: "stale-catalog-export",
+            sourceLanguageClass: "confirmed_english",
+            settingsSelection: {
+              base: "application_default",
+              overrides: {},
+            },
+            expectedResolutionFingerprint: "0".repeat(64),
+          },
+        })
+      ).statusCode,
+    ).toBe(409);
     await database.query(
       "DELETE FROM clip_language_evidence WHERE clip_id = $1",
       [clipId],

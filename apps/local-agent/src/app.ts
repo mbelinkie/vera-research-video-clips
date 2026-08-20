@@ -3,10 +3,15 @@ import { z, ZodError } from "zod";
 
 import {
   CreateExportOnlyRequestSchema,
+  ExportSettingsPreviewRequestSchema,
   type CreateExportOnlyRequest,
   type ExportRequest,
+  type ExportSettingsPreview,
+  type ExportSettingsPreviewRequest,
+  type ResolvedExportSettingsSnapshot,
   HealthResponseSchema,
 } from "@research-video/contracts";
+import { validateStoredResolvedSettingsSnapshot } from "@research-video/export-settings";
 import type { WorkspaceTranscriptResolution } from "@research-video/sync";
 
 export interface LocalAgentDependencies {
@@ -15,7 +20,17 @@ export interface LocalAgentDependencies {
     catalogVideoId: string;
     authorization: string;
   }): Promise<WorkspaceTranscriptResolution>;
-  createExportOnly?(input: CreateExportOnlyRequest): ExportRequest;
+  previewExportSettings?(input: {
+    request: ExportSettingsPreviewRequest;
+    authorization: string;
+  }): Promise<ExportSettingsPreview>;
+  createExportOnly?(
+    input: CreateExportOnlyRequest,
+    snapshot?: ResolvedExportSettingsSnapshot,
+  ): unknown;
+  findExportOnlyByIdempotencyKey?(
+    idempotencyKey: string,
+  ): ExportRequest | undefined;
   listExportRequests?(): ExportRequest[];
 }
 
@@ -29,13 +44,45 @@ class LocalAuthenticationError extends Error {
   readonly code = "authentication_required";
 }
 
+class LocalExportSettingsError extends Error {
+  constructor(
+    message: string,
+    readonly code: string,
+    readonly statusCode: number,
+    readonly issues?: ExportSettingsPreview["issues"],
+  ) {
+    super(message);
+  }
+}
+
+function withLocalWorkerCapability(
+  preview: ExportSettingsPreview,
+): ExportSettingsPreview {
+  const localIssues = validateStoredResolvedSettingsSnapshot(preview.snapshot);
+  const issues = [...preview.issues];
+  for (const issue of localIssues) {
+    if (
+      !issues.some(
+        (candidate) =>
+          candidate.field === issue.field && candidate.code === issue.code,
+      )
+    )
+      issues.push(issue);
+  }
+  return { ...preview, issues };
+}
+
 export function createLocalAgent(
   dependencies?: LocalAgentDependencies,
 ): FastifyInstance {
   const app = Fastify({ logger: false });
 
   app.setErrorHandler((error, _request, reply) => {
-    const candidate = error as Error & { statusCode?: number; code?: string };
+    const candidate = error as Error & {
+      statusCode?: number;
+      code?: string;
+      issues?: unknown;
+    };
     const statusCode =
       error instanceof ZodError ? 400 : (candidate.statusCode ?? 500);
     return reply.status(statusCode).send({
@@ -47,6 +94,7 @@ export function createLocalAgent(
         message:
           statusCode === 500 ? "Internal server error." : candidate.message,
         retryable: statusCode >= 500,
+        ...(candidate.issues ? { issues: candidate.issues } : {}),
       },
     });
   });
@@ -88,10 +136,66 @@ export function createLocalAgent(
   }
 
   if (dependencies?.createExportOnly) {
+    if (dependencies.previewExportSettings) {
+      app.post("/api/export-settings/preview", async (request) => {
+        const authorization = request.headers.authorization;
+        if (!authorization) {
+          throw new LocalAuthenticationError(
+            "Authentication is required to resolve personal export settings.",
+          );
+        }
+        return withLocalWorkerCapability(
+          await dependencies.previewExportSettings!({
+            request: ExportSettingsPreviewRequestSchema.parse(request.body),
+            authorization,
+          }),
+        );
+      });
+    }
     app.post("/api/exports", async (request, reply) => {
-      const created = dependencies.createExportOnly!(
-        CreateExportOnlyRequestSchema.parse(request.body),
+      const parsed = CreateExportOnlyRequestSchema.parse(request.body);
+      const replay = dependencies.findExportOnlyByIdempotencyKey?.(
+        parsed.idempotencyKey,
       );
+      if (replay) return reply.status(201).send(replay);
+      let resolved: ResolvedExportSettingsSnapshot | undefined;
+      if (parsed.settingsSelection) {
+        const authorization = request.headers.authorization;
+        if (!authorization || !dependencies.previewExportSettings) {
+          throw new LocalAuthenticationError(
+            "Authentication is required to create an export from catalog settings.",
+          );
+        }
+        const preview = withLocalWorkerCapability(
+          await dependencies.previewExportSettings({
+            request: {
+              sourceLanguageClass: parsed.sourceLanguageClass,
+              selection: parsed.settingsSelection,
+            },
+            authorization,
+          }),
+        );
+        if (
+          preview.snapshot.resolutionFingerprint !==
+          parsed.expectedResolutionFingerprint
+        ) {
+          throw new LocalExportSettingsError(
+            "Export settings changed after preview. Resolve them again before exporting.",
+            "export_settings_stale",
+            409,
+          );
+        }
+        if (preview.issues.length) {
+          throw new LocalExportSettingsError(
+            "The current worker cannot render the resolved export settings.",
+            "export_settings_unsupported",
+            422,
+            preview.issues,
+          );
+        }
+        resolved = preview.snapshot;
+      }
+      const created = dependencies.createExportOnly!(parsed, resolved);
       return reply.status(201).send(created);
     });
   }

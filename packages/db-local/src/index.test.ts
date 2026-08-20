@@ -98,6 +98,7 @@ describe("local migrations", () => {
       "0013_preferred_translation_cache",
       "0014_export_clip_metadata_sidecar",
       "0015_export_clip_thumbnail_artifact",
+      "0016_resolved_export_settings_snapshots",
     ]);
     expect(runLocalMigrations(database)).toEqual([]);
     expect(
@@ -134,6 +135,31 @@ describe("local migrations", () => {
     });
     expect(retry).toEqual(exportRequest);
     expect(exportQueue.list()).toEqual([exportRequest]);
+    expect(exportRequest.resolvedSettingsSnapshot).toMatchObject({
+      resolutionKind: "legacy_inline",
+      context: "export_only",
+      settings: fixtureExportInput.preset.settings,
+      capability: { validation: "legacy_unvalidated" },
+    });
+    const storedSnapshots = database
+      .prepare(
+        `SELECT er.resolved_settings_snapshot_json AS request_snapshot,
+                json_extract(j.payload_json, '$.resolvedSettingsSnapshot') AS job_snapshot
+         FROM export_requests er JOIN jobs j ON j.id = er.job_id
+         WHERE er.id = ?`,
+      )
+      .get(exportRequest.id) as {
+      request_snapshot: string;
+      job_snapshot: string;
+    };
+    expect(storedSnapshots.job_snapshot).toBe(storedSnapshots.request_snapshot);
+    expect(() =>
+      database
+        .prepare(
+          "UPDATE export_requests SET resolved_settings_snapshot_json = '{}' WHERE id = ?",
+        )
+        .run(exportRequest.id),
+    ).toThrow(/immutable/);
     expect(
       database
         .prepare(
@@ -318,9 +344,15 @@ describe("local migrations", () => {
         `INSERT INTO export_requests
            (id, job_id, mode, video_snapshot_json, selection_snapshot_json,
             source_language_class, preset_snapshot_json, created_at, updated_at)
-         VALUES (?, ?, 'export_only', '{}', '{}', 'confirmed_english', '{}', ?, ?)`,
+         VALUES (?, ?, 'export_only', '{}', '{}', 'confirmed_english', ?, ?, ?)`,
       )
-      .run(legacyRequestId, legacyJobId, legacyTimestamp, legacyTimestamp);
+      .run(
+        legacyRequestId,
+        legacyJobId,
+        JSON.stringify(fixtureExportInput.preset),
+        legacyTimestamp,
+        legacyTimestamp,
+      );
     const legacyArtifact = {
       export_request_id: legacyRequestId,
       role: "video_mp4",
@@ -369,10 +401,32 @@ describe("local migrations", () => {
 
     expect(runLocalMigrations(database, localMigrationDirectory)).toEqual([
       "0015_export_clip_thumbnail_artifact",
+      "0016_resolved_export_settings_snapshots",
     ]);
     expect(
       database.prepare("SELECT * FROM export_final_artifacts").all(),
     ).toEqual([legacyArtifact, legacyManifestArtifact, legacyMetadataArtifact]);
+    const backfilled = database
+      .prepare(
+        `SELECT er.resolved_settings_snapshot_json AS request_snapshot,
+                json_extract(j.payload_json, '$.resolvedSettingsSnapshot') AS job_snapshot
+         FROM export_requests er JOIN jobs j ON j.id = er.job_id
+         WHERE er.id = ?`,
+      )
+      .get(legacyRequestId) as {
+      request_snapshot: string;
+      job_snapshot: string;
+    };
+    expect(backfilled.job_snapshot).toBe(backfilled.request_snapshot);
+    expect(JSON.parse(backfilled.request_snapshot)).toMatchObject({
+      resolutionKind: "legacy_inline",
+      context: "export_only",
+      legacyPreset: fixtureExportInput.preset,
+      settings: fixtureExportInput.preset.settings,
+      capability: { validation: "legacy_unvalidated" },
+      resolvedAt: legacyTimestamp,
+      resolutionFingerprint: expect.stringMatching(/^[a-f0-9]{64}$/),
+    });
     expect(
       database
         .prepare(

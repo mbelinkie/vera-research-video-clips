@@ -2,6 +2,7 @@ import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 
 import { loadConfig } from "@research-video/config";
+import { ExportSettingsPreviewSchema } from "@research-video/contracts";
 import {
   LocalExportQueue,
   LocalTranscriptIndex,
@@ -34,7 +35,36 @@ const reader = new CachedTranscriptDocumentReader(
 );
 const cloudApiUrl = `http://${config.cloudApiHost}:${config.cloudApiPort}`;
 const app = createLocalAgent({
-  createExportOnly: (input) => exportQueue.createExportOnly(input),
+  createExportOnly: (input, snapshot) =>
+    exportQueue.createExportOnly(input, snapshot),
+  findExportOnlyByIdempotencyKey: (idempotencyKey) =>
+    exportQueue.getByIdempotencyKey(idempotencyKey),
+  previewExportSettings: async ({ request, authorization }) => {
+    const response = await fetch(`${cloudApiUrl}/api/export-settings/preview`, {
+      method: "POST",
+      headers: {
+        authorization,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(request),
+    });
+    const payload = await response.json().catch(() => undefined);
+    if (!response.ok) {
+      const remote = payload as
+        { error?: { code?: string; message?: string } } | undefined;
+      throw Object.assign(
+        new Error(
+          remote?.error?.message ??
+            `Cloud export-settings preview failed with HTTP ${response.status}.`,
+        ),
+        {
+          statusCode: response.status,
+          code: remote?.error?.code ?? "export_settings_preview_unavailable",
+        },
+      );
+    }
+    return ExportSettingsPreviewSchema.parse(payload);
+  },
   listExportRequests: () => exportQueue.list(),
   resolveTranscript: async ({ projectId, catalogVideoId, authorization }) =>
     new SharedTranscriptWorkspaceService(

@@ -5,6 +5,7 @@ import {
   ApiErrorSchema,
   ClipCandidateSchema,
   ExportPresetSnapshotSchema,
+  ExportSettingsPreviewSchema,
   PersonalExportPresetCatalogSchema,
   ProjectExportPresetCatalogSchema,
   ExportRequestSchema,
@@ -16,6 +17,9 @@ import {
   type ExportPresetCatalogEntry,
   type ExportPresetDefault,
   type ExportPresetSnapshot,
+  type ExportSettingsOverride,
+  type ExportSettingsPreview,
+  type ExportSettingsSelection,
   type NormalizedTranscript,
   type Project,
   type TranscriptSelection,
@@ -162,6 +166,16 @@ function App() {
   const [presetDiscoveryMessage, setPresetDiscoveryMessage] = useState(
     "Connect a session to discover saved presets. Editing MP4 remains available.",
   );
+  const [overrideFields, setOverrideFields] = useState<Set<string>>(
+    () => new Set(),
+  );
+  const [loggedSettingsPreview, setLoggedSettingsPreview] =
+    useState<ExportSettingsPreview>();
+  const [exportOnlySettingsPreview, setExportOnlySettingsPreview] =
+    useState<ExportSettingsPreview>();
+  const [loggedSettingsState, setLoggedSettingsState] = useState("missing");
+  const [exportOnlySettingsState, setExportOnlySettingsState] =
+    useState("missing");
   const [exportContainer, setExportContainer] = useState<"mp4" | "mov" | "mkv">(
     "mp4",
   );
@@ -169,11 +183,11 @@ function App() {
     "h264" | "hevc" | "prores"
   >("h264");
   const [exportCrf, setExportCrf] = useState(20);
-  const [exportMaxWidth, setExportMaxWidth] = useState(1_920);
+  const [exportMaxWidth, setExportMaxWidth] = useState<number>();
   const [exportFrameRate, setExportFrameRate] = useState<
     "source" | "23.976" | "24" | "25" | "29.97" | "30"
   >("source");
-  const [exportAudioBitrate, setExportAudioBitrate] = useState(192);
+  const [exportAudioBitrate, setExportAudioBitrate] = useState<number>();
   const [omitEnglishSubtitles, setOmitEnglishSubtitles] = useState(false);
   const [embedEnglishSubtitles, setEmbedEnglishSubtitles] = useState(false);
   const playerRef = useRef<YouTubePlayerHandle>(null);
@@ -240,34 +254,34 @@ function App() {
     [transcript],
   );
   const activeToken = tokenAtTime(timedTokens, currentMs);
-  const exportPreset = useMemo(
-    () =>
-      ExportPresetSnapshotSchema.parse({
-        presetVersion: 1,
-        name: "Editing MP4",
-        settings: {
-          container: exportContainer,
-          videoCodec: exportVideoCodec,
-          videoRateControl: { mode: "crf", value: exportCrf },
-          maxWidth: exportMaxWidth,
-          frameRate: exportFrameRate,
-          audioCodec: "aac",
-          audioKilobitsPerSecond: exportAudioBitrate,
-          omitSubtitleFilesForConfirmedEnglish: omitEnglishSubtitles,
-          embedEnglishSubtitleTrack: embedEnglishSubtitles,
-        },
-      }),
-    [
-      embedEnglishSubtitles,
-      exportAudioBitrate,
-      exportContainer,
-      exportCrf,
-      exportFrameRate,
-      exportMaxWidth,
-      exportVideoCodec,
-      omitEnglishSubtitles,
-    ],
-  );
+  const exportOverrides = useMemo(() => {
+    const override: ExportSettingsOverride = {};
+    if (overrideFields.has("container")) override.container = exportContainer;
+    if (overrideFields.has("videoCodec"))
+      override.videoCodec = exportVideoCodec;
+    if (overrideFields.has("videoRateControl"))
+      override.videoRateControl = { mode: "crf", value: exportCrf };
+    if (overrideFields.has("maxWidth"))
+      override.maxWidth = exportMaxWidth ?? null;
+    if (overrideFields.has("frameRate")) override.frameRate = exportFrameRate;
+    if (overrideFields.has("audioKilobitsPerSecond"))
+      override.audioKilobitsPerSecond = exportAudioBitrate ?? null;
+    if (overrideFields.has("omitSubtitleFilesForConfirmedEnglish"))
+      override.omitSubtitleFilesForConfirmedEnglish = omitEnglishSubtitles;
+    if (overrideFields.has("embedEnglishSubtitleTrack"))
+      override.embedEnglishSubtitleTrack = embedEnglishSubtitles;
+    return override;
+  }, [
+    embedEnglishSubtitles,
+    exportAudioBitrate,
+    exportContainer,
+    exportCrf,
+    exportFrameRate,
+    exportMaxWidth,
+    exportVideoCodec,
+    omitEnglishSubtitles,
+    overrideFields,
+  ]);
   const personalPresetOptions = useMemo(() => {
     const options = personalPresets.map((entry) => ({
       key: catalogPresetKey("personal", catalogEntrySnapshot(entry)),
@@ -336,12 +350,42 @@ function App() {
     )?.snapshot ??
     personalPresetOptions.find(
       (option) => option.key === loggedPresetSelectionKey,
-    )?.snapshot ??
-    exportPreset;
-  const exportOnlyExportPreset =
-    personalPresetOptions.find(
-      (option) => option.key === exportOnlyPresetSelectionKey,
-    )?.snapshot ?? exportPreset;
+    )?.snapshot;
+  const exportOnlyExportPreset = personalPresetOptions.find(
+    (option) => option.key === exportOnlyPresetSelectionKey,
+  )?.snapshot;
+  const sourceLanguageClass =
+    transcriptTracks &&
+    transcriptTracks.original.track.id === transcriptTracks.english.track.id &&
+    languagesEquivalent(transcriptTracks.original.track.language, "en")
+      ? ("confirmed_english" as const)
+      : ("foreign" as const);
+  const selectionForKey = (
+    key: string,
+    selected: ExportPresetSnapshot | undefined,
+  ): ExportSettingsSelection => ({
+    base: key === builtInPresetKey ? "application_default" : "context_default",
+    ...(selected?.presetId
+      ? {
+          selectedPreset: {
+            scope: key.startsWith("project:")
+              ? ("project" as const)
+              : ("personal" as const),
+            presetId: selected.presetId,
+            presetVersion: selected.presetVersion,
+          },
+        }
+      : {}),
+    overrides: exportOverrides,
+  });
+  const loggedSettingsSelection = selectionForKey(
+    loggedPresetSelectionKey,
+    loggedExportPreset,
+  );
+  const exportOnlySettingsSelection = selectionForKey(
+    exportOnlyPresetSelectionKey,
+    exportOnlyExportPreset,
+  );
   const selectedTokenIds = useMemo(() => {
     const ids = new Set<string>();
     if (!transcript || !selection?.firstTokenId || !selection.lastTokenId) {
@@ -410,6 +454,7 @@ function App() {
       );
       return;
     }
+    setExportOnlySettingsState("loading");
     void fetch("/cloud-api/api/export-presets", {
       headers: { accept: "application/json", authorization },
     })
@@ -463,6 +508,7 @@ function App() {
       current.startsWith("project:") ? builtInPresetKey : current,
     );
     if (!authorization || !projectId) return;
+    setLoggedSettingsState("loading");
     void fetch(`/cloud-api/api/projects/${projectId}/export-presets`, {
       headers: { accept: "application/json", authorization },
     })
@@ -513,6 +559,91 @@ function App() {
         );
       });
   }, [authorization, projectId]);
+
+  useEffect(() => {
+    if (!authorization || !transcriptTracks) {
+      setLoggedSettingsPreview(undefined);
+      setExportOnlySettingsPreview(undefined);
+      setLoggedSettingsState("missing");
+      setExportOnlySettingsState("missing");
+      return;
+    }
+    const controller = new AbortController();
+    const resolvePreview = async (
+      url: string,
+      selection: ExportSettingsSelection,
+      setPreview: (preview: ExportSettingsPreview | undefined) => void,
+      setState: (state: string) => void,
+    ) => {
+      setState("resolving");
+      setPreview(undefined);
+      try {
+        const response = await fetch(url, {
+          method: "POST",
+          headers: {
+            accept: "application/json",
+            authorization,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({ sourceLanguageClass, selection }),
+          signal: controller.signal,
+        });
+        const payload = await response.json().catch(() => undefined);
+        if (!response.ok) {
+          const parsed = ApiErrorSchema.safeParse(payload);
+          throw new Error(
+            parsed.success
+              ? parsed.data.error.message
+              : "Settings preview unavailable.",
+          );
+        }
+        const preview = ExportSettingsPreviewSchema.parse(payload);
+        setPreview(preview);
+        setState(
+          preview.issues.some(
+            (issue) => issue.code === "capability_profile_unavailable",
+          )
+            ? "capability-unavailable"
+            : preview.issues.length
+              ? "unsupported"
+              : "ready",
+        );
+      } catch (caught) {
+        if (controller.signal.aborted) return;
+        setState(
+          caught instanceof Error && /missing|not found/i.test(caught.message)
+            ? "missing"
+            : "stale",
+        );
+      }
+    };
+    if (projectId) {
+      void resolvePreview(
+        `/cloud-api/api/projects/${projectId}/export-settings/preview`,
+        loggedSettingsSelection,
+        setLoggedSettingsPreview,
+        setLoggedSettingsState,
+      );
+    } else {
+      setLoggedSettingsPreview(undefined);
+      setLoggedSettingsState("missing");
+    }
+    void resolvePreview(
+      "/local-agent/api/export-settings/preview",
+      exportOnlySettingsSelection,
+      setExportOnlySettingsPreview,
+      setExportOnlySettingsState,
+    );
+    return () => controller.abort();
+  }, [
+    authorization,
+    projectId,
+    loggedPresetSelectionKey,
+    exportOnlyPresetSelectionKey,
+    JSON.stringify(exportOverrides),
+    sourceLanguageClass,
+    transcriptTracks,
+  ]);
 
   const previousTranscriptTrackId = useRef<string | undefined>(undefined);
   useEffect(() => {
@@ -795,7 +926,15 @@ function App() {
   }
 
   async function requestLoggedExport() {
-    if (!authorization || !projectId || !selection || !transcriptTracks) return;
+    if (
+      !authorization ||
+      !projectId ||
+      !selection ||
+      !transcriptTracks ||
+      loggedSettingsState !== "ready" ||
+      !loggedSettingsPreview?.snapshot.resolutionFingerprint
+    )
+      return;
     const clipId =
       loggedClipId ?? (await queueClipOnly().then((clip) => clip?.id));
     if (!clipId) return;
@@ -836,13 +975,20 @@ function App() {
                     },
                   },
                 }),
-            preset: loggedExportPreset,
+            settingsSelection: loggedSettingsSelection,
+            expectedResolutionFingerprint:
+              loggedSettingsPreview.snapshot.resolutionFingerprint,
           }),
         },
       );
       const payload = await response.json().catch(() => undefined);
       if (!response.ok) {
         const parsed = ApiErrorSchema.safeParse(payload);
+        if (
+          parsed.success &&
+          parsed.data.error.code === "export_settings_stale"
+        )
+          setLoggedSettingsState("stale");
         throw new Error(
           parsed.success
             ? `Clip logged, but export could not be queued: ${parsed.data.error.message}`
@@ -866,13 +1012,21 @@ function App() {
   }
 
   async function requestExportOnly() {
-    if (!videoId || !selection || !transcriptTracks) return;
+    if (
+      !videoId ||
+      !selection ||
+      !transcriptTracks ||
+      exportOnlySettingsState !== "ready" ||
+      !exportOnlySettingsPreview?.snapshot.resolutionFingerprint
+    )
+      return;
     setClipActionBusy(true);
     try {
       const response = await fetch("/local-agent/api/exports", {
         method: "POST",
         headers: {
           accept: "application/json",
+          authorization,
           "content-type": "application/json",
         },
         body: JSON.stringify({
@@ -910,12 +1064,19 @@ function App() {
                   },
                 },
               }),
-          preset: exportOnlyExportPreset,
+          settingsSelection: exportOnlySettingsSelection,
+          expectedResolutionFingerprint:
+            exportOnlySettingsPreview.snapshot.resolutionFingerprint,
         }),
       });
       const payload = await response.json().catch(() => undefined);
       if (!response.ok) {
         const parsed = ApiErrorSchema.safeParse(payload);
+        if (
+          parsed.success &&
+          parsed.data.error.code === "export_settings_stale"
+        )
+          setExportOnlySettingsState("stale");
         throw new Error(
           parsed.success
             ? parsed.data.error.message
@@ -1458,15 +1619,95 @@ function App() {
                   {presetDiscoveryMessage}
                 </p>
                 <p className="muted">
-                  Logged: {loggedExportPreset.name} v
-                  {loggedExportPreset.presetVersion}. Export only:{" "}
-                  {exportOnlyExportPreset.name} v
-                  {exportOnlyExportPreset.presetVersion}. Saved selections
-                  submit their exact immutable snapshot.
+                  Logged settings: {loggedSettingsState}. Export-only settings:{" "}
+                  {exportOnlySettingsState}. Preset versions are resolved by the
+                  authoritative service and creation must match this preview.
                 </p>
+                {loggedSettingsPreview ? (
+                  <p className="muted" data-testid="logged-settings-summary">
+                    Logged provenance: Editing application v1
+                    {loggedSettingsPreview.snapshot.base ===
+                    "application_default"
+                      ? " → application base selected"
+                      : loggedSettingsPreview.snapshot.contextDefault
+                        ? ` → project default ${loggedSettingsPreview.snapshot.contextDefault.name} v${loggedSettingsPreview.snapshot.contextDefault.presetVersion}`
+                        : " → no project default"}
+                    {loggedSettingsPreview.snapshot.selectedPreset
+                      ? ` → selected ${loggedSettingsPreview.snapshot.selectedPresetScope} ${loggedSettingsPreview.snapshot.selectedPreset.name} v${loggedSettingsPreview.snapshot.selectedPreset.presetVersion}`
+                      : " → no explicit preset"}
+                    {loggedSettingsPreview.snapshot.overrideFields.length
+                      ? ` → overrides ${loggedSettingsPreview.snapshot.overrideFields.join(", ")}`
+                      : " → no overrides"}
+                    . Effective:{" "}
+                    {loggedSettingsPreview.snapshot.settings.container.toUpperCase()}{" "}
+                    /{" "}
+                    {loggedSettingsPreview.snapshot.settings.videoCodec.toUpperCase()}{" "}
+                    / {loggedSettingsPreview.snapshot.settings.frameRate} fps.
+                    Sidecars:{" "}
+                    {loggedSettingsPreview.effectiveSubtitlePolicy.requiredSidecars.join(
+                      " + ",
+                    ) || "omitted for confidently English"}
+                    .
+                  </p>
+                ) : null}
+                {exportOnlySettingsPreview ? (
+                  <p
+                    className="muted"
+                    data-testid="export-only-settings-summary"
+                  >
+                    Export-only provenance: Editing application v1
+                    {exportOnlySettingsPreview.snapshot.base ===
+                    "application_default"
+                      ? " → application base selected"
+                      : exportOnlySettingsPreview.snapshot.contextDefault
+                        ? ` → personal default ${exportOnlySettingsPreview.snapshot.contextDefault.name} v${exportOnlySettingsPreview.snapshot.contextDefault.presetVersion}`
+                        : " → no personal default"}
+                    {exportOnlySettingsPreview.snapshot.selectedPreset
+                      ? ` → selected personal ${exportOnlySettingsPreview.snapshot.selectedPreset.name} v${exportOnlySettingsPreview.snapshot.selectedPreset.presetVersion}`
+                      : " → no explicit preset"}
+                    {exportOnlySettingsPreview.snapshot.overrideFields.length
+                      ? ` → overrides ${exportOnlySettingsPreview.snapshot.overrideFields.join(", ")}`
+                      : " → no overrides"}
+                    . Effective:{" "}
+                    {exportOnlySettingsPreview.snapshot.settings.container.toUpperCase()}{" "}
+                    /{" "}
+                    {exportOnlySettingsPreview.snapshot.settings.videoCodec.toUpperCase()}{" "}
+                    / {exportOnlySettingsPreview.snapshot.settings.frameRate}{" "}
+                    fps. Sidecars:{" "}
+                    {exportOnlySettingsPreview.effectiveSubtitlePolicy.requiredSidecars.join(
+                      " + ",
+                    ) || "omitted for confidently English"}
+                    .
+                  </p>
+                ) : null}
+                {[
+                  ...(loggedSettingsPreview?.issues ?? []),
+                  ...(exportOnlySettingsPreview?.issues ?? []),
+                ].map((issue, index) => (
+                  <p
+                    className="form-message error"
+                    key={`${issue.field}:${issue.code}:${index}`}
+                  >
+                    {issue.field}: {issue.message}
+                  </p>
+                ))}
               </section>
               <details className="export-settings-panel">
-                <summary>Built-in Editing MP4 settings</summary>
+                <summary>Per-export overrides</summary>
+                <p className="muted">
+                  {overrideFields.size
+                    ? `Overrides: ${[...overrideFields].join(", ")}`
+                    : "No overrides; the resolved base is used unchanged."}
+                  {overrideFields.size ? (
+                    <button
+                      type="button"
+                      className="handle-button"
+                      onClick={() => setOverrideFields(new Set())}
+                    >
+                      Reset all overrides
+                    </button>
+                  ) : null}
+                </p>
                 <div className="export-settings-grid">
                   <label>
                     Container
@@ -1475,6 +1716,9 @@ function App() {
                       onChange={(event) => {
                         const container = event.target.value as
                           "mp4" | "mov" | "mkv";
+                        setOverrideFields((current) =>
+                          new Set(current).add("container"),
+                        );
                         setExportContainer(container);
                         if (
                           container === "mp4" &&
@@ -1495,6 +1739,9 @@ function App() {
                       onChange={(event) => {
                         const codec = event.target.value as
                           "h264" | "hevc" | "prores";
+                        setOverrideFields((current) =>
+                          new Set(current).add("videoCodec"),
+                        );
                         setExportVideoCodec(codec);
                         if (codec === "prores" && exportContainer === "mp4")
                           setExportContainer("mov");
@@ -1520,6 +1767,9 @@ function App() {
                           value <= 51
                         )
                           setExportCrf(value);
+                        setOverrideFields((current) =>
+                          new Set(current).add("videoRateControl"),
+                        );
                       }}
                     />
                   </label>
@@ -1530,8 +1780,16 @@ function App() {
                       min="320"
                       max="7680"
                       step="2"
-                      value={exportMaxWidth}
+                      value={exportMaxWidth ?? ""}
+                      placeholder="Source width"
                       onChange={(event) => {
+                        setOverrideFields((current) =>
+                          new Set(current).add("maxWidth"),
+                        );
+                        if (!event.target.value) {
+                          setExportMaxWidth(undefined);
+                          return;
+                        }
                         const value = Number(event.target.value);
                         if (
                           Number.isInteger(value) &&
@@ -1546,12 +1804,15 @@ function App() {
                     Frame rate
                     <select
                       value={exportFrameRate}
-                      onChange={(event) =>
+                      onChange={(event) => (
+                        setOverrideFields((current) =>
+                          new Set(current).add("frameRate"),
+                        ),
                         setExportFrameRate(
                           event.target.value as
                             "source" | "23.976" | "24" | "25" | "29.97" | "30",
                         )
-                      }
+                      )}
                     >
                       <option value="source">Source</option>
                       <option value="23.976">23.976</option>
@@ -1568,8 +1829,16 @@ function App() {
                       min="64"
                       max="1536"
                       step="16"
-                      value={exportAudioBitrate}
+                      value={exportAudioBitrate ?? ""}
+                      placeholder="Adapter default"
                       onChange={(event) => {
+                        setOverrideFields((current) =>
+                          new Set(current).add("audioKilobitsPerSecond"),
+                        );
+                        if (!event.target.value) {
+                          setExportAudioBitrate(undefined);
+                          return;
+                        }
                         const value = Number(event.target.value);
                         if (
                           Number.isInteger(value) &&
@@ -1585,19 +1854,35 @@ function App() {
                   <input
                     type="checkbox"
                     checked={omitEnglishSubtitles}
-                    onChange={(event) =>
-                      setOmitEnglishSubtitles(event.target.checked)
-                    }
+                    disabled={sourceLanguageClass !== "confirmed_english"}
+                    onChange={(event) => {
+                      setOverrideFields((current) =>
+                        new Set(current).add(
+                          "omitSubtitleFilesForConfirmedEnglish",
+                        ),
+                      );
+                      setOmitEnglishSubtitles(event.target.checked);
+                    }}
                   />
                   Omit subtitle files for confirmed-English videos
                 </label>
+                {sourceLanguageClass !== "confirmed_english" ? (
+                  <p className="muted">
+                    Omission is ineligible here: foreign, mixed, and unknown
+                    sources always require original + English sidecars. A saved
+                    true preference remains inert in the immutable settings.
+                  </p>
+                ) : null}
                 <label className="export-checkbox">
                   <input
                     type="checkbox"
                     checked={embedEnglishSubtitles}
-                    onChange={(event) =>
-                      setEmbedEnglishSubtitles(event.target.checked)
-                    }
+                    onChange={(event) => {
+                      setOverrideFields((current) =>
+                        new Set(current).add("embedEnglishSubtitleTrack"),
+                      );
+                      setEmbedEnglishSubtitles(event.target.checked);
+                    }}
                   />
                   Embed an English soft-subtitle track
                 </label>
@@ -1626,7 +1911,8 @@ function App() {
                     !authorization ||
                     !projectId ||
                     !user ||
-                    !languageEvidenceReady
+                    !languageEvidenceReady ||
+                    loggedSettingsState !== "ready"
                   }
                   onClick={() => void requestLoggedExport()}
                 >
@@ -1634,7 +1920,11 @@ function App() {
                 </button>
                 <button
                   type="button"
-                  disabled={clipActionBusy || Boolean(exportOnlyRequestId)}
+                  disabled={
+                    clipActionBusy ||
+                    Boolean(exportOnlyRequestId) ||
+                    exportOnlySettingsState !== "ready"
+                  }
                   onClick={() => void requestExportOnly()}
                 >
                   {exportOnlyRequestId ? "Export-only queued" : "Export only"}

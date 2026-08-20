@@ -549,12 +549,209 @@ export const ProjectExportPresetCatalogSchema = z
 export const ExportPresetDefaultResponseSchema = z
   .object({ default: ExportPresetDefaultSchema.optional() })
   .strict();
-const createExportRequestBaseSchema = z.object({
-  idempotencyKey: z.string().trim().min(1).max(512),
-  sourceLanguageClass: ExportSourceLanguageClassSchema,
-  subtitleTracks: ExportSubtitleTrackSnapshotsSchema.optional(),
-  preset: ExportPresetSnapshotSchema,
-});
+export const ExportSettingsOverrideSchema = z
+  .object({
+    container: z.enum(["mp4", "mov", "mkv"]).optional(),
+    videoCodec: z.enum(["h264", "hevc", "prores"]).optional(),
+    videoRateControl: ExportVideoRateControlSchema.optional(),
+    maxWidth: z.number().int().min(320).max(7_680).nullable().optional(),
+    frameRate: z
+      .enum(["source", "23.976", "24", "25", "29.97", "30"])
+      .optional(),
+    audioCodec: z.enum(["aac", "pcm_s16le"]).optional(),
+    audioKilobitsPerSecond: z
+      .number()
+      .int()
+      .min(64)
+      .max(1_536)
+      .nullable()
+      .optional(),
+    omitSubtitleFilesForConfirmedEnglish: z.boolean().optional(),
+    embedEnglishSubtitleTrack: z.boolean().optional(),
+  })
+  .strict();
+export const ExportPresetReferenceSchema = z
+  .object({
+    scope: ExportPresetScopeSchema,
+    presetId: IdSchema,
+    presetVersion: z.number().int().positive(),
+  })
+  .strict();
+export const ExportSettingsSelectionSchema = z
+  .object({
+    base: z.enum(["context_default", "application_default"]),
+    selectedPreset: ExportPresetReferenceSchema.optional(),
+    overrides: ExportSettingsOverrideSchema.default({}),
+  })
+  .strict()
+  .superRefine((selection, context) => {
+    if (selection.base === "application_default" && selection.selectedPreset) {
+      context.addIssue({
+        code: "custom",
+        path: ["selectedPreset"],
+        message:
+          "An explicit preset cannot be combined with the application-default base.",
+      });
+    }
+  });
+export const ExportCapabilityIssueSchema = z
+  .object({
+    field: z.string().min(1),
+    code: z.string().min(1),
+    message: z.string().min(1),
+  })
+  .strict();
+export const ExportWorkerCapabilityReferenceSchema = z
+  .object({
+    profileId: z.string().min(1),
+    profileVersion: z.number().int().positive(),
+    fingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+    validation: z.enum(["validated", "legacy_unvalidated"]),
+  })
+  .strict();
+export const ResolvedExportSettingsSnapshotSchema = z
+  .object({
+    schemaVersion: z.literal(1),
+    resolutionKind: z.enum(["catalog", "legacy_inline"]),
+    context: z.enum(["logged", "export_only"]),
+    base: z.enum(["application_default", "context_default", "legacy_inline"]),
+    applicationDefaultVersion: z.literal(1),
+    contextDefault: ExportPresetSnapshotSchema.optional(),
+    selectedPreset: ExportPresetSnapshotSchema.optional(),
+    selectedPresetScope: ExportPresetScopeSchema.optional(),
+    legacyPreset: ExportPresetSnapshotSchema.optional(),
+    overrides: ExportSettingsOverrideSchema,
+    overrideFields: z.array(z.string().min(1)),
+    settings: ExportSettingsSchema,
+    capability: ExportWorkerCapabilityReferenceSchema,
+    resolutionFingerprint: z
+      .string()
+      .regex(/^[a-f0-9]{64}$/)
+      .optional(),
+    resolvedAt: UtcTimestampSchema,
+  })
+  .strict()
+  .superRefine((snapshot, context) => {
+    const legacy = snapshot.resolutionKind === "legacy_inline";
+    if (
+      legacy !==
+      (snapshot.base === "legacy_inline" &&
+        Boolean(snapshot.legacyPreset) &&
+        snapshot.capability.validation === "legacy_unvalidated")
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["resolutionKind"],
+        message: "Legacy resolution provenance is inconsistent.",
+      });
+    }
+    if (
+      (legacy &&
+        (snapshot.contextDefault ||
+          snapshot.selectedPreset ||
+          snapshot.selectedPresetScope ||
+          snapshot.overrideFields.length > 0)) ||
+      (snapshot.base === "application_default" && snapshot.contextDefault)
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["base"],
+        message: "Resolved base-layer provenance is inconsistent.",
+      });
+    }
+    if (
+      !legacy &&
+      (snapshot.base === "legacy_inline" ||
+        snapshot.legacyPreset ||
+        snapshot.capability.validation !== "validated" ||
+        !snapshot.resolutionFingerprint)
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["resolutionKind"],
+        message: "Catalog resolution provenance is inconsistent.",
+      });
+    }
+    if (
+      Boolean(snapshot.selectedPreset) !== Boolean(snapshot.selectedPresetScope)
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["selectedPresetScope"],
+        message:
+          "Selected preset scope must accompany selected preset provenance.",
+      });
+    }
+    const overrideFields = Object.keys(snapshot.overrides).sort();
+    if (
+      overrideFields.length !== snapshot.overrideFields.length ||
+      overrideFields.some(
+        (field, index) => field !== snapshot.overrideFields[index],
+      )
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["overrideFields"],
+        message:
+          "Override fields must exactly name the sorted override payload fields.",
+      });
+    }
+  });
+export const ExportSettingsPreviewRequestSchema = z
+  .object({
+    sourceLanguageClass: ExportSourceLanguageClassSchema,
+    selection: ExportSettingsSelectionSchema,
+  })
+  .strict();
+export const ExportSettingsPreviewSchema = z
+  .object({
+    snapshot: ResolvedExportSettingsSnapshotSchema,
+    issues: z.array(ExportCapabilityIssueSchema),
+    effectiveSubtitlePolicy: z.object({
+      requiredSidecars: z.array(z.enum(["original", "english"])).max(2),
+      subtitleSidecarsOmittedReason: z
+        .literal("confirmed_english_user_setting")
+        .optional(),
+    }),
+  })
+  .strict();
+const createExportRequestBaseSchema = z
+  .object({
+    idempotencyKey: z.string().trim().min(1).max(512),
+    sourceLanguageClass: ExportSourceLanguageClassSchema,
+    subtitleTracks: ExportSubtitleTrackSnapshotsSchema.optional(),
+    preset: ExportPresetSnapshotSchema.optional(),
+    settingsSelection: ExportSettingsSelectionSchema.optional(),
+    expectedResolutionFingerprint: z
+      .string()
+      .regex(/^[a-f0-9]{64}$/)
+      .optional(),
+  })
+  .strict()
+  .superRefine((request, context) => {
+    if (Boolean(request.preset) === Boolean(request.settingsSelection)) {
+      context.addIssue({
+        code: "custom",
+        path: ["settingsSelection"],
+        message:
+          "Provide exactly one legacy preset or catalog settings selection.",
+      });
+    }
+    if (request.settingsSelection && !request.expectedResolutionFingerprint) {
+      context.addIssue({
+        code: "custom",
+        path: ["expectedResolutionFingerprint"],
+        message: "Catalog settings creation requires the preview fingerprint.",
+      });
+    }
+    if (request.preset && request.expectedResolutionFingerprint) {
+      context.addIssue({
+        code: "custom",
+        path: ["expectedResolutionFingerprint"],
+        message: "Legacy inline presets do not accept a preview fingerprint.",
+      });
+    }
+  });
 
 function requireBilingualSubtitleTrackSnapshots(
   request: {
@@ -1264,6 +1461,7 @@ export const ExportRequestSchema = z.object({
   sourceLanguageClass: ExportSourceLanguageClassSchema,
   subtitleTracks: ExportSubtitleTrackSnapshotsSchema.optional(),
   preset: ExportPresetSnapshotSchema,
+  resolvedSettingsSnapshot: ResolvedExportSettingsSnapshotSchema.optional(),
   mediaProvenance: ExportMediaProvenanceSchema.optional(),
   resolvedExportBounds: ResolvedExportBoundsSchema.optional(),
   renderedMediaProvenance: RenderedExportMediaProvenanceSchema.optional(),
@@ -1415,6 +1613,27 @@ export type UpdateClipCandidateRequest = z.infer<
   typeof UpdateClipCandidateRequestSchema
 >;
 export type ExportSettings = z.infer<typeof ExportSettingsSchema>;
+export type ExportSourceLanguageClass = z.infer<
+  typeof ExportSourceLanguageClassSchema
+>;
+export type ExportSettingsOverride = z.infer<
+  typeof ExportSettingsOverrideSchema
+>;
+export type ExportPresetReference = z.infer<typeof ExportPresetReferenceSchema>;
+export type ExportSettingsSelection = z.infer<
+  typeof ExportSettingsSelectionSchema
+>;
+export type ExportCapabilityIssue = z.infer<typeof ExportCapabilityIssueSchema>;
+export type ExportWorkerCapabilityReference = z.infer<
+  typeof ExportWorkerCapabilityReferenceSchema
+>;
+export type ResolvedExportSettingsSnapshot = z.infer<
+  typeof ResolvedExportSettingsSnapshotSchema
+>;
+export type ExportSettingsPreviewRequest = z.infer<
+  typeof ExportSettingsPreviewRequestSchema
+>;
+export type ExportSettingsPreview = z.infer<typeof ExportSettingsPreviewSchema>;
 export type ExportPresetSnapshot = z.infer<typeof ExportPresetSnapshotSchema>;
 export type ExportPresetScope = z.infer<typeof ExportPresetScopeSchema>;
 export type ExportPresetVersion = z.infer<typeof ExportPresetVersionSchema>;

@@ -17,6 +17,7 @@ import {
   RequestDerivedTranslationSchema,
   CreateTranscriptionBatchResponseSchema,
   ExportRequestSchema,
+  ExportSettingsSchema,
   ExportPresetCatalogEntrySchema,
   ExportPresetDefaultSchema,
   PersonalExportPresetCatalogSchema,
@@ -52,6 +53,10 @@ import {
   type ExportPresetCatalogEntry,
   type ExportPresetDefault,
   type ExportPresetScope,
+  type ExportPresetReference,
+  type ExportPresetSnapshot,
+  type ExportSettingsPreview,
+  type ExportSettingsPreviewRequest,
   type PersonalExportPresetCatalog,
   type ProjectExportPresetCatalog,
   type CreateExportPresetRequest,
@@ -78,6 +83,10 @@ import {
   type WorkerFailureRequest,
   type WorkerProgressStage,
 } from "@research-video/contracts";
+import {
+  resolveExportSettings,
+  resolvedPresetForCompatibility,
+} from "@research-video/export-settings";
 import {
   MemoryStagedUploadUrlIssuer,
   type StagedUploadUrlIssuer,
@@ -107,6 +116,22 @@ export class CatalogValidationError extends Error {
 export class CatalogIdempotencyConflictError extends Error {
   readonly statusCode = 409;
   readonly code = "idempotency_conflict";
+}
+
+export class ExportSettingsCapabilityError extends Error {
+  readonly statusCode = 422;
+  readonly code = "export_settings_unsupported";
+  constructor(
+    message: string,
+    readonly issues: ExportSettingsPreview["issues"],
+  ) {
+    super(message);
+  }
+}
+
+export class ExportSettingsStaleError extends Error {
+  readonly statusCode = 409;
+  readonly code = "export_settings_stale";
 }
 
 export type ArtifactType = TranscriptArtifact["type"];
@@ -255,6 +280,35 @@ export class SharedProjectCatalog {
   ): Promise<ExportPresetDefault | undefined> {
     await this.authorize(actor, projectId, "read");
     return this.getExportPresetDefault("project", projectId);
+  }
+
+  async previewPersonalExportSettings(
+    actor: AuthenticatedActor,
+    input: ExportSettingsPreviewRequest,
+  ): Promise<ExportSettingsPreview> {
+    await this.requireRegistered(actor);
+    return this.resolveCatalogExportSettings(
+      actor,
+      "export_only",
+      undefined,
+      input,
+      this.now().toISOString(),
+    );
+  }
+
+  async previewProjectExportSettings(
+    actor: AuthenticatedActor,
+    projectId: string,
+    input: ExportSettingsPreviewRequest,
+  ): Promise<ExportSettingsPreview> {
+    await this.authorize(actor, projectId, "read");
+    return this.resolveCatalogExportSettings(
+      actor,
+      "logged",
+      projectId,
+      input,
+      this.now().toISOString(),
+    );
   }
 
   async createPersonalExportPreset(
@@ -1074,17 +1128,53 @@ export class SharedProjectCatalog {
     const requestId = randomUUID();
     const jobId = randomUUID();
     const now = this.now().toISOString();
-    const payload = {
-      exportRequestId: requestId,
-      mode: "logged",
-      clipId,
-      video: clip.video,
-      selection: clip.selection,
-      sourceLanguageClass: input.sourceLanguageClass,
-      ...(input.subtitleTracks ? { subtitleTracks: input.subtitleTracks } : {}),
-      preset: input.preset,
-    };
     await this.transaction(async () => {
+      const preview = input.preset
+        ? resolveExportSettings({
+            context: "logged",
+            sourceLanguageClass: input.sourceLanguageClass,
+            legacyPreset: input.preset,
+            resolvedAt: now,
+          })
+        : await this.resolveCatalogExportSettings(
+            actor,
+            "logged",
+            projectId,
+            {
+              sourceLanguageClass: input.sourceLanguageClass,
+              selection: input.settingsSelection!,
+            },
+            now,
+          );
+      if (
+        input.expectedResolutionFingerprint &&
+        preview.snapshot.resolutionFingerprint !==
+          input.expectedResolutionFingerprint
+      ) {
+        throw new ExportSettingsStaleError(
+          "Export settings changed after preview. Resolve them again before exporting.",
+        );
+      }
+      if (!input.preset && preview.issues.length) {
+        throw new ExportSettingsCapabilityError(
+          "The current worker cannot render the resolved export settings.",
+          preview.issues,
+        );
+      }
+      const preset = resolvedPresetForCompatibility(preview.snapshot);
+      const payload = {
+        exportRequestId: requestId,
+        mode: "logged",
+        clipId,
+        video: clip.video,
+        selection: clip.selection,
+        sourceLanguageClass: input.sourceLanguageClass,
+        ...(input.subtitleTracks
+          ? { subtitleTracks: input.subtitleTracks }
+          : {}),
+        preset,
+        resolvedSettingsSnapshot: preview.snapshot,
+      };
       await this.database.query(
         `INSERT INTO jobs
            (id, project_id, kind, state, idempotency_key, attempt, payload,
@@ -1096,8 +1186,8 @@ export class SharedProjectCatalog {
         `INSERT INTO export_requests
             (id, job_id, clip_id, project_id, mode, video_snapshot,
             selection_snapshot, source_language_class, subtitle_tracks_snapshot, preset_snapshot,
-            requested_by, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, 'logged', $5, $6, $7, $8, $9, $10, $11, $11)`,
+            resolved_settings_snapshot, requested_by, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, 'logged', $5, $6, $7, $8, $9, $10, $11, $12, $12)`,
         [
           requestId,
           jobId,
@@ -1107,7 +1197,8 @@ export class SharedProjectCatalog {
           JSON.stringify(clip.selection),
           input.sourceLanguageClass,
           input.subtitleTracks ? JSON.stringify(input.subtitleTracks) : null,
-          JSON.stringify(input.preset),
+          JSON.stringify(preset),
+          JSON.stringify(preview.snapshot),
           actor.userId,
           now,
         ],
@@ -2566,6 +2657,96 @@ export class SharedProjectCatalog {
       : undefined;
   }
 
+  private async resolveCatalogExportSettings(
+    actor: AuthenticatedActor,
+    context: "logged" | "export_only",
+    projectId: string | undefined,
+    input: ExportSettingsPreviewRequest,
+    resolvedAt: string,
+  ): Promise<ExportSettingsPreview> {
+    const selection = input.selection;
+    const contextDefault =
+      selection.base === "context_default"
+        ? context === "logged"
+          ? await this.getExportPresetDefault("project", projectId!)
+          : await this.getExportPresetDefault("personal", actor.userId)
+        : undefined;
+    const selectedPreset = selection.selectedPreset
+      ? await this.loadAuthorizedExportPresetRevision(
+          actor,
+          context,
+          projectId,
+          selection.selectedPreset,
+        )
+      : undefined;
+    return resolveExportSettings({
+      context,
+      sourceLanguageClass: input.sourceLanguageClass,
+      ...(contextDefault
+        ? {
+            contextDefault: {
+              scope: contextDefault.scope,
+              snapshot: contextDefault.snapshot,
+            },
+          }
+        : {}),
+      ...(selectedPreset
+        ? {
+            selectedPreset: {
+              scope: selection.selectedPreset!.scope,
+              snapshot: selectedPreset,
+            },
+          }
+        : {}),
+      useApplicationDefault: selection.base === "application_default",
+      overrides: selection.overrides,
+      resolvedAt,
+    });
+  }
+
+  private async loadAuthorizedExportPresetRevision(
+    actor: AuthenticatedActor,
+    context: "logged" | "export_only",
+    projectId: string | undefined,
+    reference: ExportPresetReference,
+  ): Promise<ExportPresetSnapshot> {
+    if (context === "export_only" && reference.scope !== "personal") {
+      throw new AuthorizationError(
+        "Export-only settings may select personal presets only.",
+      );
+    }
+    const result = await this.database.query<DbRow>(
+      `SELECT p.scope, p.owner_user_id, p.project_id, v.name,
+              v.settings_snapshot
+       FROM export_presets p
+       JOIN export_preset_versions v ON v.preset_id = p.id
+       WHERE p.id = $1 AND v.version = $2 AND p.scope = $3`,
+      [reference.presetId, reference.presetVersion, reference.scope],
+    );
+    const row = result.rows[0];
+    if (!row) {
+      throw new CatalogNotFoundError(
+        "The selected export preset version is missing.",
+      );
+    }
+    const authorized =
+      (reference.scope === "personal" && row.owner_user_id === actor.userId) ||
+      (reference.scope === "project" &&
+        context === "logged" &&
+        row.project_id === projectId);
+    if (!authorized) {
+      throw new AuthorizationError(
+        "The selected export preset version is outside this export scope.",
+      );
+    }
+    return {
+      presetId: reference.presetId,
+      presetVersion: reference.presetVersion,
+      name: String(row.name),
+      settings: ExportSettingsSchema.parse(row.settings_snapshot),
+    };
+  }
+
   private async createExportPreset(
     actor: AuthenticatedActor,
     scope: ExportPresetScope,
@@ -3373,6 +3554,7 @@ function mapLoggedExportRequest(row: DbRow): ExportRequest {
       ? { subtitleTracks: row.subtitle_tracks_snapshot }
       : {}),
     preset: row.preset_snapshot,
+    resolvedSettingsSnapshot: row.resolved_settings_snapshot,
     state: row.state,
     createdAt: iso(row.created_at),
     updatedAt: iso(row.updated_at),

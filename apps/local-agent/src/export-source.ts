@@ -40,6 +40,7 @@ import {
   type RenderedExportMediaProvenance,
   type ResolvedExportBounds,
 } from "@research-video/contracts";
+import { validateStoredResolvedSettingsSnapshot } from "@research-video/export-settings";
 import {
   deriveClipRelativeSrtCues,
   parseSrt,
@@ -76,9 +77,43 @@ export class LocalExportSourceProcessor {
         retryable: false,
       });
     }
+    const resolvedSettingsSnapshot = request.resolvedSettingsSnapshot;
+    if (!resolvedSettingsSnapshot) {
+      const error = new ExportSourceAcquisitionError(
+        "This export request is missing its immutable resolved settings snapshot. Recreate the request before retrying.",
+        { code: "resolved_export_settings_missing", retryable: false },
+      );
+      this.queue.recordSourceNotStartedFailure(
+        input.requestId,
+        error.code,
+        error.message,
+      );
+      throw error;
+    }
+    const settingsIssues = validateStoredResolvedSettingsSnapshot(
+      resolvedSettingsSnapshot,
+    );
+    if (settingsIssues.length) {
+      const error = new ExportSourceAcquisitionError(
+        `Resolved export settings cannot be processed: ${settingsIssues
+          .map((issue) => `${issue.field}: ${issue.message}`)
+          .join(" ")}`,
+        { code: settingsIssues[0]!.code, retryable: false },
+      );
+      this.queue.recordSourceNotStartedFailure(
+        input.requestId,
+        error.code,
+        error.message,
+      );
+      throw error;
+    }
     let subtitlePlan: RequiredSubtitlePlan;
     try {
-      subtitlePlan = resolveRequiredSubtitlePlan(this.queue, request);
+      subtitlePlan = resolveRequiredSubtitlePlan(
+        this.queue,
+        request,
+        resolvedSettingsSnapshot.settings,
+      );
     } catch (error) {
       this.queue.recordSourceNotStartedFailure(
         input.requestId,
@@ -112,7 +147,9 @@ export class LocalExportSourceProcessor {
       throw error;
     }
     try {
-      assertEditingFriendlyH264AacMp4Settings(request.preset.settings);
+      assertEditingFriendlyH264AacMp4Settings(
+        resolvedSettingsSnapshot.settings,
+      );
     } catch (error) {
       this.queue.recordSourceNotStartedFailure(
         input.requestId,
@@ -168,7 +205,7 @@ export class LocalExportSourceProcessor {
             outputPath,
             startMs: persistedBounds.startMs,
             endMs: persistedBounds.endMs,
-            settings: started.request.preset.settings,
+            settings: resolvedSettingsSnapshot.settings,
             ...(input.signal ? { signal: input.signal } : {}),
           });
           const outputInspection = await inspectAndValidateRenderedExportOutput(
@@ -178,7 +215,7 @@ export class LocalExportSourceProcessor {
               inspector: this.inspector,
               startMs: persistedBounds.startMs,
               endMs: persistedBounds.endMs,
-              settings: started.request.preset.settings,
+              settings: resolvedSettingsSnapshot.settings,
               ...(input.signal ? { signal: input.signal } : {}),
             },
           );
@@ -358,9 +395,10 @@ type SidecarValidation = {
 function resolveRequiredSubtitlePlan(
   queue: LocalExportQueue,
   request: ExportRequest,
+  settings: ExportRequest["preset"]["settings"],
 ): RequiredSubtitlePlan {
   if (request.sourceLanguageClass === "confirmed_english") {
-    if (request.preset.settings.omitSubtitleFilesForConfirmedEnglish) {
+    if (settings.omitSubtitleFilesForConfirmedEnglish) {
       return { policy: "confirmed_english_omission", sidecars: [] };
     }
     return {
@@ -634,7 +672,10 @@ function resolveVerifiedPackagePolicy(
     thumbnail,
   };
   if (request.sourceLanguageClass === "confirmed_english") {
-    if (request.preset.settings.omitSubtitleFilesForConfirmedEnglish) {
+    if (
+      request.resolvedSettingsSnapshot!.settings
+        .omitSubtitleFilesForConfirmedEnglish
+    ) {
       if (
         request.subtitleOmissionProvenance?.policy !==
           "confirmed_english_user_setting" ||

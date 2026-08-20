@@ -16,6 +16,7 @@ import {
   ExportClipManifestSchema,
   ExportClipMetadataSchema,
 } from "@research-video/contracts";
+import { resolveExportSettings } from "@research-video/export-settings";
 import {
   LocalExportQueue,
   LocalTranscriptIndex,
@@ -205,15 +206,45 @@ function enableConfirmedEnglishOmission(
   requestId: string,
 ) {
   const request = database
-    .prepare("SELECT preset_snapshot_json FROM export_requests WHERE id = ?")
-    .get(requestId) as { preset_snapshot_json: string };
+    .prepare(
+      "SELECT preset_snapshot_json, created_at, job_id FROM export_requests WHERE id = ?",
+    )
+    .get(requestId) as {
+    preset_snapshot_json: string;
+    created_at: string;
+    job_id: string;
+  };
   const preset = JSON.parse(request.preset_snapshot_json) as {
     settings: { omitSubtitleFilesForConfirmedEnglish: boolean };
   };
   preset.settings.omitSubtitleFilesForConfirmedEnglish = true;
+  const snapshot = resolveExportSettings({
+    context: "export_only",
+    sourceLanguageClass: "confirmed_english",
+    legacyPreset: preset as never,
+    resolvedAt: request.created_at,
+  }).snapshot;
+  database.exec("DROP TRIGGER export_requests_resolved_settings_immutable;");
   database
-    .prepare("UPDATE export_requests SET preset_snapshot_json = ? WHERE id = ?")
-    .run(JSON.stringify(preset), requestId);
+    .prepare(
+      "UPDATE export_requests SET preset_snapshot_json = ?, resolved_settings_snapshot_json = ? WHERE id = ?",
+    )
+    .run(JSON.stringify(preset), JSON.stringify(snapshot), requestId);
+  const job = database
+    .prepare("SELECT payload_json FROM jobs WHERE id = ?")
+    .get(request.job_id) as { payload_json: string };
+  const payload = JSON.parse(job.payload_json) as Record<string, unknown>;
+  payload.preset = preset;
+  payload.resolvedSettingsSnapshot = snapshot;
+  database
+    .prepare("UPDATE jobs SET payload_json = ? WHERE id = ?")
+    .run(JSON.stringify(payload), request.job_id);
+  database.exec(`CREATE TRIGGER export_requests_resolved_settings_immutable
+    BEFORE UPDATE OF resolved_settings_snapshot_json ON export_requests
+    WHEN NEW.resolved_settings_snapshot_json <> OLD.resolved_settings_snapshot_json
+    BEGIN
+      SELECT RAISE(ABORT, 'resolved settings snapshot is immutable');
+    END;`);
 }
 
 const fixtureInspection = (durationMs = 2_000) => ({
@@ -305,6 +336,46 @@ const fixtureSourceProvider = (contentSha256 = "e".repeat(64)) => ({
 });
 
 describe("LocalExportSourceProcessor", () => {
+  it("rejects a changed resolved snapshot before transcript or provider work", async () => {
+    const { root, database, queue, request } = fixtureQueue();
+    const changed = structuredClone(
+      resolveExportSettings({
+        context: "export_only",
+        sourceLanguageClass: "confirmed_english",
+        resolvedAt: request.createdAt,
+      }).snapshot,
+    );
+    changed.settings.videoRateControl = { mode: "crf", value: 19 };
+    database.exec("DROP TRIGGER export_requests_resolved_settings_immutable;");
+    database
+      .prepare(
+        "UPDATE export_requests SET resolved_settings_snapshot_json = ? WHERE id = ?",
+      )
+      .run(JSON.stringify(changed), request.id);
+    const acquireAuthorizedFullSource = vi.fn();
+    const getEnglish = vi.spyOn(queue, "getVerifiedEnglishTranscript");
+    const processor = new LocalExportSourceProcessor(
+      queue,
+      { acquireAuthorizedFullSource },
+      fixtureInspector(),
+      fixtureRenderer(),
+      root,
+      fixtureThumbnailExtractor(),
+      fixtureThumbnailInspector(),
+    );
+    await expect(
+      processor.process({
+        requestId: request.id,
+        authorizationConfirmed: true,
+      }),
+    ).rejects.toMatchObject({ code: "resolved_settings_snapshot_changed" });
+    expect(acquireAuthorizedFullSource).not.toHaveBeenCalled();
+    expect(getEnglish).not.toHaveBeenCalled();
+    expect(queue.getSourceAttempt(request.jobId, 1)).toBeUndefined();
+    expect(queue.get(request.id)).toMatchObject({ state: "needs_user_action" });
+    database.close();
+  });
+
   it("renders a confirmed-English omission snapshot without transcript lookup or staged SRTs", async () => {
     const { root, database, queue, request } = fixtureQueue();
     enableConfirmedEnglishOmission(database, request.id);

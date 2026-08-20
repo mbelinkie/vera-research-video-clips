@@ -13,8 +13,13 @@ import {
   type CreateExportOnlyRequest,
   type DerivedTranslationIdentity,
   type ExportRequest,
+  type ResolvedExportSettingsSnapshot,
   type NormalizedTranscript,
 } from "@research-video/contracts";
+import {
+  resolveExportSettings,
+  resolvedPresetForCompatibility,
+} from "@research-video/export-settings";
 
 const defaultMigrationDirectory = fileURLToPath(
   new URL("../migrations", import.meta.url),
@@ -63,6 +68,10 @@ export function runLocalMigrations(
   database: DatabaseSync,
   migrationDirectory = defaultMigrationDirectory,
 ): string[] {
+  database.function("legacy_export_settings_fingerprint", (value) => {
+    const digest = createHash("md5").update(String(value)).digest("hex");
+    return `${digest}${digest}`;
+  });
   database.exec(`
     CREATE TABLE IF NOT EXISTS schema_migrations (
       version TEXT PRIMARY KEY,
@@ -111,7 +120,10 @@ export class LocalExportQueue {
     private readonly now: () => Date = () => new Date(),
   ) {}
 
-  createExportOnly(input: CreateExportOnlyRequest): ExportRequest {
+  createExportOnly(
+    input: CreateExportOnlyRequest,
+    resolvedSettingsSnapshot?: ResolvedExportSettingsSnapshot,
+  ): ExportRequest {
     const request = CreateExportOnlyRequestSchema.parse(input);
     const idempotencyKey = `export-only:${request.idempotencyKey}`;
     const existing = this.database
@@ -125,9 +137,27 @@ export class LocalExportQueue {
     const requestId = randomUUID();
     const jobId = randomUUID();
     const now = this.now().toISOString();
+    const resolved =
+      resolvedSettingsSnapshot ??
+      (request.preset
+        ? resolveExportSettings({
+            context: "export_only",
+            sourceLanguageClass: request.sourceLanguageClass,
+            legacyPreset: request.preset,
+            resolvedAt: now,
+          }).snapshot
+        : undefined);
+    if (!resolved) {
+      throw new LocalExportLifecycleError(
+        "Catalog export creation requires an authoritative resolved settings snapshot.",
+        "resolved_export_settings_required",
+      );
+    }
+    const preset = resolvedPresetForCompatibility(resolved);
     const videoSnapshot = JSON.stringify(request.video);
     const selectionSnapshot = JSON.stringify(request.selection);
-    const presetSnapshot = JSON.stringify(request.preset);
+    const presetSnapshot = JSON.stringify(preset);
+    const resolvedSettingsSnapshotJson = JSON.stringify(resolved);
     const subtitleTracksSnapshot = request.subtitleTracks
       ? JSON.stringify(request.subtitleTracks)
       : null;
@@ -149,7 +179,8 @@ export class LocalExportQueue {
             video: request.video,
             selection: request.selection,
             sourceLanguageClass: request.sourceLanguageClass,
-            preset: request.preset,
+            preset,
+            resolvedSettingsSnapshot: resolved,
           }),
           now,
           now,
@@ -159,8 +190,9 @@ export class LocalExportQueue {
           `INSERT INTO export_requests
              (id, job_id, mode, video_snapshot_json,
               selection_snapshot_json, source_language_class,
-              preset_snapshot_json, subtitle_tracks_snapshot_json, created_at, updated_at)
-           VALUES (?, ?, 'export_only', ?, ?, ?, ?, ?, ?, ?)`,
+              preset_snapshot_json, resolved_settings_snapshot_json,
+              subtitle_tracks_snapshot_json, created_at, updated_at)
+           VALUES (?, ?, 'export_only', ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           requestId,
@@ -169,6 +201,7 @@ export class LocalExportQueue {
           selectionSnapshot,
           request.sourceLanguageClass,
           presetSnapshot,
+          resolvedSettingsSnapshotJson,
           subtitleTracksSnapshot,
           now,
           now,
@@ -188,6 +221,14 @@ export class LocalExportQueue {
          WHERE er.id = ?`,
       )
       .get(requestId) as Record<string, unknown> | undefined;
+    return row ? this.mapRequest(row) : undefined;
+  }
+
+  getByIdempotencyKey(idempotencyKey: string): ExportRequest | undefined {
+    const row = this.database
+      .prepare(`${localExportRequestSelect} WHERE j.idempotency_key = ?`)
+      .get(`export-only:${idempotencyKey}`) as
+      Record<string, unknown> | undefined;
     return row ? this.mapRequest(row) : undefined;
   }
 
@@ -503,7 +544,7 @@ export class LocalExportQueue {
          WHERE job_id = ? AND source_language_class = 'confirmed_english'
            AND resolved_source_attempt = ? AND rendered_source_attempt = ?
            AND json_extract(
-             preset_snapshot_json,
+             resolved_settings_snapshot_json,
              '$.settings.omitSubtitleFilesForConfirmedEnglish'
            ) = 1`,
       )
@@ -961,6 +1002,13 @@ function mapLocalExportRequest(
           subtitleTracks: JSON.parse(String(row.subtitle_tracks_snapshot_json)),
         }),
     preset: JSON.parse(String(row.preset_snapshot_json)),
+    ...(row.resolved_settings_snapshot_json
+      ? {
+          resolvedSettingsSnapshot: JSON.parse(
+            String(row.resolved_settings_snapshot_json),
+          ),
+        }
+      : {}),
     ...(row.media_duration_ms === null || row.media_duration_ms === undefined
       ? {}
       : {
