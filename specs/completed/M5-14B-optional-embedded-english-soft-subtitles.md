@@ -1,6 +1,6 @@
 # M5-14B — Optional embedded English soft subtitles
 
-- Status: completed
+- Status: active (audit fix)
 - Task/thread: M5-14B only
 - Dependency: completed M5-14A capability-driven rendering and conformance
 
@@ -209,3 +209,10 @@ verified completed behavior.
 - Remaining risk: FFprobe may omit optional stream titles on some builds; title
   is recorded only when safely observed, while codec/language/disposition/count
   remain mandatory.
+- Audit follow-up: commit `09bd88897b37d5533dc6207d44c20df5b9187057` used
+  `-shortest`, which could truncate a requested video range when the final
+  English cue ended early. The follow-up removes that output option: fixed `-t`
+  remains authoritative, while the offset subtitle stream stays time-aligned.
+  The real family fixture now has a nonzero export start and its final subtitle
+  cue ends two seconds before the requested clip end; all embedded packages
+  still verify the full requested duration.

@@ -774,7 +774,6 @@ export function buildFfmpegRenderArguments(
       "-disposition:s:0",
       "0",
     );
-    args.push("-shortest");
   }
   const filters: string[] = [];
   if (input.settings.maxWidth !== undefined) {
