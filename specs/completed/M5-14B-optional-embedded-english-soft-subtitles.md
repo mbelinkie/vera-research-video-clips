@@ -1,6 +1,6 @@
 # M5-14B — Optional embedded English soft subtitles
 
-- Status: active (audit fix)
+- Status: completed
 - Task/thread: M5-14B only
 - Dependency: completed M5-14A capability-driven rendering and conformance
 
@@ -216,3 +216,13 @@ verified completed behavior.
   The real family fixture now has a nonzero export start and its final subtitle
   cue ends two seconds before the requested clip end; all embedded packages
   still verify the full requested duration.
+- Final audit correction: commit `20d73c0151223998357d30e0f24f6fc1a32ada98`
+  fixed duration but direct stream extraction showed its embedded cue timestamps
+  were source-relative. The renderer now performs a private first video/audio
+  pass using the established post-input seek, then a fixed stream-copy mux of
+  that clip and the zero-based validated English SRT. The MP4 real-tool test
+  extracts stream `0:s:0` through FFmpeg's fixed SRT encoder and compares parsed
+  text and clip-relative timing exactly with the promoted English sidecar.
+  The immutable request's exact English track/version is retained in metadata
+  subtitle provenance; it remains mandatory for embedding even when the sidecar
+  is omitted.

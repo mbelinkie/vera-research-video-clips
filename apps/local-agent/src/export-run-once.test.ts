@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { execFile as execFileCallback } from "node:child_process";
 import {
   access,
   copyFile,
@@ -11,6 +12,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
 
@@ -51,6 +53,7 @@ const fixtureMediaPath = fileURLToPath(
 const ffmpegPath = "/usr/local/bin/ffmpeg";
 const ffprobePath = "/usr/local/bin/ffprobe";
 const temporaryRoots = new Set<string>();
+const execFile = promisify(execFileCallback);
 
 beforeAll(async () => {
   await Promise.all([
@@ -457,6 +460,13 @@ describe("one-shot local export runtime", () => {
           default: false,
           forced: false,
         });
+      if (fixture.embedded && fixture.extension === "mp4") {
+        const [embedded, sidecar] = await Promise.all([
+          extractEmbeddedEnglishSrt(videoPath),
+          readFile(join(packageDirectory, `${packageIdentity}.en.srt`), "utf8"),
+        ]);
+        expect(parseSrt(embedded)).toEqual(parseSrt(sidecar));
+      }
       const manifest = ExportClipManifestSchema.parse(
         JSON.parse(
           await readFile(join(packageDirectory, "manifest.json"), "utf8"),
@@ -474,6 +484,27 @@ describe("one-shot local export runtime", () => {
     },
   );
 });
+
+async function extractEmbeddedEnglishSrt(videoPath: string): Promise<string> {
+  const result = await execFile(
+    ffmpegPath,
+    [
+      "-hide_banner",
+      "-nostdin",
+      "-i",
+      videoPath,
+      "-map",
+      "0:s:0",
+      "-c:s",
+      "srt",
+      "-f",
+      "srt",
+      "-",
+    ],
+    { maxBuffer: 1024 * 1024 },
+  );
+  return result.stdout;
+}
 
 async function createFixtureWorkspace() {
   const root = await mkdtemp(join(tmpdir(), "local-export-runtime-"));
