@@ -651,19 +651,30 @@ export class FfmpegCapabilityRangeRenderer implements FfmpegRangeRenderer {
             settings: { ...input.settings, embedEnglishSubtitleTrack: false },
             ...(input.signal ? { signal: input.signal } : {}),
           }),
-          { timeoutMs: this.#timeoutMs, ...(input.signal ? { signal: input.signal } : {}) },
+          {
+            timeoutMs: this.#timeoutMs,
+            ...(input.signal ? { signal: input.signal } : {}),
+          },
         );
         await validateRenderedOutput(intermediatePath);
         await this.#runner.run(
           this.#executable,
           buildFfmpegSoftSubtitleMuxArguments(input, intermediatePath),
-          { timeoutMs: this.#timeoutMs, ...(input.signal ? { signal: input.signal } : {}) },
+          {
+            timeoutMs: this.#timeoutMs,
+            ...(input.signal ? { signal: input.signal } : {}),
+          },
         );
         await rm(intermediatePath, { force: true });
       } else {
-        await this.#runner.run(this.#executable, buildFfmpegRenderArguments(input), {
-          timeoutMs: this.#timeoutMs, ...(input.signal ? { signal: input.signal } : {}),
-        });
+        await this.#runner.run(
+          this.#executable,
+          buildFfmpegRenderArguments(input),
+          {
+            timeoutMs: this.#timeoutMs,
+            ...(input.signal ? { signal: input.signal } : {}),
+          },
+        );
       }
     } catch {
       if (input.signal?.aborted) throw renderCanceled();
@@ -861,10 +872,48 @@ export function buildFfmpegSoftSubtitleMuxArguments(
   renderedVideoAudioPath: string,
 ): string[] {
   if (!input.settings.embedEnglishSubtitleTrack || !input.englishSubtitlePath)
-    throw new FfmpegRenderError("Embedded English subtitle input is required.", { code: "english_subtitle_input_invalid", retryable: false });
+    throw new FfmpegRenderError(
+      "Embedded English subtitle input is required.",
+      { code: "english_subtitle_input_invalid", retryable: false },
+    );
   const subtitleCodec = input.settings.container === "mkv" ? "srt" : "mov_text";
-  const format = input.settings.container === "mkv" ? "matroska" : input.settings.container;
-  return ["-hide_banner", "-nostdin", "-i", resolve(renderedVideoAudioPath), "-i", resolve(input.englishSubtitlePath), "-map", "0:v:0", "-map", "0:a:0", "-map", "1:s:0", "-c:v", "copy", "-c:a", "copy", "-c:s", subtitleCodec, "-map_metadata", "-1", "-map_chapters", "-1", "-dn", "-metadata:s:s:0", "language=eng", "-metadata:s:s:0", "title=English", "-disposition:s:0", "0", "-f", format, "-n", resolve(input.outputPath)];
+  const format =
+    input.settings.container === "mkv" ? "matroska" : input.settings.container;
+  return [
+    "-hide_banner",
+    "-nostdin",
+    "-i",
+    resolve(renderedVideoAudioPath),
+    "-i",
+    resolve(input.englishSubtitlePath),
+    "-map",
+    "0:v:0",
+    "-map",
+    "0:a:0",
+    "-map",
+    "1:s:0",
+    "-c:v",
+    "copy",
+    "-c:a",
+    "copy",
+    "-c:s",
+    subtitleCodec,
+    "-map_metadata",
+    "-1",
+    "-map_chapters",
+    "-1",
+    "-dn",
+    "-metadata:s:s:0",
+    "language=eng",
+    "-metadata:s:s:0",
+    "title=English",
+    "-disposition:s:0",
+    "0",
+    "-f",
+    format,
+    "-n",
+    resolve(input.outputPath),
+  ];
 }
 
 export function assertEditingFriendlySourceCompatibility(
