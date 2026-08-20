@@ -2,8 +2,8 @@
 
 ## Project guide and implementation plan
 
-Status: Milestones 1–4 core workflow complete; Milestone 5 local export-only runtime composition proven through M5-08; logged/cloud export delivery and the broader release gate remain open
-Last updated: 2026-08-15
+Status: Milestones 1–4 core workflow complete; Milestone 5 local export-only runtime composition proven through M5-09; logged/cloud export delivery and the broader release gate remain open
+Last updated: 2026-08-20
 
 This document is the source of truth for product scope, architecture, sequencing, and acceptance criteria. Update it when a deliberate product or architectural decision changes. Use `outline.md` as the shorter execution checklist.
 
@@ -40,7 +40,9 @@ own rationale; do not create decision records for routine implementation notes.
 
 ## 1. Product promise
 
-Turn a YouTube video in any supported language into a searchable English transcript, let the user navigate the video from that transcript, and make any selected passage actionable in one step:
+Turn a YouTube video in any supported language into a searchable transcript in
+the user's preferred language, let the user navigate the video from that
+transcript, and make any selected passage actionable in one step:
 
 - **Queue / log only:** save a potential clip to an explicitly chosen project without rendering media.
 - **Export + log:** save it to an explicitly chosen project, then create its editing-ready clip package.
@@ -54,14 +56,18 @@ Every foreign-language clip export includes two separate subtitle files covering
 
 1. Open or create a shared project.
 2. Paste one YouTube URL for immediate review, or submit many URLs as a transcription batch.
-3. Load video metadata and resolve an English transcript from local cache, the project's shared store, available captions, translation, or transcription.
+3. Load video metadata and resolve the source-language and English transcripts,
+   then resolve the requesting user's preferred-language view from the source,
+   verified local cache, or the project's shared store before translating it.
 4. Publish a newly completed transcript version to the project so other authorized members can reuse it.
 5. Click transcript text to seek the player.
 6. Search, highlight, and adjust a transcript range.
 7. Choose `Queue / log only`, `Export + log`, or `Export only`.
 8. For either logging action, explicitly indicate the destination project.
 9. Optionally add reusable tags (topic, person, theme, or any project-defined label) and a note describing context or intended use.
-10. Preserve the appropriate selection, timing, provenance, tags, note, and status atomically with the logged clip.
+10. Preserve the native-language and English text, plus preferred-language text
+    when it is a distinct third language, together with selection timing,
+    provenance, tags, note, and status atomically with the logged clip.
 11. Generate and verify the language-policy subtitle set: both original and English SRTs for foreign-language clips; an English SRT for English clips unless explicitly omitted.
 12. Export logged clips later individually or in a batch.
 
@@ -99,7 +105,12 @@ Preserve whether timestamps are word-exact, caption-cue-level, or estimated. Do 
 
 ### 3.7 Translation never destroys the source
 
-Preserve original-language text and English text as separate, linked tracks. Keep language, provider, model, and generation metadata.
+Preserve original-language text and English text as separate, linked tracks.
+Additional translated tracks are supplemental, language-addressed derivatives
+linked to the same original track by source-video time. Keep language,
+provider, model, source-track identity, and generation metadata. A user's
+current preference never changes the language or identity of an existing
+track.
 
 ### 3.8 Long work is resumable
 
@@ -131,6 +142,30 @@ Tags are reusable project-scoped labels: match them case-insensitively for uniqu
 
 Prefer mature, actively maintained libraries and official vendor SDKs for standard infrastructure concerns. Put each external tool, library-specific data shape, and hosted service behind a narrow typed adapter so the application model, worker orchestration, and UI do not depend on that choice. Keep deterministic fakes for normal tests and make live-provider checks optional. Pin compatible dependency ranges and record provider/model/tool provenance on durable outputs so an implementation can be upgraded or replaced without silently changing existing work.
 
+### 3.14 Preferred language is personal; logged language evidence is durable
+
+Each user may set one account-level preferred transcript language, defaulting
+to English. Use normalized BCP-47 language tags and treat tags with the same
+primary language as equivalent for the initial translation policy (for example,
+`en-US` satisfies English). The preference controls transcript display and
+search; it does not replace the shared English track, mutate a project's active
+base transcript, or become project-wide state.
+
+Resolve the display track in this order: the original track when the source
+already matches the preference, the canonical English track when the preference
+is English, otherwise a verified translation derived directly from the original
+track. Reuse a verified local or project-shared derived translation before
+requesting provider work. If the configured provider cannot produce the target,
+show an actionable unsupported/unavailable state rather than silently falling
+back to an unrelated language or translating English a second time.
+
+Every logged clip keeps native-language text and English text. When the user's
+preferred language is non-English and differs from the native and English
+languages, also snapshot `preferred_language`, `preferred_text`, and its exact
+track/version provenance. Those preferred fields are an optional all-or-none
+group and are absent in every other case. Changing the user's preference never
+rewrites an existing logged clip.
+
 ## 4. MVP definition
 
 ### 4.1 Included in the first usable release
@@ -148,6 +183,10 @@ Prefer mature, actively maintained libraries and official vendor SDKs for standa
 - Generate a transcript when no usable transcript exists.
 - Detect the spoken language and produce English when necessary.
 - Preserve original and English transcript tracks.
+- Let each user set a preferred transcript language and display/search verified
+  source, English, or supplemental translated tracks accordingly.
+- Reuse project-shared, immutable preferred-language translations before
+  generating them, without changing the active source-plus-English transcript.
 - Normalize all transcript sources into one segment/token model.
 - Upload an immutable, checksummed transcript bundle to private online storage and finalize its shared manifest.
 - Download and verify a shared transcript on another authorized workstation without regeneration.
@@ -162,6 +201,8 @@ Prefer mature, actively maintained libraries and official vendor SDKs for standa
 - Queue/log a selection to a chosen project without exporting.
 - Export and log a selection to a chosen project.
 - Add optional usage notes and reusable project-scoped tags while performing either logging action, then edit/search/filter them later.
+- Log native and English text for every candidate, plus preferred-language text
+  and provenance only when it is a distinct third language.
 - Export a selection without adding it to a project log.
 - Export a previously logged selection.
 - When conversion requires it, download the full authorized source behind the scenes into private job-scoped scratch storage, reuse it for all requested ranges in that active source job, and verify its deletion after outputs finalize.
@@ -198,7 +239,7 @@ Use a resizable split layout:
 
 ```text
 +-----------------------------------------------------------------------+
-| URL / project | Search | language toggle | queue | settings           |
+| URL / project | Search | display language | queue | settings          |
 +-------------------------------+---------------------------------------+
 | Transcript (about 40%)        | YouTube player (about 60%)            |
 |                               |                                       |
@@ -246,7 +287,10 @@ Do not show a single indefinite spinner for the entire pipeline.
 - Auto-scroll only while follow mode is enabled.
 - Temporarily suspend follow mode when the user manually scrolls; expose a `Resume follow` control.
 - Keep text selection stable while the active playback highlight changes.
-- Toggle `English`, `Original`, or a paired bilingual view without losing the selected time range.
+- Default to the current user's preferred-language track. Allow `Preferred`,
+  `English`, `Original`, and paired views for the tracks that exist without
+  losing the selected source-video time range. When preferred English or the
+  source already matches the preference, do not show a duplicate track/view.
 
 ### 5.4 Selection behavior
 
@@ -259,6 +303,9 @@ A selection stores:
 - user-adjusted export time range
 - selected original text, when available
 - selected English text
+- selected preferred-language text and language only when it is a distinct
+  third language
+- exact original, English, and optional preferred track/version provenance
 - timing precision and transcript version
 
 After selection, show:
@@ -317,7 +364,11 @@ Provide a dedicated `Transcription queue` surface:
 1. Require a target project.
 2. Accept newline-separated URLs and CSV import initially; playlist import can follow.
 3. Show a preflight table with normalized video ID, title/duration when resolvable, existing shared transcript, duplicate/unsupported status, and estimated processing need.
-4. Let the user name the batch and choose source policy, target language, transcription profile, execution location (`local` or available hosted worker), and priority.
+4. Let the user name the batch and choose source policy, transcription profile,
+   execution location (`local` or available hosted worker), and priority. The
+   canonical shared target remains English; snapshot the submitting user's
+   non-English preferred display language as a supplemental translation request
+   without making it part of base-transcript deduplication.
 5. Submit valid unique items in one action.
 6. Show aggregate counts and per-item stage/progress/error/retry controls.
 7. Put successful project videos in `Ready for review`; keep failed items visible without blocking siblings.
@@ -385,7 +436,15 @@ For each video, resolve a transcript deterministically:
 9. Acquire audio and run multilingual speech recognition.
 10. Translate the resulting original transcript to English when needed.
 11. Align or estimate timing and mark its precision.
-12. Upload/finalize the new immutable transcript bundle, then mark it active for the project.
+12. Upload/finalize the new immutable source-plus-English transcript bundle,
+    then mark it active for the project.
+13. Resolve the requesting user's preferred language: use original or English
+    when equivalent; otherwise check a verified local derived-translation cache,
+    then the project's shared derived-translation catalog, then request one
+    provider translation directly from the original track.
+14. Publish a newly completed preferred-language translation as an immutable,
+    checksummed derivative of the exact base transcript version. Do not replace
+    or mutate the active base transcript.
 
 Let the user override track choice and explicitly request regeneration.
 
@@ -418,7 +477,7 @@ type TranscriptTrack = {
   id: string;
   videoId: string;
   language: string;          // BCP-47 when known
-  kind: "original" | "english";
+  kind: "original" | "english" | "translation";
   source: "youtube-manual" | "youtube-auto" | "generated" | "translated";
   provider: string;
   model?: string;
@@ -450,7 +509,12 @@ type TranscriptToken = {
 };
 ```
 
-Store time as integer milliseconds relative to the original video. Keep raw provider responses in the cache for debugging/reprocessing, but do not make UI code depend on them.
+Store time as integer milliseconds relative to the original video. `english`
+remains an explicit compatibility/collaboration role; any non-English derived
+track uses `translation`, because whether it is "preferred" depends on the
+viewer. Every derived track has `sourceTrackId` pointing to the original track
+and copies its honest source-video cue boundaries. Keep raw provider responses
+in the cache for debugging/reprocessing, but do not make UI code depend on them.
 
 ### 6.4 Timing policy
 
@@ -475,6 +539,12 @@ Build transcript cache keys from at least:
 
 Partial jobs must not be treated as ready cache hits.
 
+Base transcript identity and preferred-translation identity are separate. A
+user preference must not cause the source-plus-English transcription job to be
+regenerated or create a competing active base version. Key a derived
+translation by the exact base transcript version, original track/content
+identity, normalized target language, provider/model, and normalization schema.
+
 ### 6.6 Shared transcript bundle
 
 Store large transcript data as compressed private objects, not database rows alone. Keep the searchable/local normalized form in SQLite after download.
@@ -489,9 +559,18 @@ projects/<project-id>/videos/<video-id>/transcripts/<lineage-id>/v<version>/
   english.normalized.json.gz
   original.srt
   english.srt
+  translations/<target-language>/v<translation-version>/
+    manifest.json
+    translated.normalized.json.gz
+    translated.srt
 ```
 
-The manifest records project/video/track IDs, source and target languages, provenance, model/provider versions, timing precision, normalization schema, object keys/version IDs, byte sizes, SHA-256 checksums, job ID, creator, and created time. Do not use titles or other mutable text as object identity.
+The base manifest records project/video/track IDs, source and English target
+languages, provenance, model/provider versions, timing precision, normalization
+schema, object keys/version IDs, byte sizes, SHA-256 checksums, job ID, creator,
+and created time. Each supplemental translation has its own manifest linked to
+the exact base transcript version and original track. Do not use a user ID,
+preference label, title, or other mutable text as translation identity.
 
 Use a private S3 bucket with versioning, encryption, blocked public access, least-privilege service roles, and lifecycle rules for abandoned staging objects/old versions. The application receives short-lived presigned upload/download URLs from the authenticated project API; do not ship general AWS credentials to clients.
 
@@ -507,6 +586,13 @@ Publish atomically at the catalog level:
 6. API marks the job ready and emits a project update.
 
 Another workstation reads the active manifest through the API, downloads with a short-lived URL, verifies checksum/schema, and atomically promotes the local cache entry. It must never expose a half-uploaded transcript as ready.
+
+Use the same staging-upload plus transactional-finalize protocol for a derived
+translation. Finalization may advance only the active pointer for that base
+version and target-language lineage; it must not change the project's active
+base transcript pointer. Concurrent equivalent preferred-language work adopts
+or supersedes the canonical finalized derivative instead of publishing
+duplicate active results.
 
 Use a unique idempotency key over project, video, source/target languages, source fingerprint, provider/model, and normalization schema. Concurrent equivalent jobs may both compute, but only one canonical finalized version should win; the other adopts the completed version or becomes `superseded` without overwriting it. Cross-project reuse is opt-in because project access boundaries must not leak transcript existence or content.
 
@@ -548,8 +634,12 @@ At minimum persist:
 - transcript track/version IDs
 - transcript start/end milliseconds
 - export start/end milliseconds
-- English text
-- original text and language when available
+- English text plus exact English track/version provenance
+- native/original text, language, and exact track/version provenance when the
+  English track is not itself the native track
+- optional preferred-language text, normalized language, and exact
+  track/version provenance only when the user's non-English preference differs
+  from both native and English
 - notes and tags
 - research status
 - export status and latest error
@@ -560,7 +650,15 @@ At minimum persist:
 
 ### 7.4 Export request snapshot
 
-Every export job stores an immutable request snapshot containing the video, transcript version, selected text, source bounds, export bounds, language tracks, fully resolved conversion settings, preset ID/version when applicable, and optional logged clip ID. The clip ID is required for `Export + log` or exporting a previously logged clip and absent for `Export only`. Later edits to project/global presets must not change an existing request or retry.
+Every export job stores an immutable request snapshot containing the video,
+transcript version, selected text, source bounds, export bounds, language
+tracks, fully resolved conversion settings, preset ID/version when applicable,
+and optional logged clip ID. The clip ID is required for `Export + log` or
+exporting a previously logged clip and absent for `Export only`. Later edits to
+project/global presets must not change an existing request or retry. A
+preferred-language logging snapshot does not change the export subtitle policy:
+original and English remain the required foreign-language sidecars; a preferred
+subtitle sidecar is outside this feature unless separately requested later.
 
 ### 7.5 Export pipeline
 
@@ -661,6 +759,7 @@ Recommended sheet columns:
 ```text
 Project ID | Project | Clip ID | Clip Name | Source Video | YouTube URL | Channel | Start | End |
 Length | Topic | Notes | Tags | English Transcript | Original Transcript |
+Preferred Language | Preferred Transcript |
 Export Preset | Preset Version | Request Export | Status | Error | English Subtitle File |
 Original Subtitle File | Video File | Export Date
 ```
@@ -808,6 +907,8 @@ Shared PostgreSQL tables or equivalent aggregates:
 - `transcript_lineages`
 - `transcript_versions`
 - `transcript_artifacts`
+- `transcript_translation_lineages` and immutable translation versions/artifacts
+  keyed to one base transcript version and target language
 - `transcription_batches`
 - `transcription_jobs`
 - `worker_leases`
@@ -841,6 +942,16 @@ Important constraints:
 - `start_ms >= 0`, `end_ms > start_ms`.
 - Clip export bounds contain or deliberately document deviation from transcript bounds.
 - A clip note and all clip-tag assignments are committed atomically with clip creation; tag names are unique by project after case/Unicode normalization.
+- A user's preferred language is a normalized account preference with English
+  as the default. Only that authenticated user may change it.
+- Clip native/English text provenance is frozen at creation. Optional preferred
+  language, text, track ID, and track version are either all present or all
+  absent, and may be present only for a non-English language distinct from the
+  clip's native and English languages.
+- A derived translation is immutable, checksummed, and uniquely/idempotently
+  linked to one exact base transcript version, original track/content identity,
+  normalized target language, provider/model, and schema version. It never
+  changes the active base transcript pointer.
 - Every export job contains a validated, immutable resolved-settings snapshot.
 - Jobs have an idempotency key and attempt count.
 - Worker claims have an expiring lease/heartbeat and safe reassignment policy.
@@ -857,7 +968,9 @@ Use stable UUIDs, UTC timestamps, actor IDs, and optimistic versions now. Enforc
 ### MVP
 
 - Normalize case and Unicode consistently.
-- Search English and the active original-language track.
+- Search the displayed preferred-language track, English, and the active
+  original-language track without presenting duplicate results for equivalent
+  tracks.
 - Highlight all visible matches.
 - Jump next/previous and seek to the matching segment.
 - Keep query state per video.
@@ -899,6 +1012,7 @@ Keep small, redistributable fixtures that cover:
 
 - English caption cues
 - non-English original plus English translation
+- non-English original plus English and a distinct preferred-language translation
 - word-timed generated transcript
 - cue-only transcript
 - missing captions
@@ -915,6 +1029,8 @@ Do not make the normal test suite depend on live YouTube availability. Keep live
 - URL normalization
 - caption-source precedence
 - transcript normalization and re-segmentation
+- BCP-47 preference normalization/equivalence and display-track resolution
+- derived-translation cache and idempotency identity
 - token/segment time lookup
 - selection-to-time mapping
 - subtitle selection, boundary clamping, and zero-based time shifting
@@ -927,6 +1043,9 @@ Do not make the normal test suite depend on live YouTube availability. Keep live
 - filename sanitization
 - three-action command effects and queue/export state transitions
 - note validation and project-scoped tag normalization/deduplication
+- logged-language matrix: source equals English, source equals preference, and
+  source/English/preference all differ; reject partial or redundant preferred
+  field groups
 - cache keys and idempotency keys
 - transcript manifest/checksum verification
 - batch/item/review state transitions
@@ -941,11 +1060,15 @@ Do not make the normal test suite depend on live YouTube availability. Keep live
 - staged upload/finalize with a fake object store
 - download/verify/cache from a second simulated workstation
 - generated transcript job with a fake provider
+- preferred-language resolution reuses local/shared derivatives before one
+  direct-from-original provider request and never changes the active base version
 - batch preflight deduplication and sibling failure isolation
 - duplicate queue delivery and expired worker lease recovery
 - project selection enforcement for both logging actions
 - queue item creation independent of export
 - atomic note/tag persistence for both logging actions, including offline outbox replay and collaborator edits
+- atomic native/English/optional-preferred text and track provenance for both
+  logging actions, CSV projection, reload, and offline outbox replay
 - export-only job creation without a clip/project log record
 - FFmpeg exports from the local fixture using representative conversion presets
 - confirmed-English export produces an English SRT by default and produces no sidecar files when omission is explicitly enabled
@@ -974,6 +1097,13 @@ Do not make the normal test suite depend on live YouTube availability. Keep live
 12. Verify that the completed export has no retained source scratch media.
 13. Select an English-language phrase, use `Export + log`, leave omission off, and verify the project record exists before the render completes and its package has a matching English SRT.
 14. Select another English-language phrase, enable `Omit subtitle files for English-language clips`, use `Export only`, and verify no project clip/CSV/Sheets row or SRT sidecar is created while the intentional omission is recorded in the manifest.
+15. Set the test user preference to Spanish, open a Romanian fixture, and verify
+    the displayed/searchable transcript is Spanish while the active shared base
+    transcript remains Romanian plus English.
+16. Log a Romanian selection and verify its native Romanian text, mandatory
+    English text, and optional Spanish preferred text carry exact time-linked
+    track/version provenance through reload and CSV export. Then change the
+    user's preference and verify the existing clip is unchanged.
 
 Use a thin manual smoke test with an authorized real YouTube video before a release.
 
@@ -1196,6 +1326,8 @@ A slice is done only when:
 - published objects are checksummed, immutable, and invisible until catalog finalization
 - temporary source media is isolated, deleted on every terminal path, and covered by crash-recovery cleanup
 - every completed clip satisfies the snapshotted language-aware subtitle policy with transcript/timing provenance or a recorded confirmed-English omission
+- every logged clip contains time-linked native and English text provenance and,
+  only when required, a complete distinct preferred-language snapshot
 - relevant unit/integration tests pass
 - the critical UI state is manually verified
 - errors are actionable and logs do not leak secrets
@@ -1214,6 +1346,8 @@ A slice is done only when:
 | Temporary source media survives a crash or cleanup error | Storage, privacy, or rights exposure | Job-scoped scratch, explicit deletion state, finally-path cleanup, retries/alerts, and short-TTL sweeper/lifecycle backstop |
 | Cue-only captions are imprecise | Word selection implies false accuracy | Track timing precision, use cue bounds, preview/adjust, later align on demand |
 | Translation changes segment lengths | English/original selections drift | Link tracks by time rather than array index; preserve both tracks |
+| Personal language changes fragment shared transcripts or overwrite logs | Duplicate translation cost, inconsistent collaboration data, or historical clip drift | Keep source-plus-English as the active base, store target-language derivatives separately, deduplicate by base/version/target, and snapshot optional preferred clip text immutably |
+| A preferred language is unsupported or its provider is disabled | The user cannot review the requested translation | Preserve the setting, expose an actionable translation-unavailable state, keep native/English data intact, and never silently pivot through English or display a mislabeled track |
 | Long videos exhaust memory | UI/worker instability | Stream files, virtualize UI, paginate APIs, bound job concurrency |
 | Concurrent/duplicate transcription jobs | Wasted compute or competing versions | Unique idempotency keys, at-least-once-safe workers, transactional finalize, supersede/adopt policy |
 | Cloud/API outage | Another workstation cannot fetch new work | Verified local cache, offline outbox, clear sync state, retry without regeneration |
