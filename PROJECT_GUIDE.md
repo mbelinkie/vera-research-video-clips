@@ -2,7 +2,7 @@
 
 ## Project guide and implementation plan
 
-Status: Milestones 1–4 core workflow complete; preferred-language logging and Milestone 5 local export capabilities are verified through M5-14A; embedded subtitles, logged/cloud delivery, operational recovery/grouping, and the final release gate remain open
+Status: Milestones 1–4 core workflow complete; preferred-language logging and Milestone 5 local export capabilities including optional English soft subtitles are verified through M5-14B; logged/cloud delivery, operational recovery/grouping, and the final release gate remain open
 Last updated: 2026-08-20
 
 This document is the source of truth for product scope, architecture, sequencing, and acceptance criteria. Update it when a deliberate product or architectural decision changes. Use `outline.md` as the shorter execution checklist.
@@ -1377,7 +1377,7 @@ Deliver:
 
 Exit when representative presets/overrides produce the requested media properties, queued jobs are unaffected by later preset edits, English clips include a validated clip-relative English SRT by default but can explicitly omit sidecars, every foreign/mixed/unknown-language clip has validated original and translated-English SRTs from the expected transcript versions, a 30-second foreign-language clip has accurate cues only within its 30-second duration, a real authorized video succeeds in a smoke test, and no full source media remains after any terminal job path.
 
-M5-10 through M5-14A completed 2026-08-20. Every newly promoted package now
+M5-10 through M5-14B completed 2026-08-20. Every newly promoted package now
 includes a verified descriptive `clip-<id>.json` metadata sidecar and a
 midpoint-derived, independently probed JPEG thumbnail; both are staged, hashed,
 named by the manifest, and required by atomic finalization while legacy package
@@ -1392,13 +1392,18 @@ software-only families—H.264 High/AAC in MP4, HEVC Main/AAC in MKV, and ProRes
 422/PCM in MOV—through fixed argument mappings, installed-capability discovery,
 dynamic package roles/extensions, and normalized FFprobe conformance. Manifest
 and metadata schema version 2 records remain backward-readable with version 1.
+An immutable export may additionally include exactly one selectable English soft
+subtitle stream, while required SRT sidecars remain independent. The renderer
+uses only `mov_text` for MP4/MOV and SubRip for MKV, snapshots the exact English
+track independently of the preferred display track, and verifies stream codec,
+language, disposition, count, and normalized observed-media provenance before
+promotion.
 The latest aggregate verification passed 173 tests with one declared skip, the
 web build, 17 local and 11 cloud migrations, four Playwright flows, and real
 FFmpeg/FFprobe renders for all three families. Commits `2323a0f`, `fe1efed`,
 `38047c4`, `9c8d8c6`, and `75def13` contain the completed slices.
 
-These slices do not complete Milestone 5. Optional embedded English soft
-subtitles, registered local-agent delivery of logged/cloud requests, durable
+These slices do not complete Milestone 5. Registered local-agent delivery of logged/cloud requests, durable
 result reconciliation and progress/retry/cancel controls, batch and same-source
 group execution, crash-recovery cleanup sweeping, the 30-second foreign fixture
 gate, and the user-authorized live YouTube smoke test remain open.

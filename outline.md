@@ -284,8 +284,10 @@ produce preferred SRT artifacts.
   the mandatory bilingual path.
 - [x] For foreign/mixed/unknown-language clips, always derive both original-language and translated-English SRTs even if the selected preset carries the English-only omission preference.
 - [x] Trim/clamp required sidecar cues to actual padded export bounds, zero-base timestamps, and block this staging lifecycle when required subtitles are missing or mismatched.
-- [ ] M5-14B: add one optional embedded English soft subtitle track without
-  replacing any language-policy sidecar.
+- [x] M5-14B: add one optional embedded English soft subtitle track without
+  replacing any language-policy sidecar, with fixed MP4/MOV `mov_text` and MKV
+  `subrip` mappings, exact English snapshots, and FFprobe conformance
+  (`specs/completed/M5-14B-optional-embedded-english-soft-subtitles.md`).
 - [x] Generate and verify thumbnail, metadata JSON, and manifest.
 - [x] Use private staging plus exact-artifact validation and atomic completion.
 - [ ] Deliver logged/cloud export requests to an authorized local worker and

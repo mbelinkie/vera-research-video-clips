@@ -97,7 +97,7 @@ describe("FfprobeMediaInspector", () => {
         "-v",
         "error",
         "-show_entries",
-        "format=duration,format_name,nb_streams:format_tags=major_brand:stream=index,codec_type,codec_name,profile,pix_fmt,width,height,sample_aspect_ratio,display_aspect_ratio,avg_frame_rate,sample_rate,channels,channel_layout,bit_rate",
+        "format=duration,format_name,nb_streams:format_tags=major_brand:stream=index,codec_type,codec_name,profile,pix_fmt,width,height,sample_aspect_ratio,display_aspect_ratio,avg_frame_rate,sample_rate,channels,channel_layout,bit_rate,disposition:stream_tags=language,title",
         "-of",
         "json",
         "--",
@@ -251,6 +251,39 @@ describe("FfmpegH264AacRangeRenderer", () => {
     expect(prores).not.toContain("-crf");
     expect(prores).not.toContain("-b:v");
     expect(prores).not.toContain("-b:a");
+  });
+
+  it("maps one processor-owned English SRT to the fixed MP4 soft-subtitle stream", () => {
+    const args = buildFfmpegRenderArguments({
+      sourcePath: "/private/tmp/source.mp4",
+      stagingDirectory: "/private/tmp",
+      outputPath: "/private/tmp/output.mp4",
+      englishSubtitlePath: "/private/tmp/english.srt",
+      startMs: 1_000,
+      endMs: 2_000,
+      settings: {
+        container: "mp4",
+        videoCodec: "h264",
+        videoRateControl: { mode: "crf", value: 20 },
+        frameRate: "source",
+        audioCodec: "aac",
+        omitSubtitleFilesForConfirmedEnglish: false,
+        embedEnglishSubtitleTrack: true,
+      },
+    });
+    expect(args).toEqual(
+      expect.arrayContaining([
+        "-map",
+        "1:s:0",
+        "-c:s",
+        "mov_text",
+        "language=eng",
+        "title=English",
+        "-disposition:s:0",
+        "0",
+      ]),
+    );
+    expect(args).toContain("/private/tmp/english.srt");
   });
 
   it("builds a precise, bounded H.264/AAC MP4 argument array", async () => {

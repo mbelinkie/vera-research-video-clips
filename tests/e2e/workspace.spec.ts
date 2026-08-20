@@ -715,10 +715,8 @@ test("maps transcript text selection to stable source and export bounds", async 
     "3840",
   ]);
   await expect(
-    page.getByLabel(
-      "Embed an English soft-subtitle track (not available in this milestone)",
-    ),
-  ).toBeDisabled();
+    page.getByLabel("Embed an English soft-subtitle track"),
+  ).toBeEnabled();
   await expect(
     page.getByLabel("Omit subtitle files for confirmed-English videos"),
   ).not.toBeChecked();

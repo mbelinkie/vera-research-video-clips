@@ -30,7 +30,7 @@ export const APPLICATION_EDITING_EXPORT_SETTINGS: ExportSettings = {
 
 const capabilityDescriptor = {
   profileId: "local-editing-renderer",
-  profileVersion: 2,
+  profileVersion: 3,
   renderers: [
     {
       id: "h264_mp4",
@@ -65,7 +65,7 @@ const capabilityDescriptor = {
   aacBitratesKbps: [96, 128, 192, 256, 320],
   audioSampleRate: ["source", "44100", "48000"],
   audioChannels: ["source", "1", "2"],
-  subtitleEmbedding: false,
+  subtitleEmbedding: true,
   acceleration: ["software"],
 } as const;
 
@@ -86,7 +86,7 @@ export interface ExportWorkerCapabilityProvider {
 
 export const FULLY_AVAILABLE_EXPORT_WORKER_CAPABILITIES: InstalledExportWorkerCapabilities =
   {
-    encoders: ["libx264", "libx265", "prores_ks"],
+    encoders: ["libx264", "libx265", "prores_ks", "mov_text", "srt", "subrip"],
     muxers: ["mp4", "matroska", "mov"],
     filters: ["scale", "fps"],
   };
@@ -111,6 +111,17 @@ export function canonicalJson(value: unknown): string {
 export function sha256Fingerprint(value: unknown): string {
   return createHash("sha256").update(canonicalJson(value)).digest("hex");
 }
+
+/** M5-14A snapshots remain executable when they did not request embedding. */
+export const M5_14A_EXPORT_WORKER_CAPABILITY = {
+  profileId: "local-editing-renderer",
+  profileVersion: 2,
+  fingerprint: sha256Fingerprint({
+    ...capabilityDescriptor,
+    profileVersion: 2,
+    subtitleEmbedding: false,
+  }),
+} as const;
 
 export const CURRENT_EXPORT_WORKER_CAPABILITY = {
   profileId: capabilityDescriptor.profileId,
@@ -232,12 +243,6 @@ export function validateExportSettingsCapabilities(
       "unsupported_audio_channels",
       "Audio channels must preserve source, use mono, or use stereo.",
     );
-  if (settings.embedEnglishSubtitleTrack)
-    reject(
-      "embedEnglishSubtitleTrack",
-      "unsupported_subtitle_embedding",
-      "The current renderer does not support embedded subtitle tracks.",
-    );
   return issues;
 }
 
@@ -302,6 +307,11 @@ export function validateInstalledExportCapabilities(
     missing.push("filter scale");
   if (settings.frameRate !== "source" && !filters.has("fps"))
     missing.push("filter fps");
+  if (settings.embedEnglishSubtitleTrack) {
+    const subtitleEncoder = settings.container === "mkv" ? "srt" : "mov_text";
+    if (!installed.encoders.includes(subtitleEncoder))
+      missing.push(`subtitle encoder ${subtitleEncoder}`);
+  }
   return missing.length
     ? [
         {
@@ -442,6 +452,9 @@ export function validateStoredResolvedSettingsSnapshot(
   const matchesLegacyCapability = matchesCapability(
     LEGACY_EDITING_EXPORT_WORKER_CAPABILITY,
   );
+  const matchesM514ACapability = matchesCapability(
+    M5_14A_EXPORT_WORKER_CAPABILITY,
+  );
   if (
     matchesLegacyCapability &&
     (snapshot.settings.container !== "mp4" ||
@@ -462,9 +475,18 @@ export function validateStoredResolvedSettingsSnapshot(
         "The legacy worker capability is valid only for its original Editing H.264/AAC MP4 settings.",
     });
   }
+  if (matchesM514ACapability && snapshot.settings.embedEnglishSubtitleTrack) {
+    issues.unshift({
+      field: "capability",
+      code: "capability_profile_unavailable",
+      message:
+        "This historical worker capability profile does not support embedded subtitle tracks.",
+    });
+  }
   if (
     !matchesCapability(CURRENT_EXPORT_WORKER_CAPABILITY) &&
-    !matchesLegacyCapability
+    !matchesLegacyCapability &&
+    !matchesM514ACapability
   ) {
     issues.unshift({
       field: "capability",

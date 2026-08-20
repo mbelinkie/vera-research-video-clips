@@ -122,7 +122,6 @@ describe("resolved export settings", () => {
     expect(preview.issues.map((issue) => issue.field)).toEqual([
       "container",
       "audioKilobitsPerSecond",
-      "embedEnglishSubtitleTrack",
     ]);
   });
 

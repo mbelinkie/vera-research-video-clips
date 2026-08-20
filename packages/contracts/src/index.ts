@@ -1310,6 +1310,16 @@ export const ExportObservedMediaPropertiesSchema = z
         reportedBitRate: z.number().int().positive().optional(),
       })
       .strict(),
+    subtitle: z
+      .object({
+        codec: z.string().trim().min(1).max(120),
+        language: z.string().trim().min(2).max(35),
+        title: z.string().trim().min(1).max(120).optional(),
+        default: z.boolean(),
+        forced: z.boolean(),
+      })
+      .strict()
+      .optional(),
     durationMs: z.number().int().positive(),
     ffprobeVersion: z.string().trim().min(1).max(120).optional(),
   })
@@ -1493,6 +1503,16 @@ export const ExportClipConversionSummarySchema = z
     audioCodec: z.enum(["aac", "pcm_s16le"]),
     audioSampleRate: z.number().int().positive(),
     audioChannels: z.number().int().positive(),
+    embeddedEnglishSubtitle: z
+      .object({
+        codec: z.enum(["mov_text", "subrip"]),
+        language: z.literal("eng"),
+        title: z.literal("English").optional(),
+        default: z.literal(false),
+        forced: z.literal(false),
+      })
+      .strict()
+      .optional(),
   })
   .strict();
 

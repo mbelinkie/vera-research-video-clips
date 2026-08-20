@@ -1006,21 +1006,16 @@ function App() {
               )
                 ? "confirmed_english"
                 : "foreign",
-            ...(transcriptTracks.original.track.id ===
-            transcriptTracks.english.track.id
-              ? {}
-              : {
-                  subtitleTracks: {
-                    original: {
-                      trackId: transcriptTracks.original.track.id,
-                      trackVersion: transcriptTracks.original.track.version,
-                    },
-                    english: {
-                      trackId: transcriptTracks.english.track.id,
-                      trackVersion: transcriptTracks.english.track.version,
-                    },
-                  },
-                }),
+            subtitleTracks: {
+              original: {
+                trackId: transcriptTracks.original.track.id,
+                trackVersion: transcriptTracks.original.track.version,
+              },
+              english: {
+                trackId: transcriptTracks.english.track.id,
+                trackVersion: transcriptTracks.english.track.version,
+              },
+            },
             settingsSelection: loggedSettingsSelection,
             expectedResolutionFingerprint:
               loggedSettingsPreview.snapshot.resolutionFingerprint,
@@ -1095,21 +1090,16 @@ function App() {
             languagesEquivalent(transcriptTracks.original.track.language, "en")
               ? "confirmed_english"
               : "foreign",
-          ...(transcriptTracks.original.track.id ===
-          transcriptTracks.english.track.id
-            ? {}
-            : {
-                subtitleTracks: {
-                  original: {
-                    trackId: transcriptTracks.original.track.id,
-                    trackVersion: transcriptTracks.original.track.version,
-                  },
-                  english: {
-                    trackId: transcriptTracks.english.track.id,
-                    trackVersion: transcriptTracks.english.track.version,
-                  },
-                },
-              }),
+          subtitleTracks: {
+            original: {
+              trackId: transcriptTracks.original.track.id,
+              trackVersion: transcriptTracks.original.track.version,
+            },
+            english: {
+              trackId: transcriptTracks.english.track.id,
+              trackVersion: transcriptTracks.english.track.version,
+            },
+          },
           settingsSelection: exportOnlySettingsSelection,
           expectedResolutionFingerprint:
             exportOnlySettingsPreview.snapshot.resolutionFingerprint,
@@ -2028,13 +2018,23 @@ function App() {
                 <label className="export-checkbox">
                   <input
                     type="checkbox"
-                    checked={false}
-                    disabled
-                    onChange={() => setEmbedEnglishSubtitles(false)}
+                    checked={embedEnglishSubtitles}
+                    disabled={exportOnlySettingsState !== "ready"}
+                    onChange={(event) => {
+                      setOverrideFields((current) =>
+                        new Set(current).add("embedEnglishSubtitleTrack"),
+                      );
+                      setEmbedEnglishSubtitles(event.target.checked);
+                    }}
                   />
-                  Embed an English soft-subtitle track (not available in this
-                  milestone)
+                  Embed an English soft-subtitle track
                 </label>
+                {exportOnlySettingsState !== "ready" ? (
+                  <p className="muted">
+                    Resolve an eligible local renderer before enabling English
+                    soft subtitles.
+                  </p>
+                ) : null}
               </details>
               <div className="selection-actions">
                 <button

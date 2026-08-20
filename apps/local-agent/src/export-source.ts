@@ -229,6 +229,16 @@ export class LocalExportSourceProcessor {
               { code: "resolved_export_bounds_missing" },
             );
           }
+          const embeddedEnglishPath = resolvedSettingsSnapshot.settings
+            .embedEnglishSubtitleTrack
+            ? await stagePrivateEmbeddedEnglishSrt({
+                stagingDirectory: scratchDirectory,
+                transcript: subtitlePlan.english!,
+                resolvedStartMs: persistedBounds.startMs,
+                resolvedEndMs: persistedBounds.endMs,
+                ...(input.signal ? { signal: input.signal } : {}),
+              })
+            : undefined;
           const outputPath = join(
             scratchDirectory,
             `rendered-range.${resolvedSettingsSnapshot.settings.container}`,
@@ -240,8 +250,13 @@ export class LocalExportSourceProcessor {
             startMs: persistedBounds.startMs,
             endMs: persistedBounds.endMs,
             settings: resolvedSettingsSnapshot.settings,
+            ...(embeddedEnglishPath
+              ? { englishSubtitlePath: embeddedEnglishPath }
+              : {}),
             ...(input.signal ? { signal: input.signal } : {}),
           });
+          if (embeddedEnglishPath)
+            await rm(embeddedEnglishPath, { force: true });
           const outputInspection = await inspectAndValidateRenderedExportOutput(
             {
               outputPath,
@@ -393,6 +408,7 @@ export class LocalExportSourceProcessor {
 type RequiredSubtitlePlan = {
   policy: "confirmed_english" | "confirmed_english_omission" | "bilingual";
   sidecars: readonly RequiredSidecar[];
+  english?: NormalizedTranscript;
 };
 
 type RequiredSidecar = {
@@ -439,22 +455,46 @@ function resolveRequiredSubtitlePlan(
   settings: ExportRequest["preset"]["settings"],
 ): RequiredSubtitlePlan {
   if (request.sourceLanguageClass === "confirmed_english") {
-    if (settings.omitSubtitleFilesForConfirmedEnglish) {
+    if (
+      settings.embedEnglishSubtitleTrack &&
+      !request.subtitleTracks?.english
+    ) {
+      throw new ExportSourceAcquisitionError(
+        "An embedded export requires an immutable exact English track identity. Recreate the export after resolving English.",
+        { code: "english_subtitle_track_snapshot_missing", retryable: true },
+      );
+    }
+    if (
+      settings.omitSubtitleFilesForConfirmedEnglish &&
+      !settings.embedEnglishSubtitleTrack
+    ) {
       return { policy: "confirmed_english_omission", sidecars: [] };
+    }
+    const english = request.subtitleTracks?.english
+      ? resolveExactEnglishTranscript(
+          queue,
+          request.subtitleTracks.english.trackId,
+          request.subtitleTracks.english.trackVersion,
+          request.video.youtubeVideoId,
+        )
+      : resolveExactEnglishTranscript(
+          queue,
+          request.selection.trackId,
+          request.selection.transcriptVersion,
+          request.video.youtubeVideoId,
+        );
+    if (settings.omitSubtitleFilesForConfirmedEnglish) {
+      return { policy: "confirmed_english_omission", sidecars: [], english };
     }
     return {
       policy: "confirmed_english",
       sidecars: [
         {
           role: "english",
-          transcript: resolveExactEnglishTranscript(
-            queue,
-            request.selection.trackId,
-            request.selection.transcriptVersion,
-            request.video.youtubeVideoId,
-          ),
+          transcript: english,
         },
       ],
+      english,
     };
   }
   if (!request.subtitleTracks) {
@@ -490,7 +530,40 @@ function resolveRequiredSubtitlePlan(
       { role: "original", transcript: original },
       { role: "english", transcript: english },
     ],
+    english,
   };
+}
+
+async function stagePrivateEmbeddedEnglishSrt(input: {
+  stagingDirectory: string;
+  transcript: NormalizedTranscript;
+  resolvedStartMs: number;
+  resolvedEndMs: number;
+  signal?: AbortSignal;
+}): Promise<string> {
+  throwIfSubtitleCanceled(input.signal);
+  const path = join(input.stagingDirectory, "embedded-english.srt");
+  const cues = deriveClipRelativeSrtCues({
+    transcript: input.transcript,
+    startMs: input.resolvedStartMs,
+    endMs: input.resolvedEndMs,
+    missingCue: {
+      code: "english_subtitle_cue_missing",
+      message:
+        "The verified English transcript has no cue in the resolved export range.",
+    },
+  });
+  await writeFile(path, serializeSrtCues(cues), {
+    encoding: "utf8",
+    flag: "wx",
+    mode: 0o600,
+  });
+  await regularNonemptyStagedFile(
+    path,
+    "Embedded English subtitle",
+    "english_subtitle_file_invalid",
+  );
+  return path;
 }
 
 /**
@@ -999,6 +1072,19 @@ function buildVerifiedClipMetadata(input: {
       audioCodec: resolved.settings.audioCodec,
       audioSampleRate: observed.audio.sampleRate,
       audioChannels: observed.audio.channels,
+      ...(observed.subtitle
+        ? {
+            embeddedEnglishSubtitle: {
+              codec: observed.subtitle.codec as "mov_text" | "subrip",
+              language: "eng" as const,
+              ...(observed.subtitle.title === "English"
+                ? { title: "English" as const }
+                : {}),
+              default: false as const,
+              forced: false as const,
+            },
+          }
+        : {}),
     },
     subtitlePolicy: {
       requiredSidecars: [...policy.requiredSidecars],

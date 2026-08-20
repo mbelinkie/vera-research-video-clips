@@ -339,6 +339,18 @@ describe("one-shot local export runtime", () => {
 
   it.each([
     {
+      label: "H.264/MP4 with English soft subtitles",
+      settings: {
+        ...editingSettings,
+        embedEnglishSubtitleTrack: true,
+      } satisfies ExportSettings,
+      extension: "mp4",
+      role: "video_mp4",
+      videoCodec: "h264",
+      audioCodec: "aac",
+      embedded: true,
+    },
+    {
       label: "HEVC/MKV",
       settings: {
         container: "mkv",
@@ -351,9 +363,11 @@ describe("one-shot local export runtime", () => {
         audioSampleRate: "48000",
         audioChannels: "2",
         omitSubtitleFilesForConfirmedEnglish: false,
-        embedEnglishSubtitleTrack: false,
+        embedEnglishSubtitleTrack: true,
       } satisfies ExportSettings,
       extension: "mkv",
+      embedded: true,
+      subtitleCodec: "subrip",
       role: "video_mkv",
       videoCodec: "hevc",
       audioCodec: "aac",
@@ -369,9 +383,11 @@ describe("one-shot local export runtime", () => {
         audioSampleRate: "48000",
         audioChannels: "2",
         omitSubtitleFilesForConfirmedEnglish: false,
-        embedEnglishSubtitleTrack: false,
+        embedEnglishSubtitleTrack: true,
       } satisfies ExportSettings,
       extension: "mov",
+      embedded: true,
+      subtitleCodec: "mov_text",
       role: "video_mov",
       videoCodec: "prores",
       audioCodec: "pcm_s16le",
@@ -425,16 +441,22 @@ describe("one-shot local export runtime", () => {
         audioCodec: fixture.audioCodec,
         observedProperties: {
           streamCounts: {
-            total: 2,
+            total: fixture.embedded ? 3 : 2,
             video: 1,
             audio: 1,
-            subtitle: 0,
+            subtitle: fixture.embedded ? 1 : 0,
             data: 0,
             other: 0,
           },
-          audio: { sampleRate: 48_000, channels: 2, channelLayout: "stereo" },
         },
       });
+      if (fixture.embedded)
+        expect(observed.observedProperties?.subtitle).toMatchObject({
+          codec: fixture.subtitleCodec ?? "mov_text",
+          language: "eng",
+          default: false,
+          forced: false,
+        });
       const manifest = ExportClipManifestSchema.parse(
         JSON.parse(
           await readFile(join(packageDirectory, "manifest.json"), "utf8"),

@@ -412,6 +412,8 @@ export type FfmpegRangeRenderInput = {
   startMs: number;
   endMs: number;
   settings: EditingMp4RenderSettings;
+  /** Processor-owned, validated clip-relative English SRT; never user input. */
+  englishSubtitlePath?: string;
   signal?: AbortSignal;
 };
 
@@ -736,6 +738,14 @@ export function buildFfmpegRenderArguments(
     "-nostdin",
     "-i",
     resolve(input.sourcePath),
+    ...(input.settings.embedEnglishSubtitleTrack
+      ? [
+          "-itsoffset",
+          formatFfmpegTime(input.startMs),
+          "-i",
+          resolve(input.englishSubtitlePath!),
+        ]
+      : []),
     "-ss",
     formatFfmpegTime(input.startMs),
     "-t",
@@ -744,13 +754,28 @@ export function buildFfmpegRenderArguments(
     "0:v:0",
     "-map",
     "0:a:0",
-    "-sn",
+    ...(input.settings.embedEnglishSubtitleTrack ? [] : ["-sn"]),
     "-dn",
     "-map_metadata",
     "-1",
     "-map_chapters",
     "-1",
   ];
+  if (input.settings.embedEnglishSubtitleTrack) {
+    args.push(
+      "-map",
+      "1:s:0",
+      "-c:s",
+      input.settings.container === "mkv" ? "srt" : "mov_text",
+      "-metadata:s:s:0",
+      "language=eng",
+      "-metadata:s:s:0",
+      "title=English",
+      "-disposition:s:0",
+      "0",
+    );
+    args.push("-shortest");
+  }
   const filters: string[] = [];
   if (input.settings.maxWidth !== undefined) {
     filters.push(
@@ -905,14 +930,30 @@ function assertObservedMediaConformance(input: {
     );
   };
   if (
-    observed.streamCounts.total !== 2 ||
+    observed.streamCounts.total !==
+      (settings.embedEnglishSubtitleTrack ? 3 : 2) ||
     observed.streamCounts.video !== 1 ||
     observed.streamCounts.audio !== 1 ||
-    observed.streamCounts.subtitle !== 0 ||
+    observed.streamCounts.subtitle !==
+      (settings.embedEnglishSubtitleTrack ? 1 : 0) ||
     observed.streamCounts.data !== 0 ||
     observed.streamCounts.other !== 0
   ) {
     fail("render_output_stream_count_mismatch", "stream counts");
+  }
+  if (settings.embedEnglishSubtitleTrack) {
+    const subtitle = observed.subtitle;
+    const expectedCodec = settings.container === "mkv" ? "subrip" : "mov_text";
+    if (
+      !subtitle ||
+      subtitle.codec !== expectedCodec ||
+      subtitle.language !== "eng" ||
+      subtitle.default ||
+      subtitle.forced
+    )
+      fail("render_output_subtitle_stream_mismatch", "English subtitle stream");
+  } else if (observed.subtitle) {
+    fail("render_output_subtitle_stream_mismatch", "subtitle stream");
   }
   const formats = new Set(observed.container.formatNames);
   if (
@@ -1096,7 +1137,7 @@ export class FfprobeMediaInspector implements ExportSourceInspector {
           "-v",
           "error",
           "-show_entries",
-          "format=duration,format_name,nb_streams:format_tags=major_brand:stream=index,codec_type,codec_name,profile,pix_fmt,width,height,sample_aspect_ratio,display_aspect_ratio,avg_frame_rate,sample_rate,channels,channel_layout,bit_rate",
+          "format=duration,format_name,nb_streams:format_tags=major_brand:stream=index,codec_type,codec_name,profile,pix_fmt,width,height,sample_aspect_ratio,display_aspect_ratio,avg_frame_rate,sample_rate,channels,channel_layout,bit_rate,disposition:stream_tags=language,title",
           "-of",
           "json",
           "--",
@@ -1410,6 +1451,25 @@ async function validateRenderInput(
       { code: "render_output_path_invalid", retryable: false },
     );
   }
+  if (input.settings.embedEnglishSubtitleTrack) {
+    if (
+      !input.englishSubtitlePath ||
+      !isInsideScratchDirectory(
+        input.stagingDirectory,
+        input.englishSubtitlePath,
+      )
+    )
+      throw new FfmpegRenderError(
+        "Embedded English subtitle input is invalid.",
+        { code: "english_subtitle_input_invalid", retryable: false },
+      );
+    await validateRegularNonemptySource(input.englishSubtitlePath);
+  } else if (input.englishSubtitlePath) {
+    throw new FfmpegRenderError(
+      "A subtitle input is not permitted when embedding is disabled.",
+      { code: "english_subtitle_input_invalid", retryable: false },
+    );
+  }
   if (!resolve(input.outputPath).endsWith(`.${input.settings.container}`)) {
     throw new FfmpegRenderError(
       "The rendered output filename must use the selected container extension.",
@@ -1587,9 +1647,8 @@ function parseObservedMediaProperties(input: {
   );
   const videoRows = rows.filter((row) => row.codec_type === "video");
   const audioRows = rows.filter((row) => row.codec_type === "audio");
-  const subtitleCount = rows.filter(
-    (row) => row.codec_type === "subtitle",
-  ).length;
+  const subtitleRows = rows.filter((row) => row.codec_type === "subtitle");
+  const subtitleCount = subtitleRows.length;
   const dataCount = rows.filter((row) => row.codec_type === "data").length;
   const otherCount =
     rows.length -
@@ -1619,6 +1678,22 @@ function parseObservedMediaProperties(input: {
   const channels = Number(audio?.channels);
   const channelLayout = boundedProbeText(audio?.channel_layout, 120);
   const reportedBitRate = positiveSafeInteger(audio?.bit_rate);
+  const subtitleRow = subtitleRows[0];
+  const subtitleTags =
+    subtitleRow?.tags &&
+    typeof subtitleRow.tags === "object" &&
+    !Array.isArray(subtitleRow.tags)
+      ? (subtitleRow.tags as Record<string, unknown>)
+      : undefined;
+  const subtitleDisposition =
+    subtitleRow?.disposition &&
+    typeof subtitleRow.disposition === "object" &&
+    !Array.isArray(subtitleRow.disposition)
+      ? (subtitleRow.disposition as Record<string, unknown>)
+      : undefined;
+  const subtitleCodec = boundedProbeValue(subtitleRow?.codec_name, 120);
+  const subtitleLanguage = boundedProbeText(subtitleTags?.language, 35);
+  const subtitleTitle = boundedProbeText(subtitleTags?.title, 120);
   const sampleAspectRatio = parseProbeRational(video?.sample_aspect_ratio);
   const displayAspectRatio = parseProbeRational(video?.display_aspect_ratio);
   const averageFrameRate = parseProbeRational(video?.avg_frame_rate);
@@ -1670,6 +1745,17 @@ function parseObservedMediaProperties(input: {
       channelLayout,
       ...(reportedBitRate ? { reportedBitRate } : {}),
     },
+    ...(subtitleRows.length === 1 && subtitleCodec && subtitleLanguage
+      ? {
+          subtitle: {
+            codec: subtitleCodec,
+            language: subtitleLanguage.toLowerCase(),
+            ...(subtitleTitle ? { title: subtitleTitle } : {}),
+            default: subtitleDisposition?.default === 1,
+            forced: subtitleDisposition?.forced === 1,
+          },
+        }
+      : {}),
     durationMs: input.durationMs,
   });
   if (!parsed.success) throw malformedFfprobeOutput();
