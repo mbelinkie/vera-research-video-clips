@@ -169,3 +169,198 @@ describe("claimed transcript finalization", () => {
     ).rejects.toMatchObject({ statusCode: 403 });
   });
 });
+
+const editingSettings = {
+  container: "mp4" as const,
+  videoCodec: "h264" as const,
+  videoRateControl: { mode: "crf" as const, value: 20 },
+  maxWidth: 1_920,
+  frameRate: "source" as const,
+  audioCodec: "aac" as const,
+  audioKilobitsPerSecond: 192,
+  omitSubtitleFilesForConfirmedEnglish: false,
+  embedEnglishSubtitleTrack: false,
+};
+
+describe("versioned export preset catalogs", () => {
+  it("keeps personal revisions/defaults fixed and replays durable receipts after CAS advances", async () => {
+    const database = new PGlite();
+    databases.add(database);
+    await runCloudMigrations(database);
+    const catalog = new SharedProjectCatalog(
+      database,
+      new MemoryTranscriptObjectStore(),
+    );
+    const actor: AuthenticatedActor = {
+      userId: randomUUID(),
+      externalSubject: "fixture:preset-owner",
+    };
+    await catalog.registerUser(actor, "Preset owner");
+    const createInput = {
+      idempotencyKey: "personal-create-1",
+      name: "Editing Personal",
+      description: "My standard export",
+      settings: editingSettings,
+    };
+    const created = await catalog.createPersonalExportPreset(
+      actor,
+      createInput,
+    );
+    expect(
+      await catalog.createPersonalExportPreset(actor, createInput),
+    ).toEqual(created);
+    const revised = await catalog.revisePersonalExportPreset(actor, {
+      idempotencyKey: "personal-revise-1",
+      presetId: created.id,
+      expectedEntityVersion: 1,
+      name: "Editing Personal",
+      description: "A newer immutable revision",
+      settings: { ...editingSettings, maxWidth: 1_280 },
+    });
+    expect(revised).toMatchObject({ currentVersion: 2, entityVersion: 2 });
+    expect(
+      await catalog.createPersonalExportPreset(actor, createInput),
+    ).toEqual(created);
+    const fixedDefault = await catalog.setPersonalExportPresetDefault(actor, {
+      idempotencyKey: "personal-default-1",
+      expectedEntityVersion: 0,
+      presetId: created.id,
+      presetVersion: 1,
+    });
+    await catalog.revisePersonalExportPreset(actor, {
+      idempotencyKey: "personal-revise-2",
+      presetId: created.id,
+      expectedEntityVersion: 2,
+      name: "Editing Personal",
+      description: "Third revision",
+      settings: { ...editingSettings, maxWidth: 960 },
+    });
+    expect(
+      await catalog.revisePersonalExportPreset(actor, {
+        idempotencyKey: "personal-revise-1",
+        presetId: created.id,
+        expectedEntityVersion: 1,
+        name: "Editing Personal",
+        description: "A newer immutable revision",
+        settings: { ...editingSettings, maxWidth: 1_280 },
+      }),
+    ).toEqual(revised);
+    expect(
+      await catalog.setPersonalExportPresetDefault(actor, {
+        idempotencyKey: "personal-default-1",
+        expectedEntityVersion: 0,
+        presetId: created.id,
+        presetVersion: 1,
+      }),
+    ).toEqual(fixedDefault);
+    const discovered = await catalog.listPersonalExportPresets(actor);
+    expect(discovered.presets[0]).toMatchObject({
+      currentVersion: 3,
+      current: { settings: { maxWidth: 960 } },
+    });
+    expect(discovered.default).toMatchObject({
+      presetVersion: 1,
+      snapshot: { settings: { maxWidth: 1_920 } },
+    });
+    await expect(
+      catalog.createPersonalExportPreset(actor, {
+        ...createInput,
+        name: "Different command",
+      }),
+    ).rejects.toMatchObject({ code: "idempotency_conflict" });
+    expect(
+      Number(
+        (
+          await database.query<{ count: string }>(
+            "SELECT count(*) FROM sync_events",
+          )
+        ).rows[0]!.count,
+      ),
+    ).toBe(0);
+  });
+
+  it("authorizes project discovery/writes and never exposes another member's personal presets", async () => {
+    const database = new PGlite();
+    databases.add(database);
+    await runCloudMigrations(database);
+    const catalog = new SharedProjectCatalog(
+      database,
+      new MemoryTranscriptObjectStore(),
+    );
+    const owner: AuthenticatedActor = {
+      userId: randomUUID(),
+      externalSubject: "fixture:project-preset-owner",
+    };
+    const viewer: AuthenticatedActor = {
+      userId: randomUUID(),
+      externalSubject: "fixture:project-preset-viewer",
+    };
+    const outsider: AuthenticatedActor = {
+      userId: randomUUID(),
+      externalSubject: "fixture:project-preset-outsider",
+    };
+    await catalog.registerUser(owner, "Owner");
+    await catalog.registerUser(viewer, "Viewer");
+    await catalog.registerUser(outsider, "Outsider");
+    const project = await catalog.createProject(owner, {
+      name: "Preset project",
+    });
+    await catalog.addMember(owner, project.id, viewer.userId, "viewer");
+    await catalog.createPersonalExportPreset(owner, {
+      idempotencyKey: "owner-personal",
+      name: "Owner private",
+      description: "Must not leak",
+      settings: editingSettings,
+    });
+    const projectPreset = await catalog.createProjectExportPreset(
+      owner,
+      project.id,
+      {
+        idempotencyKey: "project-create",
+        name: "Project Editing",
+        description: "Shared",
+        settings: editingSettings,
+      },
+    );
+    await catalog.setProjectExportPresetDefault(owner, project.id, {
+      idempotencyKey: "project-default",
+      expectedEntityVersion: 0,
+      presetId: projectPreset.id,
+      presetVersion: 1,
+    });
+    const viewerDiscovery = await catalog.listProjectExportPresets(
+      viewer,
+      project.id,
+    );
+    expect(viewerDiscovery.projectPresets).toHaveLength(1);
+    expect(viewerDiscovery.personalPresets).toEqual([]);
+    expect(viewerDiscovery.projectDefault?.snapshot.name).toBe(
+      "Project Editing",
+    );
+    await expect(
+      catalog.createProjectExportPreset(viewer, project.id, {
+        idempotencyKey: "viewer-write",
+        name: "Forbidden",
+        description: "",
+        settings: editingSettings,
+      }),
+    ).rejects.toMatchObject({ statusCode: 403 });
+    await expect(
+      catalog.listProjectExportPresets(outsider, project.id),
+    ).rejects.toMatchObject({ statusCode: 403 });
+    const events = await database.query<{
+      event_type: string;
+      payload: Record<string, unknown>;
+    }>(
+      `SELECT event_type, payload FROM sync_events
+       WHERE project_id = $1 AND event_type LIKE 'export_preset.%'
+       ORDER BY sequence`,
+      [project.id],
+    );
+    expect(events.rows.map((row) => row.event_type)).toEqual([
+      "export_preset.created",
+      "export_preset.default_set",
+    ]);
+    expect(JSON.stringify(events.rows)).not.toContain("Owner private");
+  });
+});

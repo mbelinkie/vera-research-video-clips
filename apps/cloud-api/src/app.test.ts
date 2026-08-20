@@ -18,6 +18,17 @@ import { authenticateDevBearer, createCloudApi } from "./app.ts";
 
 const apps = new Set<ReturnType<typeof createCloudApi>>();
 const databases = new Set<PGlite>();
+const presetSettings = {
+  container: "mp4",
+  videoCodec: "h264",
+  videoRateControl: { mode: "crf", value: 20 },
+  maxWidth: 1_920,
+  frameRate: "source",
+  audioCodec: "aac",
+  audioKilobitsPerSecond: 192,
+  omitSubtitleFilesForConfirmedEnglish: false,
+  embedEnglishSubtitleTrack: false,
+};
 
 afterEach(async () => {
   await Promise.all([...apps].map((app) => app.close()));
@@ -81,6 +92,155 @@ describe("cloud API", () => {
     });
     expect(listed.statusCode).toBe(200);
     expect(listed.json()).toMatchObject([{ name: "Shared research" }]);
+  });
+
+  it("serves self-only personal and authorized project preset catalogs through strict routes", async () => {
+    const database = new PGlite();
+    databases.add(database);
+    await runCloudMigrations(database);
+    const catalog = new SharedProjectCatalog(
+      database,
+      new MemoryTranscriptObjectStore(),
+    );
+    const app = createCloudApi({
+      catalog,
+      authenticate: authenticateDevBearer,
+    });
+    apps.add(app);
+    const userId = randomUUID();
+    const outsiderId = randomUUID();
+    const authorization = `Bearer ${userId}|fixture:preset-api`;
+    const outsiderAuthorization = `Bearer ${outsiderId}|fixture:preset-outsider`;
+    for (const [header, displayName] of [
+      [authorization, "Preset API User"],
+      [outsiderAuthorization, "Preset Outsider"],
+    ]) {
+      expect(
+        (
+          await app.inject({
+            method: "POST",
+            url: "/api/session/register",
+            headers: { authorization: header },
+            payload: { displayName },
+          })
+        ).statusCode,
+      ).toBe(200);
+    }
+    const project = await app.inject({
+      method: "POST",
+      url: "/api/projects",
+      headers: { authorization },
+      payload: { name: "Preset API Project" },
+    });
+    const projectId = project.json<{ id: string }>().id;
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: "/api/export-presets",
+          headers: { authorization },
+          payload: {
+            idempotencyKey: "personal-create",
+            name: "Personal Editing",
+            description: "Personal catalog entry",
+            settings: presetSettings,
+            userId: outsiderId,
+          },
+        })
+      ).statusCode,
+    ).toBe(400);
+    const personal = await app.inject({
+      method: "POST",
+      url: "/api/export-presets",
+      headers: { authorization },
+      payload: {
+        idempotencyKey: "personal-create",
+        name: "Personal Editing",
+        description: "Personal catalog entry",
+        settings: presetSettings,
+      },
+    });
+    expect(personal.statusCode).toBe(201);
+    const personalId = personal.json<{ id: string }>().id;
+    const revised = await app.inject({
+      method: "PATCH",
+      url: "/api/export-presets",
+      headers: { authorization },
+      payload: {
+        idempotencyKey: "personal-revise",
+        presetId: personalId,
+        expectedEntityVersion: 1,
+        name: "Personal Editing",
+        description: "Revision two",
+        settings: { ...presetSettings, maxWidth: 1_280 },
+      },
+    });
+    expect(revised.json()).toMatchObject({
+      currentVersion: 2,
+      entityVersion: 2,
+    });
+    const personalDefault = await app.inject({
+      method: "PUT",
+      url: "/api/export-presets/default",
+      headers: { authorization },
+      payload: {
+        idempotencyKey: "personal-default",
+        expectedEntityVersion: 0,
+        presetId: personalId,
+        presetVersion: 1,
+      },
+    });
+    expect(personalDefault.json()).toMatchObject({
+      default: { presetVersion: 1, snapshot: { name: "Personal Editing" } },
+    });
+    const projectPreset = await app.inject({
+      method: "POST",
+      url: `/api/projects/${projectId}/export-presets`,
+      headers: { authorization },
+      payload: {
+        idempotencyKey: "project-create",
+        name: "Project Editing",
+        description: "Shared catalog entry",
+        settings: presetSettings,
+      },
+    });
+    expect(projectPreset.statusCode).toBe(201);
+    const projectPresetId = projectPreset.json<{ id: string }>().id;
+    expect(
+      (
+        await app.inject({
+          method: "PUT",
+          url: `/api/projects/${projectId}/export-presets/default`,
+          headers: { authorization },
+          payload: {
+            idempotencyKey: "project-default",
+            expectedEntityVersion: 0,
+            presetId: projectPresetId,
+            presetVersion: 1,
+          },
+        })
+      ).statusCode,
+    ).toBe(200);
+    const discovered = await app.inject({
+      method: "GET",
+      url: `/api/projects/${projectId}/export-presets`,
+      headers: { authorization },
+    });
+    expect(discovered.json()).toMatchObject({
+      projectPresets: [{ current: { name: "Project Editing" } }],
+      projectDefault: { snapshot: { name: "Project Editing" } },
+      personalPresets: [{ currentVersion: 2 }],
+      personalDefault: { presetVersion: 1 },
+    });
+    expect(
+      (
+        await app.inject({
+          method: "GET",
+          url: `/api/projects/${projectId}/export-presets`,
+          headers: { authorization: outsiderAuthorization },
+        })
+      ).statusCode,
+    ).toBe(403);
   });
 
   it("atomically logs an idempotent tagged clip without creating an export job", async () => {

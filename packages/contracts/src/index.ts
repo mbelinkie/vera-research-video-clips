@@ -410,6 +410,145 @@ export const ExportPresetSnapshotSchema = z.object({
   name: z.string().trim().min(1).max(160),
   settings: ExportSettingsSchema,
 });
+export const ExportPresetScopeSchema = z.enum(["personal", "project"]);
+export const ExportPresetDescriptionSchema = z.string().trim().max(2_000);
+export const ExportPresetVersionSchema = z
+  .object({
+    presetId: IdSchema,
+    presetVersion: z.number().int().positive(),
+    name: z.string().trim().min(1).max(160),
+    description: ExportPresetDescriptionSchema,
+    settings: ExportSettingsSchema,
+    createdBy: IdSchema,
+    createdAt: UtcTimestampSchema,
+  })
+  .strict();
+export const ExportPresetCatalogEntrySchema = z
+  .object({
+    id: IdSchema,
+    scope: ExportPresetScopeSchema,
+    projectId: IdSchema.optional(),
+    currentVersion: z.number().int().positive(),
+    entityVersion: z.number().int().positive(),
+    current: ExportPresetVersionSchema,
+    createdBy: IdSchema,
+    createdAt: UtcTimestampSchema,
+    updatedAt: UtcTimestampSchema,
+  })
+  .strict()
+  .superRefine((preset, context) => {
+    if (preset.current.presetId !== preset.id) {
+      context.addIssue({
+        code: "custom",
+        path: ["current", "presetId"],
+        message: "The current revision must belong to this preset.",
+      });
+    }
+    if (preset.current.presetVersion !== preset.currentVersion) {
+      context.addIssue({
+        code: "custom",
+        path: ["current", "presetVersion"],
+        message: "The current revision must match the current-version pointer.",
+      });
+    }
+    if (preset.scope === "project" && !preset.projectId) {
+      context.addIssue({
+        code: "custom",
+        path: ["projectId"],
+        message: "Project presets require their project identity.",
+      });
+    }
+    if (preset.scope === "personal" && preset.projectId) {
+      context.addIssue({
+        code: "custom",
+        path: ["projectId"],
+        message: "Personal presets cannot carry a project identity.",
+      });
+    }
+  });
+export const ExportPresetDefaultSchema = z
+  .object({
+    scope: ExportPresetScopeSchema,
+    projectId: IdSchema.optional(),
+    presetId: IdSchema,
+    presetVersion: z.number().int().positive(),
+    entityVersion: z.number().int().positive(),
+    snapshot: ExportPresetSnapshotSchema.extend({ presetId: IdSchema }),
+    description: ExportPresetDescriptionSchema,
+    updatedBy: IdSchema,
+    createdAt: UtcTimestampSchema,
+    updatedAt: UtcTimestampSchema,
+  })
+  .strict()
+  .superRefine((record, context) => {
+    if (
+      record.snapshot.presetId !== record.presetId ||
+      record.snapshot.presetVersion !== record.presetVersion
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["snapshot"],
+        message: "The default snapshot must match its fixed preset version.",
+      });
+    }
+    if (record.scope === "project" && !record.projectId) {
+      context.addIssue({
+        code: "custom",
+        path: ["projectId"],
+        message: "Project defaults require their project identity.",
+      });
+    }
+    if (record.scope === "personal" && record.projectId) {
+      context.addIssue({
+        code: "custom",
+        path: ["projectId"],
+        message: "Personal defaults cannot carry a project identity.",
+      });
+    }
+  });
+export const CreateExportPresetRequestSchema = z
+  .object({
+    idempotencyKey: z.string().trim().min(1).max(512),
+    name: z.string().trim().min(1).max(160),
+    description: ExportPresetDescriptionSchema.default(""),
+    settings: ExportSettingsSchema,
+  })
+  .strict();
+export const ReviseExportPresetRequestSchema = z
+  .object({
+    idempotencyKey: z.string().trim().min(1).max(512),
+    presetId: IdSchema,
+    expectedEntityVersion: z.number().int().positive(),
+    name: z.string().trim().min(1).max(160),
+    description: ExportPresetDescriptionSchema,
+    settings: ExportSettingsSchema,
+  })
+  .strict();
+export const SetExportPresetDefaultRequestSchema = z
+  .object({
+    idempotencyKey: z.string().trim().min(1).max(512),
+    expectedEntityVersion: z.number().int().nonnegative(),
+    presetId: IdSchema,
+    presetVersion: z.number().int().positive(),
+  })
+  .strict();
+export const PersonalExportPresetCatalogSchema = z
+  .object({
+    presets: z.array(ExportPresetCatalogEntrySchema),
+    default: ExportPresetDefaultSchema.optional(),
+  })
+  .strict();
+export const ProjectExportPresetCatalogSchema = z
+  .object({
+    projectPresets: z.array(ExportPresetCatalogEntrySchema),
+    projectDefault: ExportPresetDefaultSchema.optional(),
+    personalPresets: z.array(ExportPresetCatalogEntrySchema),
+    personalDefault: ExportPresetDefaultSchema.optional(),
+  })
+  .strict();
+export const ExportPresetDefaultResponseSchema = z
+  .object({ default: ExportPresetDefaultSchema.optional() })
+  .strict();
 const createExportRequestBaseSchema = z.object({
   idempotencyKey: z.string().trim().min(1).max(512),
   sourceLanguageClass: ExportSourceLanguageClassSchema,
@@ -1277,6 +1416,27 @@ export type UpdateClipCandidateRequest = z.infer<
 >;
 export type ExportSettings = z.infer<typeof ExportSettingsSchema>;
 export type ExportPresetSnapshot = z.infer<typeof ExportPresetSnapshotSchema>;
+export type ExportPresetScope = z.infer<typeof ExportPresetScopeSchema>;
+export type ExportPresetVersion = z.infer<typeof ExportPresetVersionSchema>;
+export type ExportPresetCatalogEntry = z.infer<
+  typeof ExportPresetCatalogEntrySchema
+>;
+export type ExportPresetDefault = z.infer<typeof ExportPresetDefaultSchema>;
+export type CreateExportPresetRequest = z.infer<
+  typeof CreateExportPresetRequestSchema
+>;
+export type ReviseExportPresetRequest = z.infer<
+  typeof ReviseExportPresetRequestSchema
+>;
+export type SetExportPresetDefaultRequest = z.infer<
+  typeof SetExportPresetDefaultRequestSchema
+>;
+export type PersonalExportPresetCatalog = z.infer<
+  typeof PersonalExportPresetCatalogSchema
+>;
+export type ProjectExportPresetCatalog = z.infer<
+  typeof ProjectExportPresetCatalogSchema
+>;
 export type ExportSubtitleTrackSnapshots = z.infer<
   typeof ExportSubtitleTrackSnapshotsSchema
 >;

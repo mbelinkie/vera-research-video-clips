@@ -17,6 +17,10 @@ import {
   RequestDerivedTranslationSchema,
   CreateTranscriptionBatchResponseSchema,
   ExportRequestSchema,
+  ExportPresetCatalogEntrySchema,
+  ExportPresetDefaultSchema,
+  PersonalExportPresetCatalogSchema,
+  ProjectExportPresetCatalogSchema,
   JobSchema,
   ProjectSchema,
   ReviewInboxItemSchema,
@@ -45,6 +49,14 @@ import {
   type DerivedTranslationJob,
   type FinalizeTranscriptRequest,
   type ExportRequest,
+  type ExportPresetCatalogEntry,
+  type ExportPresetDefault,
+  type ExportPresetScope,
+  type PersonalExportPresetCatalog,
+  type ProjectExportPresetCatalog,
+  type CreateExportPresetRequest,
+  type ReviseExportPresetRequest,
+  type SetExportPresetDefaultRequest,
   type Project,
   type ProjectRole,
   type PublishDerivedTranslationRequest,
@@ -90,6 +102,11 @@ export class TranscriptIntegrityError extends Error {
 export class CatalogValidationError extends Error {
   readonly statusCode = 422;
   readonly code = "invalid_language_evidence";
+}
+
+export class CatalogIdempotencyConflictError extends Error {
+  readonly statusCode = 409;
+  readonly code = "idempotency_conflict";
 }
 
 export type ArtifactType = TranscriptArtifact["type"];
@@ -189,6 +206,106 @@ export class SharedProjectCatalog {
       [input.preferredLanguage, now, actor.userId, actor.externalSubject],
     );
     return mapUser(result.rows[0]);
+  }
+
+  async listPersonalExportPresets(
+    actor: AuthenticatedActor,
+  ): Promise<PersonalExportPresetCatalog> {
+    await this.requireRegistered(actor);
+    const [presets, personalDefault] = await Promise.all([
+      this.listExportPresetEntries("personal", actor.userId),
+      this.getExportPresetDefault("personal", actor.userId),
+    ]);
+    return PersonalExportPresetCatalogSchema.parse({
+      presets,
+      ...(personalDefault ? { default: personalDefault } : {}),
+    });
+  }
+
+  async listProjectExportPresets(
+    actor: AuthenticatedActor,
+    projectId: string,
+  ): Promise<ProjectExportPresetCatalog> {
+    await this.authorize(actor, projectId, "read");
+    const [projectPresets, projectDefault, personalPresets, personalDefault] =
+      await Promise.all([
+        this.listExportPresetEntries("project", projectId),
+        this.getExportPresetDefault("project", projectId),
+        this.listExportPresetEntries("personal", actor.userId),
+        this.getExportPresetDefault("personal", actor.userId),
+      ]);
+    return ProjectExportPresetCatalogSchema.parse({
+      projectPresets,
+      ...(projectDefault ? { projectDefault } : {}),
+      personalPresets,
+      ...(personalDefault ? { personalDefault } : {}),
+    });
+  }
+
+  async getPersonalExportPresetDefault(
+    actor: AuthenticatedActor,
+  ): Promise<ExportPresetDefault | undefined> {
+    await this.requireRegistered(actor);
+    return this.getExportPresetDefault("personal", actor.userId);
+  }
+
+  async getProjectExportPresetDefault(
+    actor: AuthenticatedActor,
+    projectId: string,
+  ): Promise<ExportPresetDefault | undefined> {
+    await this.authorize(actor, projectId, "read");
+    return this.getExportPresetDefault("project", projectId);
+  }
+
+  async createPersonalExportPreset(
+    actor: AuthenticatedActor,
+    input: CreateExportPresetRequest,
+  ): Promise<ExportPresetCatalogEntry> {
+    await this.requireRegistered(actor);
+    return this.createExportPreset(actor, "personal", actor.userId, input);
+  }
+
+  async createProjectExportPreset(
+    actor: AuthenticatedActor,
+    projectId: string,
+    input: CreateExportPresetRequest,
+  ): Promise<ExportPresetCatalogEntry> {
+    await this.authorize(actor, projectId, "write");
+    return this.createExportPreset(actor, "project", projectId, input);
+  }
+
+  async revisePersonalExportPreset(
+    actor: AuthenticatedActor,
+    input: ReviseExportPresetRequest,
+  ): Promise<ExportPresetCatalogEntry> {
+    await this.requireRegistered(actor);
+    return this.reviseExportPreset(actor, "personal", actor.userId, input);
+  }
+
+  async reviseProjectExportPreset(
+    actor: AuthenticatedActor,
+    projectId: string,
+    input: ReviseExportPresetRequest,
+  ): Promise<ExportPresetCatalogEntry> {
+    await this.authorize(actor, projectId, "write");
+    return this.reviseExportPreset(actor, "project", projectId, input);
+  }
+
+  async setPersonalExportPresetDefault(
+    actor: AuthenticatedActor,
+    input: SetExportPresetDefaultRequest,
+  ): Promise<ExportPresetDefault> {
+    await this.requireRegistered(actor);
+    return this.setExportPresetDefault(actor, "personal", actor.userId, input);
+  }
+
+  async setProjectExportPresetDefault(
+    actor: AuthenticatedActor,
+    projectId: string,
+    input: SetExportPresetDefaultRequest,
+  ): Promise<ExportPresetDefault> {
+    await this.authorize(actor, projectId, "write");
+    return this.setExportPresetDefault(actor, "project", projectId, input);
   }
 
   async createProject(
@@ -2403,6 +2520,504 @@ export class SharedProjectCatalog {
     return id;
   }
 
+  private async listExportPresetEntries(
+    scope: ExportPresetScope,
+    ownerId: string,
+  ): Promise<ExportPresetCatalogEntry[]> {
+    const ownerColumn =
+      scope === "personal" ? "p.owner_user_id" : "p.project_id";
+    const result = await this.database.query<DbRow>(
+      `SELECT p.*, v.name AS revision_name,
+              v.description AS revision_description,
+              v.settings_snapshot AS revision_settings,
+              v.created_by AS revision_created_by,
+              v.created_at AS revision_created_at
+       FROM export_presets p
+       JOIN export_preset_versions v
+         ON v.preset_id = p.id AND v.version = p.current_version
+       WHERE p.scope = $1 AND ${ownerColumn} = $2
+       ORDER BY p.normalized_name, p.id`,
+      [scope, ownerId],
+    );
+    return result.rows.map(mapExportPresetEntry);
+  }
+
+  private async getExportPresetDefault(
+    scope: ExportPresetScope,
+    ownerId: string,
+  ): Promise<ExportPresetDefault | undefined> {
+    const table =
+      scope === "personal"
+        ? "personal_export_preset_defaults"
+        : "project_export_preset_defaults";
+    const ownerColumn = scope === "personal" ? "user_id" : "project_id";
+    const result = await this.database.query<DbRow>(
+      `SELECT d.*, v.name AS revision_name,
+              v.description AS revision_description,
+              v.settings_snapshot AS revision_settings
+       FROM ${table} d
+       JOIN export_preset_versions v
+         ON v.preset_id = d.preset_id AND v.version = d.preset_version
+       WHERE d.${ownerColumn} = $1`,
+      [ownerId],
+    );
+    return result.rows[0]
+      ? mapExportPresetDefault(scope, ownerId, result.rows[0])
+      : undefined;
+  }
+
+  private async createExportPreset(
+    actor: AuthenticatedActor,
+    scope: ExportPresetScope,
+    ownerId: string,
+    input: CreateExportPresetRequest,
+  ): Promise<ExportPresetCatalogEntry> {
+    const replay = await this.readExportPresetReceipt(
+      actor,
+      scope,
+      ownerId,
+      "create",
+      input.idempotencyKey,
+      input,
+    );
+    if (replay) return ExportPresetCatalogEntrySchema.parse(replay);
+    const normalizedName = normalizePresetName(input.name);
+    await this.assertExportPresetNameAvailable(scope, ownerId, normalizedName);
+    const presetId = randomUUID();
+    const now = this.now().toISOString();
+    const response = ExportPresetCatalogEntrySchema.parse({
+      id: presetId,
+      scope,
+      ...(scope === "project" ? { projectId: ownerId } : {}),
+      currentVersion: 1,
+      entityVersion: 1,
+      current: {
+        presetId,
+        presetVersion: 1,
+        name: input.name,
+        description: input.description,
+        settings: input.settings,
+        createdBy: actor.userId,
+        createdAt: now,
+      },
+      createdBy: actor.userId,
+      createdAt: now,
+      updatedAt: now,
+    });
+    return this.transaction(async () => {
+      const concurrentReplay = await this.readExportPresetReceipt(
+        actor,
+        scope,
+        ownerId,
+        "create",
+        input.idempotencyKey,
+        input,
+      );
+      if (concurrentReplay)
+        return ExportPresetCatalogEntrySchema.parse(concurrentReplay);
+      await this.database.query(
+        `INSERT INTO export_presets
+           (id, scope, owner_user_id, project_id, normalized_name,
+            current_version, entity_version, created_by, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, 1, 1, $6, $7, $7)`,
+        [
+          presetId,
+          scope,
+          scope === "personal" ? ownerId : null,
+          scope === "project" ? ownerId : null,
+          normalizedName,
+          actor.userId,
+          now,
+        ],
+      );
+      await this.database.query(
+        `INSERT INTO export_preset_versions
+           (preset_id, version, name, description, settings_snapshot,
+            created_by, created_at)
+         VALUES ($1, 1, $2, $3, $4, $5, $6)`,
+        [
+          presetId,
+          input.name,
+          input.description,
+          JSON.stringify(input.settings),
+          actor.userId,
+          now,
+        ],
+      );
+      if (scope === "project") {
+        await this.insertExportPresetSyncEvent(
+          ownerId,
+          "export_preset.created",
+          presetId,
+          1,
+          { presetId, presetVersion: 1 },
+          now,
+        );
+      }
+      await this.writeExportPresetReceipt(
+        actor,
+        scope,
+        ownerId,
+        "create",
+        input.idempotencyKey,
+        input,
+        response,
+        now,
+      );
+      return response;
+    });
+  }
+
+  private async reviseExportPreset(
+    actor: AuthenticatedActor,
+    scope: ExportPresetScope,
+    ownerId: string,
+    input: ReviseExportPresetRequest,
+  ): Promise<ExportPresetCatalogEntry> {
+    const replay = await this.readExportPresetReceipt(
+      actor,
+      scope,
+      ownerId,
+      "revise",
+      input.idempotencyKey,
+      input,
+    );
+    if (replay) return ExportPresetCatalogEntrySchema.parse(replay);
+    const normalizedName = normalizePresetName(input.name);
+    const now = this.now().toISOString();
+    return this.transaction(async () => {
+      const concurrentReplay = await this.readExportPresetReceipt(
+        actor,
+        scope,
+        ownerId,
+        "revise",
+        input.idempotencyKey,
+        input,
+      );
+      if (concurrentReplay)
+        return ExportPresetCatalogEntrySchema.parse(concurrentReplay);
+      const preset = await this.findOwnedExportPreset(
+        scope,
+        ownerId,
+        input.presetId,
+      );
+      if (!preset) throw new CatalogNotFoundError("Export preset not found.");
+      if (Number(preset.entity_version) !== input.expectedEntityVersion) {
+        throw new CatalogConflictError(
+          "This preset changed elsewhere. Reload it before creating a revision.",
+        );
+      }
+      await this.assertExportPresetNameAvailable(
+        scope,
+        ownerId,
+        normalizedName,
+        input.presetId,
+      );
+      const nextPresetVersion = Number(preset.current_version) + 1;
+      const nextEntityVersion = Number(preset.entity_version) + 1;
+      await this.database.query(
+        `INSERT INTO export_preset_versions
+           (preset_id, version, name, description, settings_snapshot,
+            created_by, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        [
+          input.presetId,
+          nextPresetVersion,
+          input.name,
+          input.description,
+          JSON.stringify(input.settings),
+          actor.userId,
+          now,
+        ],
+      );
+      const advanced = await this.database.query<DbRow>(
+        `UPDATE export_presets
+         SET normalized_name = $1, current_version = $2,
+             entity_version = $3, updated_at = $4
+         WHERE id = $5 AND entity_version = $6
+         RETURNING id`,
+        [
+          normalizedName,
+          nextPresetVersion,
+          nextEntityVersion,
+          now,
+          input.presetId,
+          input.expectedEntityVersion,
+        ],
+      );
+      if (!advanced.rows[0]) {
+        throw new CatalogConflictError(
+          "This preset changed elsewhere. Reload it before creating a revision.",
+        );
+      }
+      const response = ExportPresetCatalogEntrySchema.parse({
+        id: input.presetId,
+        scope,
+        ...(scope === "project" ? { projectId: ownerId } : {}),
+        currentVersion: nextPresetVersion,
+        entityVersion: nextEntityVersion,
+        current: {
+          presetId: input.presetId,
+          presetVersion: nextPresetVersion,
+          name: input.name,
+          description: input.description,
+          settings: input.settings,
+          createdBy: actor.userId,
+          createdAt: now,
+        },
+        createdBy: preset.created_by,
+        createdAt: iso(preset.created_at),
+        updatedAt: now,
+      });
+      if (scope === "project") {
+        await this.insertExportPresetSyncEvent(
+          ownerId,
+          "export_preset.revised",
+          input.presetId,
+          nextEntityVersion,
+          { presetId: input.presetId, presetVersion: nextPresetVersion },
+          now,
+        );
+      }
+      await this.writeExportPresetReceipt(
+        actor,
+        scope,
+        ownerId,
+        "revise",
+        input.idempotencyKey,
+        input,
+        response,
+        now,
+      );
+      return response;
+    });
+  }
+
+  private async setExportPresetDefault(
+    actor: AuthenticatedActor,
+    scope: ExportPresetScope,
+    ownerId: string,
+    input: SetExportPresetDefaultRequest,
+  ): Promise<ExportPresetDefault> {
+    const replay = await this.readExportPresetReceipt(
+      actor,
+      scope,
+      ownerId,
+      "set_default",
+      input.idempotencyKey,
+      input,
+    );
+    if (replay) return ExportPresetDefaultSchema.parse(replay);
+    const now = this.now().toISOString();
+    return this.transaction(async () => {
+      const concurrentReplay = await this.readExportPresetReceipt(
+        actor,
+        scope,
+        ownerId,
+        "set_default",
+        input.idempotencyKey,
+        input,
+      );
+      if (concurrentReplay)
+        return ExportPresetDefaultSchema.parse(concurrentReplay);
+      const preset = await this.findOwnedExportPreset(
+        scope,
+        ownerId,
+        input.presetId,
+      );
+      if (!preset) throw new CatalogNotFoundError("Export preset not found.");
+      const revisionResult = await this.database.query<DbRow>(
+        `SELECT * FROM export_preset_versions
+         WHERE preset_id = $1 AND version = $2`,
+        [input.presetId, input.presetVersion],
+      );
+      const revision = revisionResult.rows[0];
+      if (!revision)
+        throw new CatalogNotFoundError("Export preset revision not found.");
+      const existing = await this.getExportPresetDefault(scope, ownerId);
+      const currentEntityVersion = existing?.entityVersion ?? 0;
+      if (currentEntityVersion !== input.expectedEntityVersion) {
+        throw new CatalogConflictError(
+          "The default changed elsewhere. Reload it before saving.",
+        );
+      }
+      const nextEntityVersion = currentEntityVersion + 1;
+      const table =
+        scope === "personal"
+          ? "personal_export_preset_defaults"
+          : "project_export_preset_defaults";
+      const ownerColumn = scope === "personal" ? "user_id" : "project_id";
+      await this.database.query(
+        `INSERT INTO ${table}
+           (${ownerColumn}, preset_id, preset_version, entity_version,
+            updated_by, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $6)
+         ON CONFLICT (${ownerColumn}) DO UPDATE
+         SET preset_id = EXCLUDED.preset_id,
+             preset_version = EXCLUDED.preset_version,
+             entity_version = EXCLUDED.entity_version,
+             updated_by = EXCLUDED.updated_by,
+             updated_at = EXCLUDED.updated_at`,
+        [
+          ownerId,
+          input.presetId,
+          input.presetVersion,
+          nextEntityVersion,
+          actor.userId,
+          now,
+        ],
+      );
+      const response = ExportPresetDefaultSchema.parse({
+        scope,
+        ...(scope === "project" ? { projectId: ownerId } : {}),
+        presetId: input.presetId,
+        presetVersion: input.presetVersion,
+        entityVersion: nextEntityVersion,
+        snapshot: {
+          presetId: input.presetId,
+          presetVersion: input.presetVersion,
+          name: revision.name,
+          settings: revision.settings_snapshot,
+        },
+        description: revision.description,
+        updatedBy: actor.userId,
+        createdAt: existing?.createdAt ?? now,
+        updatedAt: now,
+      });
+      if (scope === "project") {
+        await this.insertExportPresetSyncEvent(
+          ownerId,
+          "export_preset.default_set",
+          input.presetId,
+          nextEntityVersion,
+          { presetId: input.presetId, presetVersion: input.presetVersion },
+          now,
+        );
+      }
+      await this.writeExportPresetReceipt(
+        actor,
+        scope,
+        ownerId,
+        "set_default",
+        input.idempotencyKey,
+        input,
+        response,
+        now,
+      );
+      return response;
+    });
+  }
+
+  private async findOwnedExportPreset(
+    scope: ExportPresetScope,
+    ownerId: string,
+    presetId: string,
+  ): Promise<DbRow | undefined> {
+    const ownerColumn = scope === "personal" ? "owner_user_id" : "project_id";
+    const result = await this.database.query<DbRow>(
+      `SELECT * FROM export_presets
+       WHERE id = $1 AND scope = $2 AND ${ownerColumn} = $3`,
+      [presetId, scope, ownerId],
+    );
+    return result.rows[0];
+  }
+
+  private async assertExportPresetNameAvailable(
+    scope: ExportPresetScope,
+    ownerId: string,
+    normalizedName: string,
+    excludingPresetId?: string,
+  ): Promise<void> {
+    const ownerColumn = scope === "personal" ? "owner_user_id" : "project_id";
+    const result = await this.database.query(
+      `SELECT 1 FROM export_presets
+       WHERE scope = $1 AND ${ownerColumn} = $2 AND normalized_name = $3
+         AND ($4::uuid IS NULL OR id <> $4::uuid)`,
+      [scope, ownerId, normalizedName, excludingPresetId ?? null],
+    );
+    if (result.rows[0]) {
+      throw new CatalogConflictError(
+        "A preset with that name already exists in this catalog.",
+      );
+    }
+  }
+
+  private async readExportPresetReceipt(
+    actor: AuthenticatedActor,
+    scope: ExportPresetScope,
+    ownerId: string,
+    commandKind: "create" | "revise" | "set_default",
+    idempotencyKey: string,
+    input: unknown,
+  ): Promise<unknown | undefined> {
+    const result = await this.database.query<DbRow>(
+      `SELECT request_sha256, response_snapshot
+       FROM export_preset_command_receipts
+       WHERE scope = $1 AND scope_owner_id = $2 AND actor_user_id = $3
+         AND command_kind = $4 AND idempotency_key = $5`,
+      [scope, ownerId, actor.userId, commandKind, idempotencyKey],
+    );
+    const receipt = result.rows[0];
+    if (!receipt) return undefined;
+    if (receipt.request_sha256 !== exportPresetCommandHash(input)) {
+      throw new CatalogIdempotencyConflictError(
+        "That idempotency key was already used for a different preset command.",
+      );
+    }
+    return receipt.response_snapshot;
+  }
+
+  private async writeExportPresetReceipt(
+    actor: AuthenticatedActor,
+    scope: ExportPresetScope,
+    ownerId: string,
+    commandKind: "create" | "revise" | "set_default",
+    idempotencyKey: string,
+    input: unknown,
+    response: unknown,
+    now: string,
+  ): Promise<void> {
+    await this.database.query(
+      `INSERT INTO export_preset_command_receipts
+         (scope, scope_owner_id, actor_user_id, command_kind, idempotency_key,
+          request_sha256, response_snapshot, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+      [
+        scope,
+        ownerId,
+        actor.userId,
+        commandKind,
+        idempotencyKey,
+        exportPresetCommandHash(input),
+        JSON.stringify(response),
+        now,
+      ],
+    );
+  }
+
+  private async insertExportPresetSyncEvent(
+    projectId: string,
+    eventType: string,
+    entityId: string,
+    serverVersion: number,
+    payload: unknown,
+    now: string,
+  ): Promise<void> {
+    await this.database.query(
+      `INSERT INTO sync_events
+         (project_id, event_type, entity_id, server_version, payload, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [
+        projectId,
+        eventType,
+        entityId,
+        serverVersion,
+        JSON.stringify(payload),
+        now,
+      ],
+    );
+  }
+
   private async requireRegistered(actor: AuthenticatedActor) {
     const result = await this.database.query(
       "SELECT 1 FROM users WHERE id = $1 AND external_subject = $2",
@@ -2589,11 +3204,12 @@ export class SharedProjectCatalog {
     requirePermission(result.rows[0]?.role, permission);
   }
 
-  private async transaction(action: () => Promise<void>) {
+  private async transaction<Result>(action: () => Promise<Result>) {
     await this.database.exec("BEGIN");
     try {
-      await action();
+      const result = await action();
       await this.database.exec("COMMIT");
+      return result;
     } catch (error) {
       await this.database.exec("ROLLBACK");
       throw error;
@@ -2611,6 +3227,60 @@ function mapUser(row: DbRow | undefined): User {
     createdAt: iso(row.created_at),
     updatedAt: iso(row.updated_at),
   });
+}
+
+function mapExportPresetEntry(row: DbRow): ExportPresetCatalogEntry {
+  return ExportPresetCatalogEntrySchema.parse({
+    id: row.id,
+    scope: row.scope,
+    ...(row.project_id ? { projectId: row.project_id } : {}),
+    currentVersion: Number(row.current_version),
+    entityVersion: Number(row.entity_version),
+    current: {
+      presetId: row.id,
+      presetVersion: Number(row.current_version),
+      name: row.revision_name,
+      description: row.revision_description,
+      settings: row.revision_settings,
+      createdBy: row.revision_created_by,
+      createdAt: iso(row.revision_created_at),
+    },
+    createdBy: row.created_by,
+    createdAt: iso(row.created_at),
+    updatedAt: iso(row.updated_at),
+  });
+}
+
+function mapExportPresetDefault(
+  scope: ExportPresetScope,
+  ownerId: string,
+  row: DbRow,
+): ExportPresetDefault {
+  return ExportPresetDefaultSchema.parse({
+    scope,
+    ...(scope === "project" ? { projectId: ownerId } : {}),
+    presetId: row.preset_id,
+    presetVersion: Number(row.preset_version),
+    entityVersion: Number(row.entity_version),
+    snapshot: {
+      presetId: row.preset_id,
+      presetVersion: Number(row.preset_version),
+      name: row.revision_name,
+      settings: row.revision_settings,
+    },
+    description: row.revision_description,
+    updatedBy: row.updated_by,
+    createdAt: iso(row.created_at),
+    updatedAt: iso(row.updated_at),
+  });
+}
+
+function normalizePresetName(value: string) {
+  return value.trim().normalize("NFKC").toLocaleLowerCase("en-US");
+}
+
+function exportPresetCommandHash(value: unknown) {
+  return createHash("sha256").update(JSON.stringify(value)).digest("hex");
 }
 
 function mapProject(row: DbRow): Project {

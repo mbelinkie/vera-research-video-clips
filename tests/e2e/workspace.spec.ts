@@ -84,11 +84,74 @@ test("maps transcript text selection to stable source and export bounds", async 
   const now = "2026-08-01T12:00:00.000Z";
   const existingProjectId = "019fbb95-cd76-7920-93fa-e23ba755ee40";
   const createdProjectId = "019fbb95-cd76-7920-93fa-e23ba755ee41";
+  const personalPresetId = "019fbb95-cd76-7920-93fa-e23ba755ee48";
+  const existingProjectPresetId = "019fbb95-cd76-7920-93fa-e23ba755ee49";
+  const createdProjectPresetId = "019fbb95-cd76-7920-93fa-e23ba755ee50";
+  const presetSettings = {
+    container: "mp4",
+    videoCodec: "h264",
+    videoRateControl: { mode: "crf", value: 18 },
+    maxWidth: 1_280,
+    frameRate: "source",
+    audioCodec: "aac",
+    audioKilobitsPerSecond: 160,
+    omitSubtitleFilesForConfirmedEnglish: false,
+    embedEnglishSubtitleTrack: false,
+  };
+  const presetEntry = (
+    id: string,
+    scope: "personal" | "project",
+    name: string,
+    projectId?: string,
+  ) => ({
+    id,
+    scope,
+    ...(projectId ? { projectId } : {}),
+    currentVersion: 1,
+    entityVersion: 1,
+    current: {
+      presetId: id,
+      presetVersion: 1,
+      name,
+      description: `${name} description`,
+      settings: presetSettings,
+      createdBy: "019fbb95-cd76-7920-93fa-e23ba755ee36",
+      createdAt: now,
+    },
+    createdBy: "019fbb95-cd76-7920-93fa-e23ba755ee36",
+    createdAt: now,
+    updatedAt: now,
+  });
+  const presetDefault = (
+    id: string,
+    scope: "personal" | "project",
+    name: string,
+    projectId?: string,
+  ) => ({
+    scope,
+    ...(projectId ? { projectId } : {}),
+    presetId: id,
+    presetVersion: 1,
+    entityVersion: 1,
+    snapshot: {
+      presetId: id,
+      presetVersion: 1,
+      name,
+      settings: presetSettings,
+    },
+    description: `${name} description`,
+    updatedBy: "019fbb95-cd76-7920-93fa-e23ba755ee36",
+    createdAt: now,
+    updatedAt: now,
+  });
   let clipPostCount = 0;
   let loggedExportPostCount = 0;
   let exportOnlyPostCount = 0;
   let loggedClip: Record<string, unknown> | undefined;
   let lastClipBody: Record<string, any> | undefined;
+  let lastLoggedExportBody: Record<string, any> | undefined;
+  let lastExportOnlyBody: Record<string, any> | undefined;
+  let failExistingPresetDiscovery = false;
   await page.route("**/cloud-api/api/session/profile", async (route) => {
     const request = route.request();
     const body = request.method() === "PATCH" ? request.postDataJSON() : {};
@@ -100,6 +163,20 @@ test("maps transcript text selection to stable source and export bounds", async 
         preferredLanguage: body.preferredLanguage ?? "en",
         createdAt: now,
         updatedAt: now,
+      },
+    });
+  });
+  await page.route("**/cloud-api/api/export-presets", async (route) => {
+    return route.fulfill({
+      json: {
+        presets: [
+          presetEntry(personalPresetId, "personal", "Personal Documentary"),
+        ],
+        default: presetDefault(
+          personalPresetId,
+          "personal",
+          "Personal Documentary",
+        ),
       },
     });
   });
@@ -128,6 +205,76 @@ test("maps transcript text selection to stable source and export bounds", async 
                   updatedAt: now,
                 },
               ],
+      });
+    }
+    if (
+      path === `/cloud-api/api/projects/${existingProjectId}/export-presets`
+    ) {
+      if (failExistingPresetDiscovery) {
+        return route.fulfill({
+          status: 503,
+          json: {
+            error: {
+              code: "preset_catalog_unavailable",
+              message: "Project presets are temporarily unavailable.",
+              retryable: true,
+            },
+          },
+        });
+      }
+      return route.fulfill({
+        json: {
+          projectPresets: [
+            presetEntry(
+              existingProjectPresetId,
+              "project",
+              "Existing Project Edit",
+              existingProjectId,
+            ),
+          ],
+          projectDefault: presetDefault(
+            existingProjectPresetId,
+            "project",
+            "Existing Project Edit",
+            existingProjectId,
+          ),
+          personalPresets: [
+            presetEntry(personalPresetId, "personal", "Personal Documentary"),
+          ],
+          personalDefault: presetDefault(
+            personalPresetId,
+            "personal",
+            "Personal Documentary",
+          ),
+        },
+      });
+    }
+    if (path === `/cloud-api/api/projects/${createdProjectId}/export-presets`) {
+      return route.fulfill({
+        json: {
+          projectPresets: [
+            presetEntry(
+              createdProjectPresetId,
+              "project",
+              "New Essay Edit",
+              createdProjectId,
+            ),
+          ],
+          projectDefault: presetDefault(
+            createdProjectPresetId,
+            "project",
+            "New Essay Edit",
+            createdProjectId,
+          ),
+          personalPresets: [
+            presetEntry(personalPresetId, "personal", "Personal Documentary"),
+          ],
+          personalDefault: presetDefault(
+            personalPresetId,
+            "personal",
+            "Personal Documentary",
+          ),
+        },
       });
     }
     if (path === `/cloud-api/api/projects/${createdProjectId}/clips`) {
@@ -194,6 +341,7 @@ test("maps transcript text selection to stable source and export bounds", async 
     ) {
       loggedExportPostCount += 1;
       const body = request.postDataJSON();
+      lastLoggedExportBody = body;
       return route.fulfill({
         status: 201,
         json: {
@@ -240,6 +388,7 @@ test("maps transcript text selection to stable source and export bounds", async 
   await page.route("**/local-agent/api/exports", async (route) => {
     exportOnlyPostCount += 1;
     const body = route.request().postDataJSON();
+    lastExportOnlyBody = body;
     return route.fulfill({
       status: 201,
       json: {
@@ -313,6 +462,21 @@ test("maps transcript text selection to stable source and export bounds", async 
   await expect(page.getByLabel("Logging project")).toHaveValue(
     existingProjectId,
   );
+  await expect(page.getByLabel("Logged export preset")).toHaveValue(
+    `project:${existingProjectPresetId}:v1`,
+  );
+  await expect(page.getByLabel("Export-only preset")).toHaveValue(
+    `personal:${personalPresetId}:v1`,
+  );
+  await expect(
+    page
+      .getByLabel("Logged export preset")
+      .locator("optgroup")
+      .allTextContents(),
+  ).resolves.toEqual([
+    "Existing Project Edit v1 — project default",
+    "Personal Documentary v1 — personal default",
+  ]);
   await page.getByRole("button", { name: "New project", exact: true }).click();
   await page.getByLabel("Project name").fill("New essay");
   await page
@@ -321,6 +485,26 @@ test("maps transcript text selection to stable source and export bounds", async 
   await page.getByRole("button", { name: "Create and select project" }).click();
   await expect(page.getByLabel("Logging project")).toHaveValue(
     createdProjectId,
+  );
+  await expect(page.getByLabel("Logged export preset")).toHaveValue(
+    `project:${createdProjectPresetId}:v1`,
+  );
+  await expect(
+    page.getByLabel("Logged export preset").locator("option").allTextContents(),
+  ).resolves.not.toContain("Existing Project Edit v1 — project default");
+  failExistingPresetDiscovery = true;
+  await page.getByLabel("Logging project").selectOption(existingProjectId);
+  await expect(page.getByLabel("Logged export preset")).toHaveValue(
+    "built-in:editing-mp4:v1",
+  );
+  await expect(page.getByLabel("Conversion preset picker")).toContainText(
+    "Project presets are temporarily unavailable. Continue with the current valid personal selection or Editing MP4.",
+  );
+  await expect(page.getByRole("button", { name: "Export only" })).toBeEnabled();
+  failExistingPresetDiscovery = false;
+  await page.getByLabel("Logging project").selectOption(createdProjectId);
+  await expect(page.getByLabel("Logged export preset")).toHaveValue(
+    `project:${createdProjectPresetId}:v1`,
   );
   await expect(panel).toContainText(
     "fixture has accurate word timing. Click any word",
@@ -360,7 +544,7 @@ test("maps transcript text selection to stable source and export bounds", async 
     "Downloaded the project clip log as CSV.",
   );
 
-  await page.getByText("Export settings — Editing MP4").click();
+  await page.getByText("Built-in Editing MP4 settings").click();
   await expect(
     page.getByLabel("Omit subtitle files for confirmed-English videos"),
   ).not.toBeChecked();
@@ -369,21 +553,33 @@ test("maps transcript text selection to stable source and export bounds", async 
     .check();
   await page.getByRole("button", { name: "Export + log" }).click();
   await expect(panel).toContainText(
-    "Logged to New essay and queued an export with the Editing MP4 snapshot.",
+    "Logged to New essay and queued an export with the New Essay Edit snapshot.",
   );
   await expect(
     page.getByRole("button", { name: "Export queued" }),
   ).toBeDisabled();
   expect(loggedExportPostCount).toBe(1);
+  expect(lastLoggedExportBody?.preset).toEqual({
+    presetId: createdProjectPresetId,
+    presetVersion: 1,
+    name: "New Essay Edit",
+    settings: presetSettings,
+  });
 
   await page.getByRole("button", { name: "Export only" }).click();
   await expect(panel).toContainText(
-    "Queued a local export-only job with the Editing MP4 snapshot. Nothing was added to a project.",
+    "Queued a local export-only job with the Personal Documentary snapshot. Nothing was added to a project.",
   );
   await expect(
     page.getByRole("button", { name: "Export-only queued" }),
   ).toBeDisabled();
   expect(exportOnlyPostCount).toBe(1);
+  expect(lastExportOnlyBody?.preset).toEqual({
+    presetId: personalPresetId,
+    presetVersion: 1,
+    name: "Personal Documentary",
+    settings: presetSettings,
+  });
 
   await page.getByLabel("Preferred transcript language").fill("es-MX");
   await page.getByRole("button", { name: "Save preference" }).click();

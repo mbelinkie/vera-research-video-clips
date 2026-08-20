@@ -5,12 +5,17 @@ import {
   ApiErrorSchema,
   ClipCandidateSchema,
   ExportPresetSnapshotSchema,
+  PersonalExportPresetCatalogSchema,
+  ProjectExportPresetCatalogSchema,
   ExportRequestSchema,
   ProjectSchema,
   TranscriptSelectionSchema,
   UserSchema,
   languagesEquivalent,
   type ClipCandidate,
+  type ExportPresetCatalogEntry,
+  type ExportPresetDefault,
+  type ExportPresetSnapshot,
   type NormalizedTranscript,
   type Project,
   type TranscriptSelection,
@@ -39,6 +44,26 @@ import { VirtualTranscript } from "./virtual-transcript.tsx";
 const demoVideoId = "M7lc1UVf-VE";
 const multilingualDemoVideoId = "Romanian001";
 const demoUrl = `https://www.youtube.com/watch?v=${demoVideoId}`;
+const builtInPresetKey = "built-in:editing-mp4:v1";
+
+function catalogPresetKey(
+  scope: "personal" | "project",
+  snapshot: ExportPresetSnapshot & { presetId: string },
+) {
+  return `${scope}:${snapshot.presetId}:v${snapshot.presetVersion}`;
+}
+
+function catalogEntrySnapshot(
+  entry: ExportPresetCatalogEntry,
+): ExportPresetSnapshot & { presetId: string } {
+  const snapshot = ExportPresetSnapshotSchema.parse({
+    presetId: entry.id,
+    presetVersion: entry.current.presetVersion,
+    name: entry.current.name,
+    settings: entry.current.settings,
+  });
+  return { ...snapshot, presetId: entry.id };
+}
 
 function formatTime(milliseconds: number) {
   const totalSeconds = Math.floor(milliseconds / 1_000);
@@ -121,6 +146,22 @@ function App() {
   const [loggedClipId, setLoggedClipId] = useState<string>();
   const [loggedExportRequestId, setLoggedExportRequestId] = useState<string>();
   const [exportOnlyRequestId, setExportOnlyRequestId] = useState<string>();
+  const [personalPresets, setPersonalPresets] = useState<
+    ExportPresetCatalogEntry[]
+  >([]);
+  const [personalPresetDefault, setPersonalPresetDefault] =
+    useState<ExportPresetDefault>();
+  const [projectPresets, setProjectPresets] = useState<
+    ExportPresetCatalogEntry[]
+  >([]);
+  const [projectPresetDefault, setProjectPresetDefault] =
+    useState<ExportPresetDefault>();
+  const [loggedPresetKey, setLoggedPresetKey] = useState(builtInPresetKey);
+  const [exportOnlyPresetKey, setExportOnlyPresetKey] =
+    useState(builtInPresetKey);
+  const [presetDiscoveryMessage, setPresetDiscoveryMessage] = useState(
+    "Connect a session to discover saved presets. Editing MP4 remains available.",
+  );
   const [exportContainer, setExportContainer] = useState<"mp4" | "mov" | "mkv">(
     "mp4",
   );
@@ -227,6 +268,80 @@ function App() {
       omitEnglishSubtitles,
     ],
   );
+  const personalPresetOptions = useMemo(() => {
+    const options = personalPresets.map((entry) => ({
+      key: catalogPresetKey("personal", catalogEntrySnapshot(entry)),
+      snapshot: catalogEntrySnapshot(entry),
+      description: entry.current.description,
+      isDefault:
+        personalPresetDefault?.presetId === entry.id &&
+        personalPresetDefault.presetVersion === entry.currentVersion,
+    }));
+    if (
+      personalPresetDefault &&
+      !options.some(
+        (option) =>
+          option.snapshot.presetId === personalPresetDefault.presetId &&
+          option.snapshot.presetVersion === personalPresetDefault.presetVersion,
+      )
+    ) {
+      options.push({
+        key: catalogPresetKey("personal", personalPresetDefault.snapshot),
+        snapshot: personalPresetDefault.snapshot,
+        description: personalPresetDefault.description,
+        isDefault: true,
+      });
+    }
+    return options;
+  }, [personalPresetDefault, personalPresets]);
+  const projectPresetOptions = useMemo(() => {
+    const options = projectPresets.map((entry) => ({
+      key: catalogPresetKey("project", catalogEntrySnapshot(entry)),
+      snapshot: catalogEntrySnapshot(entry),
+      description: entry.current.description,
+      isDefault:
+        projectPresetDefault?.presetId === entry.id &&
+        projectPresetDefault.presetVersion === entry.currentVersion,
+    }));
+    if (
+      projectPresetDefault &&
+      !options.some(
+        (option) =>
+          option.snapshot.presetId === projectPresetDefault.presetId &&
+          option.snapshot.presetVersion === projectPresetDefault.presetVersion,
+      )
+    ) {
+      options.push({
+        key: catalogPresetKey("project", projectPresetDefault.snapshot),
+        snapshot: projectPresetDefault.snapshot,
+        description: projectPresetDefault.description,
+        isDefault: true,
+      });
+    }
+    return options;
+  }, [projectPresetDefault, projectPresets]);
+  const loggedPresetSelectionKey =
+    projectPresetOptions.some((option) => option.key === loggedPresetKey) ||
+    personalPresetOptions.some((option) => option.key === loggedPresetKey)
+      ? loggedPresetKey
+      : builtInPresetKey;
+  const exportOnlyPresetSelectionKey = personalPresetOptions.some(
+    (option) => option.key === exportOnlyPresetKey,
+  )
+    ? exportOnlyPresetKey
+    : builtInPresetKey;
+  const loggedExportPreset =
+    projectPresetOptions.find(
+      (option) => option.key === loggedPresetSelectionKey,
+    )?.snapshot ??
+    personalPresetOptions.find(
+      (option) => option.key === loggedPresetSelectionKey,
+    )?.snapshot ??
+    exportPreset;
+  const exportOnlyExportPreset =
+    personalPresetOptions.find(
+      (option) => option.key === exportOnlyPresetSelectionKey,
+    )?.snapshot ?? exportPreset;
   const selectedTokenIds = useMemo(() => {
     const ids = new Set<string>();
     if (!transcript || !selection?.firstTokenId || !selection.lastTokenId) {
@@ -281,6 +396,123 @@ function App() {
         );
       });
   }, [authorization]);
+
+  useEffect(() => {
+    if (!authorization) {
+      setPersonalPresets([]);
+      setPersonalPresetDefault(undefined);
+      setProjectPresets([]);
+      setProjectPresetDefault(undefined);
+      setLoggedPresetKey(builtInPresetKey);
+      setExportOnlyPresetKey(builtInPresetKey);
+      setPresetDiscoveryMessage(
+        "Connect a session to discover saved presets. Editing MP4 remains available.",
+      );
+      return;
+    }
+    void fetch("/cloud-api/api/export-presets", {
+      headers: { accept: "application/json", authorization },
+    })
+      .then(async (response) => {
+        const payload = await response.json().catch(() => undefined);
+        if (!response.ok) {
+          const parsed = ApiErrorSchema.safeParse(payload);
+          throw new Error(
+            parsed.success
+              ? parsed.data.error.message
+              : "Unable to discover personal presets.",
+          );
+        }
+        return PersonalExportPresetCatalogSchema.parse(payload);
+      })
+      .then((catalog) => {
+        setPersonalPresets(catalog.presets);
+        setPersonalPresetDefault(catalog.default);
+        const validKeys = new Set(
+          catalog.presets.map((entry) =>
+            catalogPresetKey("personal", catalogEntrySnapshot(entry)),
+          ),
+        );
+        if (catalog.default) {
+          validKeys.add(catalogPresetKey("personal", catalog.default.snapshot));
+        }
+        setExportOnlyPresetKey((current) => {
+          if (current !== builtInPresetKey && validKeys.has(current))
+            return current;
+          return catalog.default
+            ? catalogPresetKey("personal", catalog.default.snapshot)
+            : builtInPresetKey;
+        });
+        setPresetDiscoveryMessage(
+          catalog.presets.length
+            ? "Saved personal presets loaded."
+            : "No saved personal presets. Editing MP4 is available.",
+        );
+      })
+      .catch((caught: unknown) => {
+        setPresetDiscoveryMessage(
+          `${caught instanceof Error ? caught.message : "Unable to discover personal presets."} Continue with the current valid selection or Editing MP4.`,
+        );
+      });
+  }, [authorization]);
+
+  useEffect(() => {
+    setProjectPresets([]);
+    setProjectPresetDefault(undefined);
+    setLoggedPresetKey((current) =>
+      current.startsWith("project:") ? builtInPresetKey : current,
+    );
+    if (!authorization || !projectId) return;
+    void fetch(`/cloud-api/api/projects/${projectId}/export-presets`, {
+      headers: { accept: "application/json", authorization },
+    })
+      .then(async (response) => {
+        const payload = await response.json().catch(() => undefined);
+        if (!response.ok) {
+          const parsed = ApiErrorSchema.safeParse(payload);
+          throw new Error(
+            parsed.success
+              ? parsed.data.error.message
+              : "Unable to discover project presets.",
+          );
+        }
+        return ProjectExportPresetCatalogSchema.parse(payload);
+      })
+      .then((catalog) => {
+        setProjectPresets(catalog.projectPresets);
+        setProjectPresetDefault(catalog.projectDefault);
+        setPersonalPresets(catalog.personalPresets);
+        setPersonalPresetDefault(catalog.personalDefault);
+        const personalKeys = new Set(
+          catalog.personalPresets.map((entry) =>
+            catalogPresetKey("personal", catalogEntrySnapshot(entry)),
+          ),
+        );
+        if (catalog.personalDefault) {
+          personalKeys.add(
+            catalogPresetKey("personal", catalog.personalDefault.snapshot),
+          );
+        }
+        setLoggedPresetKey((current) => {
+          if (current.startsWith("personal:") && personalKeys.has(current)) {
+            return current;
+          }
+          return catalog.projectDefault
+            ? catalogPresetKey("project", catalog.projectDefault.snapshot)
+            : builtInPresetKey;
+        });
+        setPresetDiscoveryMessage(
+          catalog.projectPresets.length || catalog.personalPresets.length
+            ? "Saved project and personal presets loaded."
+            : "No saved presets for this context. Editing MP4 is available.",
+        );
+      })
+      .catch((caught: unknown) => {
+        setPresetDiscoveryMessage(
+          `${caught instanceof Error ? caught.message : "Unable to discover project presets."} Continue with the current valid personal selection or Editing MP4.`,
+        );
+      });
+  }, [authorization, projectId]);
 
   const previousTranscriptTrackId = useRef<string | undefined>(undefined);
   useEffect(() => {
@@ -604,7 +836,7 @@ function App() {
                     },
                   },
                 }),
-            preset: exportPreset,
+            preset: loggedExportPreset,
           }),
         },
       );
@@ -678,7 +910,7 @@ function App() {
                   },
                 },
               }),
-          preset: exportPreset,
+          preset: exportOnlyExportPreset,
         }),
       });
       const payload = await response.json().catch(() => undefined);
@@ -1157,8 +1389,84 @@ function App() {
                   Set end from playhead
                 </button>
               </div>
+              <section
+                className="preset-picker"
+                aria-label="Conversion preset picker"
+              >
+                <div className="export-settings-grid">
+                  <label>
+                    Logged export preset
+                    <select
+                      value={loggedPresetSelectionKey}
+                      onChange={(event) =>
+                        setLoggedPresetKey(event.target.value)
+                      }
+                    >
+                      {projectPresetOptions.length ? (
+                        <optgroup label="Project presets">
+                          {projectPresetOptions.map((option) => (
+                            <option key={option.key} value={option.key}>
+                              {option.snapshot.name} v
+                              {option.snapshot.presetVersion}
+                              {option.isDefault ? " — project default" : ""}
+                            </option>
+                          ))}
+                        </optgroup>
+                      ) : null}
+                      {personalPresetOptions.length ? (
+                        <optgroup label="Personal presets">
+                          {personalPresetOptions.map((option) => (
+                            <option key={option.key} value={option.key}>
+                              {option.snapshot.name} v
+                              {option.snapshot.presetVersion}
+                              {option.isDefault ? " — personal default" : ""}
+                            </option>
+                          ))}
+                        </optgroup>
+                      ) : null}
+                      <option value={builtInPresetKey}>
+                        Editing MP4 v1 — built-in fallback
+                      </option>
+                    </select>
+                  </label>
+                  <label>
+                    Export-only preset
+                    <select
+                      value={exportOnlyPresetSelectionKey}
+                      onChange={(event) =>
+                        setExportOnlyPresetKey(event.target.value)
+                      }
+                    >
+                      {personalPresetOptions.length ? (
+                        <optgroup label="Personal presets">
+                          {personalPresetOptions.map((option) => (
+                            <option key={option.key} value={option.key}>
+                              {option.snapshot.name} v
+                              {option.snapshot.presetVersion}
+                              {option.isDefault ? " — personal default" : ""}
+                            </option>
+                          ))}
+                        </optgroup>
+                      ) : null}
+                      <option value={builtInPresetKey}>
+                        Editing MP4 v1 — built-in fallback
+                      </option>
+                    </select>
+                  </label>
+                </div>
+                <p className="form-message" role="status">
+                  {presetDiscoveryMessage}
+                </p>
+                <p className="muted">
+                  Logged: {loggedExportPreset.name} v
+                  {loggedExportPreset.presetVersion}. Export only:{" "}
+                  {exportOnlyExportPreset.name} v
+                  {exportOnlyExportPreset.presetVersion}. Saved selections
+                  submit their exact immutable snapshot.
+                </p>
+              </section>
               <details className="export-settings-panel">
-                <summary>Export settings — {exportPreset.name}</summary>
+                <summary>Built-in Editing MP4 settings</summary>
                 <div className="export-settings-grid">
                   <label>
                     Container

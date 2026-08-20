@@ -7,6 +7,9 @@ import {
   CreateTranscriptionBatchRequestSchema,
   ExportClipManifestSchema,
   ExportClipMetadataSchema,
+  ExportPresetCatalogEntrySchema,
+  ExportPresetDefaultSchema,
+  ExportPresetSnapshotSchema,
   ExportSettingsSchema,
   FinalArtifactProvenanceSchema,
   HealthResponseSchema,
@@ -201,6 +204,68 @@ describe("shared contracts", () => {
         videoCodec: "prores",
       }).error?.issues[0]?.message,
     ).toMatch(/requires MOV or MKV/u);
+  });
+
+  it("keeps legacy inline snapshots compatible and makes catalog responses strict", () => {
+    const settings = {
+      container: "mp4" as const,
+      videoCodec: "h264" as const,
+      videoRateControl: { mode: "crf" as const, value: 20 },
+      frameRate: "source" as const,
+      audioCodec: "aac" as const,
+      omitSubtitleFilesForConfirmedEnglish: false,
+      embedEnglishSubtitleTrack: false,
+    };
+    expect(
+      ExportPresetSnapshotSchema.parse({
+        presetVersion: 1,
+        name: "Editing MP4",
+        settings,
+      }),
+    ).not.toHaveProperty("presetId");
+    const entry = {
+      id,
+      scope: "personal",
+      currentVersion: 1,
+      entityVersion: 1,
+      current: {
+        presetId: id,
+        presetVersion: 1,
+        name: "My editing preset",
+        description: "Personal default",
+        settings,
+        createdBy: id,
+        createdAt: now,
+      },
+      createdBy: id,
+      createdAt: now,
+      updatedAt: now,
+    };
+    expect(
+      ExportPresetCatalogEntrySchema.parse(entry).current.settings,
+    ).toEqual(settings);
+    expect(
+      ExportPresetCatalogEntrySchema.safeParse({ ...entry, unexpected: true })
+        .success,
+    ).toBe(false);
+    expect(
+      ExportPresetDefaultSchema.safeParse({
+        scope: "personal",
+        presetId: id,
+        presetVersion: 1,
+        entityVersion: 1,
+        snapshot: {
+          presetId: id,
+          presetVersion: 2,
+          name: "Wrong revision",
+          settings,
+        },
+        description: "Wrong fixed revision",
+        updatedBy: id,
+        createdAt: now,
+        updatedAt: now,
+      }).success,
+    ).toBe(false);
   });
 
   it("requires immutable bilingual track identities for foreign, mixed, and unknown exports", () => {

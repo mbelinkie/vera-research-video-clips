@@ -10,6 +10,8 @@ import {
   BatchPreflightResponseSchema,
   CreateClipCandidateRequestSchema,
   CreateClipExportRequestSchema,
+  CreateExportPresetRequestSchema,
+  ExportPresetDefaultResponseSchema,
   CreateTranscriptionBatchRequestSchema,
   CreateProjectRequestSchema,
   PublishDerivedTranslationRequestSchema,
@@ -17,6 +19,8 @@ import {
   TranscriptionBatchControlRequestSchema,
   UpdateReviewStatusRequestSchema,
   UpdateClipCandidateRequestSchema,
+  ReviseExportPresetRequestSchema,
+  SetExportPresetDefaultRequestSchema,
   UpdatePreferredLanguageRequestSchema,
   FinalizeTranscriptRequestSchema,
   HealthResponseSchema,
@@ -132,6 +136,43 @@ export function createCloudApi(
     ),
   );
 
+  app.get("/api/export-presets", async (request) =>
+    catalog.listPersonalExportPresets(await authenticate(request)),
+  );
+
+  app.post("/api/export-presets", async (request, reply) => {
+    const preset = await catalog.createPersonalExportPreset(
+      await authenticate(request),
+      CreateExportPresetRequestSchema.parse(request.body),
+    );
+    return reply.status(201).send(preset);
+  });
+
+  app.patch("/api/export-presets", async (request) =>
+    catalog.revisePersonalExportPreset(
+      await authenticate(request),
+      ReviseExportPresetRequestSchema.parse(request.body),
+    ),
+  );
+
+  app.get("/api/export-presets/default", async (request) => {
+    const presetDefault = await catalog.getPersonalExportPresetDefault(
+      await authenticate(request),
+    );
+    return ExportPresetDefaultResponseSchema.parse(
+      presetDefault ? { default: presetDefault } : {},
+    );
+  });
+
+  app.put("/api/export-presets/default", async (request) =>
+    ExportPresetDefaultResponseSchema.parse({
+      default: await catalog.setPersonalExportPresetDefault(
+        await authenticate(request),
+        SetExportPresetDefaultRequestSchema.parse(request.body),
+      ),
+    }),
+  );
+
   app.get("/api/projects", async (request) =>
     catalog.listProjects(await authenticate(request)),
   );
@@ -143,6 +184,64 @@ export function createCloudApi(
     );
     return reply.status(201).send(project);
   });
+
+  app.get("/api/projects/:projectId/export-presets", async (request) => {
+    const { projectId } = IdParamsSchema.parse(request.params);
+    return catalog.listProjectExportPresets(
+      await authenticate(request),
+      projectId,
+    );
+  });
+
+  app.post(
+    "/api/projects/:projectId/export-presets",
+    async (request, reply) => {
+      const { projectId } = IdParamsSchema.parse(request.params);
+      const preset = await catalog.createProjectExportPreset(
+        await authenticate(request),
+        projectId,
+        CreateExportPresetRequestSchema.parse(request.body),
+      );
+      return reply.status(201).send(preset);
+    },
+  );
+
+  app.patch("/api/projects/:projectId/export-presets", async (request) => {
+    const { projectId } = IdParamsSchema.parse(request.params);
+    return catalog.reviseProjectExportPreset(
+      await authenticate(request),
+      projectId,
+      ReviseExportPresetRequestSchema.parse(request.body),
+    );
+  });
+
+  app.get(
+    "/api/projects/:projectId/export-presets/default",
+    async (request) => {
+      const { projectId } = IdParamsSchema.parse(request.params);
+      const presetDefault = await catalog.getProjectExportPresetDefault(
+        await authenticate(request),
+        projectId,
+      );
+      return ExportPresetDefaultResponseSchema.parse(
+        presetDefault ? { default: presetDefault } : {},
+      );
+    },
+  );
+
+  app.put(
+    "/api/projects/:projectId/export-presets/default",
+    async (request) => {
+      const { projectId } = IdParamsSchema.parse(request.params);
+      return ExportPresetDefaultResponseSchema.parse({
+        default: await catalog.setProjectExportPresetDefault(
+          await authenticate(request),
+          projectId,
+          SetExportPresetDefaultRequestSchema.parse(request.body),
+        ),
+      });
+    },
+  );
 
   app.post("/api/projects/:projectId/members", async (request, reply) => {
     const { projectId } = IdParamsSchema.parse(request.params);
