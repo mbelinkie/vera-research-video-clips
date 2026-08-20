@@ -230,6 +230,13 @@ const fixtureInspector = (
 ) => ({
   inspect: async (path: string) =>
     path.endsWith("rendered-range.mp4") ? output : source,
+  thumbnailInspector: {
+    inspect: async () => ({ codecName: "mjpeg", width: 640, height: 360 }),
+  },
+});
+
+const fixtureThumbnailInspector = () => ({
+  inspect: async () => ({ codecName: "mjpeg", width: 640, height: 360 }),
 });
 
 const fixtureRenderer = (
@@ -238,6 +245,17 @@ const fixtureRenderer = (
   render: async (input: { outputPath: string }) => {
     if (action) return action(input);
     await writeFile(input.outputPath, "fixture render");
+  },
+  thumbnailExtractor: {
+    extract: async ({ outputPath }: { outputPath: string }) => {
+      await writeFile(outputPath, "fixture thumbnail");
+    },
+  },
+});
+
+const fixtureThumbnailExtractor = () => ({
+  extract: async ({ outputPath }: { outputPath: string }) => {
+    await writeFile(outputPath, "fixture thumbnail");
   },
 });
 
@@ -298,6 +316,8 @@ describe("LocalExportSourceProcessor", () => {
       fixtureInspector(),
       fixtureRenderer(),
       root,
+      fixtureThumbnailExtractor(),
+      fixtureThumbnailInspector(),
     );
 
     await processor.process({
@@ -333,12 +353,18 @@ describe("LocalExportSourceProcessor", () => {
         sourceAttempt: 1,
       }),
       expect.objectContaining({
+        role: "thumbnail_jpg",
+        packageIdentity: `clip-${request.id}`,
+        sourceAttempt: 1,
+      }),
+      expect.objectContaining({
         role: "video_mp4",
         packageIdentity: `clip-${request.id}`,
         sourceAttempt: 1,
       }),
     ]);
     expect(await readdir(join(root, "exports", `clip-${request.id}`))).toEqual([
+      `clip-${request.id}.jpg`,
       `clip-${request.id}.json`,
       `clip-${request.id}.mp4`,
       "manifest.json",
@@ -372,6 +398,42 @@ describe("LocalExportSourceProcessor", () => {
     database.close();
   });
 
+  it("fails closed and cleans scratch when thumbnail extraction fails", async () => {
+    const { root, database, queue, request } = fixtureQueue();
+    const processor = new LocalExportSourceProcessor(
+      queue,
+      fixtureSourceProvider(),
+      fixtureInspector(),
+      fixtureRenderer(),
+      root,
+      {
+        extract: async () => {
+          throw Object.assign(new Error("thumbnail unavailable"), {
+            code: "thumbnail_extraction_failed",
+          });
+        },
+      },
+      fixtureThumbnailInspector(),
+    );
+
+    await expect(
+      processor.process({
+        requestId: request.id,
+        authorizationConfirmed: true,
+      }),
+    ).rejects.toMatchObject({ code: "thumbnail_extraction_failed" });
+    expect(queue.get(request.id)).toMatchObject({ state: "needs_user_action" });
+    expect(queue.get(request.id)?.finalArtifacts).toBeUndefined();
+    expect(queue.getSourceAttempt(request.jobId, 1)).toMatchObject({
+      lifecycleState: "deleted",
+    });
+    expect(existsSync(join(root, "exports"))).toBe(false);
+    expect(await readdir(join(root, "jobs", "export-source-scratch"))).toEqual(
+      [],
+    );
+    database.close();
+  });
+
   it("renders the resolved range, records safe output provenance, then cleans scratch", async () => {
     const { root, database, queue, request } = fixtureQueue();
     const processor = new LocalExportSourceProcessor(
@@ -392,6 +454,8 @@ describe("LocalExportSourceProcessor", () => {
       fixtureInspector(),
       fixtureRenderer(),
       root,
+      fixtureThumbnailExtractor(),
+      fixtureThumbnailInspector(),
     );
 
     await processor.process({
@@ -446,10 +510,12 @@ describe("LocalExportSourceProcessor", () => {
       expect.objectContaining({ role: "clip_metadata_json", sourceAttempt: 1 }),
       expect.objectContaining({ role: "english_srt", sourceAttempt: 1 }),
       expect.objectContaining({ role: "manifest_json", sourceAttempt: 1 }),
+      expect.objectContaining({ role: "thumbnail_jpg", sourceAttempt: 1 }),
       expect.objectContaining({ role: "video_mp4", sourceAttempt: 1 }),
     ]);
     expect(await readdir(join(root, "exports", `clip-${request.id}`))).toEqual([
       `clip-${request.id}.en.srt`,
+      `clip-${request.id}.jpg`,
       `clip-${request.id}.json`,
       `clip-${request.id}.mp4`,
       "manifest.json",
@@ -484,6 +550,8 @@ describe("LocalExportSourceProcessor", () => {
         fixtureInspector(),
         fixtureRenderer(),
         root,
+        fixtureThumbnailExtractor(),
+        fixtureThumbnailInspector(),
       );
 
       await processor.process({
@@ -525,6 +593,7 @@ describe("LocalExportSourceProcessor", () => {
         await readdir(join(root, "exports", `clip-${request.id}`)),
       ).toEqual([
         `clip-${request.id}.en.srt`,
+        `clip-${request.id}.jpg`,
         `clip-${request.id}.json`,
         `clip-${request.id}.mp4`,
         `clip-${request.id}.original.srt`,
@@ -555,6 +624,8 @@ describe("LocalExportSourceProcessor", () => {
       fixtureInspector(),
       fixtureRenderer(),
       missing.root,
+      fixtureThumbnailExtractor(),
+      fixtureThumbnailInspector(),
     );
     await expect(
       missingProcessor.process({
@@ -596,6 +667,8 @@ describe("LocalExportSourceProcessor", () => {
       fixtureInspector(),
       fixtureRenderer(),
       wrongVersion.root,
+      fixtureThumbnailExtractor(),
+      fixtureThumbnailInspector(),
     );
     await expect(
       wrongVersionProcessor.process({
@@ -622,6 +695,8 @@ describe("LocalExportSourceProcessor", () => {
       fixtureInspector(),
       fixtureRenderer(),
       nonEnglish.root,
+      fixtureThumbnailExtractor(),
+      fixtureThumbnailInspector(),
     );
     await expect(
       nonEnglishProcessor.process({
@@ -647,6 +722,8 @@ describe("LocalExportSourceProcessor", () => {
       fixtureInspector(fixtureInspection(5_000), fixtureInspection(500)),
       fixtureRenderer(),
       noCue.root,
+      fixtureThumbnailExtractor(),
+      fixtureThumbnailInspector(),
     );
     await expect(
       noCueProcessor.process({
@@ -672,6 +749,8 @@ describe("LocalExportSourceProcessor", () => {
       fixtureInspector(),
       fixtureRenderer(),
       root,
+      fixtureThumbnailExtractor(),
+      fixtureThumbnailInspector(),
     );
 
     await expect(
@@ -704,6 +783,8 @@ describe("LocalExportSourceProcessor", () => {
       fixtureInspector(),
       fixtureRenderer(),
       root,
+      fixtureThumbnailExtractor(),
+      fixtureThumbnailInspector(),
     );
     await expect(
       processor.process({
@@ -726,6 +807,8 @@ describe("LocalExportSourceProcessor", () => {
       fixtureInspector(),
       fixtureRenderer(),
       second.root,
+      fixtureThumbnailExtractor(),
+      fixtureThumbnailInspector(),
     );
     await expect(
       foreignProcessor.process({
@@ -747,6 +830,8 @@ describe("LocalExportSourceProcessor", () => {
       fixtureInspector(),
       fixtureRenderer(),
       mismatched.root,
+      fixtureThumbnailExtractor(),
+      fixtureThumbnailInspector(),
     );
     await expect(
       mismatchedProcessor.process({
@@ -787,6 +872,8 @@ describe("LocalExportSourceProcessor", () => {
       fixtureInspector(fixtureInspection(2_000), fixtureInspection(2_000)),
       fixtureRenderer(),
       root,
+      fixtureThumbnailExtractor(),
+      fixtureThumbnailInspector(),
     );
 
     await expect(
@@ -836,6 +923,8 @@ describe("LocalExportSourceProcessor", () => {
       },
       fixtureRenderer(),
       root,
+      fixtureThumbnailExtractor(),
+      fixtureThumbnailInspector(),
     );
     await expect(
       malformed.process({
@@ -864,6 +953,8 @@ describe("LocalExportSourceProcessor", () => {
       },
       fixtureRenderer(),
       root,
+      fixtureThumbnailExtractor(),
+      fixtureThumbnailInspector(),
     );
     await expect(
       canceled.process({
@@ -890,6 +981,8 @@ describe("LocalExportSourceProcessor", () => {
       }),
       fixtureRenderer(),
       root,
+      fixtureThumbnailExtractor(),
+      fixtureThumbnailInspector(),
     );
 
     await expect(
@@ -922,6 +1015,8 @@ describe("LocalExportSourceProcessor", () => {
       fixtureInspector(fixtureInspection(5_000), fixtureInspection(500)),
       fixtureRenderer(),
       noCue.root,
+      fixtureThumbnailExtractor(),
+      fixtureThumbnailInspector(),
     );
     configureBilingualFixture({
       database: noCue.database,
@@ -948,6 +1043,8 @@ describe("LocalExportSourceProcessor", () => {
       fixtureInspector(fixtureInspection(), fixtureInspection(1_800)),
       fixtureRenderer(),
       outOfRange.root,
+      fixtureThumbnailExtractor(),
+      fixtureThumbnailInspector(),
     );
     configureBilingualFixture({
       database: outOfRange.database,
@@ -990,6 +1087,8 @@ describe("LocalExportSourceProcessor", () => {
       fixtureInspector(),
       fixtureRenderer(),
       root,
+      fixtureThumbnailExtractor(),
+      fixtureThumbnailInspector(),
     );
     await expect(
       processor.process({
@@ -1021,6 +1120,8 @@ describe("LocalExportSourceProcessor", () => {
         );
       }),
       malformed.root,
+      fixtureThumbnailExtractor(),
+      fixtureThumbnailInspector(),
     );
     await expect(
       malformedProcessor.process({
@@ -1044,7 +1145,7 @@ describe("LocalExportSourceProcessor", () => {
     const signal = {
       get aborted() {
         checks += 1;
-        return checks >= 5;
+        return checks >= 7;
       },
     } as AbortSignal;
     const canceledProcessor = new LocalExportSourceProcessor(
@@ -1053,6 +1154,8 @@ describe("LocalExportSourceProcessor", () => {
       fixtureInspector(),
       fixtureRenderer(),
       canceled.root,
+      fixtureThumbnailExtractor(),
+      fixtureThumbnailInspector(),
     );
     await expect(
       canceledProcessor.process({
@@ -1100,6 +1203,8 @@ describe("LocalExportSourceProcessor", () => {
         fixtureInspector(),
         fixtureRenderer(),
         root,
+        fixtureThumbnailExtractor(),
+        fixtureThumbnailInspector(),
       );
       await expect(
         processor.process({
@@ -1132,6 +1237,8 @@ describe("LocalExportSourceProcessor", () => {
       fixtureInspector(),
       fixtureRenderer(),
       root,
+      fixtureThumbnailExtractor(),
+      fixtureThumbnailInspector(),
     );
 
     await processor.process({
@@ -1150,6 +1257,11 @@ describe("LocalExportSourceProcessor", () => {
         },
         {
           role: "manifest_json",
+          packageIdentity: `clip-${request.id}`,
+          sourceAttempt: 1,
+        },
+        {
+          role: "thumbnail_jpg",
           packageIdentity: `clip-${request.id}`,
           sourceAttempt: 1,
         },
@@ -1191,6 +1303,8 @@ describe("LocalExportSourceProcessor", () => {
         });
       }),
       root,
+      fixtureThumbnailExtractor(),
+      fixtureThumbnailInspector(),
     );
     await expect(
       failed.process({ requestId: request.id, authorizationConfirmed: true }),
@@ -1212,6 +1326,8 @@ describe("LocalExportSourceProcessor", () => {
         });
       }),
       root,
+      fixtureThumbnailExtractor(),
+      fixtureThumbnailInspector(),
     );
     await expect(
       canceled.process({
@@ -1241,6 +1357,8 @@ describe("LocalExportSourceProcessor", () => {
         await chmod(join(root, "jobs", "export-source-scratch"), 0o500);
       }),
       root,
+      fixtureThumbnailExtractor(),
+      fixtureThumbnailInspector(),
     );
     try {
       await expect(
@@ -1275,6 +1393,8 @@ describe("LocalExportSourceProcessor", () => {
       fixtureInspector(),
       fixtureRenderer(),
       root,
+      fixtureThumbnailExtractor(),
+      fixtureThumbnailInspector(),
     );
 
     await processor.process({
@@ -1311,6 +1431,7 @@ describe("LocalExportSourceProcessor", () => {
       `clip-${request.id}.original.srt`,
       `clip-${request.id}.en.srt`,
       `clip-${request.id}.json`,
+      `clip-${request.id}.jpg`,
     ]);
     expect(manifest.artifacts[0]).not.toHaveProperty("subtitle");
     expect(manifest.artifacts[1]?.subtitle).toEqual({
@@ -1330,6 +1451,16 @@ describe("LocalExportSourceProcessor", () => {
     expect(manifest.artifacts[3]).toMatchObject({
       role: "clip_metadata_json",
       filename: `clip-${request.id}.json`,
+    });
+    expect(manifest.artifacts[4]).toMatchObject({
+      role: "thumbnail_jpg",
+      filename: `clip-${request.id}.jpg`,
+      thumbnail: {
+        extractionTimeMs: 1_000,
+        width: 640,
+        height: 360,
+        jpegQuality: 3,
+      },
     });
     for (const artifact of manifest.artifacts) {
       const bytes = await readFile(
@@ -1377,6 +1508,8 @@ describe("LocalExportSourceProcessor", () => {
       fixtureInspector(),
       fixtureRenderer(),
       withSidecar.root,
+      fixtureThumbnailExtractor(),
+      fixtureThumbnailInspector(),
     );
     await sidecarProcessor.process({
       requestId: withSidecar.request.id,
@@ -1395,6 +1528,7 @@ describe("LocalExportSourceProcessor", () => {
       "video_mp4",
       "english_srt",
       "clip_metadata_json",
+      "thumbnail_jpg",
     ]);
     expect(englishManifest.artifacts[1]?.subtitle).toEqual({
       language: "en",
@@ -1415,6 +1549,8 @@ describe("LocalExportSourceProcessor", () => {
       fixtureInspector(),
       fixtureRenderer(),
       omitted.root,
+      fixtureThumbnailExtractor(),
+      fixtureThumbnailInspector(),
     );
     await omissionProcessor.process({
       requestId: omitted.request.id,
@@ -1432,6 +1568,7 @@ describe("LocalExportSourceProcessor", () => {
     expect(omittedManifest.artifacts.map((artifact) => artifact.role)).toEqual([
       "video_mp4",
       "clip_metadata_json",
+      "thumbnail_jpg",
     ]);
     omitted.database.close();
   });
@@ -1451,6 +1588,8 @@ describe("LocalExportSourceProcessor", () => {
         );
       }),
       squatted.root,
+      fixtureThumbnailExtractor(),
+      fixtureThumbnailInspector(),
     );
     await expect(
       squattedProcessor.process({
@@ -1494,6 +1633,8 @@ describe("LocalExportSourceProcessor", () => {
       fixtureInspector(),
       fixtureRenderer(),
       tampered.root,
+      fixtureThumbnailExtractor(),
+      fixtureThumbnailInspector(),
     );
     await expect(
       tamperedProcessor.process({

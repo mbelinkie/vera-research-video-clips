@@ -27,6 +27,7 @@ import {
 } from "@research-video/db-local";
 import {
   FfmpegH264AacRangeRenderer,
+  FfprobeJpegThumbnailInspector,
   FfprobeMediaInspector,
   RenderDurationToleranceMs,
 } from "@research-video/media";
@@ -139,6 +140,7 @@ describe("one-shot local export runtime", () => {
       "english_srt",
       "manifest_json",
       "original_srt",
+      "thumbnail_jpg",
       "video_mp4",
     ]);
     expect(JSON.stringify(result)).not.toMatch(/\/|youtube\.com|Authorized/u);
@@ -151,6 +153,7 @@ describe("one-shot local export runtime", () => {
     const packageEntries = await readdir(packageDirectory);
     expect(packageEntries.sort()).toEqual([
       `${packageIdentity}.en.srt`,
+      `${packageIdentity}.jpg`,
       `${packageIdentity}.json`,
       `${packageIdentity}.mp4`,
       `${packageIdentity}.original.srt`,
@@ -168,6 +171,10 @@ describe("one-shot local export runtime", () => {
     expect(Math.abs(output.durationMs - 3_000)).toBeLessThanOrEqual(
       RenderDurationToleranceMs,
     );
+    const thumbnail = await new FfprobeJpegThumbnailInspector({
+      executable: ffprobePath,
+    }).inspect(join(packageDirectory, `${packageIdentity}.jpg`));
+    expect(thumbnail).toEqual({ codecName: "mjpeg", width: 640, height: 360 });
     for (const suffix of ["original", "en"]) {
       const cues = parseSrt(
         await readFile(
@@ -222,6 +229,18 @@ describe("one-shot local export runtime", () => {
     );
     expect(manifest.toolVersions.ffprobeVersion).toMatch(/^[0-9]/u);
     expect(manifest.toolVersions.ffmpegVersion).toMatch(/^[0-9]/u);
+    const thumbnailArtifact = manifest.artifacts.find(
+      (artifact) => artifact.role === "thumbnail_jpg",
+    );
+    expect(thumbnailArtifact).toMatchObject({
+      filename: `${packageIdentity}.jpg`,
+      thumbnail: {
+        extractionTimeMs: Math.floor(manifest.renderedDurationMs / 2),
+        width: 640,
+        height: 360,
+        jpegQuality: 3,
+      },
+    });
     for (const artifact of manifest.artifacts) {
       const bytes = await readFile(join(packageDirectory, artifact.filename));
       expect(artifact.byteSize).toBe(bytes.byteLength);
@@ -233,7 +252,13 @@ describe("one-shot local export runtime", () => {
       const queue = new LocalExportQueue(persisted);
       const request = queue.get(firstAttempt.requestId);
       expect(request?.state).toBe("complete");
-      expect(request?.finalArtifacts).toHaveLength(5);
+      expect(request?.finalArtifacts).toHaveLength(6);
+      expect(request?.thumbnailProvenance).toMatchObject({
+        extractionTimeMs: Math.floor(manifest.renderedDurationMs / 2),
+        width: 640,
+        height: 360,
+        sourceAttempt: 1,
+      });
       expect(request?.renderedMediaProvenance?.ffmpegVersion).toBe(
         manifest.toolVersions.ffmpegVersion,
       );
@@ -245,9 +270,11 @@ describe("one-shot local export runtime", () => {
               ? `${packageIdentity}.en.srt`
               : artifact.role === "clip_metadata_json"
                 ? `${packageIdentity}.json`
-                : artifact.role === "manifest_json"
-                  ? "manifest.json"
-                  : `${packageIdentity}.original.srt`;
+                : artifact.role === "thumbnail_jpg"
+                  ? `${packageIdentity}.jpg`
+                  : artifact.role === "manifest_json"
+                    ? "manifest.json"
+                    : `${packageIdentity}.original.srt`;
         const bytes = await readFile(join(packageDirectory, filename));
         expect(artifact.byteSize).toBe(bytes.byteLength);
         expect(artifact.contentSha256).toBe(sha256(bytes));

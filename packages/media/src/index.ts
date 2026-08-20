@@ -422,6 +422,34 @@ export interface FfmpegRangeRenderer {
   readVersion?(signal?: AbortSignal): Promise<string | undefined>;
 }
 
+export const ClipThumbnailMaxWidth = 1_280;
+export const ClipThumbnailMaxHeight = 720;
+export const ClipThumbnailJpegQuality = 3;
+
+export type FfmpegJpegThumbnailExtractionInput = {
+  renderedMp4Path: string;
+  stagingDirectory: string;
+  outputPath: string;
+  extractionTimeMs: number;
+  signal?: AbortSignal;
+};
+
+/** A narrow, independently replaceable boundary for one clip-derived JPEG. */
+export interface FfmpegJpegThumbnailExtractionAdapter {
+  extract(input: FfmpegJpegThumbnailExtractionInput): Promise<void>;
+}
+
+export type JpegThumbnailInspection = {
+  codecName: string;
+  width: number;
+  height: number;
+};
+
+/** Kept separate from source inspection because a thumbnail has no audio/duration contract. */
+export interface JpegThumbnailInspector {
+  inspect(path: string, signal?: AbortSignal): Promise<JpegThumbnailInspection>;
+}
+
 export class FfmpegRenderError extends Error {
   readonly code: string;
   readonly retryable: boolean;
@@ -437,11 +465,90 @@ export class FfmpegRenderError extends Error {
   }
 }
 
+export class FfmpegThumbnailError extends Error {
+  readonly code: string;
+  readonly retryable: boolean;
+
+  constructor(
+    message: string,
+    options: { code?: string; retryable?: boolean } = {},
+  ) {
+    super(message);
+    this.name = "FfmpegThumbnailError";
+    this.code = options.code ?? "thumbnail_extraction_failed";
+    this.retryable = options.retryable ?? true;
+  }
+}
+
 export type FfmpegH264AacRangeRendererOptions = {
   executable?: string;
   runner?: MediaCommandRunner;
   timeoutMs?: number;
 };
+
+export type FfmpegJpegThumbnailExtractorOptions = {
+  executable?: string;
+  runner?: MediaCommandRunner;
+  timeoutMs?: number;
+};
+
+export class FfmpegJpegThumbnailExtractor implements FfmpegJpegThumbnailExtractionAdapter {
+  readonly #executable: string;
+  readonly #runner: MediaCommandRunner;
+  readonly #timeoutMs: number;
+
+  constructor(options: FfmpegJpegThumbnailExtractorOptions = {}) {
+    this.#executable = options.executable ?? "ffmpeg";
+    validateExecutable(this.#executable);
+    this.#runner = options.runner ?? new SpawnMediaCommandRunner();
+    this.#timeoutMs = options.timeoutMs ?? 30_000;
+  }
+
+  async extract(input: FfmpegJpegThumbnailExtractionInput): Promise<void> {
+    await validateThumbnailInput(input);
+    if (input.signal?.aborted) throw thumbnailCanceled();
+    try {
+      await this.#runner.run(
+        this.#executable,
+        [
+          "-hide_banner",
+          "-nostdin",
+          "-i",
+          resolve(input.renderedMp4Path),
+          "-ss",
+          formatFfmpegTime(input.extractionTimeMs),
+          "-map",
+          "0:v:0",
+          "-frames:v",
+          "1",
+          "-vf",
+          `scale=w='min(${ClipThumbnailMaxWidth},iw)':h='min(${ClipThumbnailMaxHeight},ih)':force_original_aspect_ratio=decrease:force_divisible_by=2`,
+          "-c:v",
+          "mjpeg",
+          "-q:v",
+          String(ClipThumbnailJpegQuality),
+          "-pix_fmt",
+          "yuvj420p",
+          "-f",
+          "image2",
+          "-n",
+          resolve(input.outputPath),
+        ],
+        {
+          timeoutMs: this.#timeoutMs,
+          ...(input.signal ? { signal: input.signal } : {}),
+        },
+      );
+    } catch {
+      if (input.signal?.aborted) throw thumbnailCanceled();
+      throw new FfmpegThumbnailError(
+        "FFmpeg could not extract the clip thumbnail. Retry this export after checking the local media tools.",
+        { code: "thumbnail_extraction_failed" },
+      );
+    }
+    if (input.signal?.aborted) throw thumbnailCanceled();
+  }
+}
 
 /**
  * The first render adapter deliberately supports only the immutable
@@ -721,6 +828,103 @@ export class FfprobeMediaInspector implements ExportSourceInspector {
   }
 }
 
+export type FfprobeJpegThumbnailInspectorOptions = {
+  executable?: string;
+  runner?: MediaCommandRunner;
+  timeoutMs?: number;
+};
+
+/** A bounded FFprobe adapter for the one JPEG emitted by the thumbnail boundary. */
+export class FfprobeJpegThumbnailInspector implements JpegThumbnailInspector {
+  readonly #executable: string;
+  readonly #runner: MediaCommandRunner;
+  readonly #timeoutMs: number;
+
+  constructor(options: FfprobeJpegThumbnailInspectorOptions = {}) {
+    this.#executable = options.executable ?? "ffprobe";
+    validateExecutable(this.#executable);
+    this.#runner = options.runner ?? new SpawnMediaCommandRunner();
+    this.#timeoutMs = options.timeoutMs ?? 30_000;
+  }
+
+  async inspect(
+    path: string,
+    signal?: AbortSignal,
+  ): Promise<JpegThumbnailInspection> {
+    await validateRegularNonemptySource(path);
+    if (signal?.aborted) throw thumbnailInspectionCanceled();
+    let result: MediaCommandResult;
+    try {
+      result = await this.#runner.run(
+        this.#executable,
+        [
+          "-v",
+          "error",
+          "-select_streams",
+          "v:0",
+          "-show_entries",
+          "stream=codec_name,width,height",
+          "-of",
+          "json",
+          "--",
+          resolve(path),
+        ],
+        {
+          timeoutMs: this.#timeoutMs,
+          ...(signal ? { signal } : {}),
+        },
+      );
+    } catch {
+      if (signal?.aborted) throw thumbnailInspectionCanceled();
+      throw new FfmpegThumbnailError(
+        "FFprobe could not inspect the generated thumbnail. Retry this export after checking the local media tools.",
+        { code: "thumbnail_inspection_failed" },
+      );
+    }
+    if (signal?.aborted) throw thumbnailInspectionCanceled();
+    return parseFfprobeJpegThumbnailOutput(result.stdout);
+  }
+}
+
+export async function inspectAndValidateJpegThumbnail(input: {
+  outputPath: string;
+  stagingDirectory: string;
+  inspector: JpegThumbnailInspector;
+  signal?: AbortSignal;
+}): Promise<JpegThumbnailInspection> {
+  validateScratchDirectory(input.stagingDirectory);
+  if (!isInsideScratchDirectory(input.stagingDirectory, input.outputPath)) {
+    throw new FfmpegThumbnailError(
+      "Thumbnail output is outside its private staging directory.",
+      { code: "thumbnail_output_outside_staging", retryable: false },
+    );
+  }
+  await validateThumbnailOutput(input.outputPath);
+  if (input.signal?.aborted) throw thumbnailInspectionCanceled();
+  const inspection = await input.inspector.inspect(
+    input.outputPath,
+    input.signal,
+  );
+  if (input.signal?.aborted) throw thumbnailInspectionCanceled();
+  if (
+    inspection.codecName !== "mjpeg" ||
+    !Number.isSafeInteger(inspection.width) ||
+    !Number.isSafeInteger(inspection.height) ||
+    inspection.width <= 0 ||
+    inspection.height <= 0 ||
+    inspection.width > ClipThumbnailMaxWidth ||
+    inspection.height > ClipThumbnailMaxHeight ||
+    inspection.width % 2 !== 0 ||
+    inspection.height % 2 !== 0
+  ) {
+    throw new FfmpegThumbnailError(
+      "Generated thumbnail does not satisfy the verified JPEG dimensions policy. Retry this export.",
+      { code: "thumbnail_output_policy_mismatch", retryable: false },
+    );
+  }
+  return inspection;
+}
+
 /**
  * Checks M5-01's handoff asset before any inspector sees it. This keeps
  * deterministic fakes honest and ensures a provider cannot redirect FFprobe
@@ -906,6 +1110,53 @@ async function validateRenderInput(
   }
 }
 
+async function validateThumbnailInput(
+  input: FfmpegJpegThumbnailExtractionInput,
+): Promise<void> {
+  validateScratchDirectory(input.stagingDirectory);
+  if (
+    !Number.isSafeInteger(input.extractionTimeMs) ||
+    input.extractionTimeMs < 0
+  ) {
+    throw new FfmpegThumbnailError("Thumbnail extraction time is invalid.", {
+      code: "thumbnail_time_invalid",
+      retryable: false,
+    });
+  }
+  if (
+    !isInsideScratchDirectory(input.stagingDirectory, input.renderedMp4Path) ||
+    !isInsideScratchDirectory(input.stagingDirectory, input.outputPath)
+  ) {
+    throw new FfmpegThumbnailError(
+      "Thumbnail input or output is outside its private staging directory.",
+      { code: "thumbnail_path_outside_staging", retryable: false },
+    );
+  }
+  if (resolve(input.renderedMp4Path) === resolve(input.outputPath)) {
+    throw new FfmpegThumbnailError(
+      "Thumbnail output path must differ from the rendered MP4.",
+      { code: "thumbnail_output_path_invalid", retryable: false },
+    );
+  }
+  if (!resolve(input.outputPath).endsWith(".jpg")) {
+    throw new FfmpegThumbnailError(
+      "Thumbnail output must use a JPEG filename.",
+      { code: "thumbnail_output_path_invalid", retryable: false },
+    );
+  }
+  await validateRegularNonemptySource(input.renderedMp4Path);
+  const exists = await access(input.outputPath).then(
+    () => true,
+    () => false,
+  );
+  if (exists) {
+    throw new FfmpegThumbnailError(
+      "A thumbnail output already exists for this attempt. Retry the export.",
+      { code: "thumbnail_output_already_exists", retryable: true },
+    );
+  }
+}
+
 async function validateRenderedOutput(path: string): Promise<void> {
   let info;
   try {
@@ -920,6 +1171,24 @@ async function validateRenderedOutput(path: string): Promise<void> {
     throw new FfmpegRenderError(
       "Rendered output must be a regular nonempty file.",
       { code: "render_output_invalid", retryable: false },
+    );
+  }
+}
+
+async function validateThumbnailOutput(path: string): Promise<void> {
+  let info;
+  try {
+    info = await lstat(path);
+  } catch {
+    throw new FfmpegThumbnailError(
+      "FFmpeg completed without producing a thumbnail file.",
+      { code: "thumbnail_output_missing" },
+    );
+  }
+  if (!info.isFile() || info.size <= 0) {
+    throw new FfmpegThumbnailError(
+      "Thumbnail output must be a regular nonempty file.",
+      { code: "thumbnail_output_invalid", retryable: false },
     );
   }
 }
@@ -979,6 +1248,50 @@ function parseFfprobeOutput(output: string): ExportSourceInspection {
   };
 }
 
+function parseFfprobeJpegThumbnailOutput(
+  output: string,
+): JpegThumbnailInspection {
+  if (Buffer.byteLength(output, "utf8") > 64 * 1024) {
+    throw new FfmpegThumbnailError(
+      "FFprobe returned too much inspection data for the thumbnail.",
+      { code: "thumbnail_inspection_output_too_large", retryable: true },
+    );
+  }
+  let value: unknown;
+  try {
+    value = JSON.parse(output) as unknown;
+  } catch {
+    throw malformedThumbnailInspection();
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw malformedThumbnailInspection();
+  }
+  const streams = (value as { streams?: unknown }).streams;
+  if (!Array.isArray(streams) || streams.length !== 1) {
+    throw malformedThumbnailInspection();
+  }
+  const stream = streams[0];
+  if (!stream || typeof stream !== "object" || Array.isArray(stream)) {
+    throw malformedThumbnailInspection();
+  }
+  const row = stream as {
+    codec_name?: unknown;
+    width?: unknown;
+    height?: unknown;
+  };
+  const codecName = boundedProbeValue(row.codec_name, 120);
+  const width = Number(row.width);
+  const height = Number(row.height);
+  if (
+    !codecName ||
+    !Number.isSafeInteger(width) ||
+    !Number.isSafeInteger(height)
+  ) {
+    throw malformedThumbnailInspection();
+  }
+  return { codecName, width, height };
+}
+
 function parseFfprobeVersion(output: string): string | undefined {
   const line = output.split(/\r?\n/u)[0]?.trim();
   if (!line) return undefined;
@@ -1020,6 +1333,13 @@ function malformedFfprobeOutput() {
   );
 }
 
+function malformedThumbnailInspection() {
+  return new FfmpegThumbnailError(
+    "FFprobe returned malformed thumbnail inspection data. Retry this export after checking the local media tools.",
+    { code: "thumbnail_inspection_output_malformed", retryable: true },
+  );
+}
+
 function inspectionCanceled() {
   return new ExportSourceInspectionError("Media inspection was canceled.", {
     code: "source_inspection_canceled",
@@ -1030,6 +1350,20 @@ function inspectionCanceled() {
 function renderCanceled() {
   return new FfmpegRenderError("Media rendering was canceled.", {
     code: "ffmpeg_render_canceled",
+    retryable: true,
+  });
+}
+
+function thumbnailCanceled() {
+  return new FfmpegThumbnailError("Thumbnail extraction was canceled.", {
+    code: "thumbnail_extraction_canceled",
+    retryable: true,
+  });
+}
+
+function thumbnailInspectionCanceled() {
+  return new FfmpegThumbnailError("Thumbnail inspection was canceled.", {
+    code: "thumbnail_inspection_canceled",
     retryable: true,
   });
 }

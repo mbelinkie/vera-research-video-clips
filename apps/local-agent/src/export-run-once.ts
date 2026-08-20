@@ -9,10 +9,14 @@ import {
 import {
   createExportSourceAcquisitionProvider,
   FfmpegH264AacRangeRenderer,
+  FfmpegJpegThumbnailExtractor,
+  FfprobeJpegThumbnailInspector,
   FfprobeMediaInspector,
   type ExportSourceAcquisitionProvider,
   type ExportSourceInspector,
   type FfmpegRangeRenderer,
+  type FfmpegJpegThumbnailExtractionAdapter,
+  type JpegThumbnailInspector,
 } from "@research-video/media";
 
 import { LocalExportSourceProcessor } from "./export-source.ts";
@@ -35,6 +39,8 @@ export type LocalExportRuntimeDependencies = {
   sourceProvider?: ExportSourceAcquisitionProvider;
   inspector?: ExportSourceInspector;
   renderer?: FfmpegRangeRenderer;
+  thumbnailExtractor?: FfmpegJpegThumbnailExtractionAdapter;
+  thumbnailInspector?: JpegThumbnailInspector;
   dataRoot: string;
 };
 
@@ -62,6 +68,8 @@ export async function runLocalExportOnce(
     dependencies.inspector ?? new FfprobeMediaInspector(),
     dependencies.renderer ?? new FfmpegH264AacRangeRenderer(),
     dependencies.dataRoot,
+    dependencies.thumbnailExtractor ?? new FfmpegJpegThumbnailExtractor(),
+    dependencies.thumbnailInspector ?? new FfprobeJpegThumbnailInspector(),
   );
   try {
     await processor.process(input);
@@ -91,6 +99,8 @@ export async function runConfiguredLocalExportOnce(
     sourceProvider?: ExportSourceAcquisitionProvider;
     inspector?: ExportSourceInspector;
     renderer?: FfmpegRangeRenderer;
+    thumbnailExtractor?: FfmpegJpegThumbnailExtractionAdapter;
+    thumbnailInspector?: JpegThumbnailInspector;
   } = {},
 ): Promise<LocalExportOnceResult> {
   const config = options.config ?? loadConfig();
@@ -108,6 +118,12 @@ export async function runConfiguredLocalExportOnce(
       ...(sourceProvider ? { sourceProvider } : {}),
       ...(options.inspector ? { inspector: options.inspector } : {}),
       ...(options.renderer ? { renderer: options.renderer } : {}),
+      ...(options.thumbnailExtractor
+        ? { thumbnailExtractor: options.thumbnailExtractor }
+        : {}),
+      ...(options.thumbnailInspector
+        ? { thumbnailInspector: options.thumbnailInspector }
+        : {}),
       dataRoot: config.dataDir,
     });
   } finally {

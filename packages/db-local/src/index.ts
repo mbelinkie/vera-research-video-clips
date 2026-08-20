@@ -440,6 +440,59 @@ export class LocalExportQueue {
     if (result.changes !== 1) throw new LocalExportLifecycleError();
   }
 
+  recordThumbnailValidation(
+    jobId: string,
+    attempt: number,
+    thumbnail: { extractionTimeMs: number; width: number; height: number },
+  ): void {
+    if (
+      !Number.isSafeInteger(thumbnail.extractionTimeMs) ||
+      thumbnail.extractionTimeMs < 0 ||
+      !Number.isSafeInteger(thumbnail.width) ||
+      !Number.isSafeInteger(thumbnail.height) ||
+      thumbnail.width <= 0 ||
+      thumbnail.height <= 0 ||
+      thumbnail.width > 1_280 ||
+      thumbnail.height > 720 ||
+      thumbnail.width % 2 !== 0 ||
+      thumbnail.height % 2 !== 0
+    ) {
+      throw new LocalExportLifecycleError(
+        "Thumbnail provenance is invalid.",
+        "thumbnail_provenance_invalid",
+      );
+    }
+    const now = this.now().toISOString();
+    const result = this.database
+      .prepare(
+        `UPDATE export_requests
+         SET thumbnail_extraction_time_ms = ?, thumbnail_width = ?,
+             thumbnail_height = ?, thumbnail_source_attempt = ?,
+             thumbnail_validated_at = ?, updated_at = ?
+         WHERE job_id = ? AND resolved_source_attempt = ?
+           AND rendered_source_attempt = ?
+           AND rendered_duration_ms > ?`,
+      )
+      .run(
+        thumbnail.extractionTimeMs,
+        thumbnail.width,
+        thumbnail.height,
+        attempt,
+        now,
+        now,
+        jobId,
+        attempt,
+        attempt,
+        thumbnail.extractionTimeMs,
+      );
+    if (result.changes !== 1) {
+      throw new LocalExportLifecycleError(
+        "Thumbnail provenance does not match the rendered export.",
+        "thumbnail_provenance_invalid",
+      );
+    }
+  }
+
   recordConfirmedEnglishSubtitleOmission(jobId: string, attempt: number): void {
     const now = this.now().toISOString();
     const result = this.database
@@ -609,11 +662,12 @@ export class LocalExportQueue {
   ): void {
     const roles = new Set(artifacts.map((artifact) => artifact.role));
     if (
-      artifacts.length < 2 ||
-      artifacts.length > 5 ||
+      artifacts.length < 4 ||
+      artifacts.length > 6 ||
       roles.size !== artifacts.length ||
       !roles.has("video_mp4") ||
       !roles.has("clip_metadata_json") ||
+      !roles.has("thumbnail_jpg") ||
       !roles.has("manifest_json") ||
       artifacts.some((artifact) => !validFinalArtifact(artifact))
     ) {
@@ -639,9 +693,10 @@ export class LocalExportQueue {
         .prepare(
           `SELECT id FROM export_requests
            WHERE job_id = ? AND resolved_source_attempt = ?
-             AND rendered_source_attempt = ?`,
+             AND rendered_source_attempt = ?
+             AND thumbnail_source_attempt = ?`,
         )
-        .get(jobId, attempt, attempt) as { id: string } | undefined;
+        .get(jobId, attempt, attempt, attempt) as { id: string } | undefined;
       if (!request) throw new LocalExportLifecycleError();
       const insert = this.database.prepare(
         `INSERT INTO export_final_artifacts
@@ -836,6 +891,7 @@ type LocalFinalArtifactProvenance = {
     | "english_srt"
     | "original_srt"
     | "clip_metadata_json"
+    | "thumbnail_jpg"
     | "manifest_json";
   packageIdentity: string;
   byteSize: number;
@@ -963,6 +1019,22 @@ function mapLocalExportRequest(
               : { ffmpegVersion: String(row.rendered_ffmpeg_version) }),
             sourceAttempt: Number(row.rendered_source_attempt),
             validatedAt: String(row.rendered_validated_at),
+          },
+        }),
+    ...(row.thumbnail_extraction_time_ms === null ||
+    row.thumbnail_extraction_time_ms === undefined ||
+    row.thumbnail_width === null ||
+    row.thumbnail_height === null ||
+    row.thumbnail_source_attempt === null ||
+    row.thumbnail_validated_at === null
+      ? {}
+      : {
+          thumbnailProvenance: {
+            extractionTimeMs: Number(row.thumbnail_extraction_time_ms),
+            width: Number(row.thumbnail_width),
+            height: Number(row.thumbnail_height),
+            sourceAttempt: Number(row.thumbnail_source_attempt),
+            validatedAt: String(row.thumbnail_validated_at),
           },
         }),
     ...(row.subtitle_omission_policy === null ||

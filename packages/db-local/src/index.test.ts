@@ -97,6 +97,7 @@ describe("local migrations", () => {
       "0012_export_clip_package_manifest",
       "0013_preferred_translation_cache",
       "0014_export_clip_metadata_sidecar",
+      "0015_export_clip_thumbnail_artifact",
     ]);
     expect(runLocalMigrations(database)).toEqual([]);
     expect(
@@ -281,7 +282,7 @@ describe("local migrations", () => {
     database.close();
   });
 
-  it("widens the final-artifact role vocabulary in 0014 without rewriting existing rows", () => {
+  it("widens the final-artifact role vocabulary in 0015 without rewriting existing rows", () => {
     const directory = mkdtempSync(
       join(tmpdir(), "research-video-sqlite-0014-"),
     );
@@ -289,7 +290,7 @@ describe("local migrations", () => {
     const previousMigrations = join(directory, "migrations");
     mkdirSync(previousMigrations);
     for (const filename of readdirSync(localMigrationDirectory)) {
-      if (filename < "0014") {
+      if (filename < "0015") {
         copyFileSync(
           resolve(localMigrationDirectory, filename),
           join(previousMigrations, filename),
@@ -348,25 +349,30 @@ describe("local migrations", () => {
         );
     insertArtifact("video_mp4");
     insertArtifact("manifest_json");
-    expect(() => insertArtifact("clip_metadata_json")).toThrow();
+    insertArtifact("clip_metadata_json");
+    expect(() => insertArtifact("thumbnail_jpg")).toThrow();
 
-    database.exec("CREATE TABLE export_final_artifacts_0014 (blocker TEXT);");
+    database.exec("CREATE TABLE export_final_artifacts_0015 (blocker TEXT);");
     expect(() =>
       runLocalMigrations(database, localMigrationDirectory),
     ).toThrow();
     const legacyManifestArtifact = { ...legacyArtifact, role: "manifest_json" };
+    const legacyMetadataArtifact = {
+      ...legacyArtifact,
+      role: "clip_metadata_json",
+    };
     expect(
       database.prepare("SELECT * FROM export_final_artifacts").all(),
-    ).toEqual([legacyArtifact, legacyManifestArtifact]);
-    expect(() => insertArtifact("clip_metadata_json")).toThrow();
-    database.exec("DROP TABLE export_final_artifacts_0014;");
+    ).toEqual([legacyArtifact, legacyManifestArtifact, legacyMetadataArtifact]);
+    expect(() => insertArtifact("thumbnail_jpg")).toThrow();
+    database.exec("DROP TABLE export_final_artifacts_0015;");
 
     expect(runLocalMigrations(database, localMigrationDirectory)).toEqual([
-      "0014_export_clip_metadata_sidecar",
+      "0015_export_clip_thumbnail_artifact",
     ]);
     expect(
       database.prepare("SELECT * FROM export_final_artifacts").all(),
-    ).toEqual([legacyArtifact, legacyManifestArtifact]);
+    ).toEqual([legacyArtifact, legacyManifestArtifact, legacyMetadataArtifact]);
     expect(
       database
         .prepare(
@@ -375,19 +381,18 @@ describe("local migrations", () => {
         )
         .get(),
     ).toBeDefined();
-    insertArtifact("clip_metadata_json");
-    expect(() => insertArtifact("thumbnail_jpg")).toThrow();
+    insertArtifact("thumbnail_jpg");
     expect(
       database
         .prepare(
           "SELECT count(*) AS count FROM export_final_artifacts WHERE export_request_id = ?",
         )
         .get(legacyRequestId),
-    ).toEqual({ count: 3 });
+    ).toEqual({ count: 4 });
     database.close();
   });
 
-  it("requires metadata and manifest artifacts in every promoted package", () => {
+  it("requires metadata, thumbnail, and manifest artifacts in every promoted package", () => {
     const directory = mkdtempSync(
       join(tmpdir(), "research-video-sqlite-manifest-"),
     );
@@ -415,8 +420,14 @@ describe("local migrations", () => {
     queue.recordRenderedOutputValidation(request.jobId, 1, {
       durationMs: 3_200,
     });
+    queue.recordThumbnailValidation(request.jobId, 1, {
+      extractionTimeMs: 1_600,
+      width: 640,
+      height: 360,
+    });
     const artifact = (
-      role: "video_mp4" | "clip_metadata_json" | "manifest_json",
+      role:
+        "video_mp4" | "clip_metadata_json" | "thumbnail_jpg" | "manifest_json",
       byteSize: number,
     ) => ({
       role,
@@ -435,11 +446,13 @@ describe("local migrations", () => {
     queue.recordFinalArtifactPromotion(request.jobId, 1, [
       artifact("video_mp4", 2_048),
       artifact("clip_metadata_json", 384),
+      artifact("thumbnail_jpg", 256),
       artifact("manifest_json", 512),
     ]);
     expect(queue.get(request.id)?.finalArtifacts).toEqual([
       expect.objectContaining({ role: "clip_metadata_json", byteSize: 384 }),
       expect.objectContaining({ role: "manifest_json", byteSize: 512 }),
+      expect.objectContaining({ role: "thumbnail_jpg", byteSize: 256 }),
       expect.objectContaining({ role: "video_mp4", byteSize: 2_048 }),
     ]);
     database.close();

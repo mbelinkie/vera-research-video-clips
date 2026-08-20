@@ -8,13 +8,16 @@ import {
   assertEditingFriendlyH264AacMp4Settings,
   ExportSourceAcquisitionError,
   FfmpegH264AacRangeRenderer,
+  FfmpegJpegThumbnailExtractor,
   FfmpegRenderError,
+  FfprobeJpegThumbnailInspector,
   FfprobeMediaInspector,
   YtDlpAudioAcquisitionProvider,
   YtDlpFullSourceAcquisitionProvider,
   createMediaAcquisitionProvider,
   createExportSourceAcquisitionProvider,
   inspectVerifiedExportSource,
+  inspectAndValidateJpegThumbnail,
   resolveExportBounds,
   type MediaCommandRunner,
   withExportSourceScratch,
@@ -233,6 +236,135 @@ describe("FfmpegH264AacRangeRenderer", () => {
         runner: { run: async () => ({ stdout: "unexpected", stderr: "" }) },
       }).readVersion(),
     ).resolves.toBeUndefined();
+  });
+});
+
+describe("FfmpegJpegThumbnailExtractor", () => {
+  it("uses one bounded argument-array extraction from the rendered MP4", async () => {
+    const scratch = await mkdtemp(join(tmpdir(), "ffmpeg-thumbnail-"));
+    const rendered = join(scratch, "rendered-range.mp4");
+    const output = join(scratch, "thumbnail.jpg");
+    await writeFile(rendered, "fixture render");
+    const runner = vi.fn<MediaCommandRunner["run"]>(async () => ({
+      stdout: "",
+      stderr: "",
+    }));
+    try {
+      const extractor = new FfmpegJpegThumbnailExtractor({
+        executable: "/opt/tools/ffmpeg",
+        runner: { run: runner },
+      });
+      await extractor.extract({
+        renderedMp4Path: rendered,
+        stagingDirectory: scratch,
+        outputPath: output,
+        extractionTimeMs: 1_500,
+      });
+      expect(runner).toHaveBeenCalledWith(
+        "/opt/tools/ffmpeg",
+        [
+          "-hide_banner",
+          "-nostdin",
+          "-i",
+          rendered,
+          "-ss",
+          "1.500",
+          "-map",
+          "0:v:0",
+          "-frames:v",
+          "1",
+          "-vf",
+          "scale=w='min(1280,iw)':h='min(720,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2",
+          "-c:v",
+          "mjpeg",
+          "-q:v",
+          "3",
+          "-pix_fmt",
+          "yuvj420p",
+          "-f",
+          "image2",
+          "-n",
+          output,
+        ],
+        expect.objectContaining({ timeoutMs: 30_000 }),
+      );
+    } finally {
+      await rm(scratch, { recursive: true, force: true });
+    }
+  });
+
+  it("independently validates one in-policy MJPEG thumbnail", async () => {
+    const scratch = await mkdtemp(join(tmpdir(), "ffprobe-thumbnail-"));
+    const output = join(scratch, "thumbnail.jpg");
+    await writeFile(output, "fixture thumbnail");
+    try {
+      await expect(
+        inspectAndValidateJpegThumbnail({
+          outputPath: output,
+          stagingDirectory: scratch,
+          inspector: {
+            inspect: async () => ({
+              codecName: "mjpeg",
+              width: 640,
+              height: 360,
+            }),
+          },
+        }),
+      ).resolves.toEqual({ codecName: "mjpeg", width: 640, height: 360 });
+      await expect(
+        inspectAndValidateJpegThumbnail({
+          outputPath: output,
+          stagingDirectory: scratch,
+          inspector: {
+            inspect: async () => ({
+              codecName: "png",
+              width: 641,
+              height: 360,
+            }),
+          },
+        }),
+      ).rejects.toMatchObject({ code: "thumbnail_output_policy_mismatch" });
+    } finally {
+      await rm(scratch, { recursive: true, force: true });
+    }
+  });
+
+  it("bounds image probe output and accepts only one safe image stream", async () => {
+    const scratch = await mkdtemp(join(tmpdir(), "ffprobe-thumbnail-"));
+    const output = join(scratch, "thumbnail.jpg");
+    await writeFile(output, "fixture thumbnail");
+    const runner = vi.fn<MediaCommandRunner["run"]>(async () => ({
+      stdout: JSON.stringify({
+        streams: [{ codec_name: "mjpeg", width: 640, height: 360 }],
+      }),
+      stderr: "",
+    }));
+    try {
+      await expect(
+        new FfprobeJpegThumbnailInspector({
+          executable: "/opt/tools/ffprobe",
+          runner: { run: runner },
+        }).inspect(output),
+      ).resolves.toEqual({ codecName: "mjpeg", width: 640, height: 360 });
+      expect(runner).toHaveBeenCalledWith(
+        "/opt/tools/ffprobe",
+        [
+          "-v",
+          "error",
+          "-select_streams",
+          "v:0",
+          "-show_entries",
+          "stream=codec_name,width,height",
+          "-of",
+          "json",
+          "--",
+          output,
+        ],
+        expect.objectContaining({ timeoutMs: 30_000 }),
+      );
+    } finally {
+      await rm(scratch, { recursive: true, force: true });
+    }
   });
 });
 

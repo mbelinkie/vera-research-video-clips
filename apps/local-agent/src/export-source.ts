@@ -12,16 +12,20 @@ import {
 import { basename, join, resolve, sep } from "node:path";
 
 import {
+  ClipThumbnailJpegQuality,
   assertEditingFriendlyH264AacMp4Settings,
   assertEditingFriendlySourceCompatibility,
   ExportSourceAcquisitionError,
+  inspectAndValidateJpegThumbnail,
   inspectAndValidateRenderedExportOutput,
   inspectVerifiedExportSource,
   resolveExportBounds,
   withExportSourceScratch,
   type ExportSourceAcquisitionProvider,
   type ExportSourceInspector,
+  type FfmpegJpegThumbnailExtractionAdapter,
   type FfmpegRangeRenderer,
+  type JpegThumbnailInspector,
 } from "@research-video/media";
 import { type LocalExportQueue } from "@research-video/db-local";
 import {
@@ -56,6 +60,8 @@ export class LocalExportSourceProcessor {
     private readonly inspector: ExportSourceInspector,
     private readonly renderer: FfmpegRangeRenderer,
     private readonly dataRoot: string,
+    private readonly thumbnailExtractor: FfmpegJpegThumbnailExtractionAdapter,
+    private readonly thumbnailInspector: JpegThumbnailInspector,
   ) {}
 
   async process(input: {
@@ -188,6 +194,30 @@ export class LocalExportSourceProcessor {
               ...(ffmpegVersion ? { ffmpegVersion } : {}),
             },
           );
+          const thumbnailPath = join(scratchDirectory, "thumbnail.jpg");
+          const extractionTimeMs = Math.floor(outputInspection.durationMs / 2);
+          await this.thumbnailExtractor.extract({
+            renderedMp4Path: outputPath,
+            stagingDirectory: scratchDirectory,
+            outputPath: thumbnailPath,
+            extractionTimeMs,
+            ...(input.signal ? { signal: input.signal } : {}),
+          });
+          const thumbnail = await inspectAndValidateJpegThumbnail({
+            outputPath: thumbnailPath,
+            stagingDirectory: scratchDirectory,
+            inspector: this.thumbnailInspector,
+            ...(input.signal ? { signal: input.signal } : {}),
+          });
+          this.queue.recordThumbnailValidation(
+            started.request.jobId,
+            started.attempt,
+            {
+              extractionTimeMs,
+              width: thumbnail.width,
+              height: thumbnail.height,
+            },
+          );
           if (subtitlePlan.policy === "confirmed_english_omission") {
             await assertNoStagedSrtFiles(scratchDirectory);
             this.queue.recordConfirmedEnglishSubtitleOmission(
@@ -300,6 +330,7 @@ type FinalArtifact = {
     | "english_srt"
     | "original_srt"
     | "clip_metadata_json"
+    | "thumbnail_jpg"
     | "manifest_json";
   packageIdentity: string;
   byteSize: number;
@@ -535,11 +566,18 @@ type VerifiedPackageArtifact = {
     endMs: number;
     sourceAttempt: number;
   };
+  thumbnail?: {
+    extractionTimeMs: number;
+    width: number;
+    height: number;
+    sourceAttempt: number;
+  };
 };
 
 type VerifiedPackagePolicy = {
   rendered: RenderedExportMediaProvenance;
   bounds: ResolvedExportBounds;
+  thumbnail: NonNullable<ExportRequest["thumbnailProvenance"]>;
   requiredSidecars: readonly ("original" | "english")[];
   omittedReason?: "confirmed_english_user_setting";
   artifacts: readonly VerifiedPackageArtifact[];
@@ -563,6 +601,17 @@ function resolveVerifiedPackagePolicy(
       { code: "resolved_export_bounds_missing", retryable: true },
     );
   }
+  const thumbnail = request.thumbnailProvenance;
+  if (
+    !thumbnail ||
+    thumbnail.sourceAttempt !== attempt ||
+    thumbnail.extractionTimeMs !== Math.floor(rendered.durationMs / 2)
+  ) {
+    throw new ExportSourceAcquisitionError(
+      "The verified clip thumbnail is unavailable for this source attempt. Retry this export.",
+      { code: "thumbnail_provenance_missing", retryable: true },
+    );
+  }
   const video = {
     role: "video_mp4" as const,
     stagedName: "rendered-range.mp4",
@@ -577,6 +626,12 @@ function resolveVerifiedPackagePolicy(
     role: "clip_metadata_json" as const,
     stagedName: `clip-${request.id}.json`,
     finalName: `clip-${request.id}.json`,
+  };
+  const thumbnailArtifact = {
+    role: "thumbnail_jpg" as const,
+    stagedName: "thumbnail.jpg",
+    finalName: `clip-${request.id}.jpg`,
+    thumbnail,
   };
   if (request.sourceLanguageClass === "confirmed_english") {
     if (request.preset.settings.omitSubtitleFilesForConfirmedEnglish) {
@@ -593,9 +648,10 @@ function resolveVerifiedPackagePolicy(
       return {
         rendered,
         bounds,
+        thumbnail,
         requiredSidecars: [],
         omittedReason: "confirmed_english_user_setting",
-        artifacts: [video, metadata, manifest],
+        artifacts: [video, metadata, thumbnailArtifact, manifest],
       };
     }
     const english = request.englishSubtitleProvenance;
@@ -608,6 +664,7 @@ function resolveVerifiedPackagePolicy(
     return {
       rendered,
       bounds,
+      thumbnail,
       requiredSidecars: ["english"],
       artifacts: [
         video,
@@ -620,6 +677,7 @@ function resolveVerifiedPackagePolicy(
           sidecar: { ...english, language: "en" },
         },
         metadata,
+        thumbnailArtifact,
         manifest,
       ],
     };
@@ -647,6 +705,7 @@ function resolveVerifiedPackagePolicy(
   return {
     rendered,
     bounds,
+    thumbnail,
     requiredSidecars: ["original", "english"],
     artifacts: [
       video,
@@ -663,6 +722,7 @@ function resolveVerifiedPackagePolicy(
         sidecar: english,
       },
       metadata,
+      thumbnailArtifact,
       manifest,
     ],
   };
@@ -739,6 +799,16 @@ function buildVerifiedClipManifest(input: {
                   cueCount: artifact.sidecar.cueCount,
                   startMs: artifact.sidecar.startMs,
                   endMs: artifact.sidecar.endMs,
+                },
+              }
+            : {}),
+          ...(artifact.thumbnail
+            ? {
+                thumbnail: {
+                  extractionTimeMs: artifact.thumbnail.extractionTimeMs,
+                  width: artifact.thumbnail.width,
+                  height: artifact.thumbnail.height,
+                  jpegQuality: ClipThumbnailJpegQuality,
                 },
               }
             : {}),

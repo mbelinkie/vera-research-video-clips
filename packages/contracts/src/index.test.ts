@@ -286,6 +286,18 @@ describe("shared contracts", () => {
           byteSize: 512,
           contentSha256: "c".repeat(64),
         },
+        {
+          role: "thumbnail_jpg",
+          filename: `clip-${id}.jpg`,
+          byteSize: 640,
+          contentSha256: "d".repeat(64),
+          thumbnail: {
+            extractionTimeMs: 1_000,
+            width: 640,
+            height: 360,
+            jpegQuality: 3,
+          },
+        },
       ],
     };
 
@@ -306,6 +318,23 @@ describe("shared contracts", () => {
     expect(
       ExportClipManifestSchema.safeParse({ ...manifest, schemaVersion: 2 })
         .success,
+    ).toBe(false);
+    expect(
+      ExportClipManifestSchema.safeParse({
+        ...manifest,
+        artifacts: [
+          ...manifest.artifacts.slice(0, 3),
+          {
+            ...manifest.artifacts[3],
+            thumbnail: {
+              extractionTimeMs: 1_000,
+              width: 641,
+              height: 360,
+              jpegQuality: 3,
+            },
+          },
+        ],
+      }).success,
     ).toBe(false);
     expect(
       ExportClipManifestSchema.safeParse({

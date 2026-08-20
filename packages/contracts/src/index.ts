@@ -914,6 +914,33 @@ export const RenderedExportMediaProvenanceSchema =
     validatedAt: UtcTimestampSchema,
   });
 
+export const ExportThumbnailProvenanceSchema = z
+  .object({
+    extractionTimeMs: z.number().int().nonnegative(),
+    width: z.number().int().positive().max(1_280),
+    height: z.number().int().positive().max(720),
+    sourceAttempt: z.number().int().positive(),
+    validatedAt: UtcTimestampSchema,
+  })
+  .refine(
+    (thumbnail) => thumbnail.width % 2 === 0 && thumbnail.height % 2 === 0,
+    {
+      message: "Thumbnail dimensions must be even.",
+    },
+  );
+
+const ExportClipManifestThumbnailSchema = z
+  .object({
+    extractionTimeMs: z.number().int().nonnegative(),
+    width: z.number().int().positive().max(1_280),
+    height: z.number().int().positive().max(720),
+    jpegQuality: z.literal(3),
+  })
+  .refine(
+    (thumbnail) => thumbnail.width % 2 === 0 && thumbnail.height % 2 === 0,
+    { message: "Thumbnail dimensions must be even." },
+  );
+
 export const SubtitleOmissionProvenanceSchema = z.object({
   policy: z.literal("confirmed_english_user_setting"),
   sourceAttempt: z.number().int().positive(),
@@ -959,6 +986,7 @@ export const FinalArtifactRoleSchema = z.enum([
   "english_srt",
   "original_srt",
   "clip_metadata_json",
+  "thumbnail_jpg",
   "manifest_json",
 ]);
 
@@ -1035,6 +1063,7 @@ export const ExportClipManifestArtifactSchema = z.object({
     "english_srt",
     "original_srt",
     "clip_metadata_json",
+    "thumbnail_jpg",
   ]),
   filename: z.string().trim().min(1).max(255),
   byteSize: z.number().int().positive(),
@@ -1050,6 +1079,7 @@ export const ExportClipManifestArtifactSchema = z.object({
       endMs: z.number().int().positive(),
     })
     .optional(),
+  thumbnail: ExportClipManifestThumbnailSchema.optional(),
 });
 
 /**
@@ -1081,7 +1111,7 @@ export const ExportClipManifestSchema = z.object({
     ffprobeVersion: z.string().trim().min(1).max(120).optional(),
     ffmpegVersion: z.string().trim().min(1).max(120).optional(),
   }),
-  artifacts: z.array(ExportClipManifestArtifactSchema).min(1).max(4),
+  artifacts: z.array(ExportClipManifestArtifactSchema).min(1).max(5),
 });
 
 export const ExportRequestSchema = z.object({
@@ -1098,13 +1128,14 @@ export const ExportRequestSchema = z.object({
   mediaProvenance: ExportMediaProvenanceSchema.optional(),
   resolvedExportBounds: ResolvedExportBoundsSchema.optional(),
   renderedMediaProvenance: RenderedExportMediaProvenanceSchema.optional(),
+  thumbnailProvenance: ExportThumbnailProvenanceSchema.optional(),
   subtitleOmissionProvenance: SubtitleOmissionProvenanceSchema.optional(),
   englishSubtitleProvenance: EnglishSubtitleSidecarProvenanceSchema.optional(),
   subtitleSidecars: z.array(SubtitleSidecarProvenanceSchema).max(2).optional(),
   finalArtifacts: z
     .array(FinalArtifactProvenanceSchema)
     .min(1)
-    .max(5)
+    .max(6)
     .optional(),
   state: JobStateSchema,
   createdAt: UtcTimestampSchema,
@@ -1261,6 +1292,9 @@ export type CreateExportOnlyRequest = z.infer<
 export type ExportMediaProvenance = z.infer<typeof ExportMediaProvenanceSchema>;
 export type RenderedExportMediaProvenance = z.infer<
   typeof RenderedExportMediaProvenanceSchema
+>;
+export type ExportThumbnailProvenance = z.infer<
+  typeof ExportThumbnailProvenanceSchema
 >;
 export type ResolvedExportBounds = z.infer<typeof ResolvedExportBoundsSchema>;
 export type FinalArtifactRole = z.infer<typeof FinalArtifactRoleSchema>;
