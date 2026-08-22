@@ -1,6 +1,6 @@
 # M6-03 — Restart-safe Clip Library
 
-- Status: active
+- Status: implementation complete
 - Task/thread: M6-03 only
 - Dependencies: M6-01 immutable history and M6-02 local locator verification
   implemented; M5 request/retry/progress/batch primitives unchanged
@@ -67,7 +67,7 @@ label and no mutation capability.
    high-water sequence and fetch time. A cached page is a clearly labeled
    subset, never claimed to be a complete project snapshot.
 6. Scope cache and selected clip IDs to `(projectId,
-sha256(Authorization header))`. Require the exact credential again after
+   sha256(Authorization header))`. Require the exact credential again after
    restart; never store or return the raw header. Online 401/403 deletes that
    credential scope and cannot fall back to stale data.
 7. Overlay only locator summaries whose artifact-version IDs already occur in
@@ -144,3 +144,75 @@ dedicated surface, next page, selection restore, separate availability, and
 stale offline labeling. Then run formatting, typecheck, relevant integration,
 both migration CLIs, Playwright, `git diff --check`, and full `npm run check` in
 a clean worktree. Record any platform/real-source skips without weakening them.
+
+## Decisions and delivered behavior
+
+- Kept every completed M5 schema and migration unchanged. Local migration 0027
+  creates empty cache/selection tables and performs no eager backfill.
+- Preserved the legacy bare `/clips` route for M5 batch and CSV callers. The
+  dedicated `/clip-library` route performs bounded literal search, typed
+  filtering, and immutable `(created_at, id)` keyset pagination.
+- Reads clip rows, tags/language evidence, retry leaves/progress, immutable
+  history, and the sync-event high-water from one repeatable-read snapshot.
+- Stores parsed pages and selection under project plus SHA-256 of the exact
+  Authorization header. A 401 purges that credential across projects; a 403
+  purges its project scope. Raw credentials are never persisted.
+- Restores the most recently viewed exact query/cursor page using a monotonic
+  local view sequence. Offline fallback is limited to the exact cached query
+  and is always labeled `stale` and `cached_subset`.
+- Updates selection incrementally so hidden pages and filters retain their
+  choices. Selection IDs must already occur in an authorized cached page.
+- Joins path-free local locator summaries only for artifact-version IDs already
+  present in the authorized page. Cloud completion remains distinct from local
+  verified/missing/invalid availability.
+- Keeps note/tag edits online-only and generation-guards page, tag, and
+  selection responses so an older project or credential cannot repopulate the
+  current UI. Export operations remain deferred to M6-04.
+
+## Changed files
+
+- `packages/contracts/src/index.ts` and tests: bounded cloud/local page,
+  current-leaf, cache freshness, availability, and selection contracts.
+- `packages/catalog/src/index.ts` and tests: authorized repeatable-read Clip
+  Library projection, literal NFKC search, filters, pagination, leaves,
+  progress, recent history, and sync high-water.
+- `apps/cloud-api/src/app.ts` and tests: dedicated cloud Clip Library route.
+- `packages/db-local/migrations/0027_clip_library_cache.sql`, repository, and
+  tests: authorization-scoped exact-page cache, monotonic last-view recovery,
+  selection preservation, restart, revocation, and populated-M5 compatibility.
+- `apps/local-agent/src/clip-library.ts`, app/main wiring, and tests: online
+  refresh, exact stale fallback, latest-page restore, path-free overlays, and
+  fail-closed authorization behavior.
+- `apps/web/src/clip-queue.tsx` and Playwright coverage: dedicated Clip Library
+  presentation, cloud filters/pagination, history versus workstation state,
+  restart-safe selection, and stale mutation lockout.
+
+## Verification evidence
+
+- Focused contract/catalog/cloud API/local cache/local-agent suite: 107 tests
+  passed after review fixes.
+- Focused local cache, service, app, and contract suite: 68 tests passed; local
+  migration CLI validated all 27 ordered migrations.
+- Catalog concurrency/NFKC Clip Library proof passed against PGlite.
+- Production web build and TypeScript typecheck passed.
+- Playwright browser regression passed 4 of 4 tests.
+- Aggregate repository tests passed 290 tests with the two declared existing
+  skips; cloud migration CLI validated all 20 ordered migrations.
+- `git diff --check` and scoped formatting passed. Repository-wide formatting
+  remains blocked only by the preserved user-owned edits in
+  `docs/Script-to-Resolve Product Spec.md`; this slice did not reformat them.
+
+## Independent review and remaining scope
+
+The Sol review drove fixes for exact latest-page recovery, selection retention
+across unloaded pages, repeatable-read sync coherence, project/credential race
+guards, invalid status filtering, contract-drift fallback, tag cursor
+normalization, and Unicode search. Its final follow-up found no remaining P1.
+
+M6-04–M6-07 remain deliberately unopened. M6-03 does not submit, retry, cancel,
+verify, reveal, open, relink, or build authoring exports.
+
+## Commits
+
+- Implementation, migration, tests, and active specification: `65f56c1`
+- Completion documentation and status: pending
