@@ -24,10 +24,12 @@ import {
 import {
   LocalExportQueue,
   LocalArtifactLocatorRepository,
+  LocalClipLibraryCacheRepository,
   LocalExportWorkerIdentityRepository,
   LocalTranscriptIndex,
   openLocalDatabase,
   runLocalMigrations,
+  clipLibraryAuthorizationScope,
 } from "./index.ts";
 
 const localMigrationDirectory = fileURLToPath(
@@ -151,6 +153,7 @@ describe("local migrations", () => {
       "0024_logged_export_same_source_groups",
       "0025_export_request_origin",
       "0026_artifact_roots_and_locators",
+      "0027_clip_library_cache",
     ]);
     expect(runLocalMigrations(database)).toEqual([]);
     expect(
@@ -173,6 +176,15 @@ describe("local migrations", () => {
         .prepare("SELECT count(*) AS count FROM export_artifact_locators")
         .get(),
     ).toEqual({ count: 0 });
+    expect(
+      database
+        .prepare(
+          `SELECT count(*) AS count FROM clip_library_cache_pages
+           UNION ALL
+           SELECT count(*) AS count FROM clip_library_selected_clips`,
+        )
+        .all(),
+    ).toEqual([{ count: 0 }, { count: 0 }]);
     expect(
       database
         .prepare(
@@ -434,6 +446,118 @@ describe("local migrations", () => {
     ).toThrow(/immutable/u);
   });
 
+  it("scopes restart-safe Clip Library pages and selection to authorization", () => {
+    const directory = mkdtempSync(
+      join(tmpdir(), "research-video-clip-library-cache-"),
+    );
+    temporaryDirectories.add(directory);
+    const databasePath = join(directory, "cache.sqlite");
+    const database = openLocalDatabase(databasePath);
+    runLocalMigrations(database);
+    const now = "2026-08-22T12:00:00.000Z";
+    const projectId = randomUUID();
+    const selectedClipId = randomUUID();
+    const secondSelectedClipId = randomUUID();
+    const firstScope = clipLibraryAuthorizationScope("Bearer first-session");
+    const secondScope = clipLibraryAuthorizationScope("Bearer second-session");
+    const query = {
+      limit: 25,
+      query: "quotation",
+      completed: "any" as const,
+    };
+    const page = {
+      projectId,
+      entries: [],
+      syncCursor: "17",
+      fetchedAt: now,
+    };
+    const cache = new LocalClipLibraryCacheRepository(
+      database,
+      () => new Date(now),
+    );
+    expect(
+      cache.storePage({
+        projectId,
+        authorizationScopeSha256: firstScope,
+        query,
+        page,
+      }),
+    ).toEqual({ query, page, cachedAt: now });
+    expect(
+      cache.getPage({
+        projectId,
+        authorizationScopeSha256: secondScope,
+        query,
+      }),
+    ).toBeUndefined();
+    const secondQuery = { ...query, query: "second filter" };
+    cache.storePage({
+      projectId,
+      authorizationScopeSha256: firstScope,
+      query: secondQuery,
+      page,
+    });
+    expect(cache.getLatestPage(projectId, firstScope)?.query).toEqual(
+      secondQuery,
+    );
+    cache.getPage({
+      projectId,
+      authorizationScopeSha256: firstScope,
+      query,
+    });
+    expect(cache.getLatestPage(projectId, firstScope)?.query).toEqual(query);
+    expect(
+      cache.replaceSelection({
+        projectId,
+        authorizationScopeSha256: firstScope,
+        pageClipIds: [selectedClipId],
+        selectedClipIds: [selectedClipId, selectedClipId],
+      }),
+    ).toEqual([selectedClipId]);
+    expect(
+      cache.replaceSelection({
+        projectId,
+        authorizationScopeSha256: firstScope,
+        pageClipIds: [secondSelectedClipId],
+        selectedClipIds: [secondSelectedClipId],
+      }),
+    ).toEqual([selectedClipId, secondSelectedClipId].toSorted());
+    expect(cache.getLatestPage(projectId, firstScope)).toEqual({
+      query,
+      page,
+      cachedAt: now,
+    });
+    expect(
+      JSON.stringify(
+        database.prepare("SELECT * FROM clip_library_cache_pages").all(),
+      ),
+    ).not.toContain("first-session");
+    database.close();
+
+    const restarted = openLocalDatabase(databasePath);
+    const restartedCache = new LocalClipLibraryCacheRepository(restarted);
+    expect(
+      restartedCache.getPage({
+        projectId,
+        authorizationScopeSha256: firstScope,
+        query,
+      }),
+    ).toEqual({ query, page, cachedAt: now });
+    expect(restartedCache.listSelection(projectId, firstScope)).toEqual(
+      [selectedClipId, secondSelectedClipId].toSorted(),
+    );
+    restartedCache.purgeScope(projectId, firstScope);
+    expect(
+      restartedCache.getPage({
+        projectId,
+        authorizationScopeSha256: firstScope,
+        query,
+      }),
+    ).toBeUndefined();
+    expect(restartedCache.listSelection(projectId, firstScope)).toEqual([]);
+    restarted.close();
+  });
+
   it("rejects grouped scratch without the exact shared layout version", () => {
     const directory = mkdtempSync(join(tmpdir(), "research-video-layout3-"));
     temporaryDirectories.add(directory);
@@ -513,6 +637,7 @@ describe("local migrations", () => {
       "0024_logged_export_same_source_groups",
       "0025_export_request_origin",
       "0026_artifact_roots_and_locators",
+      "0027_clip_library_cache",
     ]);
     expect(
       database
@@ -693,6 +818,7 @@ describe("local migrations", () => {
       "0024_logged_export_same_source_groups",
       "0025_export_request_origin",
       "0026_artifact_roots_and_locators",
+      "0027_clip_library_cache",
     ]);
     expect(
       database.prepare("SELECT * FROM export_final_artifacts").all(),
@@ -829,6 +955,7 @@ describe("local migrations", () => {
       "0024_logged_export_same_source_groups",
       "0025_export_request_origin",
       "0026_artifact_roots_and_locators",
+      "0027_clip_library_cache",
     ]);
     expect(
       database
@@ -1839,6 +1966,7 @@ describe("logged export delivery import", () => {
       "0024_logged_export_same_source_groups",
       "0025_export_request_origin",
       "0026_artifact_roots_and_locators",
+      "0027_clip_library_cache",
     ]);
     const after = new LocalExportQueue(database).get(before.id);
     expect(after).toEqual(before);
@@ -1860,6 +1988,16 @@ describe("logged export delivery import", () => {
         )
         .get(before.id),
     ).toEqual(rawSnapshot);
+    expect(
+      database
+        .prepare("SELECT count(*) AS count FROM clip_library_cache_pages")
+        .get(),
+    ).toEqual({ count: 0 });
+    expect(
+      database
+        .prepare("SELECT count(*) AS count FROM clip_library_selected_clips")
+        .get(),
+    ).toEqual({ count: 0 });
     database.close();
   });
 
@@ -1902,6 +2040,7 @@ describe("logged export delivery import", () => {
       "0024_logged_export_same_source_groups",
       "0025_export_request_origin",
       "0026_artifact_roots_and_locators",
+      "0027_clip_library_cache",
     ]);
     expect(
       new LocalExportQueue(database).getAcceptedLoggedDelivery(

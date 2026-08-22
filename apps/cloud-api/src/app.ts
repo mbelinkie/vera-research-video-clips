@@ -20,6 +20,7 @@ import {
   CreateTranscriptionBatchRequestSchema,
   CreateProjectRequestSchema,
   ClaimLoggedExportDeliveryRequestSchema,
+  ClipLibraryQuerySchema,
   PublishDerivedTranslationRequestSchema,
   RequestDerivedTranslationSchema,
   TranscriptionBatchControlRequestSchema,
@@ -525,6 +526,15 @@ export function createCloudApi(
   app.get("/api/projects/:projectId/clips", async (request) => {
     const { projectId } = IdParamsSchema.parse(request.params);
     return catalog.listClipCandidates(await authenticate(request), projectId);
+  });
+
+  app.get("/api/projects/:projectId/clip-library", async (request) => {
+    const { projectId } = IdParamsSchema.parse(request.params);
+    return catalog.listClipLibrary(
+      await authenticate(request),
+      projectId,
+      ClipLibraryQuerySchema.parse(request.query),
+    );
   });
 
   app.get("/api/projects/:projectId/clips.csv", async (request, reply) => {

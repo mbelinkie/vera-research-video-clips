@@ -1,9 +1,13 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import {
   ClipCandidateSchema,
   ClipTagNameSchema,
+  LocalClipLibrarySelectionSchema,
+  LocalClipLibraryPageSchema,
   type ClipCandidate,
+  type ClipLibraryEntry,
+  type LocalClipLibraryPage,
 } from "@research-video/contracts";
 
 type CloudRequest = (path: string, init?: RequestInit) => Promise<unknown>;
@@ -21,75 +25,198 @@ export function ClipQueue({
   request,
   onOpenVideo,
 }: ClipQueueProps) {
-  const [clips, setClips] = useState<ClipCandidate[]>([]);
+  const [entries, setEntries] = useState<ClipLibraryEntry[]>([]);
+  const [page, setPage] = useState<LocalClipLibraryPage>();
+  const [localAvailability, setLocalAvailability] = useState<
+    LocalClipLibraryPage["localAvailability"]
+  >([]);
+  const [selected, setSelected] = useState<Set<string>>(() => new Set());
   const [suggestedTags, setSuggestedTags] = useState<string[]>([]);
   const [query, setQuery] = useState("");
   const [tagFilter, setTagFilter] = useState("");
+  const [researchFilter, setResearchFilter] = useState("all");
   const [statusFilter, setStatusFilter] = useState("all");
+  const [completedFilter, setCompletedFilter] = useState("any");
+  const [availabilityFilter, setAvailabilityFilter] = useState("all");
   const [editingClipId, setEditingClipId] = useState<string>();
   const [notes, setNotes] = useState("");
   const [tagsText, setTagsText] = useState("");
   const [busy, setBusy] = useState(false);
-  const [message, setMessage] = useState("Loading project clips…");
+  const [message, setMessage] = useState("Loading project Clip Library…");
+  const requestGeneration = useRef(0);
 
-  async function reload() {
-    if (!projectId) return;
+  function pagePath(
+    cursor?: string,
+    resetFilters = false,
+    restoreLatest = false,
+  ) {
+    if (restoreLatest) {
+      return `/local-agent/api/projects/${projectId}/clip-library/latest`;
+    }
+    const parameters = new URLSearchParams({
+      limit: "25",
+      completed: resetFilters ? "any" : completedFilter,
+    });
+    if (cursor) parameters.set("cursor", cursor);
+    if (!resetFilters && query.trim()) parameters.set("query", query.trim());
+    if (!resetFilters && tagFilter) parameters.set("tag", tagFilter);
+    if (!resetFilters && researchFilter !== "all")
+      parameters.set("researchStatus", researchFilter);
+    if (!resetFilters && statusFilter !== "all")
+      parameters.set("exportStatus", statusFilter);
+    return `/local-agent/api/projects/${projectId}/clip-library?${parameters}`;
+  }
+
+  async function reload(
+    cursor?: string,
+    resetFilters = false,
+    restoreLatest = false,
+  ) {
+    if (!projectId || !authorization) return;
+    const generation = ++requestGeneration.current;
     setBusy(true);
     try {
-      const [listed, tags] = await Promise.all([
-        request(`/api/projects/${projectId}/clips`),
-        request(`/api/projects/${projectId}/clip-tags`),
-      ]);
-      setClips(ClipCandidateSchema.array().parse(listed));
-      setSuggestedTags(ClipTagNameSchema.array().parse(tags));
-      setMessage("");
-    } catch (error) {
-      setMessage(
-        error instanceof Error ? error.message : "Unable to load clips.",
+      const response = await fetch(
+        pagePath(cursor, resetFilters, restoreLatest),
+        {
+          headers: { accept: "application/json", authorization },
+        },
       );
+      if (restoreLatest && response.status === 503) {
+        await reload(undefined, true);
+        return;
+      }
+      const payload: unknown = await response.json().catch(() => undefined);
+      if (!response.ok) throw new Error("Unable to load the Clip Library.");
+      const loaded = LocalClipLibraryPageSchema.parse(payload);
+      if (generation !== requestGeneration.current) return;
+      if (restoreLatest) {
+        setQuery(loaded.query.query ?? "");
+        setTagFilter(loaded.query.tag ?? "");
+        setResearchFilter(loaded.query.researchStatus ?? "all");
+        setStatusFilter(loaded.query.exportStatus ?? "all");
+        setCompletedFilter(loaded.query.completed);
+      }
+      setPage(loaded);
+      setLocalAvailability((current) =>
+        cursor
+          ? [
+              ...current,
+              ...loaded.localAvailability.filter(
+                (availability) =>
+                  !current.some(
+                    (candidate) =>
+                      candidate.artifactVersionId ===
+                      availability.artifactVersionId,
+                  ),
+              ),
+            ]
+          : loaded.localAvailability,
+      );
+      setEntries((current) =>
+        cursor
+          ? [
+              ...current,
+              ...loaded.entries.filter(
+                (entry) =>
+                  !current.some(
+                    (candidate) => candidate.clip.id === entry.clip.id,
+                  ),
+              ),
+            ]
+          : loaded.entries,
+      );
+      setSelected((current) =>
+        cursor
+          ? new Set([...current, ...loaded.selectedClipIds])
+          : new Set(loaded.selectedClipIds),
+      );
+      setMessage(
+        loaded.freshness === "stale"
+          ? `Offline cached subset from ${new Date(loaded.cachedAt).toLocaleString()}. Cloud changes and mutations are unavailable.`
+          : "",
+      );
+      if (!cursor) {
+        void request(`/api/projects/${projectId}/clip-tags`)
+          .then((tags) => {
+            if (generation === requestGeneration.current) {
+              setSuggestedTags(ClipTagNameSchema.array().parse(tags));
+            }
+          })
+          .catch(() => undefined);
+      }
+    } catch (error) {
+      if (generation === requestGeneration.current) {
+        setMessage(
+          error instanceof Error ? error.message : "Unable to load clips.",
+        );
+      }
     } finally {
-      setBusy(false);
+      if (generation === requestGeneration.current) setBusy(false);
     }
   }
 
   useEffect(() => {
+    requestGeneration.current += 1;
+    setEntries([]);
+    setPage(undefined);
+    setLocalAvailability([]);
+    setSelected(new Set());
     setEditingClipId(undefined);
     setQuery("");
     setTagFilter("");
+    setResearchFilter("all");
     setStatusFilter("all");
-    void reload();
-    // `request` deliberately reads the current in-memory session credential.
-    // Reloads are tied to an explicit project change or user action.
+    setCompletedFilter("any");
+    setAvailabilityFilter("all");
+    void reload(undefined, true, true);
+    // Reads use the current in-memory credential and restart through the local
+    // authorization-fingerprint cache only after the same credential returns.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [projectId]);
+  }, [projectId, authorization]);
 
-  const visibleClips = useMemo(() => {
-    const normalizedQuery = query.trim().toLocaleLowerCase();
-    return clips.filter((clip) => {
-      if (statusFilter !== "all" && clip.exportStatus !== statusFilter) {
-        return false;
-      }
-      if (tagFilter && !clip.tags.includes(tagFilter)) return false;
-      if (!normalizedQuery) return true;
-      return [
-        clip.video.title,
-        clip.englishText,
-        clip.originalText ?? "",
-        ...(clip.languageEvidence.schemaVersion === 2
-          ? [
-              clip.languageEvidence.native.text,
-              clip.languageEvidence.english.text,
-              clip.languageEvidence.preferred?.text ?? "",
-              clip.languageEvidence.preferred?.language ?? "",
-            ]
-          : []),
-        clip.notes,
-        ...clip.tags,
-      ].some((value) => value.toLocaleLowerCase().includes(normalizedQuery));
-    });
-  }, [clips, query, statusFilter, tagFilter]);
+  const availabilityByVersion = useMemo(
+    () =>
+      new Map(
+        localAvailability.map((availability) => [
+          availability.artifactVersionId,
+          availability.locators,
+        ]),
+      ),
+    [localAvailability],
+  );
+
+  function entryAvailability(entry: ClipLibraryEntry) {
+    const locators = entry.recentArtifactVersions.flatMap(
+      (version) => availabilityByVersion.get(version.artifactVersionId) ?? [],
+    );
+    if (locators.some((locator) => locator.availability === "verified"))
+      return "verified";
+    if (locators.some((locator) => locator.availability === "invalid"))
+      return "invalid";
+    if (locators.some((locator) => locator.availability === "missing"))
+      return "missing";
+    return "none";
+  }
+
+  const visibleEntries = useMemo(
+    () =>
+      availabilityFilter === "all"
+        ? entries
+        : entries.filter(
+            (entry) => entryAvailability(entry) === availabilityFilter,
+          ),
+    // Availability is a local filter over the cached subset, not a cloud-global
+    // predicate.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [entries, availabilityFilter, availabilityByVersion],
+  );
 
   function beginEdit(clip: ClipCandidate) {
+    if (page?.freshness !== "fresh") {
+      setMessage("Reconnect before changing shared clip notes or tags.");
+      return;
+    }
     setEditingClipId(clip.id);
     setNotes(clip.notes);
     setTagsText(clip.tags.join(", "));
@@ -97,6 +224,7 @@ export function ClipQueue({
   }
 
   async function saveEdit(clip: ClipCandidate) {
+    if (page?.freshness !== "fresh") return;
     setBusy(true);
     try {
       const tags = tagsText
@@ -106,16 +234,12 @@ export function ClipQueue({
       const updated = ClipCandidateSchema.parse(
         await request(`/api/projects/${projectId}/clips/${clip.id}`, {
           method: "PATCH",
-          body: JSON.stringify({
-            expectedVersion: clip.version,
-            notes,
-            tags,
-          }),
+          body: JSON.stringify({ expectedVersion: clip.version, notes, tags }),
         }),
       );
-      setClips((current) =>
-        current.map((candidate) =>
-          candidate.id === updated.id ? updated : candidate,
+      setEntries((current) =>
+        current.map((entry) =>
+          entry.clip.id === updated.id ? { ...entry, clip: updated } : entry,
         ),
       );
       setSuggestedTags((current) =>
@@ -124,13 +248,52 @@ export function ClipQueue({
         ),
       );
       setEditingClipId(undefined);
-      setMessage("Clip notes and tags saved.");
+      setMessage("Clip notes and tags saved. Refresh to update the cache.");
     } catch (error) {
       setMessage(
-        error instanceof Error ? error.message : "Unable to save clip.",
+        error instanceof Error
+          ? `${error.message} Refresh before retrying; this edit is not replayed offline.`
+          : "Unable to save clip.",
       );
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function updateSelection(clipId: string, checked: boolean) {
+    const generation = requestGeneration.current;
+    const next = new Set(selected);
+    if (checked) next.add(clipId);
+    else next.delete(clipId);
+    setSelected(next);
+    try {
+      const response = await fetch(
+        `/local-agent/api/projects/${projectId}/clip-library/selection`,
+        {
+          method: "PUT",
+          headers: {
+            accept: "application/json",
+            authorization,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({
+            pageClipIds: [clipId],
+            selectedClipIds: checked ? [clipId] : [],
+          }),
+        },
+      );
+      const payload: unknown = await response.json().catch(() => undefined);
+      if (!response.ok) throw new Error("Unable to persist clip selection.");
+      if (generation !== requestGeneration.current) return;
+      setSelected(
+        new Set(LocalClipLibrarySelectionSchema.parse(payload).selectedClipIds),
+      );
+    } catch (error) {
+      if (generation === requestGeneration.current) {
+        setMessage(
+          error instanceof Error ? error.message : "Unable to save selection.",
+        );
+      }
     }
   }
 
@@ -164,17 +327,17 @@ export function ClipQueue({
   return (
     <article
       className="queue-card clip-queue"
-      aria-labelledby="clip-queue-title"
+      aria-labelledby="clip-library-title"
     >
       <div className="section-heading">
         <div>
           <p className="eyebrow">Project research log</p>
-          <h3 id="clip-queue-title">Clip queue</h3>
+          <h3 id="clip-library-title">Clip Library</h3>
         </div>
         <div className="clip-queue-actions">
           <button
             type="button"
-            disabled={busy}
+            disabled={busy || page?.freshness !== "fresh"}
             onClick={() => void downloadCsv()}
           >
             Export CSV
@@ -208,6 +371,18 @@ export function ClipQueue({
           </select>
         </label>
         <label>
+          Research status
+          <select
+            value={researchFilter}
+            onChange={(event) => setResearchFilter(event.target.value)}
+          >
+            <option value="all">All statuses</option>
+            <option value="candidate">Candidate</option>
+            <option value="approved">Approved</option>
+            <option value="rejected">Rejected</option>
+          </select>
+        </label>
+        <label>
           Export status
           <select
             value={statusFilter}
@@ -219,38 +394,101 @@ export function ClipQueue({
             <option value="processing">Processing</option>
             <option value="complete">Complete</option>
             <option value="failed">Failed</option>
+            <option value="canceled">Canceled</option>
+          </select>
+        </label>
+        <label>
+          Completed versions
+          <select
+            value={completedFilter}
+            onChange={(event) => setCompletedFilter(event.target.value)}
+          >
+            <option value="any">Any</option>
+            <option value="yes">Has completed version</option>
+            <option value="no">No completed version</option>
+          </select>
+        </label>
+        <label>
+          This cached subset
+          <select
+            value={availabilityFilter}
+            onChange={(event) => setAvailabilityFilter(event.target.value)}
+          >
+            <option value="all">Any local state</option>
+            <option value="verified">Verified locally</option>
+            <option value="missing">Missing locally</option>
+            <option value="invalid">Invalid locally</option>
+            <option value="none">No local locator</option>
           </select>
         </label>
       </div>
+      <div className="action-row">
+        <button type="button" disabled={busy} onClick={() => void reload()}>
+          Apply cloud filters
+        </button>
+      </div>
       <p className="form-message" role="status">
         {message ||
-          `${visibleClips.length} of ${clips.length} clip${clips.length === 1 ? "" : "s"}.`}
+          `${visibleEntries.length} cached result${visibleEntries.length === 1 ? "" : "s"}; ${selected.size} selected.`}
       </p>
-      {visibleClips.length ? (
+      {visibleEntries.length ? (
         <div className="clip-list">
-          {visibleClips.map((clip) => {
+          {visibleEntries.map((entry) => {
+            const clip = entry.clip;
             const editing = editingClipId === clip.id;
+            const localState = entryAvailability(entry);
             return (
               <section className="clip-card" key={clip.id}>
                 <div className="clip-card-heading">
                   <div>
+                    <label className="clip-library-select">
+                      <input
+                        type="checkbox"
+                        checked={selected.has(clip.id)}
+                        onChange={(event) =>
+                          void updateSelection(clip.id, event.target.checked)
+                        }
+                      />
+                      Select {clip.video.title}
+                    </label>
                     <strong>{clip.video.title}</strong>
                     <span>
                       {formatTime(clip.selection.exportStartMs)}–
                       {formatTime(clip.selection.exportEndMs)} ·{" "}
                       {clip.exportStatus.replaceAll("_", " ")}
                     </span>
+                    <span>
+                      History: {entry.completedVersionCount} completed ·
+                      Workstation:{" "}
+                      {localState === "none"
+                        ? "no verified locator"
+                        : localState}
+                    </span>
+                    {entry.currentLeaves.map((leaf) => (
+                      <span key={leaf.requestId}>
+                        Export {leaf.state.replaceAll("_", " ")}
+                        {leaf.retryOrdinal
+                          ? ` · retry ${leaf.retryOrdinal}`
+                          : ""}
+                        {leaf.progress
+                          ? ` · ${leaf.progress.stage.replaceAll("_", " ")} ${Math.floor(leaf.progress.basisPoints / 100)}%`
+                          : ""}
+                      </span>
+                    ))}
+                    {entry.hasMoreLeaves ? (
+                      <span>Additional export lineages are available.</span>
+                    ) : null}
                   </div>
                   <div className="clip-card-actions">
                     <button
                       type="button"
                       onClick={() => onOpenVideo(clip.video.canonicalUrl)}
                     >
-                      Open
+                      Open video
                     </button>
                     <button
                       type="button"
-                      disabled={busy}
+                      disabled={busy || page?.freshness !== "fresh"}
                       onClick={() => beginEdit(clip)}
                     >
                       Edit notes/tags
@@ -281,6 +519,20 @@ export function ClipQueue({
                 ) : (
                   <blockquote>{clip.englishText}</blockquote>
                 )}
+                {entry.recentArtifactVersions.length ? (
+                  <details>
+                    <summary>Recent immutable artifact history</summary>
+                    <ul>
+                      {entry.recentArtifactVersions.map((version) => (
+                        <li key={version.artifactVersionId}>
+                          {new Date(version.completedAt).toLocaleString()} ·{" "}
+                          {version.artifacts.length} artifacts · manifest{" "}
+                          {version.manifest.schemaVersion}
+                        </li>
+                      ))}
+                    </ul>
+                  </details>
+                ) : null}
                 {editing ? (
                   <div className="clip-edit-form">
                     <label>
@@ -339,6 +591,15 @@ export function ClipQueue({
       ) : (
         <p className="muted">No clip candidates match the current filters.</p>
       )}
+      {page?.nextCursor ? (
+        <button
+          type="button"
+          disabled={busy}
+          onClick={() => void reload(page.nextCursor)}
+        >
+          Load next page
+        </button>
+      ) : null}
       <datalist id="project-tag-suggestions">
         {suggestedTags.map((tag) => (
           <option key={tag} value={tag} />

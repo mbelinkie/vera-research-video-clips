@@ -36,6 +36,87 @@ describe("local agent", () => {
     );
   });
 
+  it("requires authorization for Clip Library refresh and selection", async () => {
+    const projectId = "019fbb95-cd76-7920-93fa-e23ba755ee65";
+    const clipId = "019fbb95-cd76-7920-93fa-e23ba755ee66";
+    const now = "2026-08-22T12:00:00.000Z";
+    const localPage = {
+      projectId,
+      entries: [],
+      syncCursor: "3",
+      fetchedAt: now,
+      query: { limit: 10, completed: "yes" as const },
+      freshness: "fresh" as const,
+      cachedAt: now,
+      cacheCoverage: "cached_subset" as const,
+      selectedClipIds: [],
+      localAvailability: [],
+    };
+    const resolveClipLibrary = vi.fn(async () => localPage);
+    const resolveLatestClipLibrary = vi.fn(async () => localPage);
+    const updateClipLibrarySelection = vi.fn(() => [clipId]);
+    const app = createLocalAgent({
+      resolveClipLibrary,
+      resolveLatestClipLibrary,
+      updateClipLibrarySelection,
+    });
+    apps.add(app);
+    const pageUrl = `/api/projects/${projectId}/clip-library?limit=10&completed=yes`;
+    expect((await app.inject({ method: "GET", url: pageUrl })).statusCode).toBe(
+      401,
+    );
+    const response = await app.inject({
+      method: "GET",
+      url: pageUrl,
+      headers: { authorization: "Bearer project-session" },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual(localPage);
+    expect(resolveClipLibrary).toHaveBeenCalledWith({
+      projectId,
+      authorization: "Bearer project-session",
+      query: { limit: 10, completed: "yes" },
+    });
+    expect(
+      (
+        await app.inject({
+          method: "GET",
+          url: `/api/projects/${projectId}/clip-library/latest`,
+          headers: { authorization: "Bearer project-session" },
+        })
+      ).json(),
+    ).toEqual(localPage);
+    expect(resolveLatestClipLibrary).toHaveBeenCalledWith({
+      projectId,
+      authorization: "Bearer project-session",
+    });
+    const selectionUrl = `/api/projects/${projectId}/clip-library/selection`;
+    expect(
+      (
+        await app.inject({
+          method: "PUT",
+          url: selectionUrl,
+          payload: { pageClipIds: [clipId], selectedClipIds: [clipId] },
+        })
+      ).statusCode,
+    ).toBe(401);
+    expect(
+      (
+        await app.inject({
+          method: "PUT",
+          url: selectionUrl,
+          headers: { authorization: "Bearer project-session" },
+          payload: { pageClipIds: [clipId], selectedClipIds: [clipId] },
+        })
+      ).json(),
+    ).toEqual({ selectedClipIds: [clipId] });
+    expect(updateClipLibrarySelection).toHaveBeenCalledWith({
+      projectId,
+      authorization: "Bearer project-session",
+      command: { pageClipIds: [clipId], selectedClipIds: [clipId] },
+    });
+  });
+
   it("keeps root paths local and resolves verification evidence through authorization", async () => {
     const rootId = "019fbb95-cd76-7920-93fa-e23ba755ee71";
     const artifactVersionId = "019fbb95-cd76-7920-93fa-e23ba755ee72";

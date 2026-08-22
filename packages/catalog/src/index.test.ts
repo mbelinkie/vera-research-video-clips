@@ -1258,6 +1258,151 @@ describe("logged export delivery", () => {
     ).rejects.toMatchObject({ statusCode: 403 });
   });
 
+  it("lists an authorized bounded Clip Library with stable cursors and separate history", async () => {
+    const fixture = await createAcceptedLoggedExportResultFixture();
+    const projectId = fixture.accepted.request.projectId!;
+    const clipId = fixture.accepted.request.clipId!;
+    const clip = await fixture.catalog.getClipCandidate(
+      fixture.owner,
+      projectId,
+      clipId,
+    );
+    await fixture.catalog.updateClipCandidate(
+      fixture.owner,
+      projectId,
+      clipId,
+      {
+        expectedVersion: clip.version,
+        notes: "Needle quotation for the library at Cafe\u0301",
+        tags: ["Featured Quote"],
+      },
+    );
+    const searched = await fixture.catalog.listClipLibrary(
+      fixture.owner,
+      projectId,
+      { limit: 25, query: "needle quotation", completed: "no" },
+    );
+    expect(searched.entries).toHaveLength(1);
+    expect(searched.entries[0]).toMatchObject({
+      clip: { id: clipId, tags: ["Featured Quote"] },
+      currentLeaves: [
+        {
+          requestId: fixture.accepted.request.id,
+          requestOrigin: "selection_action",
+        },
+      ],
+      completedVersionCount: 0,
+      recentArtifactVersions: [],
+    });
+    expect(
+      (
+        await fixture.catalog.listClipLibrary(fixture.owner, projectId, {
+          limit: 25,
+          query: "Café",
+          completed: "any",
+        })
+      ).entries.map((entry) => entry.clip.id),
+    ).toEqual([clipId]);
+    expect(
+      (
+        await fixture.catalog.listClipLibrary(fixture.owner, projectId, {
+          limit: 25,
+          tag: "featured quote",
+          completed: "any",
+        })
+      ).entries.map((entry) => entry.clip.id),
+    ).toEqual([clipId]);
+
+    const success = await fixture.catalog.reconcileLoggedExportSuccess(
+      fixture.owner,
+      reconcileSuccessCommand(fixture),
+    );
+    const completed = await fixture.catalog.listClipLibrary(
+      fixture.owner,
+      projectId,
+      { limit: 25, completed: "yes" },
+    );
+    expect(completed.entries[0]).toMatchObject({
+      completedVersionCount: 1,
+      recentArtifactVersions: [
+        {
+          artifactVersionId: success.id,
+          requestId: fixture.accepted.request.id,
+        },
+      ],
+    });
+    expect(JSON.stringify(completed)).not.toMatch(
+      /localPath|filename|absolutePath|reservationToken/u,
+    );
+    const beforeConcurrentUpdate = completed.entries[0]!.clip;
+    const [coherentRead, afterConcurrentUpdate] = await Promise.all([
+      fixture.catalog.listClipLibrary(fixture.owner, projectId, {
+        limit: 25,
+        completed: "yes",
+      }),
+      fixture.catalog.updateClipCandidate(fixture.owner, projectId, clipId, {
+        expectedVersion: beforeConcurrentUpdate.version,
+        notes: "Concurrent updated note",
+        tags: ["Concurrent Tag"],
+      }),
+    ]);
+    const coherentClip = coherentRead.entries[0]!.clip;
+    if (coherentClip.version === beforeConcurrentUpdate.version) {
+      expect(coherentClip).toMatchObject({
+        notes: beforeConcurrentUpdate.notes,
+        tags: beforeConcurrentUpdate.tags,
+      });
+      expect(coherentRead.syncCursor).toBe(completed.syncCursor);
+    } else {
+      expect(coherentClip).toMatchObject({
+        version: afterConcurrentUpdate.version,
+        notes: afterConcurrentUpdate.notes,
+        tags: afterConcurrentUpdate.tags,
+      });
+      expect(BigInt(coherentRead.syncCursor)).toBeGreaterThan(
+        BigInt(completed.syncCursor),
+      );
+    }
+
+    await createBatchClips(fixture.catalog, fixture.owner, projectId, 2);
+    const firstPage = await fixture.catalog.listClipLibrary(
+      fixture.owner,
+      projectId,
+      { limit: 2, completed: "any" },
+    );
+    expect(firstPage.entries).toHaveLength(2);
+    expect(firstPage.nextCursor).toBeDefined();
+    const secondPage = await fixture.catalog.listClipLibrary(
+      fixture.owner,
+      projectId,
+      { limit: 2, cursor: firstPage.nextCursor, completed: "any" },
+    );
+    expect(secondPage.entries).toHaveLength(1);
+    expect(
+      secondPage.entries.some((entry) =>
+        firstPage.entries.some(
+          (firstEntry) => firstEntry.clip.id === entry.clip.id,
+        ),
+      ),
+    ).toBe(false);
+    await expect(
+      fixture.catalog.listClipLibrary(fixture.owner, projectId, {
+        limit: 2,
+        cursor: firstPage.nextCursor,
+        query: "different-filter",
+        completed: "any",
+      }),
+    ).rejects.toMatchObject({ statusCode: 400 });
+    const outsider = fixtureActor("clip-library-outsider");
+    await fixture.catalog.registerUser(outsider, "Clip Library outsider");
+    await expect(
+      fixture.catalog.listClipLibrary(outsider, projectId, {
+        limit: 25,
+        completed: "any",
+      }),
+    ).rejects.toMatchObject({ statusCode: 403 });
+  });
+
   it("reads a parseable legacy success with unknown origin and manifest schema", async () => {
     const fixture = await createAcceptedLoggedExportResultFixture();
     await fixture.catalog.reconcileLoggedExportSuccess(

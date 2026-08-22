@@ -3,7 +3,9 @@ import { z, ZodError } from "zod";
 
 import {
   CreateExportOnlyRequestSchema,
+  ClipLibraryQuerySchema,
   VerifyLocalArtifactVersionRequestSchema,
+  UpdateLocalClipLibrarySelectionSchema,
   ClaimLoggedExportDeliveryResponseSchema,
   ExportSettingsPreviewRequestSchema,
   ProcessAcceptedLoggedExportRequestSchema,
@@ -11,6 +13,9 @@ import {
   type HeartbeatExportWorkerRequest,
   type ArtifactLocatorSummary,
   type ArtifactVersionSummary,
+  type ClipLibraryQuery,
+  type LocalClipLibraryPage,
+  type UpdateLocalClipLibrarySelection,
   type AcceptLoggedExportDeliveryRequest,
   type ClaimLoggedExportDeliveryRequest,
   type ClaimLoggedExportDeliveryResponse,
@@ -54,6 +59,20 @@ import type { WorkspaceTranscriptResolution } from "@research-video/sync";
 import type { LocalExportOnceResult } from "./export-run-once.ts";
 
 export interface LocalAgentDependencies {
+  resolveClipLibrary?(input: {
+    projectId: string;
+    authorization: string;
+    query: ClipLibraryQuery;
+  }): Promise<LocalClipLibraryPage>;
+  resolveLatestClipLibrary?(input: {
+    projectId: string;
+    authorization: string;
+  }): Promise<LocalClipLibraryPage>;
+  updateClipLibrarySelection?(input: {
+    projectId: string;
+    authorization: string;
+    command: UpdateLocalClipLibrarySelection;
+  }): string[];
   resolveArtifactVersion?(input: {
     projectId: string;
     clipId: string;
@@ -172,6 +191,7 @@ const TranscriptParamsSchema = z.object({
   projectId: z.uuid(),
   videoId: z.uuid(),
 });
+const LocalProjectParamsSchema = z.object({ projectId: z.uuid() });
 
 class LocalAuthenticationError extends Error {
   readonly statusCode = 401;
@@ -248,6 +268,61 @@ export function createLocalAgent(
       timestamp: new Date().toISOString(),
     }),
   );
+
+  if (dependencies?.resolveClipLibrary) {
+    app.get("/api/projects/:projectId/clip-library", async (request) => {
+      const { projectId } = LocalProjectParamsSchema.parse(request.params);
+      const authorization = request.headers.authorization;
+      if (!authorization) {
+        throw new LocalAuthenticationError(
+          "Authentication is required to read the Clip Library.",
+        );
+      }
+      return dependencies.resolveClipLibrary!({
+        projectId,
+        authorization,
+        query: ClipLibraryQuerySchema.parse(request.query),
+      });
+    });
+  }
+
+  if (dependencies?.resolveLatestClipLibrary) {
+    app.get("/api/projects/:projectId/clip-library/latest", async (request) => {
+      const { projectId } = LocalProjectParamsSchema.parse(request.params);
+      const authorization = request.headers.authorization;
+      if (!authorization) {
+        throw new LocalAuthenticationError(
+          "Authentication is required to restore the Clip Library.",
+        );
+      }
+      return dependencies.resolveLatestClipLibrary!({
+        projectId,
+        authorization,
+      });
+    });
+  }
+
+  if (dependencies?.updateClipLibrarySelection) {
+    app.put(
+      "/api/projects/:projectId/clip-library/selection",
+      async (request) => {
+        const { projectId } = LocalProjectParamsSchema.parse(request.params);
+        const authorization = request.headers.authorization;
+        if (!authorization) {
+          throw new LocalAuthenticationError(
+            "Authentication is required to update Clip Library selection.",
+          );
+        }
+        return {
+          selectedClipIds: dependencies.updateClipLibrarySelection!({
+            projectId,
+            authorization,
+            command: UpdateLocalClipLibrarySelectionSchema.parse(request.body),
+          }),
+        };
+      },
+    );
+  }
 
   if (
     dependencies?.resolveArtifactVersion &&

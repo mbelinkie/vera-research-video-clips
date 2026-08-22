@@ -1897,6 +1897,12 @@ describe("logged export delivery API", () => {
     }));
     const cancelLoggedExport = vi.fn(async () => ({ requested: true }));
     const retryLoggedExport = vi.fn(async () => ({ retried: true }));
+    const listClipLibrary = vi.fn(async () => ({
+      projectId: randomUUID(),
+      entries: [],
+      syncCursor: "0",
+      fetchedAt: "2026-08-22T12:00:00.000Z",
+    }));
     const listArtifactVersionHistory = vi.fn(async () => ({ versions: [] }));
     const getArtifactVersion = vi.fn(async () => ({ exact: true }));
     const catalog = {
@@ -1913,6 +1919,7 @@ describe("logged export delivery API", () => {
       reconcileLoggedExportCanceled,
       cancelLoggedExport,
       retryLoggedExport,
+      listClipLibrary,
       listArtifactVersionHistory,
       getArtifactVersion,
     } as unknown as SharedProjectCatalog;
@@ -2146,6 +2153,16 @@ describe("logged export delivery API", () => {
       batchId,
     );
     const historyClipId = randomUUID();
+    const clipLibraryResponse = await app.inject({
+      method: "GET",
+      url: `/api/projects/${batchProjectId}/clip-library?limit=10&query=quote&completed=yes`,
+    });
+    expect(clipLibraryResponse.statusCode).toBe(200);
+    expect(listClipLibrary).toHaveBeenCalledWith(actor, batchProjectId, {
+      limit: 10,
+      query: "quote",
+      completed: "yes",
+    });
     expect(
       (
         await app.inject({

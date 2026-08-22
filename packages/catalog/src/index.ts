@@ -13,6 +13,8 @@ import {
   BatchPreflightSummarySchema,
   ClaimedTranscriptionJobSchema,
   ClipCandidateSchema,
+  ClipLibraryPageSchema,
+  ClipLibraryQuerySchema,
   ClipLanguageEvidenceV2Schema,
   DerivedTranslationJobSchema,
   DerivedTranslationIdentitySchema,
@@ -81,6 +83,8 @@ import {
   type BatchPreflightItem,
   type ClaimedTranscriptionJob,
   type ClipCandidate,
+  type ClipLibraryPage,
+  type ClipLibraryQuery,
   type ClipLanguageEvidence,
   type CreateClipCandidateRequest,
   type ClaimLoggedExportDeliveryRequest,
@@ -176,6 +180,11 @@ export class CatalogConflictError extends Error {
   readonly code = "conflict";
 }
 
+export class CatalogInvalidRequestError extends Error {
+  readonly statusCode = 400;
+  readonly code = "invalid_request";
+}
+
 export class TranscriptIntegrityError extends Error {
   readonly statusCode = 422;
   readonly code = "transcript_integrity_failed";
@@ -251,6 +260,45 @@ const iso = (value: unknown) =>
 
 const sha256 = (bytes: Uint8Array) =>
   createHash("sha256").update(bytes).digest("hex");
+
+type ClipLibraryCursor = {
+  projectId: string;
+  id: string;
+  createdAt: string;
+  filterFingerprint: string;
+};
+
+function makeClipLibraryCursor(cursor: ClipLibraryCursor) {
+  return Buffer.from(canonicalJson(cursor)).toString("base64url");
+}
+
+function parseClipLibraryCursor(value: string): ClipLibraryCursor {
+  try {
+    const parsed = JSON.parse(Buffer.from(value, "base64url").toString("utf8"));
+    const keys = Object.keys(parsed).sort();
+    if (
+      canonicalJson(keys) !==
+        canonicalJson(["createdAt", "filterFingerprint", "id", "projectId"]) ||
+      typeof parsed.projectId !== "string" ||
+      typeof parsed.id !== "string" ||
+      typeof parsed.createdAt !== "string" ||
+      typeof parsed.filterFingerprint !== "string" ||
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(
+        parsed.projectId,
+      ) ||
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(
+        parsed.id,
+      ) ||
+      !Number.isFinite(Date.parse(parsed.createdAt)) ||
+      !/^[a-f0-9]{64}$/u.test(parsed.filterFingerprint)
+    ) {
+      throw new Error("invalid cursor");
+    }
+    return parsed as ClipLibraryCursor;
+  } catch {
+    throw new CatalogInvalidRequestError("Clip Library cursor is invalid.");
+  }
+}
 
 const LoggedExportProgressStageRank: Record<LoggedExportProgressStage, number> =
   {
@@ -2581,6 +2629,180 @@ export class SharedProjectCatalog {
           await this.loadClipLanguageEvidence(String(row.id)),
         ),
       ),
+    );
+  }
+
+  async listClipLibrary(
+    actor: AuthenticatedActor,
+    projectId: string,
+    query: ClipLibraryQuery,
+  ): Promise<ClipLibraryPage> {
+    await this.authorize(actor, projectId, "read");
+    const parsed = ClipLibraryQuerySchema.parse(query);
+    return this.transaction(
+      async () => {
+        const normalizedQuery = parsed.query
+          ? parsed.query.normalize("NFKC").toLocaleLowerCase("en-US")
+          : undefined;
+        const filterFingerprint = sha256Fingerprint({
+          query: normalizedQuery ?? null,
+          tag: parsed.tag ? normalizeTagName(parsed.tag) : null,
+          researchStatus: parsed.researchStatus ?? null,
+          exportStatus: parsed.exportStatus ?? null,
+          completed: parsed.completed,
+        });
+        let cursorCreatedAt: string | undefined;
+        let cursorId: string | undefined;
+        if (parsed.cursor) {
+          const cursor = parseClipLibraryCursor(parsed.cursor);
+          if (
+            cursor.projectId !== projectId ||
+            cursor.filterFingerprint !== filterFingerprint
+          ) {
+            throw new CatalogInvalidRequestError(
+              "Clip Library cursor does not match this project and filter.",
+            );
+          }
+          const boundary = await this.database.query<DbRow>(
+            `SELECT created_at FROM clip_candidates
+         WHERE id = $1 AND project_id = $2 AND created_at = $3::timestamptz`,
+            [cursor.id, projectId, cursor.createdAt],
+          );
+          if (!boundary.rows[0]) {
+            throw new CatalogInvalidRequestError(
+              "Clip Library cursor is no longer valid.",
+            );
+          }
+          cursorCreatedAt = cursor.createdAt;
+          cursorId = cursor.id;
+        }
+
+        const result = await this.database.query<DbRow>(
+          `${clipCandidateSelect}
+       WHERE c.project_id = $1
+         AND ($2::text IS NULL OR
+              position($2::text in lower(normalize(c.video_title, NFKC))) > 0 OR
+              position($2::text in lower(normalize(c.english_text, NFKC))) > 0 OR
+              position($2::text in lower(normalize(coalesce(c.original_text, ''), NFKC))) > 0 OR
+              position($2::text in lower(normalize(coalesce(c.selection_text, ''), NFKC))) > 0 OR
+              position($2::text in lower(normalize(c.notes, NFKC))) > 0 OR
+              EXISTS (
+                SELECT 1 FROM clip_candidate_tags candidate_tag
+                JOIN clip_tags tag ON tag.id = candidate_tag.tag_id
+                WHERE candidate_tag.clip_id = c.id
+                  AND position($2::text in lower(normalize(tag.name, NFKC))) > 0
+              ))
+         AND ($3::text IS NULL OR EXISTS (
+              SELECT 1 FROM clip_candidate_tags exact_candidate_tag
+              JOIN clip_tags exact_tag ON exact_tag.id = exact_candidate_tag.tag_id
+              WHERE exact_candidate_tag.clip_id = c.id
+                AND exact_tag.normalized_name = $3::text
+         ))
+         AND ($4::text IS NULL OR c.research_status = $4::text)
+         AND ($5::text IS NULL OR c.export_status = $5::text)
+         AND ($6::text = 'any' OR
+              ($6::text = 'yes') = EXISTS (
+                SELECT 1 FROM export_requests completed_request
+                JOIN logged_export_success_results completed_success
+                  ON completed_success.export_request_id = completed_request.id
+                WHERE completed_request.clip_id = c.id
+                  AND completed_request.project_id = c.project_id
+              ))
+         AND ($7::timestamptz IS NULL OR
+              (c.created_at, c.id) < ($7::timestamptz, $8::uuid))
+       ORDER BY c.created_at DESC, c.id DESC
+       LIMIT $9`,
+          [
+            projectId,
+            normalizedQuery ?? null,
+            parsed.tag ? normalizeTagName(parsed.tag) : null,
+            parsed.researchStatus ?? null,
+            parsed.exportStatus ?? null,
+            parsed.completed,
+            cursorCreatedAt ?? null,
+            cursorId ?? null,
+            parsed.limit + 1,
+          ],
+        );
+        const pageRows = result.rows.slice(0, parsed.limit);
+        const entries = await Promise.all(
+          pageRows.map(async (row) => {
+            const clipId = String(row.id);
+            const [tags, languageEvidence, leaves, history] = await Promise.all(
+              [
+                this.loadClipTags(clipId),
+                this.loadClipLanguageEvidence(clipId),
+                this.loadClipLibraryLeaves(projectId, clipId),
+                this.loadClipLibraryHistory(projectId, clipId),
+              ],
+            );
+            return {
+              clip: mapClipCandidate(row, tags, languageEvidence),
+              currentLeaves: leaves.rows.slice(0, 10).map((leaf) => ({
+                requestId: leaf.id,
+                jobId: leaf.job_id,
+                state: leaf.state,
+                requestOrigin: leaf.request_origin
+                  ? String(leaf.request_origin)
+                  : null,
+                ...(leaf.retry_of_request_id
+                  ? {
+                      retryOfRequestId: leaf.retry_of_request_id,
+                      retryOrdinal: Number(leaf.retry_ordinal),
+                    }
+                  : {}),
+                ...(leaf.batch_item_id
+                  ? { batchItemId: leaf.batch_item_id }
+                  : {}),
+                ...(leaf.execution_id
+                  ? {
+                      progress: mapLoggedExportProgress({
+                        execution_id: leaf.execution_id,
+                        export_request_id: leaf.export_request_id,
+                        attempt: leaf.attempt,
+                        sequence: leaf.sequence,
+                        stage: leaf.stage,
+                        basis_points: leaf.basis_points,
+                        updated_at: leaf.progress_updated_at,
+                      }),
+                    }
+                  : {}),
+                updatedAt: iso(leaf.updated_at),
+              })),
+              hasMoreLeaves: leaves.rows.length > 10,
+              completedVersionCount: history.rows[0]
+                ? Number(history.rows[0].completed_count)
+                : 0,
+              recentArtifactVersions: history.rows.map(
+                mapArtifactVersionSummary,
+              ),
+            };
+          }),
+        );
+        const sync = await this.database.query<{ cursor: string }>(
+          `SELECT coalesce(max(sequence), 0)::text AS cursor
+       FROM sync_events WHERE project_id = $1`,
+          [projectId],
+        );
+        const last = pageRows[pageRows.length - 1];
+        return ClipLibraryPageSchema.parse({
+          projectId,
+          entries,
+          ...(result.rows.length > parsed.limit && last
+            ? {
+                nextCursor: makeClipLibraryCursor({
+                  projectId,
+                  id: String(last.id),
+                  createdAt: iso(last.created_at),
+                  filterFingerprint,
+                }),
+              }
+            : {}),
+          syncCursor: sync.rows[0]?.cursor ?? "0",
+          fetchedAt: this.now().toISOString(),
+        });
+      },
+      { repeatableRead: true },
     );
   }
 
@@ -5624,6 +5846,42 @@ export class SharedProjectCatalog {
       : {};
   }
 
+  private loadClipLibraryLeaves(projectId: string, clipId: string) {
+    return this.database.query<DbRow>(
+      `SELECT request.*, job.state,
+              progress.execution_id, progress.export_request_id,
+              progress.attempt, progress.sequence, progress.stage,
+              progress.basis_points, progress.updated_at AS progress_updated_at
+       FROM export_requests request
+       JOIN jobs job ON job.id = request.job_id
+       LEFT JOIN logged_export_execution_progress progress
+         ON progress.export_request_id = request.id
+       WHERE request.project_id = $1 AND request.clip_id = $2
+         AND NOT EXISTS (
+           SELECT 1 FROM export_requests child
+           WHERE child.retry_of_request_id = request.id
+         )
+       ORDER BY request.updated_at DESC, request.id DESC
+       LIMIT 11`,
+      [projectId, clipId],
+    );
+  }
+
+  private loadClipLibraryHistory(projectId: string, clipId: string) {
+    return this.database.query<DbRow>(
+      `SELECT success.id AS artifact_version_id,
+              success.result_json, success.result_fingerprint,
+              success.reconciled_at, request.*,
+              count(*) OVER () AS completed_count
+       FROM logged_export_success_results success
+       JOIN export_requests request ON request.id = success.export_request_id
+       WHERE request.project_id = $1 AND request.clip_id = $2
+       ORDER BY success.reconciled_at DESC, success.id DESC
+       LIMIT 5`,
+      [projectId, clipId],
+    );
+  }
+
   private async loadLoggedExportBatchRows(
     projectId: string,
     batchId: string,
@@ -5749,7 +6007,10 @@ export class SharedProjectCatalog {
     requirePermission(result.rows[0]?.role, permission);
   }
 
-  private async transaction<Result>(action: () => Promise<Result>) {
+  private async transaction<Result>(
+    action: () => Promise<Result>,
+    options: { repeatableRead?: boolean } = {},
+  ) {
     const predecessor = this.transactionTail;
     let release!: () => void;
     this.transactionTail = new Promise<void>((resolve) => {
@@ -5757,7 +6018,11 @@ export class SharedProjectCatalog {
     });
     await predecessor;
     try {
-      await this.database.exec("BEGIN");
+      await this.database.exec(
+        options.repeatableRead
+          ? "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY"
+          : "BEGIN",
+      );
       try {
         const result = await action();
         await this.database.exec("COMMIT");

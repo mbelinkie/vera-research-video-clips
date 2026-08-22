@@ -11,6 +11,8 @@ import {
   CancelLoggedExportRequestSchema,
   BatchPreflightRequestSchema,
   ClipLanguageEvidenceV2Schema,
+  ClipLibraryPageSchema,
+  ClipLibraryQuerySchema,
   CreateClipExportRequestSchema,
   CreateLoggedExportBatchRequestSchema,
   CreateTranscriptionBatchRequestSchema,
@@ -34,6 +36,8 @@ import {
   LoggedExportFailureSchema,
   LoggedExportSuccessResultSchema,
   LoggedExportSuccessSchema,
+  LocalClipLibraryPageSchema,
+  UpdateLocalClipLibrarySelectionSchema,
   ProcessAcceptedLoggedExportRequestSchema,
   ProcessAcceptedLoggedExportResponseSchema,
   ReconcileLoggedExportCanceledRequestSchema,
@@ -285,6 +289,94 @@ describe("shared contracts", () => {
       ArtifactVersionSummarySchema.safeParse({
         ...summary,
         localPath: "/private/export.mov",
+      }).success,
+    ).toBe(false);
+  });
+
+  it("bounds project Clip Library pages and keeps local overlays path-free", () => {
+    const request = deliveryContractFixture().request;
+    const clip = {
+      id: request.clipId,
+      projectId: request.projectId,
+      catalogVideoId: "019fbb95-cd76-7920-93fa-e23ba755ee56",
+      video: request.video,
+      selection: request.selection,
+      languageEvidence: { schemaVersion: 1 as const, englishText: "Fixture" },
+      englishText: "Fixture",
+      notes: "Review this quotation",
+      tags: ["Key Quote"],
+      researchStatus: "approved" as const,
+      exportStatus: "queued" as const,
+      createdBy: "019fbb95-cd76-7920-93fa-e23ba755ee57",
+      version: 1,
+      createdAt: now,
+      updatedAt: now,
+    };
+    const page = {
+      projectId: request.projectId,
+      entries: [
+        {
+          clip,
+          currentLeaves: [
+            {
+              requestId: request.id,
+              jobId: request.jobId,
+              state: "queued" as const,
+              requestOrigin: null,
+              updatedAt: now,
+            },
+          ],
+          hasMoreLeaves: false,
+          completedVersionCount: 0,
+          recentArtifactVersions: [],
+        },
+      ],
+      nextCursor: "cursor_value_1",
+      syncCursor: "42",
+      fetchedAt: now,
+    };
+    expect(ClipLibraryPageSchema.parse(page)).toEqual(page);
+    expect(ClipLibraryQuerySchema.parse({ query: "  quote  " })).toEqual({
+      limit: 25,
+      completed: "any",
+      query: "quote",
+    });
+    expect(
+      ClipLibraryQuerySchema.safeParse({ limit: 51, localPath: "/private" })
+        .success,
+    ).toBe(false);
+    const localPage = {
+      ...page,
+      query: { limit: 25, completed: "any" as const },
+      freshness: "stale" as const,
+      cachedAt: now,
+      cacheCoverage: "cached_subset" as const,
+      selectedClipIds: [clip.id],
+      localAvailability: [],
+    };
+    expect(LocalClipLibraryPageSchema.parse(localPage)).toEqual(localPage);
+    expect(
+      UpdateLocalClipLibrarySelectionSchema.parse({
+        pageClipIds: [clip.id],
+        selectedClipIds: [clip.id],
+      }),
+    ).toEqual({ pageClipIds: [clip.id], selectedClipIds: [clip.id] });
+    expect(
+      UpdateLocalClipLibrarySelectionSchema.safeParse({
+        pageClipIds: [clip.id],
+        selectedClipIds: ["019fbb95-cd76-7920-93fa-e23ba755ee58"],
+      }).success,
+    ).toBe(false);
+    expect(
+      LocalClipLibraryPageSchema.safeParse({
+        ...localPage,
+        selectedClipIds: ["019fbb95-cd76-7920-93fa-e23ba755ee58"],
+      }).success,
+    ).toBe(false);
+    expect(
+      LocalClipLibraryPageSchema.safeParse({
+        ...localPage,
+        absoluteRootPath: "/private/exports",
       }).success,
     ).toBe(false);
   });

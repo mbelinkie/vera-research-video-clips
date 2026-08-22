@@ -2620,6 +2620,166 @@ export const ArtifactLocatorListResponseSchema = z
   .object({ locators: z.array(ArtifactLocatorSummarySchema).max(100) })
   .strict();
 
+export const ClipLibraryQuerySchema = z
+  .object({
+    limit: z.coerce.number().int().min(1).max(50).default(25),
+    cursor: z
+      .string()
+      .regex(/^[A-Za-z0-9_-]{10,1024}$/)
+      .optional(),
+    query: z.string().trim().max(200).optional(),
+    tag: ClipTagNameSchema.optional(),
+    researchStatus: ClipResearchStatusSchema.optional(),
+    exportStatus: ClipExportStatusSchema.optional(),
+    completed: z.enum(["any", "yes", "no"]).default("any"),
+  })
+  .strict();
+
+export const ClipLibraryExportLeafSchema = z
+  .object({
+    requestId: IdSchema,
+    jobId: IdSchema,
+    state: JobStateSchema,
+    requestOrigin: ExportRequestOriginSchema.nullable(),
+    retryOfRequestId: IdSchema.optional(),
+    retryOrdinal: z.number().int().positive().optional(),
+    batchItemId: IdSchema.optional(),
+    progress: LoggedExportProgressSnapshotSchema.optional(),
+    updatedAt: UtcTimestampSchema,
+  })
+  .strict();
+
+export const ClipLibraryEntrySchema = z
+  .object({
+    clip: ClipCandidateSchema,
+    currentLeaves: z.array(ClipLibraryExportLeafSchema).max(10),
+    hasMoreLeaves: z.boolean(),
+    completedVersionCount: z.number().int().nonnegative(),
+    recentArtifactVersions: z.array(ArtifactVersionSummarySchema).max(5),
+  })
+  .strict()
+  .superRefine((entry, context) => {
+    if (
+      entry.recentArtifactVersions.some(
+        (version) =>
+          version.projectId !== entry.clip.projectId ||
+          version.clipId !== entry.clip.id,
+      )
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["recentArtifactVersions"],
+        message: "Clip Library history must belong to the exact clip entry.",
+      });
+    }
+    if (entry.completedVersionCount < entry.recentArtifactVersions.length) {
+      context.addIssue({
+        code: "custom",
+        path: ["completedVersionCount"],
+        message: "Recent history cannot exceed the completed-version count.",
+      });
+    }
+  });
+
+export const ClipLibraryPageSchema = z
+  .object({
+    projectId: IdSchema,
+    entries: z.array(ClipLibraryEntrySchema).max(50),
+    nextCursor: z
+      .string()
+      .regex(/^[A-Za-z0-9_-]{10,1024}$/)
+      .optional(),
+    syncCursor: z.string().regex(/^\d+$/),
+    fetchedAt: UtcTimestampSchema,
+  })
+  .strict()
+  .superRefine((page, context) => {
+    if (page.entries.some((entry) => entry.clip.projectId !== page.projectId)) {
+      context.addIssue({
+        code: "custom",
+        path: ["entries"],
+        message: "Clip Library entries must belong to the requested project.",
+      });
+    }
+  });
+
+export const LocalClipLibraryAvailabilitySchema = z
+  .object({
+    artifactVersionId: IdSchema,
+    locators: z.array(ArtifactLocatorSummarySchema).max(100),
+  })
+  .strict()
+  .superRefine((availability, context) => {
+    if (
+      availability.locators.some(
+        (locator) =>
+          locator.artifactVersionId !== availability.artifactVersionId,
+      )
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["locators"],
+        message: "Local availability must match one artifact version.",
+      });
+    }
+  });
+
+export const LocalClipLibraryPageSchema = ClipLibraryPageSchema.extend({
+  query: ClipLibraryQuerySchema,
+  freshness: z.enum(["fresh", "stale"]),
+  cachedAt: UtcTimestampSchema,
+  cacheCoverage: z.literal("cached_subset"),
+  selectedClipIds: z.array(IdSchema).max(50),
+  localAvailability: z.array(LocalClipLibraryAvailabilitySchema).max(250),
+}).superRefine((page, context) => {
+  const clipIds = new Set(page.entries.map((entry) => entry.clip.id));
+  if (page.selectedClipIds.some((clipId) => !clipIds.has(clipId))) {
+    context.addIssue({
+      code: "custom",
+      path: ["selectedClipIds"],
+      message: "Restored Clip Library selection must exist on this page.",
+    });
+  }
+  const artifactVersionIds = new Set(
+    page.entries.flatMap((entry) =>
+      entry.recentArtifactVersions.map((version) => version.artifactVersionId),
+    ),
+  );
+  if (
+    page.localAvailability.some(
+      (availability) => !artifactVersionIds.has(availability.artifactVersionId),
+    )
+  ) {
+    context.addIssue({
+      code: "custom",
+      path: ["localAvailability"],
+      message:
+        "Local availability may include only authorized versions on this page.",
+    });
+  }
+});
+
+export const LocalClipLibrarySelectionSchema = z
+  .object({ selectedClipIds: z.array(IdSchema).max(50) })
+  .strict();
+
+export const UpdateLocalClipLibrarySelectionSchema = z
+  .object({
+    pageClipIds: z.array(IdSchema).max(50),
+    selectedClipIds: z.array(IdSchema).max(50),
+  })
+  .strict()
+  .superRefine((command, context) => {
+    const pageClipIds = new Set(command.pageClipIds);
+    if (command.selectedClipIds.some((clipId) => !pageClipIds.has(clipId))) {
+      context.addIssue({
+        code: "custom",
+        path: ["selectedClipIds"],
+        message: "Selected clips must occur in the visible Clip Library page.",
+      });
+    }
+  });
+
 export function sanitizeLoggedExportFailureCode(value: string): string {
   const sanitized = value
     .trim()
@@ -3174,6 +3334,20 @@ export type VerifyLocalArtifactVersionRequest = z.infer<
 >;
 export type ArtifactLocatorSummary = z.infer<
   typeof ArtifactLocatorSummarySchema
+>;
+export type ClipLibraryQuery = z.infer<typeof ClipLibraryQuerySchema>;
+export type ClipLibraryExportLeaf = z.infer<typeof ClipLibraryExportLeafSchema>;
+export type ClipLibraryEntry = z.infer<typeof ClipLibraryEntrySchema>;
+export type ClipLibraryPage = z.infer<typeof ClipLibraryPageSchema>;
+export type LocalClipLibraryAvailability = z.infer<
+  typeof LocalClipLibraryAvailabilitySchema
+>;
+export type LocalClipLibraryPage = z.infer<typeof LocalClipLibraryPageSchema>;
+export type LocalClipLibrarySelection = z.infer<
+  typeof LocalClipLibrarySelectionSchema
+>;
+export type UpdateLocalClipLibrarySelection = z.infer<
+  typeof UpdateLocalClipLibrarySelectionSchema
 >;
 export type LoggedExportFailureResult = z.infer<
   typeof LoggedExportFailureResultSchema

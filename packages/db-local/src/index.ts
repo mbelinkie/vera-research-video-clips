@@ -8,6 +8,8 @@ import {
   CreateExportOnlyRequestSchema,
   ArtifactLocatorSummarySchema,
   ArtifactRootSummarySchema,
+  ClipLibraryPageSchema,
+  ClipLibraryQuerySchema,
   ExportObservedMediaPropertiesSchema,
   ExportRequestSchema,
   LoggedExportDeliverySchema,
@@ -28,6 +30,8 @@ import {
   type ArtifactRootSummary,
   type ArtifactStoragePlatform,
   type ArtifactVerificationFailureClass,
+  type ClipLibraryPage,
+  type ClipLibraryQuery,
   type DerivedTranslationIdentity,
   type ExportRequest,
   type LoggedExportDelivery,
@@ -3680,6 +3684,295 @@ export class LocalArtifactLocatorRepository {
     return result.changes === 1
       ? this.getLocator(input.rootId, input.artifactVersionId)
       : undefined;
+  }
+}
+
+export type CachedClipLibraryPage = {
+  query: ClipLibraryQuery;
+  page: ClipLibraryPage;
+  cachedAt: string;
+};
+
+export function clipLibraryAuthorizationScope(authorization: string): string {
+  return createHash("sha256").update(authorization).digest("hex");
+}
+
+function clipLibraryCacheKeys(query: ClipLibraryQuery) {
+  const parsed = ClipLibraryQuerySchema.parse(query);
+  return {
+    query: parsed,
+    queryFingerprint: sha256Fingerprint({
+      limit: parsed.limit,
+      query: parsed.query ?? null,
+      tag: parsed.tag ?? null,
+      researchStatus: parsed.researchStatus ?? null,
+      exportStatus: parsed.exportStatus ?? null,
+      completed: parsed.completed,
+    }),
+    cursorKey: parsed.cursor
+      ? createHash("sha256").update(parsed.cursor).digest("hex")
+      : "root",
+  };
+}
+
+export class LocalClipLibraryCacheRepository {
+  constructor(
+    private readonly database: DatabaseSync,
+    private readonly now: () => Date = () => new Date(),
+  ) {}
+
+  storePage(input: {
+    projectId: string;
+    authorizationScopeSha256: string;
+    query: ClipLibraryQuery;
+    page: ClipLibraryPage;
+  }): CachedClipLibraryPage {
+    const page = ClipLibraryPageSchema.parse(input.page);
+    if (page.projectId !== input.projectId) {
+      throw new LocalArtifactCatalogError(
+        "Clip Library page does not match the requested project.",
+      );
+    }
+    const keys = clipLibraryCacheKeys(input.query);
+    const cachedAt = this.now().toISOString();
+    const lastViewedSequence = this.nextViewSequence();
+    this.database
+      .prepare(
+        `INSERT INTO clip_library_cache_pages
+           (project_id, authorization_scope_sha256, query_fingerprint,
+           cursor_key, query_json, response_json, sync_cursor, cached_at,
+           last_viewed_at, last_viewed_sequence)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT (
+           project_id, authorization_scope_sha256, query_fingerprint, cursor_key
+         ) DO UPDATE SET
+           query_json = excluded.query_json,
+           response_json = excluded.response_json,
+           sync_cursor = excluded.sync_cursor,
+           cached_at = excluded.cached_at,
+           last_viewed_at = excluded.last_viewed_at,
+           last_viewed_sequence = excluded.last_viewed_sequence`,
+      )
+      .run(
+        input.projectId,
+        input.authorizationScopeSha256,
+        keys.queryFingerprint,
+        keys.cursorKey,
+        canonicalJson(keys.query),
+        canonicalJson(page),
+        page.syncCursor,
+        cachedAt,
+        cachedAt,
+        lastViewedSequence,
+      );
+    return { query: keys.query, page, cachedAt };
+  }
+
+  getPage(input: {
+    projectId: string;
+    authorizationScopeSha256: string;
+    query: ClipLibraryQuery;
+  }): CachedClipLibraryPage | undefined {
+    const keys = clipLibraryCacheKeys(input.query);
+    const row = this.database
+      .prepare(
+        `SELECT query_json, response_json, cached_at
+         FROM clip_library_cache_pages
+         WHERE project_id = ? AND authorization_scope_sha256 = ?
+           AND query_fingerprint = ? AND cursor_key = ?`,
+      )
+      .get(
+        input.projectId,
+        input.authorizationScopeSha256,
+        keys.queryFingerprint,
+        keys.cursorKey,
+      ) as
+      | { query_json: string; response_json: string; cached_at: string }
+      | undefined;
+    if (row) {
+      this.database
+        .prepare(
+          `UPDATE clip_library_cache_pages
+           SET last_viewed_at = ?, last_viewed_sequence = ?
+           WHERE project_id = ? AND authorization_scope_sha256 = ?
+             AND query_fingerprint = ? AND cursor_key = ?`,
+        )
+        .run(
+          this.now().toISOString(),
+          this.nextViewSequence(),
+          input.projectId,
+          input.authorizationScopeSha256,
+          keys.queryFingerprint,
+          keys.cursorKey,
+        );
+      return {
+        query: ClipLibraryQuerySchema.parse(JSON.parse(row.query_json)),
+        page: ClipLibraryPageSchema.parse(JSON.parse(row.response_json)),
+        cachedAt: row.cached_at,
+      };
+    }
+    return undefined;
+  }
+
+  getLatestPage(
+    projectId: string,
+    authorizationScopeSha256: string,
+  ): CachedClipLibraryPage | undefined {
+    const row = this.database
+      .prepare(
+        `SELECT query_json, response_json, cached_at
+         FROM clip_library_cache_pages
+         WHERE project_id = ? AND authorization_scope_sha256 = ?
+         ORDER BY last_viewed_sequence DESC
+         LIMIT 1`,
+      )
+      .get(projectId, authorizationScopeSha256) as
+      | { query_json: string; response_json: string; cached_at: string }
+      | undefined;
+    return row
+      ? {
+          query: ClipLibraryQuerySchema.parse(JSON.parse(row.query_json)),
+          page: ClipLibraryPageSchema.parse(JSON.parse(row.response_json)),
+          cachedAt: row.cached_at,
+        }
+      : undefined;
+  }
+
+  replaceSelection(input: {
+    projectId: string;
+    authorizationScopeSha256: string;
+    pageClipIds: readonly string[];
+    selectedClipIds: readonly string[];
+  }): string[] {
+    const pageClipIds = [...new Set(input.pageClipIds)];
+    const selectedClipIds = [...new Set(input.selectedClipIds)].slice(0, 50);
+    const now = this.now().toISOString();
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      if (pageClipIds.length) {
+        this.database
+          .prepare(
+            `DELETE FROM clip_library_selected_clips
+             WHERE project_id = ? AND authorization_scope_sha256 = ?
+               AND clip_id IN (${pageClipIds.map(() => "?").join(", ")})`,
+          )
+          .run(input.projectId, input.authorizationScopeSha256, ...pageClipIds);
+      }
+      const insert = this.database.prepare(
+        `INSERT INTO clip_library_selected_clips
+           (project_id, authorization_scope_sha256, clip_id, selected_at)
+         VALUES (?, ?, ?, ?)`,
+      );
+      for (const clipId of selectedClipIds) {
+        insert.run(
+          input.projectId,
+          input.authorizationScopeSha256,
+          clipId,
+          now,
+        );
+      }
+      const completeSelection = this.listSelection(
+        input.projectId,
+        input.authorizationScopeSha256,
+      );
+      if (completeSelection.length > 50) {
+        throw new LocalArtifactCatalogError(
+          "Clip Library selection cannot exceed 50 clips.",
+        );
+      }
+      this.database.exec("COMMIT");
+      return completeSelection;
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  listSelection(projectId: string, authorizationScopeSha256: string): string[] {
+    return (
+      this.database
+        .prepare(
+          `SELECT clip_id FROM clip_library_selected_clips
+           WHERE project_id = ? AND authorization_scope_sha256 = ?
+           ORDER BY selected_at, clip_id`,
+        )
+        .all(projectId, authorizationScopeSha256) as { clip_id: string }[]
+    ).map((row) => row.clip_id);
+  }
+
+  listCachedClipIds(
+    projectId: string,
+    authorizationScopeSha256: string,
+  ): string[] {
+    const rows = this.database
+      .prepare(
+        `SELECT response_json FROM clip_library_cache_pages
+         WHERE project_id = ? AND authorization_scope_sha256 = ?`,
+      )
+      .all(projectId, authorizationScopeSha256) as { response_json: string }[];
+    return [
+      ...new Set(
+        rows.flatMap((row) =>
+          ClipLibraryPageSchema.parse(
+            JSON.parse(row.response_json),
+          ).entries.map((entry) => entry.clip.id),
+        ),
+      ),
+    ];
+  }
+
+  purgeScope(projectId: string, authorizationScopeSha256: string): void {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      this.database
+        .prepare(
+          `DELETE FROM clip_library_cache_pages
+           WHERE project_id = ? AND authorization_scope_sha256 = ?`,
+        )
+        .run(projectId, authorizationScopeSha256);
+      this.database
+        .prepare(
+          `DELETE FROM clip_library_selected_clips
+           WHERE project_id = ? AND authorization_scope_sha256 = ?`,
+        )
+        .run(projectId, authorizationScopeSha256);
+      this.database.exec("COMMIT");
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  purgeAuthorizationScope(authorizationScopeSha256: string): void {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      this.database
+        .prepare(
+          `DELETE FROM clip_library_cache_pages
+           WHERE authorization_scope_sha256 = ?`,
+        )
+        .run(authorizationScopeSha256);
+      this.database
+        .prepare(
+          `DELETE FROM clip_library_selected_clips
+           WHERE authorization_scope_sha256 = ?`,
+        )
+        .run(authorizationScopeSha256);
+      this.database.exec("COMMIT");
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  private nextViewSequence(): number {
+    const row = this.database
+      .prepare(
+        `SELECT coalesce(max(last_viewed_sequence), 0) + 1 AS next
+         FROM clip_library_cache_pages`,
+      )
+      .get() as { next: number };
+    return Number(row.next);
   }
 }
 

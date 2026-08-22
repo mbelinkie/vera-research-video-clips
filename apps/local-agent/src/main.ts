@@ -5,6 +5,8 @@ import { loadConfig } from "@research-video/config";
 import {
   ExportSettingsPreviewSchema,
   ArtifactVersionSummarySchema,
+  ClipLibraryPageSchema,
+  ClipLibraryQuerySchema,
   ClaimLoggedExportDeliveryResponseSchema,
   LoggedExportDeliverySchema,
   LoggedExportFailureSchema,
@@ -13,10 +15,12 @@ import {
   HeartbeatLoggedExportExecutionResponseSchema,
   LoggedExportSuccessSchema,
   RegisteredExportWorkerSchema,
+  type ClipLibraryQuery,
 } from "@research-video/contracts";
 import {
   LocalExportQueue,
   LocalArtifactLocatorRepository,
+  LocalClipLibraryCacheRepository,
   LocalExportWorkerIdentityRepository,
   LocalTranscriptIndex,
   openLocalDatabase,
@@ -41,6 +45,7 @@ import {
 
 import { createLocalAgent } from "./app.ts";
 import { LocalArtifactLocatorService } from "./artifact-locators.ts";
+import { LocalClipLibraryService } from "./clip-library.ts";
 import { runLocalSourceScratchSweep } from "./export-scratch-sweeper.ts";
 import {
   discardCompletedLoggedExportForCancellation,
@@ -55,8 +60,13 @@ await mkdir(managedExportRoot, { recursive: true });
 const database = openLocalDatabase(join(config.dataDir, "local.sqlite"));
 runLocalMigrations(database);
 const exportQueue = new LocalExportQueue(database);
+const artifactLocatorRepository = new LocalArtifactLocatorRepository(database);
 const artifactLocators = new LocalArtifactLocatorService(
-  new LocalArtifactLocatorRepository(database),
+  artifactLocatorRepository,
+);
+const clipLibrary = new LocalClipLibraryService(
+  new LocalClipLibraryCacheRepository(database),
+  artifactLocatorRepository,
 );
 await artifactLocators.configureRoot({
   label: "Managed exports",
@@ -95,6 +105,22 @@ const reader = new CachedTranscriptDocumentReader(
 );
 const cloudApiUrl = `http://${config.cloudApiHost}:${config.cloudApiPort}`;
 const app = createLocalAgent({
+  resolveClipLibrary: ({ projectId, authorization, query }) =>
+    clipLibrary.resolvePage({
+      projectId,
+      authorization,
+      query,
+      fetchCloud: () => callCloudClipLibrary(projectId, query, authorization),
+    }),
+  resolveLatestClipLibrary: ({ projectId, authorization }) =>
+    clipLibrary.resolveLatestPage({
+      projectId,
+      authorization,
+      fetchCloud: (query) =>
+        callCloudClipLibrary(projectId, query, authorization),
+    }),
+  updateClipLibrarySelection: ({ projectId, authorization, command }) =>
+    clipLibrary.updateSelection({ projectId, authorization, command }),
   resolveArtifactVersion: async ({
     projectId,
     clipId,
@@ -302,6 +328,49 @@ async function callCloudArtifactVersion(
     );
   }
   return ArtifactVersionSummarySchema.parse(payload);
+}
+
+async function callCloudClipLibrary(
+  projectId: string,
+  query: ClipLibraryQuery,
+  authorization: string,
+) {
+  const parsed = ClipLibraryQuerySchema.parse(query);
+  const parameters = new URLSearchParams({
+    limit: String(parsed.limit),
+    completed: parsed.completed,
+  });
+  if (parsed.cursor) parameters.set("cursor", parsed.cursor);
+  if (parsed.query) parameters.set("query", parsed.query);
+  if (parsed.tag) parameters.set("tag", parsed.tag);
+  if (parsed.researchStatus)
+    parameters.set("researchStatus", parsed.researchStatus);
+  if (parsed.exportStatus) parameters.set("exportStatus", parsed.exportStatus);
+  let response: Response;
+  try {
+    response = await fetch(
+      `${cloudApiUrl}/api/projects/${projectId}/clip-library?${parameters}`,
+      { headers: { authorization } },
+    );
+  } catch {
+    throw Object.assign(new Error("Cloud Clip Library is unreachable."), {
+      code: "cloud_unreachable",
+      statusCode: 503,
+    });
+  }
+  const payload = await response.json().catch(() => undefined);
+  if (!response.ok) {
+    const remote = payload as
+      { error?: { code?: string; message?: string } } | undefined;
+    throw Object.assign(
+      new Error(remote?.error?.message ?? "Cloud Clip Library request failed."),
+      {
+        statusCode: response.status,
+        code: remote?.error?.code ?? "clip_library_cloud_failed",
+      },
+    );
+  }
+  return ClipLibraryPageSchema.parse(payload);
 }
 
 async function callCloudLoggedExportDeliveryClaim(

@@ -594,6 +594,53 @@ test("maps transcript text selection to stable source and export bounds", async 
     return route.fulfill({ status: 404, json: { error: "not found" } });
   });
   await page.route(
+    "**/local-agent/api/projects/*/clip-library**",
+    async (route) => {
+      const request = route.request();
+      const path = new URL(request.url()).pathname;
+      const projectId = path.split("/")[4]!;
+      if (path.endsWith("/selection")) {
+        return route.fulfill({
+          json: {
+            selectedClipIds: request.postDataJSON().selectedClipIds,
+          },
+        });
+      }
+      const entries =
+        projectId === createdProjectId && loggedClip
+          ? [
+              {
+                clip: loggedClip,
+                currentLeaves: [],
+                hasMoreLeaves: false,
+                completedVersionCount: 0,
+                recentArtifactVersions: [],
+              },
+            ]
+          : [];
+      return route.fulfill({
+        json: {
+          projectId,
+          entries,
+          syncCursor: "1",
+          fetchedAt: now,
+          query: {
+            limit: Number(
+              new URL(request.url()).searchParams.get("limit") ?? 25,
+            ),
+            completed:
+              new URL(request.url()).searchParams.get("completed") ?? "any",
+          },
+          freshness: "fresh",
+          cachedAt: now,
+          cacheCoverage: "cached_subset",
+          selectedClipIds: [],
+          localAvailability: [],
+        },
+      });
+    },
+  );
+  await page.route(
     "**/local-agent/api/export-settings/preview",
     async (route) => {
       const preview = settingsPreview(
@@ -753,7 +800,7 @@ test("maps transcript text selection to stable source and export bounds", async 
   await expect(page.getByRole("button", { name: "Logged" })).toBeDisabled();
   expect(clipPostCount).toBe(1);
 
-  const clipQueue = page.getByRole("article", { name: /clip queue/i });
+  const clipQueue = page.getByRole("article", { name: /clip library/i });
   await clipQueue.getByRole("button", { name: "Refresh" }).click();
   await expect(clipQueue).toContainText("YouTube IFrame API demo");
   await expect(clipQueue).toContainText(
@@ -769,8 +816,10 @@ test("maps transcript text selection to stable source and export bounds", async 
   await clipQueue.getByRole("button", { name: "Save clip" }).click();
   await expect(clipQueue).toContainText("Clip notes and tags saved.");
   await clipQueue.getByLabel("Filter tag").selectOption("Theme: Institutions");
+  await clipQueue.getByRole("button", { name: "Apply cloud filters" }).click();
   await expect(clipQueue).toContainText("Use this in the revised opening.");
   await clipQueue.getByLabel("Search clips").fill("institutions");
+  await clipQueue.getByRole("button", { name: "Apply cloud filters" }).click();
   await expect(clipQueue).toContainText("YouTube IFrame API demo");
   await clipQueue.getByRole("button", { name: "Export CSV" }).click();
   await expect(clipQueue).toContainText(
