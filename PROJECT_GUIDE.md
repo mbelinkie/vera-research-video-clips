@@ -2,7 +2,7 @@
 
 ## Project guide and implementation plan
 
-Status: Milestones 1–4 core workflow complete; preferred-language logging, local export capabilities, authorized logged-export reconciliation, cleanup recovery, immutable retry, exact execution ownership, durable progress, isolated batch export, same-source grouping, and the deterministic 30-second foreign fixture gate are verified through M5-25; the authorized live smoke and final Milestone 5 matrix remain open
+Status: Milestones 1–4 core workflow complete; preferred-language logging, local export capabilities, authorized logged-export reconciliation, cleanup recovery, immutable retry, exact execution ownership, durable progress, isolated batch export, same-source grouping, the deterministic 30-second foreign fixture gate, and the opt-in authorized live YouTube smoke are verified through M5-26; the final Milestone 5 matrix remains open
 Last updated: 2026-08-22
 
 This document is the source of truth for product scope, architecture, sequencing, and acceptance criteria. Update it when a deliberate product or architectural decision changes. Use `outline.md` as the shorter execution checklist.
@@ -1638,6 +1638,31 @@ tests with one declared skip, the web build, 24 local and 19 cloud migrations,
 plus four Playwright flows. The explicitly user-authorized live YouTube smoke
 and final Milestone 5 matrix remain open; synthetic media is not live-provider
 or acoustic-language proof.
+
+M5-26 completed 2026-08-22. A dormant `export:live-smoke` command now wraps the
+existing persisted one-shot processor and refuses provider access unless every
+invocation supplies both explicit authorization flags, an external strict
+rights-cleared descriptor, the configured yt-dlp provider, and working yt-dlp,
+FFmpeg, and FFprobe tools. The descriptor binds one non-English original track
+to one English derivative with exact versions, segment linkage, cue coverage,
+and a one-to-thirty-second range; it admits no credentials, cookies, tokens, or
+local paths. The command creates one private workspace, delegates once to the
+existing executor, verifies real media, exact descriptor-derived SRT cues,
+metadata/manifest provenance, every promoted byte hash, persisted terminal
+state, and source-scratch absence, then deletes the entire workspace before
+emitting only bounded sanitized evidence. Abort propagation and signal handling
+await source/process cleanup, and the network-free suite covers direct-call
+authorization, deep descriptor rejection, containment, real offline
+verification, tamper detection, and interruption cleanup. After separate user
+authorization, the installed yt-dlp was upgraded from `2025.04.30` to official
+stable `2026.08.19`, and one exact 15-second live foreign-language export passed:
+H.264/AAC at 852x480, six original plus six English cues clamped to 0–15,000 ms,
+six hashed final artifacts, verified absent source scratch, and verified removed
+temporary workspace. The external descriptor and caption inputs were deleted
+after the run and no source identity, URL, transcript text, raw provider output,
+or credential was retained. The aggregate implementation gate passes 268 tests
+with one declared skip, the web build, 24 local and 19 cloud migrations, plus
+four Playwright flows. Only the final recorded Milestone 5 matrix remains open.
 
 M5-09 completed 2026-08-19. Every promoted clip package now also contains one
 `manifest.json`, written into attempt-private staging and promoted through the
