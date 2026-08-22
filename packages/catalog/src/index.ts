@@ -4,6 +4,9 @@ import type { PGlite } from "@electric-sql/pglite";
 import { AuthorizationError, requirePermission } from "@research-video/auth";
 import {
   ActiveTranscriptBundleSchema,
+  ArtifactVersionHistoryResponseSchema,
+  ArtifactVersionHistoryQuerySchema,
+  ArtifactVersionSummarySchema,
   AcceptLoggedExportDeliveryRequestSchema,
   CancelLoggedExportRequestSchema,
   CancelLoggedExportResponseSchema,
@@ -67,6 +70,8 @@ import {
   languagesEquivalent,
   primaryLanguage,
   type ActiveTranscriptBundle,
+  type ArtifactVersionHistoryQuery,
+  type ArtifactVersionHistoryResponse,
   type AcceptLoggedExportDeliveryRequest,
   type CancelLoggedExportRequest,
   type CancelLoggedExportResponse,
@@ -2810,6 +2815,7 @@ export class SharedProjectCatalog {
       const payload = {
         exportRequestId: requestId,
         mode: "logged",
+        requestOrigin: input.requestOrigin ?? "selection_action",
         clipId,
         video: clip.video,
         selection: clip.selection,
@@ -2831,8 +2837,9 @@ export class SharedProjectCatalog {
         `INSERT INTO export_requests
             (id, job_id, clip_id, project_id, mode, video_snapshot,
             selection_snapshot, source_language_class, subtitle_tracks_snapshot, preset_snapshot,
-            resolved_settings_snapshot, requested_by, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, 'logged', $5, $6, $7, $8, $9, $10, $11, $12, $12)`,
+            resolved_settings_snapshot, requested_by, request_origin,
+            created_at, updated_at)
+         VALUES ($1, $2, $3, $4, 'logged', $5, $6, $7, $8, $9, $10, $11, $12, $13, $13)`,
         [
           requestId,
           jobId,
@@ -2845,6 +2852,7 @@ export class SharedProjectCatalog {
           JSON.stringify(preset),
           JSON.stringify(preview.snapshot),
           actor.userId,
+          input.requestOrigin ?? "selection_action",
           now,
         ],
       );
@@ -2884,7 +2892,14 @@ export class SharedProjectCatalog {
   ): Promise<LoggedExportBatch> {
     await this.requireRegistered(actor);
     const parsed = CreateLoggedExportBatchRequestSchema.parse(input);
-    const requestFingerprint = sha256Fingerprint(parsed);
+    const requestFingerprint = sha256Fingerprint({
+      ...parsed,
+      items: parsed.items.map(({ clipId, export: itemExport }) => {
+        const { requestOrigin: _diagnosticOrigin, ...compatibleExport } =
+          itemExport;
+        return { clipId, export: compatibleExport };
+      }),
+    });
     const now = this.now().toISOString();
     let batchId: string | undefined;
 
@@ -3013,6 +3028,7 @@ export class SharedProjectCatalog {
         const payload = {
           exportRequestId: requestId,
           mode: "logged",
+          requestOrigin: resolved.input.requestOrigin ?? "selection_action",
           clipId: resolved.clip.id,
           batchItemId,
           video: resolved.clip.video,
@@ -3042,10 +3058,11 @@ export class SharedProjectCatalog {
              (id, job_id, clip_id, project_id, mode, video_snapshot,
               selection_snapshot, source_language_class,
               subtitle_tracks_snapshot, preset_snapshot,
-              resolved_settings_snapshot, requested_by, batch_item_id,
+              resolved_settings_snapshot, requested_by, request_origin,
+              batch_item_id,
               created_at, updated_at)
-           VALUES ($1, $2, $3, $4, 'logged', $5, $6, $7, $8, $9, $10,
-                   $11, $12, $13, $13)`,
+         VALUES ($1, $2, $3, $4, 'logged', $5, $6, $7, $8, $9, $10,
+                   $11, $12, $13, $14, $14)`,
           [
             requestId,
             jobId,
@@ -3060,6 +3077,7 @@ export class SharedProjectCatalog {
             JSON.stringify(resolved.preset),
             JSON.stringify(resolved.snapshot),
             actor.userId,
+            resolved.input.requestOrigin ?? "selection_action",
             batchItemId,
             now,
           ],
@@ -3242,6 +3260,7 @@ export class SharedProjectCatalog {
       const payload = {
         exportRequestId: requestId,
         mode: "logged",
+        requestOrigin: parent.requestOrigin,
         clipId: parent.clipId!,
         video: parent.video,
         selection: parent.selection,
@@ -3292,13 +3311,14 @@ export class SharedProjectCatalog {
             selection_snapshot, source_language_class,
             subtitle_tracks_snapshot, preset_snapshot,
             resolved_settings_snapshot, requested_by, retry_of_request_id,
-            retry_ordinal, retry_idempotency_key, batch_item_id,
+            retry_ordinal, retry_idempotency_key, request_origin, batch_item_id,
             created_at, updated_at)
          SELECT $1, $2, parent.clip_id, parent.project_id, parent.mode,
                 parent.video_snapshot, parent.selection_snapshot,
                 parent.source_language_class, parent.subtitle_tracks_snapshot,
                 parent.preset_snapshot, parent.resolved_settings_snapshot,
-                $3, parent.id, $4, $5, parent.batch_item_id, $6, $6
+                $3, parent.id, $4, $5, parent.request_origin,
+                parent.batch_item_id, $6, $6
          FROM export_requests parent
          WHERE parent.id = $7
          ON CONFLICT DO NOTHING
@@ -3360,6 +3380,65 @@ export class SharedProjectCatalog {
     }
     return RetryLoggedExportResponseSchema.parse({
       request: mapLoggedExportRequest(retried),
+    });
+  }
+
+  async listArtifactVersionHistory(
+    actor: AuthenticatedActor,
+    projectId: string,
+    clipId: string,
+    query: ArtifactVersionHistoryQuery,
+  ): Promise<ArtifactVersionHistoryResponse> {
+    await this.authorize(actor, projectId, "read");
+    const parsedQuery = ArtifactVersionHistoryQuerySchema.parse(query);
+    const clip = await this.database.query<{ id: string }>(
+      "SELECT id FROM clip_candidates WHERE id = $1 AND project_id = $2",
+      [clipId, projectId],
+    );
+    if (!clip.rows[0]) {
+      throw new CatalogNotFoundError("Clip candidate not found.");
+    }
+
+    let cursorCompletedAt: string | undefined;
+    if (parsedQuery.cursor) {
+      const cursor = await this.database.query<DbRow>(
+        `SELECT success.reconciled_at
+         FROM logged_export_success_results success
+         JOIN export_requests request ON request.id = success.export_request_id
+         WHERE success.id = $1 AND request.project_id = $2 AND request.clip_id = $3`,
+        [parsedQuery.cursor, projectId, clipId],
+      );
+      if (!cursor.rows[0]) {
+        throw new CatalogNotFoundError("Artifact history cursor not found.");
+      }
+      cursorCompletedAt = iso(cursor.rows[0].reconciled_at);
+    }
+
+    const result = await this.database.query<DbRow>(
+      `SELECT success.id AS artifact_version_id,
+              success.result_json, success.result_fingerprint,
+              success.reconciled_at, request.*
+       FROM logged_export_success_results success
+       JOIN export_requests request ON request.id = success.export_request_id
+       WHERE request.project_id = $1 AND request.clip_id = $2
+         AND ($3::timestamptz IS NULL OR
+              (success.reconciled_at, success.id) < ($3::timestamptz, $4::uuid))
+       ORDER BY success.reconciled_at DESC, success.id DESC
+       LIMIT $5`,
+      [
+        projectId,
+        clipId,
+        cursorCompletedAt ?? null,
+        parsedQuery.cursor ?? null,
+        parsedQuery.limit + 1,
+      ],
+    );
+    const page = result.rows.slice(0, parsedQuery.limit);
+    return ArtifactVersionHistoryResponseSchema.parse({
+      versions: page.map(mapArtifactVersionSummary),
+      ...(result.rows.length > parsedQuery.limit && page.length
+        ? { nextCursor: String(page[page.length - 1]!.artifact_version_id) }
+        : {}),
     });
   }
 
@@ -5891,6 +5970,7 @@ function assertLoggedExportRetryParentEvidence(
   const expectedPayload = {
     exportRequestId: request.id,
     mode: "logged",
+    ...(request.requestOrigin ? { requestOrigin: request.requestOrigin } : {}),
     clipId: request.clipId,
     video: request.video,
     selection: request.selection,
@@ -6263,6 +6343,9 @@ function mapLoggedExportRequest(row: DbRow): ExportRequest {
     id: row.id,
     jobId: row.job_id,
     mode: row.mode,
+    ...(row.request_origin
+      ? { requestOrigin: String(row.request_origin) }
+      : {}),
     projectId: row.project_id,
     clipId: row.clip_id,
     ...(row.retry_of_request_id
@@ -6304,6 +6387,56 @@ function mapLoggedExportRequest(row: DbRow): ExportRequest {
     state: row.state,
     createdAt: iso(row.created_at),
     updatedAt: iso(row.updated_at),
+  });
+}
+
+function mapArtifactVersionSummary(row: DbRow) {
+  const result = LoggedExportSuccessResultSchema.parse(
+    typeof row.result_json === "string"
+      ? JSON.parse(row.result_json)
+      : row.result_json,
+  );
+  const manifest = result.artifacts.find(
+    (artifact) => artifact.role === "manifest_json",
+  );
+  if (!manifest) {
+    throw new CatalogConflictError(
+      "Immutable export history is missing its manifest artifact identity.",
+    );
+  }
+  const packageIdentity = result.artifacts[0]!.packageIdentity;
+  return ArtifactVersionSummarySchema.parse({
+    artifactVersionId: row.artifact_version_id,
+    requestId: row.id,
+    jobId: row.job_id,
+    projectId: row.project_id,
+    clipId: row.clip_id,
+    requestOrigin: row.request_origin ? String(row.request_origin) : null,
+    ...(row.retry_of_request_id
+      ? {
+          retryOfRequestId: row.retry_of_request_id,
+          retryOrdinal: Number(row.retry_ordinal),
+        }
+      : {}),
+    ...(row.batch_item_id ? { batchItemId: row.batch_item_id } : {}),
+    packageIdentity,
+    video: row.video_snapshot,
+    selection: row.selection_snapshot,
+    sourceLanguageClass: row.source_language_class,
+    ...(row.subtitle_tracks_snapshot
+      ? { subtitleTracks: row.subtitle_tracks_snapshot }
+      : {}),
+    resolvedSettingsSnapshot: row.resolved_settings_snapshot,
+    artifacts: result.artifacts,
+    manifest: {
+      contentSha256: manifest.contentSha256,
+      // M5 success lineage stores the manifest hash but no verified schema
+      // number. M6-02 may enrich local availability after reading the bytes;
+      // cloud history must not guess.
+      schemaVersion: "unknown",
+    },
+    resultFingerprint: row.result_fingerprint,
+    completedAt: iso(row.reconciled_at),
   });
 }
 

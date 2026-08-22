@@ -120,6 +120,7 @@ export function ExportBatchPanel(props: {
             clipId: clip.id,
             export: {
               idempotencyKey: `batch-item:${index}:${clip.id}`,
+              requestOrigin: "selection_action",
               sourceLanguageClass,
               ...(sourceLanguageClass === "confirmed_english"
                 ? {}

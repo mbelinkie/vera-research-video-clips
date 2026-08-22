@@ -6,6 +6,7 @@ import type { SharedProjectCatalog } from "@research-video/catalog";
 import {
   AddProjectMemberRequestSchema,
   AcceptLoggedExportDeliveryRequestSchema,
+  ArtifactVersionHistoryQuerySchema,
   CancelLoggedExportRequestSchema,
   AddProjectVideoRequestSchema,
   BatchPreflightRequestSchema,
@@ -554,6 +555,21 @@ export function createCloudApi(
       clipId,
     );
   });
+
+  app.get(
+    "/api/projects/:projectId/clips/:clipId/artifact-versions",
+    async (request) => {
+      const { projectId, clipId } = ProjectClipParamsSchema.parse(
+        request.params,
+      );
+      return catalog.listArtifactVersionHistory(
+        await authenticate(request),
+        projectId,
+        clipId,
+        ArtifactVersionHistoryQuerySchema.parse(request.query),
+      );
+    },
+  );
 
   app.patch("/api/projects/:projectId/clips/:clipId", async (request) => {
     const { projectId, clipId } = ProjectClipParamsSchema.parse(request.params);

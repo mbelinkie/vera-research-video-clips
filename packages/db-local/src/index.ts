@@ -218,6 +218,7 @@ export class LocalExportQueue {
           JSON.stringify({
             exportRequestId: requestId,
             mode: "export_only",
+            requestOrigin: request.requestOrigin ?? "selection_action",
             video: request.video,
             selection: request.selection,
             sourceLanguageClass: request.sourceLanguageClass,
@@ -227,14 +228,16 @@ export class LocalExportQueue {
           now,
           now,
         );
+      const originColumn = this.hasRequestOriginColumn();
       this.database
         .prepare(
           `INSERT INTO export_requests
              (id, job_id, mode, video_snapshot_json,
               selection_snapshot_json, source_language_class,
               preset_snapshot_json, resolved_settings_snapshot_json,
-              subtitle_tracks_snapshot_json, created_at, updated_at)
-           VALUES (?, ?, 'export_only', ?, ?, ?, ?, ?, ?, ?, ?)`,
+              subtitle_tracks_snapshot_json${originColumn ? ", request_origin" : ""},
+              created_at, updated_at)
+           VALUES (?, ?, 'export_only', ?, ?, ?, ?, ?, ?${originColumn ? ", ?" : ""}, ?, ?)`,
         )
         .run(
           requestId,
@@ -245,6 +248,9 @@ export class LocalExportQueue {
           presetSnapshot,
           resolvedSettingsSnapshotJson,
           subtitleTracksSnapshot,
+          ...(originColumn
+            ? [request.requestOrigin ?? "selection_action"]
+            : []),
           now,
           now,
         );
@@ -305,6 +311,9 @@ export class LocalExportQueue {
           JSON.stringify({
             exportRequestId: request.id,
             mode: "logged",
+            ...(request.requestOrigin
+              ? { requestOrigin: request.requestOrigin }
+              : {}),
             projectId: request.projectId,
             clipId: request.clipId,
             video: request.video,
@@ -322,6 +331,7 @@ export class LocalExportQueue {
           request.createdAt,
           request.updatedAt,
         );
+      const originColumn = this.hasRequestOriginColumn();
       this.database
         .prepare(
           `INSERT INTO export_requests
@@ -331,13 +341,16 @@ export class LocalExportQueue {
               cloud_project_id, cloud_clip_id, cloud_delivery_id,
               cloud_delivery_generation, cloud_reservation_token,
               cloud_worker_id, cloud_worker_epoch, cloud_reserved_at,
-              cloud_reservation_expires_at, cloud_delivery_state,
+              cloud_reservation_expires_at, cloud_delivery_state
+              ${originColumn ? ", request_origin" : ""},
               created_at, updated_at)
            VALUES ($id, $jobId, $mode, $video, $selection, $sourceLanguage,
                    $preset, $resolved, $subtitleTracks, $projectId, $clipId,
                    $deliveryId, $generation, $reservationToken, $workerId,
                    $workerEpoch, $reservedAt, $reservationExpiresAt,
-                   'pending_acceptance', $createdAt, $updatedAt)`,
+                   'pending_acceptance'
+                   ${originColumn ? ", $requestOrigin" : ""},
+                   $createdAt, $updatedAt)`,
         )
         .run({
           $id: request.id,
@@ -360,6 +373,9 @@ export class LocalExportQueue {
           $workerEpoch: delivery.workerEpoch,
           $reservedAt: delivery.reservedAt,
           $reservationExpiresAt: delivery.reservationExpiresAt,
+          ...(originColumn
+            ? { $requestOrigin: request.requestOrigin ?? null }
+            : {}),
           $createdAt: request.createdAt,
           $updatedAt: request.updatedAt,
         });
@@ -3134,6 +3150,14 @@ export class LocalExportQueue {
     );
   }
 
+  private hasRequestOriginColumn(): boolean {
+    return (
+      this.database
+        .prepare("PRAGMA table_info(export_requests)")
+        .all() as Array<{ name: string }>
+    ).some((column) => column.name === "request_origin");
+  }
+
   private assertExactLoggedDelivery(
     row: Record<string, unknown>,
     delivery: LoggedExportDelivery,
@@ -3166,6 +3190,7 @@ export class LocalExportQueue {
       id: existing.id,
       jobId: existing.jobId,
       mode: existing.mode,
+      requestOrigin: existing.requestOrigin,
       projectId: existing.projectId,
       clipId: existing.clipId,
       video: existing.video,
@@ -3181,6 +3206,7 @@ export class LocalExportQueue {
       id: request.id,
       jobId: request.jobId,
       mode: request.mode,
+      requestOrigin: request.requestOrigin,
       projectId: request.projectId,
       clipId: request.clipId,
       video: request.video,
@@ -3512,6 +3538,9 @@ function mapLocalExportRequest(
     id: row.id,
     jobId: row.job_id,
     mode: row.cloud_delivery_state ? "logged" : row.mode,
+    ...(row.request_origin
+      ? { requestOrigin: String(row.request_origin) }
+      : {}),
     ...(row.cloud_delivery_state
       ? {
           projectId: row.cloud_project_id,

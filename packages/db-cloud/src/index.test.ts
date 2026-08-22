@@ -13,6 +13,8 @@ import { fileURLToPath } from "node:url";
 import { PGlite } from "@electric-sql/pglite";
 import { afterEach, describe, expect, it } from "vitest";
 
+import { LoggedExportSuccessResultSchema } from "../../contracts/src/index.ts";
+
 import { runCloudMigrations } from "./index.ts";
 
 const databases = new Set<PGlite>();
@@ -54,8 +56,25 @@ describe("cloud migrations", () => {
       "0017_logged_export_safe_cancellation",
       "0018_logged_export_execution_progress",
       "0019_logged_export_batches",
+      "0020_export_request_origin",
     ]);
     expect(await runCloudMigrations(database)).toEqual([]);
+    expect(
+      (
+        await database.query<{ column_name: string }>(
+          `SELECT column_name FROM information_schema.columns
+           WHERE table_name = 'export_requests' AND column_name = 'request_origin'`,
+        )
+      ).rows,
+    ).toEqual([{ column_name: "request_origin" }]);
+    expect(
+      (
+        await database.query<{ table_name: string }>(
+          `SELECT table_name FROM information_schema.tables
+           WHERE table_name IN ('artifact_versions', 'export_artifact_versions')`,
+        )
+      ).rows,
+    ).toEqual([]);
     const result = await database.query<{ table_name: string }>(
       "SELECT table_name FROM information_schema.tables WHERE table_name = 'transcription_batch_items'",
     );
@@ -474,6 +493,167 @@ describe("cloud migrations", () => {
         )
       ).rows,
     ).toHaveLength(1);
+    const projectId = randomUUID();
+    const videoId = randomUUID();
+    const clipId = randomUUID();
+    const jobId = randomUUID();
+    const requestId = randomUUID();
+    const deliveryId = randomUUID();
+    const successId = randomUUID();
+    await database.query(
+      `INSERT INTO projects (id, name, created_by, created_at, updated_at)
+       VALUES ($1, 'Legacy history', $2, $3, $3)`,
+      [projectId, userId, at],
+    );
+    await database.query(
+      `INSERT INTO videos (id, youtube_video_id, title, created_at)
+       VALUES ($1, 'LegacyM6History', 'Legacy history', $2)`,
+      [videoId, at],
+    );
+    await database.query(
+      `INSERT INTO clip_candidates
+         (id, project_id, video_id, youtube_video_id, canonical_url,
+          video_title, idempotency_key, transcript_track_id,
+          transcript_version, first_segment_id, last_segment_id,
+          transcript_start_ms, transcript_end_ms, export_start_ms,
+          export_end_ms, timing_precision, english_text, export_status,
+          created_by, created_at, updated_at)
+       VALUES ($1, $2, $3, 'LegacyM6History',
+               'https://www.youtube.com/watch?v=LegacyM6History',
+               'Legacy history', 'legacy-history-clip', $4, 1, $5, $6,
+               0, 1000, 0, 1000, 'cue', 'Legacy selection', 'complete',
+               $7, $8, $8)`,
+      [
+        clipId,
+        projectId,
+        videoId,
+        randomUUID(),
+        randomUUID(),
+        randomUUID(),
+        userId,
+        at,
+      ],
+    );
+    await database.query(
+      `INSERT INTO jobs
+         (id, project_id, kind, state, idempotency_key, attempt, payload,
+          created_at, updated_at)
+       VALUES ($1, $2, 'export', 'complete', 'legacy-history-job', 0,
+               '{}'::jsonb, $3, $3)`,
+      [jobId, projectId, at],
+    );
+    await database.query(
+      `INSERT INTO export_requests
+         (id, job_id, clip_id, project_id, mode, video_snapshot,
+          selection_snapshot, source_language_class, preset_snapshot,
+          resolved_settings_snapshot, requested_by, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, 'logged', '{}'::jsonb, '{}'::jsonb,
+               'confirmed_english', '{}'::jsonb, '{}'::jsonb, $5, $6, $6)`,
+      [requestId, jobId, clipId, projectId, userId, at],
+    );
+    await database.query(
+      `INSERT INTO logged_export_deliveries
+         (id, export_request_id, generation, reservation_token, worker_id,
+          worker_epoch, reserved_at, reservation_expires_at, accepted_at,
+          created_at, updated_at)
+       VALUES ($1, $2, 1, $3, $4, 7, $5, $6, $5, $5, $5)`,
+      [
+        deliveryId,
+        requestId,
+        randomUUID(),
+        workerId,
+        at,
+        "2026-08-20T12:00:30.000Z",
+      ],
+    );
+    await database.query(
+      `INSERT INTO logged_export_success_results
+         (id, export_request_id, delivery_id, delivery_generation, worker_id,
+          worker_epoch, result_schema_version, result_json,
+          result_fingerprint, reconciled_at)
+       VALUES ($1, $2, $3, 1, $4, 7, 1, $5::jsonb, $6, $7)`,
+      [
+        successId,
+        requestId,
+        deliveryId,
+        workerId,
+        JSON.stringify(
+          legacyLoggedExportSuccessResult({
+            requestId,
+            jobId,
+            projectId,
+            clipId,
+            trackId: randomUUID(),
+            validatedAt: at,
+          }),
+        ),
+        "b".repeat(64),
+        at,
+      ],
+    );
+    const legacySuccess = (
+      await database.query<Record<string, unknown>>(
+        "SELECT * FROM logged_export_success_results WHERE id = $1",
+        [successId],
+      )
+    ).rows[0];
+    copyFileSync(
+      resolve(cloudMigrationDirectory, "0020_export_request_origin.sql"),
+      join(migrations, "0020_export_request_origin.sql"),
+    );
+    expect(await runCloudMigrations(database, migrations)).toEqual([
+      "0020_export_request_origin",
+    ]);
+    expect(
+      (
+        await database.query<{ request_origin: string | null }>(
+          "SELECT request_origin FROM export_requests WHERE id = $1",
+          [requestId],
+        )
+      ).rows[0],
+    ).toEqual({ request_origin: null });
+    expect(
+      LoggedExportSuccessResultSchema.parse(legacySuccess!.result_json),
+    ).toMatchObject({
+      requestId,
+      jobId,
+      projectId,
+      clipId,
+      artifacts: expect.arrayContaining([
+        expect.objectContaining({ role: "manifest_json" }),
+      ]),
+    });
+    expect(
+      (
+        await database.query(
+          "SELECT * FROM logged_export_success_results WHERE id = $1",
+          [successId],
+        )
+      ).rows[0],
+    ).toEqual(legacySuccess);
+    await expect(
+      database.query(
+        "UPDATE export_requests SET request_origin = 'selection_action' WHERE id = $1",
+        [requestId],
+      ),
+    ).rejects.toThrow(/immutable/u);
+    await expect(
+      database.query(
+        "DELETE FROM logged_export_success_results WHERE id = $1",
+        [successId],
+      ),
+    ).rejects.toThrow(/immutable history/u);
+    await expect(
+      database.query("DELETE FROM export_requests WHERE id = $1", [requestId]),
+    ).rejects.toThrow(/immutable history/u);
+    expect(
+      (
+        await database.query<{ count: string }>(
+          "SELECT count(*)::text AS count FROM logged_export_success_results WHERE id = $1",
+          [successId],
+        )
+      ).rows[0]!.count,
+    ).toBe("1");
   });
 
   it("enforces preset ownership, scope names, fixed defaults, and immutable revisions", async () => {
@@ -542,3 +722,103 @@ describe("cloud migrations", () => {
     ).rejects.toThrow(/immutable/u);
   });
 });
+
+function legacyLoggedExportSuccessResult(input: {
+  requestId: string;
+  jobId: string;
+  projectId: string;
+  clipId: string;
+  trackId: string;
+  validatedAt: string;
+}) {
+  const packageIdentity = `clip-${input.requestId}`;
+  const artifact = (role: string, digit: string) => ({
+    role,
+    packageIdentity,
+    byteSize: 128,
+    contentSha256: digit.repeat(64),
+    sourceAttempt: 1,
+    validatedAt: input.validatedAt,
+  });
+  return LoggedExportSuccessResultSchema.parse({
+    schemaVersion: 1,
+    requestId: input.requestId,
+    jobId: input.jobId,
+    projectId: input.projectId,
+    clipId: input.clipId,
+    sourceLanguageClass: "confirmed_english",
+    resolvedExportBounds: {
+      startMs: 0,
+      endMs: 1_000,
+      sourceAttempt: 1,
+      resolvedAt: input.validatedAt,
+    },
+    renderedMediaProvenance: {
+      durationMs: 1_000,
+      containerFormat: "mp4",
+      videoCodec: "h264",
+      audioCodec: "aac",
+      ffprobeVersion: "8.1.2",
+      ffmpegVersion: "8.1.2",
+      verificationSchemaVersion: 1,
+      settingsSha256: "a".repeat(64),
+      observedProperties: {
+        schemaVersion: 1,
+        container: { formatNames: ["mp4"] },
+        streamCounts: {
+          total: 2,
+          video: 1,
+          audio: 1,
+          subtitle: 0,
+          data: 0,
+          other: 0,
+        },
+        video: {
+          codec: "h264",
+          profile: "High",
+          pixelFormat: "yuv420p",
+          width: 1_920,
+          height: 1_080,
+          sampleAspectRatio: { numerator: 1, denominator: 1 },
+          displayAspectRatio: { numerator: 16, denominator: 9 },
+          averageFrameRate: { numerator: 30, denominator: 1 },
+        },
+        audio: {
+          codec: "aac",
+          sampleRate: 48_000,
+          channels: 2,
+          channelLayout: "stereo",
+        },
+        durationMs: 1_000,
+        ffprobeVersion: "8.1.2",
+      },
+      sourceAttempt: 1,
+      validatedAt: input.validatedAt,
+    },
+    thumbnailProvenance: {
+      extractionTimeMs: 500,
+      width: 640,
+      height: 360,
+      sourceAttempt: 1,
+      validatedAt: input.validatedAt,
+    },
+    englishSubtitleProvenance: {
+      trackId: input.trackId,
+      trackVersion: 1,
+      cueCount: 1,
+      byteSize: 64,
+      contentSha256: "e".repeat(64),
+      startMs: 0,
+      endMs: 1_000,
+      sourceAttempt: 1,
+      validatedAt: input.validatedAt,
+    },
+    artifacts: [
+      artifact("clip_metadata_json", "1"),
+      artifact("english_srt", "2"),
+      artifact("manifest_json", "3"),
+      artifact("thumbnail_jpg", "4"),
+      artifact("video_mp4", "5"),
+    ],
+  });
+}

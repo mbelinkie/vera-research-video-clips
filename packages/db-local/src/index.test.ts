@@ -148,8 +148,16 @@ describe("local migrations", () => {
       "0022_logged_export_execution_cancellation",
       "0023_logged_export_execution_progress",
       "0024_logged_export_same_source_groups",
+      "0025_export_request_origin",
     ]);
     expect(runLocalMigrations(database)).toEqual([]);
+    expect(
+      (
+        database.prepare("PRAGMA table_info(export_requests)").all() as Array<{
+          name: string;
+        }>
+      ).some((column) => column.name === "request_origin"),
+    ).toBe(true);
     expect(
       database
         .prepare(
@@ -393,6 +401,7 @@ describe("local migrations", () => {
       "0022_logged_export_execution_cancellation",
       "0023_logged_export_execution_progress",
       "0024_logged_export_same_source_groups",
+      "0025_export_request_origin",
     ]);
     expect(
       database
@@ -571,6 +580,7 @@ describe("local migrations", () => {
       "0022_logged_export_execution_cancellation",
       "0023_logged_export_execution_progress",
       "0024_logged_export_same_source_groups",
+      "0025_export_request_origin",
     ]);
     expect(
       database.prepare("SELECT * FROM export_final_artifacts").all(),
@@ -700,6 +710,7 @@ describe("local migrations", () => {
       "0022_logged_export_execution_cancellation",
       "0023_logged_export_execution_progress",
       "0024_logged_export_same_source_groups",
+      "0025_export_request_origin",
     ]);
     expect(
       database
@@ -843,7 +854,14 @@ describe("logged export delivery import", () => {
       database,
       () => new Date("2026-08-20T12:00:10.000Z"),
     );
-    const delivery = fixtureLoggedDelivery();
+    const baseDelivery = fixtureLoggedDelivery();
+    const delivery: LoggedExportDelivery = {
+      ...baseDelivery,
+      request: {
+        ...baseDelivery.request,
+        requestOrigin: "authoring_build",
+      },
+    };
     const partialJobId = "019fbb95-cd76-7920-93fa-e23ba755ef21";
     database
       .prepare(
@@ -884,6 +902,7 @@ describe("logged export delivery import", () => {
       mode: "logged",
       projectId: delivery.request.projectId,
       clipId: delivery.request.clipId,
+      requestOrigin: "authoring_build",
       state: "claimed",
     });
     expect(queue.importLoggedDeliveryPending(delivery)).toEqual(pending);
@@ -912,6 +931,14 @@ describe("logged export delivery import", () => {
           ...delivery.request,
           video: { ...delivery.request.video, title: "Mutated title" },
         },
+      }),
+    ).toThrowError(
+      expect.objectContaining({ code: "logged_export_delivery_conflict" }),
+    );
+    expect(() =>
+      queue.importLoggedDeliveryPending({
+        ...delivery,
+        request: { ...delivery.request, requestOrigin: "clip_library" },
       }),
     ).toThrowError(
       expect.objectContaining({ code: "logged_export_delivery_conflict" }),
@@ -1692,6 +1719,7 @@ describe("logged export delivery import", () => {
       "0022_logged_export_execution_cancellation",
       "0023_logged_export_execution_progress",
       "0024_logged_export_same_source_groups",
+      "0025_export_request_origin",
     ]);
     const after = new LocalExportQueue(database).get(before.id);
     expect(after).toEqual(before);
@@ -1753,6 +1781,7 @@ describe("logged export delivery import", () => {
       "0022_logged_export_execution_cancellation",
       "0023_logged_export_execution_progress",
       "0024_logged_export_same_source_groups",
+      "0025_export_request_origin",
     ]);
     expect(
       new LocalExportQueue(database).getAcceptedLoggedDelivery(

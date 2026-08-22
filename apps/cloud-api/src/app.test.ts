@@ -1897,6 +1897,7 @@ describe("logged export delivery API", () => {
     }));
     const cancelLoggedExport = vi.fn(async () => ({ requested: true }));
     const retryLoggedExport = vi.fn(async () => ({ retried: true }));
+    const listArtifactVersionHistory = vi.fn(async () => ({ versions: [] }));
     const catalog = {
       claimLoggedExportDelivery,
       acceptLoggedExportDelivery,
@@ -1911,6 +1912,7 @@ describe("logged export delivery API", () => {
       reconcileLoggedExportCanceled,
       cancelLoggedExport,
       retryLoggedExport,
+      listArtifactVersionHistory,
     } as unknown as SharedProjectCatalog;
     const app = createCloudApi({ catalog, authenticate: async () => actor });
     apps.add(app);
@@ -2140,6 +2142,21 @@ describe("logged export delivery API", () => {
       actor,
       batchProjectId,
       batchId,
+    );
+    const historyClipId = randomUUID();
+    expect(
+      (
+        await app.inject({
+          method: "GET",
+          url: `/api/projects/${batchProjectId}/clips/${historyClipId}/artifact-versions?limit=10`,
+        })
+      ).json(),
+    ).toEqual({ versions: [] });
+    expect(listArtifactVersionHistory).toHaveBeenCalledWith(
+      actor,
+      batchProjectId,
+      historyClipId,
+      { limit: 10 },
     );
     const canceledResult = {
       schemaVersion: 1,

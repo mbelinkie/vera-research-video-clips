@@ -841,9 +841,15 @@ export const ExportSettingsPreviewSchema = z
     }),
   })
   .strict();
+export const ExportRequestOriginSchema = z.enum([
+  "selection_action",
+  "clip_library",
+  "authoring_build",
+]);
 const createExportRequestBaseSchema = z
   .object({
     idempotencyKey: z.string().trim().min(1).max(512),
+    requestOrigin: ExportRequestOriginSchema.optional(),
     sourceLanguageClass: ExportSourceLanguageClassSchema,
     subtitleTracks: ExportSubtitleTrackSnapshotsSchema.optional(),
     preset: ExportPresetSnapshotSchema.optional(),
@@ -1849,6 +1855,7 @@ export const ExportRequestSchema = z
     id: IdSchema,
     jobId: IdSchema,
     mode: z.enum(["logged", "export_only"]),
+    requestOrigin: ExportRequestOriginSchema.optional(),
     projectId: IdSchema.optional(),
     clipId: IdSchema.optional(),
     retryOfRequestId: IdSchema.optional(),
@@ -2434,6 +2441,77 @@ export const LoggedExportSuccessSchema = z
   })
   .strict();
 
+export const ArtifactVersionSummarySchema = z
+  .object({
+    artifactVersionId: IdSchema,
+    requestId: IdSchema,
+    jobId: IdSchema,
+    projectId: IdSchema,
+    clipId: IdSchema,
+    requestOrigin: ExportRequestOriginSchema.nullable(),
+    retryOfRequestId: IdSchema.optional(),
+    retryOrdinal: z.number().int().positive().optional(),
+    batchItemId: IdSchema.optional(),
+    packageIdentity: z.string().regex(/^clip-[a-f0-9-]{36}$/),
+    video: ClipVideoSnapshotSchema,
+    selection: TranscriptSelectionSchema,
+    sourceLanguageClass: ExportSourceLanguageClassSchema,
+    subtitleTracks: ExportSubtitleTrackSnapshotsSchema.optional(),
+    resolvedSettingsSnapshot: ResolvedExportSettingsSnapshotSchema,
+    artifacts: z.array(FinalArtifactProvenanceSchema).min(4).max(6),
+    manifest: z
+      .object({
+        contentSha256: z.string().regex(/^[a-f0-9]{64}$/),
+        schemaVersion: z.union([
+          z.literal(1),
+          z.literal(2),
+          z.literal("unknown"),
+        ]),
+      })
+      .strict(),
+    resultFingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+    completedAt: UtcTimestampSchema,
+  })
+  .strict()
+  .superRefine((summary, context) => {
+    if (summary.packageIdentity !== `clip-${summary.requestId}`) {
+      context.addIssue({
+        code: "custom",
+        path: ["packageIdentity"],
+        message:
+          "Artifact package identity must name the immutable export request.",
+      });
+    }
+    const manifest = summary.artifacts.find(
+      (artifact) => artifact.role === "manifest_json",
+    );
+    if (
+      !manifest ||
+      manifest.contentSha256 !== summary.manifest.contentSha256
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["manifest", "contentSha256"],
+        message:
+          "Artifact history manifest identity must match its manifest role.",
+      });
+    }
+  });
+
+export const ArtifactVersionHistoryQuerySchema = z
+  .object({
+    limit: z.coerce.number().int().min(1).max(100).default(25),
+    cursor: IdSchema.optional(),
+  })
+  .strict();
+
+export const ArtifactVersionHistoryResponseSchema = z
+  .object({
+    versions: z.array(ArtifactVersionSummarySchema).max(100),
+    nextCursor: IdSchema.optional(),
+  })
+  .strict();
+
 export function sanitizeLoggedExportFailureCode(value: string): string {
   const sanitized = value
     .trim()
@@ -2840,6 +2918,7 @@ export type ExportSettingsPreviewRequest = z.infer<
   typeof ExportSettingsPreviewRequestSchema
 >;
 export type ExportSettingsPreview = z.infer<typeof ExportSettingsPreviewSchema>;
+export type ExportRequestOrigin = z.infer<typeof ExportRequestOriginSchema>;
 export type ExportPresetSnapshot = z.infer<typeof ExportPresetSnapshotSchema>;
 export type ExportPresetScope = z.infer<typeof ExportPresetScopeSchema>;
 export type ExportPresetVersion = z.infer<typeof ExportPresetVersionSchema>;
@@ -2960,6 +3039,15 @@ export type ReconcileLoggedExportSuccessRequest = z.infer<
   typeof ReconcileLoggedExportSuccessRequestSchema
 >;
 export type LoggedExportSuccess = z.infer<typeof LoggedExportSuccessSchema>;
+export type ArtifactVersionSummary = z.infer<
+  typeof ArtifactVersionSummarySchema
+>;
+export type ArtifactVersionHistoryQuery = z.infer<
+  typeof ArtifactVersionHistoryQuerySchema
+>;
+export type ArtifactVersionHistoryResponse = z.infer<
+  typeof ArtifactVersionHistoryResponseSchema
+>;
 export type LoggedExportFailureResult = z.infer<
   typeof LoggedExportFailureResultSchema
 >;

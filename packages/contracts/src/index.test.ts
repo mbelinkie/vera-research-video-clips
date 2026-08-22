@@ -2,12 +2,16 @@ import { describe, expect, it } from "vitest";
 
 import {
   AcceptLoggedExportDeliveryRequestSchema,
+  ArtifactVersionHistoryQuerySchema,
+  ArtifactVersionHistoryResponseSchema,
+  ArtifactVersionSummarySchema,
   CancelLoggedExportRequestSchema,
   BatchPreflightRequestSchema,
   ClipLanguageEvidenceV2Schema,
   CreateClipExportRequestSchema,
   CreateLoggedExportBatchRequestSchema,
   CreateTranscriptionBatchRequestSchema,
+  ExportRequestOriginSchema,
   ExportClipManifestSchema,
   ExportClipMetadataSchema,
   ExportPresetCatalogEntrySchema,
@@ -228,6 +232,51 @@ describe("shared contracts", () => {
         resultFingerprint: "a".repeat(64),
         reconciledAt: now,
         reservationToken: reconcile.reservationToken,
+      }).success,
+    ).toBe(false);
+  });
+
+  it("bounds immutable artifact history and keeps request origin diagnostic", () => {
+    const request = deliveryContractFixture().request;
+    const result = successResultContractFixture();
+    const manifest = result.artifacts.find(
+      (artifact) => artifact.role === "manifest_json",
+    )!;
+    const summary = {
+      artifactVersionId: "019fbb95-cd76-7920-93fa-e23ba755ee55",
+      requestId: result.requestId,
+      jobId: result.jobId,
+      projectId: result.projectId,
+      clipId: result.clipId,
+      requestOrigin: "clip_library" as const,
+      packageIdentity: manifest.packageIdentity,
+      video: request.video,
+      selection: request.selection,
+      sourceLanguageClass: result.sourceLanguageClass,
+      resolvedSettingsSnapshot: request.resolvedSettingsSnapshot,
+      artifacts: result.artifacts,
+      manifest: {
+        contentSha256: manifest.contentSha256,
+        schemaVersion: "unknown" as const,
+      },
+      resultFingerprint: "f".repeat(64),
+      completedAt: now,
+    };
+    expect(ArtifactVersionSummarySchema.parse(summary)).toEqual(summary);
+    expect(
+      ArtifactVersionHistoryResponseSchema.parse({ versions: [summary] }),
+    ).toEqual({ versions: [summary] });
+    expect(ArtifactVersionHistoryQuerySchema.parse({})).toEqual({ limit: 25 });
+    expect(
+      ArtifactVersionHistoryQuerySchema.safeParse({ limit: 101 }).success,
+    ).toBe(false);
+    expect(ExportRequestOriginSchema.safeParse("repair_renderer").success).toBe(
+      false,
+    );
+    expect(
+      ArtifactVersionSummarySchema.safeParse({
+        ...summary,
+        localPath: "/private/export.mov",
       }).success,
     ).toBe(false);
   });

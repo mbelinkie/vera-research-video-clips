@@ -998,6 +998,7 @@ function App() {
           },
           body: JSON.stringify({
             idempotencyKey: `logged-export:${selectionCommandId}`,
+            requestOrigin: "selection_action",
             sourceLanguageClass:
               transcriptTracks.original.track.id ===
                 transcriptTracks.english.track.id &&

@@ -378,9 +378,10 @@ describe("versioned export preset catalogs", () => {
       owner,
       project.id,
       clip!.id,
-      command,
+      { ...command, requestOrigin: "authoring_build" },
     );
     expect(replayed).toEqual(queued);
+    expect(replayed.requestOrigin).toBe("selection_action");
     expect(replayed.resolvedSettingsSnapshot).toEqual(originalSnapshot);
     expect(replayed.resolvedSettingsSnapshot!.resolutionFingerprint).toBe(
       originalSnapshot.resolutionFingerprint,
@@ -1137,6 +1138,203 @@ describe("logged export delivery", () => {
     ).rejects.toThrow(/mutually exclusive/u);
   });
 
+  it("derives bounded authorized artifact history from immutable M5 success IDs", async () => {
+    const clock = { now: new Date("2026-08-20T12:00:00.000Z") };
+    const fixture = await createAcceptedLoggedExportResultFixture(clock);
+    const first = await fixture.catalog.reconcileLoggedExportSuccess(
+      fixture.owner,
+      reconcileSuccessCommand(fixture),
+    );
+    clock.now = new Date("2026-08-20T12:00:01.000Z");
+    const secondRequest = await createLoggedExportFromClip(
+      fixture.catalog,
+      fixture.owner,
+      fixture.accepted.request.projectId!,
+      fixture.accepted.request.clipId!,
+      "clip-library-reexport",
+      "h264",
+      "confirmed_english",
+      "clip_library",
+    );
+    const reserved = (
+      await fixture.catalog.claimLoggedExportDelivery(fixture.owner, {
+        workerId: fixture.worker.workerId,
+        workerEpoch: fixture.worker.epoch,
+      })
+    ).delivery!;
+    const accepted = await fixture.catalog.acceptLoggedExportDelivery(
+      fixture.owner,
+      {
+        workerId: fixture.worker.workerId,
+        workerEpoch: fixture.worker.epoch,
+        deliveryId: reserved.deliveryId,
+        generation: reserved.generation,
+        reservationToken: reserved.reservationToken,
+      },
+    );
+    const second = await fixture.catalog.reconcileLoggedExportSuccess(
+      fixture.owner,
+      {
+        workerId: accepted.workerId,
+        workerEpoch: accepted.workerEpoch,
+        deliveryId: accepted.deliveryId,
+        generation: accepted.generation,
+        reservationToken: accepted.reservationToken,
+        result: loggedExportSuccessFixture(
+          secondRequest,
+          clock.now.toISOString(),
+        ),
+      },
+    );
+
+    const firstPage = await fixture.catalog.listArtifactVersionHistory(
+      fixture.owner,
+      secondRequest.projectId!,
+      secondRequest.clipId!,
+      { limit: 1 },
+    );
+    expect(firstPage).toMatchObject({
+      nextCursor: second.id,
+      versions: [
+        {
+          artifactVersionId: second.id,
+          requestId: secondRequest.id,
+          requestOrigin: "clip_library",
+          manifest: { schemaVersion: "unknown" },
+        },
+      ],
+    });
+    const secondPage = await fixture.catalog.listArtifactVersionHistory(
+      fixture.owner,
+      secondRequest.projectId!,
+      secondRequest.clipId!,
+      { limit: 1, cursor: firstPage.nextCursor },
+    );
+    expect(secondPage).toMatchObject({
+      versions: [
+        {
+          artifactVersionId: first.id,
+          requestId: fixture.accepted.request.id,
+          requestOrigin: "selection_action",
+        },
+      ],
+    });
+    expect(secondPage.nextCursor).toBeUndefined();
+    expect(
+      JSON.stringify([...firstPage.versions, ...secondPage.versions]),
+    ).not.toMatch(/localPath|filename|reservationToken|notes|tags/u);
+
+    const outsider = fixtureActor("artifact-history-outsider");
+    await fixture.catalog.registerUser(outsider, "History outsider");
+    await expect(
+      fixture.catalog.listArtifactVersionHistory(
+        outsider,
+        secondRequest.projectId!,
+        secondRequest.clipId!,
+        { limit: 25 },
+      ),
+    ).rejects.toMatchObject({ statusCode: 403 });
+  });
+
+  it("reads a parseable legacy success with unknown origin and manifest schema", async () => {
+    const fixture = await createAcceptedLoggedExportResultFixture();
+    await fixture.catalog.reconcileLoggedExportSuccess(
+      fixture.owner,
+      reconcileSuccessCommand(fixture),
+    );
+    const legacyJobId = randomUUID();
+    const legacyRequestId = randomUUID();
+    const legacyDeliveryId = randomUUID();
+    const legacySuccessId = randomUUID();
+    const completedAt = "2026-08-20T12:00:01.000Z";
+    await fixture.database.query(
+      `INSERT INTO jobs
+         (id, project_id, kind, state, idempotency_key, attempt, payload,
+          created_at, updated_at)
+       SELECT $1, project_id, kind, 'complete', $2, attempt, payload, $3, $3
+       FROM jobs WHERE id = $4`,
+      [
+        legacyJobId,
+        `legacy-history:${legacyRequestId}`,
+        completedAt,
+        fixture.accepted.request.jobId,
+      ],
+    );
+    await fixture.database.query(
+      `INSERT INTO export_requests
+         (id, job_id, clip_id, project_id, mode, video_snapshot,
+          selection_snapshot, source_language_class, subtitle_tracks_snapshot,
+          preset_snapshot, resolved_settings_snapshot, requested_by,
+          retry_of_request_id, retry_ordinal, retry_idempotency_key,
+          batch_item_id, request_origin, created_at, updated_at)
+       SELECT $1, $2, clip_id, project_id, mode, video_snapshot,
+              selection_snapshot, source_language_class,
+              subtitle_tracks_snapshot, preset_snapshot,
+              resolved_settings_snapshot, requested_by,
+              NULL, 0, NULL, NULL, NULL, $3, $3
+       FROM export_requests WHERE id = $4`,
+      [legacyRequestId, legacyJobId, completedAt, fixture.accepted.request.id],
+    );
+    await fixture.database.query(
+      `INSERT INTO logged_export_deliveries
+         (id, export_request_id, generation, reservation_token, worker_id,
+          worker_epoch, reserved_at, reservation_expires_at, accepted_at,
+          created_at, updated_at)
+       VALUES ($1, $2, 1, $3, $4, $5, $6, $7, $6, $6, $6)`,
+      [
+        legacyDeliveryId,
+        legacyRequestId,
+        randomUUID(),
+        fixture.worker.workerId,
+        fixture.worker.epoch,
+        completedAt,
+        "2026-08-20T12:00:31.000Z",
+      ],
+    );
+    const legacyRequest: ExportRequest = {
+      ...fixture.accepted.request,
+      id: legacyRequestId,
+      jobId: legacyJobId,
+      requestOrigin: undefined,
+      createdAt: completedAt,
+      updatedAt: completedAt,
+    };
+    const legacyResult = loggedExportSuccessFixture(legacyRequest, completedAt);
+    await fixture.database.query(
+      `INSERT INTO logged_export_success_results
+         (id, export_request_id, delivery_id, delivery_generation, worker_id,
+          worker_epoch, result_schema_version, result_json,
+          result_fingerprint, reconciled_at)
+       VALUES ($1, $2, $3, 1, $4, $5, 1, $6, $7, $8)`,
+      [
+        legacySuccessId,
+        legacyRequestId,
+        legacyDeliveryId,
+        fixture.worker.workerId,
+        fixture.worker.epoch,
+        JSON.stringify(legacyResult),
+        sha256Fingerprint(legacyResult),
+        completedAt,
+      ],
+    );
+
+    const history = await fixture.catalog.listArtifactVersionHistory(
+      fixture.owner,
+      fixture.accepted.request.projectId!,
+      fixture.accepted.request.clipId!,
+      { limit: 25 },
+    );
+    expect(history.versions[0]).toMatchObject({
+      artifactVersionId: legacySuccessId,
+      requestId: legacyRequestId,
+      requestOrigin: null,
+      manifest: { schemaVersion: "unknown" },
+    });
+    expect(JSON.stringify(history.versions[0])).not.toMatch(
+      /localPath|filename|reservationToken|workerId|workerEpoch/u,
+    );
+  });
+
   it("atomically reconciles one sanitized immutable failure and replays it without another event or version", async () => {
     const fixture = await createAcceptedLoggedExportResultFixture();
     const unsafeResult: LoggedExportFailureResult = {
@@ -1713,6 +1911,7 @@ describe("logged export delivery", () => {
       state: "queued",
       retryOfRequestId: parentId,
       retryOrdinal: 1,
+      requestOrigin: fixture.accepted.request.requestOrigin,
       projectId,
       clipId,
     });
@@ -2497,6 +2696,24 @@ describe("logged export batches", () => {
     expect(
       await catalog.createLoggedExportBatch(owner, project.id, command),
     ).toEqual(batch);
+    expect(
+      await catalog.createLoggedExportBatch(owner, project.id, {
+        ...command,
+        items: command.items.map((item) => ({
+          ...item,
+          export: { ...item.export, requestOrigin: "authoring_build" },
+        })),
+      }),
+    ).toEqual(batch);
+    expect(
+      (
+        await database.query<{ request_origin: string }>(
+          "SELECT request_origin FROM export_requests ORDER BY id",
+        )
+      ).rows.every(
+        ({ request_origin }) => request_origin === "selection_action",
+      ),
+    ).toBe(true);
     await expect(
       catalog.createClipExport(owner, project.id, clips[0]!.id, {
         ...command.items[0]!.export,
@@ -2805,6 +3022,10 @@ async function createLoggedExportFromClip(
   idempotencyKey: string,
   family: "h264" | "hevc",
   sourceLanguageClass: "confirmed_english" | "foreign" = "confirmed_english",
+  requestOrigin:
+    | "selection_action"
+    | "clip_library"
+    | "authoring_build" = "selection_action",
 ) {
   const overrides =
     family === "hevc"
@@ -2828,6 +3049,7 @@ async function createLoggedExportFromClip(
       : undefined;
   return catalog.createClipExport(actor, projectId, clipId, {
     idempotencyKey,
+    requestOrigin,
     sourceLanguageClass,
     ...(subtitleTracks ? { subtitleTracks } : {}),
     settingsSelection: selection,
