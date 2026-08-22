@@ -1,6 +1,7 @@
 # M6-02 — Local roots, locators, and package verification
 
-- Status: active
+- Status: implementation complete; real-Windows physical-containment run is a
+  declared release gate
 - Task/thread: M6-02 only
 - Dependencies: M6-01 complete at `6f5d33b`; Milestone 5 package and success
   lineage complete through M5-27
@@ -159,3 +160,81 @@ responses while confirming no cloud-facing shape contains the configured path.
 The physical Windows junction test is platform-gated and therefore declared
 skipped on the current macOS host. It must run on a real Windows host before a
 Windows release; macOS evidence does not substitute for that platform result.
+
+## Decisions and delivered behavior
+
+- Kept every M5 schema and completed migration unchanged. Local migration 0026
+  creates empty `artifact_roots` and `export_artifact_locators` tables without
+  guessing paths, schema versions, or artifact-version IDs.
+- Reused `logged_export_success_results.id` exactly as `artifactVersionId` and
+  added an authorized exact-version catalog/API read. Project and clip are
+  bound transitively through that authorized cloud lineage because M5 package
+  bytes do not claim to contain either ID.
+- Registered the existing managed `DATA_DIR/exports` directory internally at
+  local-agent startup. Root management is not exposed over unauthenticated
+  loopback; a future custom-root UI requires a real local app-session boundary.
+- Derived the only package lookup segment internally as
+  `clip-<export-request-id>`. Neither the browser nor cloud supplies a path.
+- Inserted a locator only after full verification. A failed initial adoption
+  leaves no locator; a later failure for a previously verified locator preserves
+  its identity and last successful timestamp while changing only availability.
+- Verified manifest v1/v2 and metadata bytes strictly, including raw unknown
+  fields, exact filenames/roles, streamed hashes, sizes, success fingerprint,
+  request/video/selection/settings/bounds/render provenance, thumbnail, and
+  omission/English/bilingual subtitle provenance.
+- Kept configured paths and stored relative segments out of shared responses,
+  cloud history, failures, and diagnostics. Public root/locator shapes contain
+  only opaque IDs and bounded verification state.
+
+## Changed files
+
+- `packages/contracts/src/index.ts` and tests: verification evidence plus
+  path-free local root/locator contracts.
+- `packages/catalog/src/index.ts` and tests: authorized exact artifact-version
+  projection and the additional immutable success evidence needed locally.
+- `apps/cloud-api/src/app.ts` and tests: exact artifact-version route.
+- `packages/db-local/migrations/0026_artifact_roots_and_locators.sql`, local
+  repository, and migration/restart tests.
+- `apps/local-agent/src/artifact-locators.ts` and tests: hostile-filesystem
+  verifier, local state transitions, and path-leakage checks.
+- `apps/local-agent/src/main.ts` and app tests: managed-root startup and the
+  authorization-confirmed verify composition.
+
+## Verification evidence
+
+- Focused contracts/catalog/cloud API/local migration/local-agent run:
+  104 tests passed before review.
+- Post-review local persistence and verifier run: 46 tests passed and the one
+  Windows-only physical junction test was skipped on macOS.
+- Aggregate `npm run test`: 28 files passed, 1 file declared skipped; 284 tests
+  passed and 2 were skipped. The skips are the pre-existing opt-in live AWS test
+  and the real-Windows junction test.
+- `npm run build`: TypeScript and the production web build passed.
+- Migration CLIs passed with 26 local and 20 cloud migrations.
+- Playwright browser regression: 4 of 4 tests passed.
+- `git diff --check` and scoped formatting passed.
+- A clean detached worktree at implementation commit `50ee0e6` passed the full
+  `npm run check`: formatting, typecheck, aggregate tests, web build, and both
+  migration validators.
+- Manual filesystem evidence was exercised through real temporary directories
+  on macOS: manifest v1/v2, confirmed-English omission, confirmed-English
+  sidecar, foreign bilingual sidecars, every package role tamper, missing and
+  restored packages, unexpected entries, file symlinks, hardlinks,
+  non-regular entries, root replacement, persistence conflict, and restart.
+
+## Independent review and remaining risk
+
+The Sol review identified and drove fixes for manifest/metadata timestamps and
+subtitle policy, sidecar hash/size correlation, persistence-conflict isolation,
+unauthenticated root management, bilingual coverage, and physical hardlink and
+non-regular cases. No material macOS/data-lineage finding remains.
+
+Actual Windows junction/reparse behavior cannot be truthfully claimed from the
+current macOS host. The guarded Windows test is committed and must pass on a
+real Windows host before Windows release acceptance. This is a platform evidence
+gate, not a reason to alter M5 or weaken the fail-closed verifier.
+
+## Commits
+
+- Implementation, migrations, tests, and active specification: `50ee0e6`
+- Completion documentation: recorded by the following documentation commit.
