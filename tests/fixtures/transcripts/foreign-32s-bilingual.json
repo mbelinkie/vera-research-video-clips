@@ -1,0 +1,124 @@
+{
+  "schemaVersion": 1,
+  "license": "CC0-1.0",
+  "provenance": "Original Spanish and translated English text authored for this repository; no third-party transcript content.",
+  "original": {
+    "track": {
+      "id": "019fbb95-cd76-7920-93fa-e23ba755e601",
+      "videoId": "fixture-foreign-32s",
+      "language": "es",
+      "kind": "original",
+      "source": "fixture",
+      "provider": "repository-fixture",
+      "timingPrecision": "cue",
+      "schemaVersion": 1,
+      "contentSha256": "4444444444444444444444444444444444444444444444444444444444444444",
+      "version": 7
+    },
+    "segments": [
+      {
+        "id": "019fbb95-cd76-7920-93fa-e23ba755e611",
+        "ordinal": 0,
+        "startMs": 0,
+        "endMs": 500,
+        "text": "Antes del intervalo."
+      },
+      {
+        "id": "019fbb95-cd76-7920-93fa-e23ba755e612",
+        "ordinal": 1,
+        "startMs": 500,
+        "endMs": 2500,
+        "text": "El primer límite queda recortado."
+      },
+      {
+        "id": "019fbb95-cd76-7920-93fa-e23ba755e613",
+        "ordinal": 2,
+        "startMs": 5000,
+        "endMs": 9000,
+        "text": "Esta frase permanece dentro del clip."
+      },
+      {
+        "id": "019fbb95-cd76-7920-93fa-e23ba755e614",
+        "ordinal": 3,
+        "startMs": 15000,
+        "endMs": 19000,
+        "text": "La sincronización sigue siendo exacta."
+      },
+      {
+        "id": "019fbb95-cd76-7920-93fa-e23ba755e615",
+        "ordinal": 4,
+        "startMs": 30000,
+        "endMs": 31500,
+        "text": "El último límite también se recorta."
+      },
+      {
+        "id": "019fbb95-cd76-7920-93fa-e23ba755e616",
+        "ordinal": 5,
+        "startMs": 31500,
+        "endMs": 32000,
+        "text": "Después del intervalo."
+      }
+    ],
+    "tokens": []
+  },
+  "english": {
+    "track": {
+      "id": "019fbb95-cd76-7920-93fa-e23ba755e602",
+      "videoId": "fixture-foreign-32s",
+      "language": "en",
+      "kind": "english",
+      "source": "translated",
+      "provider": "repository-fixture",
+      "sourceTrackId": "019fbb95-cd76-7920-93fa-e23ba755e601",
+      "timingPrecision": "cue",
+      "schemaVersion": 1,
+      "contentSha256": "5555555555555555555555555555555555555555555555555555555555555555",
+      "version": 9
+    },
+    "segments": [
+      {
+        "id": "019fbb95-cd76-7920-93fa-e23ba755e621",
+        "ordinal": 0,
+        "startMs": 0,
+        "endMs": 500,
+        "text": "Before the interval."
+      },
+      {
+        "id": "019fbb95-cd76-7920-93fa-e23ba755e622",
+        "ordinal": 1,
+        "startMs": 500,
+        "endMs": 2500,
+        "text": "The first boundary is trimmed."
+      },
+      {
+        "id": "019fbb95-cd76-7920-93fa-e23ba755e623",
+        "ordinal": 2,
+        "startMs": 5000,
+        "endMs": 9000,
+        "text": "This sentence remains inside the clip."
+      },
+      {
+        "id": "019fbb95-cd76-7920-93fa-e23ba755e624",
+        "ordinal": 3,
+        "startMs": 15000,
+        "endMs": 19000,
+        "text": "The synchronization stays exact."
+      },
+      {
+        "id": "019fbb95-cd76-7920-93fa-e23ba755e625",
+        "ordinal": 4,
+        "startMs": 30000,
+        "endMs": 31500,
+        "text": "The final boundary is also trimmed."
+      },
+      {
+        "id": "019fbb95-cd76-7920-93fa-e23ba755e626",
+        "ordinal": 5,
+        "startMs": 31500,
+        "endMs": 32000,
+        "text": "After the interval."
+      }
+    ],
+    "tokens": []
+  }
+}

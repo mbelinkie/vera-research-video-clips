@@ -31,6 +31,7 @@
     "test": "vitest run --exclude tests/e2e/**",
     "test:aws:s3": "vitest run tests/integration/shared-transcript-store.aws.test.ts",
     "test:e2e": "playwright test",
+    "test:fixture:foreign-30s": "vitest run apps/local-agent/src/export-run-once.test.ts -t \"30-second foreign-language fixture\"",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit"
   },

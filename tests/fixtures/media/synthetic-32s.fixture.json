@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "filename": "synthetic-32s.mp4",
+  "license": "CC0-1.0",
+  "provenance": "Generated exclusively from FFmpeg lavfi color and sine sources; contains no third-party media or speech.",
+  "generationScript": "scripts/generate-media-fixture.ts",
+  "contentSha256": "a7e6032d7201e266312930885771e30f5f8d82b4372d7907832b46f9f1ebcdd9",
+  "expectedMedia": {
+    "durationMs": 32000,
+    "videoCodec": "h264",
+    "audioCodec": "aac",
+    "width": 640,
+    "height": 360,
+    "frameRate": "30/1",
+    "audioSampleRate": 48000
+  },
+  "gate": {
+    "exportStartMs": 1000,
+    "exportEndMs": 31000,
+    "expectedDurationMs": 30000
+  },
+  "transcriptFixture": "tests/fixtures/transcripts/foreign-32s-bilingual.json"
+}

@@ -56,8 +56,14 @@ import {
 } from "./export-run-once.ts";
 import { LocalLoggedExportSourceGroupCoordinator } from "./shared-source-group.ts";
 
+import foreignThirtyTwoSecondFixture from "../../../tests/fixtures/transcripts/foreign-32s-bilingual.json" with { type: "json" };
+import thirtyTwoSecondMediaFixture from "../../../tests/fixtures/media/synthetic-32s.fixture.json" with { type: "json" };
+
 const fixtureMediaPath = fileURLToPath(
   new URL("../../../tests/fixtures/media/synthetic-4s.mp4", import.meta.url),
+);
+const thirtyTwoSecondFixtureMediaPath = fileURLToPath(
+  new URL("../../../tests/fixtures/media/synthetic-32s.mp4", import.meta.url),
 );
 const ffmpegPath = "/usr/local/bin/ffmpeg";
 const ffprobePath = "/usr/local/bin/ffprobe";
@@ -67,6 +73,7 @@ const execFile = promisify(execFileCallback);
 beforeAll(async () => {
   await Promise.all([
     access(fixtureMediaPath),
+    access(thirtyTwoSecondFixtureMediaPath),
     access(ffmpegPath),
     access(ffprobePath),
   ]);
@@ -347,6 +354,300 @@ describe("one-shot local export runtime", () => {
       error: { code: "fixture_acquisition_failed" },
     });
     expect(await readdir(join(root, "exports"))).toEqual([packageIdentity]);
+  });
+
+  it("proves the deterministic 30-second foreign-language fixture gate", async () => {
+    const sourceBytes = await readFile(thirtyTwoSecondFixtureMediaPath);
+    expect(sha256(sourceBytes)).toBe(thirtyTwoSecondMediaFixture.contentSha256);
+    const sourceInspection = await new FfprobeMediaInspector({
+      executable: ffprobePath,
+    }).inspect(thirtyTwoSecondFixtureMediaPath);
+    expect(sourceInspection).toMatchObject({
+      durationMs: thirtyTwoSecondMediaFixture.expectedMedia.durationMs,
+      videoCodec: thirtyTwoSecondMediaFixture.expectedMedia.videoCodec,
+      audioCodec: thirtyTwoSecondMediaFixture.expectedMedia.audioCodec,
+      observedProperties: {
+        video: {
+          width: thirtyTwoSecondMediaFixture.expectedMedia.width,
+          height: thirtyTwoSecondMediaFixture.expectedMedia.height,
+          averageFrameRate: { numerator: 30, denominator: 1 },
+        },
+        audio: {
+          sampleRate: thirtyTwoSecondMediaFixture.expectedMedia.audioSampleRate,
+        },
+      },
+    });
+
+    const root = await createFixtureWorkspace();
+    const request = createThirtySecondForeignFixtureRequest(root);
+    const inspection = new FfprobeMediaInspector({ executable: ffprobePath });
+    const renderer = new FfmpegCapabilityRangeRenderer({
+      executable: ffmpegPath,
+    });
+    let acquisitionCalls = 0;
+    let renderCalls = 0;
+    const result = await runConfiguredLocalExportOnce(
+      { requestId: request.requestId, authorizationConfirmed: true },
+      {
+        config: fixtureConfig(root),
+        sourceProvider: fixtureSourceProvider(
+          () => {
+            acquisitionCalls += 1;
+          },
+          {
+            mediaPath: thirtyTwoSecondFixtureMediaPath,
+            sourceIdentity: "repository-synthetic-32s",
+          },
+        ),
+        inspector: inspection,
+        renderer: {
+          render: async (...args) => {
+            renderCalls += 1;
+            return renderer.render(...args);
+          },
+          readVersion: (signal) => renderer.readVersion(signal),
+        },
+      },
+    );
+
+    expect(result).toMatchObject({
+      requestId: request.requestId,
+      status: "complete",
+      state: "complete",
+    });
+    expect(result.artifacts?.map((artifact) => artifact.role).sort()).toEqual([
+      "clip_metadata_json",
+      "english_srt",
+      "manifest_json",
+      "original_srt",
+      "thumbnail_jpg",
+      "video_mp4",
+    ]);
+    expect({ acquisitionCalls, renderCalls }).toEqual({
+      acquisitionCalls: 1,
+      renderCalls: 1,
+    });
+
+    const packageIdentity = `clip-${request.requestId}`;
+    const packageDirectory = join(root, "exports", packageIdentity);
+    expect((await readdir(packageDirectory)).sort()).toEqual([
+      `${packageIdentity}.en.srt`,
+      `${packageIdentity}.jpg`,
+      `${packageIdentity}.json`,
+      `${packageIdentity}.mp4`,
+      `${packageIdentity}.original.srt`,
+      "manifest.json",
+    ]);
+    const videoPath = join(packageDirectory, `${packageIdentity}.mp4`);
+    const rendered = await inspection.inspect(videoPath);
+    expect(rendered).toMatchObject({
+      videoCodec: "h264",
+      audioCodec: "aac",
+      observedProperties: {
+        video: { width: 640, height: 360 },
+        streamCounts: {
+          total: 2,
+          video: 1,
+          audio: 1,
+          subtitle: 0,
+          data: 0,
+          other: 0,
+        },
+      },
+    });
+    expect(
+      Math.abs(
+        rendered.durationMs -
+          thirtyTwoSecondMediaFixture.gate.expectedDurationMs,
+      ),
+    ).toBeLessThanOrEqual(RenderDurationToleranceMs);
+
+    const originalCues = parseSrt(
+      await readFile(
+        join(packageDirectory, `${packageIdentity}.original.srt`),
+        "utf8",
+      ),
+    );
+    const englishCues = parseSrt(
+      await readFile(
+        join(packageDirectory, `${packageIdentity}.en.srt`),
+        "utf8",
+      ),
+    );
+    for (const cues of [originalCues, englishCues]) {
+      validateClipRelativeSrtCues(cues, rendered.durationMs);
+      expect(cues.map(({ startMs, endMs }) => ({ startMs, endMs }))).toEqual([
+        { startMs: 0, endMs: 1_500 },
+        { startMs: 4_000, endMs: 8_000 },
+        { startMs: 14_000, endMs: 18_000 },
+        { startMs: 29_000, endMs: 30_000 },
+      ]);
+      expect(cues.every((cue) => cue.endMs <= rendered.durationMs)).toBe(true);
+    }
+    expect(originalCues.map((cue) => cue.text)).toEqual([
+      "El primer límite queda recortado.",
+      "Esta frase permanece dentro del clip.",
+      "La sincronización sigue siendo exacta.",
+      "El último límite también se recorta.",
+    ]);
+    expect(englishCues.map((cue) => cue.text)).toEqual([
+      "The first boundary is trimmed.",
+      "This sentence remains inside the clip.",
+      "The synchronization stays exact.",
+      "The final boundary is also trimmed.",
+    ]);
+    expect(JSON.stringify([originalCues, englishCues])).not.toMatch(
+      /Antes del intervalo|Después del intervalo|Before the interval|After the interval/u,
+    );
+
+    const metadata = ExportClipMetadataSchema.parse(
+      JSON.parse(
+        await readFile(
+          join(packageDirectory, `${packageIdentity}.json`),
+          "utf8",
+        ),
+      ),
+    );
+    expect(metadata).toMatchObject({
+      schemaVersion: 2,
+      sourceLanguageClass: "foreign",
+      selection: {
+        transcriptStartMs: thirtyTwoSecondMediaFixture.gate.exportStartMs,
+        transcriptEndMs: thirtyTwoSecondMediaFixture.gate.exportEndMs,
+        exportStartMs: thirtyTwoSecondMediaFixture.gate.exportStartMs,
+        exportEndMs: thirtyTwoSecondMediaFixture.gate.exportEndMs,
+      },
+      resolvedExportBounds: {
+        startMs: thirtyTwoSecondMediaFixture.gate.exportStartMs,
+        endMs: thirtyTwoSecondMediaFixture.gate.exportEndMs,
+      },
+      renderedDurationMs: rendered.durationMs,
+      subtitlePolicy: { requiredSidecars: ["original", "english"] },
+      subtitleTracks: {
+        original: {
+          trackId: foreignThirtyTwoSecondFixture.original.track.id,
+          trackVersion: foreignThirtyTwoSecondFixture.original.track.version,
+        },
+        english: {
+          trackId: foreignThirtyTwoSecondFixture.english.track.id,
+          trackVersion: foreignThirtyTwoSecondFixture.english.track.version,
+        },
+      },
+    });
+
+    const manifest = ExportClipManifestSchema.parse(
+      JSON.parse(
+        await readFile(join(packageDirectory, "manifest.json"), "utf8"),
+      ),
+    );
+    expect(manifest).toMatchObject({
+      schemaVersion: 2,
+      sourceLanguageClass: "foreign",
+      resolvedExportBounds: {
+        startMs: thirtyTwoSecondMediaFixture.gate.exportStartMs,
+        endMs: thirtyTwoSecondMediaFixture.gate.exportEndMs,
+      },
+      renderedDurationMs: rendered.durationMs,
+      subtitlePolicy: { requiredSidecars: ["original", "english"] },
+      rendererCapabilityId: "h264_mp4",
+    });
+    expect(
+      manifest.artifacts.find((artifact) => artifact.role === "original_srt"),
+    ).toMatchObject({
+      subtitle: {
+        language: "es",
+        trackId: foreignThirtyTwoSecondFixture.original.track.id,
+        trackVersion: foreignThirtyTwoSecondFixture.original.track.version,
+        cueCount: 4,
+        startMs: 0,
+        endMs: 30_000,
+      },
+    });
+    expect(
+      manifest.artifacts.find((artifact) => artifact.role === "english_srt"),
+    ).toMatchObject({
+      subtitle: {
+        language: "en",
+        trackId: foreignThirtyTwoSecondFixture.english.track.id,
+        trackVersion: foreignThirtyTwoSecondFixture.english.track.version,
+        cueCount: 4,
+        startMs: 0,
+        endMs: 30_000,
+      },
+    });
+    for (const artifact of manifest.artifacts) {
+      const bytes = await readFile(join(packageDirectory, artifact.filename));
+      expect(artifact.byteSize).toBe(bytes.byteLength);
+      expect(artifact.contentSha256).toBe(sha256(bytes));
+    }
+
+    const database = openLocalDatabase(join(root, "local.sqlite"));
+    try {
+      const queue = new LocalExportQueue(database);
+      const persisted = queue.get(request.requestId)!;
+      expect(persisted).toMatchObject({ state: "complete" });
+      expect(persisted.finalArtifacts).toHaveLength(6);
+      for (const artifact of persisted.finalArtifacts ?? []) {
+        const filename =
+          artifact.role === "manifest_json"
+            ? "manifest.json"
+            : artifact.role === "video_mp4"
+              ? `${packageIdentity}.mp4`
+              : artifact.role === "video_mkv"
+                ? `${packageIdentity}.mkv`
+                : artifact.role === "video_mov"
+                  ? `${packageIdentity}.mov`
+                  : artifact.role === "english_srt"
+                    ? `${packageIdentity}.en.srt`
+                    : artifact.role === "original_srt"
+                      ? `${packageIdentity}.original.srt`
+                      : artifact.role === "thumbnail_jpg"
+                        ? `${packageIdentity}.jpg`
+                        : `${packageIdentity}.json`;
+        const bytes = await readFile(join(packageDirectory, filename));
+        expect(artifact.byteSize).toBe(bytes.byteLength);
+        expect(artifact.contentSha256).toBe(sha256(bytes));
+        const resultArtifact = result.artifacts?.find(
+          (candidate) => candidate.role === artifact.role,
+        );
+        expect(resultArtifact).toMatchObject({
+          byteSize: artifact.byteSize,
+          contentSha256: artifact.contentSha256,
+        });
+      }
+      expect(queue.getSourceAttempt(persisted.jobId, 1)).toMatchObject({
+        lifecycleState: "deleted",
+      });
+    } finally {
+      database.close();
+    }
+    expect(await readdir(join(root, "jobs", "export-source-scratch"))).toEqual(
+      [],
+    );
+
+    expect(
+      await runConfiguredLocalExportOnce(
+        { requestId: request.requestId, authorizationConfirmed: true },
+        {
+          config: fixtureConfig(root),
+          sourceProvider: fixtureSourceProvider(
+            () => {
+              acquisitionCalls += 1;
+            },
+            {
+              mediaPath: thirtyTwoSecondFixtureMediaPath,
+              sourceIdentity: "repository-synthetic-32s",
+            },
+          ),
+          inspector: inspection,
+          renderer,
+        },
+      ),
+    ).toMatchObject({ status: "already_complete", state: "complete" });
+    expect({ acquisitionCalls, renderCalls }).toEqual({
+      acquisitionCalls: 1,
+      renderCalls: 1,
+    });
   });
 
   it("executes one accepted logged delivery through the same processor and projects a replay-stable safe result", async () => {
@@ -1031,11 +1332,88 @@ function createFixtureRequest(
   }
 }
 
+function createThirtySecondForeignFixtureRequest(root: string) {
+  const database = openLocalDatabase(join(root, "local.sqlite"));
+  try {
+    const queue = new LocalExportQueue(database);
+    const index = new LocalTranscriptIndex(database);
+    const original = normalizeTranscriptFixture(
+      foreignThirtyTwoSecondFixture.original,
+    );
+    const english = normalizeTranscriptFixture(
+      foreignThirtyTwoSecondFixture.english,
+    );
+    index.replace({
+      projectId: "019fbb95-cd76-7920-93fa-e23ba755e101",
+      catalogVideoId: "019fbb95-cd76-7920-93fa-e23ba755e102",
+      transcriptVersionId: "019fbb95-cd76-7920-93fa-e23ba755e603",
+      transcript: original,
+    });
+    index.replace({
+      projectId: "019fbb95-cd76-7920-93fa-e23ba755e101",
+      catalogVideoId: "019fbb95-cd76-7920-93fa-e23ba755e102",
+      transcriptVersionId: "019fbb95-cd76-7920-93fa-e23ba755e604",
+      transcript: english,
+    });
+    const request = queue.createExportOnly({
+      idempotencyKey: "runtime-foreign-30-second-gate",
+      video: {
+        youtubeVideoId: original.track.videoId,
+        canonicalUrl: `https://www.youtube.com/watch?v=${original.track.videoId}`,
+        title: "Repository-authored 32-second foreign fixture",
+      },
+      selection: {
+        trackId: english.track.id,
+        transcriptVersion: english.track.version,
+        firstSegmentId: english.segments[1]!.id,
+        lastSegmentId: english.segments[4]!.id,
+        transcriptStartMs: thirtyTwoSecondMediaFixture.gate.exportStartMs,
+        transcriptEndMs: thirtyTwoSecondMediaFixture.gate.exportEndMs,
+        exportStartMs: thirtyTwoSecondMediaFixture.gate.exportStartMs,
+        exportEndMs: thirtyTwoSecondMediaFixture.gate.exportEndMs,
+        text: english.segments
+          .slice(1, 5)
+          .map((segment) => segment.text)
+          .join(" "),
+        timingPrecision: "cue",
+      },
+      sourceLanguageClass: "foreign",
+      subtitleTracks: {
+        original: {
+          trackId: original.track.id,
+          trackVersion: original.track.version,
+        },
+        english: {
+          trackId: english.track.id,
+          trackVersion: english.track.version,
+        },
+      },
+      preset: {
+        presetVersion: 1,
+        name: "30-second foreign fixture gate",
+        settings: {
+          ...editingSettings,
+          omitSubtitleFilesForConfirmedEnglish: true,
+        },
+      },
+    });
+    return { requestId: request.id };
+  } finally {
+    database.close();
+  }
+}
+
 function fixtureConfig(root: string) {
   return loadConfig({ NODE_ENV: "test", DATA_DIR: root });
 }
 
-function fixtureSourceProvider(onAcquisition: () => void = () => undefined) {
+function fixtureSourceProvider(
+  onAcquisition: () => void = () => undefined,
+  fixture: { mediaPath: string; sourceIdentity: string } = {
+    mediaPath: fixtureMediaPath,
+    sourceIdentity: "repository-synthetic-4s",
+  },
+) {
   return {
     acquireAuthorizedFullSource: async (input: {
       videoId: string;
@@ -1048,11 +1426,11 @@ function fixtureSourceProvider(onAcquisition: () => void = () => undefined) {
         input.scratchDirectory,
         `source-${input.videoId}.mp4`,
       );
-      await copyFile(fixtureMediaPath, scratchPath);
+      await copyFile(fixture.mediaPath, scratchPath);
       const info = await lstat(scratchPath);
       return {
         scratchPath,
-        sourceIdentity: "repository-synthetic-4s",
+        sourceIdentity: fixture.sourceIdentity,
         byteSize: info.size,
         provider: "repository-fixture",
         contentSha256: sha256(await readFile(scratchPath)),
