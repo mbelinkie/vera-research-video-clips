@@ -229,6 +229,7 @@ export const ClipExportStatusSchema = z.enum([
   "processing",
   "complete",
   "failed",
+  "canceled",
 ]);
 export const ClipTagNameSchema = z
   .string()
@@ -903,6 +904,35 @@ export const CreateClipExportRequestSchema =
   createExportRequestBaseSchema.superRefine(
     requireBilingualSubtitleTrackSnapshots,
   );
+export const CreateLoggedExportBatchRequestSchema = z
+  .object({
+    idempotencyKey: z.string().trim().min(1).max(512),
+    items: z
+      .array(
+        z
+          .object({
+            clipId: IdSchema,
+            export: CreateClipExportRequestSchema,
+          })
+          .strict(),
+      )
+      .min(2)
+      .max(25),
+  })
+  .strict()
+  .superRefine((request, context) => {
+    const seen = new Set<string>();
+    request.items.forEach((item, index) => {
+      if (seen.has(item.clipId)) {
+        context.addIssue({
+          code: "custom",
+          path: ["items", index, "clipId"],
+          message: "A clip can appear only once in an export batch.",
+        });
+      }
+      seen.add(item.clipId);
+    });
+  });
 export const CreateExportOnlyRequestSchema = createExportRequestBaseSchema
   .extend({
     video: ClipVideoSnapshotSchema,
@@ -1823,6 +1853,7 @@ export const ExportRequestSchema = z
     clipId: IdSchema.optional(),
     retryOfRequestId: IdSchema.optional(),
     retryOrdinal: z.number().int().positive().optional(),
+    batchItemId: IdSchema.optional(),
     video: ClipVideoSnapshotSchema,
     selection: TranscriptSelectionSchema,
     sourceLanguageClass: ExportSourceLanguageClassSchema,
@@ -2104,6 +2135,85 @@ export const GetLoggedExportProgressResponseSchema = z
     state: JobStateSchema,
     progress: LoggedExportProgressSnapshotSchema.optional(),
   })
+  .strict();
+
+export const LoggedExportBatchSummarySchema = z
+  .object({
+    total: z.number().int().min(2).max(25),
+    queued: z.number().int().nonnegative(),
+    claimed: z.number().int().nonnegative(),
+    processing: z.number().int().nonnegative(),
+    needsUserAction: z.number().int().nonnegative(),
+    complete: z.number().int().nonnegative(),
+    failed: z.number().int().nonnegative(),
+    canceled: z.number().int().nonnegative(),
+    status: z.enum(["active", "complete", "mixed_terminal"]),
+  })
+  .strict()
+  .superRefine((summary, context) => {
+    const count =
+      summary.queued +
+      summary.claimed +
+      summary.processing +
+      summary.needsUserAction +
+      summary.complete +
+      summary.failed +
+      summary.canceled;
+    if (count !== summary.total) {
+      context.addIssue({
+        code: "custom",
+        path: ["total"],
+        message: "Batch summary counts must equal its total.",
+      });
+    }
+    const terminal = summary.complete + summary.failed + summary.canceled;
+    const consistent =
+      (summary.status === "complete" && summary.complete === summary.total) ||
+      (summary.status === "mixed_terminal" &&
+        terminal === summary.total &&
+        summary.complete < summary.total) ||
+      (summary.status === "active" && terminal < summary.total);
+    if (!consistent) {
+      context.addIssue({
+        code: "custom",
+        path: ["status"],
+        message: "Batch summary status must agree with its terminal counts.",
+      });
+    }
+  });
+
+export const LoggedExportBatchItemSchema = z
+  .object({
+    id: IdSchema,
+    batchId: IdSchema,
+    ordinal: z.number().int().nonnegative(),
+    clipId: IdSchema,
+    rootRequestId: IdSchema,
+    currentRequest: z
+      .object({
+        id: IdSchema,
+        jobId: IdSchema,
+        state: JobStateSchema,
+        retryOfRequestId: IdSchema.optional(),
+        retryOrdinal: z.number().int().positive().optional(),
+      })
+      .strict(),
+    progress: LoggedExportProgressSnapshotSchema.optional(),
+  })
+  .strict();
+
+export const LoggedExportBatchSchema = z
+  .object({
+    id: IdSchema,
+    projectId: IdSchema,
+    createdAt: UtcTimestampSchema,
+    summary: LoggedExportBatchSummarySchema,
+    items: z.array(LoggedExportBatchItemSchema).min(2).max(25),
+  })
+  .strict();
+
+export const LoggedExportBatchListResponseSchema = z
+  .object({ batches: z.array(LoggedExportBatchSchema).max(100) })
   .strict();
 
 export const CancelLoggedExportRequestSchema = z
@@ -2742,6 +2852,9 @@ export type SubtitleSidecarProvenance = z.infer<
 export type CreateClipExportRequest = z.infer<
   typeof CreateClipExportRequestSchema
 >;
+export type CreateLoggedExportBatchRequest = z.infer<
+  typeof CreateLoggedExportBatchRequestSchema
+>;
 export type CreateExportOnlyRequest = z.infer<
   typeof CreateExportOnlyRequestSchema
 >;
@@ -2806,6 +2919,14 @@ export type HeartbeatLoggedExportExecutionResponse = z.infer<
 >;
 export type GetLoggedExportProgressResponse = z.infer<
   typeof GetLoggedExportProgressResponseSchema
+>;
+export type LoggedExportBatchSummary = z.infer<
+  typeof LoggedExportBatchSummarySchema
+>;
+export type LoggedExportBatchItem = z.infer<typeof LoggedExportBatchItemSchema>;
+export type LoggedExportBatch = z.infer<typeof LoggedExportBatchSchema>;
+export type LoggedExportBatchListResponse = z.infer<
+  typeof LoggedExportBatchListResponseSchema
 >;
 export type CancelLoggedExportRequest = z.infer<
   typeof CancelLoggedExportRequestSchema

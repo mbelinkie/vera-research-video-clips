@@ -2336,8 +2336,279 @@ describe("logged export delivery", () => {
   });
 });
 
+describe("logged export batches", () => {
+  it("creates and replays one atomic sanitized batch with isolated derived status", async () => {
+    const database = new PGlite();
+    databases.add(database);
+    await runCloudMigrations(database);
+    const catalog = new SharedProjectCatalog(
+      database,
+      new MemoryTranscriptObjectStore(),
+      () => new Date("2026-08-22T12:00:00.000Z"),
+    );
+    const owner = fixtureActor("batch-owner");
+    await catalog.registerUser(owner, "Batch owner");
+    const project = await catalog.createProject(owner, {
+      name: "Batch project",
+    });
+    const clips = await createBatchClips(catalog, owner, project.id, 3);
+    const command = await createBatchCommand(catalog, owner, project.id, clips);
+    const [batch, concurrentReplay] = await Promise.all([
+      catalog.createLoggedExportBatch(owner, project.id, command),
+      catalog.createLoggedExportBatch(owner, project.id, command),
+    ]);
+    expect(concurrentReplay).toEqual(batch);
+    expect(batch).toMatchObject({
+      projectId: project.id,
+      summary: {
+        total: 3,
+        queued: 3,
+        complete: 0,
+        failed: 0,
+        canceled: 0,
+        status: "active",
+      },
+    });
+    expect(batch.items.map((item) => item.ordinal)).toEqual([0, 1, 2]);
+    expect(new Set(batch.items.map((item) => item.id)).size).toBe(3);
+    const membership = await database.query<{
+      id: string;
+      batch_item_id: string;
+    }>("SELECT id, batch_item_id FROM export_requests ORDER BY id");
+    expect(
+      membership.rows.every((request) => Boolean(request.batch_item_id)),
+    ).toBe(true);
+    expect(
+      await catalog.createLoggedExportBatch(owner, project.id, command),
+    ).toEqual(batch);
+    await expect(
+      catalog.createClipExport(owner, project.id, clips[0]!.id, {
+        ...command.items[0]!.export,
+        idempotencyKey: "second-export-for-batch-clip",
+      }),
+    ).rejects.toMatchObject({ statusCode: 409 });
+    await expect(
+      catalog.createLoggedExportBatch(owner, project.id, {
+        ...command,
+        items: [...command.items].reverse(),
+      }),
+    ).rejects.toMatchObject({ statusCode: 409 });
+    expect(await catalog.listLoggedExportBatches(owner, project.id)).toEqual({
+      batches: [batch],
+    });
+    const outsider = fixtureActor("batch-outsider");
+    await catalog.registerUser(outsider, "Batch outsider");
+    await expect(
+      catalog.getLoggedExportBatch(outsider, project.id, batch.id),
+    ).rejects.toMatchObject({ statusCode: 403 });
+    expect(JSON.stringify(batch)).not.toMatch(
+      /reservation|leaseToken|workerId|sourceIdentity|artifactLocator|path|url|createdBy/i,
+    );
+
+    for (const [index, state] of ["complete", "failed", "canceled"].entries()) {
+      await database.query("UPDATE jobs SET state = $1 WHERE id = $2", [
+        state,
+        batch.items[index]!.currentRequest.jobId,
+      ]);
+    }
+    const mixed = await catalog.getLoggedExportBatch(
+      owner,
+      project.id,
+      batch.id,
+    );
+    expect(mixed.summary).toMatchObject({
+      complete: 1,
+      failed: 1,
+      canceled: 1,
+      status: "mixed_terminal",
+    });
+    expect(mixed.items.map((item) => item.currentRequest.id)).toEqual(
+      batch.items.map((item) => item.currentRequest.id),
+    );
+  });
+
+  it("rolls back invalid siblings and keeps retry lineage on its batch item", async () => {
+    const database = new PGlite();
+    databases.add(database);
+    await runCloudMigrations(database);
+    const catalog = new SharedProjectCatalog(
+      database,
+      new MemoryTranscriptObjectStore(),
+      () => new Date("2026-08-22T13:00:00.000Z"),
+    );
+    const owner = fixtureActor("batch-retry-owner");
+    await catalog.registerUser(owner, "Batch retry owner");
+    const project = await catalog.createProject(owner, {
+      name: "Batch retry project",
+    });
+    const clips = await createBatchClips(catalog, owner, project.id, 2);
+    const command = await createBatchCommand(catalog, owner, project.id, clips);
+    await expect(
+      catalog.createLoggedExportBatch(owner, project.id, {
+        ...command,
+        idempotencyKey: "invalid-batch",
+        items: [
+          command.items[0]!,
+          { ...command.items[1]!, clipId: randomUUID() },
+        ],
+      }),
+    ).rejects.toMatchObject({ statusCode: 404 });
+    expect(
+      (
+        await database.query<{ count: string }>(
+          "SELECT count(*)::text AS count FROM logged_export_batches",
+        )
+      ).rows[0]!.count,
+    ).toBe("0");
+    expect(await countOrphanExportJobs(database, project.id)).toBe(0);
+    const batch = await catalog.createLoggedExportBatch(
+      owner,
+      project.id,
+      command,
+    );
+
+    const advertisement = currentExportWorkerAdvertisement({
+      ffmpegVersion: "8.1.2",
+      encoders: ["libx264", "mov_text"],
+      muxers: ["mp4"],
+      filters: ["scale", "fps"],
+    });
+    const worker = { workerId: randomUUID(), epoch: 1, ...advertisement };
+    await catalog.registerExportWorker(owner, worker);
+    const reserved = (
+      await catalog.claimLoggedExportDelivery(owner, {
+        workerId: worker.workerId,
+        workerEpoch: worker.epoch,
+      })
+    ).delivery!;
+    const accepted = await catalog.acceptLoggedExportDelivery(owner, {
+      workerId: worker.workerId,
+      workerEpoch: worker.epoch,
+      deliveryId: reserved.deliveryId,
+      generation: reserved.generation,
+      reservationToken: reserved.reservationToken,
+    });
+    await catalog.reconcileLoggedExportFailure(owner, {
+      workerId: accepted.workerId,
+      workerEpoch: accepted.workerEpoch,
+      deliveryId: accepted.deliveryId,
+      generation: accepted.generation,
+      reservationToken: accepted.reservationToken,
+      result: loggedExportFailureFixture(accepted.request),
+    });
+    const retried = await catalog.retryLoggedExport(
+      owner,
+      project.id,
+      accepted.request.id,
+      { idempotencyKey: "batch-item-retry" },
+    );
+    const failedItem = batch.items.find(
+      (item) => item.currentRequest.id === accepted.request.id,
+    )!;
+    expect(retried.request).toMatchObject({
+      batchItemId: failedItem.id,
+      retryOfRequestId: accepted.request.id,
+      retryOrdinal: 1,
+    });
+    const afterRetry = await catalog.getLoggedExportBatch(
+      owner,
+      project.id,
+      batch.id,
+    );
+    expect(
+      afterRetry.items.find((item) => item.id === failedItem.id)!
+        .currentRequest,
+    ).toMatchObject({ id: retried.request.id, state: "queued" });
+    expect(afterRetry.summary).toMatchObject({ queued: 2, status: "active" });
+  });
+});
+
 function fixtureActor(name: string): AuthenticatedActor {
   return { userId: randomUUID(), externalSubject: `fixture:${name}` };
+}
+
+async function createBatchClips(
+  catalog: SharedProjectCatalog,
+  actor: AuthenticatedActor,
+  projectId: string,
+  count: number,
+) {
+  return Promise.all(
+    Array.from({ length: count }, async (_, index) => {
+      const trackId = randomUUID();
+      return catalog.createClipCandidate(actor, projectId, {
+        idempotencyKey: `batch-clip-${index}`,
+        video: {
+          youtubeVideoId: "M7lc1UVf-VE",
+          canonicalUrl: "https://www.youtube.com/watch?v=M7lc1UVf-VE",
+          title: `Batch fixture ${index}`,
+        },
+        selection: {
+          trackId,
+          transcriptVersion: 1,
+          firstSegmentId: randomUUID(),
+          lastSegmentId: randomUUID(),
+          firstTokenId: randomUUID(),
+          lastTokenId: randomUUID(),
+          transcriptStartMs: 300 + index * 100,
+          transcriptEndMs: 2_900 + index * 100,
+          exportStartMs: index * 100,
+          exportEndMs: 3_400 + index * 100,
+          text: `Batch fixture selection ${index}`,
+          timingPrecision: "word",
+        },
+        languageEvidence: {
+          schemaVersion: 2,
+          native: {
+            role: "native",
+            language: "en",
+            text: `Batch fixture selection ${index}`,
+            trackId,
+            trackVersion: 1,
+            timingPrecision: "word",
+          },
+          english: {
+            role: "english",
+            language: "en",
+            text: `Batch fixture selection ${index}`,
+            trackId,
+            trackVersion: 1,
+            timingPrecision: "word",
+          },
+        },
+        notes: "",
+        tags: [],
+      });
+    }),
+  );
+}
+
+async function createBatchCommand(
+  catalog: SharedProjectCatalog,
+  actor: AuthenticatedActor,
+  projectId: string,
+  clips: Awaited<ReturnType<typeof createBatchClips>>,
+) {
+  const selection = {
+    base: "application_default" as const,
+    overrides: {},
+  };
+  const preview = await catalog.previewProjectExportSettings(actor, projectId, {
+    sourceLanguageClass: "confirmed_english",
+    selection,
+  });
+  return {
+    idempotencyKey: "batch-create-1",
+    items: clips.map((clip, index) => ({
+      clipId: clip.id,
+      export: {
+        idempotencyKey: `batch-item-${index}`,
+        sourceLanguageClass: "confirmed_english" as const,
+        settingsSelection: selection,
+        expectedResolutionFingerprint: preview.snapshot.resolutionFingerprint!,
+      },
+    })),
+  };
 }
 
 async function createLoggedExportFixture(

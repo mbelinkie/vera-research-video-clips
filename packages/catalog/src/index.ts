@@ -19,6 +19,7 @@ import {
   PublishDerivedTranslationRequestSchema,
   RequestDerivedTranslationSchema,
   CreateTranscriptionBatchResponseSchema,
+  CreateLoggedExportBatchRequestSchema,
   ExportRequestSchema,
   ClaimLoggedExportDeliveryRequestSchema,
   ClaimLoggedExportDeliveryResponseSchema,
@@ -32,6 +33,8 @@ import {
   HeartbeatLoggedExportExecutionRequestSchema,
   HeartbeatLoggedExportExecutionResponseSchema,
   GetLoggedExportProgressResponseSchema,
+  LoggedExportBatchSchema,
+  LoggedExportBatchListResponseSchema,
   ReconcileLoggedExportFailureRequestSchema,
   ReconcileLoggedExportSuccessRequestSchema,
   ReconcileLoggedExportCanceledRequestSchema,
@@ -78,6 +81,7 @@ import {
   type ClaimLoggedExportDeliveryResponse,
   type CreateClipExportRequest,
   type CreateTranscriptionBatchResponse,
+  type CreateLoggedExportBatchRequest,
   type DerivedTranslation,
   type DerivedTranslationIdentity,
   type DerivedTranslationJob,
@@ -101,6 +105,8 @@ import {
   type HeartbeatLoggedExportExecutionRequest,
   type HeartbeatLoggedExportExecutionResponse,
   type GetLoggedExportProgressResponse,
+  type LoggedExportBatch,
+  type LoggedExportBatchListResponse,
   type LoggedExportProgressSnapshot,
   type LoggedExportProgressStage,
   type LoggedExportSuccess,
@@ -2749,11 +2755,22 @@ export class SharedProjectCatalog {
       [idempotencyKey, projectId],
     );
     if (existing.rows[0]) return mapLoggedExportRequest(existing.rows[0]);
-
     const requestId = randomUUID();
     const jobId = randomUUID();
     const now = this.now().toISOString();
     await this.transaction(async () => {
+      const batchMembership = await this.database.query(
+        `SELECT 1 FROM export_requests
+         WHERE project_id = $1 AND clip_id = $2
+           AND batch_item_id IS NOT NULL
+         LIMIT 1`,
+        [projectId, clipId],
+      );
+      if (batchMembership.rows[0]) {
+        throw new CatalogConflictError(
+          "A batch clip cannot receive a second independent export request.",
+        );
+      }
       const preview = input.preset
         ? resolveExportSettings({
             context: "logged",
@@ -2828,26 +2845,297 @@ export class SharedProjectCatalog {
           now,
         ],
       );
-      await this.database.query(
+      const queued = await this.database.query<{ version: number }>(
         `UPDATE clip_candidates
          SET export_status = 'queued', version = version + 1, updated_at = $1
-         WHERE id = $2 AND project_id = $3`,
+         WHERE id = $2 AND project_id = $3
+         RETURNING version`,
         [now, clipId, projectId],
       );
+      if (!queued.rows[0]) {
+        throw new CatalogConflictError(
+          "This clip changed while its export was being created.",
+        );
+      }
       await this.database.query(
         `INSERT INTO sync_events
            (project_id, event_type, entity_id, server_version, payload, created_at)
          VALUES ($1, 'clip_candidate.export_queued', $2,
-                 (SELECT version FROM clip_candidates WHERE id = $2), $3, $4)`,
+                 $3, $4, $5)`,
         [
           projectId,
           clipId,
+          queued.rows[0].version,
           JSON.stringify({ clipId, exportRequestId: requestId, jobId }),
           now,
         ],
       );
     });
     return this.getLoggedExportRequest(actor, projectId, requestId);
+  }
+
+  async createLoggedExportBatch(
+    actor: AuthenticatedActor,
+    projectId: string,
+    input: CreateLoggedExportBatchRequest,
+  ): Promise<LoggedExportBatch> {
+    await this.requireRegistered(actor);
+    const parsed = CreateLoggedExportBatchRequestSchema.parse(input);
+    const requestFingerprint = sha256Fingerprint(parsed);
+    const now = this.now().toISOString();
+    let batchId: string | undefined;
+
+    await this.transaction(async () => {
+      const membership = await this.database.query<{ role: ProjectRole }>(
+        `SELECT members.role
+         FROM projects project
+         JOIN project_members members
+           ON members.project_id = project.id AND members.user_id = $1
+         WHERE project.id = $2
+         FOR UPDATE OF project, members`,
+        [actor.userId, projectId],
+      );
+      requirePermission(membership.rows[0]?.role, "write");
+
+      const existing = await this.database.query<DbRow>(
+        `SELECT * FROM logged_export_batches
+         WHERE project_id = $1 AND idempotency_key = $2
+         FOR UPDATE`,
+        [projectId, parsed.idempotencyKey],
+      );
+      if (existing.rows[0]) {
+        if (
+          String(existing.rows[0].request_fingerprint) !== requestFingerprint
+        ) {
+          throw new CatalogIdempotencyConflictError(
+            "This batch command identity already belongs to different items or settings.",
+          );
+        }
+        batchId = String(existing.rows[0].id);
+        return;
+      }
+
+      const resolvedItems: Array<{
+        clip: ClipCandidate;
+        input: CreateLoggedExportBatchRequest["items"][number]["export"];
+        preset: ExportPresetSnapshot;
+        snapshot: ReturnType<typeof resolveExportSettings>["snapshot"];
+      }> = [];
+      for (const item of parsed.items) {
+        const clipResult = await this.database.query<DbRow>(
+          `SELECT c.* FROM clip_candidates c
+           WHERE c.id = $1 AND c.project_id = $2
+           FOR UPDATE OF c`,
+          [item.clipId, projectId],
+        );
+        const clipRow = clipResult.rows[0];
+        if (!clipRow) {
+          throw new CatalogNotFoundError("Batch clip candidate not found.");
+        }
+        if (String(clipRow.export_status) !== "not_requested") {
+          throw new CatalogConflictError(
+            "Every batch clip must be eligible and not previously exported.",
+          );
+        }
+        const clip = mapClipCandidate(
+          clipRow,
+          await this.loadClipTags(item.clipId),
+          await this.loadClipLanguageEvidence(item.clipId),
+        );
+        const preview = item.export.preset
+          ? resolveExportSettings({
+              context: "logged",
+              sourceLanguageClass: item.export.sourceLanguageClass,
+              legacyPreset: item.export.preset,
+              resolvedAt: now,
+            })
+          : await this.resolveCatalogExportSettings(
+              actor,
+              "logged",
+              projectId,
+              {
+                sourceLanguageClass: item.export.sourceLanguageClass,
+                selection: item.export.settingsSelection!,
+              },
+              now,
+            );
+        if (
+          item.export.expectedResolutionFingerprint &&
+          preview.snapshot.resolutionFingerprint !==
+            item.export.expectedResolutionFingerprint
+        ) {
+          throw new ExportSettingsStaleError(
+            "Batch export settings changed after preview.",
+          );
+        }
+        if (!item.export.preset && preview.issues.length) {
+          throw new ExportSettingsCapabilityError(
+            "The current worker cannot render one batch item's resolved settings.",
+            preview.issues,
+          );
+        }
+        resolvedItems.push({
+          clip,
+          input: item.export,
+          preset: resolvedPresetForCompatibility(preview.snapshot),
+          snapshot: preview.snapshot,
+        });
+      }
+
+      batchId = randomUUID();
+      await this.database.query(
+        `INSERT INTO logged_export_batches
+           (id, project_id, created_by, idempotency_key,
+            request_fingerprint, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [
+          batchId,
+          projectId,
+          actor.userId,
+          parsed.idempotencyKey,
+          requestFingerprint,
+          now,
+        ],
+      );
+      for (const [ordinal, resolved] of resolvedItems.entries()) {
+        const batchItemId = randomUUID();
+        const requestId = randomUUID();
+        const jobId = randomUUID();
+        await this.database.query(
+          `INSERT INTO logged_export_batch_items
+             (id, batch_id, clip_id, ordinal, created_at)
+           VALUES ($1, $2, $3, $4, $5)`,
+          [batchItemId, batchId, resolved.clip.id, ordinal, now],
+        );
+        const payload = {
+          exportRequestId: requestId,
+          mode: "logged",
+          clipId: resolved.clip.id,
+          batchItemId,
+          video: resolved.clip.video,
+          selection: resolved.clip.selection,
+          sourceLanguageClass: resolved.input.sourceLanguageClass,
+          ...(resolved.input.subtitleTracks
+            ? { subtitleTracks: resolved.input.subtitleTracks }
+            : {}),
+          preset: resolved.preset,
+          resolvedSettingsSnapshot: resolved.snapshot,
+        };
+        await this.database.query(
+          `INSERT INTO jobs
+             (id, project_id, kind, state, idempotency_key, attempt, payload,
+              created_at, updated_at)
+           VALUES ($1, $2, 'export', 'queued', $3, 0, $4, $5, $5)`,
+          [
+            jobId,
+            projectId,
+            `logged-export-batch:${batchId}:${ordinal}`,
+            JSON.stringify(payload),
+            now,
+          ],
+        );
+        await this.database.query(
+          `INSERT INTO export_requests
+             (id, job_id, clip_id, project_id, mode, video_snapshot,
+              selection_snapshot, source_language_class,
+              subtitle_tracks_snapshot, preset_snapshot,
+              resolved_settings_snapshot, requested_by, batch_item_id,
+              created_at, updated_at)
+           VALUES ($1, $2, $3, $4, 'logged', $5, $6, $7, $8, $9, $10,
+                   $11, $12, $13, $13)`,
+          [
+            requestId,
+            jobId,
+            resolved.clip.id,
+            projectId,
+            JSON.stringify(resolved.clip.video),
+            JSON.stringify(resolved.clip.selection),
+            resolved.input.sourceLanguageClass,
+            resolved.input.subtitleTracks
+              ? JSON.stringify(resolved.input.subtitleTracks)
+              : null,
+            JSON.stringify(resolved.preset),
+            JSON.stringify(resolved.snapshot),
+            actor.userId,
+            batchItemId,
+            now,
+          ],
+        );
+        await this.database.query(
+          `UPDATE logged_export_batch_items
+           SET root_export_request_id = $1 WHERE id = $2`,
+          [requestId, batchItemId],
+        );
+        const queued = await this.database.query<{ version: number }>(
+          `UPDATE clip_candidates
+           SET export_status = 'queued', version = version + 1, updated_at = $1
+           WHERE id = $2 AND project_id = $3
+             AND export_status = 'not_requested'
+           RETURNING version`,
+          [now, resolved.clip.id, projectId],
+        );
+        if (!queued.rows[0]) {
+          throw new CatalogConflictError(
+            "A batch sibling changed while the batch was being created.",
+          );
+        }
+        await this.database.query(
+          `INSERT INTO sync_events
+             (project_id, event_type, entity_id, server_version, payload, created_at)
+           VALUES ($1, 'clip_candidate.export_queued', $2, $3, $4, $5)`,
+          [
+            projectId,
+            resolved.clip.id,
+            queued.rows[0].version,
+            JSON.stringify({
+              clipId: resolved.clip.id,
+              exportRequestId: requestId,
+              jobId,
+              batchId,
+              batchItemId,
+              ordinal,
+            }),
+            now,
+          ],
+        );
+      }
+    });
+
+    if (!batchId)
+      throw new CatalogConflictError("Batch creation did not persist.");
+    return this.getLoggedExportBatch(actor, projectId, batchId);
+  }
+
+  async getLoggedExportBatch(
+    actor: AuthenticatedActor,
+    projectId: string,
+    batchId: string,
+  ): Promise<LoggedExportBatch> {
+    await this.authorize(actor, projectId, "read");
+    const rows = await this.loadLoggedExportBatchRows(projectId, batchId);
+    if (!rows.length) throw new CatalogNotFoundError("Export batch not found.");
+    return mapLoggedExportBatchRows(rows);
+  }
+
+  async listLoggedExportBatches(
+    actor: AuthenticatedActor,
+    projectId: string,
+  ): Promise<LoggedExportBatchListResponse> {
+    await this.authorize(actor, projectId, "read");
+    const batches = await this.database.query<{ id: string }>(
+      `SELECT id FROM logged_export_batches
+       WHERE project_id = $1 ORDER BY created_at DESC, id LIMIT 100`,
+      [projectId],
+    );
+    return LoggedExportBatchListResponseSchema.parse({
+      batches: await Promise.all(
+        batches.rows.map(async ({ id }) =>
+          mapLoggedExportBatchRows(
+            await this.loadLoggedExportBatchRows(projectId, id),
+          ),
+        ),
+      ),
+    });
   }
 
   async retryLoggedExport(
@@ -2962,6 +3250,7 @@ export class SharedProjectCatalog {
         resolvedSettingsSnapshot: parent.resolvedSettingsSnapshot!,
         retryOfRequestId: parent.id,
         retryOrdinal,
+        ...(parent.batchItemId ? { batchItemId: parent.batchItemId } : {}),
       };
       const jobIdempotencyKey = `logged-export-retry:${sha256Fingerprint({
         projectId,
@@ -3000,12 +3289,13 @@ export class SharedProjectCatalog {
             selection_snapshot, source_language_class,
             subtitle_tracks_snapshot, preset_snapshot,
             resolved_settings_snapshot, requested_by, retry_of_request_id,
-            retry_ordinal, retry_idempotency_key, created_at, updated_at)
+            retry_ordinal, retry_idempotency_key, batch_item_id,
+            created_at, updated_at)
          SELECT $1, $2, parent.clip_id, parent.project_id, parent.mode,
                 parent.video_snapshot, parent.selection_snapshot,
                 parent.source_language_class, parent.subtitle_tracks_snapshot,
                 parent.preset_snapshot, parent.resolved_settings_snapshot,
-                $3, parent.id, $4, $5, $6, $6
+                $3, parent.id, $4, $5, parent.batch_item_id, $6, $6
          FROM export_requests parent
          WHERE parent.id = $7
          ON CONFLICT DO NOTHING
@@ -5229,6 +5519,47 @@ export class SharedProjectCatalog {
       : {};
   }
 
+  private async loadLoggedExportBatchRows(
+    projectId: string,
+    batchId: string,
+  ): Promise<DbRow[]> {
+    const result = await this.database.query<DbRow>(
+      `SELECT batch.id AS batch_id,
+              batch.project_id AS batch_project_id,
+              batch.created_at AS batch_created_at,
+              item.id AS batch_item_id_value,
+              item.ordinal AS batch_item_ordinal,
+              item.clip_id AS batch_clip_id,
+              item.root_export_request_id,
+              er.*, job.state,
+              success.result_json AS export_success_result_json,
+              progress.execution_id AS progress_execution_id,
+              progress.export_request_id AS progress_export_request_id,
+              progress.attempt AS progress_attempt,
+              progress.sequence AS progress_sequence,
+              progress.stage AS progress_stage,
+              progress.basis_points AS progress_basis_points,
+              progress.updated_at AS progress_updated_at
+       FROM logged_export_batches batch
+       JOIN logged_export_batch_items item ON item.batch_id = batch.id
+       JOIN export_requests er ON er.id = (
+         SELECT leaf.id FROM export_requests leaf
+         WHERE leaf.batch_item_id = item.id
+         ORDER BY leaf.retry_ordinal DESC, leaf.created_at DESC, leaf.id
+         LIMIT 1
+       )
+       JOIN jobs job ON job.id = er.job_id
+       LEFT JOIN logged_export_success_results success
+         ON success.export_request_id = er.id
+       LEFT JOIN logged_export_execution_progress progress
+         ON progress.export_request_id = er.id
+       WHERE batch.id = $1 AND batch.project_id = $2
+       ORDER BY item.ordinal, item.id`,
+      [batchId, projectId],
+    );
+    return result.rows;
+  }
+
   private async persistLoggedExportProgress(
     progress: LoggedExportProgressSnapshot,
   ): Promise<void> {
@@ -5564,6 +5895,7 @@ function assertLoggedExportRetryParentEvidence(
           retryOrdinal: request.retryOrdinal,
         }
       : {}),
+    ...(request.batchItemId ? { batchItemId: request.batchItemId } : {}),
   };
   if (canonicalJson(payload) !== canonicalJson(expectedPayload)) {
     throw new CatalogConflictError(
@@ -5838,6 +6170,76 @@ function mapClipCandidate(
   });
 }
 
+function mapLoggedExportBatchRows(rows: DbRow[]): LoggedExportBatch {
+  if (!rows[0]) throw new CatalogNotFoundError("Export batch not found.");
+  const counts = {
+    queued: 0,
+    claimed: 0,
+    processing: 0,
+    needsUserAction: 0,
+    complete: 0,
+    failed: 0,
+    canceled: 0,
+  };
+  const items = rows.map((row) => {
+    const state = String(row.state);
+    if (state === "needs_user_action") counts.needsUserAction += 1;
+    else if (state in counts) counts[state as keyof typeof counts] += 1;
+    else
+      throw new CatalogConflictError("Export batch contains an invalid state.");
+    const currentRequest = mapLoggedExportRequest(row);
+    return {
+      id: row.batch_item_id_value,
+      batchId: row.batch_id,
+      ordinal: Number(row.batch_item_ordinal),
+      clipId: row.batch_clip_id,
+      rootRequestId: row.root_export_request_id,
+      currentRequest: {
+        id: currentRequest.id,
+        jobId: currentRequest.jobId,
+        state: currentRequest.state,
+        ...(currentRequest.retryOfRequestId
+          ? {
+              retryOfRequestId: currentRequest.retryOfRequestId,
+              retryOrdinal: currentRequest.retryOrdinal,
+            }
+          : {}),
+      },
+      ...(row.progress_execution_id
+        ? {
+            progress: mapLoggedExportProgress({
+              execution_id: row.progress_execution_id,
+              export_request_id: row.progress_export_request_id,
+              attempt: row.progress_attempt,
+              sequence: row.progress_sequence,
+              stage: row.progress_stage,
+              basis_points: row.progress_basis_points,
+              updated_at: row.progress_updated_at,
+            }),
+          }
+        : {}),
+    };
+  });
+  const total = items.length;
+  const terminal = counts.complete + counts.failed + counts.canceled;
+  return LoggedExportBatchSchema.parse({
+    id: rows[0].batch_id,
+    projectId: rows[0].batch_project_id,
+    createdAt: iso(rows[0].batch_created_at),
+    summary: {
+      total,
+      ...counts,
+      status:
+        counts.complete === total
+          ? "complete"
+          : terminal === total
+            ? "mixed_terminal"
+            : "active",
+    },
+    items,
+  });
+}
+
 function mapLoggedExportRequest(row: DbRow): ExportRequest {
   const success = row.export_success_result_json
     ? LoggedExportSuccessResultSchema.parse(
@@ -5858,6 +6260,7 @@ function mapLoggedExportRequest(row: DbRow): ExportRequest {
           retryOrdinal: Number(row.retry_ordinal),
         }
       : {}),
+    ...(row.batch_item_id ? { batchItemId: row.batch_item_id } : {}),
     video: row.video_snapshot,
     selection: row.selection_snapshot,
     sourceLanguageClass: row.source_language_class,

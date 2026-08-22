@@ -1889,6 +1889,9 @@ describe("logged export delivery API", () => {
     const startLoggedExportExecution = vi.fn(async () => ({ started: true }));
     const heartbeatLoggedExportExecution = vi.fn(async () => ({ alive: true }));
     const getLoggedExportProgress = vi.fn(async () => ({ progress: true }));
+    const createLoggedExportBatch = vi.fn(async () => ({ created: true }));
+    const listLoggedExportBatches = vi.fn(async () => ({ batches: [] }));
+    const getLoggedExportBatch = vi.fn(async () => ({ batch: true }));
     const reconcileLoggedExportCanceled = vi.fn(async () => ({
       canceled: true,
     }));
@@ -1902,6 +1905,9 @@ describe("logged export delivery API", () => {
       startLoggedExportExecution,
       heartbeatLoggedExportExecution,
       getLoggedExportProgress,
+      createLoggedExportBatch,
+      listLoggedExportBatches,
+      getLoggedExportBatch,
       reconcileLoggedExportCanceled,
       cancelLoggedExport,
       retryLoggedExport,
@@ -2072,6 +2078,68 @@ describe("logged export delivery API", () => {
       actor,
       progressProjectId,
       progressRequestId,
+    );
+    const batchProjectId = randomUUID();
+    const batchId = randomUUID();
+    const preset = {
+      presetVersion: 1,
+      name: "Editing MP4",
+      settings: {
+        container: "mp4",
+        videoCodec: "h264",
+        videoRateControl: { mode: "crf", value: 20 },
+        frameRate: "source",
+        audioCodec: "aac",
+        omitSubtitleFilesForConfirmedEnglish: false,
+        embedEnglishSubtitleTrack: false,
+      },
+    };
+    const batchCommand = {
+      idempotencyKey: "api-batch-1",
+      items: [0, 1].map((index) => ({
+        clipId: randomUUID(),
+        export: {
+          idempotencyKey: `api-batch-item-${index}`,
+          sourceLanguageClass: "confirmed_english",
+          preset,
+        },
+      })),
+    };
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: `/api/projects/${batchProjectId}/export-batches`,
+          payload: batchCommand,
+        })
+      ).json(),
+    ).toEqual({ created: true });
+    expect(createLoggedExportBatch).toHaveBeenCalledWith(
+      actor,
+      batchProjectId,
+      batchCommand,
+    );
+    expect(
+      (
+        await app.inject({
+          method: "GET",
+          url: `/api/projects/${batchProjectId}/export-batches`,
+        })
+      ).json(),
+    ).toEqual({ batches: [] });
+    expect(listLoggedExportBatches).toHaveBeenCalledWith(actor, batchProjectId);
+    expect(
+      (
+        await app.inject({
+          method: "GET",
+          url: `/api/projects/${batchProjectId}/export-batches/${batchId}`,
+        })
+      ).json(),
+    ).toEqual({ batch: true });
+    expect(getLoggedExportBatch).toHaveBeenCalledWith(
+      actor,
+      batchProjectId,
+      batchId,
     );
     const canceledResult = {
       schemaVersion: 1,

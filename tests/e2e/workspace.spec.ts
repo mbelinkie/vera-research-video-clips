@@ -239,9 +239,51 @@ test("maps transcript text selection to stable source and export bounds", async 
             },
     };
   };
+  const batchResponse = (body: Record<string, any>) => ({
+    id: "019fbb95-cd76-7920-93fa-e23ba755eeb4",
+    projectId: createdProjectId,
+    createdAt: now,
+    summary: {
+      total: 2,
+      queued: 2,
+      claimed: 0,
+      processing: 0,
+      needsUserAction: 0,
+      complete: 0,
+      failed: 0,
+      canceled: 0,
+      status: "active",
+    },
+    items: body.items.map((item: Record<string, any>, index: number) => ({
+      id: [
+        "019fbb95-cd76-7920-93fa-e23ba755eeb5",
+        "019fbb95-cd76-7920-93fa-e23ba755eeb6",
+      ][index],
+      batchId: "019fbb95-cd76-7920-93fa-e23ba755eeb4",
+      ordinal: index,
+      clipId: item.clipId,
+      rootRequestId: [
+        "019fbb95-cd76-7920-93fa-e23ba755eeb7",
+        "019fbb95-cd76-7920-93fa-e23ba755eeb8",
+      ][index],
+      currentRequest: {
+        id: [
+          "019fbb95-cd76-7920-93fa-e23ba755eeb7",
+          "019fbb95-cd76-7920-93fa-e23ba755eeb8",
+        ][index],
+        jobId: [
+          "019fbb95-cd76-7920-93fa-e23ba755eeb9",
+          "019fbb95-cd76-7920-93fa-e23ba755eeba",
+        ][index],
+        state: "queued",
+      },
+    })),
+  });
   let clipPostCount = 0;
   let loggedExportPostCount = 0;
   let exportOnlyPostCount = 0;
+  let batchExportPostCount = 0;
+  let batchFixtureEnabled = false;
   let loggedClip: Record<string, unknown> | undefined;
   let lastClipBody: Record<string, any> | undefined;
   let lastLoggedExportBody: Record<string, any> | undefined;
@@ -398,7 +440,25 @@ test("maps transcript text selection to stable source and export bounds", async 
     }
     if (path === `/cloud-api/api/projects/${createdProjectId}/clips`) {
       if (request.method() === "GET") {
-        return route.fulfill({ json: loggedClip ? [loggedClip] : [] });
+        return route.fulfill({
+          json:
+            batchFixtureEnabled && loggedClip
+              ? [
+                  loggedClip,
+                  {
+                    ...loggedClip,
+                    id: "019fbb95-cd76-7920-93fa-e23ba755eeb2",
+                    catalogVideoId: "019fbb95-cd76-7920-93fa-e23ba755eeb3",
+                    video: {
+                      ...(loggedClip.video as Record<string, unknown>),
+                      title: "Second batch sibling",
+                    },
+                  },
+                ]
+              : loggedClip
+                ? [loggedClip]
+                : [],
+        });
       }
       clipPostCount += 1;
       const body = request.postDataJSON();
@@ -499,6 +559,30 @@ test("maps transcript text selection to stable source and export bounds", async 
           createdAt: now,
           updatedAt: now,
         },
+      });
+    }
+    if (
+      path === `/cloud-api/api/projects/${createdProjectId}/export-batches` &&
+      request.method() === "POST"
+    ) {
+      batchExportPostCount += 1;
+      const body = request.postDataJSON();
+      return route.fulfill({
+        status: 201,
+        json: batchResponse(body),
+      });
+    }
+    if (
+      path ===
+      `/cloud-api/api/projects/${createdProjectId}/export-batches/019fbb95-cd76-7920-93fa-e23ba755eeb4`
+    ) {
+      return route.fulfill({
+        json: batchResponse({
+          items: [
+            { clipId: String(loggedClip?.id) },
+            { clipId: "019fbb95-cd76-7920-93fa-e23ba755eeb2" },
+          ],
+        }),
       });
     }
     if (path.endsWith("/transcription-batches")) {
@@ -815,6 +899,24 @@ test("maps transcript text selection to stable source and export bounds", async 
   expect(lastClipBody?.selection.trackId).toBe(
     lastClipBody?.languageEvidence.preferred.trackId,
   );
+  batchFixtureEnabled = true;
+  const batchPanel = page.getByTestId("export-batch-panel");
+  await batchPanel
+    .getByRole("button", { name: "Refresh eligible clips" })
+    .click();
+  await expect(batchPanel.locator('input[type="checkbox"]')).toHaveCount(2);
+  for (const checkbox of await batchPanel
+    .locator('input[type="checkbox"]')
+    .all()) {
+    await checkbox.check();
+  }
+  await batchPanel
+    .getByRole("button", { name: "Export 2 selected clips" })
+    .click();
+  await expect(batchPanel.getByTestId("export-batch-summary")).toContainText(
+    "2 active",
+  );
+  expect(batchExportPostCount).toBe(1);
   await clipQueue.getByLabel("Filter tag").selectOption("");
   await clipQueue.getByLabel("Search clips").fill("");
   await clipQueue.getByRole("button", { name: "Refresh" }).click();

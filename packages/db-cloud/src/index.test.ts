@@ -53,6 +53,7 @@ describe("cloud migrations", () => {
       "0016_logged_export_retry_lineage",
       "0017_logged_export_safe_cancellation",
       "0018_logged_export_execution_progress",
+      "0019_logged_export_batches",
     ]);
     expect(await runCloudMigrations(database)).toEqual([]);
     const result = await database.query<{ table_name: string }>(
@@ -435,6 +436,41 @@ describe("cloud migrations", () => {
         await database.query<{ table_name: string }>(
           `SELECT table_name FROM information_schema.tables
            WHERE table_name = 'logged_export_execution_progress'`,
+        )
+      ).rows,
+    ).toHaveLength(1);
+    copyFileSync(
+      resolve(cloudMigrationDirectory, "0019_logged_export_batches.sql"),
+      join(migrations, "0019_logged_export_batches.sql"),
+    );
+    expect(await runCloudMigrations(database, migrations)).toEqual([
+      "0019_logged_export_batches",
+    ]);
+    expect(
+      (
+        await database.query(
+          "SELECT * FROM registered_export_workers WHERE id = $1",
+          [workerId],
+        )
+      ).rows[0],
+    ).toEqual(before);
+    expect(
+      (
+        await database.query<{ count: string }>(
+          `SELECT count(*)::text AS count
+           FROM information_schema.tables
+           WHERE table_name IN (
+             'logged_export_batches', 'logged_export_batch_items'
+           )`,
+        )
+      ).rows[0]!.count,
+    ).toBe("2");
+    expect(
+      (
+        await database.query<{ column_name: string }>(
+          `SELECT column_name FROM information_schema.columns
+           WHERE table_name = 'export_requests'
+             AND column_name = 'batch_item_id'`,
         )
       ).rows,
     ).toHaveLength(1);

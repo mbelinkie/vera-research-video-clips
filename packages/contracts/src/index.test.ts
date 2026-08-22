@@ -6,6 +6,7 @@ import {
   BatchPreflightRequestSchema,
   ClipLanguageEvidenceV2Schema,
   CreateClipExportRequestSchema,
+  CreateLoggedExportBatchRequestSchema,
   CreateTranscriptionBatchRequestSchema,
   ExportClipManifestSchema,
   ExportClipMetadataSchema,
@@ -18,6 +19,7 @@ import {
   LoggedExportDeliverySchema,
   LoggedExportCanceledResultSchema,
   LoggedExportExecutionSchema,
+  LoggedExportBatchSummarySchema,
   LoggedExportProgressSnapshotSchema,
   HeartbeatLoggedExportExecutionRequestSchema,
   GetLoggedExportProgressResponseSchema,
@@ -389,6 +391,61 @@ describe("shared contracts", () => {
         jobId: id,
         state: "processing",
         progress: { ...progress, leaseToken: id },
+      }).success,
+    ).toBe(false);
+  });
+
+  it("requires bounded unique batch items and exact derived summary counts", () => {
+    const exportInput = {
+      idempotencyKey: "item-1",
+      sourceLanguageClass: "confirmed_english" as const,
+      preset: {
+        presetVersion: 1,
+        name: "Editing MP4",
+        settings: {
+          container: "mp4" as const,
+          videoCodec: "h264" as const,
+          videoRateControl: { mode: "crf" as const, value: 20 },
+          frameRate: "source" as const,
+          audioCodec: "aac" as const,
+          omitSubtitleFilesForConfirmedEnglish: false,
+          embedEnglishSubtitleTrack: false,
+        },
+      },
+    };
+    expect(
+      CreateLoggedExportBatchRequestSchema.safeParse({
+        idempotencyKey: "batch-1",
+        items: [
+          { clipId: id, export: exportInput },
+          { clipId: id, export: { ...exportInput, idempotencyKey: "item-2" } },
+        ],
+      }).success,
+    ).toBe(false);
+    expect(
+      LoggedExportBatchSummarySchema.parse({
+        total: 2,
+        queued: 1,
+        claimed: 0,
+        processing: 0,
+        needsUserAction: 0,
+        complete: 0,
+        failed: 1,
+        canceled: 0,
+        status: "active",
+      }),
+    ).toMatchObject({ total: 2, queued: 1, failed: 1 });
+    expect(
+      LoggedExportBatchSummarySchema.safeParse({
+        total: 2,
+        queued: 2,
+        claimed: 0,
+        processing: 0,
+        needsUserAction: 0,
+        complete: 1,
+        failed: 0,
+        canceled: 0,
+        status: "active",
       }).success,
     ).toBe(false);
   });

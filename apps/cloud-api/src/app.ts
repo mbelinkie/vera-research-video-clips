@@ -12,6 +12,7 @@ import {
   BatchPreflightResponseSchema,
   CreateClipCandidateRequestSchema,
   CreateClipExportRequestSchema,
+  CreateLoggedExportBatchRequestSchema,
   CreateExportPresetRequestSchema,
   ExportPresetDefaultResponseSchema,
   ExportSettingsPreviewRequestSchema,
@@ -65,6 +66,9 @@ const ProjectVideoParamsSchema = IdParamsSchema.extend({ videoId: z.uuid() });
 const ProjectClipParamsSchema = IdParamsSchema.extend({ clipId: z.uuid() });
 const ProjectExportRequestParamsSchema = IdParamsSchema.extend({
   requestId: z.uuid(),
+});
+const ProjectExportBatchParamsSchema = IdParamsSchema.extend({
+  batchId: z.uuid(),
 });
 const ProjectBatchParamsSchema = IdParamsSchema.extend({ batchId: z.uuid() });
 const ProjectReviewItemParamsSchema = IdParamsSchema.extend({
@@ -574,6 +578,41 @@ export function createCloudApi(
         CreateClipExportRequestSchema.parse(request.body),
       );
       return reply.status(201).send(created);
+    },
+  );
+
+  app.post(
+    "/api/projects/:projectId/export-batches",
+    async (request, reply) => {
+      const { projectId } = IdParamsSchema.parse(request.params);
+      const batch = await catalog.createLoggedExportBatch(
+        await authenticate(request),
+        projectId,
+        CreateLoggedExportBatchRequestSchema.parse(request.body),
+      );
+      return reply.status(201).send(batch);
+    },
+  );
+
+  app.get("/api/projects/:projectId/export-batches", async (request) => {
+    const { projectId } = IdParamsSchema.parse(request.params);
+    return catalog.listLoggedExportBatches(
+      await authenticate(request),
+      projectId,
+    );
+  });
+
+  app.get(
+    "/api/projects/:projectId/export-batches/:batchId",
+    async (request) => {
+      const { projectId, batchId } = ProjectExportBatchParamsSchema.parse(
+        request.params,
+      );
+      return catalog.getLoggedExportBatch(
+        await authenticate(request),
+        projectId,
+        batchId,
+      );
     },
   );
 
