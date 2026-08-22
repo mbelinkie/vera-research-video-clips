@@ -2,7 +2,7 @@
 
 ## Project guide and implementation plan
 
-Status: Milestones 1–4 core workflow complete; preferred-language logging, local export capabilities, authorized logged-export success/failure reconciliation, safe local source-scratch cleanup recovery, and immutable retry of terminal failed logged exports are verified through M5-20; safe cancellation, durable progress, batch/group execution, and the final Milestone 5 release gate remain open
+Status: Milestones 1–4 core workflow complete; preferred-language logging, local export capabilities, authorized logged-export success/failure/canceled reconciliation, safe local source-scratch cleanup recovery, immutable retry, and exact execution ownership are verified through M5-21; durable progress, batch/group execution, and the final Milestone 5 release gate remain open
 Last updated: 2026-08-21
 
 This document is the source of truth for product scope, architecture, sequencing, and acceptance criteria. Update it when a deliberate product or architectural decision changes. Use `outline.md` as the shorter execution checklist.
@@ -1413,10 +1413,10 @@ web build, 17 local and 11 cloud migrations, four Playwright flows, and real
 FFmpeg/FFprobe renders for all three families. Commits `2323a0f`, `fe1efed`,
 `38047c4`, `9c8d8c6`, and `75def13` contain the completed slices.
 
-These slices do not complete Milestone 5. Later M5-15 through M5-20 slices add
+These slices do not complete Milestone 5. Later M5-15 through M5-21 slices add
 worker registration, accepted logged-export delivery and reconciliation,
-cleanup recovery, and immutable retry as described below. Durable progress,
-safe cancellation, batch and same-source group execution, the 30-second foreign
+cleanup recovery, immutable retry, and safe cancellation as described below.
+Durable progress, batch and same-source group execution, the 30-second foreign
 fixture gate, and the user-authorized live YouTube smoke test remain open.
 
 M5-15 completed 2026-08-20. A local workstation now persists one stable worker
@@ -1522,6 +1522,29 @@ slice adds retry only: safe cancellation still requires durable execution
 start/lease/heartbeat state, cancel intent, cooperative local abort and child
 process termination, verified scratch cleanup, and immutable canceled-result
 reconciliation mutually exclusive with success and failure.
+
+M5-21 completed 2026-08-21. Accepted logged work now starts only after the
+cloud creates or exactly replays one durable execution identity bound to its
+accepted delivery generation, pinned worker epoch, positive attempt, opaque
+lease, and bounded heartbeat. SQLite persists that exact identity before source
+acquisition and refuses logged processor entry without it. A current
+write-capable project member can record one immutable cancel intent for queued,
+accepted-not-started, or executing work. Never-accepted work closes atomically
+with attempt-zero evidence; accepted work observes intent at execution start or
+heartbeat and aborts the existing processor through one `AbortSignal` spanning
+acquisition, FFprobe, FFmpeg, subtitle, thumbnail, staging, and promotion.
+Active child processes receive `SIGTERM`, escalate to `SIGKILL` when necessary,
+and settle only after close. Cancellation becomes terminal only after no-start
+proof or verified exact-attempt scratch deletion. A locally promoted package is
+removed only through its validated deterministic request-owned directory when
+cancellation wins the cloud commit race. Cloud migration `0017` and local
+migration `0022` add execution, intent, and immutable canceled evidence;
+success, failure, and canceled results serialize under the same request/delivery
+lock and are mutually exclusive through catalog checks and database triggers.
+Persisted canceled evidence replays directly after restart or cloud response
+loss without rerendering or extending a lost lease. Durable progress, batch and
+same-source group execution, the foreign fixture, authorized live smoke, and
+the final Milestone 5 matrix remain open.
 
 M5-09 completed 2026-08-19. Every promoted clip package now also contains one
 `manifest.json`, written into attempt-private staging and promoted through the
