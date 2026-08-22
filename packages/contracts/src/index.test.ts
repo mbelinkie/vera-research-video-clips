@@ -23,6 +23,8 @@ import {
   ProcessAcceptedLoggedExportResponseSchema,
   ReconcileLoggedExportFailureRequestSchema,
   ReconcileLoggedExportSuccessRequestSchema,
+  RetryLoggedExportRequestSchema,
+  RetryLoggedExportResponseSchema,
   FinalArtifactProvenanceSchema,
   HealthResponseSchema,
   JobSchema,
@@ -100,6 +102,44 @@ describe("shared contracts", () => {
             canonicalUrl: `${delivery.request.video.canonicalUrl}&token=private`,
           },
         },
+      }).success,
+    ).toBe(false);
+  });
+
+  it("binds logged-export retry provenance as a strict all-or-none lineage", () => {
+    const parent = deliveryContractFixture().request;
+    const child = {
+      ...parent,
+      id: "019fbb95-cd76-7920-93fa-e23ba755ee4a",
+      jobId: "019fbb95-cd76-7920-93fa-e23ba755ee4b",
+      retryOfRequestId: parent.id,
+      retryOrdinal: 1,
+    };
+    expect(
+      RetryLoggedExportRequestSchema.parse({ idempotencyKey: " retry-1 " }),
+    ).toEqual({ idempotencyKey: "retry-1" });
+    expect(RetryLoggedExportResponseSchema.parse({ request: child })).toEqual({
+      request: child,
+    });
+    expect(
+      RetryLoggedExportResponseSchema.safeParse({
+        request: { ...child, retryOrdinal: undefined },
+      }).success,
+    ).toBe(false);
+    expect(
+      RetryLoggedExportResponseSchema.safeParse({
+        request: {
+          ...child,
+          mode: "export_only",
+          projectId: undefined,
+          clipId: undefined,
+        },
+      }).success,
+    ).toBe(false);
+    expect(
+      RetryLoggedExportRequestSchema.safeParse({
+        idempotencyKey: "retry-1",
+        preset: "caller replacement forbidden",
       }).success,
     ).toBe(false);
   });

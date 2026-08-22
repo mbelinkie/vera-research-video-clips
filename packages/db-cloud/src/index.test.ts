@@ -50,6 +50,7 @@ describe("cloud migrations", () => {
       "0013_logged_export_deliveries",
       "0014_logged_export_success_results",
       "0015_logged_export_failure_results",
+      "0016_logged_export_retry_lineage",
     ]);
     expect(await runCloudMigrations(database)).toEqual([]);
     const result = await database.query<{ table_name: string }>(
@@ -90,6 +91,14 @@ describe("cloud migrations", () => {
        WHERE table_name = 'logged_export_failure_results'`,
     );
     expect(failureResultTable.rows).toHaveLength(1);
+    const retryColumns = await database.query<{ column_name: string }>(
+      `SELECT column_name FROM information_schema.columns
+       WHERE table_name = 'export_requests'
+         AND column_name IN (
+           'retry_of_request_id', 'retry_ordinal', 'retry_idempotency_key'
+         )`,
+    );
+    expect(retryColumns.rows).toHaveLength(3);
   });
 
   it("backfills immutable legacy request/job snapshots from the 0010 schema", async () => {
@@ -341,6 +350,21 @@ describe("cloud migrations", () => {
         )
       ).rows,
     ).toHaveLength(1);
+    copyFileSync(
+      resolve(cloudMigrationDirectory, "0016_logged_export_retry_lineage.sql"),
+      join(migrations, "0016_logged_export_retry_lineage.sql"),
+    );
+    expect(await runCloudMigrations(database, migrations)).toEqual([
+      "0016_logged_export_retry_lineage",
+    ]);
+    expect(
+      (
+        await database.query(
+          "SELECT * FROM registered_export_workers WHERE id = $1",
+          [workerId],
+        )
+      ).rows[0],
+    ).toEqual(before);
   });
 
   it("enforces preset ownership, scope names, fixed defaults, and immutable revisions", async () => {

@@ -22,10 +22,13 @@ import {
   ClaimLoggedExportDeliveryResponseSchema,
   LoggedExportDeliverySchema,
   LoggedExportFailureSchema,
+  LoggedExportFailureResultSchema,
   LoggedExportSuccessResultSchema,
   LoggedExportSuccessSchema,
   ReconcileLoggedExportFailureRequestSchema,
   ReconcileLoggedExportSuccessRequestSchema,
+  RetryLoggedExportRequestSchema,
+  RetryLoggedExportResponseSchema,
   ExportSettingsSchema,
   ExportWorkerCompatibilityRequestSchema,
   HeartbeatExportWorkerRequestSchema,
@@ -85,6 +88,8 @@ import {
   type LoggedExportSuccessResult,
   type ReconcileLoggedExportFailureRequest,
   type ReconcileLoggedExportSuccessRequest,
+  type RetryLoggedExportRequest,
+  type RetryLoggedExportResponse,
   type RevokeExportWorkerRequest,
   type ExportSettingsPreviewRequest,
   type PersonalExportPresetCatalog,
@@ -233,6 +238,8 @@ const loggedExportDeliverySelect = `SELECT
    ON export_success.export_request_id = er.id`;
 
 export class SharedProjectCatalog {
+  private transactionTail: Promise<void> = Promise.resolve();
+
   constructor(
     private readonly database: PGlite,
     private readonly store: TranscriptObjectStore,
@@ -2081,6 +2088,226 @@ export class SharedProjectCatalog {
       );
     });
     return this.getLoggedExportRequest(actor, projectId, requestId);
+  }
+
+  async retryLoggedExport(
+    actor: AuthenticatedActor,
+    projectId: string,
+    parentRequestId: string,
+    input: RetryLoggedExportRequest,
+  ): Promise<RetryLoggedExportResponse> {
+    await this.requireRegistered(actor);
+    const parsed = RetryLoggedExportRequestSchema.parse(input);
+    const now = this.now().toISOString();
+    let retried: DbRow | undefined;
+
+    await this.transaction(async () => {
+      const membership = await this.database.query<{ role: ProjectRole }>(
+        `SELECT members.role
+         FROM projects project
+         JOIN project_members members
+           ON members.project_id = project.id AND members.user_id = $1
+         WHERE project.id = $2
+         FOR UPDATE OF project, members`,
+        [actor.userId, projectId],
+      );
+      requirePermission(membership.rows[0]?.role, "write");
+
+      const parentResult = await this.database.query<DbRow>(
+        `SELECT er.*, j.state, j.payload AS retry_parent_job_payload,
+                retry_clip.export_status AS retry_clip_export_status,
+                failure.id AS retry_failure_id,
+                failure.result_json AS retry_failure_result_json,
+                failure.delivery_generation AS retry_failure_generation,
+                failure.worker_id AS retry_failure_worker_id,
+                failure.worker_epoch AS retry_failure_worker_epoch,
+                delivery.id AS retry_delivery_id,
+                delivery.generation AS retry_delivery_generation,
+                delivery.worker_id AS retry_delivery_worker_id,
+                delivery.worker_epoch AS retry_delivery_worker_epoch,
+                delivery.accepted_at AS retry_delivery_accepted_at,
+                success.id AS retry_success_id
+         FROM export_requests er
+         JOIN jobs j ON j.id = er.job_id
+         JOIN clip_candidates retry_clip ON retry_clip.id = er.clip_id
+         JOIN logged_export_failure_results failure
+           ON failure.export_request_id = er.id
+         JOIN logged_export_deliveries delivery
+           ON delivery.id = failure.delivery_id
+          AND delivery.export_request_id = er.id
+         LEFT JOIN logged_export_success_results success
+           ON success.export_request_id = er.id
+         WHERE er.id = $1 AND er.project_id = $2
+         FOR UPDATE OF er, j, retry_clip, failure, delivery`,
+        [parentRequestId, projectId],
+      );
+      const parentRow = parentResult.rows[0];
+      if (!parentRow) {
+        throw new CatalogConflictError(
+          "Only an exact terminal failed logged export can be retried.",
+        );
+      }
+      const parent = mapLoggedExportRequest(parentRow);
+      assertLoggedExportRetryParentEvidence(parentRow, parent);
+
+      const existingCommand = await this.database.query<DbRow>(
+        `${loggedExportRequestSelect}
+         WHERE er.project_id = $1 AND er.retry_idempotency_key = $2
+         FOR UPDATE OF er, j`,
+        [projectId, parsed.idempotencyKey],
+      );
+      if (existingCommand.rows[0]) {
+        if (
+          String(existingCommand.rows[0].retry_of_request_id) !==
+          parentRequestId
+        ) {
+          throw new CatalogIdempotencyConflictError(
+            "This retry command identity already belongs to another export request.",
+          );
+        }
+        retried = existingCommand.rows[0];
+        return;
+      }
+
+      const existingChild = await this.database.query<DbRow>(
+        `${loggedExportRequestSelect}
+         WHERE er.retry_of_request_id = $1
+         FOR UPDATE OF er, j`,
+        [parentRequestId],
+      );
+      if (existingChild.rows[0]) {
+        throw new CatalogConflictError(
+          "This failed export already has a retry child. Retry the newest failed child instead of branching the lineage.",
+        );
+      }
+      assertRetryableLoggedExportParent(parentRow);
+
+      const requestId = randomUUID();
+      const jobId = randomUUID();
+      const retryOrdinal = Number(parentRow.retry_ordinal) + 1;
+      if (!Number.isSafeInteger(retryOrdinal) || retryOrdinal <= 0) {
+        throw new CatalogConflictError("Export retry lineage is invalid.");
+      }
+      const payload = {
+        exportRequestId: requestId,
+        mode: "logged",
+        clipId: parent.clipId!,
+        video: parent.video,
+        selection: parent.selection,
+        sourceLanguageClass: parent.sourceLanguageClass,
+        ...(parent.subtitleTracks
+          ? { subtitleTracks: parent.subtitleTracks }
+          : {}),
+        preset: parent.preset,
+        resolvedSettingsSnapshot: parent.resolvedSettingsSnapshot!,
+        retryOfRequestId: parent.id,
+        retryOrdinal,
+      };
+      const jobIdempotencyKey = `logged-export-retry:${sha256Fingerprint({
+        projectId,
+        idempotencyKey: parsed.idempotencyKey,
+      })}`;
+      const insertedJob = await this.database.query<{ id: string }>(
+        `INSERT INTO jobs
+           (id, project_id, kind, state, idempotency_key, attempt, payload,
+            created_at, updated_at)
+         VALUES ($1, $2, 'export', 'queued', $3, 0, $4, $5, $5)
+         ON CONFLICT (idempotency_key) DO NOTHING
+         RETURNING id`,
+        [jobId, projectId, jobIdempotencyKey, JSON.stringify(payload), now],
+      );
+      if (!insertedJob.rows[0]) {
+        const raced = await this.database.query<DbRow>(
+          `${loggedExportRequestSelect}
+           WHERE er.project_id = $1 AND er.retry_idempotency_key = $2
+           FOR UPDATE OF er, j`,
+          [projectId, parsed.idempotencyKey],
+        );
+        if (
+          raced.rows[0] &&
+          String(raced.rows[0].retry_of_request_id) === parentRequestId
+        ) {
+          retried = raced.rows[0];
+          return;
+        }
+        throw new CatalogIdempotencyConflictError(
+          "This retry command identity already belongs to another export request.",
+        );
+      }
+      const inserted = await this.database.query<DbRow>(
+        `INSERT INTO export_requests
+           (id, job_id, clip_id, project_id, mode, video_snapshot,
+            selection_snapshot, source_language_class,
+            subtitle_tracks_snapshot, preset_snapshot,
+            resolved_settings_snapshot, requested_by, retry_of_request_id,
+            retry_ordinal, retry_idempotency_key, created_at, updated_at)
+         SELECT $1, $2, parent.clip_id, parent.project_id, parent.mode,
+                parent.video_snapshot, parent.selection_snapshot,
+                parent.source_language_class, parent.subtitle_tracks_snapshot,
+                parent.preset_snapshot, parent.resolved_settings_snapshot,
+                $3, parent.id, $4, $5, $6, $6
+         FROM export_requests parent
+         WHERE parent.id = $7
+         ON CONFLICT DO NOTHING
+         RETURNING id`,
+        [
+          requestId,
+          jobId,
+          actor.userId,
+          retryOrdinal,
+          parsed.idempotencyKey,
+          now,
+          parent.id,
+        ],
+      );
+      if (!inserted.rows[0]) {
+        throw new CatalogConflictError(
+          "This failed export already has a divergent retry child.",
+        );
+      }
+      const queuedClip = await this.database.query<{ version: number }>(
+        `UPDATE clip_candidates
+         SET export_status = 'queued', version = version + 1, updated_at = $1
+         WHERE id = $2 AND project_id = $3 AND export_status = 'failed'
+         RETURNING version`,
+        [now, parent.clipId, projectId],
+      );
+      if (!queuedClip.rows[0]) {
+        throw new CatalogConflictError(
+          "The exact failed clip is no longer eligible for retry.",
+        );
+      }
+      await this.database.query(
+        `INSERT INTO sync_events
+           (project_id, event_type, entity_id, server_version, payload, created_at)
+         VALUES ($1, 'clip_candidate.export_retried', $2, $3, $4, $5)`,
+        [
+          projectId,
+          parent.clipId,
+          queuedClip.rows[0].version,
+          JSON.stringify({
+            clipId: parent.clipId,
+            parentExportRequestId: parent.id,
+            exportRequestId: requestId,
+            jobId,
+            retryOrdinal,
+          }),
+          now,
+        ],
+      );
+      const child = await this.database.query<DbRow>(
+        `${loggedExportRequestSelect} WHERE er.id = $1`,
+        [requestId],
+      );
+      retried = child.rows[0];
+    });
+
+    if (!retried) {
+      throw new CatalogConflictError("Export retry did not persist.");
+    }
+    return RetryLoggedExportResponseSchema.parse({
+      request: mapLoggedExportRequest(retried),
+    });
   }
 
   async getLoggedExportRequest(
@@ -4244,14 +4471,24 @@ export class SharedProjectCatalog {
   }
 
   private async transaction<Result>(action: () => Promise<Result>) {
-    await this.database.exec("BEGIN");
+    const predecessor = this.transactionTail;
+    let release!: () => void;
+    this.transactionTail = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await predecessor;
     try {
-      const result = await action();
-      await this.database.exec("COMMIT");
-      return result;
-    } catch (error) {
-      await this.database.exec("ROLLBACK");
-      throw error;
+      await this.database.exec("BEGIN");
+      try {
+        const result = await action();
+        await this.database.exec("COMMIT");
+        return result;
+      } catch (error) {
+        await this.database.exec("ROLLBACK");
+        throw error;
+      }
+    } finally {
+      release();
     }
   }
 }
@@ -4349,6 +4586,86 @@ function assertLoggedExportFailureMatchesRequest(
   ) {
     throw new CatalogConflictError(
       "Export failure identity does not match the immutable queued request.",
+    );
+  }
+}
+
+function assertLoggedExportRetryParentEvidence(
+  row: DbRow,
+  request: ExportRequest,
+): void {
+  if (
+    request.mode !== "logged" ||
+    !request.projectId ||
+    !request.clipId ||
+    !request.resolvedSettingsSnapshot ||
+    !row.retry_failure_id ||
+    !row.retry_delivery_id ||
+    !row.retry_delivery_accepted_at ||
+    row.retry_success_id
+  ) {
+    throw new CatalogConflictError(
+      "Only an exact terminal failed logged export can be retried.",
+    );
+  }
+  const failure = LoggedExportFailureResultSchema.parse(
+    typeof row.retry_failure_result_json === "string"
+      ? JSON.parse(row.retry_failure_result_json)
+      : row.retry_failure_result_json,
+  );
+  if (
+    failure.requestId !== request.id ||
+    failure.jobId !== request.jobId ||
+    failure.projectId !== request.projectId ||
+    failure.clipId !== request.clipId ||
+    Number(row.retry_failure_generation) !==
+      Number(row.retry_delivery_generation) ||
+    String(row.retry_failure_worker_id) !==
+      String(row.retry_delivery_worker_id) ||
+    Number(row.retry_failure_worker_epoch) !==
+      Number(row.retry_delivery_worker_epoch)
+  ) {
+    throw new CatalogConflictError(
+      "The immutable failure and accepted delivery do not match the retry parent.",
+    );
+  }
+  const payload =
+    typeof row.retry_parent_job_payload === "string"
+      ? JSON.parse(row.retry_parent_job_payload)
+      : row.retry_parent_job_payload;
+  const expectedPayload = {
+    exportRequestId: request.id,
+    mode: "logged",
+    clipId: request.clipId,
+    video: request.video,
+    selection: request.selection,
+    sourceLanguageClass: request.sourceLanguageClass,
+    ...(request.subtitleTracks
+      ? { subtitleTracks: request.subtitleTracks }
+      : {}),
+    preset: request.preset,
+    resolvedSettingsSnapshot: request.resolvedSettingsSnapshot,
+    ...(request.retryOfRequestId
+      ? {
+          retryOfRequestId: request.retryOfRequestId,
+          retryOrdinal: request.retryOrdinal,
+        }
+      : {}),
+  };
+  if (canonicalJson(payload) !== canonicalJson(expectedPayload)) {
+    throw new CatalogConflictError(
+      "The retry parent job payload does not match its immutable request snapshots.",
+    );
+  }
+}
+
+function assertRetryableLoggedExportParent(row: DbRow): void {
+  if (
+    String(row.state) !== "failed" ||
+    String(row.retry_clip_export_status) !== "failed"
+  ) {
+    throw new CatalogConflictError(
+      "Only an exact terminal failed logged export can be retried.",
     );
   }
 }
@@ -4622,6 +4939,12 @@ function mapLoggedExportRequest(row: DbRow): ExportRequest {
     mode: row.mode,
     projectId: row.project_id,
     clipId: row.clip_id,
+    ...(row.retry_of_request_id
+      ? {
+          retryOfRequestId: row.retry_of_request_id,
+          retryOrdinal: Number(row.retry_ordinal),
+        }
+      : {}),
     video: row.video_snapshot,
     selection: row.selection_snapshot,
     sourceLanguageClass: row.source_language_class,

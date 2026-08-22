@@ -1814,34 +1814,77 @@ export const ExportClipManifestSchema = z.union([
   ExportClipManifestV2Schema,
 ]);
 
-export const ExportRequestSchema = z.object({
-  id: IdSchema,
-  jobId: IdSchema,
-  mode: z.enum(["logged", "export_only"]),
-  projectId: IdSchema.optional(),
-  clipId: IdSchema.optional(),
-  video: ClipVideoSnapshotSchema,
-  selection: TranscriptSelectionSchema,
-  sourceLanguageClass: ExportSourceLanguageClassSchema,
-  subtitleTracks: ExportSubtitleTrackSnapshotsSchema.optional(),
-  preset: ExportPresetSnapshotSchema,
-  resolvedSettingsSnapshot: ResolvedExportSettingsSnapshotSchema.optional(),
-  mediaProvenance: ExportMediaProvenanceSchema.optional(),
-  resolvedExportBounds: ResolvedExportBoundsSchema.optional(),
-  renderedMediaProvenance: RenderedExportMediaProvenanceSchema.optional(),
-  thumbnailProvenance: ExportThumbnailProvenanceSchema.optional(),
-  subtitleOmissionProvenance: SubtitleOmissionProvenanceSchema.optional(),
-  englishSubtitleProvenance: EnglishSubtitleSidecarProvenanceSchema.optional(),
-  subtitleSidecars: z.array(SubtitleSidecarProvenanceSchema).max(2).optional(),
-  finalArtifacts: z
-    .array(FinalArtifactProvenanceSchema)
-    .min(1)
-    .max(6)
-    .optional(),
-  state: JobStateSchema,
-  createdAt: UtcTimestampSchema,
-  updatedAt: UtcTimestampSchema,
-});
+export const ExportRequestSchema = z
+  .object({
+    id: IdSchema,
+    jobId: IdSchema,
+    mode: z.enum(["logged", "export_only"]),
+    projectId: IdSchema.optional(),
+    clipId: IdSchema.optional(),
+    retryOfRequestId: IdSchema.optional(),
+    retryOrdinal: z.number().int().positive().optional(),
+    video: ClipVideoSnapshotSchema,
+    selection: TranscriptSelectionSchema,
+    sourceLanguageClass: ExportSourceLanguageClassSchema,
+    subtitleTracks: ExportSubtitleTrackSnapshotsSchema.optional(),
+    preset: ExportPresetSnapshotSchema,
+    resolvedSettingsSnapshot: ResolvedExportSettingsSnapshotSchema.optional(),
+    mediaProvenance: ExportMediaProvenanceSchema.optional(),
+    resolvedExportBounds: ResolvedExportBoundsSchema.optional(),
+    renderedMediaProvenance: RenderedExportMediaProvenanceSchema.optional(),
+    thumbnailProvenance: ExportThumbnailProvenanceSchema.optional(),
+    subtitleOmissionProvenance: SubtitleOmissionProvenanceSchema.optional(),
+    englishSubtitleProvenance:
+      EnglishSubtitleSidecarProvenanceSchema.optional(),
+    subtitleSidecars: z
+      .array(SubtitleSidecarProvenanceSchema)
+      .max(2)
+      .optional(),
+    finalArtifacts: z
+      .array(FinalArtifactProvenanceSchema)
+      .min(1)
+      .max(6)
+      .optional(),
+    state: JobStateSchema,
+    createdAt: UtcTimestampSchema,
+    updatedAt: UtcTimestampSchema,
+  })
+  .superRefine((request, context) => {
+    if (
+      Boolean(request.retryOfRequestId) !== Boolean(request.retryOrdinal) ||
+      (request.retryOfRequestId && request.mode !== "logged")
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["retryOfRequestId"],
+        message:
+          "Retry provenance is an all-or-none positive lineage available only to logged exports.",
+      });
+    }
+  });
+
+export const RetryLoggedExportRequestSchema = z
+  .object({
+    idempotencyKey: z.string().trim().min(1).max(512),
+  })
+  .strict();
+
+export const RetryLoggedExportResponseSchema = z
+  .object({ request: ExportRequestSchema })
+  .strict()
+  .superRefine((response, context) => {
+    if (
+      response.request.mode !== "logged" ||
+      !response.request.retryOfRequestId ||
+      !response.request.retryOrdinal
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["request", "retryOfRequestId"],
+        message: "A retry response must contain one logged retry child.",
+      });
+    }
+  });
 
 export const ClaimLoggedExportDeliveryRequestSchema = z
   .object({
@@ -2491,6 +2534,12 @@ export type ExportResolvedSubtitlePolicy = z.infer<
 >;
 export type ExportClipMetadata = z.infer<typeof ExportClipMetadataSchema>;
 export type ExportRequest = z.infer<typeof ExportRequestSchema>;
+export type RetryLoggedExportRequest = z.infer<
+  typeof RetryLoggedExportRequestSchema
+>;
+export type RetryLoggedExportResponse = z.infer<
+  typeof RetryLoggedExportResponseSchema
+>;
 export type ClaimLoggedExportDeliveryRequest = z.infer<
   typeof ClaimLoggedExportDeliveryRequestSchema
 >;

@@ -1543,6 +1543,427 @@ describe("logged export delivery", () => {
       ).rows[0]!.count,
     ).toBe("0");
   });
+
+  it("creates one immutable retry lineage, replays concurrently, and advances only through the newest failed child", async () => {
+    const fixture = await createAcceptedLoggedExportResultFixture();
+    await fixture.catalog.reconcileLoggedExportFailure(
+      fixture.owner,
+      reconcileFailureCommand(fixture),
+    );
+    const parentId = fixture.accepted.request.id;
+    const projectId = fixture.accepted.request.projectId!;
+    const clipId = fixture.accepted.request.clipId!;
+    const before = await fixture.database.query<Record<string, unknown>>(
+      `SELECT er.*, j.state AS job_state, j.payload AS job_payload,
+              failure.result_json AS failure_result,
+              delivery.reservation_token, delivery.worker_id,
+              delivery.worker_epoch, delivery.accepted_at
+       FROM export_requests er
+       JOIN jobs j ON j.id = er.job_id
+       JOIN logged_export_failure_results failure
+         ON failure.export_request_id = er.id
+       JOIN logged_export_deliveries delivery
+         ON delivery.id = failure.delivery_id
+       WHERE er.id = $1`,
+      [parentId],
+    );
+    const versionBefore = Number(
+      (
+        await fixture.database.query<{ version: number }>(
+          "SELECT version FROM clip_candidates WHERE id = $1",
+          [clipId],
+        )
+      ).rows[0]!.version,
+    );
+    const command = { idempotencyKey: "retry-terminal-failure-1" };
+    const concurrent = await Promise.all([
+      fixture.catalog.retryLoggedExport(
+        fixture.owner,
+        projectId,
+        parentId,
+        command,
+      ),
+      fixture.catalog.retryLoggedExport(
+        fixture.owner,
+        projectId,
+        parentId,
+        command,
+      ),
+    ]);
+    expect(concurrent[1]).toEqual(concurrent[0]);
+    expect(await countOrphanExportJobs(fixture.database, projectId)).toBe(0);
+    const child = concurrent[0]!.request;
+    expect(child).toMatchObject({
+      state: "queued",
+      retryOfRequestId: parentId,
+      retryOrdinal: 1,
+      projectId,
+      clipId,
+    });
+    expect(child.id).not.toBe(parentId);
+    expect(child.jobId).not.toBe(fixture.accepted.request.jobId);
+    expect(retrySnapshot(child)).toEqual(
+      retrySnapshot(fixture.accepted.request),
+    );
+    expect(
+      await fixture.catalog.retryLoggedExport(
+        fixture.owner,
+        projectId,
+        parentId,
+        command,
+      ),
+    ).toEqual(concurrent[0]);
+    await expect(
+      fixture.catalog.retryLoggedExport(fixture.owner, projectId, parentId, {
+        idempotencyKey: "branching-retry-forbidden",
+      }),
+    ).rejects.toMatchObject({ statusCode: 409 });
+
+    const after = await fixture.database.query<Record<string, unknown>>(
+      `SELECT er.*, j.state AS job_state, j.payload AS job_payload,
+              failure.result_json AS failure_result,
+              delivery.reservation_token, delivery.worker_id,
+              delivery.worker_epoch, delivery.accepted_at
+       FROM export_requests er
+       JOIN jobs j ON j.id = er.job_id
+       JOIN logged_export_failure_results failure
+         ON failure.export_request_id = er.id
+       JOIN logged_export_deliveries delivery
+         ON delivery.id = failure.delivery_id
+       WHERE er.id = $1`,
+      [parentId],
+    );
+    expect(after.rows[0]).toEqual(before.rows[0]);
+    expect(
+      (
+        await fixture.database.query<{ count: string }>(
+          `SELECT count(*)::text AS count FROM export_requests
+           WHERE retry_of_request_id = $1`,
+          [parentId],
+        )
+      ).rows[0]!.count,
+    ).toBe("1");
+    expect(
+      (
+        await fixture.database.query<{ count: string }>(
+          `SELECT count(*)::text AS count FROM sync_events
+           WHERE entity_id = $1
+             AND event_type = 'clip_candidate.export_retried'`,
+          [clipId],
+        )
+      ).rows[0]!.count,
+    ).toBe("1");
+    expect(
+      Number(
+        (
+          await fixture.database.query<{ version: number }>(
+            "SELECT version FROM clip_candidates WHERE id = $1",
+            [clipId],
+          )
+        ).rows[0]!.version,
+      ),
+    ).toBe(versionBefore + 1);
+    const event = (
+      await fixture.database.query<{ payload: Record<string, unknown> }>(
+        `SELECT payload FROM sync_events
+         WHERE entity_id = $1
+           AND event_type = 'clip_candidate.export_retried'`,
+        [clipId],
+      )
+    ).rows[0]!.payload;
+    expect(event).toEqual({
+      clipId,
+      parentExportRequestId: parentId,
+      exportRequestId: child.id,
+      jobId: child.jobId,
+      retryOrdinal: 1,
+    });
+    expect(JSON.stringify(event)).not.toMatch(
+      /reservation|worker|failure|error|token|path|url/i,
+    );
+    expect(
+      (
+        await fixture.database.query<{ snapshots_match: boolean }>(
+          `SELECT child.project_id = parent.project_id
+                    AND child.clip_id = parent.clip_id
+                    AND child.mode = parent.mode
+                    AND child.video_snapshot = parent.video_snapshot
+                    AND child.selection_snapshot = parent.selection_snapshot
+                    AND child.source_language_class = parent.source_language_class
+                    AND child.subtitle_tracks_snapshot IS NOT DISTINCT FROM parent.subtitle_tracks_snapshot
+                    AND child.preset_snapshot = parent.preset_snapshot
+                    AND child.resolved_settings_snapshot = parent.resolved_settings_snapshot
+                    AS snapshots_match
+           FROM export_requests child
+           JOIN export_requests parent ON parent.id = child.retry_of_request_id
+           WHERE child.id = $1`,
+          [child.id],
+        )
+      ).rows[0]!.snapshots_match,
+    ).toBe(true);
+    expect(
+      (
+        await fixture.database.query<{ count: string }>(
+          `SELECT count(*)::text AS count
+           FROM logged_export_failure_results
+           WHERE export_request_id = $1`,
+          [parentId],
+        )
+      ).rows[0]!.count,
+    ).toBe("1");
+
+    const reservedChild = (
+      await fixture.catalog.claimLoggedExportDelivery(fixture.owner, {
+        workerId: fixture.worker.workerId,
+        workerEpoch: fixture.worker.epoch,
+      })
+    ).delivery!;
+    expect(reservedChild.request).toEqual(child);
+    expect(JSON.stringify(reservedChild)).not.toContain(
+      fixture.accepted.reservationToken,
+    );
+    const acceptedChild = await fixture.catalog.acceptLoggedExportDelivery(
+      fixture.owner,
+      {
+        workerId: reservedChild.workerId,
+        workerEpoch: reservedChild.workerEpoch,
+        deliveryId: reservedChild.deliveryId,
+        generation: reservedChild.generation,
+        reservationToken: reservedChild.reservationToken,
+      },
+    );
+    await fixture.catalog.reconcileLoggedExportFailure(fixture.owner, {
+      workerId: acceptedChild.workerId,
+      workerEpoch: acceptedChild.workerEpoch,
+      deliveryId: acceptedChild.deliveryId,
+      generation: acceptedChild.generation,
+      reservationToken: acceptedChild.reservationToken,
+      result: loggedExportFailureFixture(acceptedChild.request),
+    });
+    const grandchild = (
+      await fixture.catalog.retryLoggedExport(
+        fixture.owner,
+        projectId,
+        child.id,
+        { idempotencyKey: "retry-terminal-failure-2" },
+      )
+    ).request;
+    expect(grandchild).toMatchObject({
+      retryOfRequestId: child.id,
+      retryOrdinal: 2,
+      state: "queued",
+    });
+    expect(retrySnapshot(grandchild)).toEqual(retrySnapshot(child));
+    const childPayload = (
+      await fixture.database.query<{ payload: Record<string, unknown> }>(
+        "SELECT payload FROM jobs WHERE id = $1",
+        [child.jobId],
+      )
+    ).rows[0]!.payload;
+    expect(childPayload).toMatchObject({
+      exportRequestId: child.id,
+      retryOfRequestId: parentId,
+      retryOrdinal: 1,
+    });
+    expect(childPayload).not.toHaveProperty("projectId");
+    expect(JSON.stringify(childPayload)).not.toContain(
+      reconcileFailureCommand(fixture).result.error.message,
+    );
+    expect(JSON.stringify(childPayload)).not.toContain(
+      fixture.accepted.reservationToken,
+    );
+    expect(await countOrphanExportJobs(fixture.database, projectId)).toBe(0);
+  });
+
+  it("serializes divergent concurrent retries without leaving an orphan export job", async () => {
+    const fixture = await createAcceptedLoggedExportResultFixture();
+    await fixture.catalog.reconcileLoggedExportFailure(
+      fixture.owner,
+      reconcileFailureCommand(fixture),
+    );
+    const parentId = fixture.accepted.request.id;
+    const projectId = fixture.accepted.request.projectId!;
+
+    const results = await Promise.allSettled([
+      fixture.catalog.retryLoggedExport(fixture.owner, projectId, parentId, {
+        idempotencyKey: "divergent-concurrent-a",
+      }),
+      fixture.catalog.retryLoggedExport(fixture.owner, projectId, parentId, {
+        idempotencyKey: "divergent-concurrent-b",
+      }),
+    ]);
+    expect(results.filter(({ status }) => status === "fulfilled")).toHaveLength(
+      1,
+    );
+    const rejected = results.filter(
+      (result): result is PromiseRejectedResult => result.status === "rejected",
+    );
+    expect(rejected).toHaveLength(1);
+    expect(rejected[0]!.reason).toMatchObject({ statusCode: 409 });
+    expect(
+      (
+        await fixture.database.query<{ count: string }>(
+          `SELECT count(*)::text AS count FROM export_requests
+           WHERE retry_of_request_id = $1`,
+          [parentId],
+        )
+      ).rows[0]!.count,
+    ).toBe("1");
+    expect(await countOrphanExportJobs(fixture.database, projectId)).toBe(0);
+  });
+
+  it("authorizes retry writers and rejects ineligible or inconsistent parents without mutation", async () => {
+    const terminal = await createAcceptedLoggedExportResultFixture();
+    await terminal.catalog.reconcileLoggedExportFailure(
+      terminal.owner,
+      reconcileFailureCommand(terminal),
+    );
+    const projectId = terminal.accepted.request.projectId!;
+    const viewer = fixtureActor("retry-viewer");
+    const outsider = fixtureActor("retry-outsider");
+    await terminal.catalog.registerUser(viewer, "Retry viewer");
+    await terminal.catalog.registerUser(outsider, "Retry outsider");
+    await terminal.catalog.addMember(
+      terminal.owner,
+      projectId,
+      viewer.userId,
+      "viewer",
+    );
+    for (const actor of [viewer, outsider]) {
+      await expect(
+        terminal.catalog.retryLoggedExport(
+          actor,
+          projectId,
+          terminal.accepted.request.id,
+          { idempotencyKey: `forbidden-${actor.userId}` },
+        ),
+      ).rejects.toMatchObject({ statusCode: 403 });
+    }
+    await terminal.database.query(
+      "DELETE FROM project_members WHERE project_id = $1 AND user_id = $2",
+      [projectId, terminal.owner.userId],
+    );
+    await expect(
+      terminal.catalog.retryLoggedExport(
+        terminal.owner,
+        projectId,
+        terminal.accepted.request.id,
+        { idempotencyKey: "lost-membership" },
+      ),
+    ).rejects.toMatchObject({ statusCode: 403 });
+    expect(
+      (
+        await terminal.database.query<{ count: string }>(
+          "SELECT count(*)::text AS count FROM export_requests WHERE retry_of_request_id IS NOT NULL",
+        )
+      ).rows[0]!.count,
+    ).toBe("0");
+    await terminal.database.query(
+      `INSERT INTO project_members
+         (project_id, user_id, role, version, created_at, updated_at)
+       VALUES ($1, $2, 'owner', 1, now(), now())`,
+      [projectId, terminal.owner.userId],
+    );
+    for (const state of [
+      "queued",
+      "claimed",
+      "processing",
+      "needs_user_action",
+      "complete",
+      "canceled",
+    ]) {
+      await terminal.database.query(
+        "UPDATE jobs SET state = $1 WHERE id = $2",
+        [state, terminal.accepted.request.jobId],
+      );
+      await expect(
+        terminal.catalog.retryLoggedExport(
+          terminal.owner,
+          projectId,
+          terminal.accepted.request.id,
+          { idempotencyKey: `ineligible-job-${state}` },
+        ),
+      ).rejects.toMatchObject({ statusCode: 409 });
+    }
+    await terminal.database.query(
+      "UPDATE jobs SET state = 'failed' WHERE id = $1",
+      [terminal.accepted.request.jobId],
+    );
+    for (const state of ["not_requested", "queued", "processing", "complete"]) {
+      await terminal.database.query(
+        "UPDATE clip_candidates SET export_status = $1 WHERE id = $2",
+        [state, terminal.accepted.request.clipId],
+      );
+      await expect(
+        terminal.catalog.retryLoggedExport(
+          terminal.owner,
+          projectId,
+          terminal.accepted.request.id,
+          { idempotencyKey: `ineligible-clip-${state}` },
+        ),
+      ).rejects.toMatchObject({ statusCode: 409 });
+    }
+    expect(await countOrphanExportJobs(terminal.database, projectId)).toBe(0);
+
+    const inconsistent = await createAcceptedLoggedExportResultFixture();
+    await inconsistent.catalog.reconcileLoggedExportFailure(
+      inconsistent.owner,
+      reconcileFailureCommand(inconsistent),
+    );
+    await inconsistent.database.query(
+      `UPDATE jobs SET payload = payload || '{"unexpected":"mutation"}'::jsonb
+       WHERE id = $1`,
+      [inconsistent.accepted.request.jobId],
+    );
+    await expect(
+      inconsistent.catalog.retryLoggedExport(
+        inconsistent.owner,
+        inconsistent.accepted.request.projectId!,
+        inconsistent.accepted.request.id,
+        { idempotencyKey: "inconsistent-parent" },
+      ),
+    ).rejects.toMatchObject({ statusCode: 409 });
+
+    const queued = await createAcceptedLoggedExportResultFixture();
+    await expect(
+      queued.catalog.retryLoggedExport(
+        queued.owner,
+        queued.accepted.request.projectId!,
+        queued.accepted.request.id,
+        { idempotencyKey: "queued-parent" },
+      ),
+    ).rejects.toMatchObject({ statusCode: 409 });
+    const successful = await createAcceptedLoggedExportResultFixture();
+    await successful.catalog.reconcileLoggedExportSuccess(
+      successful.owner,
+      reconcileSuccessCommand(successful),
+    );
+    await expect(
+      successful.catalog.retryLoggedExport(
+        successful.owner,
+        successful.accepted.request.projectId!,
+        successful.accepted.request.id,
+        { idempotencyKey: "successful-parent" },
+      ),
+    ).rejects.toMatchObject({ statusCode: 409 });
+    const missingFailure = await createAcceptedLoggedExportResultFixture();
+    await missingFailure.database.query(
+      "UPDATE jobs SET state = 'canceled' WHERE id = $1",
+      [missingFailure.accepted.request.jobId],
+    );
+    await missingFailure.database.query(
+      "UPDATE clip_candidates SET export_status = 'failed' WHERE id = $1",
+      [missingFailure.accepted.request.clipId],
+    );
+    await expect(
+      missingFailure.catalog.retryLoggedExport(
+        missingFailure.owner,
+        missingFailure.accepted.request.projectId!,
+        missingFailure.accepted.request.id,
+        { idempotencyKey: "canceled-parent" },
+      ),
+    ).rejects.toMatchObject({ statusCode: 409 });
+  }, 30_000);
 });
 
 function fixtureActor(name: string): AuthenticatedActor {
@@ -1747,6 +2168,33 @@ function loggedExportFailureFixture(
     attempt: 0,
     sourceCleanup: { lifecycle: "not_started" },
   };
+}
+
+function retrySnapshot(request: ExportRequest) {
+  return {
+    projectId: request.projectId,
+    clipId: request.clipId,
+    video: request.video,
+    selection: request.selection,
+    sourceLanguageClass: request.sourceLanguageClass,
+    subtitleTracks: request.subtitleTracks,
+    preset: request.preset,
+    resolvedSettingsSnapshot: request.resolvedSettingsSnapshot,
+  };
+}
+
+async function countOrphanExportJobs(
+  database: PGlite,
+  projectId: string,
+): Promise<number> {
+  const result = await database.query<{ count: string }>(
+    `SELECT count(*)::text AS count
+     FROM jobs job
+     LEFT JOIN export_requests request ON request.job_id = job.id
+     WHERE job.project_id = $1 AND job.kind = 'export' AND request.id IS NULL`,
+    [projectId],
+  );
+  return Number(result.rows[0]!.count);
 }
 
 function loggedExportSuccessFixture(

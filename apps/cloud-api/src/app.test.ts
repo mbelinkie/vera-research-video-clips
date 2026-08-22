@@ -1886,11 +1886,13 @@ describe("logged export delivery API", () => {
     const acceptLoggedExportDelivery = vi.fn(async () => ({ accepted: true }));
     const reconcileLoggedExportSuccess = vi.fn(async () => ({ ok: true }));
     const reconcileLoggedExportFailure = vi.fn(async () => ({ failed: true }));
+    const retryLoggedExport = vi.fn(async () => ({ retried: true }));
     const catalog = {
       claimLoggedExportDelivery,
       acceptLoggedExportDelivery,
       reconcileLoggedExportSuccess,
       reconcileLoggedExportFailure,
+      retryLoggedExport,
     } as unknown as SharedProjectCatalog;
     const app = createCloudApi({ catalog, authenticate: async () => actor });
     apps.add(app);
@@ -1996,6 +1998,32 @@ describe("logged export delivery API", () => {
       reservationToken,
       result: failureResult,
     });
+    const projectId = randomUUID();
+    const requestId = randomUUID();
+    const retried = await app.inject({
+      method: "POST",
+      url: `/api/projects/${projectId}/export-requests/${requestId}/retry`,
+      payload: { idempotencyKey: "retry-command-1" },
+    });
+    expect(retried.json()).toEqual({ retried: true });
+    expect(retryLoggedExport).toHaveBeenCalledWith(
+      actor,
+      projectId,
+      requestId,
+      { idempotencyKey: "retry-command-1" },
+    );
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: `/api/projects/${projectId}/export-requests/${requestId}/retry`,
+          payload: {
+            idempotencyKey: "retry-command-2",
+            preset: "caller replacement forbidden",
+          },
+        })
+      ).statusCode,
+    ).toBe(400);
   });
 });
 

@@ -38,6 +38,7 @@ import {
   RegisterExportWorkerRequestSchema,
   ReconcileLoggedExportFailureRequestSchema,
   ReconcileLoggedExportSuccessRequestSchema,
+  RetryLoggedExportRequestSchema,
   RevokeExportWorkerRequestSchema,
   type AuthenticatedActor,
   type BatchOptions,
@@ -58,6 +59,9 @@ export interface CloudApiDependencies {
 const IdParamsSchema = z.object({ projectId: z.uuid() });
 const ProjectVideoParamsSchema = IdParamsSchema.extend({ videoId: z.uuid() });
 const ProjectClipParamsSchema = IdParamsSchema.extend({ clipId: z.uuid() });
+const ProjectExportRequestParamsSchema = IdParamsSchema.extend({
+  requestId: z.uuid(),
+});
 const ProjectBatchParamsSchema = IdParamsSchema.extend({ batchId: z.uuid() });
 const ProjectReviewItemParamsSchema = IdParamsSchema.extend({
   itemId: z.uuid(),
@@ -187,6 +191,21 @@ export function createCloudApi(
       await authenticate(request),
       ReconcileLoggedExportFailureRequestSchema.parse(request.body),
     ),
+  );
+
+  app.post(
+    "/api/projects/:projectId/export-requests/:requestId/retry",
+    async (request) => {
+      const { projectId, requestId } = ProjectExportRequestParamsSchema.parse(
+        request.params,
+      );
+      return catalog.retryLoggedExport(
+        await authenticate(request),
+        projectId,
+        requestId,
+        RetryLoggedExportRequestSchema.parse(request.body),
+      );
+    },
   );
 
   app.get("/api/session/profile", async (request) =>
