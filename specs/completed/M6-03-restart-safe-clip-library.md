@@ -67,7 +67,7 @@ label and no mutation capability.
    high-water sequence and fetch time. A cached page is a clearly labeled
    subset, never claimed to be a complete project snapshot.
 6. Scope cache and selected clip IDs to `(projectId,
-   sha256(Authorization header))`. Require the exact credential again after
+sha256(Authorization header))`. Require the exact credential again after
    restart; never store or return the raw header. Online 401/403 deletes that
    credential scope and cannot fall back to stale data.
 7. Overlay only locator summaries whose artifact-version IDs already occur in
@@ -215,4 +215,4 @@ verify, reveal, open, relink, or build authoring exports.
 ## Commits
 
 - Implementation, migration, tests, and active specification: `65f56c1`
-- Completion documentation and status: pending
+- Completion documentation and status: `41f97af`
