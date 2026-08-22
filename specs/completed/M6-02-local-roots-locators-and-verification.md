@@ -237,4 +237,4 @@ gate, not a reason to alter M5 or weaken the fail-closed verifier.
 ## Commits
 
 - Implementation, migrations, tests, and active specification: `50ee0e6`
-- Completion documentation: recorded by the following documentation commit.
+- Completion documentation and status: `030f4b7`
