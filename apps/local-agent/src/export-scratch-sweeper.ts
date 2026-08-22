@@ -4,11 +4,13 @@ import { join, relative, resolve, sep } from "node:path";
 import { loadConfig, type AppConfig } from "@research-video/config";
 import {
   LocalExportQueue,
+  type LocalLoggedExportSourceGroupCleanupClaim,
   type LocalSourceScratchCleanupClaim,
   openLocalDatabase,
   runLocalMigrations,
 } from "@research-video/db-local";
 import {
+  cleanupExportSourceScratch,
   removeEmptyExportSourceScratchJobDirectory,
   resolveExportSourceScratchAttemptDirectory,
 } from "@research-video/media";
@@ -36,7 +38,7 @@ export type LocalSourceScratchSweepDependencies = {
  * media acquisition, rendering, or cloud interaction.
  */
 export async function runLocalSourceScratchSweep(
-  input: { limit?: number } = {},
+  input: { limit?: number; recoverOrphanedGroups?: boolean } = {},
   dependencies: LocalSourceScratchSweepDependencies,
 ): Promise<LocalSourceScratchSweepResult> {
   const limit = input.limit ?? DefaultSweepLimit;
@@ -47,16 +49,48 @@ export async function runLocalSourceScratchSweep(
   }
   const legacyUnsupported =
     dependencies.queue.countLegacySourceScratchRecoveryRows();
-  const claims = dependencies.queue.claimSourceScratchCleanup(limit);
+  const groupClaims = dependencies.queue.claimLoggedExportSourceGroupCleanup(
+    limit,
+    {
+      ...(input.recoverOrphanedGroups ? { recoverOrphanedJoined: true } : {}),
+    },
+  );
+  const remaining = limit - groupClaims.length;
+  const claims =
+    remaining > 0
+      ? dependencies.queue.claimSourceScratchCleanup(remaining)
+      : [];
   const result: LocalSourceScratchSweepResult = {
     status: "complete",
-    claimed: claims.length,
+    claimed: groupClaims.length + claims.length,
     deleted: 0,
     cleanupFailed: 0,
     restoredComplete: 0,
     markedNeedsUserAction: 0,
     legacyUnsupported,
   };
+  for (const claim of groupClaims) {
+    try {
+      await removeExactSourceGroupScratch(dependencies.dataRoot, claim);
+      const settlement =
+        dependencies.queue.completeLoggedExportSourceGroupCleanupClaim(claim);
+      result.deleted += 1;
+      if (settlement.restoredComplete) result.restoredComplete += 1;
+      if (settlement.markedNeedsUserAction) result.markedNeedsUserAction += 1;
+    } catch (error) {
+      try {
+        dependencies.queue.failLoggedExportSourceGroupCleanupClaim(
+          claim,
+          safeSweepFailureMessage(error),
+        );
+        result.cleanupFailed += 1;
+      } catch (settlementError) {
+        const candidate = settlementError as { code?: unknown };
+        if (candidate.code === "source_scratch_cleanup_claim_lost") continue;
+        throw settlementError;
+      }
+    }
+  }
   for (const claim of claims) {
     try {
       await removeExactSourceScratchAttempt(dependencies.dataRoot, claim);
@@ -80,6 +114,17 @@ export async function runLocalSourceScratchSweep(
     }
   }
   return result;
+}
+
+async function removeExactSourceGroupScratch(
+  dataRoot: string,
+  claim: LocalLoggedExportSourceGroupCleanupClaim,
+): Promise<void> {
+  await cleanupExportSourceScratch({
+    scratchRoot: join(dataRoot, "jobs", "export-source-groups"),
+    jobId: claim.groupId,
+    attempt: 1,
+  });
 }
 
 export async function runConfiguredLocalSourceScratchSweep(

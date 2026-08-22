@@ -23,6 +23,7 @@ import {
 import type { ExportWorkerCapabilityProvider } from "@research-video/export-settings";
 
 import { LocalExportSourceProcessor } from "./export-source.ts";
+import type { LocalLoggedExportSourceGroupCoordinator } from "./shared-source-group.ts";
 
 export type LocalExportOnceResult = {
   requestId: string;
@@ -45,6 +46,7 @@ export type LocalExportRuntimeDependencies = {
   thumbnailExtractor?: FfmpegJpegThumbnailExtractionAdapter;
   thumbnailInspector?: JpegThumbnailInspector;
   capabilityProvider?: ExportWorkerCapabilityProvider;
+  sharedSourceCoordinator?: LocalLoggedExportSourceGroupCoordinator;
   dataRoot: string;
 };
 
@@ -87,6 +89,7 @@ export async function runLocalExportOnce(
     dependencies.thumbnailExtractor ?? new FfmpegJpegThumbnailExtractor(),
     dependencies.thumbnailInspector ?? new FfprobeJpegThumbnailInspector(),
     dependencies.capabilityProvider ?? new FfmpegCapabilityDiscoveryProvider(),
+    dependencies.sharedSourceCoordinator,
   );
   try {
     await processor.process(input);

@@ -147,6 +147,7 @@ describe("local migrations", () => {
       "0021_source_scratch_recovery_claims",
       "0022_logged_export_execution_cancellation",
       "0023_logged_export_execution_progress",
+      "0024_logged_export_same_source_groups",
     ]);
     expect(runLocalMigrations(database)).toEqual([]);
     expect(
@@ -315,6 +316,47 @@ describe("local migrations", () => {
     database.close();
   });
 
+  it("rejects grouped scratch without the exact shared layout version", () => {
+    const directory = mkdtempSync(join(tmpdir(), "research-video-layout3-"));
+    temporaryDirectories.add(directory);
+    const database = openLocalDatabase(join(directory, "layout.sqlite"));
+    runLocalMigrations(database);
+    const queue = new LocalExportQueue(database);
+    const request = queue.createExportOnly(fixtureExportInput);
+    const started = queue.beginSourceAcquisition(request.id);
+    const groupId = "019fbb95-cd76-7920-93fa-e23ba755ef29";
+    database
+      .prepare(
+        `INSERT INTO logged_export_source_groups
+           (id, compatibility_key, project_id, batch_id, youtube_video_id,
+            acquisition_profile_fingerprint, worker_id, worker_epoch,
+            lifecycle_state, created_at, expires_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 1, 'acquiring', ?, ?, ?)`,
+      )
+      .run(
+        groupId,
+        "a".repeat(64),
+        randomUUID(),
+        randomUUID(),
+        "M7lc1UVf-VE",
+        "b".repeat(64),
+        randomUUID(),
+        "2026-08-22T12:00:00.000Z",
+        "2026-08-23T12:00:00.000Z",
+        "2026-08-22T12:00:00.000Z",
+      );
+    expect(() =>
+      database
+        .prepare(
+          `UPDATE source_scratch_assets
+           SET source_group_id = ?, scratch_layout_version = NULL
+           WHERE job_id = ? AND attempt = ?`,
+        )
+        .run(groupId, started.request.jobId, started.attempt),
+    ).toThrow(/layout version 3/u);
+    database.close();
+  });
+
   it("upgrades a populated legacy scratch row to manual cleanup instead of inferring a new path", () => {
     const directory = mkdtempSync(
       join(tmpdir(), "research-video-legacy-scratch-migration-"),
@@ -350,6 +392,7 @@ describe("local migrations", () => {
       "0021_source_scratch_recovery_claims",
       "0022_logged_export_execution_cancellation",
       "0023_logged_export_execution_progress",
+      "0024_logged_export_same_source_groups",
     ]);
     expect(
       database
@@ -527,6 +570,7 @@ describe("local migrations", () => {
       "0021_source_scratch_recovery_claims",
       "0022_logged_export_execution_cancellation",
       "0023_logged_export_execution_progress",
+      "0024_logged_export_same_source_groups",
     ]);
     expect(
       database.prepare("SELECT * FROM export_final_artifacts").all(),
@@ -655,6 +699,7 @@ describe("local migrations", () => {
       "0021_source_scratch_recovery_claims",
       "0022_logged_export_execution_cancellation",
       "0023_logged_export_execution_progress",
+      "0024_logged_export_same_source_groups",
     ]);
     expect(
       database
@@ -1471,6 +1516,149 @@ describe("logged export delivery import", () => {
     database.close();
   });
 
+  it("durably groups exact accepted batch attempts and deletes every member only after final release", () => {
+    const directory = mkdtempSync(join(tmpdir(), "research-video-group-"));
+    temporaryDirectories.add(directory);
+    const database = openLocalDatabase(join(directory, "group.sqlite"));
+    runLocalMigrations(database);
+    const queue = new LocalExportQueue(database);
+    const batchId = "019fbb95-cd76-7920-93fa-e23ba755ef20";
+    const firstBase = fixtureLoggedDelivery();
+    const first: LoggedExportDelivery = {
+      ...firstBase,
+      sourceGroup: {
+        batchId,
+        batchItemId: "019fbb95-cd76-7920-93fa-e23ba755ef21",
+      },
+      request: {
+        ...firstBase.request,
+        batchItemId: "019fbb95-cd76-7920-93fa-e23ba755ef21",
+      },
+    };
+    const second: LoggedExportDelivery = {
+      ...first,
+      deliveryId: "019fbb95-cd76-7920-93fa-e23ba755ef22",
+      reservationToken: "019fbb95-cd76-7920-93fa-e23ba755ef23",
+      sourceGroup: {
+        batchId,
+        batchItemId: "019fbb95-cd76-7920-93fa-e23ba755ef24",
+      },
+      request: {
+        ...first.request,
+        id: "019fbb95-cd76-7920-93fa-e23ba755ef25",
+        jobId: "019fbb95-cd76-7920-93fa-e23ba755ef26",
+        clipId: "019fbb95-cd76-7920-93fa-e23ba755ef27",
+        batchItemId: "019fbb95-cd76-7920-93fa-e23ba755ef24",
+      },
+    };
+    const accept = (delivery: LoggedExportDelivery): LoggedExportDelivery => ({
+      ...delivery,
+      status: "accepted",
+      acceptedAt: "2026-08-20T12:00:05.000Z",
+    });
+    for (const delivery of [first, second]) {
+      queue.importLoggedDeliveryPending(delivery);
+      queue.activateLoggedDelivery(accept(delivery));
+      activateFixtureExecution(queue, delivery);
+    }
+    const firstAttempt = queue.beginSourceAcquisition(first.request.id);
+    const secondAttempt = queue.beginSourceAcquisition(second.request.id);
+    const groupId = "019fbb95-cd76-7920-93fa-e23ba755ef28";
+    const profile = sha256Fingerprint({ provider: "fixture" });
+    const compatibilityKey = sha256Fingerprint({ batchId, source: "fixture" });
+    expect(
+      queue.createLoggedExportSourceGroup({
+        groupId,
+        compatibilityKey,
+        acquisitionProfileFingerprint: profile,
+        members: [
+          {
+            requestId: first.request.id,
+            jobId: first.request.jobId,
+            attempt: firstAttempt.attempt,
+          },
+          {
+            requestId: second.request.id,
+            jobId: second.request.jobId,
+            attempt: secondAttempt.attempt,
+          },
+        ],
+      }),
+    ).toMatchObject({
+      id: groupId,
+      lifecycleState: "acquiring",
+      batchId,
+    });
+    queue.recordLoggedExportSourceGroupReady(
+      groupId,
+      {
+        provider: "fixture",
+        sourceIdentity: "fixture-source",
+        byteSize: 100,
+        contentSha256: "a".repeat(64),
+      },
+      { durationMs: 4_000, videoCodec: "h264", audioCodec: "aac" },
+    );
+    database
+      .prepare(
+        "UPDATE logged_export_source_groups SET expires_at = ? WHERE id = ?",
+      )
+      .run("2026-08-21T12:00:00.000Z", groupId);
+    expect(queue.claimLoggedExportSourceGroupCleanup(1)).toEqual([]);
+    database
+      .prepare(
+        `INSERT INTO export_final_artifacts
+           (export_request_id, role, package_identity, byte_size,
+            content_sha256, source_attempt, validated_at)
+         VALUES (?, 'video_mp4', ?, 100, ?, ?, ?)`,
+      )
+      .run(
+        first.request.id,
+        `clip-${first.request.id}`,
+        "c".repeat(64),
+        firstAttempt.attempt,
+        "2026-08-22T12:00:00.000Z",
+      );
+    expect(
+      queue.releaseLoggedExportSourceGroupMember(
+        groupId,
+        first.request.id,
+        "failed",
+      ),
+    ).toBe(false);
+    expect(queue.getLoggedExportSourceGroup(groupId)?.lifecycleState).toBe(
+      "ready",
+    );
+    expect(
+      queue.releaseLoggedExportSourceGroupMember(
+        groupId,
+        second.request.id,
+        "canceled",
+      ),
+    ).toBe(true);
+    queue.recordLoggedExportSourceGroupCleanupStarted(groupId);
+    queue.recordLoggedExportSourceGroupCleanupSucceeded(groupId);
+    expect(queue.getLoggedExportSourceGroup(groupId)).toMatchObject({
+      lifecycleState: "deleted",
+      deletedAt: expect.any(String),
+    });
+    expect(
+      database
+        .prepare(
+          `SELECT lifecycle_state, count(*) AS count
+           FROM source_scratch_assets WHERE source_group_id = ?
+           GROUP BY lifecycle_state`,
+        )
+        .get(groupId),
+    ).toEqual({ lifecycle_state: "deleted", count: 2 });
+    expect(
+      database
+        .prepare("SELECT state FROM jobs WHERE id = ?")
+        .get(first.request.jobId),
+    ).toEqual({ state: "queued" });
+    database.close();
+  });
+
   it("upgrades a populated export-only queue without changing its logical mode or snapshots", () => {
     const directory = mkdtempSync(
       join(tmpdir(), "research-video-populated-0018-"),
@@ -1503,6 +1691,7 @@ describe("logged export delivery import", () => {
       "0021_source_scratch_recovery_claims",
       "0022_logged_export_execution_cancellation",
       "0023_logged_export_execution_progress",
+      "0024_logged_export_same_source_groups",
     ]);
     const after = new LocalExportQueue(database).get(before.id);
     expect(after).toEqual(before);
@@ -1563,6 +1752,7 @@ describe("logged export delivery import", () => {
       "0021_source_scratch_recovery_claims",
       "0022_logged_export_execution_cancellation",
       "0023_logged_export_execution_progress",
+      "0024_logged_export_same_source_groups",
     ]);
     expect(
       new LocalExportQueue(database).getAcceptedLoggedDelivery(
@@ -1591,7 +1781,7 @@ function activateFixtureExecution(
     leaseToken: randomUUID(),
     startedAt: "2026-08-20T12:00:06.000Z",
     heartbeatAt: "2026-08-20T12:00:07.000Z",
-    expiresAt: "2026-08-20T12:00:37.000Z",
+    expiresAt: "2026-08-23T12:00:37.000Z",
   });
 }
 

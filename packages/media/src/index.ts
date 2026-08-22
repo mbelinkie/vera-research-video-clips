@@ -367,6 +367,66 @@ export type ExportSourceLifecycleInput<T> = {
   hooks?: ExportSourceLifecycleHooks;
 };
 
+export type AcquiredExportSourceScratch = {
+  source: AcquiredExportSource;
+  scratchDirectory: string;
+};
+
+/**
+ * Acquires one verified private source scratch without transferring cleanup
+ * ownership. Callers must pair this with `cleanupExportSourceScratch`.
+ */
+export async function acquireExportSourceScratch(input: {
+  scratchRoot: string;
+  jobId: string;
+  attempt: number;
+  provider: ExportSourceAcquisitionProvider;
+  videoId: string;
+  authorizationConfirmed: boolean;
+  signal?: AbortSignal;
+}): Promise<AcquiredExportSourceScratch> {
+  validateScratchDirectory(input.scratchRoot);
+  validateExportJobId(input.jobId);
+  validateExportAttempt(input.attempt);
+  const scratchDirectory = await createAttemptDirectory(
+    input.scratchRoot,
+    input.jobId,
+    input.attempt,
+  );
+  try {
+    const source = await input.provider.acquireAuthorizedFullSource({
+      videoId: input.videoId,
+      scratchDirectory,
+      authorizationConfirmed: input.authorizationConfirmed,
+      ...(input.signal ? { signal: input.signal } : {}),
+    });
+    return { source, scratchDirectory };
+  } catch (error) {
+    await cleanupAttemptDirectory(
+      scratchDirectory,
+      input.scratchRoot,
+      input.jobId,
+    );
+    throw error;
+  }
+}
+
+export async function cleanupExportSourceScratch(input: {
+  scratchRoot: string;
+  jobId: string;
+  attempt: number;
+}): Promise<void> {
+  validateScratchDirectory(input.scratchRoot);
+  validateExportJobId(input.jobId);
+  validateExportAttempt(input.attempt);
+  const scratchDirectory = resolveExportSourceScratchAttemptDirectory(input);
+  await cleanupAttemptDirectory(
+    scratchDirectory,
+    input.scratchRoot,
+    input.jobId,
+  );
+}
+
 /**
  * Gives the next export stage a verified ephemeral source and removes it on
  * every path. The source path never leaves this process boundary; persistence
@@ -404,11 +464,7 @@ export async function withExportSourceScratch<T>(
   } finally {
     try {
       await input.hooks?.cleanupStarted?.();
-      await cleanupAttemptDirectory(
-        scratchDirectory,
-        input.scratchRoot,
-        input.jobId,
-      );
+      await cleanupExportSourceScratch(input);
       await input.hooks?.cleanupSucceeded?.();
     } catch (cleanupError) {
       const message = safeErrorMessage(cleanupError);
@@ -448,6 +504,8 @@ export type EditingMp4RenderSettings = ExportSettings;
 
 export type FfmpegRangeRenderInput = {
   sourcePath: string;
+  /** Optional separately owned source root for same-source group members. */
+  sourceDirectory?: string;
   stagingDirectory: string;
   outputPath: string;
   startMs: number;
@@ -1545,6 +1603,8 @@ async function validateRenderInput(
   input: FfmpegRangeRenderInput,
 ): Promise<void> {
   validateScratchDirectory(input.stagingDirectory);
+  const sourceDirectory = input.sourceDirectory ?? input.stagingDirectory;
+  validateScratchDirectory(sourceDirectory);
   if (
     !Number.isSafeInteger(input.startMs) ||
     !Number.isSafeInteger(input.endMs) ||
@@ -1556,7 +1616,7 @@ async function validateRenderInput(
       retryable: false,
     });
   }
-  if (!isInsideScratchDirectory(input.stagingDirectory, input.sourcePath)) {
+  if (!isInsideScratchDirectory(sourceDirectory, input.sourcePath)) {
     throw new FfmpegRenderError(
       "Acquired source is outside its private staging directory.",
       { code: "source_path_outside_scratch", retryable: false },

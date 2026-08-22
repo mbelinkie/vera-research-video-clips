@@ -46,6 +46,7 @@ const defaultMigrationDirectory = fileURLToPath(
 );
 
 const SourceScratchLayoutVersion = 2;
+const SharedSourceScratchLayoutVersion = 3;
 const LoggedExportProgressStageRank: Record<LoggedExportProgressStage, number> =
   {
     preparing: 1,
@@ -63,6 +64,7 @@ const SourceScratchCleanupClaimLeaseMs = 5 * 60 * 1_000;
 const MaxSourceScratchCleanupClaims = 25;
 
 const localExportRequestSelect = `SELECT er.*, j.state,
+  j.payload_json AS job_payload_json,
   ssa.duration_ms AS media_duration_ms,
   ssa.container_format AS media_container_format,
   ssa.video_codec AS media_video_codec,
@@ -313,6 +315,9 @@ export class LocalExportQueue {
               : {}),
             preset: request.preset,
             resolvedSettingsSnapshot: request.resolvedSettingsSnapshot,
+            ...(delivery.sourceGroup
+              ? { sourceGroup: delivery.sourceGroup }
+              : {}),
           }),
           request.createdAt,
           request.updatedAt,
@@ -454,6 +459,7 @@ export class LocalExportQueue {
       status: "reserved",
       reservedAt: row.cloud_reserved_at,
       reservationExpiresAt: row.cloud_reservation_expires_at,
+      ...sourceGroupFromLocalRow(row),
       request: this.mapRequest(row),
     });
   }
@@ -478,6 +484,7 @@ export class LocalExportQueue {
       reservedAt: row.cloud_reserved_at,
       reservationExpiresAt: row.cloud_reservation_expires_at,
       acceptedAt: row.cloud_accepted_at,
+      ...sourceGroupFromLocalRow(row),
       request: this.mapRequest(row),
     });
   }
@@ -1325,6 +1332,452 @@ export class LocalExportQueue {
     return { request, attempt: nextAttempt };
   }
 
+  createLoggedExportSourceGroup(input: {
+    groupId: string;
+    compatibilityKey: string;
+    acquisitionProfileFingerprint: string;
+    members: readonly {
+      requestId: string;
+      jobId: string;
+      attempt: number;
+    }[];
+  }): LocalLoggedExportSourceGroup {
+    if (
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u.test(
+        input.groupId,
+      ) ||
+      !/^[a-f0-9]{64}$/u.test(input.compatibilityKey) ||
+      !/^[a-f0-9]{64}$/u.test(input.acquisitionProfileFingerprint) ||
+      input.members.length < 2 ||
+      new Set(input.members.map((member) => member.requestId)).size !==
+        input.members.length
+    ) {
+      throw new LocalExportLifecycleError(
+        "Shared source group membership is invalid.",
+        "logged_export_source_group_invalid",
+      );
+    }
+    const first = this.getAcceptedLoggedDelivery(input.members[0]!.requestId);
+    if (!first?.sourceGroup) {
+      throw new LocalExportLifecycleError(
+        "Shared source grouping requires one accepted batch delivery.",
+        "logged_export_source_group_ineligible",
+      );
+    }
+    const now = this.now().toISOString();
+    const expiresAt = new Date(
+      this.now().getTime() + 24 * 60 * 60 * 1_000,
+    ).toISOString();
+    this.database.exec("BEGIN IMMEDIATE;");
+    try {
+      const existing = this.database
+        .prepare(
+          "SELECT * FROM logged_export_source_groups WHERE compatibility_key = ?",
+        )
+        .get(input.compatibilityKey) as Record<string, unknown> | undefined;
+      if (existing) {
+        const members = this.database
+          .prepare(
+            `SELECT export_request_id, job_id, attempt
+             FROM logged_export_source_group_members
+             WHERE group_id = ? ORDER BY export_request_id`,
+          )
+          .all(String(existing.id)) as Record<string, unknown>[];
+        const expected = [...input.members]
+          .map(
+            (member) => `${member.requestId}:${member.jobId}:${member.attempt}`,
+          )
+          .sort();
+        const actual = members
+          .map(
+            (member) =>
+              `${String(member.export_request_id)}:${String(member.job_id)}:${Number(member.attempt)}`,
+          )
+          .sort();
+        if (
+          String(existing.id) !== input.groupId ||
+          canonicalJson(expected) !== canonicalJson(actual)
+        ) {
+          throw new LocalExportLifecycleError(
+            "Shared source group replay conflicts with durable membership.",
+            "logged_export_source_group_conflict",
+          );
+        }
+        this.database.exec("COMMIT;");
+        return mapLocalLoggedExportSourceGroup(existing);
+      }
+
+      const insertMember = this.database.prepare(
+        `INSERT INTO logged_export_source_group_members
+           (group_id, export_request_id, job_id, attempt, execution_id,
+            batch_item_id, lifecycle_state, joined_at)
+         VALUES (?, ?, ?, ?, ?, ?, 'joined', ?)`,
+      );
+      this.database
+        .prepare(
+          `INSERT INTO logged_export_source_groups
+             (id, compatibility_key, project_id, batch_id, youtube_video_id,
+              acquisition_profile_fingerprint, worker_id, worker_epoch,
+              lifecycle_state, created_at, expires_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'acquiring', ?, ?, ?)`,
+        )
+        .run(
+          input.groupId,
+          input.compatibilityKey,
+          first.request.projectId!,
+          first.sourceGroup.batchId,
+          first.request.video.youtubeVideoId,
+          input.acquisitionProfileFingerprint,
+          first.workerId,
+          first.workerEpoch,
+          now,
+          expiresAt,
+          now,
+        );
+      for (const member of input.members) {
+        const delivery = this.getAcceptedLoggedDelivery(member.requestId);
+        const execution = this.getLoggedExecution(member.requestId);
+        const request = delivery?.request;
+        if (
+          !delivery?.sourceGroup ||
+          !request ||
+          request.jobId !== member.jobId ||
+          request.projectId !== first.request.projectId ||
+          request.video.youtubeVideoId !== first.request.video.youtubeVideoId ||
+          request.video.canonicalUrl !== first.request.video.canonicalUrl ||
+          delivery.sourceGroup.batchId !== first.sourceGroup.batchId ||
+          delivery.workerId !== first.workerId ||
+          delivery.workerEpoch !== first.workerEpoch ||
+          !execution ||
+          execution.attempt !== member.attempt ||
+          execution.workerId !== delivery.workerId ||
+          execution.workerEpoch !== delivery.workerEpoch ||
+          Boolean(execution.cancelRequestedAt) ||
+          Date.parse(execution.expiresAt) <= this.now().getTime()
+        ) {
+          throw new LocalExportLifecycleError(
+            "Shared source group member ownership is incompatible.",
+            "logged_export_source_group_ineligible",
+          );
+        }
+        const scratch = this.database
+          .prepare(
+            `UPDATE source_scratch_assets
+             SET source_group_id = ?, scratch_layout_version = ?, updated_at = ?
+             WHERE job_id = ? AND attempt = ? AND lifecycle_state = 'acquiring'
+               AND source_group_id IS NULL AND cleanup_claim_token IS NULL`,
+          )
+          .run(
+            input.groupId,
+            SharedSourceScratchLayoutVersion,
+            now,
+            member.jobId,
+            member.attempt,
+          );
+        if (scratch.changes !== 1) {
+          throw new LocalExportLifecycleError(
+            "Shared source group member scratch ownership changed.",
+            "logged_export_source_group_conflict",
+          );
+        }
+        insertMember.run(
+          input.groupId,
+          member.requestId,
+          member.jobId,
+          member.attempt,
+          execution.executionId,
+          delivery.sourceGroup.batchItemId,
+          now,
+        );
+      }
+      this.database.exec("COMMIT;");
+    } catch (error) {
+      this.database.exec("ROLLBACK;");
+      throw error;
+    }
+    return this.getLoggedExportSourceGroup(input.groupId)!;
+  }
+
+  getLoggedExportSourceGroup(
+    groupId: string,
+  ): LocalLoggedExportSourceGroup | undefined {
+    const row = this.database
+      .prepare("SELECT * FROM logged_export_source_groups WHERE id = ?")
+      .get(groupId) as Record<string, unknown> | undefined;
+    return row ? mapLocalLoggedExportSourceGroup(row) : undefined;
+  }
+
+  getLoggedExportSourceGroupByCompatibilityKey(
+    compatibilityKey: string,
+  ): LocalLoggedExportSourceGroup | undefined {
+    const row = this.database
+      .prepare(
+        "SELECT * FROM logged_export_source_groups WHERE compatibility_key = ?",
+      )
+      .get(compatibilityKey) as Record<string, unknown> | undefined;
+    return row ? mapLocalLoggedExportSourceGroup(row) : undefined;
+  }
+
+  recordLoggedExportSourceGroupReady(
+    groupId: string,
+    source: {
+      provider: string;
+      sourceIdentity: string;
+      byteSize: number;
+      contentSha256: string;
+    },
+    inspection: {
+      durationMs: number;
+      containerFormat?: string;
+      videoCodec?: string;
+      audioCodec?: string;
+      ffprobeVersion?: string;
+    },
+  ): void {
+    const now = this.now().toISOString();
+    this.database.exec("BEGIN IMMEDIATE;");
+    try {
+      const group = this.database
+        .prepare(
+          `UPDATE logged_export_source_groups
+           SET lifecycle_state = 'ready', provider = ?, source_identity = ?,
+               byte_size = ?, content_sha256 = ?, duration_ms = ?,
+               container_format = ?, video_codec = ?, audio_codec = ?,
+               ffprobe_version = ?, ready_at = ?, updated_at = ?
+           WHERE id = ? AND lifecycle_state = 'acquiring'`,
+        )
+        .run(
+          source.provider,
+          source.sourceIdentity,
+          source.byteSize,
+          source.contentSha256,
+          inspection.durationMs,
+          safeProbeValue(inspection.containerFormat, 240),
+          safeProbeValue(inspection.videoCodec, 120),
+          safeProbeValue(inspection.audioCodec, 120),
+          safeProbeValue(inspection.ffprobeVersion, 120),
+          now,
+          now,
+          groupId,
+        );
+      if (group.changes !== 1) throw new LocalExportLifecycleError();
+      const assets = this.database
+        .prepare(
+          `UPDATE source_scratch_assets
+           SET provider = ?, source_identity = ?, byte_size = ?,
+               content_sha256 = ?, lifecycle_state = 'ready', ready_at = ?,
+               updated_at = ?
+           WHERE source_group_id = ? AND lifecycle_state = 'acquiring'
+             AND cleanup_claim_token IS NULL`,
+        )
+        .run(
+          source.provider,
+          source.sourceIdentity,
+          source.byteSize,
+          source.contentSha256,
+          now,
+          now,
+          groupId,
+        );
+      const expected = this.database
+        .prepare(
+          "SELECT count(*) AS count FROM logged_export_source_group_members WHERE group_id = ?",
+        )
+        .get(groupId) as { count: number };
+      if (assets.changes !== Number(expected.count))
+        throw new LocalExportLifecycleError();
+      this.database.exec("COMMIT;");
+    } catch (error) {
+      this.database.exec("ROLLBACK;");
+      throw error;
+    }
+  }
+
+  releaseLoggedExportSourceGroupMember(
+    groupId: string,
+    requestId: string,
+    outcome: "succeeded" | "failed" | "canceled",
+  ): boolean {
+    const now = this.now().toISOString();
+    this.database.exec("BEGIN IMMEDIATE;");
+    try {
+      const release = this.database
+        .prepare(
+          `UPDATE logged_export_source_group_members
+           SET lifecycle_state = 'released', outcome = ?, released_at = ?
+           WHERE group_id = ? AND export_request_id = ?
+             AND lifecycle_state = 'joined'`,
+        )
+        .run(outcome, now, groupId, requestId);
+      if (release.changes !== 1) {
+        const replay = this.database
+          .prepare(
+            `SELECT outcome FROM logged_export_source_group_members
+             WHERE group_id = ? AND export_request_id = ?
+               AND lifecycle_state IN ('released', 'settled')`,
+          )
+          .get(groupId, requestId) as { outcome?: string } | undefined;
+        if (replay?.outcome !== outcome) throw new LocalExportLifecycleError();
+      }
+      const remaining = this.database
+        .prepare(
+          `SELECT count(*) AS count FROM logged_export_source_group_members
+           WHERE group_id = ? AND lifecycle_state = 'joined'`,
+        )
+        .get(groupId) as { count: number };
+      this.database.exec("COMMIT;");
+      return Number(remaining.count) === 0;
+    } catch (error) {
+      this.database.exec("ROLLBACK;");
+      throw error;
+    }
+  }
+
+  recordLoggedExportSourceGroupCleanupStarted(groupId: string): void {
+    const now = this.now().toISOString();
+    this.database.exec("BEGIN IMMEDIATE;");
+    try {
+      const group = this.database
+        .prepare(
+          `UPDATE logged_export_source_groups
+           SET lifecycle_state = 'deleting', cleanup_started_at = ?, updated_at = ?
+           WHERE id = ? AND lifecycle_state IN ('acquiring', 'ready',
+             'acquisition_failed')
+             AND NOT EXISTS (
+               SELECT 1 FROM logged_export_source_group_members
+               WHERE group_id = ? AND lifecycle_state = 'joined'
+             )`,
+        )
+        .run(now, now, groupId, groupId);
+      if (group.changes !== 1) throw new LocalExportLifecycleError();
+      this.database
+        .prepare(
+          `UPDATE source_scratch_assets SET lifecycle_state = 'deleting',
+             cleanup_started_at = ?, updated_at = ?
+           WHERE source_group_id = ? AND lifecycle_state IN ('acquiring', 'ready')`,
+        )
+        .run(now, now, groupId);
+      this.database.exec("COMMIT;");
+    } catch (error) {
+      this.database.exec("ROLLBACK;");
+      throw error;
+    }
+  }
+
+  recordLoggedExportSourceGroupCleanupSucceeded(groupId: string): void {
+    const now = this.now().toISOString();
+    this.database.exec("BEGIN IMMEDIATE;");
+    try {
+      const group = this.database
+        .prepare(
+          `UPDATE logged_export_source_groups
+           SET lifecycle_state = 'deleted', deleted_at = ?, updated_at = ?,
+               cleanup_error_code = NULL, cleanup_error_message = NULL
+           WHERE id = ? AND lifecycle_state = 'deleting'`,
+        )
+        .run(now, now, groupId);
+      if (group.changes !== 1) throw new LocalExportLifecycleError();
+      this.database
+        .prepare(
+          `UPDATE source_scratch_assets
+           SET lifecycle_state = 'deleted', deleted_at = ?, updated_at = ?,
+               cleanup_error_code = NULL, cleanup_error_message = NULL
+           WHERE source_group_id = ? AND lifecycle_state = 'deleting'`,
+        )
+        .run(now, now, groupId);
+      const members = this.database
+        .prepare(
+          `SELECT member.job_id, member.attempt, member.outcome
+           FROM logged_export_source_group_members member
+           WHERE member.group_id = ? AND member.lifecycle_state = 'released'`,
+        )
+        .all(groupId) as Array<{
+        job_id: string;
+        attempt: number;
+        outcome: "succeeded" | "failed" | "canceled";
+      }>;
+      for (const member of members) {
+        const completePackage = this.hasCompleteFinalArtifactProvenance(
+          member.job_id,
+          member.attempt,
+        );
+        if (member.outcome === "succeeded" && !completePackage) {
+          throw new LocalExportLifecycleError(
+            "A successful shared-source member has incomplete package evidence.",
+            "final_artifact_provenance_invalid",
+          );
+        }
+        this.database
+          .prepare(
+            `UPDATE jobs SET state = ?, updated_at = ?
+             WHERE id = ? AND attempt = ? AND state = 'processing'`,
+          )
+          .run(
+            member.outcome === "succeeded" ? "complete" : "queued",
+            now,
+            member.job_id,
+            member.attempt,
+          );
+      }
+      this.database
+        .prepare(
+          `UPDATE logged_export_source_group_members
+           SET lifecycle_state = 'settled', settled_at = ?
+           WHERE group_id = ? AND lifecycle_state = 'released'`,
+        )
+        .run(now, groupId);
+      this.database.exec("COMMIT;");
+    } catch (error) {
+      this.database.exec("ROLLBACK;");
+      throw error;
+    }
+  }
+
+  recordLoggedExportSourceGroupCleanupFailed(
+    groupId: string,
+    message: string,
+  ): void {
+    const now = this.now().toISOString();
+    this.database.exec("BEGIN IMMEDIATE;");
+    try {
+      const group = this.database
+        .prepare(
+          `UPDATE logged_export_source_groups
+           SET lifecycle_state = 'cleanup_failed',
+               cleanup_error_code = 'source_cleanup_failed',
+               cleanup_error_message = ?, updated_at = ?
+           WHERE id = ? AND lifecycle_state IN ('acquiring', 'ready', 'deleting',
+             'acquisition_failed')`,
+        )
+        .run(safeLocalError(message), now, groupId);
+      if (group.changes !== 1) throw new LocalExportLifecycleError();
+      this.database
+        .prepare(
+          `UPDATE source_scratch_assets
+           SET lifecycle_state = 'cleanup_failed',
+               cleanup_error_code = 'source_cleanup_failed',
+               cleanup_error_message = ?, updated_at = ?
+           WHERE source_group_id = ? AND lifecycle_state != 'deleted'`,
+        )
+        .run(safeLocalError(message), now, groupId);
+      this.database
+        .prepare(
+          `UPDATE jobs SET state = 'needs_user_action', updated_at = ?,
+             payload_json = json_set(payload_json, '$.lastError',
+               json_object('code', 'source_cleanup_failed', 'message', ?))
+           WHERE id IN (
+             SELECT job_id FROM logged_export_source_group_members
+             WHERE group_id = ?
+           ) AND state IN ('queued', 'processing')`,
+        )
+        .run(now, safeLocalError(message), groupId);
+      this.database.exec("COMMIT;");
+    } catch (error) {
+      this.database.exec("ROLLBACK;");
+      throw error;
+    }
+  }
+
   assertExportDeliveryAccepted(requestId: string): void {
     const request = this.get(requestId);
     if (!request) throw new LocalExportRequestNotFoundError();
@@ -2035,6 +2488,260 @@ export class LocalExportQueue {
     }
   }
 
+  claimLoggedExportSourceGroupCleanup(
+    limit: number,
+    options: { recoverOrphanedJoined?: boolean } = {},
+  ): LocalLoggedExportSourceGroupCleanupClaim[] {
+    if (
+      !Number.isSafeInteger(limit) ||
+      limit <= 0 ||
+      limit > MaxSourceScratchCleanupClaims
+    ) {
+      throw new LocalExportLifecycleError(
+        "Source scratch cleanup limit is invalid.",
+        "source_scratch_cleanup_limit_invalid",
+      );
+    }
+    const claimedAt = this.now();
+    const now = claimedAt.toISOString();
+    const claimExpiresAt = new Date(
+      claimedAt.getTime() + SourceScratchCleanupClaimLeaseMs,
+    ).toISOString();
+    this.database.exec("BEGIN IMMEDIATE;");
+    try {
+      const candidates = this.database
+        .prepare(
+          `SELECT groups.id FROM logged_export_source_groups groups
+           WHERE (lifecycle_state = 'cleanup_failed'
+              OR (lifecycle_state IN ('acquiring', 'ready', 'deleting',
+                    'acquisition_failed') AND (
+                 expires_at <= ? OR ? = 1
+               )))
+           AND (cleanup_claim_expires_at IS NULL OR cleanup_claim_expires_at <= ?)
+           AND (? = 1 OR NOT EXISTS (
+             SELECT 1
+             FROM logged_export_source_group_members member
+             JOIN export_requests request
+               ON request.id = member.export_request_id
+             WHERE member.group_id = groups.id
+               AND member.lifecycle_state = 'joined'
+               AND request.cloud_execution_id = member.execution_id
+               AND request.cloud_execution_attempt = member.attempt
+               AND request.cloud_execution_expires_at > ?
+           ))
+           ORDER BY CASE WHEN lifecycle_state = 'cleanup_failed' THEN 0 ELSE 1 END,
+             expires_at, updated_at, id LIMIT ?`,
+        )
+        .all(
+          now,
+          options.recoverOrphanedJoined ? 1 : 0,
+          now,
+          options.recoverOrphanedJoined ? 1 : 0,
+          now,
+          limit,
+        ) as Array<{ id: string }>;
+      const claims: LocalLoggedExportSourceGroupCleanupClaim[] = [];
+      for (const candidate of candidates) {
+        const token = randomUUID();
+        const updated = this.database
+          .prepare(
+            `UPDATE logged_export_source_groups
+             SET lifecycle_state = 'deleting', cleanup_started_at = ?,
+                 cleanup_claim_token = ?, cleanup_claim_expires_at = ?,
+                 updated_at = ?
+             WHERE id = ? AND (
+               lifecycle_state = 'cleanup_failed'
+               OR (lifecycle_state IN ('acquiring', 'ready', 'deleting',
+                     'acquisition_failed') AND (
+                   expires_at <= ? OR ? = 1
+                 ))
+             ) AND (cleanup_claim_expires_at IS NULL
+                    OR cleanup_claim_expires_at <= ?)
+               AND (? = 1 OR NOT EXISTS (
+                 SELECT 1
+                 FROM logged_export_source_group_members member
+                 JOIN export_requests request
+                   ON request.id = member.export_request_id
+                 WHERE member.group_id = logged_export_source_groups.id
+                   AND member.lifecycle_state = 'joined'
+                   AND request.cloud_execution_id = member.execution_id
+                   AND request.cloud_execution_attempt = member.attempt
+                   AND request.cloud_execution_expires_at > ?
+               ))`,
+          )
+          .run(
+            now,
+            token,
+            claimExpiresAt,
+            now,
+            candidate.id,
+            now,
+            options.recoverOrphanedJoined ? 1 : 0,
+            now,
+            options.recoverOrphanedJoined ? 1 : 0,
+            now,
+          );
+        if (updated.changes !== 1) continue;
+        this.database
+          .prepare(
+            `UPDATE logged_export_source_group_members
+             SET lifecycle_state = 'released', outcome = 'failed', released_at = ?
+             WHERE group_id = ? AND lifecycle_state = 'joined'`,
+          )
+          .run(now, candidate.id);
+        this.database
+          .prepare(
+            `UPDATE source_scratch_assets
+             SET lifecycle_state = 'deleting', cleanup_started_at = ?, updated_at = ?
+             WHERE source_group_id = ? AND lifecycle_state != 'deleted'`,
+          )
+          .run(now, now, candidate.id);
+        claims.push({ groupId: candidate.id, claimToken: token });
+      }
+      this.database.exec("COMMIT;");
+      return claims;
+    } catch (error) {
+      this.database.exec("ROLLBACK;");
+      throw error;
+    }
+  }
+
+  completeLoggedExportSourceGroupCleanupClaim(
+    claim: LocalLoggedExportSourceGroupCleanupClaim,
+  ): LocalSourceScratchCleanupSettlement {
+    const now = this.now().toISOString();
+    this.database.exec("BEGIN IMMEDIATE;");
+    try {
+      const deleted = this.database
+        .prepare(
+          `UPDATE logged_export_source_groups
+           SET lifecycle_state = 'deleted', deleted_at = ?, updated_at = ?,
+               cleanup_error_code = NULL, cleanup_error_message = NULL,
+               cleanup_claim_token = NULL, cleanup_claim_expires_at = NULL
+           WHERE id = ? AND lifecycle_state = 'deleting'
+             AND cleanup_claim_token = ?`,
+        )
+        .run(now, now, claim.groupId, claim.claimToken);
+      if (deleted.changes !== 1) {
+        throw new LocalExportLifecycleError(
+          "Shared source cleanup claim is no longer current.",
+          "source_scratch_cleanup_claim_lost",
+        );
+      }
+      this.database
+        .prepare(
+          `UPDATE source_scratch_assets
+           SET lifecycle_state = 'deleted', deleted_at = ?, updated_at = ?,
+               cleanup_error_code = NULL, cleanup_error_message = NULL
+           WHERE source_group_id = ? AND lifecycle_state = 'deleting'`,
+        )
+        .run(now, now, claim.groupId);
+      this.database
+        .prepare(
+          `UPDATE logged_export_source_group_members
+           SET lifecycle_state = 'settled', settled_at = ?
+           WHERE group_id = ? AND lifecycle_state = 'released'`,
+        )
+        .run(now, claim.groupId);
+      const jobs = this.database
+        .prepare(
+          `SELECT jobs.id, jobs.attempt, jobs.payload_json, member.outcome
+           FROM jobs JOIN logged_export_source_group_members member
+             ON member.job_id = jobs.id
+           WHERE member.group_id = ?`,
+        )
+        .all(claim.groupId) as Array<{
+        id: string;
+        attempt: number;
+        payload_json: string;
+        outcome: "succeeded" | "failed" | "canceled";
+      }>;
+      let restoredComplete = false;
+      let markedNeedsUserAction = false;
+      for (const job of jobs) {
+        if (
+          job.outcome === "succeeded" &&
+          this.hasCompleteFinalArtifactProvenance(job.id, job.attempt)
+        ) {
+          this.database
+            .prepare(
+              `UPDATE jobs SET state = 'complete', updated_at = ?
+               WHERE id = ? AND attempt = ?`,
+            )
+            .run(now, job.id, job.attempt);
+          restoredComplete = true;
+        } else {
+          this.markJobNeedsUserAction(
+            job.id,
+            "source_scratch_abandoned",
+            "Expired shared source scratch was removed after interrupted local processing.",
+            now,
+          );
+          markedNeedsUserAction = true;
+        }
+      }
+      this.database.exec("COMMIT;");
+      return { restoredComplete, markedNeedsUserAction };
+    } catch (error) {
+      this.database.exec("ROLLBACK;");
+      throw error;
+    }
+  }
+
+  failLoggedExportSourceGroupCleanupClaim(
+    claim: LocalLoggedExportSourceGroupCleanupClaim,
+    message: string,
+  ): void {
+    const now = this.now().toISOString();
+    this.database.exec("BEGIN IMMEDIATE;");
+    try {
+      const failed = this.database
+        .prepare(
+          `UPDATE logged_export_source_groups
+           SET lifecycle_state = 'cleanup_failed',
+               cleanup_error_code = 'source_cleanup_failed',
+               cleanup_error_message = ?, cleanup_claim_token = NULL,
+               cleanup_claim_expires_at = NULL, updated_at = ?
+           WHERE id = ? AND lifecycle_state = 'deleting'
+             AND cleanup_claim_token = ?`,
+        )
+        .run(safeLocalError(message), now, claim.groupId, claim.claimToken);
+      if (failed.changes !== 1) {
+        throw new LocalExportLifecycleError(
+          "Shared source cleanup claim is no longer current.",
+          "source_scratch_cleanup_claim_lost",
+        );
+      }
+      this.database
+        .prepare(
+          `UPDATE source_scratch_assets
+           SET lifecycle_state = 'cleanup_failed',
+               cleanup_error_code = 'source_cleanup_failed',
+               cleanup_error_message = ?, updated_at = ?
+           WHERE source_group_id = ? AND lifecycle_state != 'deleted'`,
+        )
+        .run(safeLocalError(message), now, claim.groupId);
+      const jobs = this.database
+        .prepare(
+          `SELECT job_id FROM logged_export_source_group_members
+           WHERE group_id = ?`,
+        )
+        .all(claim.groupId) as Array<{ job_id: string }>;
+      for (const job of jobs) {
+        this.markJobNeedsUserAction(
+          job.job_id,
+          "source_cleanup_failed",
+          message,
+          now,
+        );
+      }
+      this.database.exec("COMMIT;");
+    } catch (error) {
+      this.database.exec("ROLLBACK;");
+      throw error;
+    }
+  }
+
   countLegacySourceScratchRecoveryRows(): number {
     const row = this.database
       .prepare(
@@ -2439,7 +3146,10 @@ export class LocalExportQueue {
       String(row.cloud_worker_id) !== delivery.workerId ||
       Number(row.cloud_worker_epoch) !== delivery.workerEpoch ||
       String(row.cloud_reserved_at) !== delivery.reservedAt ||
-      String(row.cloud_reservation_expires_at) !== delivery.reservationExpiresAt
+      String(row.cloud_reservation_expires_at) !==
+        delivery.reservationExpiresAt ||
+      canonicalJson(sourceGroupFromLocalRow(row).sourceGroup ?? null) !==
+        canonicalJson(delivery.sourceGroup ?? null)
     ) {
       throw new LocalLoggedExportDeliveryConflictError(
         "The logged export delivery conflicts with an existing immutable local request.",
@@ -2542,9 +3252,37 @@ export type LocalExportSourceAttempt = {
   attempt: number;
 };
 
+export type LocalLoggedExportSourceGroup = {
+  id: string;
+  compatibilityKey: string;
+  lifecycleState:
+    | "open"
+    | "acquiring"
+    | "ready"
+    | "deleting"
+    | "deleted"
+    | "acquisition_failed"
+    | "cleanup_failed";
+  projectId: string;
+  batchId: string;
+  youtubeVideoId: string;
+  acquisitionProfileFingerprint: string;
+  workerId: string;
+  workerEpoch: number;
+  createdAt: string;
+  expiresAt: string;
+  readyAt?: string;
+  deletedAt?: string;
+};
+
 export type LocalSourceScratchCleanupClaim = {
   jobId: string;
   attempt: number;
+  claimToken: string;
+};
+
+export type LocalLoggedExportSourceGroupCleanupClaim = {
+  groupId: string;
   claimToken: string;
 };
 
@@ -2721,6 +3459,50 @@ function mapLocalExportWorkerIdentity(
   };
 }
 
+function mapLocalLoggedExportSourceGroup(
+  row: Record<string, unknown>,
+): LocalLoggedExportSourceGroup {
+  return {
+    id: String(row.id),
+    compatibilityKey: String(row.compatibility_key),
+    lifecycleState: String(
+      row.lifecycle_state,
+    ) as LocalLoggedExportSourceGroup["lifecycleState"],
+    projectId: String(row.project_id),
+    batchId: String(row.batch_id),
+    youtubeVideoId: String(row.youtube_video_id),
+    acquisitionProfileFingerprint: String(row.acquisition_profile_fingerprint),
+    workerId: String(row.worker_id),
+    workerEpoch: Number(row.worker_epoch),
+    createdAt: String(row.created_at),
+    expiresAt: String(row.expires_at),
+    ...(row.ready_at ? { readyAt: String(row.ready_at) } : {}),
+    ...(row.deleted_at ? { deletedAt: String(row.deleted_at) } : {}),
+  };
+}
+
+function sourceGroupFromLocalRow(row: Record<string, unknown>): {
+  sourceGroup?: { batchId: string; batchItemId: string };
+} {
+  if (!row.job_payload_json) return {};
+  try {
+    const payload = JSON.parse(String(row.job_payload_json)) as {
+      sourceGroup?: { batchId?: unknown; batchItemId?: unknown };
+    };
+    return typeof payload.sourceGroup?.batchId === "string" &&
+      typeof payload.sourceGroup.batchItemId === "string"
+      ? {
+          sourceGroup: {
+            batchId: payload.sourceGroup.batchId,
+            batchItemId: payload.sourceGroup.batchItemId,
+          },
+        }
+      : {};
+  } catch {
+    return {};
+  }
+}
+
 function mapLocalExportRequest(
   row: Record<string, unknown>,
   subtitleSidecars: readonly Record<string, unknown>[] = [],
@@ -2734,6 +3516,12 @@ function mapLocalExportRequest(
       ? {
           projectId: row.cloud_project_id,
           clipId: row.cloud_clip_id,
+          ...(sourceGroupFromLocalRow(row).sourceGroup
+            ? {
+                batchItemId:
+                  sourceGroupFromLocalRow(row).sourceGroup!.batchItemId,
+              }
+            : {}),
         }
       : {}),
     video: JSON.parse(String(row.video_snapshot_json)),

@@ -33,6 +33,7 @@ import {
 import {
   FfmpegCapabilityDiscoveryProvider,
   FfmpegCapabilityRangeRenderer,
+  FfmpegJpegThumbnailExtractor,
   FfprobeJpegThumbnailInspector,
   FfprobeMediaInspector,
   RenderDurationToleranceMs,
@@ -50,8 +51,10 @@ import {
 
 import {
   discardCompletedLoggedExportForCancellation,
+  runLocalExportOnce,
   runConfiguredLocalExportOnce,
 } from "./export-run-once.ts";
+import { LocalLoggedExportSourceGroupCoordinator } from "./shared-source-group.ts";
 
 const fixtureMediaPath = fileURLToPath(
   new URL("../../../tests/fixtures/media/synthetic-4s.mp4", import.meta.url),
@@ -447,6 +450,117 @@ describe("one-shot local export runtime", () => {
     expect(acquisitionCalls).toBe(1);
   });
 
+  it("shares one real fixture source across two active batch executions while preserving independent packages", async () => {
+    const root = await createFixtureWorkspace();
+    const batchId = randomUUID();
+    const videoId = "fixture-runtime-shared-batch";
+    const first = createFixtureRequest(
+      root,
+      "shared-first",
+      editingSettings,
+      true,
+      { batchId, batchItemId: randomUUID(), videoId },
+    );
+    const second = createFixtureRequest(
+      root,
+      "shared-second",
+      editingSettings,
+      true,
+      { batchId, batchItemId: randomUUID(), videoId },
+    );
+    const database = openLocalDatabase(join(root, "local.sqlite"));
+    try {
+      const queue = new LocalExportQueue(database);
+      for (const requestId of [first.requestId, second.requestId]) {
+        const delivery = queue.getAcceptedLoggedDelivery(requestId)!;
+        queue.activateLoggedExecution({
+          executionId: randomUUID(),
+          requestId,
+          attempt: 1,
+          workerId: delivery.workerId,
+          workerEpoch: delivery.workerEpoch,
+          leaseToken: randomUUID(),
+          startedAt: "2026-08-20T12:00:06.000Z",
+          heartbeatAt: "2026-08-20T12:00:07.000Z",
+          expiresAt: "2026-08-23T12:00:37.000Z",
+        });
+      }
+      let acquisitionCalls = 0;
+      const sourceProvider = fixtureSourceProvider(() => {
+        acquisitionCalls += 1;
+      });
+      const inspector = new FfprobeMediaInspector({
+        executable: ffprobePath,
+      });
+      const renderer = new FfmpegCapabilityRangeRenderer({
+        executable: ffmpegPath,
+      });
+      const thumbnailExtractor = new FfmpegJpegThumbnailExtractor({
+        executable: ffmpegPath,
+      });
+      const thumbnailInspector = new FfprobeJpegThumbnailInspector({
+        executable: ffprobePath,
+      });
+      const coordinator = new LocalLoggedExportSourceGroupCoordinator(
+        queue,
+        sourceProvider,
+        inspector,
+        root,
+      );
+      const dependencies = {
+        queue,
+        sourceProvider,
+        inspector,
+        renderer,
+        thumbnailExtractor,
+        thumbnailInspector,
+        capabilityProvider: new FfmpegCapabilityDiscoveryProvider({
+          executable: ffmpegPath,
+        }),
+        sharedSourceCoordinator: coordinator,
+        dataRoot: root,
+      };
+      const results = await Promise.all([
+        runLocalExportOnce(
+          { requestId: first.requestId, authorizationConfirmed: true },
+          dependencies,
+        ),
+        runLocalExportOnce(
+          { requestId: second.requestId, authorizationConfirmed: true },
+          dependencies,
+        ),
+      ]);
+      expect(results).toEqual([
+        expect.objectContaining({ status: "complete", state: "complete" }),
+        expect.objectContaining({ status: "complete", state: "complete" }),
+      ]);
+      expect(acquisitionCalls).toBe(1);
+      expect(
+        queue.buildLoggedExportSuccessResult(first.requestId),
+      ).toMatchObject({ requestId: first.requestId });
+      expect(
+        queue.buildLoggedExportSuccessResult(second.requestId),
+      ).toMatchObject({ requestId: second.requestId });
+      expect(
+        database
+          .prepare(
+            `SELECT lifecycle_state, count(*) AS count
+             FROM source_scratch_assets WHERE source_group_id IS NOT NULL
+             GROUP BY lifecycle_state`,
+          )
+          .get(),
+      ).toEqual({ lifecycle_state: "deleted", count: 2 });
+      expect(new Set((await readdir(join(root, "exports"))).sort())).toEqual(
+        new Set([`clip-${first.requestId}`, `clip-${second.requestId}`]),
+      );
+      expect(await readdir(join(root, "jobs", "export-source-groups"))).toEqual(
+        [],
+      );
+    } finally {
+      database.close();
+    }
+  });
+
   it("projects processor-persisted accepted logged failures only after safe cleanup", async () => {
     const root = await createFixtureWorkspace();
     const notStarted = createFixtureRequest(
@@ -750,6 +864,7 @@ function createFixtureRequest(
   suffix = "success",
   settings: ExportSettings = editingSettings,
   logged = false,
+  sourceGroup?: { batchId: string; batchItemId: string; videoId: string },
 ) {
   const database = openLocalDatabase(join(root, "local.sqlite"));
   try {
@@ -758,7 +873,7 @@ function createFixtureRequest(
     const englishTrackId = randomUUID();
     const originalSegmentId = randomUUID();
     const englishSegmentId = randomUUID();
-    const videoId = `fixture-runtime-${suffix}`;
+    const videoId = sourceGroup?.videoId ?? `fixture-runtime-${suffix}`;
     const index = new LocalTranscriptIndex(database);
     index.replace({
       projectId: "019fbb95-cd76-7920-93fa-e23ba755e101",
@@ -862,17 +977,28 @@ function createFixtureRequest(
         deliveryId: randomUUID(),
         generation: 1,
         reservationToken: randomUUID(),
-        workerId: randomUUID(),
+        workerId: sourceGroup
+          ? "019fbb95-cd76-7920-93fa-e23ba755e199"
+          : randomUUID(),
         workerEpoch: 1,
         status: "reserved",
         reservedAt: at,
         reservationExpiresAt: "2026-08-20T12:00:30.000Z",
+        ...(sourceGroup
+          ? {
+              sourceGroup: {
+                batchId: sourceGroup.batchId,
+                batchItemId: sourceGroup.batchItemId,
+              },
+            }
+          : {}),
         request: {
           id: randomUUID(),
           jobId: randomUUID(),
           mode: "logged",
           projectId: "019fbb95-cd76-7920-93fa-e23ba755e101",
           clipId: randomUUID(),
+          ...(sourceGroup ? { batchItemId: sourceGroup.batchItemId } : {}),
           video: input.video,
           selection: input.selection,
           sourceLanguageClass: input.sourceLanguageClass,

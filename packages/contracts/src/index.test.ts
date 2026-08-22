@@ -114,6 +114,34 @@ describe("shared contracts", () => {
         },
       }).success,
     ).toBe(false);
+    const batchItemId = "019fbb95-cd76-7920-93fa-e23ba755ee49";
+    const grouped = {
+      ...delivery,
+      sourceGroup: {
+        batchId: "019fbb95-cd76-7920-93fa-e23ba755ee48",
+        batchItemId,
+      },
+      request: { ...delivery.request, batchItemId },
+    };
+    expect(LoggedExportDeliverySchema.parse(grouped)).toEqual(grouped);
+    expect(
+      LoggedExportDeliverySchema.safeParse({
+        ...grouped,
+        sourceGroup: undefined,
+      }).success,
+    ).toBe(false);
+    expect(
+      LoggedExportDeliverySchema.safeParse({
+        ...delivery,
+        sourceGroup: grouped.sourceGroup,
+      }).success,
+    ).toBe(false);
+    expect(
+      LoggedExportDeliverySchema.safeParse({
+        ...grouped,
+        sourceGroup: { ...grouped.sourceGroup, sourcePath: "/private/source" },
+      }).success,
+    ).toBe(false);
   });
 
   it("binds logged-export retry provenance as a strict all-or-none lineage", () => {

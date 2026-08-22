@@ -22,6 +22,8 @@ import {
   resolveExportBounds,
   withExportSourceScratch,
   type ExportSourceAcquisitionProvider,
+  type AcquiredExportSource,
+  type ExportSourceInspection,
   type ExportSourceInspector,
   type FfmpegJpegThumbnailExtractionAdapter,
   type FfmpegRangeRenderer,
@@ -56,6 +58,8 @@ import {
   validateClipRelativeSrtCues,
 } from "@research-video/transcript";
 
+import type { LocalLoggedExportSourceGroupCoordinator } from "./shared-source-group.ts";
+
 /**
  * The local export job boundary carries M5-01 acquisition through M5-02 media
  * inspection, rendering, and output validation in one attempt-owned scratch
@@ -74,6 +78,7 @@ export class LocalExportSourceProcessor {
     private readonly capabilityProvider: ExportWorkerCapabilityProvider = {
       discover: async () => FULLY_AVAILABLE_EXPORT_WORKER_CAPABILITIES,
     },
+    private readonly sharedSourceCoordinator?: LocalLoggedExportSourceGroupCoordinator,
   ) {}
 
   async process(input: {
@@ -221,7 +226,211 @@ export class LocalExportSourceProcessor {
     });
     this.recordProgress(started.request, "acquiring_source", 1_000);
 
+    const processSource = async (
+      source: AcquiredExportSource,
+      scratchDirectory: string,
+      sharedInspection?: ExportSourceInspection,
+      sourceDirectory = scratchDirectory,
+    ) => {
+      this.recordProgress(started.request, "inspecting_source", 2_500);
+      const inspection =
+        sharedInspection ??
+        (await inspectVerifiedExportSource({
+          sourcePath: source.scratchPath,
+          scratchDirectory,
+          inspector: this.inspector,
+          ...(input.signal ? { signal: input.signal } : {}),
+        }));
+      assertEditingFriendlySourceCompatibility(inspection);
+      const resolvedBounds = resolveExportBounds({
+        requestedStartMs: started.request.selection.exportStartMs,
+        requestedEndMs: started.request.selection.exportEndMs,
+        durationMs: inspection.durationMs,
+      });
+      this.queue.recordSourceInspection(
+        started.request.jobId,
+        started.attempt,
+        inspection,
+        resolvedBounds,
+      );
+      const persistedRequest = this.queue.get(started.request.id);
+      const persistedBounds = persistedRequest?.resolvedExportBounds;
+      if (
+        !persistedBounds ||
+        persistedBounds.sourceAttempt !== started.attempt
+      ) {
+        throw new ExportSourceAcquisitionError(
+          "Resolved export bounds were not persisted for this source attempt. Retry this export.",
+          { code: "resolved_export_bounds_missing" },
+        );
+      }
+      const embeddedEnglishPath = resolvedSettingsSnapshot.settings
+        .embedEnglishSubtitleTrack
+        ? await stagePrivateEmbeddedEnglishSrt({
+            stagingDirectory: scratchDirectory,
+            transcript: subtitlePlan.english!,
+            resolvedStartMs: persistedBounds.startMs,
+            resolvedEndMs: persistedBounds.endMs,
+            ...(input.signal ? { signal: input.signal } : {}),
+          })
+        : undefined;
+      const outputPath = join(
+        scratchDirectory,
+        `rendered-range.${resolvedSettingsSnapshot.settings.container}`,
+      );
+      this.recordProgress(started.request, "rendering", 3_500);
+      await this.renderer.render({
+        sourcePath: source.scratchPath,
+        ...(sourceDirectory !== scratchDirectory ? { sourceDirectory } : {}),
+        stagingDirectory: scratchDirectory,
+        outputPath,
+        startMs: persistedBounds.startMs,
+        endMs: persistedBounds.endMs,
+        settings: resolvedSettingsSnapshot.settings,
+        ...(embeddedEnglishPath
+          ? { englishSubtitlePath: embeddedEnglishPath }
+          : {}),
+        ...(input.signal ? { signal: input.signal } : {}),
+      });
+      if (embeddedEnglishPath) await rm(embeddedEnglishPath, { force: true });
+      this.recordProgress(started.request, "validating_media", 5_500);
+      const outputInspection = await inspectAndValidateRenderedExportOutput({
+        outputPath,
+        stagingDirectory: scratchDirectory,
+        inspector: this.inspector,
+        startMs: persistedBounds.startMs,
+        endMs: persistedBounds.endMs,
+        settings: resolvedSettingsSnapshot.settings,
+        sourceInspection: inspection,
+        ...(input.signal ? { signal: input.signal } : {}),
+      });
+      const ffmpegVersion = await readEncoderVersion(
+        this.renderer,
+        input.signal,
+      );
+      this.queue.recordRenderedOutputValidation(
+        started.request.jobId,
+        started.attempt,
+        {
+          ...outputInspection,
+          ...(ffmpegVersion ? { ffmpegVersion } : {}),
+          verificationSchemaVersion: 1,
+          settingsSha256: sha256Fingerprint(resolvedSettingsSnapshot.settings),
+        },
+      );
+      const thumbnailPath = join(scratchDirectory, "thumbnail.jpg");
+      const extractionTimeMs = Math.floor(outputInspection.durationMs / 2);
+      this.recordProgress(started.request, "building_thumbnail", 6_500);
+      await this.thumbnailExtractor.extract({
+        renderedVideoPath: outputPath,
+        stagingDirectory: scratchDirectory,
+        outputPath: thumbnailPath,
+        extractionTimeMs,
+        ...(input.signal ? { signal: input.signal } : {}),
+      });
+      const thumbnail = await inspectAndValidateJpegThumbnail({
+        outputPath: thumbnailPath,
+        stagingDirectory: scratchDirectory,
+        inspector: this.thumbnailInspector,
+        ...(input.signal ? { signal: input.signal } : {}),
+      });
+      this.queue.recordThumbnailValidation(
+        started.request.jobId,
+        started.attempt,
+        {
+          extractionTimeMs,
+          width: thumbnail.width,
+          height: thumbnail.height,
+        },
+      );
+      this.recordProgress(started.request, "building_subtitles", 7_500);
+      if (subtitlePlan.policy === "confirmed_english_omission") {
+        await assertNoStagedSrtFiles(scratchDirectory);
+        this.queue.recordConfirmedEnglishSubtitleOmission(
+          started.request.jobId,
+          started.attempt,
+        );
+      } else {
+        const sidecars = await stageAndValidateRequiredSidecars({
+          stagingDirectory: scratchDirectory,
+          renderedOutputPath: outputPath,
+          renderedDurationMs: outputInspection.durationMs,
+          sidecars: subtitlePlan.sidecars,
+          resolvedStartMs: persistedBounds.startMs,
+          resolvedEndMs: persistedBounds.endMs,
+          ...(input.signal ? { signal: input.signal } : {}),
+        });
+        if (subtitlePlan.policy === "confirmed_english") {
+          const sidecar = sidecars[0]!;
+          this.queue.recordEnglishSubtitleValidation(
+            started.request.jobId,
+            started.attempt,
+            sidecar,
+          );
+        } else {
+          this.queue.recordBilingualSubtitleValidation(
+            started.request.jobId,
+            started.attempt,
+            sidecars as [SidecarValidation, SidecarValidation],
+          );
+        }
+      }
+      this.recordProgress(started.request, "packaging", 8_000);
+      const promoted = await promoteVerifiedFinalPackage({
+        request: this.queue.get(started.request.id) ?? started.request,
+        stagingDirectory: scratchDirectory,
+        sourcePath: source.scratchPath,
+        dataRoot: this.dataRoot,
+        attempt: started.attempt,
+        ...(input.signal ? { signal: input.signal } : {}),
+      });
+      try {
+        this.queue.recordFinalArtifactPromotion(
+          started.request.jobId,
+          started.attempt,
+          promoted,
+        );
+      } catch (error) {
+        await removePromotedPackage(
+          this.dataRoot,
+          promoted[0]!.packageIdentity,
+        );
+        throw error;
+      }
+    };
+
     try {
+      if (this.sharedSourceCoordinator) {
+        const grouped = await this.sharedSourceCoordinator.run({
+          request: started.request,
+          attempt: started.attempt,
+          ...(input.signal ? { signal: input.signal } : {}),
+          handoff: async ({
+            source,
+            inspection,
+            sourceDirectory,
+            stagingDirectory,
+          }) =>
+            processSource(
+              source,
+              stagingDirectory,
+              inspection,
+              sourceDirectory,
+            ),
+          sourceReady: () => {
+            this.recordProgress(started.request, "acquiring_source", 2_000);
+          },
+          cleanupStarted: () => {
+            this.recordProgress(started.request, "cleaning_source", 9_000);
+          },
+          cleanupSucceeded: () => {},
+          cleanupFailed: () => {},
+        });
+        if (grouped) {
+          this.recordProgress(started.request, "local_complete", 10_000);
+          return;
+        }
+      }
       await withExportSourceScratch({
         scratchRoot: join(this.dataRoot, "jobs", "export-source-scratch"),
         jobId: started.request.jobId,
@@ -230,175 +439,8 @@ export class LocalExportSourceProcessor {
         videoId: started.request.video.youtubeVideoId,
         authorizationConfirmed: input.authorizationConfirmed,
         ...(input.signal ? { signal: input.signal } : {}),
-        handoff: async (source, scratchDirectory) => {
-          this.recordProgress(started.request, "inspecting_source", 2_500);
-          const inspection = await inspectVerifiedExportSource({
-            sourcePath: source.scratchPath,
-            scratchDirectory,
-            inspector: this.inspector,
-            ...(input.signal ? { signal: input.signal } : {}),
-          });
-          assertEditingFriendlySourceCompatibility(inspection);
-          const resolvedBounds = resolveExportBounds({
-            requestedStartMs: started.request.selection.exportStartMs,
-            requestedEndMs: started.request.selection.exportEndMs,
-            durationMs: inspection.durationMs,
-          });
-          this.queue.recordSourceInspection(
-            started.request.jobId,
-            started.attempt,
-            inspection,
-            resolvedBounds,
-          );
-          const persistedRequest = this.queue.get(started.request.id);
-          const persistedBounds = persistedRequest?.resolvedExportBounds;
-          if (
-            !persistedBounds ||
-            persistedBounds.sourceAttempt !== started.attempt
-          ) {
-            throw new ExportSourceAcquisitionError(
-              "Resolved export bounds were not persisted for this source attempt. Retry this export.",
-              { code: "resolved_export_bounds_missing" },
-            );
-          }
-          const embeddedEnglishPath = resolvedSettingsSnapshot.settings
-            .embedEnglishSubtitleTrack
-            ? await stagePrivateEmbeddedEnglishSrt({
-                stagingDirectory: scratchDirectory,
-                transcript: subtitlePlan.english!,
-                resolvedStartMs: persistedBounds.startMs,
-                resolvedEndMs: persistedBounds.endMs,
-                ...(input.signal ? { signal: input.signal } : {}),
-              })
-            : undefined;
-          const outputPath = join(
-            scratchDirectory,
-            `rendered-range.${resolvedSettingsSnapshot.settings.container}`,
-          );
-          this.recordProgress(started.request, "rendering", 3_500);
-          await this.renderer.render({
-            sourcePath: source.scratchPath,
-            stagingDirectory: scratchDirectory,
-            outputPath,
-            startMs: persistedBounds.startMs,
-            endMs: persistedBounds.endMs,
-            settings: resolvedSettingsSnapshot.settings,
-            ...(embeddedEnglishPath
-              ? { englishSubtitlePath: embeddedEnglishPath }
-              : {}),
-            ...(input.signal ? { signal: input.signal } : {}),
-          });
-          if (embeddedEnglishPath)
-            await rm(embeddedEnglishPath, { force: true });
-          this.recordProgress(started.request, "validating_media", 5_500);
-          const outputInspection = await inspectAndValidateRenderedExportOutput(
-            {
-              outputPath,
-              stagingDirectory: scratchDirectory,
-              inspector: this.inspector,
-              startMs: persistedBounds.startMs,
-              endMs: persistedBounds.endMs,
-              settings: resolvedSettingsSnapshot.settings,
-              sourceInspection: inspection,
-              ...(input.signal ? { signal: input.signal } : {}),
-            },
-          );
-          const ffmpegVersion = await readEncoderVersion(
-            this.renderer,
-            input.signal,
-          );
-          this.queue.recordRenderedOutputValidation(
-            started.request.jobId,
-            started.attempt,
-            {
-              ...outputInspection,
-              ...(ffmpegVersion ? { ffmpegVersion } : {}),
-              verificationSchemaVersion: 1,
-              settingsSha256: sha256Fingerprint(
-                resolvedSettingsSnapshot.settings,
-              ),
-            },
-          );
-          const thumbnailPath = join(scratchDirectory, "thumbnail.jpg");
-          const extractionTimeMs = Math.floor(outputInspection.durationMs / 2);
-          this.recordProgress(started.request, "building_thumbnail", 6_500);
-          await this.thumbnailExtractor.extract({
-            renderedVideoPath: outputPath,
-            stagingDirectory: scratchDirectory,
-            outputPath: thumbnailPath,
-            extractionTimeMs,
-            ...(input.signal ? { signal: input.signal } : {}),
-          });
-          const thumbnail = await inspectAndValidateJpegThumbnail({
-            outputPath: thumbnailPath,
-            stagingDirectory: scratchDirectory,
-            inspector: this.thumbnailInspector,
-            ...(input.signal ? { signal: input.signal } : {}),
-          });
-          this.queue.recordThumbnailValidation(
-            started.request.jobId,
-            started.attempt,
-            {
-              extractionTimeMs,
-              width: thumbnail.width,
-              height: thumbnail.height,
-            },
-          );
-          this.recordProgress(started.request, "building_subtitles", 7_500);
-          if (subtitlePlan.policy === "confirmed_english_omission") {
-            await assertNoStagedSrtFiles(scratchDirectory);
-            this.queue.recordConfirmedEnglishSubtitleOmission(
-              started.request.jobId,
-              started.attempt,
-            );
-          } else {
-            const sidecars = await stageAndValidateRequiredSidecars({
-              stagingDirectory: scratchDirectory,
-              renderedOutputPath: outputPath,
-              renderedDurationMs: outputInspection.durationMs,
-              sidecars: subtitlePlan.sidecars,
-              resolvedStartMs: persistedBounds.startMs,
-              resolvedEndMs: persistedBounds.endMs,
-              ...(input.signal ? { signal: input.signal } : {}),
-            });
-            if (subtitlePlan.policy === "confirmed_english") {
-              const sidecar = sidecars[0]!;
-              this.queue.recordEnglishSubtitleValidation(
-                started.request.jobId,
-                started.attempt,
-                sidecar,
-              );
-            } else {
-              this.queue.recordBilingualSubtitleValidation(
-                started.request.jobId,
-                started.attempt,
-                sidecars as [SidecarValidation, SidecarValidation],
-              );
-            }
-          }
-          this.recordProgress(started.request, "packaging", 8_000);
-          const promoted = await promoteVerifiedFinalPackage({
-            request: this.queue.get(started.request.id) ?? started.request,
-            stagingDirectory: scratchDirectory,
-            sourcePath: source.scratchPath,
-            dataRoot: this.dataRoot,
-            attempt: started.attempt,
-            ...(input.signal ? { signal: input.signal } : {}),
-          });
-          try {
-            this.queue.recordFinalArtifactPromotion(
-              started.request.jobId,
-              started.attempt,
-              promoted,
-            );
-          } catch (error) {
-            await removePromotedPackage(
-              this.dataRoot,
-              promoted[0]!.packageIdentity,
-            );
-            throw error;
-          }
-        },
+        handoff: async (source, scratchDirectory) =>
+          processSource(source, scratchDirectory),
         hooks: {
           sourceReady: async (source) => {
             this.queue.recordSourceReady(

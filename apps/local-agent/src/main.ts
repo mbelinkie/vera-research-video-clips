@@ -38,22 +38,40 @@ import {
 } from "@research-video/media";
 
 import { createLocalAgent } from "./app.ts";
+import { runLocalSourceScratchSweep } from "./export-scratch-sweeper.ts";
 import {
   discardCompletedLoggedExportForCancellation,
   runLocalExportOnce,
 } from "./export-run-once.ts";
+import { LocalLoggedExportSourceGroupCoordinator } from "./shared-source-group.ts";
 
 const config = loadConfig();
 await mkdir(config.dataDir, { recursive: true });
 const database = openLocalDatabase(join(config.dataDir, "local.sqlite"));
 runLocalMigrations(database);
 const exportQueue = new LocalExportQueue(database);
+await runLocalSourceScratchSweep(
+  { recoverOrphanedGroups: true },
+  { queue: exportQueue, dataRoot: config.dataDir },
+);
 const workerIdentity = new LocalExportWorkerIdentityRepository(database);
 const capabilityProvider = new FfmpegCapabilityDiscoveryProvider();
 const sourceProvider = createExportSourceAcquisitionProvider({
   mode: config.exportSourceProvider,
   ytDlpPath: config.ytDlpPath,
 });
+const sourceInspector = new FfprobeMediaInspector();
+const rangeRenderer = new FfmpegCapabilityRangeRenderer();
+const thumbnailExtractor = new FfmpegJpegThumbnailExtractor();
+const thumbnailInspector = new FfprobeJpegThumbnailInspector();
+const sharedSourceCoordinator = sourceProvider
+  ? new LocalLoggedExportSourceGroupCoordinator(
+      exportQueue,
+      sourceProvider,
+      sourceInspector,
+      config.dataDir,
+    )
+  : undefined;
 const cache = new VerifiedTranscriptCache(
   database,
   new HttpArtifactDownloader(),
@@ -136,11 +154,12 @@ const app = createLocalAgent({
     runLocalExportOnce(input, {
       queue: exportQueue,
       ...(sourceProvider ? { sourceProvider } : {}),
-      inspector: new FfprobeMediaInspector(),
-      renderer: new FfmpegCapabilityRangeRenderer(),
-      thumbnailExtractor: new FfmpegJpegThumbnailExtractor(),
-      thumbnailInspector: new FfprobeJpegThumbnailInspector(),
+      inspector: sourceInspector,
+      renderer: rangeRenderer,
+      thumbnailExtractor,
+      thumbnailInspector,
       capabilityProvider,
+      ...(sharedSourceCoordinator ? { sharedSourceCoordinator } : {}),
       dataRoot: config.dataDir,
     }),
   discardCompletedLoggedExportForCancellation: (requestId, reason) =>

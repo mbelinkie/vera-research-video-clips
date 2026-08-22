@@ -10,7 +10,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   LocalExportQueue,
@@ -94,6 +94,58 @@ function makeExpired(
 }
 
 describe("runLocalSourceScratchSweep", () => {
+  it("deletes only the exact claimed shared-group root and settles its durable claim", async () => {
+    const root = mkdtempSync(join(tmpdir(), "local-export-group-sweep-"));
+    directories.add(root);
+    const groupId = "019fbb95-cd76-7920-93fa-e23ba755ef90";
+    const siblingId = "019fbb95-cd76-7920-93fa-e23ba755ef91";
+    const target = join(root, "jobs", "export-source-groups", groupId, "1");
+    const sibling = join(root, "jobs", "export-source-groups", siblingId, "1");
+    mkdirSync(target, { recursive: true, mode: 0o700 });
+    mkdirSync(sibling, { recursive: true, mode: 0o700 });
+    writeFileSync(join(target, "source.mp4"), "delete group");
+    writeFileSync(join(sibling, "source.mp4"), "preserve sibling");
+    const claim = {
+      groupId,
+      claimToken: "019fbb95-cd76-7920-93fa-e23ba755ef92",
+    };
+    const complete = vi.fn(() => ({
+      restoredComplete: false,
+      markedNeedsUserAction: true,
+    }));
+    const claimGroups = vi.fn(() => [claim]);
+    const queue = {
+      countLegacySourceScratchRecoveryRows: () => 0,
+      claimLoggedExportSourceGroupCleanup: claimGroups,
+      claimSourceScratchCleanup: () => [],
+      completeLoggedExportSourceGroupCleanupClaim: complete,
+      failLoggedExportSourceGroupCleanupClaim: vi.fn(),
+    } as unknown as LocalExportQueue;
+
+    await expect(
+      runLocalSourceScratchSweep(
+        { recoverOrphanedGroups: true },
+        { queue, dataRoot: root },
+      ),
+    ).resolves.toEqual({
+      status: "complete",
+      claimed: 1,
+      deleted: 1,
+      cleanupFailed: 0,
+      restoredComplete: 0,
+      markedNeedsUserAction: 1,
+      legacyUnsupported: 0,
+    });
+    expect(existsSync(target)).toBe(false);
+    expect(readFileSync(join(sibling, "source.mp4"), "utf8")).toBe(
+      "preserve sibling",
+    );
+    expect(complete).toHaveBeenCalledWith(claim);
+    expect(claimGroups).toHaveBeenCalledWith(10, {
+      recoverOrphanedJoined: true,
+    });
+  });
+
   it("deletes only the expired exact attempt child and preserves siblings and exports", async () => {
     const { root, database, queue, request } = fixtureQueue();
     const started = makeExpired(queue, database, request.id);

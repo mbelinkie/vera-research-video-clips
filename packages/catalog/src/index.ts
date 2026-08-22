@@ -272,11 +272,14 @@ const loggedExportDeliverySelect = `SELECT
    d.reservation_token, d.worker_id, d.worker_epoch, d.reserved_at,
    d.reservation_expires_at, d.accepted_at, er.*, j.state,
    export_success.result_json AS export_success_result_json,
-   delivery_clip.export_status AS delivery_clip_export_status
+   delivery_clip.export_status AS delivery_clip_export_status,
+   delivery_batch_item.batch_id AS delivery_batch_id
  FROM logged_export_deliveries d
  JOIN export_requests er ON er.id = d.export_request_id
  JOIN jobs j ON j.id = er.job_id
  JOIN clip_candidates delivery_clip ON delivery_clip.id = er.clip_id
+ LEFT JOIN logged_export_batch_items delivery_batch_item
+   ON delivery_batch_item.id = er.batch_item_id
  LEFT JOIN logged_export_success_results export_success
    ON export_success.export_request_id = er.id`;
 
@@ -5708,6 +5711,14 @@ function mapLoggedExportDelivery(row: DbRow): LoggedExportDelivery {
     reservedAt: iso(row.reserved_at),
     reservationExpiresAt: iso(row.reservation_expires_at),
     ...(row.accepted_at ? { acceptedAt: iso(row.accepted_at) } : {}),
+    ...(row.delivery_batch_id && row.batch_item_id
+      ? {
+          sourceGroup: {
+            batchId: row.delivery_batch_id,
+            batchItemId: row.batch_item_id,
+          },
+        }
+      : {}),
     request: mapLoggedExportRequest(row),
   });
 }

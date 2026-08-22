@@ -2481,6 +2481,10 @@ describe("logged export batches", () => {
         workerEpoch: worker.epoch,
       })
     ).delivery!;
+    expect(reserved.sourceGroup).toEqual({
+      batchId: batch.id,
+      batchItemId: reserved.request.batchItemId,
+    });
     const accepted = await catalog.acceptLoggedExportDelivery(owner, {
       workerId: worker.workerId,
       workerEpoch: worker.epoch,

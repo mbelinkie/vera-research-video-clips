@@ -1935,6 +1935,13 @@ export const LoggedExportDeliverySchema = z
     reservedAt: UtcTimestampSchema,
     reservationExpiresAt: UtcTimestampSchema,
     acceptedAt: UtcTimestampSchema.optional(),
+    sourceGroup: z
+      .object({
+        batchId: IdSchema,
+        batchItemId: IdSchema,
+      })
+      .strict()
+      .optional(),
     request: ExportRequestSchema,
   })
   .strict()
@@ -1950,6 +1957,18 @@ export const LoggedExportDeliverySchema = z
         path: ["request", "mode"],
         message:
           "A cloud delivery must contain one project-owned logged export request.",
+      });
+    }
+    if (
+      Boolean(delivery.sourceGroup) !== Boolean(delivery.request.batchItemId) ||
+      (delivery.sourceGroup &&
+        delivery.sourceGroup.batchItemId !== delivery.request.batchItemId)
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["sourceGroup"],
+        message:
+          "Delivery-only source grouping must exactly identify one immutable batch item.",
       });
     }
     const sourceUrl = new URL(delivery.request.video.canonicalUrl);
