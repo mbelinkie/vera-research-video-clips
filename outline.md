@@ -319,14 +319,17 @@ produce preferred SRT artifacts.
   existing processor and child processes, verify exact cleanup, and reconcile
   one immutable canceled result mutually exclusive with success/failure
   (`specs/completed/M5-21-safe-cancellation-and-execution-ownership.md`).
+- [x] M5-22: persist one strict monotonic progress snapshot for the exact logged
+  execution, publish it through authenticated heartbeats, reconcile it across
+  restart, and expose only sanitized project-authorized request progress
+  (`specs/completed/M5-22-durable-exact-execution-progress.md`).
 - [x] Generate and verify thumbnail, metadata JSON, and manifest.
 - [x] Use private staging plus exact-artifact validation and atomic completion.
 - [x] Execute accepted logged requests through the existing local processor and
   reconcile immutable results with the shared catalog.
-- [ ] Add durable progress, sibling isolation, batch export, and same-source
-  grouping.
+- [ ] Add sibling isolation, batch export, and same-source grouping.
 
-Gate: representative presets produce the requested FFprobe properties, queued jobs survive preset edits unchanged, English clips get an SRT by default and can explicitly omit it, foreign/mixed/unknown clips always get original plus translated-English SRTs, a 30-second foreign-language range produces only cues within that 30-second clip, a real authorized smoke test succeeds, and no full source media remains after any terminal path. M5-08 proves the local export-only composition path with authorized repository fixture media; M5-17 and M5-18 prove exact idempotent cloud success/failure reconciliation for one accepted logged request; M5-19 proves bounded local cleanup recovery without inferring legacy random-layout scratch paths; M5-20 proves immutable linear retry of terminal failed logged exports; M5-21 proves exact execution ownership, safe cancellation, real child termination, and immutable three-way terminal exclusion. Durable progress, batch/sibling isolation, same-source grouping, and the final fixture/live gates remain open.
+Gate: representative presets produce the requested FFprobe properties, queued jobs survive preset edits unchanged, English clips get an SRT by default and can explicitly omit it, foreign/mixed/unknown clips always get original plus translated-English SRTs, a 30-second foreign-language range produces only cues within that 30-second clip, a real authorized smoke test succeeds, and no full source media remains after any terminal path. M5-08 proves the local export-only composition path with authorized repository fixture media; M5-17 and M5-18 prove exact idempotent cloud success/failure reconciliation for one accepted logged request; M5-19 proves bounded local cleanup recovery without inferring legacy random-layout scratch paths; M5-20 proves immutable linear retry of terminal failed logged exports; M5-21 proves exact execution ownership, safe cancellation, real child termination, and immutable three-way terminal exclusion; M5-22 proves durable exact-execution progress, local/cloud restart reconciliation, and sanitized project reads. Batch/sibling isolation, same-source grouping, and the final fixture/live gates remain open.
 
 ### 6. Project Clip Library + authoring handoff
 
@@ -512,8 +515,8 @@ infra/aws        storage, API, database, queues, identity, monitoring
 ## Next action
 
 Finish and test Milestone 5 only, using one bounded active spec at a time. Start
-with durable monotonic progress for the exact M5-21 execution attempt without
-weakening cancellation or terminal reconciliation. Then close batch/sibling
-isolation, same-source grouping, the 30-second foreign fixture, the
-user-authorized live smoke, and the full Milestone 5 gate. Follow
+with durable batch export and sibling isolation composed over the existing
+per-request executor and exact M5-21/M5-22 execution/progress boundaries. Then
+close same-source grouping, the 30-second foreign fixture, the user-authorized
+live smoke, and the full Milestone 5 gate. Follow
 `docs/Milestone 5 Completion Agent Prompt.md`; do not begin M6 or M7.

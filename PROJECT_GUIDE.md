@@ -2,8 +2,8 @@
 
 ## Project guide and implementation plan
 
-Status: Milestones 1–4 core workflow complete; preferred-language logging, local export capabilities, authorized logged-export success/failure/canceled reconciliation, safe local source-scratch cleanup recovery, immutable retry, and exact execution ownership are verified through M5-21; durable progress, batch/group execution, and the final Milestone 5 release gate remain open
-Last updated: 2026-08-21
+Status: Milestones 1–4 core workflow complete; preferred-language logging, local export capabilities, authorized logged-export success/failure/canceled reconciliation, safe local source-scratch cleanup recovery, immutable retry, exact execution ownership, and durable progress are verified through M5-22; batch/group execution and the final Milestone 5 release gate remain open
+Last updated: 2026-08-22
 
 This document is the source of truth for product scope, architecture, sequencing, and acceptance criteria. Update it when a deliberate product or architectural decision changes. Use `outline.md` as the shorter execution checklist.
 
@@ -1545,6 +1545,30 @@ Persisted canceled evidence replays directly after restart or cloud response
 loss without rerendering or extending a lost lease. Durable progress, batch and
 same-source group execution, the foreign fixture, authorized live smoke, and
 the final Milestone 5 matrix remain open.
+
+M5-22 completed 2026-08-22. Every accepted logged export can now persist one
+strict, bounded progress snapshot against the exact M5-21 execution ID and
+attempt. The local processor advances a fixed ordered vocabulary from
+preparation and source acquisition through inspection, rendering, validation,
+thumbnail/subtitle construction, packaging, cleanup, and local completion;
+SQLite records every step before publication and enforces exact stage/rank,
+sequence, and basis-point monotonicity. Execution heartbeats carry only the
+latest sanitized snapshot. The cloud verifies the still-live delivery,
+generation, worker epoch, execution attempt, and opaque lease before atomically
+inserting or advancing progress; exact replay is a no-op and divergent or
+regressive evidence conflicts. Start replay returns the latest cloud snapshot,
+which the local repository reconciles only for the same durable execution while
+retaining newer local evidence. Current project members can read request/job
+state and the sanitized snapshot through a project-authorized endpoint; worker
+identity, leases, reservation tokens, local paths, source identity, artifact
+locators, URLs, transcript text, and errors never cross that read boundary.
+Progress remains nonterminal and does not weaken cancellation, verified source
+cleanup, or immutable success/failure/canceled exclusion. Cloud migration
+`0018` and local migration `0023` preserve populated databases. The aggregate
+gate passes 247 tests with one declared skip, the web build, 23 local
+migrations, and 18 cloud migrations. Batch/sibling isolation, same-source group
+execution, the foreign fixture, authorized live smoke, and the final Milestone
+5 matrix remain open.
 
 M5-09 completed 2026-08-19. Every promoted clip package now also contains one
 `manifest.json`, written into attempt-private staging and promoted through the
