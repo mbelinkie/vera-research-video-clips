@@ -225,5 +225,4 @@ policy rather than silently relying on cascades.
 ### Commits
 
 - `2c3e3de` — `feat: add immutable artifact history`
-- Completion documentation commit: recorded by the immediately following
-  documentation-only commit.
+- `5269d2f` — `docs: close M6-01 artifact history slice`
