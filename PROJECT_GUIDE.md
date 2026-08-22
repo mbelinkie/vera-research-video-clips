@@ -2,7 +2,7 @@
 
 ## Project guide and implementation plan
 
-Status: Milestones 1–4 core workflow complete; preferred-language logging, local export capabilities, authorized logged-export reconciliation, cleanup recovery, immutable retry, exact execution ownership, durable progress, isolated batch export, same-source grouping, the deterministic 30-second foreign fixture gate, and the opt-in authorized live YouTube smoke are verified through M5-26; the final Milestone 5 matrix remains open
+Status: Milestones 1–5 complete; the export-worker matrix, deterministic foreign fixture, and opt-in authorized live YouTube smoke are verified through M5-27; do not begin Milestone 6 or 7 without a new bounded task
 Last updated: 2026-08-22
 
 This document is the source of truth for product scope, architecture, sequencing, and acceptance criteria. Update it when a deliberate product or architectural decision changes. Use `outline.md` as the shorter execution checklist.
@@ -1663,6 +1663,30 @@ after the run and no source identity, URL, transcript text, raw provider output,
 or credential was retained. The aggregate implementation gate passes 268 tests
 with one declared skip, the web build, 24 local and 19 cloud migrations, plus
 four Playwright flows. Only the final recorded Milestone 5 matrix remains open.
+
+M5-27 completed 2026-08-22 and closes Milestone 5. The final release matrix now
+directly proves all three installed renderer profiles with real FFmpeg/FFprobe,
+immutable queued settings after the originating project preset/default advances,
+confirmed-English default SRT and explicit omission through the real one-shot
+runtime, mandatory original-plus-English policy for foreign/mixed/unknown,
+the exact 30-second foreign fixture, individual and batch replay/failure/cancel
+behavior, same-source sibling isolation and last-release deletion, and cleanup
+before every terminal claim. M5-23 batch execution evidence remains deliberately
+compositional: a batch owns atomic creation, immutable membership, retry-leaf
+association, and aggregate reads, while every child uses the single established
+delivery/execution/result/cancel/source lifecycle. Three independent audits found
+two missing direct tests and no product integrity defect; the new real
+confirmed-English test and preset-v1-to-v2 queued-snapshot regression close both
+gaps without production, contract, migration, or UI changes. In a clean detached
+verification worktree containing exactly the final M5 code, `npm run check`
+passed formatting, typecheck, 270 tests with one declared optional AWS skip, the
+web build, 24 local migrations, and 19 cloud migrations; all four Playwright
+flows and `git diff --check` also passed. The shared worktree's protected
+pre-existing `docs/Script-to-Resolve Product Spec.md` formatting change remains
+untouched and excluded from milestone commits. The known pre-M5-19 manual legacy
+scratch recovery and M5-18 refusal to infer multi-attempt failure ownership
+remain intentional fail-closed limitations. No unresolved Milestone 5 integrity
+blocker remains, and this task stops before M6 Clip Library or M7 distribution.
 
 M5-09 completed 2026-08-19. Every promoted clip package now also contains one
 `manifest.json`, written into attempt-private staging and promoted through the
