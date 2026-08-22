@@ -650,6 +650,136 @@ describe("one-shot local export runtime", () => {
     });
   });
 
+  it("renders confirmed-English default and omission packages with real FFmpeg and FFprobe", async () => {
+    const root = await createFixtureWorkspace();
+    const defaultRequest = createConfirmedEnglishFixtureRequest(
+      root,
+      "default",
+      false,
+    );
+    const omittedRequest = createConfirmedEnglishFixtureRequest(
+      root,
+      "omitted",
+      true,
+    );
+    const inspection = new FfprobeMediaInspector({ executable: ffprobePath });
+    const renderer = new FfmpegCapabilityRangeRenderer({
+      executable: ffmpegPath,
+    });
+    let acquisitionCalls = 0;
+    let renderCalls = 0;
+    const sourceProvider = fixtureSourceProvider(() => {
+      acquisitionCalls += 1;
+    });
+
+    for (const fixture of [defaultRequest, omittedRequest]) {
+      const result = await runConfiguredLocalExportOnce(
+        { requestId: fixture.requestId, authorizationConfirmed: true },
+        {
+          config: fixtureConfig(root),
+          sourceProvider,
+          inspector: inspection,
+          renderer: {
+            render: async (...args) => {
+              renderCalls += 1;
+              return renderer.render(...args);
+            },
+            readVersion: (signal) => renderer.readVersion(signal),
+          },
+        },
+      );
+      expect(result).toMatchObject({ status: "complete", state: "complete" });
+
+      const packageIdentity = `clip-${fixture.requestId}`;
+      const packageDirectory = join(root, "exports", packageIdentity);
+      const entries = (await readdir(packageDirectory)).sort();
+      const rendered = await inspection.inspect(
+        join(packageDirectory, `${packageIdentity}.mp4`),
+      );
+      expect(rendered).toMatchObject({ videoCodec: "h264", audioCodec: "aac" });
+      expect(Math.abs(rendered.durationMs - 3_000)).toBeLessThanOrEqual(
+        RenderDurationToleranceMs,
+      );
+
+      const manifest = ExportClipManifestSchema.parse(
+        JSON.parse(
+          await readFile(join(packageDirectory, "manifest.json"), "utf8"),
+        ),
+      );
+      if (fixture.omitSidecars) {
+        expect(entries).toEqual([
+          `${packageIdentity}.jpg`,
+          `${packageIdentity}.json`,
+          `${packageIdentity}.mp4`,
+          "manifest.json",
+        ]);
+        expect(manifest.subtitlePolicy).toEqual({
+          requiredSidecars: [],
+          subtitleSidecarsOmittedReason: "confirmed_english_user_setting",
+        });
+        expect(
+          manifest.artifacts.map((artifact) => artifact.role),
+        ).not.toContain("english_srt");
+      } else {
+        expect(entries).toEqual([
+          `${packageIdentity}.en.srt`,
+          `${packageIdentity}.jpg`,
+          `${packageIdentity}.json`,
+          `${packageIdentity}.mp4`,
+          "manifest.json",
+        ]);
+        expect(manifest.subtitlePolicy).toEqual({
+          requiredSidecars: ["english"],
+        });
+        const englishArtifact = manifest.artifacts.find(
+          (artifact) => artifact.role === "english_srt",
+        );
+        expect(englishArtifact).toMatchObject({
+          subtitle: {
+            language: "en",
+            trackId: fixture.trackId,
+            trackVersion: 1,
+          },
+        });
+        validateClipRelativeSrtCues(
+          parseSrt(
+            await readFile(
+              join(packageDirectory, `${packageIdentity}.en.srt`),
+              "utf8",
+            ),
+          ),
+          rendered.durationMs,
+        );
+      }
+      for (const artifact of manifest.artifacts) {
+        const bytes = await readFile(join(packageDirectory, artifact.filename));
+        expect(artifact.byteSize).toBe(bytes.byteLength);
+        expect(artifact.contentSha256).toBe(sha256(bytes));
+      }
+    }
+
+    expect({ acquisitionCalls, renderCalls }).toEqual({
+      acquisitionCalls: 2,
+      renderCalls: 2,
+    });
+    const database = openLocalDatabase(join(root, "local.sqlite"));
+    try {
+      const queue = new LocalExportQueue(database);
+      for (const fixture of [defaultRequest, omittedRequest]) {
+        const request = queue.get(fixture.requestId)!;
+        expect(request.state).toBe("complete");
+        expect(queue.getSourceAttempt(request.jobId, 1)).toMatchObject({
+          lifecycleState: "deleted",
+        });
+      }
+    } finally {
+      database.close();
+    }
+    expect(await readdir(join(root, "jobs", "export-source-scratch"))).toEqual(
+      [],
+    );
+  });
+
   it("executes one accepted logged delivery through the same processor and projects a replay-stable safe result", async () => {
     const root = await createFixtureWorkspace();
     const request = createFixtureRequest(
@@ -1327,6 +1457,88 @@ function createFixtureRequest(
     }
     const request = queue.createExportOnly(input);
     return { requestId: request.id };
+  } finally {
+    database.close();
+  }
+}
+
+function createConfirmedEnglishFixtureRequest(
+  root: string,
+  suffix: string,
+  omitSidecars: boolean,
+) {
+  const database = openLocalDatabase(join(root, "local.sqlite"));
+  try {
+    const queue = new LocalExportQueue(database);
+    const trackId = randomUUID();
+    const firstSegmentId = randomUUID();
+    const lastSegmentId = randomUUID();
+    const videoId = `fixture-runtime-confirmed-english-${suffix}`;
+    new LocalTranscriptIndex(database).replace({
+      projectId: "019fbb95-cd76-7920-93fa-e23ba755e101",
+      catalogVideoId: "019fbb95-cd76-7920-93fa-e23ba755e102",
+      transcriptVersionId: randomUUID(),
+      transcript: normalizeTranscriptFixture({
+        track: {
+          id: trackId,
+          videoId,
+          language: "en",
+          kind: "english",
+          source: "fixture",
+          provider: "fixture",
+          timingPrecision: "cue",
+          schemaVersion: 1,
+          contentSha256: "c".repeat(64),
+          version: 1,
+        },
+        segments: [
+          {
+            id: firstSegmentId,
+            ordinal: 0,
+            startMs: 500,
+            endMs: 1_800,
+            text: "The first English fixture cue.",
+          },
+          {
+            id: lastSegmentId,
+            ordinal: 1,
+            startMs: 1_800,
+            endMs: 3_500,
+            text: "The second English fixture cue.",
+          },
+        ],
+      }),
+    });
+    const request = queue.createExportOnly({
+      idempotencyKey: `runtime-confirmed-english-${suffix}`,
+      video: {
+        youtubeVideoId: videoId,
+        canonicalUrl: `https://www.youtube.com/watch?v=${videoId}`,
+        title: "Authorized confirmed-English local fixture",
+      },
+      selection: {
+        trackId,
+        transcriptVersion: 1,
+        firstSegmentId,
+        lastSegmentId,
+        transcriptStartMs: 500,
+        transcriptEndMs: 3_500,
+        exportStartMs: 500,
+        exportEndMs: 3_500,
+        text: "Confirmed-English fixture selection",
+        timingPrecision: "cue",
+      },
+      sourceLanguageClass: "confirmed_english",
+      preset: {
+        presetVersion: 1,
+        name: "Confirmed-English fixture",
+        settings: {
+          ...editingSettings,
+          omitSubtitleFilesForConfirmedEnglish: omitSidecars,
+        },
+      },
+    });
+    return { requestId: request.id, trackId, omitSidecars };
   } finally {
     database.close();
   }

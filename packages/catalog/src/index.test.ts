@@ -287,6 +287,122 @@ describe("versioned export preset catalogs", () => {
     ).toBe(0);
   });
 
+  it("keeps a queued export's resolved settings stable after its project default advances", async () => {
+    const database = new PGlite();
+    databases.add(database);
+    await runCloudMigrations(database);
+    const catalog = new SharedProjectCatalog(
+      database,
+      new MemoryTranscriptObjectStore(),
+    );
+    const owner = fixtureActor("queued-export-settings-owner");
+    await catalog.registerUser(owner, "Queued export settings owner");
+    const project = await catalog.createProject(owner, {
+      name: "Queued export settings project",
+    });
+    const [clip] = await createBatchClips(catalog, owner, project.id, 1);
+    const preset = await catalog.createProjectExportPreset(owner, project.id, {
+      idempotencyKey: "queued-export-preset-v1",
+      name: "Queued export default",
+      description: "Initial default",
+      settings: editingSettings,
+    });
+    await catalog.setProjectExportPresetDefault(owner, project.id, {
+      idempotencyKey: "queued-export-default-v1",
+      expectedEntityVersion: 0,
+      presetId: preset.id,
+      presetVersion: 1,
+    });
+    const selection = { base: "context_default" as const, overrides: {} };
+    const previewV1 = await catalog.previewProjectExportSettings(
+      owner,
+      project.id,
+      { sourceLanguageClass: "confirmed_english", selection },
+    );
+    const command = {
+      idempotencyKey: "queued-export-request-v1",
+      sourceLanguageClass: "confirmed_english" as const,
+      settingsSelection: selection,
+      expectedResolutionFingerprint: previewV1.snapshot.resolutionFingerprint!,
+    };
+    const queued = await catalog.createClipExport(
+      owner,
+      project.id,
+      clip!.id,
+      command,
+    );
+    const originalSnapshot = queued.resolvedSettingsSnapshot!;
+    expect(queued).toMatchObject({ state: "queued" });
+    expect(originalSnapshot).toMatchObject({
+      context: "logged",
+      base: "context_default",
+      contextDefault: {
+        presetId: preset.id,
+        presetVersion: 1,
+        settings: editingSettings,
+      },
+      resolutionFingerprint: previewV1.snapshot.resolutionFingerprint,
+    });
+
+    const revised = await catalog.reviseProjectExportPreset(owner, project.id, {
+      idempotencyKey: "queued-export-preset-v2",
+      presetId: preset.id,
+      expectedEntityVersion: 1,
+      name: "Queued export default",
+      description: "Revised default",
+      settings: { ...editingSettings, maxWidth: 1_280 },
+    });
+    await catalog.setProjectExportPresetDefault(owner, project.id, {
+      idempotencyKey: "queued-export-default-v2",
+      expectedEntityVersion: 1,
+      presetId: preset.id,
+      presetVersion: revised.currentVersion,
+    });
+    const previewV2 = await catalog.previewProjectExportSettings(
+      owner,
+      project.id,
+      { sourceLanguageClass: "confirmed_english", selection },
+    );
+    expect(previewV2.snapshot).toMatchObject({
+      contextDefault: {
+        presetId: preset.id,
+        presetVersion: 2,
+        settings: { maxWidth: 1_280 },
+      },
+    });
+    expect(previewV2.snapshot.resolutionFingerprint).not.toBe(
+      originalSnapshot.resolutionFingerprint,
+    );
+
+    const replayed = await catalog.createClipExport(
+      owner,
+      project.id,
+      clip!.id,
+      command,
+    );
+    expect(replayed).toEqual(queued);
+    expect(replayed.resolvedSettingsSnapshot).toEqual(originalSnapshot);
+    expect(replayed.resolvedSettingsSnapshot!.resolutionFingerprint).toBe(
+      originalSnapshot.resolutionFingerprint,
+    );
+    const persisted = await database.query<{
+      request_snapshot: ExportRequest["resolvedSettingsSnapshot"];
+      job_snapshot: ExportRequest["resolvedSettingsSnapshot"];
+    }>(
+      `SELECT er.resolved_settings_snapshot AS request_snapshot,
+              j.payload->'resolvedSettingsSnapshot' AS job_snapshot
+       FROM export_requests er
+       JOIN jobs j ON j.id = er.job_id
+       WHERE er.id = $1`,
+      [queued.id],
+    );
+    expect(persisted.rows[0]!.request_snapshot).toEqual(originalSnapshot);
+    expect(persisted.rows[0]!.job_snapshot).toEqual(originalSnapshot);
+    expect(persisted.rows[0]!.job_snapshot!.resolutionFingerprint).toBe(
+      originalSnapshot.resolutionFingerprint,
+    );
+  });
+
   it("authorizes project discovery/writes and never exposes another member's personal presets", async () => {
     const database = new PGlite();
     databases.add(database);
