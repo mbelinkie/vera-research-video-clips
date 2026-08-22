@@ -14,9 +14,17 @@ import {
   type LoggedExportDelivery,
   type LoggedExportFailure,
   type LoggedExportFailureResult,
+  type LoggedExportCanceled,
+  type LoggedExportCanceledResult,
+  type LoggedExportExecution,
+  type StartLoggedExportExecutionRequest,
+  type StartLoggedExportExecutionResponse,
+  type HeartbeatLoggedExportExecutionRequest,
+  type HeartbeatLoggedExportExecutionResponse,
   type LoggedExportSuccess,
   type LoggedExportSuccessResult,
   type ReconcileLoggedExportFailureRequest,
+  type ReconcileLoggedExportCanceledRequest,
   type ReconcileLoggedExportSuccessRequest,
   type RegisterExportWorkerRequest,
   type RegisteredExportWorker,
@@ -89,10 +97,42 @@ export interface LocalAgentDependencies {
   ): LoggedExportDelivery | undefined;
   buildLoggedExportSuccessResult?(requestId: string): LoggedExportSuccessResult;
   buildLoggedExportFailureResult?(requestId: string): LoggedExportFailureResult;
+  buildLoggedExportCanceledResult?(
+    requestId: string,
+  ): LoggedExportCanceledResult;
+  getLoggedExecution?(requestId: string): LoggedExportExecution | undefined;
+  startLoggedExportExecution?(input: {
+    request: StartLoggedExportExecutionRequest;
+    authorization: string;
+  }): Promise<StartLoggedExportExecutionResponse>;
+  heartbeatLoggedExportExecution?(input: {
+    request: HeartbeatLoggedExportExecutionRequest;
+    authorization: string;
+  }): Promise<HeartbeatLoggedExportExecutionResponse>;
+  activateLoggedExecution?(
+    execution: LoggedExportExecution,
+  ): LoggedExportExecution;
+  recordLoggedExecutionHeartbeat?(execution: LoggedExportExecution): void;
+  recordLoggedExportNotStartedCancellation?(
+    requestId: string,
+    reason: "user_requested" | "execution_lease_lost",
+    cancelRequestedAt?: string,
+  ): void;
+  recordLoggedExportPersistedFailureCancellation?(
+    requestId: string,
+    reason: "user_requested" | "execution_lease_lost",
+    cancelRequestedAt?: string,
+  ): void;
   runLoggedExportOnce?(input: {
     requestId: string;
     authorizationConfirmed: boolean;
+    signal?: AbortSignal;
+    requireLoggedExecution?: boolean;
   }): Promise<LocalExportOnceResult>;
+  discardCompletedLoggedExportForCancellation?(
+    requestId: string,
+    reason: "user_requested" | "execution_lease_lost",
+  ): Promise<void>;
   reconcileLoggedExportSuccess?(input: {
     request: ReconcileLoggedExportSuccessRequest;
     authorization: string;
@@ -101,6 +141,11 @@ export interface LocalAgentDependencies {
     request: ReconcileLoggedExportFailureRequest;
     authorization: string;
   }): Promise<LoggedExportFailure>;
+  reconcileLoggedExportCanceled?(input: {
+    request: ReconcileLoggedExportCanceledRequest;
+    authorization: string;
+  }): Promise<LoggedExportCanceled>;
+  executionHeartbeatIntervalMs?: number;
 }
 
 const TranscriptParamsSchema = z.object({
@@ -471,6 +516,63 @@ export function createLocalAgent(
       }
 
       if (
+        dependencies.buildLoggedExportCanceledResult &&
+        dependencies.reconcileLoggedExportCanceled
+      ) {
+        let persistedCancellation: LoggedExportCanceledResult | undefined;
+        try {
+          persistedCancellation = dependencies.buildLoggedExportCanceledResult(
+            command.requestId,
+          );
+        } catch (error) {
+          if (
+            (error as { code?: string }).code !==
+            "logged_export_cancellation_not_recorded"
+          ) {
+            throw error;
+          }
+        }
+        if (persistedCancellation) {
+          const persistedExecution = persistedCancellation.executionId
+            ? dependencies.getLoggedExecution?.(command.requestId)
+            : undefined;
+          if (
+            persistedCancellation.executionId &&
+            (!persistedExecution ||
+              persistedExecution.executionId !==
+                persistedCancellation.executionId)
+          ) {
+            throw new LocalExportSettingsError(
+              "Persisted cancellation execution ownership is unavailable.",
+              "logged_export_execution_ownership_mismatch",
+              409,
+            );
+          }
+          const canceled = await dependencies.reconcileLoggedExportCanceled({
+            authorization,
+            request: {
+              workerId: delivery.workerId,
+              workerEpoch: delivery.workerEpoch,
+              deliveryId: delivery.deliveryId,
+              generation: delivery.generation,
+              reservationToken: delivery.reservationToken,
+              ...(persistedExecution
+                ? {
+                    executionId: persistedExecution.executionId,
+                    leaseToken: persistedExecution.leaseToken,
+                  }
+                : {}),
+              result: persistedCancellation,
+            },
+          });
+          return ProcessAcceptedLoggedExportResponseSchema.parse({
+            execution: "canceled",
+            canceled,
+          });
+        }
+      }
+
+      if (
         dependencies.buildLoggedExportFailureResult &&
         dependencies.reconcileLoggedExportFailure
       ) {
@@ -514,10 +616,174 @@ export function createLocalAgent(
         );
       }
 
-      const execution = await dependencies.runLoggedExportOnce!({
-        requestId: command.requestId,
-        authorizationConfirmed: command.authorizationConfirmed,
-      });
+      let executionControl: LoggedExportExecution | undefined;
+      let executionCredential: StartLoggedExportExecutionRequest | undefined;
+      let controller: AbortController | undefined;
+      let stopHeartbeat: (() => Promise<void>) | undefined;
+      if (
+        dependencies.startLoggedExportExecution &&
+        dependencies.heartbeatLoggedExportExecution &&
+        dependencies.activateLoggedExecution &&
+        dependencies.recordLoggedExecutionHeartbeat &&
+        dependencies.recordLoggedExportNotStartedCancellation &&
+        dependencies.buildLoggedExportCanceledResult &&
+        dependencies.reconcileLoggedExportCanceled
+      ) {
+        const credential = {
+          workerId: delivery.workerId,
+          workerEpoch: delivery.workerEpoch,
+          deliveryId: delivery.deliveryId,
+          generation: delivery.generation,
+          reservationToken: delivery.reservationToken,
+        };
+        executionCredential = credential;
+        const started = await dependencies.startLoggedExportExecution({
+          authorization,
+          request: credential,
+        });
+        if (started.status === "cancel_requested") {
+          dependencies.recordLoggedExportNotStartedCancellation(
+            command.requestId,
+            "user_requested",
+            started.cancelRequestedAt,
+          );
+          const result = dependencies.buildLoggedExportCanceledResult(
+            command.requestId,
+          );
+          const canceled = await dependencies.reconcileLoggedExportCanceled({
+            authorization,
+            request: { ...credential, result },
+          });
+          return ProcessAcceptedLoggedExportResponseSchema.parse({
+            execution: "canceled",
+            canceled,
+          });
+        }
+        executionControl = dependencies.activateLoggedExecution(
+          started.execution,
+        );
+        controller = new AbortController();
+        if (executionControl.cancelRequestedAt) {
+          controller.abort(
+            Object.assign(new Error("Export cancellation was requested."), {
+              code: "user_requested",
+            }),
+          );
+        } else {
+          const heartbeat = startExecutionHeartbeatLoop({
+            execution: executionControl,
+            credential,
+            authorization,
+            controller,
+            intervalMs: dependencies.executionHeartbeatIntervalMs ?? 5_000,
+            heartbeat: dependencies.heartbeatLoggedExportExecution,
+            persist: dependencies.recordLoggedExecutionHeartbeat,
+          });
+          stopHeartbeat = heartbeat.stop;
+        }
+      }
+
+      let execution: LocalExportOnceResult;
+      try {
+        execution = await dependencies.runLoggedExportOnce!({
+          requestId: command.requestId,
+          authorizationConfirmed: command.authorizationConfirmed,
+          ...(controller ? { signal: controller.signal } : {}),
+          ...(executionControl ? { requireLoggedExecution: true } : {}),
+        });
+      } finally {
+        if (stopHeartbeat) await stopHeartbeat();
+      }
+      if (
+        executionControl &&
+        dependencies.heartbeatLoggedExportExecution &&
+        dependencies.recordLoggedExecutionHeartbeat &&
+        controller &&
+        !controller.signal.aborted
+      ) {
+        try {
+          const finalHeartbeat =
+            await dependencies.heartbeatLoggedExportExecution({
+              authorization,
+              request: {
+                workerId: delivery.workerId,
+                workerEpoch: delivery.workerEpoch,
+                deliveryId: delivery.deliveryId,
+                generation: delivery.generation,
+                reservationToken: delivery.reservationToken,
+                executionId: executionControl.executionId,
+                attempt: executionControl.attempt,
+                leaseToken: executionControl.leaseToken,
+              },
+            });
+          dependencies.recordLoggedExecutionHeartbeat(finalHeartbeat.execution);
+          if (finalHeartbeat.execution.cancelRequestedAt) {
+            controller.abort(
+              Object.assign(new Error("Export cancellation was requested."), {
+                code: "user_requested",
+              }),
+            );
+          }
+        } catch (error) {
+          controller.abort(
+            Object.assign(new Error("Export execution ownership was lost."), {
+              code: "execution_lease_lost",
+              cause: error,
+            }),
+          );
+        }
+      }
+
+      if (controller?.signal.aborted || execution.status === "canceled") {
+        const reason =
+          (controller?.signal.reason as { code?: unknown } | undefined)
+            ?.code === "user_requested"
+            ? "user_requested"
+            : "execution_lease_lost";
+        if (
+          execution.status === "failed" &&
+          dependencies.recordLoggedExportPersistedFailureCancellation
+        ) {
+          dependencies.recordLoggedExportPersistedFailureCancellation(
+            command.requestId,
+            reason,
+            executionControl?.cancelRequestedAt,
+          );
+        } else if (
+          execution.status !== "canceled" &&
+          execution.status !== "failed" &&
+          dependencies.discardCompletedLoggedExportForCancellation
+        ) {
+          await dependencies.discardCompletedLoggedExportForCancellation(
+            command.requestId,
+            reason,
+          );
+        }
+        const result = dependencies.buildLoggedExportCanceledResult!(
+          command.requestId,
+        );
+        const canceled = await dependencies.reconcileLoggedExportCanceled!({
+          authorization,
+          request: {
+            workerId: delivery.workerId,
+            workerEpoch: delivery.workerEpoch,
+            deliveryId: delivery.deliveryId,
+            generation: delivery.generation,
+            reservationToken: delivery.reservationToken,
+            ...(executionControl
+              ? {
+                  executionId: executionControl.executionId,
+                  leaseToken: executionControl.leaseToken,
+                }
+              : {}),
+            result,
+          },
+        });
+        return ProcessAcceptedLoggedExportResponseSchema.parse({
+          execution: "canceled",
+          canceled,
+        });
+      }
       if (execution.status === "failed") {
         if (
           dependencies.buildLoggedExportFailureResult &&
@@ -526,17 +792,64 @@ export function createLocalAgent(
           const result = dependencies.buildLoggedExportFailureResult(
             command.requestId,
           );
-          const failure = await dependencies.reconcileLoggedExportFailure({
-            authorization,
-            request: {
-              workerId: delivery.workerId,
-              workerEpoch: delivery.workerEpoch,
-              deliveryId: delivery.deliveryId,
-              generation: delivery.generation,
-              reservationToken: delivery.reservationToken,
-              result,
-            },
-          });
+          let failure: LoggedExportFailure;
+          try {
+            failure = await dependencies.reconcileLoggedExportFailure({
+              authorization,
+              request: {
+                workerId: delivery.workerId,
+                workerEpoch: delivery.workerEpoch,
+                deliveryId: delivery.deliveryId,
+                generation: delivery.generation,
+                reservationToken: delivery.reservationToken,
+                result,
+              },
+            });
+          } catch (error) {
+            if (
+              (error as { statusCode?: number }).statusCode !== 409 ||
+              !executionControl ||
+              !executionCredential ||
+              !dependencies.startLoggedExportExecution ||
+              !dependencies.recordLoggedExportPersistedFailureCancellation ||
+              !dependencies.buildLoggedExportCanceledResult ||
+              !dependencies.reconcileLoggedExportCanceled
+            ) {
+              throw error;
+            }
+            const replay = await dependencies.startLoggedExportExecution({
+              authorization,
+              request: executionCredential,
+            });
+            if (
+              replay.status !== "started" ||
+              replay.execution.executionId !== executionControl.executionId ||
+              !replay.execution.cancelRequestedAt
+            ) {
+              throw error;
+            }
+            dependencies.recordLoggedExportPersistedFailureCancellation(
+              command.requestId,
+              "user_requested",
+              replay.execution.cancelRequestedAt,
+            );
+            const canceledResult = dependencies.buildLoggedExportCanceledResult(
+              command.requestId,
+            );
+            const canceled = await dependencies.reconcileLoggedExportCanceled({
+              authorization,
+              request: {
+                ...executionCredential,
+                executionId: executionControl.executionId,
+                leaseToken: executionControl.leaseToken,
+                result: canceledResult,
+              },
+            });
+            return ProcessAcceptedLoggedExportResponseSchema.parse({
+              execution: "canceled",
+              canceled,
+            });
+          }
           return ProcessAcceptedLoggedExportResponseSchema.parse({
             execution: "failed",
             failure,
@@ -551,17 +864,63 @@ export function createLocalAgent(
       const result = dependencies.buildLoggedExportSuccessResult!(
         command.requestId,
       );
-      const reconciliation = await dependencies.reconcileLoggedExportSuccess!({
-        authorization,
-        request: {
-          workerId: identity.workerId,
-          workerEpoch: identity.epoch,
-          deliveryId: delivery.deliveryId,
-          generation: delivery.generation,
-          reservationToken: delivery.reservationToken,
-          result,
-        },
-      });
+      let reconciliation: LoggedExportSuccess;
+      try {
+        reconciliation = await dependencies.reconcileLoggedExportSuccess!({
+          authorization,
+          request: {
+            workerId: identity.workerId,
+            workerEpoch: identity.epoch,
+            deliveryId: delivery.deliveryId,
+            generation: delivery.generation,
+            reservationToken: delivery.reservationToken,
+            result,
+          },
+        });
+      } catch (error) {
+        if (
+          (error as { statusCode?: number }).statusCode !== 409 ||
+          !executionControl ||
+          !executionCredential ||
+          !dependencies.startLoggedExportExecution ||
+          !dependencies.discardCompletedLoggedExportForCancellation ||
+          !dependencies.buildLoggedExportCanceledResult ||
+          !dependencies.reconcileLoggedExportCanceled
+        ) {
+          throw error;
+        }
+        const replay = await dependencies.startLoggedExportExecution({
+          authorization,
+          request: executionCredential,
+        });
+        if (
+          replay.status !== "started" ||
+          replay.execution.executionId !== executionControl.executionId ||
+          !replay.execution.cancelRequestedAt
+        ) {
+          throw error;
+        }
+        await dependencies.discardCompletedLoggedExportForCancellation(
+          command.requestId,
+          "user_requested",
+        );
+        const canceledResult = dependencies.buildLoggedExportCanceledResult(
+          command.requestId,
+        );
+        const canceled = await dependencies.reconcileLoggedExportCanceled({
+          authorization,
+          request: {
+            ...executionCredential,
+            executionId: executionControl.executionId,
+            leaseToken: executionControl.leaseToken,
+            result: canceledResult,
+          },
+        });
+        return ProcessAcceptedLoggedExportResponseSchema.parse({
+          execution: "canceled",
+          canceled,
+        });
+      }
       return ProcessAcceptedLoggedExportResponseSchema.parse({
         execution: execution.status,
         reconciliation,
@@ -574,4 +933,61 @@ export function createLocalAgent(
   }
 
   return app;
+}
+
+function startExecutionHeartbeatLoop(input: {
+  execution: LoggedExportExecution;
+  credential: StartLoggedExportExecutionRequest;
+  authorization: string;
+  controller: AbortController;
+  intervalMs: number;
+  heartbeat: NonNullable<
+    LocalAgentDependencies["heartbeatLoggedExportExecution"]
+  >;
+  persist: NonNullable<
+    LocalAgentDependencies["recordLoggedExecutionHeartbeat"]
+  >;
+}): { stop: () => Promise<void> } {
+  let stopped = false;
+  let chain = Promise.resolve();
+  const interval = Math.max(10, Math.min(input.intervalMs, 10_000));
+  const timer = setInterval(() => {
+    chain = chain.then(async () => {
+      if (stopped || input.controller.signal.aborted) return;
+      try {
+        const response = await input.heartbeat({
+          authorization: input.authorization,
+          request: {
+            ...input.credential,
+            executionId: input.execution.executionId,
+            attempt: input.execution.attempt,
+            leaseToken: input.execution.leaseToken,
+          },
+        });
+        input.persist(response.execution);
+        if (response.execution.cancelRequestedAt) {
+          input.controller.abort(
+            Object.assign(new Error("Export cancellation was requested."), {
+              code: "user_requested",
+            }),
+          );
+        }
+      } catch (error) {
+        input.controller.abort(
+          Object.assign(new Error("Export execution ownership was lost."), {
+            code: "execution_lease_lost",
+            cause: error,
+          }),
+        );
+      }
+    });
+  }, interval);
+  timer.unref?.();
+  return {
+    stop: async () => {
+      stopped = true;
+      clearInterval(timer);
+      await chain;
+    },
+  };
 }

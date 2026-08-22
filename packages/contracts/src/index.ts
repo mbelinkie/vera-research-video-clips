@@ -1987,6 +1987,99 @@ export const AcceptLoggedExportDeliveryRequestSchema = z
   })
   .strict();
 
+const LoggedExportExecutionCredentialSchema = z
+  .object({
+    workerId: IdSchema,
+    workerEpoch: z.number().int().positive(),
+    deliveryId: IdSchema,
+    generation: z.number().int().positive(),
+    reservationToken: IdSchema,
+  })
+  .strict();
+
+export const StartLoggedExportExecutionRequestSchema =
+  LoggedExportExecutionCredentialSchema;
+
+export const LoggedExportExecutionSchema = z
+  .object({
+    executionId: IdSchema,
+    requestId: IdSchema,
+    attempt: z.number().int().positive(),
+    workerId: IdSchema,
+    workerEpoch: z.number().int().positive(),
+    leaseToken: IdSchema,
+    startedAt: UtcTimestampSchema,
+    heartbeatAt: UtcTimestampSchema,
+    expiresAt: UtcTimestampSchema,
+    cancelRequestedAt: UtcTimestampSchema.optional(),
+  })
+  .strict()
+  .superRefine((execution, context) => {
+    const startedAt = Date.parse(execution.startedAt);
+    const heartbeatAt = Date.parse(execution.heartbeatAt);
+    const expiresAt = Date.parse(execution.expiresAt);
+    if (heartbeatAt < startedAt || expiresAt <= heartbeatAt) {
+      context.addIssue({
+        code: "custom",
+        path: ["expiresAt"],
+        message: "Execution heartbeat chronology is invalid.",
+      });
+    }
+    if (
+      execution.cancelRequestedAt &&
+      Date.parse(execution.cancelRequestedAt) > heartbeatAt
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["cancelRequestedAt"],
+        message: "Cancellation cannot be observed after the heartbeat.",
+      });
+    }
+  });
+
+export const StartLoggedExportExecutionResponseSchema = z.discriminatedUnion(
+  "status",
+  [
+    z
+      .object({
+        status: z.literal("started"),
+        execution: LoggedExportExecutionSchema,
+      })
+      .strict(),
+    z
+      .object({
+        status: z.literal("cancel_requested"),
+        cancelRequestedAt: UtcTimestampSchema,
+      })
+      .strict(),
+  ],
+);
+
+export const HeartbeatLoggedExportExecutionRequestSchema =
+  LoggedExportExecutionCredentialSchema.extend({
+    executionId: IdSchema,
+    attempt: z.number().int().positive(),
+    leaseToken: IdSchema,
+  }).strict();
+
+export const HeartbeatLoggedExportExecutionResponseSchema = z
+  .object({
+    execution: LoggedExportExecutionSchema,
+  })
+  .strict();
+
+export const CancelLoggedExportRequestSchema = z
+  .object({ idempotencyKey: z.string().trim().min(1).max(512) })
+  .strict();
+
+export const CancelLoggedExportResponseSchema = z
+  .object({
+    outcome: z.enum(["cancel_requested", "canceled", "already_terminal"]),
+    request: ExportRequestSchema,
+    cancelRequestedAt: UtcTimestampSchema.optional(),
+  })
+  .strict();
+
 export const LoggedExportSuccessResultSchema = z
   .object({
     schemaVersion: z.literal(1),
@@ -2224,6 +2317,19 @@ const LoggedExportFailureMessageSchema = z
   .transform(sanitizeLoggedExportFailureMessage)
   .pipe(z.string().min(1).max(500));
 
+const LoggedExportTerminalSourceCleanupSchema = z.discriminatedUnion(
+  "lifecycle",
+  [
+    z.object({ lifecycle: z.literal("not_started") }).strict(),
+    z
+      .object({
+        lifecycle: z.literal("deleted"),
+        deletedAt: UtcTimestampSchema,
+      })
+      .strict(),
+  ],
+);
+
 export const LoggedExportFailureResultSchema = z
   .object({
     schemaVersion: z.literal(1),
@@ -2238,15 +2344,7 @@ export const LoggedExportFailureResultSchema = z
       })
       .strict(),
     attempt: z.number().int().nonnegative(),
-    sourceCleanup: z.discriminatedUnion("lifecycle", [
-      z.object({ lifecycle: z.literal("not_started") }).strict(),
-      z
-        .object({
-          lifecycle: z.literal("deleted"),
-          deletedAt: UtcTimestampSchema,
-        })
-        .strict(),
-    ]),
+    sourceCleanup: LoggedExportTerminalSourceCleanupSchema,
   })
   .strict()
   .superRefine((result, context) => {
@@ -2287,6 +2385,99 @@ export const LoggedExportFailureSchema = z
   })
   .strict();
 
+export const LoggedExportCanceledResultSchema = z
+  .object({
+    schemaVersion: z.literal(1),
+    requestId: IdSchema,
+    jobId: IdSchema,
+    projectId: IdSchema,
+    clipId: IdSchema,
+    reason: z.enum(["user_requested", "execution_lease_lost"]),
+    attempt: z.number().int().nonnegative(),
+    sourceCleanup: LoggedExportTerminalSourceCleanupSchema,
+    executionId: IdSchema.optional(),
+    executionAttempt: z.number().int().positive().optional(),
+  })
+  .strict()
+  .superRefine((result, context) => {
+    if (
+      (result.attempt === 0) !==
+        (result.sourceCleanup.lifecycle === "not_started") ||
+      Boolean(result.executionId) !== Boolean(result.executionAttempt)
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["sourceCleanup"],
+        message:
+          "Cancellation execution provenance is all-or-none; source attempt zero is not-started.",
+      });
+    }
+    if (
+      result.attempt > 0 &&
+      (!result.executionId || result.executionAttempt !== result.attempt)
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["executionAttempt"],
+        message:
+          "A started cancellation must match its exact execution attempt.",
+      });
+    }
+  });
+
+export const ReconcileLoggedExportCanceledRequestSchema =
+  LoggedExportExecutionCredentialSchema.extend({
+    executionId: IdSchema.optional(),
+    leaseToken: IdSchema.optional(),
+    result: LoggedExportCanceledResultSchema,
+  })
+    .strict()
+    .superRefine((request, context) => {
+      if (
+        Boolean(request.executionId) !== Boolean(request.leaseToken) ||
+        Boolean(request.executionId) !== Boolean(request.result.executionId) ||
+        (request.executionId &&
+          request.executionId !== request.result.executionId)
+      ) {
+        context.addIssue({
+          code: "custom",
+          path: ["executionId"],
+          message: "Canceled execution credentials must be complete and exact.",
+        });
+      }
+    });
+
+export const LoggedExportCanceledSchema = z
+  .object({
+    id: IdSchema,
+    deliveryId: IdSchema.optional(),
+    generation: z.number().int().positive().optional(),
+    workerId: IdSchema.optional(),
+    workerEpoch: z.number().int().positive().optional(),
+    result: LoggedExportCanceledResultSchema,
+    resultFingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+    reconciledAt: UtcTimestampSchema,
+  })
+  .strict()
+  .superRefine((result, context) => {
+    const deliveryFields = [
+      result.deliveryId,
+      result.generation,
+      result.workerId,
+      result.workerEpoch,
+    ];
+    if (
+      deliveryFields.some(Boolean) &&
+      !deliveryFields.every((value) => value !== undefined)
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["deliveryId"],
+        message: "Canceled delivery provenance is all-or-none.",
+      });
+    }
+  });
+
 export const ProcessAcceptedLoggedExportRequestSchema = z
   .object({
     requestId: IdSchema,
@@ -2305,6 +2496,12 @@ export const ProcessAcceptedLoggedExportResponseSchema = z.union([
     .object({
       execution: z.literal("failed"),
       failure: LoggedExportFailureSchema,
+    })
+    .strict(),
+  z
+    .object({
+      execution: z.literal("canceled"),
+      canceled: LoggedExportCanceledSchema,
     })
     .strict(),
 ]);
@@ -2550,6 +2747,25 @@ export type ClaimLoggedExportDeliveryResponse = z.infer<
 export type AcceptLoggedExportDeliveryRequest = z.infer<
   typeof AcceptLoggedExportDeliveryRequestSchema
 >;
+export type StartLoggedExportExecutionRequest = z.infer<
+  typeof StartLoggedExportExecutionRequestSchema
+>;
+export type LoggedExportExecution = z.infer<typeof LoggedExportExecutionSchema>;
+export type StartLoggedExportExecutionResponse = z.infer<
+  typeof StartLoggedExportExecutionResponseSchema
+>;
+export type HeartbeatLoggedExportExecutionRequest = z.infer<
+  typeof HeartbeatLoggedExportExecutionRequestSchema
+>;
+export type HeartbeatLoggedExportExecutionResponse = z.infer<
+  typeof HeartbeatLoggedExportExecutionResponseSchema
+>;
+export type CancelLoggedExportRequest = z.infer<
+  typeof CancelLoggedExportRequestSchema
+>;
+export type CancelLoggedExportResponse = z.infer<
+  typeof CancelLoggedExportResponseSchema
+>;
 export type LoggedExportSuccessResult = z.infer<
   typeof LoggedExportSuccessResultSchema
 >;
@@ -2564,6 +2780,13 @@ export type ReconcileLoggedExportFailureRequest = z.infer<
   typeof ReconcileLoggedExportFailureRequestSchema
 >;
 export type LoggedExportFailure = z.infer<typeof LoggedExportFailureSchema>;
+export type LoggedExportCanceledResult = z.infer<
+  typeof LoggedExportCanceledResultSchema
+>;
+export type ReconcileLoggedExportCanceledRequest = z.infer<
+  typeof ReconcileLoggedExportCanceledRequestSchema
+>;
+export type LoggedExportCanceled = z.infer<typeof LoggedExportCanceledSchema>;
 export type ProcessAcceptedLoggedExportRequest = z.infer<
   typeof ProcessAcceptedLoggedExportRequestSchema
 >;

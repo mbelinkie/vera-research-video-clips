@@ -79,6 +79,7 @@ export class LocalExportSourceProcessor {
     requestId: string;
     authorizationConfirmed: boolean;
     signal?: AbortSignal;
+    requireLoggedExecution?: boolean;
   }): Promise<void> {
     const request = this.queue.get(input.requestId);
     if (!request) {
@@ -94,7 +95,10 @@ export class LocalExportSourceProcessor {
         "This export request is missing its immutable resolved settings snapshot. Recreate the request before retrying.",
         { code: "resolved_export_settings_missing", retryable: false },
       );
-      this.queue.recordSourceNotStartedFailure(
+      recordNotStartedOutcome(
+        this.queue,
+        request,
+        input.signal,
         input.requestId,
         error.code,
         error.message,
@@ -111,7 +115,10 @@ export class LocalExportSourceProcessor {
           .join(" ")}`,
         { code: settingsIssues[0]!.code, retryable: false },
       );
-      this.queue.recordSourceNotStartedFailure(
+      recordNotStartedOutcome(
+        this.queue,
+        request,
+        input.signal,
         input.requestId,
         error.code,
         error.message,
@@ -134,7 +141,10 @@ export class LocalExportSourceProcessor {
         });
       }
     } catch (error) {
-      this.queue.recordSourceNotStartedFailure(
+      recordNotStartedOutcome(
+        this.queue,
+        request,
+        input.signal,
         input.requestId,
         errorCode(error),
         safeErrorMessage(error),
@@ -149,7 +159,10 @@ export class LocalExportSourceProcessor {
         resolvedSettingsSnapshot.settings,
       );
     } catch (error) {
-      this.queue.recordSourceNotStartedFailure(
+      recordNotStartedOutcome(
+        this.queue,
+        request,
+        input.signal,
         input.requestId,
         errorCode(error),
         safeErrorMessage(error),
@@ -161,7 +174,10 @@ export class LocalExportSourceProcessor {
         "Full-source acquisition is disabled. Configure EXPORT_SOURCE_PROVIDER before retrying.",
         { code: "export_source_provider_unconfigured", retryable: true },
       );
-      this.queue.recordSourceNotStartedFailure(
+      recordNotStartedOutcome(
+        this.queue,
+        request,
+        input.signal,
         input.requestId,
         error.code,
         error.message,
@@ -173,7 +189,10 @@ export class LocalExportSourceProcessor {
         "Confirm authorization to process this source before acquisition.",
         { code: "source_authorization_required", retryable: true },
       );
-      this.queue.recordSourceNotStartedFailure(
+      recordNotStartedOutcome(
+        this.queue,
+        request,
+        input.signal,
         input.requestId,
         error.code,
         error.message,
@@ -183,14 +202,21 @@ export class LocalExportSourceProcessor {
     try {
       assertSupportedExportRenderSettings(resolvedSettingsSnapshot.settings);
     } catch (error) {
-      this.queue.recordSourceNotStartedFailure(
+      recordNotStartedOutcome(
+        this.queue,
+        request,
+        input.signal,
         input.requestId,
         errorCode(error),
         safeErrorMessage(error),
       );
       throw error;
     }
-    const started = this.queue.beginSourceAcquisition(input.requestId);
+    const started = this.queue.beginSourceAcquisition(input.requestId, {
+      ...(input.requireLoggedExecution === undefined
+        ? {}
+        : { requireLoggedExecution: input.requireLoggedExecution }),
+    });
 
     try {
       return await withExportSourceScratch({
@@ -395,16 +421,57 @@ export class LocalExportSourceProcessor {
       });
     } catch (error) {
       if (errorCode(error) !== "source_cleanup_failed") {
-        this.queue.recordSourceAttemptFailure(
-          started.request.jobId,
-          started.attempt,
-          errorCode(error),
-          safeErrorMessage(error),
-        );
+        if (
+          input.signal?.aborted &&
+          started.request.mode === "logged" &&
+          this.queue.getLoggedExecution(started.request.id)
+        ) {
+          this.queue.recordSourceAttemptCanceled(
+            started.request.jobId,
+            started.attempt,
+            abortReason(input.signal),
+          );
+        } else {
+          this.queue.recordSourceAttemptFailure(
+            started.request.jobId,
+            started.attempt,
+            errorCode(error),
+            safeErrorMessage(error),
+          );
+        }
       }
       throw error;
     }
   }
+}
+
+function recordNotStartedOutcome(
+  queue: LocalExportQueue,
+  request: ExportRequest,
+  signal: AbortSignal | undefined,
+  requestId: string,
+  code: string,
+  message: string,
+) {
+  if (request.mode === "logged" && signal?.aborted) {
+    const execution = queue.getLoggedExecution(requestId);
+    queue.recordLoggedExportNotStartedCancellation(
+      requestId,
+      abortReason(signal),
+      execution?.cancelRequestedAt,
+    );
+    return;
+  }
+  queue.recordSourceNotStartedFailure(requestId, code, message);
+}
+
+function abortReason(
+  signal: AbortSignal,
+): "user_requested" | "execution_lease_lost" {
+  const reason = signal.reason as { code?: unknown } | undefined;
+  return reason?.code === "user_requested"
+    ? "user_requested"
+    : "execution_lease_lost";
 }
 
 type RequiredSubtitlePlan = {

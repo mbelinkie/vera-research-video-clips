@@ -6,6 +6,7 @@ import type { SharedProjectCatalog } from "@research-video/catalog";
 import {
   AddProjectMemberRequestSchema,
   AcceptLoggedExportDeliveryRequestSchema,
+  CancelLoggedExportRequestSchema,
   AddProjectVideoRequestSchema,
   BatchPreflightRequestSchema,
   BatchPreflightResponseSchema,
@@ -37,8 +38,11 @@ import {
   HeartbeatExportWorkerRequestSchema,
   RegisterExportWorkerRequestSchema,
   ReconcileLoggedExportFailureRequestSchema,
+  ReconcileLoggedExportCanceledRequestSchema,
   ReconcileLoggedExportSuccessRequestSchema,
   RetryLoggedExportRequestSchema,
+  StartLoggedExportExecutionRequestSchema,
+  HeartbeatLoggedExportExecutionRequestSchema,
   RevokeExportWorkerRequestSchema,
   type AuthenticatedActor,
   type BatchOptions,
@@ -179,6 +183,20 @@ export function createCloudApi(
     ),
   );
 
+  app.post("/api/export-deliveries/execution/start", async (request) =>
+    catalog.startLoggedExportExecution(
+      await authenticate(request),
+      StartLoggedExportExecutionRequestSchema.parse(request.body),
+    ),
+  );
+
+  app.post("/api/export-deliveries/execution/heartbeat", async (request) =>
+    catalog.heartbeatLoggedExportExecution(
+      await authenticate(request),
+      HeartbeatLoggedExportExecutionRequestSchema.parse(request.body),
+    ),
+  );
+
   app.post("/api/export-deliveries/reconcile-success", async (request) =>
     catalog.reconcileLoggedExportSuccess(
       await authenticate(request),
@@ -191,6 +209,28 @@ export function createCloudApi(
       await authenticate(request),
       ReconcileLoggedExportFailureRequestSchema.parse(request.body),
     ),
+  );
+
+  app.post("/api/export-deliveries/reconcile-canceled", async (request) =>
+    catalog.reconcileLoggedExportCanceled(
+      await authenticate(request),
+      ReconcileLoggedExportCanceledRequestSchema.parse(request.body),
+    ),
+  );
+
+  app.post(
+    "/api/projects/:projectId/export-requests/:requestId/cancel",
+    async (request) => {
+      const { projectId, requestId } = ProjectExportRequestParamsSchema.parse(
+        request.params,
+      );
+      return catalog.cancelLoggedExport(
+        await authenticate(request),
+        projectId,
+        requestId,
+        CancelLoggedExportRequestSchema.parse(request.body),
+      );
+    },
   );
 
   app.post(

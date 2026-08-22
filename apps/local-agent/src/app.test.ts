@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   HealthResponseSchema,
   type LoggedExportDelivery,
+  type LoggedExportCanceledResult,
   type LoggedExportFailureResult,
   type LoggedExportSuccessResult,
 } from "@research-video/contracts";
@@ -647,6 +648,83 @@ describe("local agent", () => {
     );
   });
 
+  it("replays persisted canceled evidence without restarting or extending its lost lease", async () => {
+    const delivery = acceptedLoggedDeliveryFixture();
+    const identity = {
+      workerId: delivery.workerId,
+      epoch: delivery.workerEpoch + 1,
+      advertisementFingerprint: "a".repeat(64),
+      createdAt: delivery.reservedAt,
+      updatedAt: delivery.reservedAt,
+    };
+    const execution = {
+      executionId: "019fbb95-cd76-7920-93fa-e23ba755ee8a",
+      requestId: delivery.request.id,
+      attempt: 1,
+      workerId: delivery.workerId,
+      workerEpoch: delivery.workerEpoch,
+      leaseToken: "019fbb95-cd76-7920-93fa-e23ba755ee8b",
+      startedAt: "2026-08-20T12:00:10.000Z",
+      heartbeatAt: "2026-08-20T12:00:11.000Z",
+      expiresAt: "2026-08-20T12:00:41.000Z",
+    };
+    const result = {
+      ...localCanceledResultFixture(delivery, 1, execution.executionId),
+      reason: "execution_lease_lost" as const,
+    };
+    const canceled = {
+      id: "019fbb95-cd76-7920-93fa-e23ba755ee8c",
+      deliveryId: delivery.deliveryId,
+      generation: delivery.generation,
+      workerId: delivery.workerId,
+      workerEpoch: delivery.workerEpoch,
+      result,
+      resultFingerprint: "f".repeat(64),
+      reconciledAt: "2026-08-20T12:01:00.000Z",
+    };
+    const unavailable = Object.assign(new Error("cloud unavailable"), {
+      statusCode: 503,
+    });
+    const reconcile = vi
+      .fn()
+      .mockRejectedValueOnce(unavailable)
+      .mockResolvedValueOnce(canceled);
+    const run = vi.fn();
+    const start = vi.fn();
+    const app = createLocalAgent({
+      workerIdentity: {
+        get: () => identity,
+        prepareRegistration: () => identity,
+      },
+      getAcceptedLoggedDelivery: () => delivery,
+      buildLoggedExportSuccessResult: () => localSuccessResultFixture(delivery),
+      runLoggedExportOnce: run,
+      reconcileLoggedExportSuccess: vi.fn(),
+      buildLoggedExportCanceledResult: () => result,
+      getLoggedExecution: () => execution,
+      reconcileLoggedExportCanceled: reconcile,
+      startLoggedExportExecution: start,
+    });
+    apps.add(app);
+    const command = {
+      method: "POST" as const,
+      url: "/api/export-deliveries/process",
+      headers: { authorization: "Bearer fixture" },
+      payload: {
+        requestId: delivery.request.id,
+        authorizationConfirmed: true,
+      },
+    };
+    expect((await app.inject(command)).statusCode).toBe(503);
+    const recovered = await app.inject(command);
+    expect(recovered.statusCode).toBe(200);
+    expect(recovered.json()).toMatchObject({ execution: "canceled" });
+    expect(reconcile).toHaveBeenCalledTimes(2);
+    expect(reconcile.mock.calls[0]![0]).toEqual(reconcile.mock.calls[1]![0]);
+    expect(run).not.toHaveBeenCalled();
+    expect(start).not.toHaveBeenCalled();
+  });
+
   it("builds a new failure only from persisted state and never executes old accepted work at a newer epoch", async () => {
     const delivery = acceptedLoggedDeliveryFixture();
     const result = localFailureResultFixture(delivery);
@@ -799,6 +877,379 @@ describe("local agent", () => {
     });
     expect(run).not.toHaveBeenCalled();
     expect(reconcileFailure).not.toHaveBeenCalled();
+  });
+
+  it("settles accepted cancellation before local execution without invoking the processor", async () => {
+    const delivery = acceptedLoggedDeliveryFixture();
+    const identity = {
+      workerId: delivery.workerId,
+      epoch: delivery.workerEpoch,
+      advertisementFingerprint: "a".repeat(64),
+      createdAt: delivery.reservedAt,
+      updatedAt: delivery.reservedAt,
+    };
+    const canceledResult = localCanceledResultFixture(delivery, 0);
+    const canceled = {
+      id: "019fbb95-cd76-7920-93fa-e23ba755ee83",
+      deliveryId: delivery.deliveryId,
+      generation: delivery.generation,
+      workerId: delivery.workerId,
+      workerEpoch: delivery.workerEpoch,
+      result: canceledResult,
+      resultFingerprint: "c".repeat(64),
+      reconciledAt: "2026-08-20T12:00:20.000Z",
+    };
+    const run = vi.fn();
+    let cancellationRecorded = false;
+    const record = vi.fn(() => {
+      cancellationRecorded = true;
+    });
+    const reconcile = vi.fn(async () => canceled);
+    const app = createLocalAgent({
+      workerIdentity: {
+        get: () => identity,
+        prepareRegistration: () => identity,
+      },
+      getAcceptedLoggedDelivery: () => delivery,
+      buildLoggedExportSuccessResult: () => localSuccessResultFixture(delivery),
+      runLoggedExportOnce: run,
+      reconcileLoggedExportSuccess: vi.fn(),
+      startLoggedExportExecution: vi.fn(async () => ({
+        status: "cancel_requested" as const,
+        cancelRequestedAt: "2026-08-20T12:00:15.000Z",
+      })),
+      heartbeatLoggedExportExecution: vi.fn(),
+      activateLoggedExecution: vi.fn(),
+      recordLoggedExecutionHeartbeat: vi.fn(),
+      recordLoggedExportNotStartedCancellation: record,
+      buildLoggedExportCanceledResult: () => {
+        if (!cancellationRecorded) throw cancellationNotRecorded();
+        return canceledResult;
+      },
+      reconcileLoggedExportCanceled: reconcile,
+    });
+    apps.add(app);
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/export-deliveries/process",
+      headers: { authorization: "Bearer fixture" },
+      payload: {
+        requestId: delivery.request.id,
+        authorizationConfirmed: true,
+      },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({ execution: "canceled" });
+    expect(record).toHaveBeenCalledWith(
+      delivery.request.id,
+      "user_requested",
+      "2026-08-20T12:00:15.000Z",
+    );
+    expect(run).not.toHaveBeenCalled();
+    expect(JSON.stringify(response.json())).not.toMatch(
+      /leaseToken|reservationToken|Bearer fixture|\/private\//i,
+    );
+  });
+
+  it("aborts the active executor when a heartbeat observes cancel intent", async () => {
+    const delivery = acceptedLoggedDeliveryFixture();
+    const identity = {
+      workerId: delivery.workerId,
+      epoch: delivery.workerEpoch,
+      advertisementFingerprint: "a".repeat(64),
+      createdAt: delivery.reservedAt,
+      updatedAt: delivery.reservedAt,
+    };
+    const execution = {
+      executionId: "019fbb95-cd76-7920-93fa-e23ba755ee84",
+      requestId: delivery.request.id,
+      attempt: 1,
+      workerId: delivery.workerId,
+      workerEpoch: delivery.workerEpoch,
+      leaseToken: "019fbb95-cd76-7920-93fa-e23ba755ee85",
+      startedAt: "2026-08-20T12:00:10.000Z",
+      heartbeatAt: "2026-08-20T12:00:11.000Z",
+      expiresAt: "2026-08-20T12:00:41.000Z",
+    };
+    const heartbeatExecution = {
+      ...execution,
+      heartbeatAt: "2026-08-20T12:00:15.000Z",
+      expiresAt: "2026-08-20T12:00:45.000Z",
+      cancelRequestedAt: "2026-08-20T12:00:14.000Z",
+    };
+    const result = localCanceledResultFixture(
+      delivery,
+      1,
+      execution.executionId,
+    );
+    let cancellationRecorded = false;
+    const run = vi.fn(async (input: { signal?: AbortSignal }) => {
+      await new Promise<void>((resolve) =>
+        input.signal!.addEventListener("abort", () => resolve(), {
+          once: true,
+        }),
+      );
+      cancellationRecorded = true;
+      return {
+        requestId: delivery.request.id,
+        status: "canceled" as const,
+        state: "canceled",
+      };
+    });
+    const reconcile = vi.fn(async () => ({
+      id: "019fbb95-cd76-7920-93fa-e23ba755ee86",
+      deliveryId: delivery.deliveryId,
+      generation: delivery.generation,
+      workerId: delivery.workerId,
+      workerEpoch: delivery.workerEpoch,
+      result,
+      resultFingerprint: "d".repeat(64),
+      reconciledAt: "2026-08-20T12:00:16.000Z",
+    }));
+    const persist = vi.fn();
+    const app = createLocalAgent({
+      workerIdentity: {
+        get: () => identity,
+        prepareRegistration: () => identity,
+      },
+      getAcceptedLoggedDelivery: () => delivery,
+      buildLoggedExportSuccessResult: () => localSuccessResultFixture(delivery),
+      runLoggedExportOnce: run,
+      reconcileLoggedExportSuccess: vi.fn(),
+      startLoggedExportExecution: vi.fn(async () => ({
+        status: "started" as const,
+        execution,
+      })),
+      heartbeatLoggedExportExecution: vi.fn(async () => ({
+        execution: heartbeatExecution,
+      })),
+      activateLoggedExecution: vi.fn(() => execution),
+      recordLoggedExecutionHeartbeat: persist,
+      recordLoggedExportNotStartedCancellation: vi.fn(),
+      buildLoggedExportCanceledResult: () => {
+        if (!cancellationRecorded) throw cancellationNotRecorded();
+        return result;
+      },
+      getLoggedExecution: () => execution,
+      reconcileLoggedExportCanceled: reconcile,
+      executionHeartbeatIntervalMs: 10,
+    });
+    apps.add(app);
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/export-deliveries/process",
+      headers: { authorization: "Bearer fixture" },
+      payload: {
+        requestId: delivery.request.id,
+        authorizationConfirmed: true,
+      },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({ execution: "canceled" });
+    expect(run.mock.calls[0]![0]).toMatchObject({
+      requireLoggedExecution: true,
+    });
+    expect(
+      (run.mock.calls[0]![0] as { signal: AbortSignal }).signal.aborted,
+    ).toBe(true);
+    expect(persist).toHaveBeenCalledWith(heartbeatExecution);
+    expect(reconcile).toHaveBeenCalledTimes(1);
+  });
+
+  it("lets observed cancellation replace a cleaned local failure before cloud failure commits", async () => {
+    const delivery = acceptedLoggedDeliveryFixture();
+    const identity = {
+      workerId: delivery.workerId,
+      epoch: delivery.workerEpoch,
+      advertisementFingerprint: "a".repeat(64),
+      createdAt: delivery.reservedAt,
+      updatedAt: delivery.reservedAt,
+    };
+    const execution = {
+      executionId: "019fbb95-cd76-7920-93fa-e23ba755ee8d",
+      requestId: delivery.request.id,
+      attempt: 1,
+      workerId: delivery.workerId,
+      workerEpoch: delivery.workerEpoch,
+      leaseToken: "019fbb95-cd76-7920-93fa-e23ba755ee8e",
+      startedAt: "2026-08-20T12:00:10.000Z",
+      heartbeatAt: "2026-08-20T12:00:11.000Z",
+      expiresAt: "2026-08-20T12:00:41.000Z",
+    };
+    const heartbeatExecution = {
+      ...execution,
+      heartbeatAt: "2026-08-20T12:00:15.000Z",
+      expiresAt: "2026-08-20T12:00:45.000Z",
+      cancelRequestedAt: "2026-08-20T12:00:14.000Z",
+    };
+    const result = localCanceledResultFixture(
+      delivery,
+      1,
+      execution.executionId,
+    );
+    let converted = false;
+    const convert = vi.fn(() => {
+      converted = true;
+    });
+    const reconcile = vi.fn(async () => ({
+      id: "019fbb95-cd76-7920-93fa-e23ba755ee8f",
+      deliveryId: delivery.deliveryId,
+      generation: delivery.generation,
+      workerId: delivery.workerId,
+      workerEpoch: delivery.workerEpoch,
+      result,
+      resultFingerprint: "9".repeat(64),
+      reconciledAt: "2026-08-20T12:00:16.000Z",
+    }));
+    const app = createLocalAgent({
+      workerIdentity: {
+        get: () => identity,
+        prepareRegistration: () => identity,
+      },
+      getAcceptedLoggedDelivery: () => delivery,
+      buildLoggedExportSuccessResult: () => localSuccessResultFixture(delivery),
+      runLoggedExportOnce: vi.fn(async () => ({
+        requestId: delivery.request.id,
+        status: "failed" as const,
+        state: "needs_user_action",
+        error: { code: "renderer_failed", message: "Renderer failed." },
+      })),
+      reconcileLoggedExportSuccess: vi.fn(),
+      startLoggedExportExecution: vi.fn(async () => ({
+        status: "started" as const,
+        execution,
+      })),
+      heartbeatLoggedExportExecution: vi.fn(async () => ({
+        execution: heartbeatExecution,
+      })),
+      activateLoggedExecution: vi.fn(() => execution),
+      recordLoggedExecutionHeartbeat: vi.fn(),
+      recordLoggedExportNotStartedCancellation: vi.fn(),
+      recordLoggedExportPersistedFailureCancellation: convert,
+      buildLoggedExportCanceledResult: () => {
+        if (!converted) throw cancellationNotRecorded();
+        return result;
+      },
+      getLoggedExecution: () => execution,
+      reconcileLoggedExportCanceled: reconcile,
+    });
+    apps.add(app);
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/export-deliveries/process",
+      headers: { authorization: "Bearer fixture" },
+      payload: {
+        requestId: delivery.request.id,
+        authorizationConfirmed: true,
+      },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({ execution: "canceled" });
+    expect(convert).toHaveBeenCalledWith(
+      delivery.request.id,
+      "user_requested",
+      undefined,
+    );
+    expect(reconcile).toHaveBeenCalledTimes(1);
+  });
+
+  it("discards only the exact completed package when cancellation wins the cloud commit race", async () => {
+    const delivery = acceptedLoggedDeliveryFixture();
+    const identity = {
+      workerId: delivery.workerId,
+      epoch: delivery.workerEpoch,
+      advertisementFingerprint: "a".repeat(64),
+      createdAt: delivery.reservedAt,
+      updatedAt: delivery.reservedAt,
+    };
+    const execution = {
+      executionId: "019fbb95-cd76-7920-93fa-e23ba755ee87",
+      requestId: delivery.request.id,
+      attempt: 1,
+      workerId: delivery.workerId,
+      workerEpoch: delivery.workerEpoch,
+      leaseToken: "019fbb95-cd76-7920-93fa-e23ba755ee88",
+      startedAt: "2026-08-20T12:00:10.000Z",
+      heartbeatAt: "2026-08-20T12:00:11.000Z",
+      expiresAt: "2026-08-20T12:00:41.000Z",
+    };
+    const canceledExecution = {
+      ...execution,
+      heartbeatAt: "2026-08-20T12:00:16.000Z",
+      expiresAt: "2026-08-20T12:00:46.000Z",
+      cancelRequestedAt: "2026-08-20T12:00:15.000Z",
+    };
+    const canceledResult = localCanceledResultFixture(
+      delivery,
+      1,
+      execution.executionId,
+    );
+    const start = vi
+      .fn()
+      .mockResolvedValueOnce({ status: "started", execution })
+      .mockResolvedValueOnce({
+        status: "started",
+        execution: canceledExecution,
+      });
+    let discarded = false;
+    const discard = vi.fn(async () => {
+      discarded = true;
+    });
+    const reconcileCanceled = vi.fn(async () => ({
+      id: "019fbb95-cd76-7920-93fa-e23ba755ee89",
+      deliveryId: delivery.deliveryId,
+      generation: delivery.generation,
+      workerId: delivery.workerId,
+      workerEpoch: delivery.workerEpoch,
+      result: canceledResult,
+      resultFingerprint: "e".repeat(64),
+      reconciledAt: "2026-08-20T12:00:17.000Z",
+    }));
+    const app = createLocalAgent({
+      workerIdentity: {
+        get: () => identity,
+        prepareRegistration: () => identity,
+      },
+      getAcceptedLoggedDelivery: () => delivery,
+      buildLoggedExportSuccessResult: () => localSuccessResultFixture(delivery),
+      runLoggedExportOnce: vi.fn(async () => ({
+        requestId: delivery.request.id,
+        status: "complete" as const,
+        state: "complete",
+      })),
+      reconcileLoggedExportSuccess: vi.fn(async () => {
+        throw Object.assign(new Error("cancellation intent won"), {
+          statusCode: 409,
+        });
+      }),
+      startLoggedExportExecution: start,
+      heartbeatLoggedExportExecution: vi.fn(async () => ({ execution })),
+      activateLoggedExecution: vi.fn(() => execution),
+      recordLoggedExecutionHeartbeat: vi.fn(),
+      recordLoggedExportNotStartedCancellation: vi.fn(),
+      buildLoggedExportCanceledResult: () => {
+        if (!discarded) throw cancellationNotRecorded();
+        return canceledResult;
+      },
+      getLoggedExecution: () => execution,
+      discardCompletedLoggedExportForCancellation: discard,
+      reconcileLoggedExportCanceled: reconcileCanceled,
+    });
+    apps.add(app);
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/export-deliveries/process",
+      headers: { authorization: "Bearer fixture" },
+      payload: {
+        requestId: delivery.request.id,
+        authorizationConfirmed: true,
+      },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({ execution: "canceled" });
+    expect(start).toHaveBeenCalledTimes(2);
+    expect(discard).toHaveBeenCalledWith(delivery.request.id, "user_requested");
+    expect(reconcileCanceled).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -1013,4 +1464,34 @@ function localFailureResultFixture(
     attempt: 0,
     sourceCleanup: { lifecycle: "not_started" },
   };
+}
+
+function localCanceledResultFixture(
+  delivery: LoggedExportDelivery,
+  attempt: number,
+  executionId?: string,
+): LoggedExportCanceledResult {
+  return {
+    schemaVersion: 1,
+    requestId: delivery.request.id,
+    jobId: delivery.request.jobId,
+    projectId: delivery.request.projectId!,
+    clipId: delivery.request.clipId!,
+    reason: "user_requested",
+    attempt,
+    sourceCleanup:
+      attempt === 0
+        ? { lifecycle: "not_started" }
+        : {
+            lifecycle: "deleted",
+            deletedAt: "2026-08-20T12:00:15.000Z",
+          },
+    ...(executionId ? { executionId, executionAttempt: attempt } : {}),
+  };
+}
+
+function cancellationNotRecorded() {
+  return Object.assign(new Error("Cancellation is not recorded."), {
+    code: "logged_export_cancellation_not_recorded",
+  });
 }

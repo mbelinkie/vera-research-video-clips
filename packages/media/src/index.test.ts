@@ -1,4 +1,11 @@
-import { chmod, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import {
+  access,
+  chmod,
+  mkdtemp,
+  readdir,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -14,6 +21,7 @@ import {
   FfmpegRenderError,
   FfprobeJpegThumbnailInspector,
   FfprobeMediaInspector,
+  SpawnMediaCommandRunner,
   YtDlpAudioAcquisitionProvider,
   YtDlpFullSourceAcquisitionProvider,
   createMediaAcquisitionProvider,
@@ -24,6 +32,43 @@ import {
   type MediaCommandRunner,
   withExportSourceScratch,
 } from "./index.ts";
+
+async function waitForFile(path: string): Promise<void> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    try {
+      await access(path);
+      return;
+    } catch {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  }
+  throw new Error("Child process did not report readiness.");
+}
+
+describe("SpawnMediaCommandRunner", () => {
+  it("waits for an aborted real child process to terminate, escalating when SIGTERM is ignored", async () => {
+    const root = await mkdtemp(join(tmpdir(), "media-command-abort-"));
+    const ready = join(root, "ready");
+    const controller = new AbortController();
+    const runner = new SpawnMediaCommandRunner();
+    const command = runner.run(
+      process.execPath,
+      [
+        "-e",
+        "require('node:fs').writeFileSync(process.argv[1], 'ready'); process.on('SIGTERM', () => {}); setInterval(() => {}, 1000);",
+        ready,
+      ],
+      { signal: controller.signal, timeoutMs: 10_000 },
+    );
+    try {
+      await waitForFile(ready);
+      controller.abort(new Error("fixture cancellation"));
+      await expect(command).rejects.toThrow("canceled and terminated");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 5_000);
+});
 
 describe("FfprobeMediaInspector", () => {
   it("uses bounded argument arrays and parses only safe media provenance", async () => {

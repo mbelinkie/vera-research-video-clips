@@ -51,6 +51,7 @@ describe("cloud migrations", () => {
       "0014_logged_export_success_results",
       "0015_logged_export_failure_results",
       "0016_logged_export_retry_lineage",
+      "0017_logged_export_safe_cancellation",
     ]);
     expect(await runCloudMigrations(database)).toEqual([]);
     const result = await database.query<{ table_name: string }>(
@@ -99,6 +100,21 @@ describe("cloud migrations", () => {
          )`,
     );
     expect(retryColumns.rows).toHaveLength(3);
+    const cancellationTables = await database.query<{ table_name: string }>(
+      `SELECT table_name FROM information_schema.tables
+       WHERE table_name IN (
+         'logged_export_cancel_intents', 'logged_export_executions',
+         'logged_export_canceled_results'
+       )`,
+    );
+    expect(cancellationTables.rows).toHaveLength(3);
+    const clipStatusConstraints = await database.query<{ definition: string }>(
+      `SELECT pg_get_constraintdef(oid) AS definition
+       FROM pg_constraint
+       WHERE conrelid = 'clip_candidates'::regclass
+         AND conname = 'clip_candidates_export_status_check'`,
+    );
+    expect(clipStatusConstraints.rows[0]!.definition).toContain("'canceled'");
   });
 
   it("backfills immutable legacy request/job snapshots from the 0010 schema", async () => {
@@ -365,6 +381,36 @@ describe("cloud migrations", () => {
         )
       ).rows[0],
     ).toEqual(before);
+    copyFileSync(
+      resolve(
+        cloudMigrationDirectory,
+        "0017_logged_export_safe_cancellation.sql",
+      ),
+      join(migrations, "0017_logged_export_safe_cancellation.sql"),
+    );
+    expect(await runCloudMigrations(database, migrations)).toEqual([
+      "0017_logged_export_safe_cancellation",
+    ]);
+    expect(
+      (
+        await database.query(
+          "SELECT * FROM registered_export_workers WHERE id = $1",
+          [workerId],
+        )
+      ).rows[0],
+    ).toEqual(before);
+    expect(
+      (
+        await database.query<{ count: string }>(
+          `SELECT count(*)::text AS count
+           FROM information_schema.tables
+           WHERE table_name IN (
+             'logged_export_cancel_intents', 'logged_export_executions',
+             'logged_export_canceled_results'
+           )`,
+        )
+      ).rows[0]!.count,
+    ).toBe("3");
   });
 
   it("enforces preset ownership, scope names, fixed defaults, and immutable revisions", async () => {

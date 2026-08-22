@@ -1,4 +1,5 @@
-import { join } from "node:path";
+import { lstat, rm } from "node:fs/promises";
+import { join, resolve, sep } from "node:path";
 
 import { loadConfig, type AppConfig } from "@research-video/config";
 import {
@@ -25,7 +26,7 @@ import { LocalExportSourceProcessor } from "./export-source.ts";
 
 export type LocalExportOnceResult = {
   requestId: string;
-  status: "complete" | "already_complete" | "failed";
+  status: "complete" | "already_complete" | "failed" | "canceled";
   state: string;
   packageIdentity?: string;
   artifacts?: readonly {
@@ -53,7 +54,12 @@ export type LocalExportRuntimeDependencies = {
  * M5 lifecycle and all cleanup before this returns.
  */
 export async function runLocalExportOnce(
-  input: { requestId: string; authorizationConfirmed: boolean },
+  input: {
+    requestId: string;
+    authorizationConfirmed: boolean;
+    signal?: AbortSignal;
+    requireLoggedExecution?: boolean;
+  },
   dependencies: LocalExportRuntimeDependencies,
 ): Promise<LocalExportOnceResult> {
   const request = dependencies.queue.get(input.requestId);
@@ -64,6 +70,13 @@ export async function runLocalExportOnce(
     });
   }
   if (request.state === "complete") return completedResult(request, true);
+  if (request.state === "canceled") {
+    return {
+      requestId: request.id,
+      status: "canceled",
+      state: request.state,
+    };
+  }
 
   const processor = new LocalExportSourceProcessor(
     dependencies.queue,
@@ -88,6 +101,13 @@ export async function runLocalExportOnce(
     return completedResult(completed, false);
   } catch (error) {
     const persisted = dependencies.queue.get(input.requestId);
+    if (persisted?.state === "canceled") {
+      return {
+        requestId: input.requestId,
+        status: "canceled",
+        state: persisted.state,
+      };
+    }
     return failedResult(
       input.requestId,
       persisted?.state,
@@ -137,6 +157,40 @@ export async function runConfiguredLocalExportOnce(
   } finally {
     database.close();
   }
+}
+
+export async function discardCompletedLoggedExportForCancellation(
+  requestId: string,
+  reason: "user_requested" | "execution_lease_lost",
+  dependencies: Pick<LocalExportRuntimeDependencies, "queue" | "dataRoot">,
+): Promise<void> {
+  const request = dependencies.queue.get(requestId);
+  const packageIdentity = request?.finalArtifacts?.[0]?.packageIdentity;
+  if (
+    !request ||
+    request.mode !== "logged" ||
+    request.state !== "complete" ||
+    !packageIdentity ||
+    packageIdentity !== `clip-${requestId}` ||
+    !/^clip-[a-f0-9-]{36}$/u.test(packageIdentity)
+  ) {
+    throw new Error("Completed cancellation package identity is invalid.");
+  }
+  const outputRoot = resolve(dependencies.dataRoot, "exports");
+  const destination = resolve(outputRoot, packageIdentity);
+  if (!destination.startsWith(`${outputRoot}${sep}`)) {
+    throw new Error(
+      "Completed cancellation package is outside the export root.",
+    );
+  }
+  await rm(destination, { recursive: true, force: true });
+  try {
+    await lstat(destination);
+    throw new Error("Canceled package deletion could not be verified.");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  dependencies.queue.recordCompletedAttemptCanceled(requestId, reason);
 }
 
 function completedResult(

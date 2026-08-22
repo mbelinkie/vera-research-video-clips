@@ -105,14 +105,39 @@ export class SpawnMediaCommandRunner implements MediaCommandRunner {
     options: { signal?: AbortSignal; timeoutMs?: number } = {},
   ): Promise<MediaCommandResult> {
     validateExecutable(executable);
+    if (options.signal?.aborted) {
+      throw new MediaAcquisitionError(
+        "The configured media provider was canceled before it started.",
+      );
+    }
     return new Promise((resolve, reject) => {
       const child = spawn(executable, [...args], {
         shell: false,
         stdio: ["ignore", "pipe", "pipe"],
-        ...(options.signal ? { signal: options.signal } : {}),
       });
       let stdout = "";
       let stderr = "";
+      let settled = false;
+      let forceKill: ReturnType<typeof setTimeout> | undefined;
+      const settle = (callback: () => void) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        if (forceKill) clearTimeout(forceKill);
+        options.signal?.removeEventListener("abort", abort);
+        callback();
+      };
+      const terminate = () => {
+        if (child.exitCode !== null || child.signalCode !== null) return;
+        child.kill("SIGTERM");
+        forceKill = setTimeout(() => {
+          if (child.exitCode === null && child.signalCode === null) {
+            child.kill("SIGKILL");
+          }
+        }, 2_000);
+        forceKill.unref?.();
+      };
+      const abort = () => terminate();
       const append = (current: string, chunk: Buffer) =>
         (current + chunk.toString("utf8")).slice(-(4 * 1024 * 1024));
       child.stdout.on("data", (chunk: Buffer) => {
@@ -122,26 +147,34 @@ export class SpawnMediaCommandRunner implements MediaCommandRunner {
         stderr = append(stderr, chunk);
       });
       const timeout = setTimeout(
-        () => child.kill("SIGTERM"),
+        terminate,
         options.timeoutMs ?? 6 * 60 * 60 * 1_000,
       );
       timeout.unref?.();
+      options.signal?.addEventListener("abort", abort, { once: true });
+      if (options.signal?.aborted) abort();
       child.once("error", (error) => {
-        clearTimeout(timeout);
-        reject(
-          new MediaAcquisitionError(
-            `Could not run the configured media provider: ${error.message}`,
+        if (options.signal?.aborted) return;
+        settle(() =>
+          reject(
+            new MediaAcquisitionError(
+              `Could not run the configured media provider: ${error.message}`,
+            ),
           ),
         );
       });
       child.once("close", (code, childSignal) => {
-        clearTimeout(timeout);
-        if (code === 0) resolve({ stdout, stderr });
-        else {
+        if (code === 0 && !options.signal?.aborted) {
+          settle(() => resolve({ stdout, stderr }));
+        } else {
           const detail = sanitizedDetail(stderr);
-          reject(
-            new MediaAcquisitionError(
-              `Media provider exited ${childSignal ? `after ${childSignal}` : `with code ${code ?? "unknown"}`}${detail ? `: ${detail}` : "."}`,
+          settle(() =>
+            reject(
+              new MediaAcquisitionError(
+                options.signal?.aborted
+                  ? "The configured media provider was canceled and terminated."
+                  : `Media provider exited ${childSignal ? `after ${childSignal}` : `with code ${code ?? "unknown"}`}${detail ? `: ${detail}` : "."}`,
+              ),
             ),
           );
         }

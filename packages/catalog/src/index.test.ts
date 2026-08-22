@@ -1964,6 +1964,317 @@ describe("logged export delivery", () => {
       ),
     ).rejects.toMatchObject({ statusCode: 409 });
   }, 30_000);
+
+  it("cancels queued unaccepted work atomically and excludes it from delivery", async () => {
+    const database = new PGlite();
+    databases.add(database);
+    await runCloudMigrations(database);
+    const catalog = new SharedProjectCatalog(
+      database,
+      new MemoryTranscriptObjectStore(),
+      () => new Date("2026-08-21T16:00:00.000Z"),
+    );
+    const owner = fixtureActor("queued-cancel-owner");
+    await catalog.registerUser(owner, "Queued cancel owner");
+    const fixture = await createLoggedExportFixture(
+      catalog,
+      owner,
+      "queued-cancel",
+    );
+    const advertisement = currentExportWorkerAdvertisement({
+      ffmpegVersion: "8.1.2",
+      encoders: ["libx264", "mov_text"],
+      muxers: ["mp4"],
+      filters: ["scale", "fps"],
+    });
+    const worker = { workerId: randomUUID(), epoch: 1, ...advertisement };
+    await catalog.registerExportWorker(owner, worker);
+    const reserved = (
+      await catalog.claimLoggedExportDelivery(owner, {
+        workerId: worker.workerId,
+        workerEpoch: worker.epoch,
+      })
+    ).delivery!;
+    const viewer = fixtureActor("queued-cancel-viewer");
+    const outsider = fixtureActor("queued-cancel-outsider");
+    await catalog.registerUser(viewer, "Queued cancel viewer");
+    await catalog.registerUser(outsider, "Queued cancel outsider");
+    await catalog.addMember(owner, fixture.projectId, viewer.userId, "viewer");
+    for (const actor of [viewer, outsider]) {
+      await expect(
+        catalog.cancelLoggedExport(
+          actor,
+          fixture.projectId,
+          fixture.request.id,
+          { idempotencyKey: `forbidden-${actor.userId}` },
+        ),
+      ).rejects.toMatchObject({ statusCode: 403 });
+    }
+    const canceled = await catalog.cancelLoggedExport(
+      owner,
+      fixture.projectId,
+      fixture.request.id,
+      { idempotencyKey: "cancel-queued-1" },
+    );
+    expect(canceled).toMatchObject({
+      outcome: "canceled",
+      request: { state: "canceled" },
+    });
+    expect(
+      await catalog.cancelLoggedExport(
+        owner,
+        fixture.projectId,
+        fixture.request.id,
+        { idempotencyKey: "cancel-queued-1" },
+      ),
+    ).toEqual(canceled);
+    const row = await database.query<Record<string, unknown>>(
+      "SELECT * FROM logged_export_canceled_results WHERE export_request_id = $1",
+      [fixture.request.id],
+    );
+    expect(row.rows).toHaveLength(1);
+    expect(row.rows[0]!.delivery_id).toBeNull();
+    await expect(
+      catalog.acceptLoggedExportDelivery(owner, {
+        workerId: worker.workerId,
+        workerEpoch: worker.epoch,
+        deliveryId: reserved.deliveryId,
+        generation: reserved.generation,
+        reservationToken: reserved.reservationToken,
+      }),
+    ).rejects.toMatchObject({ statusCode: 409 });
+    expect(JSON.stringify(row.rows[0])).not.toMatch(
+      /reservation_token|lease_token|owner_user_id|source_identity|path|url/i,
+    );
+  });
+
+  it("starts one exact execution, observes cancel intent, and reconciles cancellation exclusively", async () => {
+    const clock = { now: new Date("2026-08-21T17:00:00.000Z") };
+    const fixture = await createAcceptedLoggedExportResultFixture(clock);
+    const credential = {
+      workerId: fixture.accepted.workerId,
+      workerEpoch: fixture.accepted.workerEpoch,
+      deliveryId: fixture.accepted.deliveryId,
+      generation: fixture.accepted.generation,
+      reservationToken: fixture.accepted.reservationToken,
+    };
+    const started = await fixture.catalog.startLoggedExportExecution(
+      fixture.owner,
+      credential,
+    );
+    expect(started).toMatchObject({
+      status: "started",
+      execution: { attempt: 1, requestId: fixture.accepted.request.id },
+    });
+    if (started.status !== "started") throw new Error("execution not started");
+    expect(
+      await fixture.catalog.startLoggedExportExecution(
+        fixture.owner,
+        credential,
+      ),
+    ).toMatchObject({
+      status: "started",
+      execution: {
+        executionId: started.execution.executionId,
+        leaseToken: started.execution.leaseToken,
+      },
+    });
+    const cancel = await fixture.catalog.cancelLoggedExport(
+      fixture.owner,
+      fixture.accepted.request.projectId!,
+      fixture.accepted.request.id,
+      { idempotencyKey: "cancel-executing-1" },
+    );
+    expect(cancel.outcome).toBe("cancel_requested");
+    expect(
+      await fixture.catalog.startLoggedExportExecution(
+        fixture.owner,
+        credential,
+      ),
+    ).toMatchObject({
+      status: "started",
+      execution: {
+        executionId: started.execution.executionId,
+        cancelRequestedAt: cancel.cancelRequestedAt,
+      },
+    });
+    await expect(
+      fixture.catalog.heartbeatLoggedExportExecution(fixture.owner, {
+        ...credential,
+        executionId: started.execution.executionId,
+        attempt: started.execution.attempt,
+        leaseToken: randomUUID(),
+      }),
+    ).rejects.toMatchObject({ statusCode: 409 });
+    const heartbeat = await fixture.catalog.heartbeatLoggedExportExecution(
+      fixture.owner,
+      {
+        ...credential,
+        executionId: started.execution.executionId,
+        attempt: started.execution.attempt,
+        leaseToken: started.execution.leaseToken,
+      },
+    );
+    expect(heartbeat.execution.cancelRequestedAt).toBe(
+      cancel.cancelRequestedAt,
+    );
+    const result = {
+      schemaVersion: 1 as const,
+      requestId: fixture.accepted.request.id,
+      jobId: fixture.accepted.request.jobId,
+      projectId: fixture.accepted.request.projectId!,
+      clipId: fixture.accepted.request.clipId!,
+      reason: "user_requested" as const,
+      attempt: 0,
+      sourceCleanup: { lifecycle: "not_started" as const },
+      executionId: started.execution.executionId,
+      executionAttempt: started.execution.attempt,
+    };
+    const reconciled = await fixture.catalog.reconcileLoggedExportCanceled(
+      fixture.owner,
+      {
+        ...credential,
+        executionId: started.execution.executionId,
+        leaseToken: started.execution.leaseToken,
+        result,
+      },
+    );
+    expect(reconciled.result).toEqual(result);
+    expect(
+      await fixture.catalog.reconcileLoggedExportCanceled(fixture.owner, {
+        ...credential,
+        executionId: started.execution.executionId,
+        leaseToken: started.execution.leaseToken,
+        result,
+      }),
+    ).toEqual(reconciled);
+    await expect(
+      fixture.catalog.reconcileLoggedExportCanceled(fixture.owner, {
+        ...credential,
+        executionId: started.execution.executionId,
+        leaseToken: started.execution.leaseToken,
+        result: { ...result, reason: "execution_lease_lost" },
+      }),
+    ).rejects.toMatchObject({ statusCode: 409 });
+    await expect(
+      fixture.catalog.reconcileLoggedExportSuccess(
+        fixture.owner,
+        reconcileSuccessCommand(fixture),
+      ),
+    ).rejects.toMatchObject({ statusCode: 409 });
+    await expect(
+      fixture.catalog.reconcileLoggedExportFailure(
+        fixture.owner,
+        reconcileFailureCommand(fixture),
+      ),
+    ).rejects.toMatchObject({ statusCode: 409 });
+    await fixture.catalog.registerExportWorker(fixture.owner, {
+      ...fixture.worker,
+      epoch: fixture.worker.epoch + 1,
+    });
+    await expect(
+      fixture.catalog.startLoggedExportExecution(fixture.owner, credential),
+    ).rejects.toMatchObject({ statusCode: 409 });
+  });
+
+  it("closes accepted but never-started work with attempt-zero evidence", async () => {
+    const fixture = await createAcceptedLoggedExportResultFixture();
+    const credential = {
+      workerId: fixture.accepted.workerId,
+      workerEpoch: fixture.accepted.workerEpoch,
+      deliveryId: fixture.accepted.deliveryId,
+      generation: fixture.accepted.generation,
+      reservationToken: fixture.accepted.reservationToken,
+    };
+    const cancel = await fixture.catalog.cancelLoggedExport(
+      fixture.owner,
+      fixture.accepted.request.projectId!,
+      fixture.accepted.request.id,
+      { idempotencyKey: "cancel-accepted-not-started" },
+    );
+    expect(cancel.outcome).toBe("cancel_requested");
+    await expect(
+      fixture.catalog.startLoggedExportExecution(fixture.owner, credential),
+    ).resolves.toEqual({
+      status: "cancel_requested",
+      cancelRequestedAt: cancel.cancelRequestedAt,
+    });
+    const result = {
+      schemaVersion: 1 as const,
+      requestId: fixture.accepted.request.id,
+      jobId: fixture.accepted.request.jobId,
+      projectId: fixture.accepted.request.projectId!,
+      clipId: fixture.accepted.request.clipId!,
+      reason: "user_requested" as const,
+      attempt: 0,
+      sourceCleanup: { lifecycle: "not_started" as const },
+    };
+    await expect(
+      fixture.catalog.reconcileLoggedExportCanceled(fixture.owner, {
+        ...credential,
+        result,
+      }),
+    ).resolves.toMatchObject({ result });
+    expect(
+      (
+        await fixture.database.query<{ count: string }>(
+          "SELECT count(*)::text AS count FROM logged_export_executions WHERE export_request_id = $1",
+          [fixture.accepted.request.id],
+        )
+      ).rows[0]!.count,
+    ).toBe("0");
+  });
+
+  it("expires stale execution ownership without allowing another attempt", async () => {
+    const clock = { now: new Date("2026-08-21T18:00:00.000Z") };
+    const fixture = await createAcceptedLoggedExportResultFixture(clock);
+    const credential = {
+      workerId: fixture.accepted.workerId,
+      workerEpoch: fixture.accepted.workerEpoch,
+      deliveryId: fixture.accepted.deliveryId,
+      generation: fixture.accepted.generation,
+      reservationToken: fixture.accepted.reservationToken,
+    };
+    const started = await fixture.catalog.startLoggedExportExecution(
+      fixture.owner,
+      credential,
+    );
+    if (started.status !== "started") throw new Error("execution not started");
+    clock.now = new Date("2026-08-21T18:00:31.000Z");
+    await expect(
+      fixture.catalog.heartbeatLoggedExportExecution(fixture.owner, {
+        ...credential,
+        executionId: started.execution.executionId,
+        attempt: started.execution.attempt,
+        leaseToken: started.execution.leaseToken,
+      }),
+    ).rejects.toMatchObject({ statusCode: 409 });
+    const result = {
+      schemaVersion: 1 as const,
+      requestId: fixture.accepted.request.id,
+      jobId: fixture.accepted.request.jobId,
+      projectId: fixture.accepted.request.projectId!,
+      clipId: fixture.accepted.request.clipId!,
+      reason: "execution_lease_lost" as const,
+      attempt: 0,
+      sourceCleanup: { lifecycle: "not_started" as const },
+      executionId: started.execution.executionId,
+      executionAttempt: started.execution.attempt,
+    };
+    await expect(
+      fixture.catalog.reconcileLoggedExportCanceled(fixture.owner, {
+        ...credential,
+        executionId: started.execution.executionId,
+        leaseToken: started.execution.leaseToken,
+        result,
+      }),
+    ).resolves.toMatchObject({ result });
+    const executions = await fixture.database.query<{ count: string }>(
+      "SELECT count(*)::text AS count FROM logged_export_executions WHERE export_request_id = $1",
+      [fixture.accepted.request.id],
+    );
+    expect(executions.rows[0]!.count).toBe("1");
+  });
 });
 
 function fixtureActor(name: string): AuthenticatedActor {

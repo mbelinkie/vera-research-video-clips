@@ -7,6 +7,9 @@ import {
   ClaimLoggedExportDeliveryResponseSchema,
   LoggedExportDeliverySchema,
   LoggedExportFailureSchema,
+  LoggedExportCanceledSchema,
+  StartLoggedExportExecutionResponseSchema,
+  HeartbeatLoggedExportExecutionResponseSchema,
   LoggedExportSuccessSchema,
   RegisteredExportWorkerSchema,
 } from "@research-video/contracts";
@@ -35,7 +38,10 @@ import {
 } from "@research-video/media";
 
 import { createLocalAgent } from "./app.ts";
-import { runLocalExportOnce } from "./export-run-once.ts";
+import {
+  discardCompletedLoggedExportForCancellation,
+  runLocalExportOnce,
+} from "./export-run-once.ts";
 
 const config = loadConfig();
 await mkdir(config.dataDir, { recursive: true });
@@ -91,6 +97,37 @@ const app = createLocalAgent({
     exportQueue.buildLoggedExportSuccessResult(requestId),
   buildLoggedExportFailureResult: (requestId) =>
     exportQueue.buildLoggedExportFailureResult(requestId),
+  buildLoggedExportCanceledResult: (requestId) =>
+    exportQueue.buildLoggedExportCanceledResult(requestId),
+  getLoggedExecution: (requestId) => exportQueue.getLoggedExecution(requestId),
+  startLoggedExportExecution: async ({ request, authorization }) =>
+    callCloudLoggedExportExecutionStart(request, authorization),
+  heartbeatLoggedExportExecution: async ({ request, authorization }) =>
+    callCloudLoggedExportExecutionHeartbeat(request, authorization),
+  activateLoggedExecution: (execution) =>
+    exportQueue.activateLoggedExecution(execution),
+  recordLoggedExecutionHeartbeat: (execution) =>
+    exportQueue.recordLoggedExecutionHeartbeat(execution),
+  recordLoggedExportNotStartedCancellation: (
+    requestId,
+    reason,
+    cancelRequestedAt,
+  ) =>
+    exportQueue.recordLoggedExportNotStartedCancellation(
+      requestId,
+      reason,
+      cancelRequestedAt,
+    ),
+  recordLoggedExportPersistedFailureCancellation: (
+    requestId,
+    reason,
+    cancelRequestedAt,
+  ) =>
+    exportQueue.recordLoggedExportPersistedFailureCancellation(
+      requestId,
+      reason,
+      cancelRequestedAt,
+    ),
   runLoggedExportOnce: (input) =>
     runLocalExportOnce(input, {
       queue: exportQueue,
@@ -102,10 +139,17 @@ const app = createLocalAgent({
       capabilityProvider,
       dataRoot: config.dataDir,
     }),
+  discardCompletedLoggedExportForCancellation: (requestId, reason) =>
+    discardCompletedLoggedExportForCancellation(requestId, reason, {
+      queue: exportQueue,
+      dataRoot: config.dataDir,
+    }),
   reconcileLoggedExportSuccess: async ({ request, authorization }) =>
     callCloudLoggedExportSuccessReconcile(request, authorization),
   reconcileLoggedExportFailure: async ({ request, authorization }) =>
     callCloudLoggedExportFailureReconcile(request, authorization),
+  reconcileLoggedExportCanceled: async ({ request, authorization }) =>
+    callCloudLoggedExportCanceledReconcile(request, authorization),
   createExportOnly: (input, snapshot) =>
     exportQueue.createExportOnly(input, snapshot),
   findExportOnlyByIdempotencyKey: (idempotencyKey) =>
@@ -228,6 +272,42 @@ async function callCloudLoggedExportFailureReconcile(
     authorization,
   );
   return LoggedExportFailureSchema.parse(payload);
+}
+
+async function callCloudLoggedExportExecutionStart(
+  request: unknown,
+  authorization: string,
+) {
+  const payload = await callCloudDelivery(
+    "/api/export-deliveries/execution/start",
+    request,
+    authorization,
+  );
+  return StartLoggedExportExecutionResponseSchema.parse(payload);
+}
+
+async function callCloudLoggedExportExecutionHeartbeat(
+  request: unknown,
+  authorization: string,
+) {
+  const payload = await callCloudDelivery(
+    "/api/export-deliveries/execution/heartbeat",
+    request,
+    authorization,
+  );
+  return HeartbeatLoggedExportExecutionResponseSchema.parse(payload);
+}
+
+async function callCloudLoggedExportCanceledReconcile(
+  request: unknown,
+  authorization: string,
+) {
+  const payload = await callCloudDelivery(
+    "/api/export-deliveries/reconcile-canceled",
+    request,
+    authorization,
+  );
+  return LoggedExportCanceledSchema.parse(payload);
 }
 
 async function callCloudDelivery(

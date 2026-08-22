@@ -5,7 +5,7 @@ import {
   readdirSync,
   rmSync,
 } from "node:fs";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -145,6 +145,7 @@ describe("local migrations", () => {
       "0019_logged_export_delivery_import",
       "0020_logged_export_delivery_acceptance_time",
       "0021_source_scratch_recovery_claims",
+      "0022_logged_export_execution_cancellation",
     ]);
     expect(runLocalMigrations(database)).toEqual([]);
     expect(
@@ -346,6 +347,7 @@ describe("local migrations", () => {
 
     expect(runLocalMigrations(database, localMigrationDirectory)).toEqual([
       "0021_source_scratch_recovery_claims",
+      "0022_logged_export_execution_cancellation",
     ]);
     expect(
       database
@@ -521,6 +523,7 @@ describe("local migrations", () => {
       "0019_logged_export_delivery_import",
       "0020_logged_export_delivery_acceptance_time",
       "0021_source_scratch_recovery_claims",
+      "0022_logged_export_execution_cancellation",
     ]);
     expect(
       database.prepare("SELECT * FROM export_final_artifacts").all(),
@@ -647,6 +650,7 @@ describe("local migrations", () => {
       "0019_logged_export_delivery_import",
       "0020_logged_export_delivery_acceptance_time",
       "0021_source_scratch_recovery_claims",
+      "0022_logged_export_execution_cancellation",
     ]);
     expect(
       database
@@ -902,6 +906,7 @@ describe("logged export delivery import", () => {
       reservationToken: delivery.reservationToken,
       request: { id: pending.id, state: "queued" },
     });
+    activateFixtureExecution(queue, accepted);
     const attempt = queue.beginSourceAcquisition(pending.id).attempt;
     expect(attempt).toBe(1);
     queue.recordSourceReady(pending.jobId, attempt, {
@@ -994,6 +999,91 @@ describe("logged export delivery import", () => {
     database.close();
   });
 
+  it("persists one exact cloud execution and projects cancellation only after verified cleanup", () => {
+    const directory = mkdtempSync(join(tmpdir(), "research-video-cancel-"));
+    temporaryDirectories.add(directory);
+    const database = openLocalDatabase(join(directory, "cancel.sqlite"));
+    runLocalMigrations(database);
+    const queue = new LocalExportQueue(
+      database,
+      () => new Date("2026-08-20T12:00:10.000Z"),
+    );
+    const delivery = fixtureLoggedDelivery();
+    queue.importLoggedDeliveryPending(delivery);
+    queue.activateLoggedDelivery({
+      ...delivery,
+      status: "accepted",
+      acceptedAt: "2026-08-20T12:00:05.000Z",
+    });
+    const execution = {
+      executionId: "019fbb95-cd76-7920-93fa-e23ba755ef31",
+      requestId: delivery.request.id,
+      attempt: 1,
+      workerId: delivery.workerId,
+      workerEpoch: delivery.workerEpoch,
+      leaseToken: "019fbb95-cd76-7920-93fa-e23ba755ef32",
+      startedAt: "2026-08-20T12:00:06.000Z",
+      heartbeatAt: "2026-08-20T12:00:07.000Z",
+      expiresAt: "2026-08-20T12:00:37.000Z",
+    };
+    expect(queue.activateLoggedExecution(execution)).toEqual(execution);
+    expect(queue.activateLoggedExecution(execution)).toEqual(execution);
+    expect(() =>
+      queue.activateLoggedExecution({
+        ...execution,
+        leaseToken: "019fbb95-cd76-7920-93fa-e23ba755ef33",
+      }),
+    ).toThrowError(
+      expect.objectContaining({ code: "logged_export_execution_conflict" }),
+    );
+    expect(() =>
+      database
+        .prepare(
+          "UPDATE export_requests SET cloud_execution_lease_token = NULL WHERE id = ?",
+        )
+        .run(delivery.request.id),
+    ).toThrow(/provenance must be complete|identity is immutable/u);
+
+    const started = queue.beginSourceAcquisition(delivery.request.id, {
+      requireLoggedExecution: true,
+    });
+    expect(started.attempt).toBe(execution.attempt);
+    queue.recordSourceCleanupStarted(started.request.jobId, started.attempt);
+    queue.recordSourceCleanupSucceeded(started.request.jobId, started.attempt);
+    queue.recordSourceAttemptCanceled(
+      started.request.jobId,
+      started.attempt,
+      "user_requested",
+    );
+    expect(queue.buildLoggedExportCanceledResult(delivery.request.id)).toEqual({
+      schemaVersion: 1,
+      requestId: delivery.request.id,
+      jobId: delivery.request.jobId,
+      projectId: delivery.request.projectId,
+      clipId: delivery.request.clipId,
+      reason: "user_requested",
+      attempt: 1,
+      sourceCleanup: {
+        lifecycle: "deleted",
+        deletedAt: "2026-08-20T12:00:10.000Z",
+      },
+      executionId: execution.executionId,
+      executionAttempt: execution.attempt,
+    });
+    expect(() =>
+      queue.recordSourceAttemptCanceled(
+        started.request.jobId,
+        started.attempt,
+        "execution_lease_lost",
+      ),
+    ).toThrowError(
+      expect.objectContaining({
+        code: "logged_export_cancellation_state_conflict",
+      }),
+    );
+    database.close();
+  });
+
   it("projects only sanitized not-started or verified-deleted logged failures", () => {
     const directory = mkdtempSync(join(tmpdir(), "research-video-failure-"));
     temporaryDirectories.add(directory);
@@ -1056,6 +1146,7 @@ describe("logged export delivery import", () => {
     const cleanedQueue = new LocalExportQueue(cleanedDatabase);
     cleanedQueue.importLoggedDeliveryPending(claimed);
     cleanedQueue.activateLoggedDelivery(accepted);
+    activateFixtureExecution(cleanedQueue, accepted);
     const started = cleanedQueue.beginSourceAcquisition(accepted.request.id);
     cleanedQueue.recordSourceCleanupStarted(
       started.request.jobId,
@@ -1081,6 +1172,21 @@ describe("logged export delivery import", () => {
         deletedAt: expect.any(String),
       },
     });
+    cleanedQueue.recordLoggedExportPersistedFailureCancellation(
+      accepted.request.id,
+      "user_requested",
+      "2026-08-20T12:00:09.000Z",
+    );
+    expect(
+      cleanedQueue.buildLoggedExportCanceledResult(accepted.request.id),
+    ).toMatchObject({
+      reason: "user_requested",
+      attempt: 1,
+      sourceCleanup: { lifecycle: "deleted" },
+    });
+    const canceledRequest = cleanedQueue.get(accepted.request.id);
+    expect(canceledRequest).toMatchObject({ state: "canceled" });
+    expect(canceledRequest).not.toHaveProperty("lastError");
     cleanedDatabase.close();
   });
 
@@ -1101,6 +1207,7 @@ describe("logged export delivery import", () => {
       };
       queue.importLoggedDeliveryPending(claimed);
       queue.activateLoggedDelivery(accepted);
+      activateFixtureExecution(queue, accepted);
       return { database, queue, accepted };
     };
 
@@ -1187,6 +1294,7 @@ describe("logged export delivery import", () => {
     };
     queue.importLoggedDeliveryPending(claimed);
     queue.activateLoggedDelivery(accepted);
+    activateFixtureExecution(queue, accepted);
     const started = queue.beginSourceAcquisition(accepted.request.id);
     queue.recordSourceCleanupFailed(
       started.request.jobId,
@@ -1323,6 +1431,7 @@ describe("logged export delivery import", () => {
       "0019_logged_export_delivery_import",
       "0020_logged_export_delivery_acceptance_time",
       "0021_source_scratch_recovery_claims",
+      "0022_logged_export_execution_cancellation",
     ]);
     const after = new LocalExportQueue(database).get(before.id);
     expect(after).toEqual(before);
@@ -1381,6 +1490,7 @@ describe("logged export delivery import", () => {
     expect(runLocalMigrations(database, localMigrationDirectory)).toEqual([
       "0020_logged_export_delivery_acceptance_time",
       "0021_source_scratch_recovery_claims",
+      "0022_logged_export_execution_cancellation",
     ]);
     expect(
       new LocalExportQueue(database).getAcceptedLoggedDelivery(
@@ -1395,6 +1505,23 @@ describe("logged export delivery import", () => {
     database.close();
   });
 });
+
+function activateFixtureExecution(
+  queue: LocalExportQueue,
+  delivery: LoggedExportDelivery,
+) {
+  return queue.activateLoggedExecution({
+    executionId: randomUUID(),
+    requestId: delivery.request.id,
+    attempt: 1,
+    workerId: delivery.workerId,
+    workerEpoch: delivery.workerEpoch,
+    leaseToken: randomUUID(),
+    startedAt: "2026-08-20T12:00:06.000Z",
+    heartbeatAt: "2026-08-20T12:00:07.000Z",
+    expiresAt: "2026-08-20T12:00:37.000Z",
+  });
+}
 
 function fixtureLoggedDelivery(): LoggedExportDelivery {
   const resolved = resolveExportSettings({

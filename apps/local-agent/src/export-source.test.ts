@@ -1189,6 +1189,95 @@ describe("LocalExportSourceProcessor", () => {
     database.close();
   });
 
+  it("records a logged cancellation only after the exact execution scratch is deleted", async () => {
+    const { root, database, queue, request } = fixtureQueue();
+    database.exec(
+      "DROP TRIGGER export_requests_cloud_delivery_state_forward_only;",
+    );
+    database.exec("DROP TRIGGER export_requests_cloud_delivery_immutable;");
+    database.exec("DROP TRIGGER export_requests_cloud_delivery_insert_only;");
+    const workerId = "019fbb95-cd76-7920-93fa-e23ba755ed15";
+    database
+      .prepare(
+        `UPDATE export_requests SET
+           cloud_project_id = ?, cloud_clip_id = ?, cloud_delivery_id = ?,
+           cloud_delivery_generation = 1, cloud_reservation_token = ?,
+           cloud_worker_id = ?, cloud_worker_epoch = 1,
+           cloud_reserved_at = ?, cloud_reservation_expires_at = ?,
+           cloud_delivery_state = 'accepted', cloud_accepted_at = ?
+         WHERE id = ?`,
+      )
+      .run(
+        "019fbb95-cd76-7920-93fa-e23ba755ed11",
+        "019fbb95-cd76-7920-93fa-e23ba755ed12",
+        "019fbb95-cd76-7920-93fa-e23ba755ed13",
+        "019fbb95-cd76-7920-93fa-e23ba755ed14",
+        workerId,
+        "2026-08-14T11:59:50.000Z",
+        "2026-08-14T12:00:20.000Z",
+        "2026-08-14T11:59:55.000Z",
+        request.id,
+      );
+    const execution = queue.activateLoggedExecution({
+      executionId: "019fbb95-cd76-7920-93fa-e23ba755ed16",
+      requestId: request.id,
+      attempt: 1,
+      workerId,
+      workerEpoch: 1,
+      leaseToken: "019fbb95-cd76-7920-93fa-e23ba755ed17",
+      startedAt: "2026-08-14T11:59:56.000Z",
+      heartbeatAt: "2026-08-14T11:59:57.000Z",
+      expiresAt: "2026-08-14T12:00:27.000Z",
+    });
+    const controller = new AbortController();
+    const processor = new LocalExportSourceProcessor(
+      queue,
+      fixtureSourceProvider(),
+      {
+        inspect: async () => {
+          controller.abort(
+            Object.assign(new Error("cancel requested"), {
+              code: "user_requested",
+            }),
+          );
+          throw Object.assign(new Error("inspection canceled"), {
+            code: "source_inspection_canceled",
+          });
+        },
+      },
+      fixtureRenderer(),
+      root,
+      fixtureThumbnailExtractor(),
+      fixtureThumbnailInspector(),
+    );
+    await expect(
+      processor.process({
+        requestId: request.id,
+        authorizationConfirmed: true,
+        signal: controller.signal,
+        requireLoggedExecution: true,
+      }),
+    ).rejects.toMatchObject({ code: "source_inspection_canceled" });
+    expect(queue.get(request.id)).toMatchObject({
+      mode: "logged",
+      state: "canceled",
+    });
+    expect(queue.getSourceAttempt(request.jobId, 1)).toMatchObject({
+      lifecycleState: "deleted",
+    });
+    expect(queue.buildLoggedExportCanceledResult(request.id)).toMatchObject({
+      reason: "user_requested",
+      attempt: 1,
+      executionId: execution.executionId,
+      executionAttempt: execution.attempt,
+      sourceCleanup: { lifecycle: "deleted" },
+    });
+    expect(await readdir(join(root, "jobs", "export-source-scratch"))).toEqual(
+      [],
+    );
+    database.close();
+  });
+
   it("rejects invalid rendered codec or duration and deletes source plus temporary output", async () => {
     const { root, database, queue, request } = fixtureQueue();
     enableConfirmedEnglishOmission(database, request.id);

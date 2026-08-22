@@ -1886,12 +1886,22 @@ describe("logged export delivery API", () => {
     const acceptLoggedExportDelivery = vi.fn(async () => ({ accepted: true }));
     const reconcileLoggedExportSuccess = vi.fn(async () => ({ ok: true }));
     const reconcileLoggedExportFailure = vi.fn(async () => ({ failed: true }));
+    const startLoggedExportExecution = vi.fn(async () => ({ started: true }));
+    const heartbeatLoggedExportExecution = vi.fn(async () => ({ alive: true }));
+    const reconcileLoggedExportCanceled = vi.fn(async () => ({
+      canceled: true,
+    }));
+    const cancelLoggedExport = vi.fn(async () => ({ requested: true }));
     const retryLoggedExport = vi.fn(async () => ({ retried: true }));
     const catalog = {
       claimLoggedExportDelivery,
       acceptLoggedExportDelivery,
       reconcileLoggedExportSuccess,
       reconcileLoggedExportFailure,
+      startLoggedExportExecution,
+      heartbeatLoggedExportExecution,
+      reconcileLoggedExportCanceled,
+      cancelLoggedExport,
       retryLoggedExport,
     } as unknown as SharedProjectCatalog;
     const app = createCloudApi({ catalog, authenticate: async () => actor });
@@ -1998,8 +2008,108 @@ describe("logged export delivery API", () => {
       reservationToken,
       result: failureResult,
     });
+    const executionId = randomUUID();
+    const leaseToken = randomUUID();
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: "/api/export-deliveries/execution/start",
+          payload: {
+            workerId,
+            workerEpoch: 4,
+            deliveryId,
+            generation: 2,
+            reservationToken,
+          },
+        })
+      ).json(),
+    ).toEqual({ started: true });
+    expect(startLoggedExportExecution).toHaveBeenCalledWith(actor, {
+      workerId,
+      workerEpoch: 4,
+      deliveryId,
+      generation: 2,
+      reservationToken,
+    });
+    await app.inject({
+      method: "POST",
+      url: "/api/export-deliveries/execution/heartbeat",
+      payload: {
+        workerId,
+        workerEpoch: 4,
+        deliveryId,
+        generation: 2,
+        reservationToken,
+        executionId,
+        attempt: 1,
+        leaseToken,
+      },
+    });
+    expect(heartbeatLoggedExportExecution).toHaveBeenCalledWith(actor, {
+      workerId,
+      workerEpoch: 4,
+      deliveryId,
+      generation: 2,
+      reservationToken,
+      executionId,
+      attempt: 1,
+      leaseToken,
+    });
+    const canceledResult = {
+      schemaVersion: 1,
+      requestId: result.requestId,
+      jobId: result.jobId,
+      projectId: result.projectId,
+      clipId: result.clipId,
+      reason: "user_requested",
+      attempt: 1,
+      sourceCleanup: {
+        lifecycle: "deleted",
+        deletedAt: "2026-08-20T12:00:00.000Z",
+      },
+      executionId,
+      executionAttempt: 1,
+    };
+    await app.inject({
+      method: "POST",
+      url: "/api/export-deliveries/reconcile-canceled",
+      payload: {
+        workerId,
+        workerEpoch: 4,
+        deliveryId,
+        generation: 2,
+        reservationToken,
+        executionId,
+        leaseToken,
+        result: canceledResult,
+      },
+    });
+    expect(reconcileLoggedExportCanceled).toHaveBeenCalledWith(actor, {
+      workerId,
+      workerEpoch: 4,
+      deliveryId,
+      generation: 2,
+      reservationToken,
+      executionId,
+      leaseToken,
+      result: canceledResult,
+    });
     const projectId = randomUUID();
     const requestId = randomUUID();
+    await app.inject({
+      method: "POST",
+      url: `/api/projects/${projectId}/export-requests/${requestId}/cancel`,
+      payload: { idempotencyKey: "cancel-command-1" },
+    });
+    expect(cancelLoggedExport).toHaveBeenCalledWith(
+      actor,
+      projectId,
+      requestId,
+      {
+        idempotencyKey: "cancel-command-1",
+      },
+    );
     const retried = await app.inject({
       method: "POST",
       url: `/api/projects/${projectId}/export-requests/${requestId}/retry`,

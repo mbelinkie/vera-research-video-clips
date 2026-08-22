@@ -10,6 +10,8 @@ import {
   ExportRequestSchema,
   LoggedExportDeliverySchema,
   LoggedExportFailureResultSchema,
+  LoggedExportCanceledResultSchema,
+  LoggedExportExecutionSchema,
   LoggedExportSuccessResultSchema,
   NormalizedTranscriptSchema,
   ResolvedExportSettingsSnapshotSchema,
@@ -22,6 +24,8 @@ import {
   type ExportRequest,
   type LoggedExportDelivery,
   type LoggedExportFailureResult,
+  type LoggedExportCanceledResult,
+  type LoggedExportExecution,
   type LoggedExportSuccessResult,
   type ExportObservedMediaProperties,
   type ResolvedExportSettingsSnapshot,
@@ -462,6 +466,281 @@ export class LocalExportQueue {
     });
   }
 
+  activateLoggedExecution(input: LoggedExportExecution): LoggedExportExecution {
+    const execution = LoggedExportExecutionSchema.parse(input);
+    const accepted = this.getAcceptedLoggedDelivery(execution.requestId);
+    if (
+      !accepted ||
+      accepted.workerId !== execution.workerId ||
+      accepted.workerEpoch !== execution.workerEpoch
+    ) {
+      throw new LocalExportLifecycleError(
+        "The cloud execution does not match this accepted delivery.",
+        "logged_export_execution_ownership_mismatch",
+      );
+    }
+    const row = this.database
+      .prepare(
+        `SELECT cloud_execution_id, cloud_execution_attempt,
+                cloud_execution_lease_token, cloud_execution_started_at
+         FROM export_requests WHERE id = ?`,
+      )
+      .get(execution.requestId) as Record<string, unknown> | undefined;
+    if (!row) throw new LocalExportRequestNotFoundError();
+    if (row.cloud_execution_id) {
+      const existing = this.getLoggedExecution(execution.requestId);
+      if (
+        !existing ||
+        existing.executionId !== execution.executionId ||
+        existing.requestId !== execution.requestId ||
+        existing.attempt !== execution.attempt ||
+        existing.workerId !== execution.workerId ||
+        existing.workerEpoch !== execution.workerEpoch ||
+        existing.leaseToken !== execution.leaseToken ||
+        existing.startedAt !== execution.startedAt
+      ) {
+        throw new LocalExportLifecycleError(
+          "The cloud execution conflicts with persisted local ownership.",
+          "logged_export_execution_conflict",
+        );
+      }
+      this.recordLoggedExecutionHeartbeat(execution);
+      return this.getLoggedExecution(execution.requestId)!;
+    }
+    const job = this.database
+      .prepare("SELECT attempt, state FROM jobs WHERE id = ?")
+      .get(accepted.request.jobId) as
+      { attempt: number; state: string } | undefined;
+    if (!job || Number(job.attempt) !== 0 || job.state !== "queued") {
+      throw new LocalExportLifecycleError(
+        "The local request is not ready to adopt its first execution.",
+        "logged_export_execution_state_conflict",
+      );
+    }
+    const result = this.database
+      .prepare(
+        `UPDATE export_requests
+         SET cloud_execution_id = ?, cloud_execution_attempt = ?,
+             cloud_execution_lease_token = ?, cloud_execution_started_at = ?,
+             cloud_execution_heartbeat_at = ?, cloud_execution_expires_at = ?,
+             cloud_cancel_requested_at = ?, updated_at = ?
+         WHERE id = ? AND cloud_execution_id IS NULL`,
+      )
+      .run(
+        execution.executionId,
+        execution.attempt,
+        execution.leaseToken,
+        execution.startedAt,
+        execution.heartbeatAt,
+        execution.expiresAt,
+        execution.cancelRequestedAt ?? null,
+        execution.heartbeatAt,
+        execution.requestId,
+      );
+    if (result.changes !== 1) {
+      throw new LocalExportLifecycleError(
+        "The local execution could not be persisted.",
+        "logged_export_execution_conflict",
+      );
+    }
+    return this.getLoggedExecution(execution.requestId)!;
+  }
+
+  getLoggedExecution(requestId: string): LoggedExportExecution | undefined {
+    const row = this.database
+      .prepare(
+        `SELECT cloud_execution_id, cloud_execution_attempt,
+                cloud_execution_lease_token, cloud_execution_started_at,
+                cloud_execution_heartbeat_at, cloud_execution_expires_at,
+                cloud_cancel_requested_at, cloud_worker_id, cloud_worker_epoch
+         FROM export_requests
+         WHERE id = ? AND cloud_execution_id IS NOT NULL`,
+      )
+      .get(requestId) as Record<string, unknown> | undefined;
+    if (!row) return undefined;
+    return LoggedExportExecutionSchema.parse({
+      executionId: row.cloud_execution_id,
+      requestId,
+      attempt: Number(row.cloud_execution_attempt),
+      workerId: row.cloud_worker_id,
+      workerEpoch: Number(row.cloud_worker_epoch),
+      leaseToken: row.cloud_execution_lease_token,
+      startedAt: row.cloud_execution_started_at,
+      heartbeatAt: row.cloud_execution_heartbeat_at,
+      expiresAt: row.cloud_execution_expires_at,
+      ...(row.cloud_cancel_requested_at
+        ? { cancelRequestedAt: row.cloud_cancel_requested_at }
+        : {}),
+    });
+  }
+
+  recordLoggedExecutionHeartbeat(input: LoggedExportExecution): void {
+    const execution = LoggedExportExecutionSchema.parse(input);
+    const existing = this.getLoggedExecution(execution.requestId);
+    if (
+      !existing ||
+      existing.executionId !== execution.executionId ||
+      existing.attempt !== execution.attempt ||
+      existing.workerId !== execution.workerId ||
+      existing.workerEpoch !== execution.workerEpoch ||
+      existing.leaseToken !== execution.leaseToken ||
+      existing.startedAt !== execution.startedAt
+    ) {
+      throw new LocalExportLifecycleError(
+        "The execution heartbeat does not match local ownership.",
+        "logged_export_execution_ownership_mismatch",
+      );
+    }
+    const updated = this.database
+      .prepare(
+        `UPDATE export_requests
+         SET cloud_execution_heartbeat_at = ?, cloud_execution_expires_at = ?,
+             cloud_cancel_requested_at = COALESCE(cloud_cancel_requested_at, ?),
+             updated_at = ?
+         WHERE id = ? AND cloud_execution_id = ?
+           AND cloud_execution_lease_token = ?`,
+      )
+      .run(
+        execution.heartbeatAt,
+        execution.expiresAt,
+        execution.cancelRequestedAt ?? null,
+        execution.heartbeatAt,
+        execution.requestId,
+        execution.executionId,
+        execution.leaseToken,
+      );
+    if (updated.changes !== 1) throw new LocalExportLifecycleError();
+  }
+
+  recordLoggedExportNotStartedCancellation(
+    requestId: string,
+    reason: "user_requested" | "execution_lease_lost",
+    cancelRequestedAt?: string,
+  ): void {
+    const request = this.get(requestId);
+    if (!request || request.mode !== "logged")
+      throw new LocalExportRequestNotFoundError();
+    const now = this.now().toISOString();
+    this.database.exec("BEGIN IMMEDIATE;");
+    try {
+      const updated = this.database
+        .prepare(
+          `UPDATE export_requests
+           SET cloud_cancel_requested_at = COALESCE(cloud_cancel_requested_at, ?),
+               local_cancellation_reason = ?,
+               local_canceled_at = ?, updated_at = ?
+           WHERE id = ? AND local_cancellation_reason IS NULL`,
+        )
+        .run(cancelRequestedAt ?? null, reason, now, now, requestId);
+      const job = this.database
+        .prepare(
+          `UPDATE jobs SET state = 'canceled', updated_at = ?
+           WHERE id = ? AND state = 'queued' AND attempt = 0`,
+        )
+        .run(now, request.jobId);
+      if (updated.changes !== 1 || job.changes !== 1) {
+        throw new LocalExportLifecycleError(
+          "The local accepted request is no longer cancelable before execution.",
+          "logged_export_cancellation_state_conflict",
+        );
+      }
+      this.database.exec("COMMIT;");
+    } catch (error) {
+      this.database.exec("ROLLBACK;");
+      throw error;
+    }
+  }
+
+  recordLoggedExportPersistedFailureCancellation(
+    requestId: string,
+    reason: "user_requested" | "execution_lease_lost",
+    cancelRequestedAt?: string,
+  ): void {
+    const request = this.get(requestId);
+    if (!request || request.mode !== "logged") {
+      throw new LocalExportRequestNotFoundError();
+    }
+    const row = this.database
+      .prepare(
+        `SELECT j.state, j.attempt, er.cloud_execution_id,
+                er.cloud_execution_attempt
+         FROM export_requests er JOIN jobs j ON j.id = er.job_id
+         WHERE er.id = ?`,
+      )
+      .get(requestId) as
+      | {
+          state: string;
+          attempt: number;
+          cloud_execution_id: string | null;
+          cloud_execution_attempt: number | null;
+        }
+      | undefined;
+    if (!row || row.state !== "needs_user_action") {
+      throw new LocalExportLifecycleError(
+        "Only one persisted nonterminal failure can yield to cancellation.",
+        "logged_export_cancellation_state_conflict",
+      );
+    }
+    const attempt = Number(row.attempt);
+    if (attempt === 0) {
+      const count = this.database
+        .prepare(
+          "SELECT count(*) AS count FROM source_scratch_assets WHERE job_id = ?",
+        )
+        .get(request.jobId) as { count: number };
+      if (Number(count.count) !== 0) {
+        throw new LocalExportLifecycleError(
+          "Not-started failure cancellation has inconsistent scratch evidence.",
+          "logged_export_cancellation_cleanup_inconsistent",
+        );
+      }
+    } else {
+      const scratch = this.getSourceAttempt(request.jobId, attempt);
+      if (
+        !row.cloud_execution_id ||
+        Number(row.cloud_execution_attempt) !== attempt ||
+        !scratch ||
+        scratch.lifecycleState !== "deleted" ||
+        !scratch.deletedAt
+      ) {
+        throw new LocalExportLifecycleError(
+          "Failed work cannot yield to cancellation until exact source cleanup is verified.",
+          "logged_export_cancellation_cleanup_incomplete",
+        );
+      }
+    }
+    const now = this.now().toISOString();
+    this.database.exec("BEGIN IMMEDIATE;");
+    try {
+      const canceled = this.database
+        .prepare(
+          `UPDATE export_requests
+           SET cloud_cancel_requested_at = COALESCE(cloud_cancel_requested_at, ?),
+               local_cancellation_reason = ?, local_canceled_at = ?, updated_at = ?
+           WHERE id = ? AND local_cancellation_reason IS NULL`,
+        )
+        .run(cancelRequestedAt ?? null, reason, now, now, requestId);
+      const job = this.database
+        .prepare(
+          `UPDATE jobs
+           SET state = 'canceled', payload_json = json_remove(payload_json, '$.lastError'),
+               updated_at = ?
+           WHERE id = ? AND state = 'needs_user_action' AND attempt = ?`,
+        )
+        .run(now, request.jobId, attempt);
+      if (canceled.changes !== 1 || job.changes !== 1) {
+        throw new LocalExportLifecycleError(
+          "Persisted failure cancellation lost its exact local state.",
+          "logged_export_cancellation_state_conflict",
+        );
+      }
+      this.database.exec("COMMIT;");
+    } catch (error) {
+      this.database.exec("ROLLBACK;");
+      throw error;
+    }
+  }
+
   buildLoggedExportSuccessResult(requestId: string): LoggedExportSuccessResult {
     const request = this.get(requestId);
     if (!request || request.mode !== "logged") {
@@ -636,6 +915,105 @@ export class LocalExportQueue {
     });
   }
 
+  buildLoggedExportCanceledResult(
+    requestId: string,
+  ): LoggedExportCanceledResult {
+    const request = this.get(requestId);
+    if (
+      !request ||
+      request.mode !== "logged" ||
+      !request.projectId ||
+      !request.clipId
+    ) {
+      throw new LocalExportRequestNotFoundError();
+    }
+    if (!this.getAcceptedLoggedDelivery(requestId)) {
+      throw new LocalExportLifecycleError(
+        "Only an accepted logged delivery can reconcile cancellation.",
+        "logged_export_delivery_not_accepted",
+      );
+    }
+    const row = this.database
+      .prepare(
+        `SELECT j.state, j.attempt, er.local_cancellation_reason,
+                er.local_canceled_at, er.cloud_execution_id,
+                er.cloud_execution_attempt
+         FROM export_requests er JOIN jobs j ON j.id = er.job_id
+         WHERE er.id = ?`,
+      )
+      .get(requestId) as Record<string, unknown> | undefined;
+    if (
+      !row ||
+      row.state !== "canceled" ||
+      !row.local_cancellation_reason ||
+      !row.local_canceled_at
+    ) {
+      throw new LocalExportLifecycleError(
+        "No verified local cancellation is ready for reconciliation.",
+        "logged_export_cancellation_not_recorded",
+      );
+    }
+    if (request.finalArtifacts?.length) {
+      throw new LocalExportLifecycleError(
+        "Canceled work cannot retain finalized package provenance.",
+        "logged_export_cancellation_has_package",
+      );
+    }
+    const attempt = Number(row.attempt);
+    let sourceCleanup: LoggedExportCanceledResult["sourceCleanup"];
+    if (attempt === 0) {
+      const count = this.database
+        .prepare(
+          "SELECT count(*) AS count FROM source_scratch_assets WHERE job_id = ?",
+        )
+        .get(request.jobId) as { count: number };
+      if (Number(count.count) !== 0) {
+        throw new LocalExportLifecycleError(
+          "Not-started cancellation has inconsistent execution evidence.",
+          "logged_export_cancellation_cleanup_inconsistent",
+        );
+      }
+      sourceCleanup = { lifecycle: "not_started" };
+    } else {
+      const scratch = this.database
+        .prepare(
+          `SELECT lifecycle_state, deleted_at FROM source_scratch_assets
+           WHERE job_id = ? AND attempt = ?`,
+        )
+        .get(request.jobId, attempt) as
+        { lifecycle_state: string; deleted_at: string | null } | undefined;
+      if (
+        !scratch ||
+        scratch.lifecycle_state !== "deleted" ||
+        !scratch.deleted_at ||
+        Number(row.cloud_execution_attempt) !== attempt ||
+        !row.cloud_execution_id
+      ) {
+        throw new LocalExportLifecycleError(
+          "Canceled source cleanup is incomplete.",
+          "logged_export_cancellation_cleanup_incomplete",
+        );
+      }
+      sourceCleanup = { lifecycle: "deleted", deletedAt: scratch.deleted_at };
+    }
+    return LoggedExportCanceledResultSchema.parse({
+      schemaVersion: 1,
+      requestId,
+      jobId: request.jobId,
+      projectId: request.projectId,
+      clipId: request.clipId,
+      reason: row.local_cancellation_reason,
+      attempt,
+      sourceCleanup,
+      ...(row.cloud_execution_id
+        ? {
+            executionId: row.cloud_execution_id,
+            executionAttempt: Number(row.cloud_execution_attempt),
+          }
+        : {}),
+    });
+  }
+
   get(requestId: string): ExportRequest | undefined {
     const row = this.database
       .prepare(
@@ -682,7 +1060,10 @@ export class LocalExportQueue {
     return new LocalTranscriptIndex(this.database).findExactOriginal(input);
   }
 
-  beginSourceAcquisition(requestId: string): LocalExportSourceAttempt {
+  beginSourceAcquisition(
+    requestId: string,
+    _options: { requireLoggedExecution?: boolean } = {},
+  ): LocalExportSourceAttempt {
     const request = this.get(requestId);
     if (!request) throw new LocalExportRequestNotFoundError();
     if (request.state === "complete") {
@@ -697,9 +1078,31 @@ export class LocalExportQueue {
       this.now().getTime() + 24 * 60 * 60 * 1_000,
     ).toISOString();
     const attempt = this.database
-      .prepare("SELECT attempt FROM jobs WHERE id = ?")
-      .get(request.jobId) as { attempt: number };
-    const nextAttempt = attempt.attempt + 1;
+      .prepare("SELECT attempt, state FROM jobs WHERE id = ?")
+      .get(request.jobId) as { attempt: number; state: string };
+    if (!["queued", "needs_user_action"].includes(attempt.state)) {
+      throw new LocalExportLifecycleError(
+        "This export already has active or terminal local work.",
+        "export_execution_state_conflict",
+      );
+    }
+    const execution =
+      request.mode === "logged"
+        ? this.getLoggedExecution(requestId)
+        : undefined;
+    if (request.mode === "logged" && !execution) {
+      throw new LocalExportLifecycleError(
+        "This accepted logged export has no durable cloud execution lease.",
+        "logged_export_execution_required",
+      );
+    }
+    const nextAttempt = execution?.attempt ?? attempt.attempt + 1;
+    if (execution && (attempt.attempt !== 0 || attempt.state !== "queued")) {
+      throw new LocalExportLifecycleError(
+        "Local execution attempt does not match its cloud ownership.",
+        "logged_export_execution_attempt_mismatch",
+      );
+    }
     this.database.exec("BEGIN IMMEDIATE;");
     try {
       this.database
@@ -1633,6 +2036,105 @@ export class LocalExportQueue {
     this.database.exec("BEGIN IMMEDIATE;");
     try {
       this.markJobNeedsUserAction(jobId, code, message, now);
+      this.database.exec("COMMIT;");
+    } catch (error) {
+      this.database.exec("ROLLBACK;");
+      throw error;
+    }
+  }
+
+  recordSourceAttemptCanceled(
+    jobId: string,
+    attempt: number,
+    reason: "user_requested" | "execution_lease_lost",
+  ): void {
+    const now = this.now().toISOString();
+    const source = this.database
+      .prepare(
+        `SELECT lifecycle_state, deleted_at FROM source_scratch_assets
+         WHERE job_id = ? AND attempt = ?`,
+      )
+      .get(jobId, attempt) as
+      { lifecycle_state: string; deleted_at: string | null } | undefined;
+    if (!source || source.lifecycle_state !== "deleted" || !source.deleted_at) {
+      throw new LocalExportLifecycleError(
+        "Cancellation cannot become terminal until source cleanup is verified.",
+        "logged_export_cancellation_cleanup_incomplete",
+      );
+    }
+    this.database.exec("BEGIN IMMEDIATE;");
+    try {
+      const request = this.database
+        .prepare(
+          `UPDATE export_requests
+           SET local_cancellation_reason = ?, local_canceled_at = ?, updated_at = ?
+           WHERE job_id = ? AND cloud_execution_attempt = ?
+             AND local_cancellation_reason IS NULL`,
+        )
+        .run(reason, now, now, jobId, attempt);
+      const job = this.database
+        .prepare(
+          `UPDATE jobs SET state = 'canceled', updated_at = ?
+           WHERE id = ? AND attempt = ? AND state IN ('queued', 'processing')`,
+        )
+        .run(now, jobId, attempt);
+      if (request.changes !== 1 || job.changes !== 1) {
+        throw new LocalExportLifecycleError(
+          "Local cancellation ownership changed before settlement.",
+          "logged_export_cancellation_state_conflict",
+        );
+      }
+      this.database.exec("COMMIT;");
+    } catch (error) {
+      this.database.exec("ROLLBACK;");
+      throw error;
+    }
+  }
+
+  recordCompletedAttemptCanceled(
+    requestId: string,
+    reason: "user_requested" | "execution_lease_lost",
+  ): void {
+    const request = this.get(requestId);
+    const execution = this.getLoggedExecution(requestId);
+    if (
+      !request ||
+      request.state !== "complete" ||
+      !execution ||
+      !request.finalArtifacts?.length
+    ) {
+      throw new LocalExportLifecycleError(
+        "Only one exact locally complete execution can lose the cloud terminal race.",
+        "logged_export_cancellation_state_conflict",
+      );
+    }
+    const source = this.getSourceAttempt(request.jobId, execution.attempt);
+    if (!source || source.lifecycleState !== "deleted" || !source.deletedAt) {
+      throw new LocalExportLifecycleError(
+        "Completed local work cannot be canceled until source deletion is verified.",
+        "logged_export_cancellation_cleanup_incomplete",
+      );
+    }
+    const now = this.now().toISOString();
+    this.database.exec("BEGIN IMMEDIATE;");
+    try {
+      this.database
+        .prepare(
+          "DELETE FROM export_final_artifacts WHERE export_request_id = ?",
+        )
+        .run(requestId);
+      this.database
+        .prepare(
+          `UPDATE export_requests
+           SET local_cancellation_reason = ?, local_canceled_at = ?, updated_at = ?
+           WHERE id = ? AND local_cancellation_reason IS NULL`,
+        )
+        .run(reason, now, now, requestId);
+      this.database
+        .prepare(
+          "UPDATE jobs SET state = 'canceled', updated_at = ? WHERE id = ? AND state = 'complete'",
+        )
+        .run(now, request.jobId);
       this.database.exec("COMMIT;");
     } catch (error) {
       this.database.exec("ROLLBACK;");

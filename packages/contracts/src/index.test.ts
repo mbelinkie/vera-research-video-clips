@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   AcceptLoggedExportDeliveryRequestSchema,
+  CancelLoggedExportRequestSchema,
   BatchPreflightRequestSchema,
   ClipLanguageEvidenceV2Schema,
   CreateClipExportRequestSchema,
@@ -15,16 +16,20 @@ import {
   InstalledExportWorkerCapabilitySummarySchema,
   ClaimLoggedExportDeliveryRequestSchema,
   LoggedExportDeliverySchema,
+  LoggedExportCanceledResultSchema,
+  LoggedExportExecutionSchema,
   LoggedExportFailureResultSchema,
   LoggedExportFailureSchema,
   LoggedExportSuccessResultSchema,
   LoggedExportSuccessSchema,
   ProcessAcceptedLoggedExportRequestSchema,
   ProcessAcceptedLoggedExportResponseSchema,
+  ReconcileLoggedExportCanceledRequestSchema,
   ReconcileLoggedExportFailureRequestSchema,
   ReconcileLoggedExportSuccessRequestSchema,
   RetryLoggedExportRequestSchema,
   RetryLoggedExportResponseSchema,
+  StartLoggedExportExecutionResponseSchema,
   FinalArtifactProvenanceSchema,
   HealthResponseSchema,
   JobSchema,
@@ -257,6 +262,89 @@ describe("shared contracts", () => {
         reservationToken: reconcile.reservationToken,
       }).success,
     ).toBe(false);
+  });
+
+  it("binds cancellation to one chronological execution without leaking control credentials", () => {
+    const execution = {
+      executionId: "019fbb95-cd76-7920-93fa-e23ba755ee60",
+      requestId: "019fbb95-cd76-7920-93fa-e23ba755ee51",
+      attempt: 1,
+      workerId: "019fbb95-cd76-7920-93fa-e23ba755ee42",
+      workerEpoch: 3,
+      leaseToken: "019fbb95-cd76-7920-93fa-e23ba755ee61",
+      startedAt: "2026-08-01T11:59:55.000Z",
+      heartbeatAt: now,
+      expiresAt: "2026-08-01T12:00:30.000Z",
+      cancelRequestedAt: "2026-08-01T11:59:59.000Z",
+    };
+    expect(
+      StartLoggedExportExecutionResponseSchema.parse({
+        status: "started",
+        execution,
+      }),
+    ).toEqual({ status: "started", execution });
+    expect(
+      LoggedExportExecutionSchema.safeParse({
+        ...execution,
+        expiresAt: execution.heartbeatAt,
+      }).success,
+    ).toBe(false);
+
+    const result = LoggedExportCanceledResultSchema.parse({
+      schemaVersion: 1,
+      requestId: execution.requestId,
+      jobId: "019fbb95-cd76-7920-93fa-e23ba755ee52",
+      projectId: "019fbb95-cd76-7920-93fa-e23ba755ee53",
+      clipId: "019fbb95-cd76-7920-93fa-e23ba755ee54",
+      reason: "user_requested",
+      attempt: 1,
+      sourceCleanup: { lifecycle: "deleted", deletedAt: now },
+      executionId: execution.executionId,
+      executionAttempt: execution.attempt,
+    });
+    const reconcile = ReconcileLoggedExportCanceledRequestSchema.parse({
+      workerId: execution.workerId,
+      workerEpoch: execution.workerEpoch,
+      deliveryId: "019fbb95-cd76-7920-93fa-e23ba755ee43",
+      generation: 2,
+      reservationToken: "019fbb95-cd76-7920-93fa-e23ba755ee44",
+      executionId: execution.executionId,
+      leaseToken: execution.leaseToken,
+      result,
+    });
+    expect(
+      ProcessAcceptedLoggedExportResponseSchema.parse({
+        execution: "canceled",
+        canceled: {
+          id,
+          deliveryId: reconcile.deliveryId,
+          generation: reconcile.generation,
+          workerId: reconcile.workerId,
+          workerEpoch: reconcile.workerEpoch,
+          result,
+          resultFingerprint: "a".repeat(64),
+          reconciledAt: now,
+        },
+      }),
+    ).toMatchObject({ execution: "canceled", canceled: { result } });
+    expect(
+      LoggedExportCanceledResultSchema.safeParse({
+        ...result,
+        executionAttempt: 2,
+      }).success,
+    ).toBe(false);
+    expect(
+      ReconcileLoggedExportCanceledRequestSchema.safeParse({
+        ...reconcile,
+        leaseToken: undefined,
+      }).success,
+    ).toBe(false);
+    expect(
+      CancelLoggedExportRequestSchema.parse({ idempotencyKey: " cancel-1 " }),
+    ).toEqual({ idempotencyKey: "cancel-1" });
+    expect(JSON.stringify(result)).not.toMatch(
+      /leaseToken|reservationToken|\/private\/|sourceIdentity|https?:\/\//i,
+    );
   });
 
   it("accepts a versioned project", () => {

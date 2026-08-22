@@ -48,7 +48,10 @@ import {
   validateClipRelativeSrtCues,
 } from "@research-video/transcript";
 
-import { runConfiguredLocalExportOnce } from "./export-run-once.ts";
+import {
+  discardCompletedLoggedExportForCancellation,
+  runConfiguredLocalExportOnce,
+} from "./export-run-once.ts";
 
 const fixtureMediaPath = fileURLToPath(
   new URL("../../../tests/fixtures/media/synthetic-4s.mp4", import.meta.url),
@@ -351,6 +354,24 @@ describe("one-shot local export runtime", () => {
       editingSettings,
       true,
     );
+    const executionDatabase = openLocalDatabase(join(root, "local.sqlite"));
+    try {
+      const queue = new LocalExportQueue(executionDatabase);
+      const delivery = queue.getAcceptedLoggedDelivery(request.requestId)!;
+      queue.activateLoggedExecution({
+        executionId: randomUUID(),
+        requestId: request.requestId,
+        attempt: 1,
+        workerId: delivery.workerId,
+        workerEpoch: delivery.workerEpoch,
+        leaseToken: randomUUID(),
+        startedAt: "2026-08-20T12:00:06.000Z",
+        heartbeatAt: "2026-08-20T12:00:07.000Z",
+        expiresAt: "2026-08-20T12:00:37.000Z",
+      });
+    } finally {
+      executionDatabase.close();
+    }
     let acquisitionCalls = 0;
     const options = {
       config: fixtureConfig(root),
@@ -401,11 +422,25 @@ describe("one-shot local export runtime", () => {
     ).toMatchObject({ status: "already_complete", state: "complete" });
     const replayDatabase = openLocalDatabase(join(root, "local.sqlite"));
     try {
+      const queue = new LocalExportQueue(replayDatabase);
+      expect(queue.buildLoggedExportSuccessResult(request.requestId)).toEqual(
+        firstResult,
+      );
+      await discardCompletedLoggedExportForCancellation(
+        request.requestId,
+        "user_requested",
+        { queue, dataRoot: root },
+      );
+      expect(queue.get(request.requestId)).toMatchObject({ state: "canceled" });
+      expect(queue.get(request.requestId)?.finalArtifacts).toBeUndefined();
       expect(
-        new LocalExportQueue(replayDatabase).buildLoggedExportSuccessResult(
-          request.requestId,
-        ),
-      ).toEqual(firstResult);
+        queue.buildLoggedExportCanceledResult(request.requestId),
+      ).toMatchObject({
+        reason: "user_requested",
+        attempt: 1,
+        sourceCleanup: { lifecycle: "deleted" },
+      });
+      expect(await readdir(join(root, "exports"))).toEqual([]);
     } finally {
       replayDatabase.close();
     }
@@ -457,6 +492,26 @@ describe("one-shot local export runtime", () => {
       editingSettings,
       true,
     );
+    const attemptedExecutionDatabase = openLocalDatabase(
+      join(root, "local.sqlite"),
+    );
+    try {
+      const queue = new LocalExportQueue(attemptedExecutionDatabase);
+      const delivery = queue.getAcceptedLoggedDelivery(attempted.requestId)!;
+      queue.activateLoggedExecution({
+        executionId: randomUUID(),
+        requestId: attempted.requestId,
+        attempt: 1,
+        workerId: delivery.workerId,
+        workerEpoch: delivery.workerEpoch,
+        leaseToken: randomUUID(),
+        startedAt: "2026-08-20T12:00:06.000Z",
+        heartbeatAt: "2026-08-20T12:00:07.000Z",
+        expiresAt: "2026-08-20T12:00:37.000Z",
+      });
+    } finally {
+      attemptedExecutionDatabase.close();
+    }
     expect(
       await runConfiguredLocalExportOnce(
         { requestId: attempted.requestId, authorizationConfirmed: true },

@@ -5,6 +5,8 @@ import { AuthorizationError, requirePermission } from "@research-video/auth";
 import {
   ActiveTranscriptBundleSchema,
   AcceptLoggedExportDeliveryRequestSchema,
+  CancelLoggedExportRequestSchema,
+  CancelLoggedExportResponseSchema,
   BatchPreflightSummarySchema,
   ClaimedTranscriptionJobSchema,
   ClipCandidateSchema,
@@ -25,10 +27,17 @@ import {
   LoggedExportFailureResultSchema,
   LoggedExportSuccessResultSchema,
   LoggedExportSuccessSchema,
+  LoggedExportCanceledResultSchema,
+  LoggedExportCanceledSchema,
+  HeartbeatLoggedExportExecutionRequestSchema,
+  HeartbeatLoggedExportExecutionResponseSchema,
   ReconcileLoggedExportFailureRequestSchema,
   ReconcileLoggedExportSuccessRequestSchema,
+  ReconcileLoggedExportCanceledRequestSchema,
   RetryLoggedExportRequestSchema,
   RetryLoggedExportResponseSchema,
+  StartLoggedExportExecutionRequestSchema,
+  StartLoggedExportExecutionResponseSchema,
   ExportSettingsSchema,
   ExportWorkerCompatibilityRequestSchema,
   HeartbeatExportWorkerRequestSchema,
@@ -55,6 +64,8 @@ import {
   primaryLanguage,
   type ActiveTranscriptBundle,
   type AcceptLoggedExportDeliveryRequest,
+  type CancelLoggedExportRequest,
+  type CancelLoggedExportResponse,
   type AuthenticatedActor,
   type BatchOptions,
   type BatchPreflightItem,
@@ -84,12 +95,19 @@ import {
   type LoggedExportDelivery,
   type LoggedExportFailure,
   type LoggedExportFailureResult,
+  type LoggedExportCanceled,
+  type LoggedExportCanceledResult,
+  type HeartbeatLoggedExportExecutionRequest,
+  type HeartbeatLoggedExportExecutionResponse,
   type LoggedExportSuccess,
   type LoggedExportSuccessResult,
   type ReconcileLoggedExportFailureRequest,
   type ReconcileLoggedExportSuccessRequest,
+  type ReconcileLoggedExportCanceledRequest,
   type RetryLoggedExportRequest,
   type RetryLoggedExportResponse,
+  type StartLoggedExportExecutionRequest,
+  type StartLoggedExportExecutionResponse,
   type RevokeExportWorkerRequest,
   type ExportSettingsPreviewRequest,
   type PersonalExportPresetCatalog,
@@ -210,6 +228,7 @@ type DbRow = Record<string, unknown>;
 
 export const ExportWorkerHeartbeatTtlMs = 60_000;
 export const LoggedExportDeliveryReservationTtlMs = 30_000;
+export const LoggedExportExecutionLeaseTtlMs = 30_000;
 
 const iso = (value: unknown) =>
   value instanceof Date ? value.toISOString() : String(value);
@@ -476,6 +495,11 @@ export class SharedProjectCatalog {
           AND delivery_members.user_id = $1
          WHERE d.worker_id = $2 AND d.worker_epoch = $3
            AND d.accepted_at IS NULL AND d.reservation_expires_at > $4
+           AND j.state = 'queued'
+           AND NOT EXISTS (
+             SELECT 1 FROM logged_export_cancel_intents cancel
+             WHERE cancel.export_request_id = er.id
+           )
          ORDER BY d.reserved_at, d.id
          LIMIT 1
          FOR UPDATE OF d SKIP LOCKED`,
@@ -494,6 +518,10 @@ export class SharedProjectCatalog {
          LEFT JOIN logged_export_deliveries existing_delivery
            ON existing_delivery.export_request_id = er.id
          WHERE j.state = 'queued'
+           AND NOT EXISTS (
+             SELECT 1 FROM logged_export_cancel_intents cancel
+             WHERE cancel.export_request_id = er.id
+           )
            AND (
              existing_delivery.id IS NULL OR
              (existing_delivery.accepted_at IS NULL
@@ -620,6 +648,17 @@ export class SharedProjectCatalog {
           AND delivery_members.user_id = $1
          WHERE d.id = $2 AND d.worker_id = $3 AND d.worker_epoch = $4
            AND d.generation = $5 AND d.reservation_token = $6
+           AND (
+             d.accepted_at IS NOT NULL
+             OR (
+               j.state = 'queued'
+               AND delivery_clip.export_status = 'queued'
+               AND NOT EXISTS (
+                 SELECT 1 FROM logged_export_cancel_intents cancel
+                 WHERE cancel.export_request_id = er.id
+               )
+             )
+           )
          FOR UPDATE OF d`,
         [
           actor.userId,
@@ -665,6 +704,617 @@ export class SharedProjectCatalog {
       throw new CatalogConflictError("Delivery acceptance did not persist.");
     }
     return mapLoggedExportDelivery(accepted);
+  }
+
+  async cancelLoggedExport(
+    actor: AuthenticatedActor,
+    projectId: string,
+    requestId: string,
+    input: CancelLoggedExportRequest,
+  ): Promise<CancelLoggedExportResponse> {
+    await this.requireRegistered(actor);
+    const parsed = CancelLoggedExportRequestSchema.parse(input);
+    const now = this.now().toISOString();
+    let outcome: CancelLoggedExportResponse["outcome"] = "cancel_requested";
+    let cancelRequestedAt: string | undefined;
+
+    await this.transaction(async () => {
+      const result = await this.database.query<DbRow>(
+        `SELECT er.*, j.state,
+                export_success.result_json AS export_success_result_json,
+                cancel_clip.export_status AS cancel_clip_export_status,
+                delivery.accepted_at AS delivery_accepted_at,
+                intent.idempotency_key AS intent_idempotency_key,
+                intent.requested_at AS intent_requested_at,
+                canceled.id AS canceled_id,
+                failure.id AS failure_id
+         FROM export_requests er
+         JOIN jobs j ON j.id = er.job_id
+         LEFT JOIN logged_export_success_results export_success
+           ON export_success.export_request_id = er.id
+         JOIN clip_candidates cancel_clip ON cancel_clip.id = er.clip_id
+         JOIN project_members cancel_member
+           ON cancel_member.project_id = er.project_id
+          AND cancel_member.user_id = $1
+         LEFT JOIN logged_export_deliveries delivery
+           ON delivery.export_request_id = er.id
+         LEFT JOIN logged_export_cancel_intents intent
+           ON intent.export_request_id = er.id
+         LEFT JOIN logged_export_failure_results failure
+           ON failure.export_request_id = er.id
+         LEFT JOIN logged_export_canceled_results canceled
+           ON canceled.export_request_id = er.id
+         WHERE er.id = $2 AND er.project_id = $3
+         FOR UPDATE OF er, j, cancel_clip`,
+        [actor.userId, requestId, projectId],
+      );
+      const row = result.rows[0];
+      if (!row)
+        throw new AuthorizationError("Export cancellation is not authorized.");
+      const membership = await this.database.query<{ role: ProjectRole }>(
+        "SELECT role FROM project_members WHERE project_id = $1 AND user_id = $2",
+        [projectId, actor.userId],
+      );
+      requirePermission(membership.rows[0]?.role, "write");
+
+      if (
+        row.intent_idempotency_key &&
+        String(row.intent_idempotency_key) !== parsed.idempotencyKey
+      ) {
+        throw new CatalogIdempotencyConflictError(
+          "This export already has a different cancellation command identity.",
+        );
+      }
+      if (["complete", "failed", "canceled"].includes(String(row.state))) {
+        outcome = row.canceled_id ? "canceled" : "already_terminal";
+        cancelRequestedAt = row.intent_requested_at
+          ? iso(row.intent_requested_at)
+          : undefined;
+        return;
+      }
+      if (
+        !["queued", "processing"].includes(String(row.state)) ||
+        !["queued", "processing"].includes(
+          String(row.cancel_clip_export_status),
+        )
+      ) {
+        throw new CatalogConflictError(
+          "This export cannot be canceled from its current state.",
+        );
+      }
+
+      if (!row.intent_requested_at) {
+        await this.database.query(
+          `INSERT INTO logged_export_cancel_intents
+             (export_request_id, project_id, requested_by, idempotency_key, requested_at)
+           VALUES ($1, $2, $3, $4, $5)`,
+          [requestId, projectId, actor.userId, parsed.idempotencyKey, now],
+        );
+        cancelRequestedAt = now;
+      } else {
+        cancelRequestedAt = iso(row.intent_requested_at);
+      }
+
+      if (!row.delivery_accepted_at) {
+        const request = mapLoggedExportRequest(row);
+        const canceledResult = LoggedExportCanceledResultSchema.parse({
+          schemaVersion: 1,
+          requestId: request.id,
+          jobId: request.jobId,
+          projectId: request.projectId,
+          clipId: request.clipId,
+          reason: "user_requested",
+          attempt: 0,
+          sourceCleanup: { lifecycle: "not_started" },
+        });
+        const canceledId = randomUUID();
+        await this.database.query(
+          `INSERT INTO logged_export_canceled_results
+             (id, export_request_id, result_schema_version, result_json,
+              result_fingerprint, reconciled_at)
+           VALUES ($1, $2, 1, $3, $4, $5)`,
+          [
+            canceledId,
+            requestId,
+            JSON.stringify(canceledResult),
+            sha256Fingerprint(canceledResult),
+            now,
+          ],
+        );
+        await this.database.query(
+          "UPDATE jobs SET state = 'canceled', updated_at = $1 WHERE id = $2 AND state = 'queued'",
+          [now, request.jobId],
+        );
+        const clip = await this.database.query<DbRow>(
+          `UPDATE clip_candidates
+           SET export_status = 'canceled', version = version + 1, updated_at = $1
+           WHERE id = $2 AND project_id = $3 AND export_status = 'queued'
+           RETURNING version`,
+          [now, request.clipId, projectId],
+        );
+        if (!clip.rows[0])
+          throw new CatalogConflictError(
+            "The queued clip changed during cancellation.",
+          );
+        await this.database.query(
+          `INSERT INTO sync_events
+             (project_id, event_type, entity_id, server_version, payload, created_at)
+           VALUES ($1, 'clip_candidate.export_canceled', $2, $3, $4, $5)`,
+          [
+            projectId,
+            request.clipId,
+            clip.rows[0].version,
+            JSON.stringify({
+              clipId: request.clipId,
+              exportRequestId: request.id,
+              jobId: request.jobId,
+              canceledResultId: canceledId,
+              reason: "user_requested",
+              attempt: 0,
+              sourceCleanup: { lifecycle: "not_started" },
+            }),
+            now,
+          ],
+        );
+        outcome = "canceled";
+      }
+    });
+
+    const request = await this.getLoggedExportRequest(
+      actor,
+      projectId,
+      requestId,
+    );
+    return CancelLoggedExportResponseSchema.parse({
+      outcome,
+      request,
+      ...(cancelRequestedAt ? { cancelRequestedAt } : {}),
+    });
+  }
+
+  async startLoggedExportExecution(
+    actor: AuthenticatedActor,
+    input: StartLoggedExportExecutionRequest,
+  ): Promise<StartLoggedExportExecutionResponse> {
+    await this.requireRegistered(actor);
+    const parsed = StartLoggedExportExecutionRequestSchema.parse(input);
+    const nowDate = this.now();
+    const now = nowDate.toISOString();
+    const expiresAt = new Date(
+      nowDate.getTime() + LoggedExportExecutionLeaseTtlMs,
+    ).toISOString();
+    let response: StartLoggedExportExecutionResponse | undefined;
+
+    await this.transaction(async () => {
+      const worker = await this.database.query<DbRow>(
+        "SELECT * FROM registered_export_workers WHERE id = $1 FOR UPDATE",
+        [parsed.workerId],
+      );
+      const workerRow = worker.rows[0];
+      if (workerRow && String(workerRow.owner_user_id) !== actor.userId) {
+        throw new AuthorizationError(
+          "This worker identity belongs to another user.",
+        );
+      }
+      if (
+        !workerRow ||
+        Number(workerRow.epoch) !== parsed.workerEpoch ||
+        workerRow.revoked_at ||
+        new Date(iso(workerRow.expires_at)).getTime() <= nowDate.getTime()
+      ) {
+        throw new CatalogConflictError(
+          "Worker registration is missing, stale, expired, or revoked.",
+        );
+      }
+      const deliveryResult = await this.database.query<DbRow>(
+        `${loggedExportDeliverySelect}
+         JOIN project_members execution_member
+           ON execution_member.project_id = er.project_id
+          AND execution_member.user_id = $1
+         LEFT JOIN logged_export_cancel_intents cancel
+           ON cancel.export_request_id = er.id
+         WHERE d.id = $2 AND d.worker_id = $3 AND d.worker_epoch = $4
+           AND d.generation = $5 AND d.reservation_token = $6
+           AND d.accepted_at IS NOT NULL
+         FOR UPDATE OF d, er, j, delivery_clip`,
+        [
+          actor.userId,
+          parsed.deliveryId,
+          parsed.workerId,
+          parsed.workerEpoch,
+          parsed.generation,
+          parsed.reservationToken,
+        ],
+      );
+      const delivery = deliveryResult.rows[0];
+      if (!delivery)
+        throw new CatalogConflictError(
+          "The accepted export delivery is stale or unauthorized.",
+        );
+      const cancelIntent = await this.database.query<{ requested_at: unknown }>(
+        "SELECT requested_at FROM logged_export_cancel_intents WHERE export_request_id = $1",
+        [delivery.id],
+      );
+      const existing = await this.database.query<DbRow>(
+        "SELECT * FROM logged_export_executions WHERE delivery_id = $1 FOR UPDATE",
+        [parsed.deliveryId],
+      );
+      let execution = existing.rows[0];
+      if (cancelIntent.rows[0] && !execution) {
+        response = {
+          status: "cancel_requested",
+          cancelRequestedAt: iso(cancelIntent.rows[0].requested_at),
+        };
+        return;
+      }
+      if (
+        !["queued", "processing"].includes(String(delivery.state)) ||
+        !["queued", "processing"].includes(
+          String(delivery.delivery_clip_export_status),
+        )
+      ) {
+        throw new CatalogConflictError(
+          "This accepted export cannot start execution.",
+        );
+      }
+      if (execution) {
+        if (
+          String(execution.export_request_id) !== String(delivery.id) ||
+          Number(execution.delivery_generation) !== parsed.generation ||
+          String(execution.worker_id) !== parsed.workerId ||
+          Number(execution.worker_epoch) !== parsed.workerEpoch
+        ) {
+          throw new CatalogConflictError(
+            "A different execution already owns this delivery.",
+          );
+        }
+        await this.database.query(
+          `UPDATE logged_export_executions
+           SET heartbeat_at = $1, expires_at = $2 WHERE id = $3`,
+          [now, expiresAt, execution.id],
+        );
+        execution = {
+          ...execution,
+          heartbeat_at: now,
+          expires_at: expiresAt,
+          ...(cancelIntent.rows[0]
+            ? { cancel_requested_at: cancelIntent.rows[0].requested_at }
+            : {}),
+        };
+      } else {
+        const inserted = await this.database.query<DbRow>(
+          `INSERT INTO logged_export_executions
+             (id, export_request_id, delivery_id, delivery_generation,
+              worker_id, worker_epoch, attempt, lease_token, started_at,
+              heartbeat_at, expires_at)
+           VALUES ($1, $2, $3, $4, $5, $6, 1, $7, $8, $8, $9)
+           RETURNING *`,
+          [
+            randomUUID(),
+            delivery.id,
+            parsed.deliveryId,
+            parsed.generation,
+            parsed.workerId,
+            parsed.workerEpoch,
+            randomUUID(),
+            now,
+            expiresAt,
+          ],
+        );
+        execution = inserted.rows[0];
+        await this.database.query(
+          "UPDATE jobs SET state = 'processing', attempt = 1, updated_at = $1 WHERE id = $2 AND state = 'queued'",
+          [now, delivery.job_id],
+        );
+        await this.database.query(
+          "UPDATE clip_candidates SET export_status = 'processing', updated_at = $1 WHERE id = $2 AND export_status = 'queued'",
+          [now, delivery.clip_id],
+        );
+      }
+      response = {
+        status: "started",
+        execution: mapLoggedExportExecution(execution!),
+      };
+    });
+    if (!response)
+      throw new CatalogConflictError("Execution start did not persist.");
+    return StartLoggedExportExecutionResponseSchema.parse(response);
+  }
+
+  async heartbeatLoggedExportExecution(
+    actor: AuthenticatedActor,
+    input: HeartbeatLoggedExportExecutionRequest,
+  ): Promise<HeartbeatLoggedExportExecutionResponse> {
+    await this.requireRegistered(actor);
+    const parsed = HeartbeatLoggedExportExecutionRequestSchema.parse(input);
+    const nowDate = this.now();
+    const now = nowDate.toISOString();
+    const expiresAt = new Date(
+      nowDate.getTime() + LoggedExportExecutionLeaseTtlMs,
+    ).toISOString();
+    let row: DbRow | undefined;
+    await this.transaction(async () => {
+      const current = await this.database.query<DbRow>(
+        `SELECT execution.*, cancel.requested_at AS cancel_requested_at,
+                worker.owner_user_id, worker.epoch AS current_worker_epoch,
+                worker.revoked_at, worker.expires_at AS worker_expires_at,
+                delivery.generation AS current_delivery_generation,
+                delivery.reservation_token
+         FROM logged_export_executions execution
+         JOIN registered_export_workers worker ON worker.id = execution.worker_id
+         JOIN logged_export_deliveries delivery ON delivery.id = execution.delivery_id
+         JOIN export_requests er ON er.id = execution.export_request_id
+         JOIN project_members member ON member.project_id = er.project_id AND member.user_id = $1
+         LEFT JOIN logged_export_cancel_intents cancel ON cancel.export_request_id = er.id
+         WHERE execution.id = $2 AND execution.attempt = $3
+           AND execution.lease_token = $4
+         FOR UPDATE OF execution`,
+        [actor.userId, parsed.executionId, parsed.attempt, parsed.leaseToken],
+      );
+      const execution = current.rows[0];
+      if (
+        !execution ||
+        String(execution.owner_user_id) !== actor.userId ||
+        String(execution.worker_id) !== parsed.workerId ||
+        Number(execution.worker_epoch) !== parsed.workerEpoch ||
+        String(execution.delivery_id) !== parsed.deliveryId ||
+        Number(execution.delivery_generation) !== parsed.generation ||
+        Number(execution.current_delivery_generation) !== parsed.generation ||
+        String(execution.reservation_token) !== parsed.reservationToken ||
+        Number(execution.current_worker_epoch) !== parsed.workerEpoch ||
+        execution.revoked_at ||
+        new Date(iso(execution.worker_expires_at)).getTime() <=
+          nowDate.getTime() ||
+        new Date(iso(execution.expires_at)).getTime() <= nowDate.getTime()
+      ) {
+        throw new CatalogConflictError(
+          "The logged export execution lease is stale or unauthorized.",
+        );
+      }
+      const updated = await this.database.query<DbRow>(
+        `UPDATE logged_export_executions SET heartbeat_at = $1, expires_at = $2
+         WHERE id = $3 RETURNING *`,
+        [now, expiresAt, parsed.executionId],
+      );
+      await this.database.query(
+        `UPDATE registered_export_workers
+         SET heartbeat_at = $1, expires_at = $2, updated_at = $1
+         WHERE id = $3 AND epoch = $4`,
+        [
+          now,
+          new Date(
+            nowDate.getTime() + ExportWorkerHeartbeatTtlMs,
+          ).toISOString(),
+          parsed.workerId,
+          parsed.workerEpoch,
+        ],
+      );
+      row = {
+        ...updated.rows[0],
+        cancel_requested_at: execution.cancel_requested_at,
+      };
+    });
+    if (!row)
+      throw new CatalogConflictError("Execution heartbeat did not persist.");
+    return HeartbeatLoggedExportExecutionResponseSchema.parse({
+      execution: mapLoggedExportExecution(row),
+    });
+  }
+
+  async reconcileLoggedExportCanceled(
+    actor: AuthenticatedActor,
+    input: ReconcileLoggedExportCanceledRequest,
+  ): Promise<LoggedExportCanceled> {
+    await this.requireRegistered(actor);
+    const parsed = ReconcileLoggedExportCanceledRequestSchema.parse(input);
+    const nowDate = this.now();
+    const now = nowDate.toISOString();
+    const resultFingerprint = sha256Fingerprint(parsed.result);
+    let reconciled: DbRow | undefined;
+
+    await this.transaction(async () => {
+      const worker = await this.database.query<DbRow>(
+        "SELECT * FROM registered_export_workers WHERE id = $1 FOR UPDATE",
+        [parsed.workerId],
+      );
+      const workerRow = worker.rows[0];
+      if (!workerRow || String(workerRow.owner_user_id) !== actor.userId) {
+        throw new AuthorizationError(
+          "This accepted delivery belongs to another worker owner.",
+        );
+      }
+      const deliveryResult = await this.database.query<DbRow>(
+        `${loggedExportDeliverySelect}
+         JOIN project_members cancel_member
+           ON cancel_member.project_id = er.project_id
+          AND cancel_member.user_id = $1
+         LEFT JOIN logged_export_cancel_intents cancel
+           ON cancel.export_request_id = er.id
+         WHERE d.id = $2 AND d.worker_id = $3 AND d.worker_epoch = $4
+           AND d.generation = $5 AND d.reservation_token = $6
+           AND d.accepted_at IS NOT NULL
+         FOR UPDATE OF d, er, j, delivery_clip`,
+        [
+          actor.userId,
+          parsed.deliveryId,
+          parsed.workerId,
+          parsed.workerEpoch,
+          parsed.generation,
+          parsed.reservationToken,
+        ],
+      );
+      const delivery = deliveryResult.rows[0];
+      if (!delivery)
+        throw new CatalogConflictError(
+          "The accepted export delivery is stale or unauthorized.",
+        );
+      assertLoggedExportCanceledMatchesRequest(delivery, parsed.result);
+
+      const existingSuccess = await this.database.query<DbRow>(
+        "SELECT id FROM logged_export_success_results WHERE export_request_id = $1 OR delivery_id = $2 FOR UPDATE",
+        [delivery.id, parsed.deliveryId],
+      );
+      const existingFailure = await this.database.query<DbRow>(
+        "SELECT id FROM logged_export_failure_results WHERE export_request_id = $1 OR delivery_id = $2 FOR UPDATE",
+        [delivery.id, parsed.deliveryId],
+      );
+      if (existingSuccess.rows[0] || existingFailure.rows[0]) {
+        throw new CatalogConflictError(
+          "A different immutable terminal result already exists for this export.",
+        );
+      }
+      const existingCanceled = await this.database.query<DbRow>(
+        "SELECT * FROM logged_export_canceled_results WHERE export_request_id = $1 OR delivery_id = $2 FOR UPDATE",
+        [delivery.id, parsed.deliveryId],
+      );
+      if (existingCanceled.rows[0]) {
+        const mapped = mapLoggedExportCanceled(existingCanceled.rows[0]);
+        if (
+          String(existingCanceled.rows[0].result_fingerprint) !==
+            resultFingerprint ||
+          canonicalJson(mapped.result) !== canonicalJson(parsed.result)
+        ) {
+          throw new CatalogConflictError(
+            "A different immutable cancellation is already reconciled.",
+          );
+        }
+        if (
+          String(delivery.state) !== "canceled" ||
+          String(delivery.delivery_clip_export_status) !== "canceled"
+        ) {
+          throw new CatalogConflictError(
+            "The existing cancellation has inconsistent authoritative state.",
+          );
+        }
+        reconciled = existingCanceled.rows[0];
+        return;
+      }
+
+      const intent = await this.database.query<DbRow>(
+        "SELECT * FROM logged_export_cancel_intents WHERE export_request_id = $1 FOR UPDATE",
+        [delivery.id],
+      );
+      let execution: DbRow | undefined;
+      if (parsed.executionId) {
+        const executionResult = await this.database.query<DbRow>(
+          `SELECT * FROM logged_export_executions
+           WHERE id = $1 AND export_request_id = $2 AND delivery_id = $3
+             AND delivery_generation = $4 AND worker_id = $5
+             AND worker_epoch = $6 AND lease_token = $7
+           FOR UPDATE`,
+          [
+            parsed.executionId,
+            delivery.id,
+            parsed.deliveryId,
+            parsed.generation,
+            parsed.workerId,
+            parsed.workerEpoch,
+            parsed.leaseToken,
+          ],
+        );
+        execution = executionResult.rows[0];
+        if (
+          !execution ||
+          Number(execution.attempt) !== parsed.result.executionAttempt
+        ) {
+          throw new CatalogConflictError(
+            "Canceled result execution ownership is stale or mismatched.",
+          );
+        }
+      }
+      if (parsed.result.reason === "user_requested" && !intent.rows[0]) {
+        throw new CatalogConflictError(
+          "User-requested cancellation has no durable cancel intent.",
+        );
+      }
+      if (
+        parsed.result.reason === "execution_lease_lost" &&
+        (!execution ||
+          (new Date(iso(execution.expires_at)).getTime() > nowDate.getTime() &&
+            Number(workerRow.epoch) === parsed.workerEpoch &&
+            !workerRow.revoked_at))
+      ) {
+        throw new CatalogConflictError(
+          "Execution ownership has not durably expired or changed.",
+        );
+      }
+      if (
+        !["queued", "processing"].includes(String(delivery.state)) ||
+        !["queued", "processing"].includes(
+          String(delivery.delivery_clip_export_status),
+        )
+      ) {
+        throw new CatalogConflictError(
+          "Only the exact nonterminal accepted export can be canceled.",
+        );
+      }
+
+      const resultId = randomUUID();
+      const inserted = await this.database.query<DbRow>(
+        `INSERT INTO logged_export_canceled_results
+           (id, export_request_id, delivery_id, delivery_generation,
+            worker_id, worker_epoch, execution_id, result_schema_version,
+            result_json, result_fingerprint, reconciled_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 1, $8, $9, $10)
+         RETURNING *`,
+        [
+          resultId,
+          delivery.id,
+          parsed.deliveryId,
+          parsed.generation,
+          parsed.workerId,
+          parsed.workerEpoch,
+          parsed.executionId ?? null,
+          JSON.stringify(parsed.result),
+          resultFingerprint,
+          now,
+        ],
+      );
+      const job = await this.database.query<DbRow>(
+        `UPDATE jobs SET state = 'canceled', updated_at = $1
+         WHERE id = $2 AND kind = 'export' AND state IN ('queued', 'processing')
+         RETURNING id`,
+        [now, parsed.result.jobId],
+      );
+      const clip = await this.database.query<DbRow>(
+        `UPDATE clip_candidates
+         SET export_status = 'canceled', version = version + 1, updated_at = $1
+         WHERE id = $2 AND project_id = $3
+           AND export_status IN ('queued', 'processing')
+         RETURNING version`,
+        [now, parsed.result.clipId, parsed.result.projectId],
+      );
+      if (!job.rows[0] || !clip.rows[0]) {
+        throw new CatalogConflictError(
+          "The export changed during cancellation reconciliation.",
+        );
+      }
+      await this.database.query(
+        `INSERT INTO sync_events
+           (project_id, event_type, entity_id, server_version, payload, created_at)
+         VALUES ($1, 'clip_candidate.export_canceled', $2, $3, $4, $5)`,
+        [
+          parsed.result.projectId,
+          parsed.result.clipId,
+          clip.rows[0].version,
+          JSON.stringify({
+            clipId: parsed.result.clipId,
+            exportRequestId: parsed.result.requestId,
+            jobId: parsed.result.jobId,
+            canceledResultId: resultId,
+            reason: parsed.result.reason,
+            attempt: parsed.result.attempt,
+            sourceCleanup: parsed.result.sourceCleanup,
+          }),
+          now,
+        ],
+      );
+      reconciled = inserted.rows[0];
+    });
+
+    if (!reconciled)
+      throw new CatalogConflictError("Cancellation reconciliation failed.");
+    return mapLoggedExportCanceled(reconciled);
   }
 
   async reconcileLoggedExportSuccess(
@@ -726,6 +1376,11 @@ export class SharedProjectCatalog {
       }
       assertLoggedExportSuccessMatchesRequest(delivery, parsed.result);
 
+      const cancelIntent = await this.database.query<DbRow>(
+        "SELECT export_request_id FROM logged_export_cancel_intents WHERE export_request_id = $1 FOR UPDATE",
+        [delivery.id],
+      );
+
       const existingFailure = await this.database.query<DbRow>(
         `SELECT id FROM logged_export_failure_results
          WHERE export_request_id = $1 OR delivery_id = $2
@@ -735,6 +1390,17 @@ export class SharedProjectCatalog {
       if (existingFailure.rows[0]) {
         throw new CatalogConflictError(
           "An immutable failure is already reconciled for this export.",
+        );
+      }
+      const existingCanceled = await this.database.query<DbRow>(
+        `SELECT id FROM logged_export_canceled_results
+         WHERE export_request_id = $1 OR delivery_id = $2
+         FOR UPDATE`,
+        [delivery.id, parsed.deliveryId],
+      );
+      if (existingCanceled.rows[0]) {
+        throw new CatalogConflictError(
+          "An immutable cancellation is already reconciled for this export.",
         );
       }
 
@@ -769,9 +1435,17 @@ export class SharedProjectCatalog {
         return;
       }
 
+      if (cancelIntent.rows[0]) {
+        throw new CatalogConflictError(
+          "Cancellation intent won before the first terminal success.",
+        );
+      }
+
       if (
-        String(delivery.state) !== "queued" ||
-        String(delivery.delivery_clip_export_status) !== "queued"
+        !["queued", "processing"].includes(String(delivery.state)) ||
+        !["queued", "processing"].includes(
+          String(delivery.delivery_clip_export_status),
+        )
       ) {
         throw new CatalogConflictError(
           "Only the exact queued accepted export can record its first result.",
@@ -800,7 +1474,7 @@ export class SharedProjectCatalog {
       );
       const completedJob = await this.database.query<DbRow>(
         `UPDATE jobs SET state = 'complete', updated_at = $1
-         WHERE id = $2 AND kind = 'export' AND state = 'queued'
+         WHERE id = $2 AND kind = 'export' AND state IN ('queued', 'processing')
          RETURNING id`,
         [nowIso, parsed.result.jobId],
       );
@@ -812,7 +1486,8 @@ export class SharedProjectCatalog {
       const completedClip = await this.database.query<DbRow>(
         `UPDATE clip_candidates
          SET export_status = 'complete', version = version + 1, updated_at = $1
-         WHERE id = $2 AND project_id = $3 AND export_status = 'queued'
+         WHERE id = $2 AND project_id = $3
+           AND export_status IN ('queued', 'processing')
          RETURNING version`,
         [nowIso, parsed.result.clipId, parsed.result.projectId],
       );
@@ -903,6 +1578,11 @@ export class SharedProjectCatalog {
       }
       assertLoggedExportFailureMatchesRequest(delivery, parsed.result);
 
+      const cancelIntent = await this.database.query<DbRow>(
+        "SELECT export_request_id FROM logged_export_cancel_intents WHERE export_request_id = $1 FOR UPDATE",
+        [delivery.id],
+      );
+
       const existingSuccess = await this.database.query<DbRow>(
         `SELECT id FROM logged_export_success_results
          WHERE export_request_id = $1 OR delivery_id = $2
@@ -912,6 +1592,17 @@ export class SharedProjectCatalog {
       if (existingSuccess.rows[0]) {
         throw new CatalogConflictError(
           "An immutable success is already reconciled for this export.",
+        );
+      }
+      const existingCanceled = await this.database.query<DbRow>(
+        `SELECT id FROM logged_export_canceled_results
+         WHERE export_request_id = $1 OR delivery_id = $2
+         FOR UPDATE`,
+        [delivery.id, parsed.deliveryId],
+      );
+      if (existingCanceled.rows[0]) {
+        throw new CatalogConflictError(
+          "An immutable cancellation is already reconciled for this export.",
         );
       }
 
@@ -946,9 +1637,17 @@ export class SharedProjectCatalog {
         return;
       }
 
+      if (cancelIntent.rows[0]) {
+        throw new CatalogConflictError(
+          "Cancellation intent won before the first terminal failure.",
+        );
+      }
+
       if (
-        String(delivery.state) !== "queued" ||
-        String(delivery.delivery_clip_export_status) !== "queued"
+        !["queued", "processing"].includes(String(delivery.state)) ||
+        !["queued", "processing"].includes(
+          String(delivery.delivery_clip_export_status),
+        )
       ) {
         throw new CatalogConflictError(
           "Only the exact queued accepted export can record its first failure.",
@@ -977,7 +1676,7 @@ export class SharedProjectCatalog {
       );
       const failedJob = await this.database.query<DbRow>(
         `UPDATE jobs SET state = 'failed', updated_at = $1
-         WHERE id = $2 AND kind = 'export' AND state = 'queued'
+         WHERE id = $2 AND kind = 'export' AND state IN ('queued', 'processing')
          RETURNING id`,
         [nowIso, parsed.result.jobId],
       );
@@ -989,7 +1688,8 @@ export class SharedProjectCatalog {
       const failedClip = await this.database.query<DbRow>(
         `UPDATE clip_candidates
          SET export_status = 'failed', version = version + 1, updated_at = $1
-         WHERE id = $2 AND project_id = $3 AND export_status = 'queued'
+         WHERE id = $2 AND project_id = $3
+           AND export_status IN ('queued', 'processing')
          RETURNING version`,
         [nowIso, parsed.result.clipId, parsed.result.projectId],
       );
@@ -4570,6 +5270,43 @@ function mapLoggedExportFailure(row: DbRow): LoggedExportFailure {
   });
 }
 
+function mapLoggedExportCanceled(row: DbRow): LoggedExportCanceled {
+  return LoggedExportCanceledSchema.parse({
+    id: row.id,
+    ...(row.delivery_id
+      ? {
+          deliveryId: row.delivery_id,
+          generation: Number(row.delivery_generation),
+          workerId: row.worker_id,
+          workerEpoch: Number(row.worker_epoch),
+        }
+      : {}),
+    result:
+      typeof row.result_json === "string"
+        ? JSON.parse(row.result_json)
+        : row.result_json,
+    resultFingerprint: row.result_fingerprint,
+    reconciledAt: iso(row.reconciled_at),
+  });
+}
+
+function mapLoggedExportExecution(row: DbRow) {
+  return {
+    executionId: String(row.id),
+    requestId: String(row.export_request_id),
+    attempt: Number(row.attempt),
+    workerId: String(row.worker_id),
+    workerEpoch: Number(row.worker_epoch),
+    leaseToken: String(row.lease_token),
+    startedAt: iso(row.started_at),
+    heartbeatAt: iso(row.heartbeat_at),
+    expiresAt: iso(row.expires_at),
+    ...(row.cancel_requested_at
+      ? { cancelRequestedAt: iso(row.cancel_requested_at) }
+      : {}),
+  };
+}
+
 function assertLoggedExportFailureMatchesRequest(
   row: DbRow,
   result: LoggedExportFailureResult,
@@ -4586,6 +5323,26 @@ function assertLoggedExportFailureMatchesRequest(
   ) {
     throw new CatalogConflictError(
       "Export failure identity does not match the immutable queued request.",
+    );
+  }
+}
+
+function assertLoggedExportCanceledMatchesRequest(
+  row: DbRow,
+  result: LoggedExportCanceledResult,
+): void {
+  const request = mapLoggedExportRequest({
+    ...row,
+    export_success_result_json: undefined,
+  });
+  if (
+    result.requestId !== request.id ||
+    result.jobId !== request.jobId ||
+    result.projectId !== request.projectId ||
+    result.clipId !== request.clipId
+  ) {
+    throw new CatalogConflictError(
+      "Export cancellation identity does not match the immutable request.",
     );
   }
 }
