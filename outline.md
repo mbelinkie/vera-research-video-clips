@@ -331,9 +331,12 @@ produce preferred SRT artifacts.
 - [x] Use private staging plus exact-artifact validation and atomic completion.
 - [x] Execute accepted logged requests through the existing local processor and
   reconcile immutable results with the shared catalog.
-- [ ] Add same-source grouping with durable reference-counted cleanup.
+- [x] M5-24: group compatible active logged batch siblings around one durable
+  local source lifecycle while preserving independent execution, progress,
+  staging, package, cancellation, and terminal state; delete only after exact
+  final release (`specs/completed/M5-24-durable-same-source-grouping.md`).
 
-Gate: representative presets produce the requested FFprobe properties, queued jobs survive preset edits unchanged, English clips get an SRT by default and can explicitly omit it, foreign/mixed/unknown clips always get original plus translated-English SRTs, a 30-second foreign-language range produces only cues within that 30-second clip, a real authorized smoke test succeeds, and no full source media remains after any terminal path. M5-08 proves the local export-only composition path with authorized repository fixture media; M5-17 and M5-18 prove exact idempotent cloud success/failure reconciliation for one accepted logged request; M5-19 proves bounded local cleanup recovery without inferring legacy random-layout scratch paths; M5-20 proves immutable linear retry of terminal failed logged exports; M5-21 proves exact execution ownership, safe cancellation, real child termination, and immutable three-way terminal exclusion; M5-22 proves durable exact-execution progress, local/cloud restart reconciliation, and sanitized project reads; M5-23 proves atomic batch composition, retry-leaf membership, mixed sibling status, and one existing executor per item. Same-source grouping and the final fixture/live gates remain open.
+Gate: representative presets produce the requested FFprobe properties, queued jobs survive preset edits unchanged, English clips get an SRT by default and can explicitly omit it, foreign/mixed/unknown clips always get original plus translated-English SRTs, a 30-second foreign-language range produces only cues within that 30-second clip, a real authorized smoke test succeeds, and no full source media remains after any terminal path. M5-08 proves the local export-only composition path with authorized repository fixture media; M5-17 and M5-18 prove exact idempotent cloud success/failure reconciliation for one accepted logged request; M5-19 proves bounded local cleanup recovery without inferring legacy random-layout scratch paths; M5-20 proves immutable linear retry of terminal failed logged exports; M5-21 proves exact execution ownership, safe cancellation, real child termination, and immutable three-way terminal exclusion; M5-22 proves durable exact-execution progress, local/cloud restart reconciliation, and sanitized project reads; M5-23 proves atomic batch composition, retry-leaf membership, mixed sibling status, and one existing executor per item; M5-24 proves one durable shared-source lifecycle with independent child processing and exact last-release deletion. The final fixture/live gates remain open.
 
 ### 6. Project Clip Library + authoring handoff
 
@@ -519,8 +522,7 @@ infra/aws        storage, API, database, queues, identity, monitoring
 ## Next action
 
 Finish and test Milestone 5 only, using one bounded active spec at a time. Start
-with same-source grouping for compatible active M5-23 siblings while retaining
-one independent M5-21 execution and M5-22 progress stream per request. Then
-close the 30-second foreign fixture, the user-authorized live smoke, and the
-full Milestone 5 gate. Follow
+with the deterministic rights-cleared approximately 30-second foreign-language
+fixture gate, then run the explicitly user-authorized live YouTube smoke and the
+full Milestone 5 matrix. Follow
 `docs/Milestone 5 Completion Agent Prompt.md`; do not begin M6 or M7.

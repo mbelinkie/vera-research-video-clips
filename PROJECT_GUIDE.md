@@ -2,7 +2,7 @@
 
 ## Project guide and implementation plan
 
-Status: Milestones 1–4 core workflow complete; preferred-language logging, local export capabilities, authorized logged-export reconciliation, cleanup recovery, immutable retry, exact execution ownership, durable progress, and isolated batch export are verified through M5-23; same-source grouping and the final Milestone 5 release gate remain open
+Status: Milestones 1–4 core workflow complete; preferred-language logging, local export capabilities, authorized logged-export reconciliation, cleanup recovery, immutable retry, exact execution ownership, durable progress, isolated batch export, and same-source grouping are verified through M5-24; the final Milestone 5 fixture/live release gate remains open
 Last updated: 2026-08-22
 
 This document is the source of truth for product scope, architecture, sequencing, and acceptance criteria. Update it when a deliberate product or architectural decision changes. Use `outline.md` as the shorter execution checklist.
@@ -1593,6 +1593,31 @@ aggregate gate passes 250 tests with one declared skip, the web build, 23 local
 and 19 cloud migrations, plus four Playwright flows. Same-source group execution,
 the foreign fixture, authorized live smoke, and the final Milestone 5 matrix
 remain open.
+
+M5-24 completed 2026-08-22. Compatible active logged children from one M5-23
+batch, project, canonical YouTube source, worker epoch, and configured provider
+profile can now share one private full-source acquisition and inspection. The
+cloud adds no group queue, executor, lease, result, or project read model; only
+delivery-private immutable batch identity crosses to the assigned worker. Local
+migration `0024` records one compatibility-bound group, exact execution/member
+attempts, per-member outcomes, logical source evidence, final release, cleanup
+claims, and deleted/actionable state without persisting a usable path. One
+process-local coordinator surrounds the existing per-request processor: member
+ranges retain independent settings, progress, abort signals, staging, render,
+subtitles, thumbnail, metadata, manifest, package, and terminal reconciliation.
+One member failure or cancellation releases only that member. No job becomes
+complete from partial artifacts or before the shared root is verified absent;
+cleanup failure blocks every dependent with redacted actionable evidence.
+Ordinary sweeping cannot delete beneath a live exact execution, while bounded
+startup recovery safely treats a prior process's joined members as orphaned and
+deletes only the deterministic group root. Durable prior-group evidence makes
+late and retry work fall back to a fresh request-owned acquisition instead of
+reviving deleted media. A real FFmpeg/FFprobe repository-fixture test proves one
+acquisition, two isolated packages, two deleted member rows, and no remaining
+group scratch. The aggregate gate passes 258 tests with one declared skip, the
+web build, 24 local and 19 cloud migrations, plus four Playwright flows. The
+approximately 30-second foreign fixture, explicitly authorized live YouTube
+smoke, and final Milestone 5 matrix remain open.
 
 M5-09 completed 2026-08-19. Every promoted clip package now also contains one
 `manifest.json`, written into attempt-private staging and promoted through the
