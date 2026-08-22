@@ -2,7 +2,7 @@
 
 ## Project guide and implementation plan
 
-Status: Milestones 1–4 core workflow complete; preferred-language logging, local export capabilities, authorized logged-export success/failure/canceled reconciliation, safe local source-scratch cleanup recovery, immutable retry, exact execution ownership, and durable progress are verified through M5-22; batch/group execution and the final Milestone 5 release gate remain open
+Status: Milestones 1–4 core workflow complete; preferred-language logging, local export capabilities, authorized logged-export reconciliation, cleanup recovery, immutable retry, exact execution ownership, durable progress, and isolated batch export are verified through M5-23; same-source grouping and the final Milestone 5 release gate remain open
 Last updated: 2026-08-22
 
 This document is the source of truth for product scope, architecture, sequencing, and acceptance criteria. Update it when a deliberate product or architectural decision changes. Use `outline.md` as the shorter execution checklist.
@@ -1569,6 +1569,30 @@ gate passes 247 tests with one declared skip, the web build, 23 local
 migrations, and 18 cloud migrations. Batch/sibling isolation, same-source group
 execution, the foreign fixture, authorized live smoke, and the final Milestone
 5 matrix remain open.
+
+M5-23 completed 2026-08-22. A project editor can now submit two through twenty-
+five eligible logged clips as one durable idempotent batch. Cloud migration
+`0019` adds immutable batch identity and ordered item membership, binds every
+root export request and all M5-20 retry descendants to the same item, and
+rejects divergent project/clip/lineage relationships at the database boundary.
+Creation locks and validates every clip, language/subtitle snapshot, settings
+selection, resolution fingerprint, and worker compatibility before writing,
+then persists the batch, items, independent jobs/requests, clip status changes,
+and sanitized sync events in one transaction. Any invalid sibling rolls the
+whole command back; exact and concurrent replay returns the original batch,
+while divergent reuse conflicts without orphan jobs. A batch owns no delivery,
+execution, cancellation, source, package, or terminal result. Aggregate reads
+follow each item's newest linear retry leaf and derive exact queued, claimed,
+processing, actionable, complete, failed, and canceled counts; only all-success
+is batch-complete, while mixed terminal outcomes remain explicit. Project reads
+expose only item/request/job state plus optional M5-22 progress—never worker or
+lease credentials, source identity, paths, URLs, transcript text, raw errors, or
+artifact locators. A narrow web panel selects eligible project clips, resolves
+each immutable settings snapshot, queues the batch, and polls its summary. The
+aggregate gate passes 250 tests with one declared skip, the web build, 23 local
+and 19 cloud migrations, plus four Playwright flows. Same-source group execution,
+the foreign fixture, authorized live smoke, and the final Milestone 5 matrix
+remain open.
 
 M5-09 completed 2026-08-19. Every promoted clip package now also contains one
 `manifest.json`, written into attempt-private staging and promoted through the
