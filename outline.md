@@ -309,14 +309,19 @@ produce preferred SRT artifacts.
   source scratch with exact-child deletion, durable SQLite claims, legacy-layout
   manual handling, and package/failure recovery
   (`specs/completed/M5-19-cleanup-recovery-and-abandoned-source-scratch-sweeper.md`).
+- [x] M5-20: create one immutable linear retry child for an exact terminal failed
+  logged export, copy the persisted request/settings snapshots exactly, preserve
+  all parent failure/delivery evidence, and recover exact/concurrent replay
+  without orphan jobs
+  (`specs/completed/M5-20-immutable-retry-of-terminal-failed-logged-export.md`).
 - [x] Generate and verify thumbnail, metadata JSON, and manifest.
 - [x] Use private staging plus exact-artifact validation and atomic completion.
 - [x] Execute accepted logged requests through the existing local processor and
   reconcile immutable results with the shared catalog.
-- [ ] Add durable progress, retry, safe cancellation, sibling isolation, and
-  batch export.
+- [ ] Add durable progress, safe cancellation, sibling isolation, batch export,
+  and same-source grouping.
 
-Gate: representative presets produce the requested FFprobe properties, queued jobs survive preset edits unchanged, English clips get an SRT by default and can explicitly omit it, foreign/mixed/unknown clips always get original plus translated-English SRTs, a 30-second foreign-language range produces only cues within that 30-second clip, a real authorized smoke test succeeds, and no full source media remains after any terminal path. M5-08 proves the local export-only composition path with authorized repository fixture media; M5-17 and M5-18 prove exact idempotent cloud success/failure reconciliation for one accepted logged request; M5-19 proves bounded local cleanup recovery without inferring legacy random-layout scratch paths. The remaining operational/release gates remain open.
+Gate: representative presets produce the requested FFprobe properties, queued jobs survive preset edits unchanged, English clips get an SRT by default and can explicitly omit it, foreign/mixed/unknown clips always get original plus translated-English SRTs, a 30-second foreign-language range produces only cues within that 30-second clip, a real authorized smoke test succeeds, and no full source media remains after any terminal path. M5-08 proves the local export-only composition path with authorized repository fixture media; M5-17 and M5-18 prove exact idempotent cloud success/failure reconciliation for one accepted logged request; M5-19 proves bounded local cleanup recovery without inferring legacy random-layout scratch paths; M5-20 proves immutable linear retry of terminal failed logged exports. Durable progress, safe cancellation, batch/sibling isolation, same-source grouping, and the final fixture/live gates remain open.
 
 ### 6. Project Clip Library + authoring handoff
 
@@ -465,6 +470,10 @@ infra/aws        storage, API, database, queues, identity, monitoring
   exact verified-deleted scratch row. Expiry/revocation/newer registration epoch
   may report existing terminal evidence but may not execute old accepted work;
   cleanup failure stays actionable and success/failure cannot coexist.
+- Retrying an accepted terminal failure requires current project write access,
+  preserves the exact parent request/job/delivery/failure evidence and immutable
+  settings snapshots, creates one linear child with a monotonic ordinal, and is
+  exact-replay/concurrency safe without orphan jobs or branching.
 - Word/cue/estimated timing lookup and bilingual preservation.
 - Transcript selection to source/export bounds.
 - Queue creation without export side effects.
@@ -497,8 +506,11 @@ infra/aws        storage, API, database, queues, identity, monitoring
 
 ## Next action
 
-Continue Milestone 5 with one bounded M5-20 durable logged-export
-operational-control slice: safe cancellation plus retry ownership/state
-transition. Do not claim batch/group/progress work unless it is implemented;
-do not broaden into the 30-second foreign fixture gate, the authorized-live
-smoke test, M6, or M7.
+Finish and test Milestone 5 only, using one bounded active spec at a time. Start
+with the integrity prerequisite for safe cancellation: durable execution
+start/lease/heartbeat and cancel intent, cooperative local abort/child-process
+termination, verified scratch cleanup, and immutable canceled reconciliation
+that cannot coexist with success or failure. Then close durable progress,
+batch/sibling isolation, same-source grouping, the 30-second foreign fixture,
+the user-authorized live smoke, and the full Milestone 5 gate. Follow
+`docs/Milestone 5 Completion Agent Prompt.md`; do not begin M6 or M7.

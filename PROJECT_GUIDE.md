@@ -2,8 +2,8 @@
 
 ## Project guide and implementation plan
 
-Status: Milestones 1–4 core workflow complete; preferred-language logging, local export capabilities, authorized logged-export success/failure reconciliation, and safe local source-scratch cleanup recovery are verified through M5-19; operational controls/grouping and the final release gate remain open
-Last updated: 2026-08-20
+Status: Milestones 1–4 core workflow complete; preferred-language logging, local export capabilities, authorized logged-export success/failure reconciliation, safe local source-scratch cleanup recovery, and immutable retry of terminal failed logged exports are verified through M5-20; safe cancellation, durable progress, batch/group execution, and the final Milestone 5 release gate remain open
+Last updated: 2026-08-21
 
 This document is the source of truth for product scope, architecture, sequencing, and acceptance criteria. Update it when a deliberate product or architectural decision changes. Use `outline.md` as the shorter execution checklist.
 
@@ -1413,10 +1413,11 @@ web build, 17 local and 11 cloud migrations, four Playwright flows, and real
 FFmpeg/FFprobe renders for all three families. Commits `2323a0f`, `fe1efed`,
 `38047c4`, `9c8d8c6`, and `75def13` contain the completed slices.
 
-These slices do not complete Milestone 5. Cleanup-failure recovery,
-progress/retry/cancel controls, batch and same-source group execution,
-crash-recovery cleanup sweeping, the 30-second foreign fixture gate, and the
-user-authorized live YouTube smoke test remain open.
+These slices do not complete Milestone 5. Later M5-15 through M5-20 slices add
+worker registration, accepted logged-export delivery and reconciliation,
+cleanup recovery, and immutable retry as described below. Durable progress,
+safe cancellation, batch and same-source group execution, the 30-second foreign
+fixture gate, and the user-authorized live YouTube smoke test remain open.
 
 M5-15 completed 2026-08-20. A local workstation now persists one stable worker
 ID and capability-registration epoch in SQLite, discovers the existing fixed
@@ -1503,6 +1504,24 @@ Legacy random-layout bytes still require manual recovery; expiry remains the
 abandonment boundary until a future execution heartbeat/control slice, and
 M5-18 intentionally still rejects multi-attempt failure projection rather than
 guessing attempt ownership.
+
+M5-20 completed 2026-08-21. A current write-capable project member can now
+retry one exact terminal failed logged export without mutating its request,
+job, accepted delivery, immutable failure, or historical events. The cloud
+transaction verifies and locks the persisted parent evidence, creates a new
+queued job/request with new IDs, explicit parent provenance, and a monotonic
+retry ordinal, and copies the exact immutable video, selection, language,
+subtitle, preset, resolved-settings, capability, and fingerprint snapshots.
+Only the shared clip moves from `failed` to `queued`, with one version increment
+and one sanitized retry event. A project-scoped idempotency identity, one-child
+lineage constraint, database snapshot/immutability triggers, and serialized
+single-connection transactions make exact replay and concurrency return one
+child while divergent branching conflicts and leaves no orphan jobs. The child
+uses the existing M5-16 delivery and M5-17/M5-18 result paths unchanged. This
+slice adds retry only: safe cancellation still requires durable execution
+start/lease/heartbeat state, cancel intent, cooperative local abort and child
+process termination, verified scratch cleanup, and immutable canceled-result
+reconciliation mutually exclusive with success and failure.
 
 M5-09 completed 2026-08-19. Every promoted clip package now also contains one
 `manifest.json`, written into attempt-private staging and promoted through the
