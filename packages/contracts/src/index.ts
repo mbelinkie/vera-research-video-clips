@@ -2457,7 +2457,18 @@ export const ArtifactVersionSummarySchema = z
     selection: TranscriptSelectionSchema,
     sourceLanguageClass: ExportSourceLanguageClassSchema,
     subtitleTracks: ExportSubtitleTrackSnapshotsSchema.optional(),
+    preset: ExportPresetSnapshotSchema,
     resolvedSettingsSnapshot: ResolvedExportSettingsSnapshotSchema,
+    resolvedExportBounds: ResolvedExportBoundsSchema,
+    renderedMediaProvenance: RenderedExportMediaProvenanceSchema,
+    thumbnailProvenance: ExportThumbnailProvenanceSchema,
+    subtitleOmissionProvenance: SubtitleOmissionProvenanceSchema.optional(),
+    englishSubtitleProvenance:
+      EnglishSubtitleSidecarProvenanceSchema.optional(),
+    subtitleSidecars: z
+      .array(SubtitleSidecarProvenanceSchema)
+      .max(2)
+      .optional(),
     artifacts: z.array(FinalArtifactProvenanceSchema).min(4).max(6),
     manifest: z
       .object({
@@ -2510,6 +2521,103 @@ export const ArtifactVersionHistoryResponseSchema = z
     versions: z.array(ArtifactVersionSummarySchema).max(100),
     nextCursor: IdSchema.optional(),
   })
+  .strict();
+
+export const ArtifactStoragePlatformSchema = z.enum(["posix", "windows"]);
+export const ArtifactAvailabilityStateSchema = z.enum([
+  "verified",
+  "missing",
+  "invalid",
+]);
+export const ArtifactVerificationFailureClassSchema = z.enum([
+  "root_unavailable",
+  "root_changed",
+  "package_missing",
+  "unsafe_path",
+  "unsupported_schema",
+  "manifest_invalid",
+  "identity_mismatch",
+  "snapshot_mismatch",
+  "artifact_mismatch",
+  "filesystem_untrusted",
+  "io_error",
+]);
+
+export const ArtifactRootSummarySchema = z
+  .object({
+    id: IdSchema,
+    label: z.string().trim().min(1).max(120),
+    platform: ArtifactStoragePlatformSchema,
+    enabled: z.boolean(),
+    createdAt: UtcTimestampSchema,
+    updatedAt: UtcTimestampSchema,
+  })
+  .strict();
+
+export const ConfigureLocalArtifactRootRequestSchema = z
+  .object({
+    label: z.string().trim().min(1).max(120),
+    platform: ArtifactStoragePlatformSchema,
+    // This command is local-agent-only. The path is never present in a root
+    // summary, cloud request, project event, diagnostic, or support record.
+    absolutePath: z.string().min(1).max(4_096),
+  })
+  .strict();
+
+export const ArtifactRootListResponseSchema = z
+  .object({ roots: z.array(ArtifactRootSummarySchema).max(100) })
+  .strict();
+
+export const VerifyLocalArtifactVersionRequestSchema = z
+  .object({
+    projectId: IdSchema,
+    clipId: IdSchema,
+    artifactVersionId: IdSchema,
+    rootId: IdSchema,
+  })
+  .strict();
+
+export const ArtifactLocatorSummarySchema = z
+  .object({
+    id: IdSchema,
+    artifactVersionId: IdSchema,
+    rootId: IdSchema,
+    platform: ArtifactStoragePlatformSchema,
+    availability: ArtifactAvailabilityStateSchema,
+    manifestSha256: z.string().regex(/^[a-f0-9]{64}$/),
+    manifestSchemaVersion: z.union([z.literal(1), z.literal(2)]).nullable(),
+    checkedAt: UtcTimestampSchema,
+    lastVerifiedAt: UtcTimestampSchema.optional(),
+    failureClass: ArtifactVerificationFailureClassSchema.optional(),
+  })
+  .strict()
+  .superRefine((locator, context) => {
+    if (
+      (locator.availability === "verified") ===
+      Boolean(locator.failureClass)
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["failureClass"],
+        message:
+          "Verified locators cannot carry a failure, and unavailable locators require one.",
+      });
+    }
+    if (
+      locator.availability === "verified" &&
+      (locator.manifestSchemaVersion === null || !locator.lastVerifiedAt)
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["lastVerifiedAt"],
+        message:
+          "Verified locators require a verified manifest schema and timestamp.",
+      });
+    }
+  });
+
+export const ArtifactLocatorListResponseSchema = z
+  .object({ locators: z.array(ArtifactLocatorSummarySchema).max(100) })
   .strict();
 
 export function sanitizeLoggedExportFailureCode(value: string): string {
@@ -3047,6 +3155,25 @@ export type ArtifactVersionHistoryQuery = z.infer<
 >;
 export type ArtifactVersionHistoryResponse = z.infer<
   typeof ArtifactVersionHistoryResponseSchema
+>;
+export type ArtifactStoragePlatform = z.infer<
+  typeof ArtifactStoragePlatformSchema
+>;
+export type ArtifactAvailabilityState = z.infer<
+  typeof ArtifactAvailabilityStateSchema
+>;
+export type ArtifactVerificationFailureClass = z.infer<
+  typeof ArtifactVerificationFailureClassSchema
+>;
+export type ArtifactRootSummary = z.infer<typeof ArtifactRootSummarySchema>;
+export type ConfigureLocalArtifactRootRequest = z.infer<
+  typeof ConfigureLocalArtifactRootRequestSchema
+>;
+export type VerifyLocalArtifactVersionRequest = z.infer<
+  typeof VerifyLocalArtifactVersionRequestSchema
+>;
+export type ArtifactLocatorSummary = z.infer<
+  typeof ArtifactLocatorSummarySchema
 >;
 export type LoggedExportFailureResult = z.infer<
   typeof LoggedExportFailureResultSchema

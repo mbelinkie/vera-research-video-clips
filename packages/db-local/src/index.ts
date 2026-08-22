@@ -6,6 +6,8 @@ import { DatabaseSync } from "node:sqlite";
 
 import {
   CreateExportOnlyRequestSchema,
+  ArtifactLocatorSummarySchema,
+  ArtifactRootSummarySchema,
   ExportObservedMediaPropertiesSchema,
   ExportRequestSchema,
   LoggedExportDeliverySchema,
@@ -21,6 +23,11 @@ import {
   sanitizeLoggedExportFailureCode,
   sanitizeLoggedExportFailureMessage,
   type CreateExportOnlyRequest,
+  type ArtifactAvailabilityState,
+  type ArtifactLocatorSummary,
+  type ArtifactRootSummary,
+  type ArtifactStoragePlatform,
+  type ArtifactVerificationFailureClass,
   type DerivedTranslationIdentity,
   type ExportRequest,
   type LoggedExportDelivery,
@@ -3460,6 +3467,233 @@ export class LocalExportWorkerIdentityRepository {
   }
 }
 
+export type LocalArtifactRootRecord = ArtifactRootSummary & {
+  absolutePath: string;
+  pathFingerprint: string;
+  filesystemIdentity: string;
+};
+
+export class LocalArtifactLocatorRepository {
+  constructor(
+    private readonly database: DatabaseSync,
+    private readonly now: () => Date = () => new Date(),
+  ) {}
+
+  configureRoot(input: {
+    label: string;
+    platform: ArtifactStoragePlatform;
+    absolutePath: string;
+    pathFingerprint: string;
+    filesystemIdentity: string;
+  }): ArtifactRootSummary {
+    const existing = this.database
+      .prepare(
+        `SELECT * FROM artifact_roots
+         WHERE platform = ? AND path_fingerprint = ?`,
+      )
+      .get(input.platform, input.pathFingerprint) as
+      Record<string, unknown> | undefined;
+    if (existing) {
+      const root = mapLocalArtifactRoot(existing);
+      if (
+        root.absolutePath !== input.absolutePath ||
+        root.filesystemIdentity !== input.filesystemIdentity
+      ) {
+        throw new LocalArtifactCatalogError(
+          "Configured artifact root identity conflicts with an existing root.",
+        );
+      }
+      return toArtifactRootSummary(root);
+    }
+    const id = randomUUID();
+    const now = this.now().toISOString();
+    this.database
+      .prepare(
+        `INSERT INTO artifact_roots
+           (id, label, platform, absolute_path, path_fingerprint,
+            filesystem_identity, enabled, path_policy_version,
+            created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, 1, 1, ?, ?)`,
+      )
+      .run(
+        id,
+        input.label,
+        input.platform,
+        input.absolutePath,
+        input.pathFingerprint,
+        input.filesystemIdentity,
+        now,
+        now,
+      );
+    return toArtifactRootSummary(this.getRoot(id)!);
+  }
+
+  getRoot(rootId: string): LocalArtifactRootRecord | undefined {
+    const row = this.database
+      .prepare("SELECT * FROM artifact_roots WHERE id = ?")
+      .get(rootId) as Record<string, unknown> | undefined;
+    return row ? mapLocalArtifactRoot(row) : undefined;
+  }
+
+  listRoots(): ArtifactRootSummary[] {
+    return (
+      this.database
+        .prepare("SELECT * FROM artifact_roots ORDER BY created_at, id")
+        .all() as Record<string, unknown>[]
+    ).map((row) => toArtifactRootSummary(mapLocalArtifactRoot(row)));
+  }
+
+  setRootEnabled(rootId: string, enabled: boolean): ArtifactRootSummary {
+    const result = this.database
+      .prepare(
+        "UPDATE artifact_roots SET enabled = ?, updated_at = ? WHERE id = ?",
+      )
+      .run(enabled ? 1 : 0, this.now().toISOString(), rootId);
+    if (result.changes !== 1) {
+      throw new LocalArtifactCatalogError(
+        "Configured artifact root not found.",
+        404,
+      );
+    }
+    return toArtifactRootSummary(this.getRoot(rootId)!);
+  }
+
+  getLocator(
+    rootId: string,
+    artifactVersionId: string,
+  ): ArtifactLocatorSummary | undefined {
+    const row = this.database
+      .prepare(
+        `SELECT * FROM export_artifact_locators
+         WHERE root_id = ? AND artifact_version_id = ?`,
+      )
+      .get(rootId, artifactVersionId) as Record<string, unknown> | undefined;
+    return row ? mapArtifactLocator(row) : undefined;
+  }
+
+  listLocators(artifactVersionId?: string): ArtifactLocatorSummary[] {
+    const rows = artifactVersionId
+      ? this.database
+          .prepare(
+            `SELECT * FROM export_artifact_locators
+             WHERE artifact_version_id = ? ORDER BY checked_at DESC, id`,
+          )
+          .all(artifactVersionId)
+      : this.database
+          .prepare(
+            "SELECT * FROM export_artifact_locators ORDER BY checked_at DESC, id",
+          )
+          .all();
+    return (rows as Record<string, unknown>[]).map(mapArtifactLocator);
+  }
+
+  recordVerified(input: {
+    artifactVersionId: string;
+    rootId: string;
+    relativePackagePath: string;
+    platform: ArtifactStoragePlatform;
+    projectId: string;
+    clipId: string;
+    requestId: string;
+    packageIdentity: string;
+    manifestSha256: string;
+    manifestSchemaVersion: 1 | 2;
+    resultFingerprint: string;
+  }): ArtifactLocatorSummary {
+    const existing = this.getLocator(input.rootId, input.artifactVersionId);
+    const id = existing?.id ?? randomUUID();
+    const now = this.now().toISOString();
+    try {
+      const result = this.database
+        .prepare(
+          `INSERT INTO export_artifact_locators
+             (id, artifact_version_id, root_id, relative_package_path,
+              platform, project_id, clip_id, request_id, package_identity,
+              manifest_sha256, manifest_schema_version, result_fingerprint,
+              verification_schema_version, availability, failure_class,
+              checked_at, last_verified_at, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'verified', NULL,
+                   ?, ?, ?, ?)
+           ON CONFLICT(root_id, artifact_version_id) DO UPDATE SET
+             availability = 'verified', failure_class = NULL,
+             checked_at = excluded.checked_at,
+             last_verified_at = excluded.last_verified_at,
+             updated_at = excluded.updated_at
+           WHERE export_artifact_locators.relative_package_path = excluded.relative_package_path
+             AND export_artifact_locators.platform = excluded.platform
+             AND export_artifact_locators.project_id = excluded.project_id
+             AND export_artifact_locators.clip_id = excluded.clip_id
+             AND export_artifact_locators.request_id = excluded.request_id
+             AND export_artifact_locators.package_identity = excluded.package_identity
+             AND export_artifact_locators.manifest_sha256 = excluded.manifest_sha256
+             AND export_artifact_locators.manifest_schema_version = excluded.manifest_schema_version
+             AND export_artifact_locators.result_fingerprint = excluded.result_fingerprint`,
+        )
+        .run(
+          id,
+          input.artifactVersionId,
+          input.rootId,
+          input.relativePackagePath,
+          input.platform,
+          input.projectId,
+          input.clipId,
+          input.requestId,
+          input.packageIdentity,
+          input.manifestSha256,
+          input.manifestSchemaVersion,
+          input.resultFingerprint,
+          now,
+          now,
+          now,
+          now,
+        );
+      if (result.changes !== 1) throw new Error("locator identity conflict");
+    } catch {
+      throw new LocalArtifactCatalogError(
+        "Artifact locator identity conflicts with existing local evidence.",
+      );
+    }
+    return this.getLocator(input.rootId, input.artifactVersionId)!;
+  }
+
+  recordUnavailable(input: {
+    rootId: string;
+    artifactVersionId: string;
+    availability: Exclude<ArtifactAvailabilityState, "verified">;
+    failureClass: ArtifactVerificationFailureClass;
+  }): ArtifactLocatorSummary | undefined {
+    const now = this.now().toISOString();
+    const result = this.database
+      .prepare(
+        `UPDATE export_artifact_locators
+         SET availability = ?, failure_class = ?, checked_at = ?, updated_at = ?
+         WHERE root_id = ? AND artifact_version_id = ?`,
+      )
+      .run(
+        input.availability,
+        input.failureClass,
+        now,
+        now,
+        input.rootId,
+        input.artifactVersionId,
+      );
+    return result.changes === 1
+      ? this.getLocator(input.rootId, input.artifactVersionId)
+      : undefined;
+  }
+}
+
+export class LocalArtifactCatalogError extends Error {
+  readonly code = "artifact_catalog_conflict";
+
+  constructor(
+    message: string,
+    readonly statusCode = 409,
+  ) {
+    super(message);
+  }
+}
+
 export class LocalExportLifecycleError extends Error {
   readonly code: string = "export_source_lifecycle_conflict";
   readonly statusCode = 409;
@@ -3483,6 +3717,52 @@ function mapLocalExportWorkerIdentity(
     createdAt: String(row.created_at),
     updatedAt: String(row.updated_at),
   };
+}
+
+function mapLocalArtifactRoot(
+  row: Record<string, unknown>,
+): LocalArtifactRootRecord {
+  return {
+    id: String(row.id),
+    label: String(row.label),
+    platform: String(row.platform) as ArtifactStoragePlatform,
+    absolutePath: String(row.absolute_path),
+    pathFingerprint: String(row.path_fingerprint),
+    filesystemIdentity: String(row.filesystem_identity),
+    enabled: Boolean(row.enabled),
+    createdAt: String(row.created_at),
+    updatedAt: String(row.updated_at),
+  };
+}
+
+function toArtifactRootSummary(
+  root: LocalArtifactRootRecord,
+): ArtifactRootSummary {
+  return ArtifactRootSummarySchema.parse({
+    id: root.id,
+    label: root.label,
+    platform: root.platform,
+    enabled: root.enabled,
+    createdAt: root.createdAt,
+    updatedAt: root.updatedAt,
+  });
+}
+
+function mapArtifactLocator(
+  row: Record<string, unknown>,
+): ArtifactLocatorSummary {
+  return ArtifactLocatorSummarySchema.parse({
+    id: row.id,
+    artifactVersionId: row.artifact_version_id,
+    rootId: row.root_id,
+    platform: row.platform,
+    availability: row.availability,
+    manifestSha256: row.manifest_sha256,
+    manifestSchemaVersion: Number(row.manifest_schema_version),
+    checkedAt: row.checked_at,
+    lastVerifiedAt: row.last_verified_at,
+    ...(row.failure_class ? { failureClass: row.failure_class } : {}),
+  });
 }
 
 function mapLocalLoggedExportSourceGroup(

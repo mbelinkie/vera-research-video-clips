@@ -36,6 +36,65 @@ describe("local agent", () => {
     );
   });
 
+  it("keeps root paths local and resolves verification evidence through authorization", async () => {
+    const rootId = "019fbb95-cd76-7920-93fa-e23ba755ee71";
+    const artifactVersionId = "019fbb95-cd76-7920-93fa-e23ba755ee72";
+    const projectId = "019fbb95-cd76-7920-93fa-e23ba755ee73";
+    const clipId = "019fbb95-cd76-7920-93fa-e23ba755ee74";
+    const now = "2026-08-22T12:00:00.000Z";
+    const artifactVersion = { artifactVersionId } as never;
+    const locator = {
+      id: "019fbb95-cd76-7920-93fa-e23ba755ee75",
+      artifactVersionId,
+      rootId,
+      platform: "posix" as const,
+      availability: "verified" as const,
+      manifestSha256: "a".repeat(64),
+      manifestSchemaVersion: 2 as const,
+      checkedAt: now,
+      lastVerifiedAt: now,
+    };
+    const resolveArtifactVersion = vi.fn(async () => artifactVersion);
+    const verifyArtifactVersion = vi.fn(async () => locator);
+    const app = createLocalAgent({
+      resolveArtifactVersion,
+      verifyArtifactVersion,
+    });
+    apps.add(app);
+    expect(
+      (await app.inject({ method: "GET", url: "/api/artifact-roots" }))
+        .statusCode,
+    ).toBe(404);
+    const command = { projectId, clipId, artifactVersionId, rootId };
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: "/api/artifact-locators/verify",
+          payload: command,
+        })
+      ).statusCode,
+    ).toBe(401);
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/artifact-locators/verify",
+      headers: { authorization: "Bearer project-session" },
+      payload: command,
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual(locator);
+    expect(resolveArtifactVersion).toHaveBeenCalledWith({
+      projectId,
+      clipId,
+      artifactVersionId,
+      authorization: "Bearer project-session",
+    });
+    expect(verifyArtifactVersion).toHaveBeenCalledWith({
+      rootId,
+      artifactVersion,
+    });
+  });
+
   it("requires authentication and returns a resolved normalized transcript", async () => {
     const transcript = normalizeTranscriptFixture(transcriptFixture);
     const transcriptVersionId = "019fbb95-cd76-7920-93fa-e23ba755e399";

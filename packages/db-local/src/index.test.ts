@@ -23,6 +23,7 @@ import {
 
 import {
   LocalExportQueue,
+  LocalArtifactLocatorRepository,
   LocalExportWorkerIdentityRepository,
   LocalTranscriptIndex,
   openLocalDatabase,
@@ -149,6 +150,7 @@ describe("local migrations", () => {
       "0023_logged_export_execution_progress",
       "0024_logged_export_same_source_groups",
       "0025_export_request_origin",
+      "0026_artifact_roots_and_locators",
     ]);
     expect(runLocalMigrations(database)).toEqual([]);
     expect(
@@ -158,6 +160,19 @@ describe("local migrations", () => {
         }>
       ).some((column) => column.name === "request_origin"),
     ).toBe(true);
+    expect(
+      database
+        .prepare(
+          `SELECT count(*) AS count FROM sqlite_master
+           WHERE type = 'table' AND name IN ('artifact_roots', 'export_artifact_locators')`,
+        )
+        .get(),
+    ).toEqual({ count: 2 });
+    expect(
+      database
+        .prepare("SELECT count(*) AS count FROM export_artifact_locators")
+        .get(),
+    ).toEqual({ count: 0 });
     expect(
       database
         .prepare(
@@ -324,6 +339,101 @@ describe("local migrations", () => {
     database.close();
   });
 
+  it("persists immutable local root and locator identity across restart", () => {
+    const directory = mkdtempSync(
+      join(tmpdir(), "research-video-locator-test-"),
+    );
+    temporaryDirectories.add(directory);
+    const database = openLocalDatabase(join(directory, "test.sqlite"));
+    runLocalMigrations(database);
+    const clock = () => new Date("2026-08-22T12:00:00.000Z");
+    const repository = new LocalArtifactLocatorRepository(database, clock);
+    const root = repository.configureRoot({
+      label: "Managed exports",
+      platform: "posix",
+      absolutePath: "/private/local-only/exports",
+      pathFingerprint: "a".repeat(64),
+      filesystemIdentity: "7:42",
+    });
+    expect(root).not.toHaveProperty("absolutePath");
+    expect(
+      repository.configureRoot({
+        label: "Ignored replay label",
+        platform: "posix",
+        absolutePath: "/private/local-only/exports",
+        pathFingerprint: "a".repeat(64),
+        filesystemIdentity: "7:42",
+      }),
+    ).toEqual(root);
+    const requestId = randomUUID();
+    const locatorIdentity = {
+      artifactVersionId: randomUUID(),
+      rootId: root.id,
+      relativePackagePath: `clip-${requestId}`,
+      platform: "posix",
+      projectId: randomUUID(),
+      clipId: randomUUID(),
+      requestId,
+      packageIdentity: `clip-${requestId}`,
+      manifestSha256: "b".repeat(64),
+      manifestSchemaVersion: 2,
+      resultFingerprint: "c".repeat(64),
+    } as const;
+    const locator = repository.recordVerified(locatorIdentity);
+    expect(locator).toMatchObject({
+      rootId: root.id,
+      availability: "verified",
+      manifestSchemaVersion: 2,
+    });
+    expect(locator).not.toHaveProperty("relativePackagePath");
+    expect(new LocalArtifactLocatorRepository(database).listLocators()).toEqual(
+      [locator],
+    );
+    const ambiguousPackage = `clip-${requestId.slice(0, -1)}A`;
+    expect(() =>
+      repository.recordVerified({
+        artifactVersionId: randomUUID(),
+        rootId: root.id,
+        relativePackagePath: ambiguousPackage,
+        platform: "posix",
+        projectId: randomUUID(),
+        clipId: randomUUID(),
+        requestId,
+        packageIdentity: ambiguousPackage,
+        manifestSha256: "d".repeat(64),
+        manifestSchemaVersion: 2,
+        resultFingerprint: "e".repeat(64),
+      }),
+    ).toThrow();
+    expect(
+      repository.recordUnavailable({
+        rootId: root.id,
+        artifactVersionId: locator.artifactVersionId,
+        availability: "missing",
+        failureClass: "package_missing",
+      }),
+    ).toMatchObject({
+      id: locator.id,
+      availability: "missing",
+      failureClass: "package_missing",
+      lastVerifiedAt: locator.lastVerifiedAt,
+    });
+    expect(() =>
+      database
+        .prepare(
+          "UPDATE artifact_roots SET absolute_path = '/different' WHERE id = ?",
+        )
+        .run(root.id),
+    ).toThrow(/immutable/u);
+    expect(() =>
+      database
+        .prepare(
+          "UPDATE export_artifact_locators SET request_id = ? WHERE id = ?",
+        )
+        .run(randomUUID(), locator.id),
+    ).toThrow(/immutable/u);
+  });
+
   it("rejects grouped scratch without the exact shared layout version", () => {
     const directory = mkdtempSync(join(tmpdir(), "research-video-layout3-"));
     temporaryDirectories.add(directory);
@@ -402,6 +512,7 @@ describe("local migrations", () => {
       "0023_logged_export_execution_progress",
       "0024_logged_export_same_source_groups",
       "0025_export_request_origin",
+      "0026_artifact_roots_and_locators",
     ]);
     expect(
       database
@@ -581,6 +692,7 @@ describe("local migrations", () => {
       "0023_logged_export_execution_progress",
       "0024_logged_export_same_source_groups",
       "0025_export_request_origin",
+      "0026_artifact_roots_and_locators",
     ]);
     expect(
       database.prepare("SELECT * FROM export_final_artifacts").all(),
@@ -622,6 +734,11 @@ describe("local migrations", () => {
         )
         .get(legacyRequestId),
     ).toEqual({ count: 4 });
+    expect(
+      database
+        .prepare("SELECT count(*) AS count FROM export_artifact_locators")
+        .get(),
+    ).toEqual({ count: 0 });
     database.close();
   });
 
@@ -711,6 +828,7 @@ describe("local migrations", () => {
       "0023_logged_export_execution_progress",
       "0024_logged_export_same_source_groups",
       "0025_export_request_origin",
+      "0026_artifact_roots_and_locators",
     ]);
     expect(
       database
@@ -1720,6 +1838,7 @@ describe("logged export delivery import", () => {
       "0023_logged_export_execution_progress",
       "0024_logged_export_same_source_groups",
       "0025_export_request_origin",
+      "0026_artifact_roots_and_locators",
     ]);
     const after = new LocalExportQueue(database).get(before.id);
     expect(after).toEqual(before);
@@ -1782,6 +1901,7 @@ describe("logged export delivery import", () => {
       "0023_logged_export_execution_progress",
       "0024_logged_export_same_source_groups",
       "0025_export_request_origin",
+      "0026_artifact_roots_and_locators",
     ]);
     expect(
       new LocalExportQueue(database).getAcceptedLoggedDelivery(

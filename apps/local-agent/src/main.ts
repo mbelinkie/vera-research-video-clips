@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { loadConfig } from "@research-video/config";
 import {
   ExportSettingsPreviewSchema,
+  ArtifactVersionSummarySchema,
   ClaimLoggedExportDeliveryResponseSchema,
   LoggedExportDeliverySchema,
   LoggedExportFailureSchema,
@@ -15,6 +16,7 @@ import {
 } from "@research-video/contracts";
 import {
   LocalExportQueue,
+  LocalArtifactLocatorRepository,
   LocalExportWorkerIdentityRepository,
   LocalTranscriptIndex,
   openLocalDatabase,
@@ -38,6 +40,7 @@ import {
 } from "@research-video/media";
 
 import { createLocalAgent } from "./app.ts";
+import { LocalArtifactLocatorService } from "./artifact-locators.ts";
 import { runLocalSourceScratchSweep } from "./export-scratch-sweeper.ts";
 import {
   discardCompletedLoggedExportForCancellation,
@@ -47,9 +50,19 @@ import { LocalLoggedExportSourceGroupCoordinator } from "./shared-source-group.t
 
 const config = loadConfig();
 await mkdir(config.dataDir, { recursive: true });
+const managedExportRoot = join(config.dataDir, "exports");
+await mkdir(managedExportRoot, { recursive: true });
 const database = openLocalDatabase(join(config.dataDir, "local.sqlite"));
 runLocalMigrations(database);
 const exportQueue = new LocalExportQueue(database);
+const artifactLocators = new LocalArtifactLocatorService(
+  new LocalArtifactLocatorRepository(database),
+);
+await artifactLocators.configureRoot({
+  label: "Managed exports",
+  platform: process.platform === "win32" ? "windows" : "posix",
+  absolutePath: managedExportRoot,
+});
 await runLocalSourceScratchSweep(
   { recoverOrphanedGroups: true },
   { queue: exportQueue, dataRoot: config.dataDir },
@@ -82,6 +95,20 @@ const reader = new CachedTranscriptDocumentReader(
 );
 const cloudApiUrl = `http://${config.cloudApiHost}:${config.cloudApiPort}`;
 const app = createLocalAgent({
+  resolveArtifactVersion: async ({
+    projectId,
+    clipId,
+    artifactVersionId,
+    authorization,
+  }) =>
+    callCloudArtifactVersion(
+      projectId,
+      clipId,
+      artifactVersionId,
+      authorization,
+    ),
+  verifyArtifactVersion: ({ rootId, artifactVersion }) =>
+    artifactLocators.verifyArtifactVersion(rootId, artifactVersion),
   capabilityProvider,
   workerIdentity,
   registerExportWorker: async ({ request, authorization }) =>
@@ -247,6 +274,34 @@ async function callCloudExportWorker(
     );
   }
   return RegisteredExportWorkerSchema.parse(payload);
+}
+
+async function callCloudArtifactVersion(
+  projectId: string,
+  clipId: string,
+  artifactVersionId: string,
+  authorization: string,
+) {
+  const response = await fetch(
+    `${cloudApiUrl}/api/projects/${projectId}/clips/${clipId}/artifact-versions/${artifactVersionId}`,
+    { headers: { authorization } },
+  );
+  const payload = await response.json().catch(() => undefined);
+  if (!response.ok) {
+    const remote = payload as
+      { error?: { code?: string; message?: string } } | undefined;
+    throw Object.assign(
+      new Error(
+        remote?.error?.message ??
+          `Cloud artifact-version lookup failed with HTTP ${response.status}.`,
+      ),
+      {
+        statusCode: response.status,
+        code: remote?.error?.code ?? "artifact_version_unavailable",
+      },
+    );
+  }
+  return ArtifactVersionSummarySchema.parse(payload);
 }
 
 async function callCloudLoggedExportDeliveryClaim(

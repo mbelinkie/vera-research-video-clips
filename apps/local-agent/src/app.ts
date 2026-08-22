@@ -3,11 +3,14 @@ import { z, ZodError } from "zod";
 
 import {
   CreateExportOnlyRequestSchema,
+  VerifyLocalArtifactVersionRequestSchema,
   ClaimLoggedExportDeliveryResponseSchema,
   ExportSettingsPreviewRequestSchema,
   ProcessAcceptedLoggedExportRequestSchema,
   ProcessAcceptedLoggedExportResponseSchema,
   type HeartbeatExportWorkerRequest,
+  type ArtifactLocatorSummary,
+  type ArtifactVersionSummary,
   type AcceptLoggedExportDeliveryRequest,
   type ClaimLoggedExportDeliveryRequest,
   type ClaimLoggedExportDeliveryResponse,
@@ -51,6 +54,16 @@ import type { WorkspaceTranscriptResolution } from "@research-video/sync";
 import type { LocalExportOnceResult } from "./export-run-once.ts";
 
 export interface LocalAgentDependencies {
+  resolveArtifactVersion?(input: {
+    projectId: string;
+    clipId: string;
+    artifactVersionId: string;
+    authorization: string;
+  }): Promise<ArtifactVersionSummary>;
+  verifyArtifactVersion?(input: {
+    rootId: string;
+    artifactVersion: ArtifactVersionSummary;
+  }): Promise<ArtifactLocatorSummary>;
   resolveTranscript?(input: {
     projectId: string;
     catalogVideoId: string;
@@ -235,6 +248,33 @@ export function createLocalAgent(
       timestamp: new Date().toISOString(),
     }),
   );
+
+  if (
+    dependencies?.resolveArtifactVersion &&
+    dependencies.verifyArtifactVersion
+  ) {
+    app.post("/api/artifact-locators/verify", async (request) => {
+      const authorization = request.headers.authorization;
+      if (!authorization) {
+        throw new LocalAuthenticationError(
+          "Authentication is required to verify a project artifact.",
+        );
+      }
+      const command = VerifyLocalArtifactVersionRequestSchema.parse(
+        request.body,
+      );
+      const artifactVersion = await dependencies.resolveArtifactVersion!({
+        projectId: command.projectId,
+        clipId: command.clipId,
+        artifactVersionId: command.artifactVersionId,
+        authorization,
+      });
+      return dependencies.verifyArtifactVersion!({
+        rootId: command.rootId,
+        artifactVersion,
+      });
+    });
+  }
 
   if (dependencies?.resolveTranscript) {
     app.get(

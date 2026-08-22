@@ -5,6 +5,9 @@ import {
   ArtifactVersionHistoryQuerySchema,
   ArtifactVersionHistoryResponseSchema,
   ArtifactVersionSummarySchema,
+  ArtifactLocatorSummarySchema,
+  ArtifactRootSummarySchema,
+  ConfigureLocalArtifactRootRequestSchema,
   CancelLoggedExportRequestSchema,
   BatchPreflightRequestSchema,
   ClipLanguageEvidenceV2Schema,
@@ -253,7 +256,12 @@ describe("shared contracts", () => {
       video: request.video,
       selection: request.selection,
       sourceLanguageClass: result.sourceLanguageClass,
+      preset: request.preset,
       resolvedSettingsSnapshot: request.resolvedSettingsSnapshot,
+      resolvedExportBounds: result.resolvedExportBounds,
+      renderedMediaProvenance: result.renderedMediaProvenance,
+      thumbnailProvenance: result.thumbnailProvenance,
+      subtitleOmissionProvenance: result.subtitleOmissionProvenance,
       artifacts: result.artifacts,
       manifest: {
         contentSha256: manifest.contentSha256,
@@ -277,6 +285,52 @@ describe("shared contracts", () => {
       ArtifactVersionSummarySchema.safeParse({
         ...summary,
         localPath: "/private/export.mov",
+      }).success,
+    ).toBe(false);
+  });
+
+  it("keeps local root and locator summaries path-free and state-consistent", () => {
+    const rootId = "019fbb95-cd76-7920-93fa-e23ba755ee61";
+    const artifactVersionId = "019fbb95-cd76-7920-93fa-e23ba755ee62";
+    expect(
+      ConfigureLocalArtifactRootRequestSchema.parse({
+        label: "Managed exports",
+        platform: "posix",
+        absolutePath: "/private/local-only/exports",
+      }),
+    ).toMatchObject({ absolutePath: "/private/local-only/exports" });
+    expect(
+      ArtifactRootSummarySchema.parse({
+        id: rootId,
+        label: "Managed exports",
+        platform: "posix",
+        enabled: true,
+        createdAt: now,
+        updatedAt: now,
+      }),
+    ).not.toHaveProperty("absolutePath");
+    const locator = {
+      id: "019fbb95-cd76-7920-93fa-e23ba755ee63",
+      artifactVersionId,
+      rootId,
+      platform: "posix" as const,
+      availability: "verified" as const,
+      manifestSha256: "a".repeat(64),
+      manifestSchemaVersion: 2 as const,
+      checkedAt: now,
+      lastVerifiedAt: now,
+    };
+    expect(ArtifactLocatorSummarySchema.parse(locator)).toEqual(locator);
+    expect(
+      ArtifactLocatorSummarySchema.safeParse({
+        ...locator,
+        availability: "missing",
+      }).success,
+    ).toBe(false);
+    expect(
+      ArtifactLocatorSummarySchema.safeParse({
+        ...locator,
+        relativePackagePath: `clip-${artifactVersionId}`,
       }).success,
     ).toBe(false);
   });

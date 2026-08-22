@@ -1221,6 +1221,20 @@ describe("logged export delivery", () => {
     });
     expect(secondPage.nextCursor).toBeUndefined();
     expect(
+      await fixture.catalog.getArtifactVersion(
+        fixture.owner,
+        secondRequest.projectId!,
+        secondRequest.clipId!,
+        second.id,
+      ),
+    ).toMatchObject({
+      artifactVersionId: second.id,
+      preset: secondRequest.preset,
+      resolvedExportBounds: second.result.resolvedExportBounds,
+      renderedMediaProvenance: second.result.renderedMediaProvenance,
+      thumbnailProvenance: second.result.thumbnailProvenance,
+    });
+    expect(
       JSON.stringify([...firstPage.versions, ...secondPage.versions]),
     ).not.toMatch(/localPath|filename|reservationToken|notes|tags/u);
 
@@ -1232,6 +1246,14 @@ describe("logged export delivery", () => {
         secondRequest.projectId!,
         secondRequest.clipId!,
         { limit: 25 },
+      ),
+    ).rejects.toMatchObject({ statusCode: 403 });
+    await expect(
+      fixture.catalog.getArtifactVersion(
+        outsider,
+        secondRequest.projectId!,
+        secondRequest.clipId!,
+        second.id,
       ),
     ).rejects.toMatchObject({ statusCode: 403 });
   });

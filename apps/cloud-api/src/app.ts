@@ -571,6 +571,25 @@ export function createCloudApi(
     },
   );
 
+  app.get(
+    "/api/projects/:projectId/clips/:clipId/artifact-versions/:artifactVersionId",
+    async (request) => {
+      const { projectId, clipId, artifactVersionId } = z
+        .object({
+          projectId: z.uuid(),
+          clipId: z.uuid(),
+          artifactVersionId: z.uuid(),
+        })
+        .parse(request.params);
+      return catalog.getArtifactVersion(
+        await authenticate(request),
+        projectId,
+        clipId,
+        artifactVersionId,
+      );
+    },
+  );
+
   app.patch("/api/projects/:projectId/clips/:clipId", async (request) => {
     const { projectId, clipId } = ProjectClipParamsSchema.parse(request.params);
     return catalog.updateClipCandidate(

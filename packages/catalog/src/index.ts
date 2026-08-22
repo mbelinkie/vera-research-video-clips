@@ -72,6 +72,7 @@ import {
   type ActiveTranscriptBundle,
   type ArtifactVersionHistoryQuery,
   type ArtifactVersionHistoryResponse,
+  type ArtifactVersionSummary,
   type AcceptLoggedExportDeliveryRequest,
   type CancelLoggedExportRequest,
   type CancelLoggedExportResponse,
@@ -3442,6 +3443,28 @@ export class SharedProjectCatalog {
     });
   }
 
+  async getArtifactVersion(
+    actor: AuthenticatedActor,
+    projectId: string,
+    clipId: string,
+    artifactVersionId: string,
+  ): Promise<ArtifactVersionSummary> {
+    await this.authorize(actor, projectId, "read");
+    const result = await this.database.query<DbRow>(
+      `SELECT success.id AS artifact_version_id,
+              success.result_json, success.result_fingerprint,
+              success.reconciled_at, request.*
+       FROM logged_export_success_results success
+       JOIN export_requests request ON request.id = success.export_request_id
+       WHERE success.id = $1 AND request.project_id = $2 AND request.clip_id = $3`,
+      [artifactVersionId, projectId, clipId],
+    );
+    if (!result.rows[0]) {
+      throw new CatalogNotFoundError("Artifact version not found.");
+    }
+    return mapArtifactVersionSummary(result.rows[0]);
+  }
+
   async getLoggedExportRequest(
     actor: AuthenticatedActor,
     projectId: string,
@@ -6426,7 +6449,20 @@ function mapArtifactVersionSummary(row: DbRow) {
     ...(row.subtitle_tracks_snapshot
       ? { subtitleTracks: row.subtitle_tracks_snapshot }
       : {}),
+    preset: row.preset_snapshot,
     resolvedSettingsSnapshot: row.resolved_settings_snapshot,
+    resolvedExportBounds: result.resolvedExportBounds,
+    renderedMediaProvenance: result.renderedMediaProvenance,
+    thumbnailProvenance: result.thumbnailProvenance,
+    ...(result.subtitleOmissionProvenance
+      ? { subtitleOmissionProvenance: result.subtitleOmissionProvenance }
+      : {}),
+    ...(result.englishSubtitleProvenance
+      ? { englishSubtitleProvenance: result.englishSubtitleProvenance }
+      : {}),
+    ...(result.subtitleSidecars
+      ? { subtitleSidecars: result.subtitleSidecars }
+      : {}),
     artifacts: result.artifacts,
     manifest: {
       contentSha256: manifest.contentSha256,
