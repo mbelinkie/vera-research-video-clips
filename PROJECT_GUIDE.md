@@ -2,7 +2,7 @@
 
 ## Project guide and implementation plan
 
-Status: Milestones 1–4 core workflow complete; preferred-language logging, local export capabilities, authorized logged-export reconciliation, cleanup recovery, immutable retry, exact execution ownership, durable progress, isolated batch export, and same-source grouping are verified through M5-24; the final Milestone 5 fixture/live release gate remains open
+Status: Milestones 1–4 core workflow complete; preferred-language logging, local export capabilities, authorized logged-export reconciliation, cleanup recovery, immutable retry, exact execution ownership, durable progress, isolated batch export, same-source grouping, and the deterministic 30-second foreign fixture gate are verified through M5-25; the authorized live smoke and final Milestone 5 matrix remain open
 Last updated: 2026-08-22
 
 This document is the source of truth for product scope, architecture, sequencing, and acceptance criteria. Update it when a deliberate product or architectural decision changes. Use `outline.md` as the shorter execution checklist.
@@ -1618,6 +1618,26 @@ group scratch. The aggregate gate passes 258 tests with one declared skip, the
 web build, 24 local and 19 cloud migrations, plus four Playwright flows. The
 approximately 30-second foreign fixture, explicitly authorized live YouTube
 smoke, and final Milestone 5 matrix remain open.
+
+M5-25 completed 2026-08-22. A checked-in 32-second H.264/AAC source is generated
+solely from FFmpeg color and sine inputs and paired with repository-authored
+Spanish/English tracks under documented CC0 provenance. Its machine-readable
+record pins the committed source SHA-256, expected FFprobe properties, exact
+1,000–31,000 ms gate bounds, and paired transcript fixture. The existing
+persisted one-shot processor renders that exact 30-second range with real
+FFmpeg/FFprobe; no fixture executor, live provider, migration, or contract was
+added. Boundary-crossing cues prove clipping to 0 and 30,000 ms, while cues
+outside the range are excluded. Both mandatory foreign-language sidecars remain
+present even when the preset carries the confirmed-English omission setting.
+The gate verifies exact track IDs/versions, metadata/manifest policy and bounds,
+observed H.264/AAC media, the six-file package, and recomputed byte size/SHA-256
+for every promoted artifact including `manifest.json`. It also proves one
+acquisition/render, six persisted final records, deleted source evidence, empty
+source scratch, and replay without reacquisition. The aggregate gate passes 259
+tests with one declared skip, the web build, 24 local and 19 cloud migrations,
+plus four Playwright flows. The explicitly user-authorized live YouTube smoke
+and final Milestone 5 matrix remain open; synthetic media is not live-provider
+or acoustic-language proof.
 
 M5-09 completed 2026-08-19. Every promoted clip package now also contains one
 `manifest.json`, written into attempt-private staging and promoted through the
