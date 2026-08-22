@@ -120,7 +120,11 @@ export async function runLocalExportOnce(
 }
 
 export async function runConfiguredLocalExportOnce(
-  input: { requestId: string; authorizationConfirmed: boolean },
+  input: {
+    requestId: string;
+    authorizationConfirmed: boolean;
+    signal?: AbortSignal;
+  },
   options: {
     config?: AppConfig;
     sourceProvider?: ExportSourceAcquisitionProvider;

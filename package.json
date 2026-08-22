@@ -24,6 +24,7 @@
     "dev:web": "vite --config apps/web/vite.config.ts",
     "dev:worker": "node --import tsx apps/worker/src/main.ts",
     "export:recover-source-scratch": "node --import tsx apps/local-agent/src/export-scratch-sweeper.ts",
+    "export:live-smoke": "node --import tsx apps/local-agent/src/live-youtube-smoke.ts",
     "export:run-once": "node --import tsx apps/local-agent/src/export-run-once.ts",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
