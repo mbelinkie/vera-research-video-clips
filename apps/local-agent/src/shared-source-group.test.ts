@@ -33,8 +33,13 @@ describe("LocalLoggedExportSourceGroupCoordinator", () => {
       "019fbb95-cd76-7920-93fa-e23ba755ef45",
       "019fbb95-cd76-7920-93fa-e23ba755ef46",
     );
+    const third = requestFixture(
+      "019fbb95-cd76-7920-93fa-e23ba755ef63",
+      "019fbb95-cd76-7920-93fa-e23ba755ef64",
+      "019fbb95-cd76-7920-93fa-e23ba755ef65",
+    );
     const deliveries = new Map(
-      [first, second].map((request, index) => [
+      [first, second, third].map((request, index) => [
         request.id,
         deliveryFixture(request, batchId, index),
       ]),
@@ -96,14 +101,27 @@ describe("LocalLoggedExportSourceGroupCoordinator", () => {
       5,
     );
     const staging = new Set<string>();
-    const run = (request: ExportRequest, fail: boolean) =>
+    const cancellation = new AbortController();
+    const run = (
+      request: ExportRequest,
+      outcome: "succeeded" | "failed" | "canceled",
+    ) =>
       coordinator.run({
         request,
         attempt: 1,
+        ...(outcome === "canceled" ? { signal: cancellation.signal } : {}),
         handoff: async ({ stagingDirectory }) => {
           staging.add(stagingDirectory);
           events.push(`handoff:${request.id}`);
-          if (fail)
+          if (outcome === "canceled") {
+            cancellation.abort(
+              Object.assign(new Error("member canceled"), {
+                code: "user_requested",
+              }),
+            );
+            throw cancellation.signal.reason;
+          }
+          if (outcome === "failed")
             throw Object.assign(new Error("member failed"), {
               code: "member_failed",
             });
@@ -113,9 +131,10 @@ describe("LocalLoggedExportSourceGroupCoordinator", () => {
         cleanupSucceeded: () => events.push(`cleaned:${request.id}`),
         cleanupFailed: () => events.push(`cleanup-failed:${request.id}`),
       });
-    const [succeeded, failed] = await Promise.allSettled([
-      run(first, false),
-      run(second, true),
+    const [succeeded, failed, canceled] = await Promise.allSettled([
+      run(first, "succeeded"),
+      run(second, "failed"),
+      run(third, "canceled"),
     ]);
 
     expect(succeeded).toEqual({ status: "fulfilled", value: true });
@@ -123,11 +142,15 @@ describe("LocalLoggedExportSourceGroupCoordinator", () => {
       status: "rejected",
       reason: { code: "member_failed" },
     });
+    expect(canceled).toMatchObject({
+      status: "rejected",
+      reason: { code: "user_requested" },
+    });
     expect(acquire).toHaveBeenCalledTimes(1);
     expect(inspect).toHaveBeenCalledTimes(1);
-    expect(staging.size).toBe(2);
+    expect(staging.size).toBe(3);
     expect(events.indexOf("cleanup-succeeded")).toBeGreaterThan(
-      events.indexOf(`released:${second.id}:failed`),
+      events.indexOf(`released:${third.id}:canceled`),
     );
     expect(events).not.toContain(`cleanup-failed:${first.id}`);
     expect(await readdir(join(root, "jobs", "export-source-groups"))).toEqual(
