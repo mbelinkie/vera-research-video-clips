@@ -2,7 +2,7 @@
 
 ## Project guide and implementation plan
 
-Status: Milestones 1–5 complete; the export-worker matrix, deterministic foreign fixture, and opt-in authorized live YouTube smoke are verified through M5-27; do not begin Milestone 6 or 7 without a new bounded task
+Status: Milestones 1–5 and M6-01 complete; immutable authorized artifact history and diagnostic request origin are verified; Milestone 6 continues through bounded slices M6-02–M6-07
 Last updated: 2026-08-22
 
 This document is the source of truth for product scope, architecture, sequencing, and acceptance criteria. Update it when a deliberate product or architectural decision changes. Use `outline.md` as the shorter execution checklist.
