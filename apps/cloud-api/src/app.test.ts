@@ -1888,6 +1888,7 @@ describe("logged export delivery API", () => {
     const reconcileLoggedExportFailure = vi.fn(async () => ({ failed: true }));
     const startLoggedExportExecution = vi.fn(async () => ({ started: true }));
     const heartbeatLoggedExportExecution = vi.fn(async () => ({ alive: true }));
+    const getLoggedExportProgress = vi.fn(async () => ({ progress: true }));
     const reconcileLoggedExportCanceled = vi.fn(async () => ({
       canceled: true,
     }));
@@ -1900,6 +1901,7 @@ describe("logged export delivery API", () => {
       reconcileLoggedExportFailure,
       startLoggedExportExecution,
       heartbeatLoggedExportExecution,
+      getLoggedExportProgress,
       reconcileLoggedExportCanceled,
       cancelLoggedExport,
       retryLoggedExport,
@@ -2056,6 +2058,21 @@ describe("logged export delivery API", () => {
       attempt: 1,
       leaseToken,
     });
+    const progressProjectId = randomUUID();
+    const progressRequestId = randomUUID();
+    expect(
+      (
+        await app.inject({
+          method: "GET",
+          url: `/api/projects/${progressProjectId}/export-requests/${progressRequestId}/progress`,
+        })
+      ).json(),
+    ).toEqual({ progress: true });
+    expect(getLoggedExportProgress).toHaveBeenCalledWith(
+      actor,
+      progressProjectId,
+      progressRequestId,
+    );
     const canceledResult = {
       schemaVersion: 1,
       requestId: result.requestId,

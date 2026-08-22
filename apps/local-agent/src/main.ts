@@ -100,6 +100,10 @@ const app = createLocalAgent({
   buildLoggedExportCanceledResult: (requestId) =>
     exportQueue.buildLoggedExportCanceledResult(requestId),
   getLoggedExecution: (requestId) => exportQueue.getLoggedExecution(requestId),
+  getLoggedExportProgress: (requestId) =>
+    exportQueue.getLoggedExportProgress(requestId),
+  reconcileLoggedExportProgress: (progress) =>
+    exportQueue.reconcileLoggedExportProgress(progress),
   startLoggedExportExecution: async ({ request, authorization }) =>
     callCloudLoggedExportExecutionStart(request, authorization),
   heartbeatLoggedExportExecution: async ({ request, authorization }) =>

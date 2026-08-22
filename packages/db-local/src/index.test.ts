@@ -146,6 +146,7 @@ describe("local migrations", () => {
       "0020_logged_export_delivery_acceptance_time",
       "0021_source_scratch_recovery_claims",
       "0022_logged_export_execution_cancellation",
+      "0023_logged_export_execution_progress",
     ]);
     expect(runLocalMigrations(database)).toEqual([]);
     expect(
@@ -348,6 +349,7 @@ describe("local migrations", () => {
     expect(runLocalMigrations(database, localMigrationDirectory)).toEqual([
       "0021_source_scratch_recovery_claims",
       "0022_logged_export_execution_cancellation",
+      "0023_logged_export_execution_progress",
     ]);
     expect(
       database
@@ -524,6 +526,7 @@ describe("local migrations", () => {
       "0020_logged_export_delivery_acceptance_time",
       "0021_source_scratch_recovery_claims",
       "0022_logged_export_execution_cancellation",
+      "0023_logged_export_execution_progress",
     ]);
     expect(
       database.prepare("SELECT * FROM export_final_artifacts").all(),
@@ -651,6 +654,7 @@ describe("local migrations", () => {
       "0020_logged_export_delivery_acceptance_time",
       "0021_source_scratch_recovery_claims",
       "0022_logged_export_execution_cancellation",
+      "0023_logged_export_execution_progress",
     ]);
     expect(
       database
@@ -1002,7 +1006,8 @@ describe("logged export delivery import", () => {
   it("persists one exact cloud execution and projects cancellation only after verified cleanup", () => {
     const directory = mkdtempSync(join(tmpdir(), "research-video-cancel-"));
     temporaryDirectories.add(directory);
-    const database = openLocalDatabase(join(directory, "cancel.sqlite"));
+    const filename = join(directory, "cancel.sqlite");
+    const database = openLocalDatabase(filename);
     runLocalMigrations(database);
     const queue = new LocalExportQueue(
       database,
@@ -1028,6 +1033,63 @@ describe("logged export delivery import", () => {
     };
     expect(queue.activateLoggedExecution(execution)).toEqual(execution);
     expect(queue.activateLoggedExecution(execution)).toEqual(execution);
+    const preparing = queue.recordLoggedExportProgress(
+      delivery.request.id,
+      "preparing",
+      250,
+    );
+    expect(
+      queue.recordLoggedExportProgress(delivery.request.id, "preparing", 250),
+    ).toEqual(preparing);
+    const rendering = queue.recordLoggedExportProgress(
+      delivery.request.id,
+      "rendering",
+      3_500,
+    );
+    expect(rendering).toMatchObject({
+      executionId: execution.executionId,
+      requestId: delivery.request.id,
+      attempt: execution.attempt,
+      sequence: 2,
+      stage: "rendering",
+      basisPoints: 3_500,
+    });
+    const packaging = queue.reconcileLoggedExportProgress({
+      ...rendering,
+      sequence: 3,
+      stage: "packaging",
+      basisPoints: 8_000,
+      updatedAt: "2026-08-20T12:00:11.000Z",
+    });
+    expect(queue.reconcileLoggedExportProgress(packaging)).toEqual(packaging);
+    expect(() =>
+      queue.reconcileLoggedExportProgress({
+        ...packaging,
+        executionId: "019fbb95-cd76-7920-93fa-e23ba755ef39",
+      }),
+    ).toThrowError(
+      expect.objectContaining({
+        code: "logged_export_progress_ownership_mismatch",
+      }),
+    );
+    expect(() =>
+      queue.recordLoggedExportProgress(
+        delivery.request.id,
+        "acquiring_source",
+        3_600,
+      ),
+    ).toThrowError(
+      expect.objectContaining({ code: "logged_export_progress_regression" }),
+    );
+    expect(() =>
+      database
+        .prepare(
+          `UPDATE export_requests
+           SET local_progress_stage_rank = 10
+           WHERE id = ?`,
+        )
+        .run(delivery.request.id),
+    ).toThrow(/stage rank|exact and monotonic/u);
     expect(() =>
       queue.activateLoggedExecution({
         ...execution,
@@ -1082,6 +1144,14 @@ describe("logged export delivery import", () => {
       }),
     );
     database.close();
+    const reopened = openLocalDatabase(filename);
+    runLocalMigrations(reopened);
+    expect(
+      new LocalExportQueue(reopened).getLoggedExportProgress(
+        delivery.request.id,
+      ),
+    ).toEqual(packaging);
+    reopened.close();
   });
 
   it("projects only sanitized not-started or verified-deleted logged failures", () => {
@@ -1432,6 +1502,7 @@ describe("logged export delivery import", () => {
       "0020_logged_export_delivery_acceptance_time",
       "0021_source_scratch_recovery_claims",
       "0022_logged_export_execution_cancellation",
+      "0023_logged_export_execution_progress",
     ]);
     const after = new LocalExportQueue(database).get(before.id);
     expect(after).toEqual(before);
@@ -1491,6 +1562,7 @@ describe("logged export delivery import", () => {
       "0020_logged_export_delivery_acceptance_time",
       "0021_source_scratch_recovery_claims",
       "0022_logged_export_execution_cancellation",
+      "0023_logged_export_execution_progress",
     ]);
     expect(
       new LocalExportQueue(database).getAcceptedLoggedDelivery(

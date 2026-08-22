@@ -31,6 +31,7 @@ import {
   LoggedExportCanceledSchema,
   HeartbeatLoggedExportExecutionRequestSchema,
   HeartbeatLoggedExportExecutionResponseSchema,
+  GetLoggedExportProgressResponseSchema,
   ReconcileLoggedExportFailureRequestSchema,
   ReconcileLoggedExportSuccessRequestSchema,
   ReconcileLoggedExportCanceledRequestSchema,
@@ -99,6 +100,9 @@ import {
   type LoggedExportCanceledResult,
   type HeartbeatLoggedExportExecutionRequest,
   type HeartbeatLoggedExportExecutionResponse,
+  type GetLoggedExportProgressResponse,
+  type LoggedExportProgressSnapshot,
+  type LoggedExportProgressStage,
   type LoggedExportSuccess,
   type LoggedExportSuccessResult,
   type ReconcileLoggedExportFailureRequest,
@@ -235,6 +239,20 @@ const iso = (value: unknown) =>
 
 const sha256 = (bytes: Uint8Array) =>
   createHash("sha256").update(bytes).digest("hex");
+
+const LoggedExportProgressStageRank: Record<LoggedExportProgressStage, number> =
+  {
+    preparing: 1,
+    acquiring_source: 2,
+    inspecting_source: 3,
+    rendering: 4,
+    validating_media: 5,
+    building_thumbnail: 6,
+    building_subtitles: 7,
+    packaging: 8,
+    cleaning_source: 9,
+    local_complete: 10,
+  };
 
 const clipCandidateSelect = "SELECT c.* FROM clip_candidates c";
 const loggedExportRequestSelect = `SELECT er.*, j.state,
@@ -1014,6 +1032,7 @@ export class SharedProjectCatalog {
       response = {
         status: "started",
         execution: mapLoggedExportExecution(execution!),
+        ...(await this.loadLoggedExportProgress(String(execution!.id))),
       };
     });
     if (!response)
@@ -1071,6 +1090,19 @@ export class SharedProjectCatalog {
           "The logged export execution lease is stale or unauthorized.",
         );
       }
+      if (
+        parsed.progress &&
+        (parsed.progress.executionId !== String(execution.id) ||
+          parsed.progress.requestId !== String(execution.export_request_id) ||
+          parsed.progress.attempt !== Number(execution.attempt))
+      ) {
+        throw new CatalogConflictError(
+          "Logged export progress belongs to a different execution.",
+        );
+      }
+      if (parsed.progress) {
+        await this.persistLoggedExportProgress(parsed.progress);
+      }
       const updated = await this.database.query<DbRow>(
         `UPDATE logged_export_executions SET heartbeat_at = $1, expires_at = $2
          WHERE id = $3 RETURNING *`,
@@ -1098,6 +1130,34 @@ export class SharedProjectCatalog {
       throw new CatalogConflictError("Execution heartbeat did not persist.");
     return HeartbeatLoggedExportExecutionResponseSchema.parse({
       execution: mapLoggedExportExecution(row),
+      ...(await this.loadLoggedExportProgress(String(row.id))),
+    });
+  }
+
+  async getLoggedExportProgress(
+    actor: AuthenticatedActor,
+    projectId: string,
+    requestId: string,
+  ): Promise<GetLoggedExportProgressResponse> {
+    await this.authorize(actor, projectId, "read");
+    const result = await this.database.query<DbRow>(
+      `SELECT er.id AS export_request_id, er.job_id, j.state,
+              progress.execution_id, progress.attempt, progress.sequence,
+              progress.stage, progress.basis_points, progress.updated_at
+       FROM export_requests er
+       JOIN jobs j ON j.id = er.job_id
+       LEFT JOIN logged_export_execution_progress progress
+         ON progress.export_request_id = er.id
+       WHERE er.id = $1 AND er.project_id = $2`,
+      [requestId, projectId],
+    );
+    const row = result.rows[0];
+    if (!row) throw new CatalogNotFoundError("Export request not found.");
+    return GetLoggedExportProgressResponseSchema.parse({
+      requestId: row.export_request_id,
+      jobId: row.job_id,
+      state: row.state,
+      ...(row.execution_id ? { progress: mapLoggedExportProgress(row) } : {}),
     });
   }
 
@@ -5157,6 +5217,89 @@ export class SharedProjectCatalog {
     return lease;
   }
 
+  private async loadLoggedExportProgress(
+    executionId: string,
+  ): Promise<{ progress?: LoggedExportProgressSnapshot }> {
+    const result = await this.database.query<DbRow>(
+      "SELECT * FROM logged_export_execution_progress WHERE execution_id = $1",
+      [executionId],
+    );
+    return result.rows[0]
+      ? { progress: mapLoggedExportProgress(result.rows[0]) }
+      : {};
+  }
+
+  private async persistLoggedExportProgress(
+    progress: LoggedExportProgressSnapshot,
+  ): Promise<void> {
+    const currentResult = await this.database.query<DbRow>(
+      "SELECT * FROM logged_export_execution_progress WHERE execution_id = $1 FOR UPDATE",
+      [progress.executionId],
+    );
+    const current = currentResult.rows[0];
+    const stageRank = LoggedExportProgressStageRank[progress.stage];
+    if (current) {
+      const mapped = mapLoggedExportProgress(current);
+      if (progress.sequence === mapped.sequence) {
+        if (
+          progress.requestId === mapped.requestId &&
+          progress.attempt === mapped.attempt &&
+          progress.stage === mapped.stage &&
+          progress.basisPoints === mapped.basisPoints &&
+          progress.updatedAt === mapped.updatedAt
+        ) {
+          return;
+        }
+        throw new CatalogConflictError(
+          "A progress sequence can only replay its original snapshot.",
+        );
+      }
+      if (
+        progress.requestId !== mapped.requestId ||
+        progress.attempt !== mapped.attempt ||
+        progress.sequence < mapped.sequence ||
+        stageRank < LoggedExportProgressStageRank[mapped.stage] ||
+        progress.basisPoints < mapped.basisPoints ||
+        Date.parse(progress.updatedAt) < Date.parse(mapped.updatedAt)
+      ) {
+        throw new CatalogConflictError(
+          "Logged export progress cannot move backward or change execution identity.",
+        );
+      }
+      await this.database.query(
+        `UPDATE logged_export_execution_progress
+         SET sequence = $1, stage = $2, stage_rank = $3,
+             basis_points = $4, updated_at = $5
+         WHERE execution_id = $6`,
+        [
+          progress.sequence,
+          progress.stage,
+          stageRank,
+          progress.basisPoints,
+          progress.updatedAt,
+          progress.executionId,
+        ],
+      );
+      return;
+    }
+    await this.database.query(
+      `INSERT INTO logged_export_execution_progress
+         (execution_id, export_request_id, attempt, sequence, stage,
+          stage_rank, basis_points, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+      [
+        progress.executionId,
+        progress.requestId,
+        progress.attempt,
+        progress.sequence,
+        progress.stage,
+        stageRank,
+        progress.basisPoints,
+        progress.updatedAt,
+      ],
+    );
+  }
+
   private async authorize(
     actor: AuthenticatedActor,
     projectId: string,
@@ -5304,6 +5447,19 @@ function mapLoggedExportExecution(row: DbRow) {
     ...(row.cancel_requested_at
       ? { cancelRequestedAt: iso(row.cancel_requested_at) }
       : {}),
+  };
+}
+
+function mapLoggedExportProgress(row: DbRow): LoggedExportProgressSnapshot {
+  return {
+    schemaVersion: 1,
+    executionId: String(row.execution_id),
+    requestId: String(row.export_request_id),
+    attempt: Number(row.attempt),
+    sequence: Number(row.sequence),
+    stage: String(row.stage) as LoggedExportProgressStage,
+    basisPoints: Number(row.basis_points),
+    updatedAt: iso(row.updated_at),
   };
 }
 

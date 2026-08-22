@@ -197,6 +197,20 @@ export function createCloudApi(
     ),
   );
 
+  app.get(
+    "/api/projects/:projectId/export-requests/:requestId/progress",
+    async (request) => {
+      const { projectId, requestId } = ProjectExportRequestParamsSchema.parse(
+        request.params,
+      );
+      return catalog.getLoggedExportProgress(
+        await authenticate(request),
+        projectId,
+        requestId,
+      );
+    },
+  );
+
   app.post("/api/export-deliveries/reconcile-success", async (request) =>
     catalog.reconcileLoggedExportSuccess(
       await authenticate(request),

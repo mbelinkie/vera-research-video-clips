@@ -52,6 +52,7 @@ describe("cloud migrations", () => {
       "0015_logged_export_failure_results",
       "0016_logged_export_retry_lineage",
       "0017_logged_export_safe_cancellation",
+      "0018_logged_export_execution_progress",
     ]);
     expect(await runCloudMigrations(database)).toEqual([]);
     const result = await database.query<{ table_name: string }>(
@@ -411,6 +412,32 @@ describe("cloud migrations", () => {
         )
       ).rows[0]!.count,
     ).toBe("3");
+    copyFileSync(
+      resolve(
+        cloudMigrationDirectory,
+        "0018_logged_export_execution_progress.sql",
+      ),
+      join(migrations, "0018_logged_export_execution_progress.sql"),
+    );
+    expect(await runCloudMigrations(database, migrations)).toEqual([
+      "0018_logged_export_execution_progress",
+    ]);
+    expect(
+      (
+        await database.query(
+          "SELECT * FROM registered_export_workers WHERE id = $1",
+          [workerId],
+        )
+      ).rows[0],
+    ).toEqual(before);
+    expect(
+      (
+        await database.query<{ table_name: string }>(
+          `SELECT table_name FROM information_schema.tables
+           WHERE table_name = 'logged_export_execution_progress'`,
+        )
+      ).rows,
+    ).toHaveLength(1);
   });
 
   it("enforces preset ownership, scope names, fixed defaults, and immutable revisions", async () => {

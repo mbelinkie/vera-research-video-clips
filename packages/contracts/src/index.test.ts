@@ -18,6 +18,9 @@ import {
   LoggedExportDeliverySchema,
   LoggedExportCanceledResultSchema,
   LoggedExportExecutionSchema,
+  LoggedExportProgressSnapshotSchema,
+  HeartbeatLoggedExportExecutionRequestSchema,
+  GetLoggedExportProgressResponseSchema,
   LoggedExportFailureResultSchema,
   LoggedExportFailureSchema,
   LoggedExportSuccessResultSchema,
@@ -345,6 +348,49 @@ describe("shared contracts", () => {
     expect(JSON.stringify(result)).not.toMatch(
       /leaseToken|reservationToken|\/private\/|sourceIdentity|https?:\/\//i,
     );
+  });
+
+  it("binds sanitized monotonic progress to one exact execution", () => {
+    const progress = {
+      schemaVersion: 1 as const,
+      executionId: "019fbb95-cd76-7920-93fa-e23ba755ee60",
+      requestId: "019fbb95-cd76-7920-93fa-e23ba755ee51",
+      attempt: 1,
+      sequence: 3,
+      stage: "rendering" as const,
+      basisPoints: 3_500,
+      updatedAt: now,
+    };
+    expect(LoggedExportProgressSnapshotSchema.parse(progress)).toEqual(
+      progress,
+    );
+    expect(
+      HeartbeatLoggedExportExecutionRequestSchema.parse({
+        workerId: id,
+        workerEpoch: 1,
+        deliveryId: "019fbb95-cd76-7920-93fa-e23ba755ee43",
+        generation: 1,
+        reservationToken: "019fbb95-cd76-7920-93fa-e23ba755ee44",
+        executionId: progress.executionId,
+        attempt: 1,
+        leaseToken: "019fbb95-cd76-7920-93fa-e23ba755ee61",
+        progress,
+      }).progress,
+    ).toEqual(progress);
+    expect(
+      LoggedExportProgressSnapshotSchema.safeParse({
+        ...progress,
+        basisPoints: 10_001,
+      }).success,
+    ).toBe(false);
+    expect(
+      GetLoggedExportProgressResponseSchema.safeParse({
+        requestId: progress.requestId,
+        jobId: id,
+        state: "processing",
+        progress: { ...progress, leaseToken: id },
+      }).success,
+    ).toBe(false);
   });
 
   it("accepts a versioned project", () => {

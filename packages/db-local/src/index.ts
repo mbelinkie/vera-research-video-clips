@@ -12,6 +12,7 @@ import {
   LoggedExportFailureResultSchema,
   LoggedExportCanceledResultSchema,
   LoggedExportExecutionSchema,
+  LoggedExportProgressSnapshotSchema,
   LoggedExportSuccessResultSchema,
   NormalizedTranscriptSchema,
   ResolvedExportSettingsSnapshotSchema,
@@ -26,6 +27,8 @@ import {
   type LoggedExportFailureResult,
   type LoggedExportCanceledResult,
   type LoggedExportExecution,
+  type LoggedExportProgressSnapshot,
+  type LoggedExportProgressStage,
   type LoggedExportSuccessResult,
   type ExportObservedMediaProperties,
   type ResolvedExportSettingsSnapshot,
@@ -43,6 +46,19 @@ const defaultMigrationDirectory = fileURLToPath(
 );
 
 const SourceScratchLayoutVersion = 2;
+const LoggedExportProgressStageRank: Record<LoggedExportProgressStage, number> =
+  {
+    preparing: 1,
+    acquiring_source: 2,
+    inspecting_source: 3,
+    rendering: 4,
+    validating_media: 5,
+    building_thumbnail: 6,
+    building_subtitles: 7,
+    packaging: 8,
+    cleaning_source: 9,
+    local_complete: 10,
+  };
 const SourceScratchCleanupClaimLeaseMs = 5 * 60 * 1_000;
 const MaxSourceScratchCleanupClaims = 25;
 
@@ -572,6 +588,179 @@ export class LocalExportQueue {
         ? { cancelRequestedAt: row.cloud_cancel_requested_at }
         : {}),
     });
+  }
+
+  getLoggedExportProgress(
+    requestId: string,
+  ): LoggedExportProgressSnapshot | undefined {
+    const execution = this.getLoggedExecution(requestId);
+    if (!execution) return undefined;
+    const row = this.database
+      .prepare(
+        `SELECT local_progress_sequence, local_progress_stage,
+                local_progress_basis_points, local_progress_updated_at
+         FROM export_requests
+         WHERE id = ? AND local_progress_sequence IS NOT NULL`,
+      )
+      .get(requestId) as Record<string, unknown> | undefined;
+    if (!row) return undefined;
+    return LoggedExportProgressSnapshotSchema.parse({
+      schemaVersion: 1,
+      executionId: execution.executionId,
+      requestId,
+      attempt: execution.attempt,
+      sequence: Number(row.local_progress_sequence),
+      stage: row.local_progress_stage,
+      basisPoints: Number(row.local_progress_basis_points),
+      updatedAt: row.local_progress_updated_at,
+    });
+  }
+
+  recordLoggedExportProgress(
+    requestId: string,
+    stage: LoggedExportProgressStage,
+    basisPoints: number,
+  ): LoggedExportProgressSnapshot {
+    const execution = this.getLoggedExecution(requestId);
+    const request = this.get(requestId);
+    if (!execution || !request || request.mode !== "logged") {
+      throw new LocalExportLifecycleError(
+        "Durable progress requires one exact logged export execution.",
+        "logged_export_execution_required",
+      );
+    }
+    if (
+      !Number.isInteger(basisPoints) ||
+      basisPoints < 0 ||
+      basisPoints > 10_000
+    ) {
+      throw new LocalExportLifecycleError(
+        "Logged export progress is outside its bounded range.",
+        "logged_export_progress_invalid",
+      );
+    }
+    const current = this.getLoggedExportProgress(requestId);
+    const rank = LoggedExportProgressStageRank[stage];
+    if (
+      current &&
+      (rank < LoggedExportProgressStageRank[current.stage] ||
+        basisPoints < current.basisPoints)
+    ) {
+      throw new LocalExportLifecycleError(
+        "Logged export progress cannot move backward.",
+        "logged_export_progress_regression",
+      );
+    }
+    if (
+      current &&
+      current.stage === stage &&
+      current.basisPoints === basisPoints
+    ) {
+      return current;
+    }
+    const now = this.now().toISOString();
+    const sequence = (current?.sequence ?? 0) + 1;
+    const updated = this.database
+      .prepare(
+        `UPDATE export_requests
+         SET local_progress_sequence = ?, local_progress_stage = ?,
+             local_progress_stage_rank = ?, local_progress_basis_points = ?,
+             local_progress_updated_at = ?, updated_at = ?
+         WHERE id = ? AND cloud_execution_id = ?
+           AND cloud_execution_attempt = ?`,
+      )
+      .run(
+        sequence,
+        stage,
+        rank,
+        basisPoints,
+        now,
+        now,
+        requestId,
+        execution.executionId,
+        execution.attempt,
+      );
+    if (updated.changes !== 1) {
+      throw new LocalExportLifecycleError(
+        "Logged export progress lost exact execution ownership.",
+        "logged_export_execution_ownership_mismatch",
+      );
+    }
+    return this.getLoggedExportProgress(requestId)!;
+  }
+
+  reconcileLoggedExportProgress(
+    input: LoggedExportProgressSnapshot,
+  ): LoggedExportProgressSnapshot {
+    const progress = LoggedExportProgressSnapshotSchema.parse(input);
+    const execution = this.getLoggedExecution(progress.requestId);
+    const request = this.get(progress.requestId);
+    if (
+      !execution ||
+      !request ||
+      request.mode !== "logged" ||
+      execution.executionId !== progress.executionId ||
+      execution.attempt !== progress.attempt
+    ) {
+      throw new LocalExportLifecycleError(
+        "Cloud progress does not belong to the exact local execution.",
+        "logged_export_progress_ownership_mismatch",
+      );
+    }
+    const current = this.getLoggedExportProgress(progress.requestId);
+    if (current && progress.sequence < current.sequence) return current;
+    if (current && progress.sequence === current.sequence) {
+      if (
+        current.stage === progress.stage &&
+        current.basisPoints === progress.basisPoints &&
+        current.updatedAt === progress.updatedAt
+      ) {
+        return current;
+      }
+      throw new LocalExportLifecycleError(
+        "A progress sequence can only replay its original snapshot.",
+        "logged_export_progress_conflict",
+      );
+    }
+    const rank = LoggedExportProgressStageRank[progress.stage];
+    if (
+      current &&
+      (rank < LoggedExportProgressStageRank[current.stage] ||
+        progress.basisPoints < current.basisPoints ||
+        Date.parse(progress.updatedAt) < Date.parse(current.updatedAt))
+    ) {
+      throw new LocalExportLifecycleError(
+        "Cloud progress cannot move local progress backward.",
+        "logged_export_progress_regression",
+      );
+    }
+    const updated = this.database
+      .prepare(
+        `UPDATE export_requests
+         SET local_progress_sequence = ?, local_progress_stage = ?,
+             local_progress_stage_rank = ?, local_progress_basis_points = ?,
+             local_progress_updated_at = ?, updated_at = ?
+         WHERE id = ? AND cloud_execution_id = ?
+           AND cloud_execution_attempt = ?`,
+      )
+      .run(
+        progress.sequence,
+        progress.stage,
+        rank,
+        progress.basisPoints,
+        progress.updatedAt,
+        progress.updatedAt,
+        progress.requestId,
+        progress.executionId,
+        progress.attempt,
+      );
+    if (updated.changes !== 1) {
+      throw new LocalExportLifecycleError(
+        "Cloud progress lost exact local execution ownership.",
+        "logged_export_progress_ownership_mismatch",
+      );
+    }
+    return this.getLoggedExportProgress(progress.requestId)!;
   }
 
   recordLoggedExecutionHeartbeat(input: LoggedExportExecution): void {

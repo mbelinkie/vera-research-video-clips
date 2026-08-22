@@ -36,6 +36,7 @@ import {
   type ExportClipManifest,
   type ExportClipMetadata,
   type ExportRequest,
+  type LoggedExportProgressStage,
   type NormalizedTranscript,
   type RenderedExportMediaProvenance,
   type ResolvedExportBounds,
@@ -89,6 +90,7 @@ export class LocalExportSourceProcessor {
       });
     }
     this.queue.assertExportDeliveryAccepted(input.requestId);
+    this.recordProgress(request, "preparing", 250);
     const resolvedSettingsSnapshot = request.resolvedSettingsSnapshot;
     if (!resolvedSettingsSnapshot) {
       const error = new ExportSourceAcquisitionError(
@@ -217,9 +219,10 @@ export class LocalExportSourceProcessor {
         ? {}
         : { requireLoggedExecution: input.requireLoggedExecution }),
     });
+    this.recordProgress(started.request, "acquiring_source", 1_000);
 
     try {
-      return await withExportSourceScratch({
+      await withExportSourceScratch({
         scratchRoot: join(this.dataRoot, "jobs", "export-source-scratch"),
         jobId: started.request.jobId,
         attempt: started.attempt,
@@ -228,6 +231,7 @@ export class LocalExportSourceProcessor {
         authorizationConfirmed: input.authorizationConfirmed,
         ...(input.signal ? { signal: input.signal } : {}),
         handoff: async (source, scratchDirectory) => {
+          this.recordProgress(started.request, "inspecting_source", 2_500);
           const inspection = await inspectVerifiedExportSource({
             sourcePath: source.scratchPath,
             scratchDirectory,
@@ -271,6 +275,7 @@ export class LocalExportSourceProcessor {
             scratchDirectory,
             `rendered-range.${resolvedSettingsSnapshot.settings.container}`,
           );
+          this.recordProgress(started.request, "rendering", 3_500);
           await this.renderer.render({
             sourcePath: source.scratchPath,
             stagingDirectory: scratchDirectory,
@@ -285,6 +290,7 @@ export class LocalExportSourceProcessor {
           });
           if (embeddedEnglishPath)
             await rm(embeddedEnglishPath, { force: true });
+          this.recordProgress(started.request, "validating_media", 5_500);
           const outputInspection = await inspectAndValidateRenderedExportOutput(
             {
               outputPath,
@@ -315,6 +321,7 @@ export class LocalExportSourceProcessor {
           );
           const thumbnailPath = join(scratchDirectory, "thumbnail.jpg");
           const extractionTimeMs = Math.floor(outputInspection.durationMs / 2);
+          this.recordProgress(started.request, "building_thumbnail", 6_500);
           await this.thumbnailExtractor.extract({
             renderedVideoPath: outputPath,
             stagingDirectory: scratchDirectory,
@@ -337,6 +344,7 @@ export class LocalExportSourceProcessor {
               height: thumbnail.height,
             },
           );
+          this.recordProgress(started.request, "building_subtitles", 7_500);
           if (subtitlePlan.policy === "confirmed_english_omission") {
             await assertNoStagedSrtFiles(scratchDirectory);
             this.queue.recordConfirmedEnglishSubtitleOmission(
@@ -368,6 +376,7 @@ export class LocalExportSourceProcessor {
               );
             }
           }
+          this.recordProgress(started.request, "packaging", 8_000);
           const promoted = await promoteVerifiedFinalPackage({
             request: this.queue.get(started.request.id) ?? started.request,
             stagingDirectory: scratchDirectory,
@@ -397,8 +406,10 @@ export class LocalExportSourceProcessor {
               started.attempt,
               source,
             );
+            this.recordProgress(started.request, "acquiring_source", 2_000);
           },
           cleanupStarted: async () => {
+            this.recordProgress(started.request, "cleaning_source", 9_000);
             this.queue.recordSourceCleanupStarted(
               started.request.jobId,
               started.attempt,
@@ -419,6 +430,8 @@ export class LocalExportSourceProcessor {
           },
         },
       });
+      this.recordProgress(started.request, "local_complete", 10_000);
+      return;
     } catch (error) {
       if (errorCode(error) !== "source_cleanup_failed") {
         if (
@@ -441,6 +454,19 @@ export class LocalExportSourceProcessor {
         }
       }
       throw error;
+    }
+  }
+
+  private recordProgress(
+    request: ExportRequest,
+    stage: LoggedExportProgressStage,
+    basisPoints: number,
+  ): void {
+    if (
+      request.mode === "logged" &&
+      this.queue.getLoggedExecution(request.id)
+    ) {
+      this.queue.recordLoggedExportProgress(request.id, stage, basisPoints);
     }
   }
 }

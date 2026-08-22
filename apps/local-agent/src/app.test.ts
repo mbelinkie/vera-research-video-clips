@@ -1007,6 +1007,21 @@ describe("local agent", () => {
       reconciledAt: "2026-08-20T12:00:16.000Z",
     }));
     const persist = vi.fn();
+    const progress = {
+      schemaVersion: 1 as const,
+      executionId: execution.executionId,
+      requestId: delivery.request.id,
+      attempt: execution.attempt,
+      sequence: 4,
+      stage: "rendering" as const,
+      basisPoints: 3_500,
+      updatedAt: "2026-08-20T12:00:12.000Z",
+    };
+    const heartbeat = vi.fn(async () => ({
+      execution: heartbeatExecution,
+      progress,
+    }));
+    const reconcileProgress = vi.fn(() => progress);
     const app = createLocalAgent({
       workerIdentity: {
         get: () => identity,
@@ -1019,10 +1034,9 @@ describe("local agent", () => {
       startLoggedExportExecution: vi.fn(async () => ({
         status: "started" as const,
         execution,
+        progress,
       })),
-      heartbeatLoggedExportExecution: vi.fn(async () => ({
-        execution: heartbeatExecution,
-      })),
+      heartbeatLoggedExportExecution: heartbeat,
       activateLoggedExecution: vi.fn(() => execution),
       recordLoggedExecutionHeartbeat: persist,
       recordLoggedExportNotStartedCancellation: vi.fn(),
@@ -1031,6 +1045,8 @@ describe("local agent", () => {
         return result;
       },
       getLoggedExecution: () => execution,
+      getLoggedExportProgress: () => progress,
+      reconcileLoggedExportProgress: reconcileProgress,
       reconcileLoggedExportCanceled: reconcile,
       executionHeartbeatIntervalMs: 10,
     });
@@ -1053,6 +1069,12 @@ describe("local agent", () => {
       (run.mock.calls[0]![0] as { signal: AbortSignal }).signal.aborted,
     ).toBe(true);
     expect(persist).toHaveBeenCalledWith(heartbeatExecution);
+    expect(reconcileProgress).toHaveBeenCalledWith(progress);
+    expect(heartbeat).toHaveBeenCalledWith(
+      expect.objectContaining({
+        request: expect.objectContaining({ progress }),
+      }),
+    );
     expect(reconcile).toHaveBeenCalledTimes(1);
   });
 

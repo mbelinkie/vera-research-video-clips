@@ -17,6 +17,7 @@ import {
   type LoggedExportCanceled,
   type LoggedExportCanceledResult,
   type LoggedExportExecution,
+  type LoggedExportProgressSnapshot,
   type StartLoggedExportExecutionRequest,
   type StartLoggedExportExecutionResponse,
   type HeartbeatLoggedExportExecutionRequest,
@@ -101,6 +102,12 @@ export interface LocalAgentDependencies {
     requestId: string,
   ): LoggedExportCanceledResult;
   getLoggedExecution?(requestId: string): LoggedExportExecution | undefined;
+  getLoggedExportProgress?(
+    requestId: string,
+  ): LoggedExportProgressSnapshot | undefined;
+  reconcileLoggedExportProgress?(
+    progress: LoggedExportProgressSnapshot,
+  ): LoggedExportProgressSnapshot;
   startLoggedExportExecution?(input: {
     request: StartLoggedExportExecutionRequest;
     authorization: string;
@@ -662,6 +669,9 @@ export function createLocalAgent(
         executionControl = dependencies.activateLoggedExecution(
           started.execution,
         );
+        if (started.progress && dependencies.reconcileLoggedExportProgress) {
+          dependencies.reconcileLoggedExportProgress(started.progress);
+        }
         controller = new AbortController();
         if (executionControl.cancelRequestedAt) {
           controller.abort(
@@ -678,6 +688,12 @@ export function createLocalAgent(
             intervalMs: dependencies.executionHeartbeatIntervalMs ?? 5_000,
             heartbeat: dependencies.heartbeatLoggedExportExecution,
             persist: dependencies.recordLoggedExecutionHeartbeat,
+            ...(dependencies.getLoggedExportProgress
+              ? {
+                  readProgress: () =>
+                    dependencies.getLoggedExportProgress!(command.requestId),
+                }
+              : {}),
           });
           stopHeartbeat = heartbeat.stop;
         }
@@ -702,6 +718,9 @@ export function createLocalAgent(
         !controller.signal.aborted
       ) {
         try {
+          const progress = dependencies.getLoggedExportProgress?.(
+            command.requestId,
+          );
           const finalHeartbeat =
             await dependencies.heartbeatLoggedExportExecution({
               authorization,
@@ -714,6 +733,7 @@ export function createLocalAgent(
                 executionId: executionControl.executionId,
                 attempt: executionControl.attempt,
                 leaseToken: executionControl.leaseToken,
+                ...(progress ? { progress } : {}),
               },
             });
           dependencies.recordLoggedExecutionHeartbeat(finalHeartbeat.execution);
@@ -947,6 +967,7 @@ function startExecutionHeartbeatLoop(input: {
   persist: NonNullable<
     LocalAgentDependencies["recordLoggedExecutionHeartbeat"]
   >;
+  readProgress?: () => LoggedExportProgressSnapshot | undefined;
 }): { stop: () => Promise<void> } {
   let stopped = false;
   let chain = Promise.resolve();
@@ -955,6 +976,7 @@ function startExecutionHeartbeatLoop(input: {
     chain = chain.then(async () => {
       if (stopped || input.controller.signal.aborted) return;
       try {
+        const progress = input.readProgress?.();
         const response = await input.heartbeat({
           authorization: input.authorization,
           request: {
@@ -962,6 +984,7 @@ function startExecutionHeartbeatLoop(input: {
             executionId: input.execution.executionId,
             attempt: input.execution.attempt,
             leaseToken: input.execution.leaseToken,
+            ...(progress ? { progress } : {}),
           },
         });
         input.persist(response.execution);

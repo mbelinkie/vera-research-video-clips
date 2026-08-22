@@ -1272,6 +1272,11 @@ describe("LocalExportSourceProcessor", () => {
       executionAttempt: execution.attempt,
       sourceCleanup: { lifecycle: "deleted" },
     });
+    expect(queue.getLoggedExportProgress(request.id)).toMatchObject({
+      executionId: execution.executionId,
+      stage: "cleaning_source",
+      basisPoints: 9_000,
+    });
     expect(await readdir(join(root, "jobs", "export-source-scratch"))).toEqual(
       [],
     );

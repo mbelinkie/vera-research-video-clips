@@ -2113,11 +2113,70 @@ describe("logged export delivery", () => {
         executionId: started.execution.executionId,
         attempt: started.execution.attempt,
         leaseToken: started.execution.leaseToken,
+        progress: {
+          schemaVersion: 1,
+          executionId: started.execution.executionId,
+          requestId: fixture.accepted.request.id,
+          attempt: started.execution.attempt,
+          sequence: 1,
+          stage: "rendering",
+          basisPoints: 3_500,
+          updatedAt: clock.now.toISOString(),
+        },
       },
     );
     expect(heartbeat.execution.cancelRequestedAt).toBe(
       cancel.cancelRequestedAt,
     );
+    expect(heartbeat.progress).toMatchObject({
+      sequence: 1,
+      stage: "rendering",
+      basisPoints: 3_500,
+    });
+    expect(
+      await fixture.catalog.getLoggedExportProgress(
+        fixture.owner,
+        fixture.accepted.request.projectId!,
+        fixture.accepted.request.id,
+      ),
+    ).toMatchObject({
+      requestId: fixture.accepted.request.id,
+      jobId: fixture.accepted.request.jobId,
+      state: "processing",
+      progress: { executionId: started.execution.executionId, sequence: 1 },
+    });
+    expect(
+      await fixture.catalog.startLoggedExportExecution(
+        fixture.owner,
+        credential,
+      ),
+    ).toMatchObject({
+      status: "started",
+      progress: { executionId: started.execution.executionId, sequence: 1 },
+    });
+    await expect(
+      fixture.catalog.heartbeatLoggedExportExecution(fixture.owner, {
+        ...credential,
+        executionId: started.execution.executionId,
+        attempt: started.execution.attempt,
+        leaseToken: started.execution.leaseToken,
+        progress: {
+          ...heartbeat.progress!,
+          sequence: 2,
+          stage: "acquiring_source",
+          basisPoints: 3_600,
+        },
+      }),
+    ).rejects.toMatchObject({ statusCode: 409 });
+    const outsider = fixtureActor("progress-outsider");
+    await fixture.catalog.registerUser(outsider, "Progress outsider");
+    await expect(
+      fixture.catalog.getLoggedExportProgress(
+        outsider,
+        fixture.accepted.request.projectId!,
+        fixture.accepted.request.id,
+      ),
+    ).rejects.toMatchObject({ statusCode: 403 });
     const result = {
       schemaVersion: 1 as const,
       requestId: fixture.accepted.request.id,

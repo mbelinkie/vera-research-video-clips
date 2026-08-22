@@ -2000,6 +2000,32 @@ const LoggedExportExecutionCredentialSchema = z
 export const StartLoggedExportExecutionRequestSchema =
   LoggedExportExecutionCredentialSchema;
 
+export const LoggedExportProgressStageSchema = z.enum([
+  "preparing",
+  "acquiring_source",
+  "inspecting_source",
+  "rendering",
+  "validating_media",
+  "building_thumbnail",
+  "building_subtitles",
+  "packaging",
+  "cleaning_source",
+  "local_complete",
+]);
+
+export const LoggedExportProgressSnapshotSchema = z
+  .object({
+    schemaVersion: z.literal(1),
+    executionId: IdSchema,
+    requestId: IdSchema,
+    attempt: z.number().int().positive(),
+    sequence: z.number().int().positive(),
+    stage: LoggedExportProgressStageSchema,
+    basisPoints: z.number().int().min(0).max(10_000),
+    updatedAt: UtcTimestampSchema,
+  })
+  .strict();
+
 export const LoggedExportExecutionSchema = z
   .object({
     executionId: IdSchema,
@@ -2044,6 +2070,7 @@ export const StartLoggedExportExecutionResponseSchema = z.discriminatedUnion(
       .object({
         status: z.literal("started"),
         execution: LoggedExportExecutionSchema,
+        progress: LoggedExportProgressSnapshotSchema.optional(),
       })
       .strict(),
     z
@@ -2060,11 +2087,22 @@ export const HeartbeatLoggedExportExecutionRequestSchema =
     executionId: IdSchema,
     attempt: z.number().int().positive(),
     leaseToken: IdSchema,
+    progress: LoggedExportProgressSnapshotSchema.optional(),
   }).strict();
 
 export const HeartbeatLoggedExportExecutionResponseSchema = z
   .object({
     execution: LoggedExportExecutionSchema,
+    progress: LoggedExportProgressSnapshotSchema.optional(),
+  })
+  .strict();
+
+export const GetLoggedExportProgressResponseSchema = z
+  .object({
+    requestId: IdSchema,
+    jobId: IdSchema,
+    state: JobStateSchema,
+    progress: LoggedExportProgressSnapshotSchema.optional(),
   })
   .strict();
 
@@ -2754,11 +2792,20 @@ export type LoggedExportExecution = z.infer<typeof LoggedExportExecutionSchema>;
 export type StartLoggedExportExecutionResponse = z.infer<
   typeof StartLoggedExportExecutionResponseSchema
 >;
+export type LoggedExportProgressStage = z.infer<
+  typeof LoggedExportProgressStageSchema
+>;
+export type LoggedExportProgressSnapshot = z.infer<
+  typeof LoggedExportProgressSnapshotSchema
+>;
 export type HeartbeatLoggedExportExecutionRequest = z.infer<
   typeof HeartbeatLoggedExportExecutionRequestSchema
 >;
 export type HeartbeatLoggedExportExecutionResponse = z.infer<
   typeof HeartbeatLoggedExportExecutionResponseSchema
+>;
+export type GetLoggedExportProgressResponse = z.infer<
+  typeof GetLoggedExportProgressResponseSchema
 >;
 export type CancelLoggedExportRequest = z.infer<
   typeof CancelLoggedExportRequestSchema
