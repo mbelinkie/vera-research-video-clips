@@ -1258,6 +1258,157 @@ describe("logged export delivery", () => {
     ).rejects.toMatchObject({ statusCode: 403 });
   });
 
+  it("creates one explicit re-export request without changing the source version", async () => {
+    const clock = { now: new Date("2026-08-20T12:00:00.000Z") };
+    const fixture = await createAcceptedLoggedExportResultFixture(clock);
+    const completed = await fixture.catalog.reconcileLoggedExportSuccess(
+      fixture.owner,
+      reconcileSuccessCommand(fixture),
+    );
+    const projectId = fixture.accepted.request.projectId!;
+    const clipId = fixture.accepted.request.clipId!;
+    const settingsSelection = {
+      base: "application_default" as const,
+      overrides: {},
+    };
+    const preview = await fixture.catalog.previewProjectExportSettings(
+      fixture.owner,
+      projectId,
+      {
+        sourceLanguageClass: "confirmed_english",
+        selection: settingsSelection,
+      },
+    );
+    const command = {
+      idempotencyKey: "explicit-reexport-v1",
+      requestOrigin: "clip_library" as const,
+      sourceLanguageClass: "confirmed_english" as const,
+      settingsSelection,
+      expectedResolutionFingerprint: preview.snapshot.resolutionFingerprint!,
+    };
+    clock.now = new Date("2026-08-20T12:00:01.000Z");
+    const [reexported, concurrentReplay] = await Promise.all([
+      fixture.catalog.reexportArtifactVersion(
+        fixture.owner,
+        projectId,
+        clipId,
+        completed.id,
+        command,
+      ),
+      fixture.catalog.reexportArtifactVersion(
+        fixture.owner,
+        projectId,
+        clipId,
+        completed.id,
+        command,
+      ),
+    ]);
+    expect(concurrentReplay).toEqual(reexported);
+    expect(reexported).toMatchObject({
+      clipId,
+      requestOrigin: "clip_library",
+      state: "queued",
+    });
+    expect(reexported.id).not.toBe(fixture.accepted.request.id);
+    await expect(
+      fixture.catalog.reexportArtifactVersion(
+        fixture.owner,
+        projectId,
+        clipId,
+        completed.id,
+        command,
+      ),
+    ).resolves.toEqual(reexported);
+    expect(
+      await fixture.catalog.listArtifactVersionHistory(
+        fixture.owner,
+        projectId,
+        clipId,
+        { limit: 25 },
+      ),
+    ).toMatchObject({
+      versions: [{ artifactVersionId: completed.id }],
+    });
+    const stored = await fixture.database.query<{
+      count: string;
+      reexport_of: string;
+    }>(
+      `SELECT
+         (SELECT count(*)::text FROM logged_export_success_results) AS count,
+         payload->>'reexportOfArtifactVersionId' AS reexport_of
+       FROM jobs WHERE id = $1`,
+      [reexported.jobId],
+    );
+    expect(stored.rows[0]).toEqual({
+      count: "1",
+      reexport_of: completed.id,
+    });
+    const reserved = (
+      await fixture.catalog.claimLoggedExportDelivery(fixture.owner, {
+        workerId: fixture.worker.workerId,
+        workerEpoch: fixture.worker.epoch,
+      })
+    ).delivery!;
+    const accepted = await fixture.catalog.acceptLoggedExportDelivery(
+      fixture.owner,
+      {
+        workerId: fixture.worker.workerId,
+        workerEpoch: fixture.worker.epoch,
+        deliveryId: reserved.deliveryId,
+        generation: reserved.generation,
+        reservationToken: reserved.reservationToken,
+      },
+    );
+    const secondVersion = await fixture.catalog.reconcileLoggedExportSuccess(
+      fixture.owner,
+      {
+        workerId: accepted.workerId,
+        workerEpoch: accepted.workerEpoch,
+        deliveryId: accepted.deliveryId,
+        generation: accepted.generation,
+        reservationToken: accepted.reservationToken,
+        result: loggedExportSuccessFixture(reexported, clock.now.toISOString()),
+      },
+    );
+    expect(
+      await fixture.catalog.listArtifactVersionHistory(
+        fixture.owner,
+        projectId,
+        clipId,
+        { limit: 25 },
+      ),
+    ).toMatchObject({
+      versions: [
+        {
+          artifactVersionId: secondVersion.id,
+          requestId: reexported.id,
+          requestOrigin: "clip_library",
+        },
+        { artifactVersionId: completed.id },
+      ],
+    });
+    await expect(
+      fixture.catalog.reexportArtifactVersion(
+        fixture.owner,
+        projectId,
+        clipId,
+        completed.id,
+        { ...command, sourceLanguageClass: "foreign" },
+      ),
+    ).rejects.toMatchObject({ statusCode: 409 });
+    const outsider = fixtureActor("reexport-outsider");
+    await fixture.catalog.registerUser(outsider, "Re-export outsider");
+    await expect(
+      fixture.catalog.reexportArtifactVersion(
+        outsider,
+        projectId,
+        clipId,
+        completed.id,
+        { ...command, idempotencyKey: "outsider" },
+      ),
+    ).rejects.toMatchObject({ statusCode: 403 });
+  });
+
   it("lists an authorized bounded Clip Library with stable cursors and separate history", async () => {
     const fixture = await createAcceptedLoggedExportResultFixture();
     const projectId = fixture.accepted.request.projectId!;

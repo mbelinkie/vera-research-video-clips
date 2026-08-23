@@ -13,6 +13,7 @@ import {
   BatchPreflightResponseSchema,
   CreateClipCandidateRequestSchema,
   CreateClipExportRequestSchema,
+  ReexportArtifactVersionRequestSchema,
   CreateLoggedExportBatchRequestSchema,
   CreateExportPresetRequestSchema,
   ExportPresetDefaultResponseSchema,
@@ -621,6 +622,27 @@ export function createCloudApi(
         projectId,
         clipId,
         CreateClipExportRequestSchema.parse(request.body),
+      );
+      return reply.status(201).send(created);
+    },
+  );
+
+  app.post(
+    "/api/projects/:projectId/clips/:clipId/artifact-versions/:artifactVersionId/reexport",
+    async (request, reply) => {
+      const { projectId, clipId, artifactVersionId } = z
+        .object({
+          projectId: z.uuid(),
+          clipId: z.uuid(),
+          artifactVersionId: z.uuid(),
+        })
+        .parse(request.params);
+      const created = await catalog.reexportArtifactVersion(
+        await authenticate(request),
+        projectId,
+        clipId,
+        artifactVersionId,
+        ReexportArtifactVersionRequestSchema.parse(request.body),
       );
       return reply.status(201).send(created);
     },

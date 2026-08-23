@@ -267,6 +267,95 @@ describe("local agent", () => {
     });
   });
 
+  it("keeps resolution and local actions ID-only and path-free", async () => {
+    const projectId = "019fbb95-cd76-7920-93fa-e23ba755ee73";
+    const clipId = "019fbb95-cd76-7920-93fa-e23ba755ee74";
+    const locatorId = "019fbb95-cd76-7920-93fa-e23ba755ee75";
+    const rootId = "019fbb95-cd76-7920-93fa-e23ba755ee71";
+    const locator = {
+      id: locatorId,
+      artifactVersionId: "019fbb95-cd76-7920-93fa-e23ba755ee72",
+      rootId,
+      platform: "posix" as const,
+      availability: "verified" as const,
+      manifestSha256: "a".repeat(64),
+      manifestSchemaVersion: 2 as const,
+      checkedAt: "2026-08-22T12:00:00.000Z",
+      lastVerifiedAt: "2026-08-22T12:00:00.000Z",
+    };
+    const resolveArtifact = vi.fn(async () => ({
+      state: "needs_export" as const,
+      freshness: "fresh" as const,
+    }));
+    const actOnArtifactLocator = vi.fn(async () => ({
+      locator,
+      freshness: "fresh" as const,
+    }));
+    const relinkArtifactLocator = vi.fn(async () => locator);
+    const app = createLocalAgent({
+      resolveArtifact,
+      actOnArtifactLocator,
+      relinkArtifactLocator,
+      listArtifactRoots: () => [
+        {
+          id: rootId,
+          label: "Managed exports",
+          platform: "posix",
+          enabled: true,
+          createdAt: locator.checkedAt,
+          updatedAt: locator.checkedAt,
+        },
+      ],
+    });
+    apps.add(app);
+    const headers = { authorization: "Bearer project-session" };
+    const roots = await app.inject({
+      method: "GET",
+      url: "/api/artifact-roots",
+      headers,
+    });
+    expect(roots.statusCode).toBe(200);
+    expect(JSON.stringify(roots.json())).not.toMatch(/path|filename/iu);
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: `/api/artifact-locators/${locatorId}/verify`,
+          headers,
+          payload: { path: "/private/package" },
+        })
+      ).statusCode,
+    ).toBe(400);
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: `/api/artifact-locators/${locatorId}/relink`,
+          headers,
+          payload: { targetRootId: rootId, absolutePath: "/private/package" },
+        })
+      ).statusCode,
+    ).toBe(400);
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: `/api/artifact-locators/${locatorId}/open`,
+          headers,
+          payload: {},
+        })
+      ).statusCode,
+    ).toBe(200);
+    expect(actOnArtifactLocator).toHaveBeenCalledWith({
+      locatorId,
+      authorization: "Bearer project-session",
+      action: "open",
+    });
+    expect(relinkArtifactLocator).not.toHaveBeenCalled();
+    expect(resolveArtifact).not.toHaveBeenCalled();
+    expect(JSON.stringify(locator)).not.toMatch(/path|filename/iu);
+  });
+
   it("requires authentication and returns a resolved normalized transcript", async () => {
     const transcript = normalizeTranscriptFixture(transcriptFixture);
     const transcriptVersionId = "019fbb95-cd76-7920-93fa-e23ba755e399";

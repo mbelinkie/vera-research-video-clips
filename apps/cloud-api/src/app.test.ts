@@ -50,6 +50,50 @@ describe("cloud API", () => {
     );
   });
 
+  it("routes strict Clip Library re-export commands to the exact artifact version", async () => {
+    const projectId = randomUUID();
+    const clipId = randomUUID();
+    const artifactVersionId = randomUUID();
+    const actor = {
+      userId: randomUUID(),
+      externalSubject: "fixture:artifact-researcher",
+    };
+    const reexportArtifactVersion = vi.fn(async () => ({ id: randomUUID() }));
+    const app = createCloudApi({
+      catalog: { reexportArtifactVersion } as unknown as SharedProjectCatalog,
+      authenticate: async () => actor,
+    });
+    apps.add(app);
+    const command = {
+      idempotencyKey: "reexport-v1",
+      sourceLanguageClass: "confirmed_english",
+      settingsSelection: { base: "application_default", overrides: {} },
+      expectedResolutionFingerprint: "a".repeat(64),
+    };
+    const response = await app.inject({
+      method: "POST",
+      url: `/api/projects/${projectId}/clips/${clipId}/artifact-versions/${artifactVersionId}/reexport`,
+      payload: command,
+    });
+    expect(response.statusCode).toBe(201);
+    expect(reexportArtifactVersion).toHaveBeenCalledWith(
+      actor,
+      projectId,
+      clipId,
+      artifactVersionId,
+      { ...command, requestOrigin: "clip_library" },
+    );
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: `/api/projects/${projectId}/clips/${clipId}/artifact-versions/${artifactVersionId}/reexport`,
+          payload: { ...command, requestOrigin: "authoring_build" },
+        })
+      ).statusCode,
+    ).toBe(400);
+  });
+
   it("authenticates a user and exposes only their project catalog", async () => {
     const database = new PGlite();
     databases.add(database);

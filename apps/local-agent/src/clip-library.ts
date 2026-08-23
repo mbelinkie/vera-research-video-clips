@@ -5,6 +5,7 @@ import {
   UpdateLocalClipLibrarySelectionSchema,
   type ClipLibraryPage,
   type ClipLibraryQuery,
+  type ArtifactVersionSummary,
   type LocalClipLibraryPage,
   type UpdateLocalClipLibrarySelection,
 } from "@research-video/contracts";
@@ -149,6 +150,28 @@ export class LocalClipLibraryService {
     } else if (input.statusCode === 403) {
       this.cache.purgeScope(input.projectId, authorizationScopeSha256);
     }
+  }
+
+  findCachedArtifactVersion(input: {
+    projectId: string;
+    clipId: string;
+    artifactVersionId: string;
+    authorization: string;
+  }): ArtifactVersionSummary | undefined {
+    return this.cache.findArtifactVersion({
+      projectId: input.projectId,
+      authorizationScopeSha256: clipLibraryAuthorizationScope(
+        input.authorization,
+      ),
+      clipId: input.clipId,
+      artifactVersionId: input.artifactVersionId,
+    });
+  }
+
+  hasCachedAuthorization(authorization: string): boolean {
+    return this.cache.hasAuthorizationScope(
+      clipLibraryAuthorizationScope(authorization),
+    );
   }
 
   private decorate(

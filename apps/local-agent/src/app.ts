@@ -3,6 +3,9 @@ import { z, ZodError } from "zod";
 
 import {
   CreateExportOnlyRequestSchema,
+  ArtifactLocatorActionRequestSchema,
+  RelinkArtifactLocatorRequestSchema,
+  ResolveLocalArtifactRequestSchema,
   ClipLibraryQuerySchema,
   PrepareClipLibraryExportRequestSchema,
   SubmitClipLibraryExportRequestSchema,
@@ -14,6 +17,10 @@ import {
   ProcessAcceptedLoggedExportResponseSchema,
   type HeartbeatExportWorkerRequest,
   type ArtifactLocatorSummary,
+  type ArtifactRootSummary,
+  type ArtifactCompatibilityRequirements,
+  type ArtifactLocatorActionResult,
+  type ArtifactResolutionResult,
   type ArtifactVersionSummary,
   type ClipLibraryQuery,
   type ClipLibraryExportSubmission,
@@ -99,6 +106,23 @@ export interface LocalAgentDependencies {
     rootId: string;
     artifactVersion: ArtifactVersionSummary;
   }): Promise<ArtifactLocatorSummary>;
+  resolveArtifact?(input: {
+    projectId: string;
+    clipId: string;
+    authorization: string;
+    requirements: ArtifactCompatibilityRequirements;
+  }): Promise<ArtifactResolutionResult>;
+  actOnArtifactLocator?(input: {
+    locatorId: string;
+    authorization: string;
+    action: "verify" | "reveal" | "open";
+  }): Promise<ArtifactLocatorActionResult>;
+  relinkArtifactLocator?(input: {
+    locatorId: string;
+    targetRootId: string;
+    authorization: string;
+  }): Promise<ArtifactLocatorSummary>;
+  listArtifactRoots?(input: { authorization: string }): ArtifactRootSummary[];
   resolveTranscript?(input: {
     projectId: string;
     catalogVideoId: string;
@@ -208,10 +232,20 @@ const TranscriptParamsSchema = z.object({
   videoId: z.uuid(),
 });
 const LocalProjectParamsSchema = z.object({ projectId: z.uuid() });
+const LocalClipParamsSchema = z.object({
+  projectId: z.uuid(),
+  clipId: z.uuid(),
+});
+const ArtifactLocatorParamsSchema = z.object({ locatorId: z.uuid() });
 
 class LocalAuthenticationError extends Error {
   readonly statusCode = 401;
   readonly code = "authentication_required";
+}
+
+class LocalArtifactRequestError extends Error {
+  readonly statusCode = 409;
+  readonly code = "artifact_identity_mismatch";
 }
 
 class LocalExportSettingsError extends Error {
@@ -405,6 +439,99 @@ export function createLocalAgent(
         rootId: command.rootId,
         artifactVersion,
       });
+    });
+  }
+
+  if (dependencies?.resolveArtifact) {
+    app.post(
+      "/api/projects/:projectId/clips/:clipId/artifact-resolution",
+      async (request) => {
+        const { projectId, clipId } = LocalClipParamsSchema.parse(
+          request.params,
+        );
+        const authorization = request.headers.authorization;
+        if (!authorization) {
+          throw new LocalAuthenticationError(
+            "Authentication is required to resolve a project artifact.",
+          );
+        }
+        const command = ResolveLocalArtifactRequestSchema.parse(request.body);
+        if (command.requirements.clipId !== clipId) {
+          throw new LocalArtifactRequestError(
+            "Artifact clip identity differs.",
+          );
+        }
+        return dependencies.resolveArtifact!({
+          projectId,
+          clipId,
+          authorization,
+          requirements: command.requirements,
+        });
+      },
+    );
+  }
+
+  if (dependencies?.actOnArtifactLocator) {
+    for (const action of ["verify", "reveal", "open"] as const) {
+      app.post(
+        `/api/artifact-locators/:locatorId/${action}`,
+        async (request) => {
+          const authorization = request.headers.authorization;
+          if (!authorization) {
+            throw new LocalAuthenticationError(
+              "Authentication is required to use a project artifact.",
+            );
+          }
+          const command = ArtifactLocatorActionRequestSchema.parse(
+            ArtifactLocatorParamsSchema.parse(request.params),
+          );
+          z.object({})
+            .strict()
+            .parse(request.body ?? {});
+          return dependencies.actOnArtifactLocator!({
+            locatorId: command.locatorId,
+            authorization,
+            action,
+          });
+        },
+      );
+    }
+  }
+
+  if (dependencies?.relinkArtifactLocator) {
+    app.post("/api/artifact-locators/:locatorId/relink", async (request) => {
+      const authorization = request.headers.authorization;
+      if (!authorization) {
+        throw new LocalAuthenticationError(
+          "Authentication is required to relink a project artifact.",
+        );
+      }
+      const params = ArtifactLocatorParamsSchema.parse(request.params);
+      const body = z
+        .object({ targetRootId: z.uuid() })
+        .strict()
+        .parse(request.body);
+      const command = RelinkArtifactLocatorRequestSchema.parse({
+        ...params,
+        ...body,
+      });
+      return dependencies.relinkArtifactLocator!({
+        locatorId: command.locatorId,
+        targetRootId: command.targetRootId,
+        authorization,
+      });
+    });
+  }
+
+  if (dependencies?.listArtifactRoots) {
+    app.get("/api/artifact-roots", async (request) => {
+      const authorization = request.headers.authorization;
+      if (!authorization) {
+        throw new LocalAuthenticationError(
+          "Authentication is required to list artifact roots.",
+        );
+      }
+      return { roots: dependencies.listArtifactRoots!({ authorization }) };
     });
   }
 

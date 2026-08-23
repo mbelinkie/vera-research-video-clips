@@ -910,6 +910,10 @@ export const CreateClipExportRequestSchema =
   createExportRequestBaseSchema.superRefine(
     requireBilingualSubtitleTrackSnapshots,
   );
+export const ReexportArtifactVersionRequestSchema =
+  CreateClipExportRequestSchema.safeExtend({
+    requestOrigin: z.literal("clip_library").default("clip_library"),
+  });
 export const CreateLoggedExportBatchRequestSchema = z
   .object({
     idempotencyKey: z.string().trim().min(1).max(512),
@@ -2620,6 +2624,182 @@ export const ArtifactLocatorListResponseSchema = z
   .object({ locators: z.array(ArtifactLocatorSummarySchema).max(100) })
   .strict();
 
+export const ArtifactCompatibilitySelectionSchema = z
+  .object({
+    trackId: IdSchema,
+    transcriptVersion: z.number().int().positive(),
+    firstSegmentId: IdSchema,
+    lastSegmentId: IdSchema,
+    firstTokenId: IdSchema.optional(),
+    lastTokenId: IdSchema.optional(),
+    transcriptStartMs: z.number().int().nonnegative(),
+    transcriptEndMs: z.number().int().positive(),
+    exportStartMs: z.number().int().nonnegative(),
+    exportEndMs: z.number().int().positive(),
+    timingPrecision: TimingPrecisionSchema,
+  })
+  .strict();
+
+export const ArtifactCompatibilityRequirementsSchema = z
+  .object({
+    clipId: IdSchema,
+    selection: ArtifactCompatibilitySelectionSchema,
+    resolvedBounds: z
+      .object({
+        startMs: z.number().int().nonnegative(),
+        endMs: z.number().int().positive(),
+      })
+      .strict(),
+    sourceLanguageClass: ExportSourceLanguageClassSchema,
+    subtitleTracks: ExportSubtitleTrackSnapshotsSchema.optional(),
+    subtitlePolicy: z
+      .object({
+        requiredSidecars: z.array(z.enum(["original", "english"])).max(2),
+        omittedReason: z.literal("confirmed_english_user_setting").optional(),
+      })
+      .strict()
+      .superRefine((policy, context) => {
+        if (
+          Boolean(policy.omittedReason) !==
+          (policy.requiredSidecars.length === 0)
+        ) {
+          context.addIssue({
+            code: "custom",
+            message:
+              "An omitted subtitle policy requires its bounded omission reason.",
+          });
+        }
+        if (
+          new Set(policy.requiredSidecars).size !==
+          policy.requiredSidecars.length
+        ) {
+          context.addIssue({
+            code: "custom",
+            path: ["requiredSidecars"],
+            message: "Required subtitle sidecars must be unique.",
+          });
+        }
+      }),
+    requiredArtifactRoles: z.array(FinalArtifactRoleSchema).min(1).max(8),
+    acceptedManifestSchemas: z
+      .array(z.union([z.literal(1), z.literal(2)]))
+      .min(1)
+      .max(2),
+    settings: z.discriminatedUnion("mode", [
+      z
+        .object({
+          mode: z.literal("exact_fingerprint"),
+          resolutionFingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+        })
+        .strict(),
+      z
+        .object({
+          mode: z.literal("accepted_renderer_profiles"),
+          rendererCapabilityIds: z
+            .array(ExportRendererCapabilityIdSchema)
+            .min(1)
+            .max(3),
+        })
+        .strict(),
+    ]),
+  })
+  .strict()
+  .superRefine((requirements, context) => {
+    if (
+      requirements.resolvedBounds.endMs <= requirements.resolvedBounds.startMs
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["resolvedBounds", "endMs"],
+        message: "Compatible artifact bounds must be nonempty.",
+      });
+    }
+    const duplicateChecks: Array<[string, ReadonlyArray<string | number>]> = [
+      ["requiredArtifactRoles", requirements.requiredArtifactRoles],
+      ["acceptedManifestSchemas", requirements.acceptedManifestSchemas],
+      [
+        "settings.rendererCapabilityIds",
+        requirements.settings.mode === "accepted_renderer_profiles"
+          ? requirements.settings.rendererCapabilityIds
+          : [],
+      ],
+    ];
+    for (const [path, values] of duplicateChecks) {
+      if (new Set<string | number>(values).size !== values.length) {
+        context.addIssue({
+          code: "custom",
+          path: path.split("."),
+          message: "Compatibility requirements must not contain duplicates.",
+        });
+      }
+    }
+  });
+
+export const ArtifactResolutionFreshnessSchema = z.enum(["fresh", "stale"]);
+const ArtifactResolutionLocatorSchema = ArtifactLocatorSummarySchema;
+export const ArtifactResolutionResultSchema = z.discriminatedUnion("state", [
+  z
+    .object({
+      state: z.literal("reusable_local"),
+      artifactVersionId: IdSchema,
+      locator: ArtifactResolutionLocatorSchema,
+      freshness: ArtifactResolutionFreshnessSchema,
+    })
+    .strict(),
+  z
+    .object({
+      state: z.literal("missing"),
+      artifactVersionId: IdSchema,
+      locators: z.array(ArtifactResolutionLocatorSchema).max(100),
+      freshness: ArtifactResolutionFreshnessSchema,
+    })
+    .strict(),
+  z
+    .object({
+      state: z.literal("invalid"),
+      artifactVersionId: IdSchema,
+      locators: z.array(ArtifactResolutionLocatorSchema).min(1).max(100),
+      freshness: ArtifactResolutionFreshnessSchema,
+    })
+    .strict(),
+  z
+    .object({
+      state: z.literal("incompatible"),
+      artifactVersionId: IdSchema.optional(),
+      freshness: ArtifactResolutionFreshnessSchema,
+    })
+    .strict(),
+  z
+    .object({
+      state: z.literal("remote_only"),
+      artifactVersionId: IdSchema,
+      freshness: ArtifactResolutionFreshnessSchema,
+    })
+    .strict(),
+  z
+    .object({
+      state: z.literal("needs_export"),
+      freshness: ArtifactResolutionFreshnessSchema,
+    })
+    .strict(),
+]);
+
+export const ResolveLocalArtifactRequestSchema = z
+  .object({ requirements: ArtifactCompatibilityRequirementsSchema })
+  .strict();
+export const ArtifactLocatorActionRequestSchema = z
+  .object({ locatorId: IdSchema })
+  .strict();
+export const RelinkArtifactLocatorRequestSchema = z
+  .object({ locatorId: IdSchema, targetRootId: IdSchema })
+  .strict();
+export const ArtifactLocatorActionResultSchema = z
+  .object({
+    locator: ArtifactResolutionLocatorSchema,
+    freshness: ArtifactResolutionFreshnessSchema,
+  })
+  .strict();
+
 export const ClipLibraryQuerySchema = z
   .object({
     limit: z.coerce.number().int().min(1).max(50).default(25),
@@ -2793,6 +2973,7 @@ export const PrepareClipLibraryExportRequestSchema = z
   .object({
     clipIds: z.array(IdSchema).min(1).max(25),
     settingsSelection: ExportSettingsSelectionSchema,
+    reexportArtifactVersionId: IdSchema.optional(),
   })
   .strict()
   .superRefine((request, context) => {
@@ -2801,6 +2982,13 @@ export const PrepareClipLibraryExportRequestSchema = z
         code: "custom",
         path: ["clipIds"],
         message: "A Clip Library export can include each clip only once.",
+      });
+    }
+    if (request.reexportArtifactVersionId && request.clipIds.length !== 1) {
+      context.addIssue({
+        code: "custom",
+        path: ["reexportArtifactVersionId"],
+        message: "An explicit re-export must target exactly one clip.",
       });
     }
   });
@@ -3367,6 +3555,9 @@ export type SubtitleSidecarProvenance = z.infer<
 export type CreateClipExportRequest = z.infer<
   typeof CreateClipExportRequestSchema
 >;
+export type ReexportArtifactVersionRequest = z.infer<
+  typeof ReexportArtifactVersionRequestSchema
+>;
 export type CreateLoggedExportBatchRequest = z.infer<
   typeof CreateLoggedExportBatchRequestSchema
 >;
@@ -3483,6 +3674,30 @@ export type VerifyLocalArtifactVersionRequest = z.infer<
 >;
 export type ArtifactLocatorSummary = z.infer<
   typeof ArtifactLocatorSummarySchema
+>;
+export type ArtifactCompatibilitySelection = z.infer<
+  typeof ArtifactCompatibilitySelectionSchema
+>;
+export type ArtifactCompatibilityRequirements = z.infer<
+  typeof ArtifactCompatibilityRequirementsSchema
+>;
+export type ArtifactResolutionFreshness = z.infer<
+  typeof ArtifactResolutionFreshnessSchema
+>;
+export type ArtifactResolutionResult = z.infer<
+  typeof ArtifactResolutionResultSchema
+>;
+export type ResolveLocalArtifactRequest = z.infer<
+  typeof ResolveLocalArtifactRequestSchema
+>;
+export type ArtifactLocatorActionRequest = z.infer<
+  typeof ArtifactLocatorActionRequestSchema
+>;
+export type RelinkArtifactLocatorRequest = z.infer<
+  typeof RelinkArtifactLocatorRequestSchema
+>;
+export type ArtifactLocatorActionResult = z.infer<
+  typeof ArtifactLocatorActionResultSchema
 >;
 export type ClipLibraryQuery = z.infer<typeof ClipLibraryQuerySchema>;
 export type ClipLibraryExportLeaf = z.infer<typeof ClipLibraryExportLeafSchema>;

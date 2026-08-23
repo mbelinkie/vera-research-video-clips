@@ -2,6 +2,10 @@ import { useEffect, useMemo, useRef, useState } from "react";
 
 import {
   ApiErrorSchema,
+  ArtifactLocatorActionResultSchema,
+  ArtifactLocatorSummarySchema,
+  ArtifactResolutionResultSchema,
+  ArtifactRootListResponseSchema,
   ClipLibraryExportSubmissionSchema,
   ClipCandidateSchema,
   ClipTagNameSchema,
@@ -10,6 +14,8 @@ import {
   LocalClipLibraryPageSchema,
   ProjectExportPresetCatalogSchema,
   type ClipCandidate,
+  type ArtifactResolutionResult,
+  type ArtifactRootSummary,
   type ClipLibraryEntry,
   type ExportSettingsSelection,
   type ExportStoragePreflight,
@@ -60,6 +66,12 @@ export function ClipQueue({
   const [presetKey, setPresetKey] = useState("context_default");
   const [preflight, setPreflight] = useState<ExportStoragePreflight>();
   const [confirmUnknownSources, setConfirmUnknownSources] = useState(false);
+  const [reexportArtifactVersionId, setReexportArtifactVersionId] =
+    useState<string>();
+  const [artifactRoots, setArtifactRoots] = useState<ArtifactRootSummary[]>([]);
+  const [resolutions, setResolutions] = useState<
+    Map<string, ArtifactResolutionResult>
+  >(() => new Map());
   const requestGeneration = useRef(0);
 
   function pagePath(
@@ -205,6 +217,19 @@ export function ClipQueue({
             ]);
           })
           .catch(() => undefined);
+        void fetch("/local-agent/api/artifact-roots", {
+          headers: { accept: "application/json", authorization },
+        })
+          .then(async (response) => {
+            if (!response.ok) return undefined;
+            return ArtifactRootListResponseSchema.parse(await response.json());
+          })
+          .then((roots) => {
+            if (roots && generation === requestGeneration.current) {
+              setArtifactRoots(roots.roots);
+            }
+          })
+          .catch(() => undefined);
       }
     } catch (error) {
       if (generation === requestGeneration.current) {
@@ -232,6 +257,9 @@ export function ClipQueue({
     setAvailabilityFilter("all");
     setPreflight(undefined);
     setConfirmUnknownSources(false);
+    setReexportArtifactVersionId(undefined);
+    setArtifactRoots([]);
+    setResolutions(new Map());
     setPresetKey("context_default");
     setSettingsSelection({ base: "context_default", overrides: {} });
     void reload(undefined, true, true);
@@ -333,6 +361,7 @@ export function ClipQueue({
     setSelected(next);
     setPreflight(undefined);
     setConfirmUnknownSources(false);
+    setReexportArtifactVersionId(undefined);
     try {
       const response = await fetch(
         `/local-agent/api/projects/${projectId}/clip-library/selection`,
@@ -364,9 +393,15 @@ export function ClipQueue({
     }
   }
 
-  async function prepareExport() {
-    if (page?.freshness !== "fresh" || !selected.size) return;
+  async function prepareExport(reexport?: {
+    clipId: string;
+    artifactVersionId: string;
+  }) {
+    const clipIds = reexport ? [reexport.clipId] : [...selected].toSorted();
+    if (page?.freshness !== "fresh" || !clipIds.length) return;
     const generation = requestGeneration.current;
+    setReexportArtifactVersionId(reexport?.artifactVersionId);
+    if (reexport) setSelected(new Set([reexport.clipId]));
     setBusy(true);
     setPreflight(undefined);
     setConfirmUnknownSources(false);
@@ -382,8 +417,11 @@ export function ClipQueue({
             "content-type": "application/json",
           },
           body: JSON.stringify({
-            clipIds: [...selected].toSorted(),
+            clipIds,
             settingsSelection,
+            ...(reexport
+              ? { reexportArtifactVersionId: reexport.artifactVersionId }
+              : {}),
           }),
         },
       );
@@ -430,6 +468,7 @@ export function ClipQueue({
           body: JSON.stringify({
             clipIds: [...selected].toSorted(),
             settingsSelection,
+            ...(reexportArtifactVersionId ? { reexportArtifactVersionId } : {}),
             expectedPreflightFingerprint: preflight.preflightFingerprint,
             confirmUnknownSourceSizes: confirmUnknownSources,
           }),
@@ -501,6 +540,153 @@ export function ClipQueue({
           error instanceof Error
             ? error.message
             : `Unable to ${action} export.`,
+        );
+      }
+    } finally {
+      if (generation === requestGeneration.current) setBusy(false);
+    }
+  }
+
+  async function resolveArtifact(
+    clip: ClipCandidate,
+    version: ClipLibraryEntry["recentArtifactVersions"][number],
+  ) {
+    const generation = requestGeneration.current;
+    const { text: _text, ...selection } = version.selection;
+    const rendererCapabilityId =
+      version.resolvedSettingsSnapshot.settings.videoCodec === "prores"
+        ? "prores_mov"
+        : version.resolvedSettingsSnapshot.settings.videoCodec === "hevc"
+          ? "hevc_mkv"
+          : "h264_mp4";
+    setBusy(true);
+    try {
+      const response = await fetch(
+        `/local-agent/api/projects/${projectId}/clips/${clip.id}/artifact-resolution`,
+        {
+          method: "POST",
+          headers: {
+            accept: "application/json",
+            authorization,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({
+            requirements: {
+              clipId: clip.id,
+              selection,
+              resolvedBounds: {
+                startMs: version.resolvedExportBounds.startMs,
+                endMs: version.resolvedExportBounds.endMs,
+              },
+              sourceLanguageClass: version.sourceLanguageClass,
+              ...(version.subtitleTracks
+                ? { subtitleTracks: version.subtitleTracks }
+                : {}),
+              subtitlePolicy: version.subtitleOmissionProvenance
+                ? {
+                    requiredSidecars: [],
+                    omittedReason: version.subtitleOmissionProvenance.policy,
+                  }
+                : version.sourceLanguageClass === "confirmed_english"
+                  ? { requiredSidecars: ["english"] }
+                  : { requiredSidecars: ["original", "english"] },
+              requiredArtifactRoles: version.artifacts.map(
+                (artifact) => artifact.role,
+              ),
+              acceptedManifestSchemas:
+                version.manifest.schemaVersion === "unknown"
+                  ? [1, 2]
+                  : [version.manifest.schemaVersion],
+              settings: version.resolvedSettingsSnapshot.resolutionFingerprint
+                ? {
+                    mode: "exact_fingerprint",
+                    resolutionFingerprint:
+                      version.resolvedSettingsSnapshot.resolutionFingerprint,
+                  }
+                : {
+                    mode: "accepted_renderer_profiles",
+                    rendererCapabilityIds: [rendererCapabilityId],
+                  },
+            },
+          }),
+        },
+      );
+      const payload: unknown = await response.json().catch(() => undefined);
+      if (!response.ok) throw apiError(payload, "Unable to resolve artifact.");
+      const resolution = ArtifactResolutionResultSchema.parse(payload);
+      if (generation !== requestGeneration.current) return;
+      setResolutions((current) =>
+        new Map(current).set(version.artifactVersionId, resolution),
+      );
+      setMessage(
+        `Artifact resolution: ${resolution.state.replaceAll("_", " ")}.`,
+      );
+      void reload();
+    } catch (error) {
+      if (generation === requestGeneration.current) {
+        setMessage(
+          error instanceof Error
+            ? error.message
+            : "Unable to resolve artifact.",
+        );
+      }
+    } finally {
+      if (generation === requestGeneration.current) setBusy(false);
+    }
+  }
+
+  async function actOnArtifact(
+    locatorId: string,
+    action: "verify" | "reveal" | "open" | "relink",
+    targetRootId?: string,
+  ) {
+    if (action === "relink" && page?.freshness !== "fresh") {
+      setMessage("Reconnect before relinking a project artifact.");
+      return;
+    }
+    const generation = requestGeneration.current;
+    setBusy(true);
+    try {
+      const response = await fetch(
+        `/local-agent/api/artifact-locators/${locatorId}/${action}`,
+        {
+          method: "POST",
+          headers: {
+            accept: "application/json",
+            authorization,
+            "content-type": "application/json",
+          },
+          body:
+            action === "relink"
+              ? JSON.stringify({ targetRootId })
+              : JSON.stringify({}),
+        },
+      );
+      const payload: unknown = await response.json().catch(() => undefined);
+      if (!response.ok)
+        throw apiError(payload, `Unable to ${action} local artifact.`);
+      const actionResult =
+        action !== "relink"
+          ? ArtifactLocatorActionResultSchema.parse(payload)
+          : undefined;
+      if (generation !== requestGeneration.current) return;
+      if (actionResult) {
+        setMessage(
+          actionResult.freshness === "stale"
+            ? `Local artifact ${action} completed after fresh byte verification under the cached authorization scope.`
+            : `Local artifact ${action} completed after full verification.`,
+        );
+      } else {
+        ArtifactLocatorSummarySchema.parse(payload);
+        setMessage("Local artifact relink completed after full verification.");
+      }
+      void reload();
+    } catch (error) {
+      if (generation === requestGeneration.current) {
+        setMessage(
+          error instanceof Error
+            ? error.message
+            : `Unable to ${action} local artifact.`,
         );
       }
     } finally {
@@ -877,13 +1063,114 @@ export function ClipQueue({
                   <details>
                     <summary>Recent immutable artifact history</summary>
                     <ul>
-                      {entry.recentArtifactVersions.map((version) => (
-                        <li key={version.artifactVersionId}>
-                          {new Date(version.completedAt).toLocaleString()} ·{" "}
-                          {version.artifacts.length} artifacts · manifest{" "}
-                          {version.manifest.schemaVersion}
-                        </li>
-                      ))}
+                      {entry.recentArtifactVersions.map((version) => {
+                        const versionLocators =
+                          availabilityByVersion.get(
+                            version.artifactVersionId,
+                          ) ?? [];
+                        const resolution = resolutions.get(
+                          version.artifactVersionId,
+                        );
+                        return (
+                          <li key={version.artifactVersionId}>
+                            <span>
+                              {new Date(version.completedAt).toLocaleString()} ·{" "}
+                              {version.artifacts.length} artifacts · manifest{" "}
+                              {version.manifest.schemaVersion} · completion is
+                              immutable · workstation{" "}
+                              {resolution?.state.replaceAll("_", " ") ??
+                                (versionLocators.length
+                                  ? versionLocators[0]!.availability
+                                  : "not resolved")}
+                            </span>
+                            <div className="action-row">
+                              <button
+                                type="button"
+                                disabled={busy}
+                                onClick={() =>
+                                  void resolveArtifact(clip, version)
+                                }
+                              >
+                                Resolve
+                              </button>
+                              {versionLocators.map((locator) => (
+                                <span key={locator.id}>
+                                  <button
+                                    type="button"
+                                    disabled={busy}
+                                    onClick={() =>
+                                      void actOnArtifact(locator.id, "verify")
+                                    }
+                                  >
+                                    Verify
+                                  </button>
+                                  <button
+                                    type="button"
+                                    disabled={
+                                      busy ||
+                                      locator.availability !== "verified"
+                                    }
+                                    onClick={() =>
+                                      void actOnArtifact(locator.id, "reveal")
+                                    }
+                                  >
+                                    Reveal
+                                  </button>
+                                  <button
+                                    type="button"
+                                    disabled={
+                                      busy ||
+                                      locator.availability !== "verified"
+                                    }
+                                    onClick={() =>
+                                      void actOnArtifact(locator.id, "open")
+                                    }
+                                  >
+                                    Open clip
+                                  </button>
+                                  {artifactRoots
+                                    .filter(
+                                      (root) =>
+                                        root.enabled &&
+                                        root.id !== locator.rootId,
+                                    )
+                                    .map((root) => (
+                                      <button
+                                        key={root.id}
+                                        type="button"
+                                        disabled={
+                                          busy || page?.freshness !== "fresh"
+                                        }
+                                        onClick={() =>
+                                          void actOnArtifact(
+                                            locator.id,
+                                            "relink",
+                                            root.id,
+                                          )
+                                        }
+                                      >
+                                        Relink to {root.label}
+                                      </button>
+                                    ))}
+                                </span>
+                              ))}
+                              <button
+                                type="button"
+                                disabled={busy || page?.freshness !== "fresh"}
+                                onClick={() =>
+                                  void prepareExport({
+                                    clipId: clip.id,
+                                    artifactVersionId:
+                                      version.artifactVersionId,
+                                  })
+                                }
+                              >
+                                Preflight re-export
+                              </button>
+                            </div>
+                          </li>
+                        );
+                      })}
                     </ul>
                   </details>
                 ) : null}

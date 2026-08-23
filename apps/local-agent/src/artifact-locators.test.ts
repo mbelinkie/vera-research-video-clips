@@ -12,13 +12,14 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   ArtifactVersionSummarySchema,
   ExportClipManifestSchema,
   ExportClipMetadataSchema,
   LoggedExportSuccessResultSchema,
+  type ArtifactCompatibilityRequirements,
   type ArtifactVersionSummary,
 } from "@research-video/contracts";
 import {
@@ -35,6 +36,8 @@ import {
 
 import {
   LocalArtifactLocatorService,
+  artifactVersionMatchesRequirements,
+  resolveArtifactActionEvidence,
   validateArtifactPackageSegment,
   validateConfiguredRootPath,
 } from "./artifact-locators.ts";
@@ -51,6 +54,262 @@ afterEach(async () => {
 });
 
 describe("local artifact locator verification", () => {
+  it("uses only exact cached evidence for offline actions and purges denied scopes", async () => {
+    const root = await mkdtemp(join(tmpdir(), "artifact-action-scope-"));
+    temporaryRoots.add(root);
+    const fixture = await writeVerifiedPackage(root);
+    const unavailable = Object.assign(new Error("unavailable"), {
+      statusCode: 503,
+    });
+    const denied = vi.fn();
+    await expect(
+      resolveArtifactActionEvidence({
+        fetchCloud: async () => Promise.reject(unavailable),
+        findCached: () => fixture.summary,
+        onAuthorizationDenied: denied,
+      }),
+    ).resolves.toEqual({ summary: fixture.summary, freshness: "stale" });
+    expect(denied).not.toHaveBeenCalled();
+    const findCached = vi.fn(() => fixture.summary);
+    await expect(
+      resolveArtifactActionEvidence({
+        fetchCloud: async () =>
+          Promise.reject(
+            Object.assign(new Error("forbidden"), { statusCode: 403 }),
+          ),
+        findCached,
+        onAuthorizationDenied: denied,
+      }),
+    ).rejects.toMatchObject({
+      code: "artifact_action_not_found",
+      statusCode: 404,
+    });
+    expect(denied).toHaveBeenCalledWith(403);
+    expect(findCached).not.toHaveBeenCalled();
+    const contractDrift = new Error("contract drift");
+    await expect(
+      resolveArtifactActionEvidence({
+        fetchCloud: async () => Promise.reject(contractDrift),
+        findCached,
+        onAuthorizationDenied: denied,
+      }),
+    ).rejects.toBe(contractDrift);
+  });
+
+  it("matches every immutable compatibility dimension and verified manifest schema", async () => {
+    const root = await mkdtemp(join(tmpdir(), "artifact-compatibility-"));
+    temporaryRoots.add(root);
+    const database = openLocalDatabase(join(root, "local.sqlite"));
+    runLocalMigrations(database);
+    const packageRoot = join(root, "exports");
+    await mkdir(packageRoot);
+    const fixture = await writeVerifiedPackage(packageRoot, 2, "bilingual");
+    const requirements = compatibilityRequirements(fixture.summary);
+    expect(
+      artifactVersionMatchesRequirements(fixture.summary, requirements),
+    ).toBe(true);
+    for (const incompatible of [
+      {
+        ...requirements,
+        selection: {
+          ...requirements.selection,
+          firstSegmentId: randomUUID(),
+        },
+      },
+      {
+        ...requirements,
+        resolvedBounds: {
+          ...requirements.resolvedBounds,
+          endMs: requirements.resolvedBounds.endMs + 1,
+        },
+      },
+      { ...requirements, sourceLanguageClass: "mixed" as const },
+      {
+        ...requirements,
+        subtitleTracks: {
+          ...requirements.subtitleTracks!,
+          english: {
+            ...requirements.subtitleTracks!.english,
+            trackVersion: requirements.subtitleTracks!.english.trackVersion + 1,
+          },
+        },
+      },
+      {
+        ...requirements,
+        subtitlePolicy: {
+          requiredSidecars: ["english"] as Array<"original" | "english">,
+        },
+      },
+      {
+        ...requirements,
+        requiredArtifactRoles: [
+          ...requirements.requiredArtifactRoles,
+          "video_mkv" as const,
+        ],
+      },
+      {
+        ...requirements,
+        settings: {
+          mode: "exact_fingerprint" as const,
+          resolutionFingerprint: "e".repeat(64),
+        },
+      },
+      {
+        ...requirements,
+        settings: {
+          mode: "accepted_renderer_profiles" as const,
+          rendererCapabilityIds: ["hevc_mkv" as const],
+        },
+      },
+    ]) {
+      expect(
+        artifactVersionMatchesRequirements(fixture.summary, incompatible),
+      ).toBe(false);
+    }
+
+    const service = new LocalArtifactLocatorService(
+      new LocalArtifactLocatorRepository(database),
+    );
+    const configured = await service.configureRoot({
+      label: "Managed exports",
+      platform: "posix",
+      absolutePath: packageRoot,
+    });
+    await service.verifyArtifactVersion(configured.id, fixture.summary);
+    await expect(
+      service.resolveArtifactHistory({
+        summaries: [fixture.summary],
+        requirements: { ...requirements, acceptedManifestSchemas: [1] },
+        freshness: "fresh",
+      }),
+    ).resolves.toMatchObject({ state: "incompatible" });
+    database.close();
+  });
+
+  it("resolves, launches, relinks, and invalidates an artifact without exposing paths", async () => {
+    const root = await mkdtemp(join(tmpdir(), "artifact-actions-"));
+    temporaryRoots.add(root);
+    const database = openLocalDatabase(join(root, "local.sqlite"));
+    runLocalMigrations(database);
+    const launched: string[] = [];
+    const repository = new LocalArtifactLocatorRepository(database);
+    const service = new LocalArtifactLocatorService(repository, {
+      revealPackage: async (path) => {
+        launched.push(`reveal:${path}`);
+      },
+      openMedia: async (path) => {
+        launched.push(`open:${path}`);
+      },
+    });
+    const firstRoot = join(root, "exports-one");
+    const secondRoot = join(root, "exports-two");
+    await Promise.all([mkdir(firstRoot), mkdir(secondRoot)]);
+    const first = await service.configureRoot({
+      label: "First",
+      platform: "posix",
+      absolutePath: firstRoot,
+    });
+    const second = await service.configureRoot({
+      label: "Second",
+      platform: "posix",
+      absolutePath: secondRoot,
+    });
+    const fixture = await writeVerifiedPackage(firstRoot);
+    const requirements = compatibilityRequirements(fixture.summary);
+    const locator = await service.verifyArtifactVersion(
+      first.id,
+      fixture.summary,
+    );
+
+    await expect(
+      service.resolveArtifactHistory({
+        summaries: [fixture.summary],
+        requirements,
+        freshness: "fresh",
+      }),
+    ).resolves.toMatchObject({
+      state: "reusable_local",
+      locator: { id: locator.id },
+    });
+    const revealed = await service.revealLocator(
+      locator.id,
+      fixture.summary,
+      "fresh",
+    );
+    const opened = await service.openLocator(
+      locator.id,
+      fixture.summary,
+      "fresh",
+    );
+    expect(launched[0]).toMatch(
+      new RegExp(`reveal:.*${fixture.summary.packageIdentity}$`, "u"),
+    );
+    expect(launched[1]).toMatch(
+      new RegExp(
+        `open:.*${fixture.summary.packageIdentity}/${fixture.summary.packageIdentity}\\.mp4$`,
+        "u",
+      ),
+    );
+    expect(JSON.stringify({ revealed, opened })).not.toMatch(
+      /artifact-actions-|relativePackagePath|manifest\.json|\.mp4/u,
+    );
+
+    const relocated = join(secondRoot, fixture.summary.packageIdentity);
+    await rename(fixture.packagePath, relocated);
+    await expect(
+      service.resolveArtifactHistory({
+        summaries: [fixture.summary],
+        requirements,
+        freshness: "fresh",
+      }),
+    ).resolves.toMatchObject({ state: "missing" });
+    const relinked = await service.relinkLocator(
+      locator.id,
+      second.id,
+      fixture.summary,
+    );
+    expect(relinked).toMatchObject({
+      id: expect.not.stringMatching(locator.id),
+      availability: "verified",
+    });
+    expect(repository.getLocatorById(locator.id)).toMatchObject({
+      availability: "missing",
+    });
+
+    await writeFile(
+      join(relocated, fixture.summary.packageIdentity + ".mp4"),
+      "x",
+    );
+    await expect(
+      service.resolveArtifactHistory({
+        summaries: [fixture.summary],
+        requirements,
+        freshness: "fresh",
+      }),
+    ).resolves.toMatchObject({ state: "invalid" });
+    await expect(
+      service.resolveArtifactHistory({
+        summaries: [fixture.summary],
+        requirements: {
+          ...requirements,
+          settings: {
+            mode: "exact_fingerprint",
+            resolutionFingerprint: "f".repeat(64),
+          },
+        },
+        freshness: "fresh",
+      }),
+    ).resolves.toMatchObject({ state: "incompatible" });
+    await expect(
+      service.resolveArtifactHistory({
+        summaries: [],
+        requirements,
+        freshness: "fresh",
+      }),
+    ).resolves.toEqual({ state: "needs_export", freshness: "fresh" });
+    database.close();
+  });
+
   it("verifies, persists, restarts, and invalidates one exact M5 package", async () => {
     const root = await mkdtemp(join(tmpdir(), "artifact-locator-"));
     temporaryRoots.add(root);
@@ -445,6 +704,39 @@ describe("local artifact locator verification", () => {
     expect(() => validateConfiguredRootPath("relative", "posix")).toThrow();
   });
 });
+
+function compatibilityRequirements(
+  summary: ArtifactVersionSummary,
+): ArtifactCompatibilityRequirements {
+  const { text: _text, ...selection } = summary.selection;
+  return {
+    clipId: summary.clipId,
+    selection,
+    resolvedBounds: {
+      startMs: summary.resolvedExportBounds.startMs,
+      endMs: summary.resolvedExportBounds.endMs,
+    },
+    sourceLanguageClass: summary.sourceLanguageClass,
+    ...(summary.subtitleTracks
+      ? { subtitleTracks: summary.subtitleTracks }
+      : {}),
+    subtitlePolicy: summary.subtitleOmissionProvenance
+      ? {
+          requiredSidecars: [],
+          omittedReason: summary.subtitleOmissionProvenance.policy,
+        }
+      : summary.sourceLanguageClass === "confirmed_english"
+        ? { requiredSidecars: ["english"] }
+        : { requiredSidecars: ["original", "english"] },
+    requiredArtifactRoles: summary.artifacts.map((artifact) => artifact.role),
+    acceptedManifestSchemas: [2],
+    settings: {
+      mode: "exact_fingerprint",
+      resolutionFingerprint:
+        summary.resolvedSettingsSnapshot.resolutionFingerprint!,
+    },
+  };
+}
 
 async function writeVerifiedPackage(
   root: string,

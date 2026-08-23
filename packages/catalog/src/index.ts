@@ -91,6 +91,7 @@ import {
   type ClaimLoggedExportDeliveryRequest,
   type ClaimLoggedExportDeliveryResponse,
   type CreateClipExportRequest,
+  type ReexportArtifactVersionRequest,
   type CreateTranscriptionBatchResponse,
   type CreateLoggedExportBatchRequest,
   type DerivedTranslation,
@@ -2987,9 +2988,49 @@ export class SharedProjectCatalog {
     clipId: string,
     input: CreateClipExportRequest,
   ): Promise<ExportRequest> {
+    return this.createClipExportInternal(actor, projectId, clipId, input);
+  }
+
+  async reexportArtifactVersion(
+    actor: AuthenticatedActor,
+    projectId: string,
+    clipId: string,
+    artifactVersionId: string,
+    input: ReexportArtifactVersionRequest,
+  ): Promise<ExportRequest> {
+    await this.authorize(actor, projectId, "write");
+    const source = await this.getArtifactVersion(
+      actor,
+      projectId,
+      clipId,
+      artifactVersionId,
+    );
+    if (
+      input.sourceLanguageClass !== source.sourceLanguageClass ||
+      sha256Fingerprint(input.subtitleTracks ?? null) !==
+        sha256Fingerprint(source.subtitleTracks ?? null)
+    ) {
+      throw new CatalogConflictError(
+        "An explicit re-export must preserve the source version's language and subtitle evidence.",
+      );
+    }
+    return this.createClipExportInternal(actor, projectId, clipId, input, {
+      artifactVersionId,
+    });
+  }
+
+  private async createClipExportInternal(
+    actor: AuthenticatedActor,
+    projectId: string,
+    clipId: string,
+    input: CreateClipExportRequest,
+    reexport?: { artifactVersionId: string },
+  ): Promise<ExportRequest> {
     await this.authorize(actor, projectId, "write");
     const clip = await this.getClipCandidate(actor, projectId, clipId);
-    const idempotencyKey = `clip-export:${clipId}:${input.idempotencyKey}`;
+    const idempotencyKey = reexport
+      ? `clip-reexport:${clipId}:${reexport.artifactVersionId}:${input.idempotencyKey}`
+      : `clip-export:${clipId}:${input.idempotencyKey}`;
     const adoptCompatibleReplay = (row: DbRow) => {
       const persisted = mapLoggedExportRequest(row);
       const persistedFingerprint =
@@ -3043,6 +3084,7 @@ export class SharedProjectCatalog {
         return;
       }
       if (
+        !reexport &&
         input.requestOrigin === "clip_library" &&
         lockedClip.rows[0].export_status !== "not_requested"
       ) {
@@ -3050,13 +3092,15 @@ export class SharedProjectCatalog {
           "A new Clip Library export requires a not-requested clip; recover the existing request instead.",
         );
       }
-      const batchMembership = await this.database.query(
-        `SELECT 1 FROM export_requests
+      const batchMembership = reexport
+        ? { rows: [] }
+        : await this.database.query(
+            `SELECT 1 FROM export_requests
          WHERE project_id = $1 AND clip_id = $2
            AND batch_item_id IS NOT NULL
          LIMIT 1`,
-        [projectId, clipId],
-      );
+            [projectId, clipId],
+          );
       if (batchMembership.rows[0]) {
         throw new CatalogConflictError(
           "A batch clip cannot receive a second independent export request.",
@@ -3108,6 +3152,9 @@ export class SharedProjectCatalog {
           : {}),
         preset,
         resolvedSettingsSnapshot: preview.snapshot,
+        ...(reexport
+          ? { reexportOfArtifactVersionId: reexport.artifactVersionId }
+          : {}),
       };
       await this.database.query(
         `INSERT INTO jobs
@@ -3160,7 +3207,14 @@ export class SharedProjectCatalog {
           projectId,
           clipId,
           queued.rows[0].version,
-          JSON.stringify({ clipId, exportRequestId: requestId, jobId }),
+          JSON.stringify({
+            clipId,
+            exportRequestId: requestId,
+            jobId,
+            ...(reexport
+              ? { reexportOfArtifactVersionId: reexport.artifactVersionId }
+              : {}),
+          }),
           now,
         ],
       );

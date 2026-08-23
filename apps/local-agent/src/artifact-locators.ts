@@ -15,6 +15,10 @@ import {
   ExportClipMetadataSchema,
   LoggedExportSuccessResultSchema,
   type ArtifactLocatorSummary,
+  type ArtifactCompatibilityRequirements,
+  type ArtifactLocatorActionResult,
+  type ArtifactResolutionFreshness,
+  type ArtifactResolutionResult,
   type ArtifactRootSummary,
   type ArtifactStoragePlatform,
   type ArtifactVerificationFailureClass,
@@ -29,14 +33,59 @@ import {
 } from "@research-video/export-settings";
 import {
   LocalArtifactLocatorRepository,
+  type LocalArtifactLocatorRecord,
   type LocalArtifactRootRecord,
 } from "@research-video/db-local";
 
 const MaxPackageJsonBytes = 2 * 1024 * 1024;
 const PackageIdentityPattern = /^clip-[a-f0-9-]{36}$/u;
 
+export interface LocalArtifactLauncher {
+  revealPackage(packagePath: string): Promise<void>;
+  openMedia(mediaPath: string): Promise<void>;
+}
+
+type VerifiedArtifactPaths = {
+  platform: ArtifactStoragePlatform;
+  manifestSchemaVersion: 1 | 2;
+  packagePath: string;
+  mediaPath: string;
+};
+
+export async function resolveArtifactActionEvidence(input: {
+  fetchCloud(): Promise<ArtifactVersionSummary>;
+  findCached(): ArtifactVersionSummary | undefined;
+  onAuthorizationDenied(statusCode: 401 | 403): void;
+}): Promise<{
+  summary: ArtifactVersionSummary;
+  freshness: ArtifactResolutionFreshness;
+}> {
+  try {
+    return {
+      summary: ArtifactVersionSummarySchema.parse(await input.fetchCloud()),
+      freshness: "fresh",
+    };
+  } catch (error) {
+    const statusCode = (error as { statusCode?: number }).statusCode;
+    if (statusCode === 401 || statusCode === 403) {
+      input.onAuthorizationDenied(statusCode);
+      throw new LocalArtifactActionError("not_found", 404);
+    }
+    if (statusCode === undefined || statusCode < 500) throw error;
+    const cached = input.findCached();
+    if (!cached) throw error;
+    return {
+      summary: ArtifactVersionSummarySchema.parse(cached),
+      freshness: "stale",
+    };
+  }
+}
+
 export class LocalArtifactLocatorService {
-  constructor(private readonly repository: LocalArtifactLocatorRepository) {}
+  constructor(
+    private readonly repository: LocalArtifactLocatorRepository,
+    private readonly launcher?: LocalArtifactLauncher,
+  ) {}
 
   async configureRoot(
     input: ConfigureLocalArtifactRootRequest,
@@ -65,6 +114,155 @@ export class LocalArtifactLocatorService {
 
   listLocators(artifactVersionId?: string): ArtifactLocatorSummary[] {
     return this.repository.listLocators(artifactVersionId);
+  }
+
+  getLocatorCloudIdentity(locatorId: string): {
+    projectId: string;
+    clipId: string;
+    artifactVersionId: string;
+  } {
+    const locator = this.requireLocator(locatorId);
+    return {
+      projectId: locator.projectId,
+      clipId: locator.clipId,
+      artifactVersionId: locator.artifactVersionId,
+    };
+  }
+
+  async resolveArtifactVersion(input: {
+    summary?: ArtifactVersionSummary;
+    requirements: ArtifactCompatibilityRequirements;
+    freshness: ArtifactResolutionFreshness;
+  }): Promise<ArtifactResolutionResult> {
+    if (!input.summary) {
+      return { state: "needs_export", freshness: input.freshness };
+    }
+    const summary = ArtifactVersionSummarySchema.parse(input.summary);
+    if (!artifactVersionMatchesRequirements(summary, input.requirements)) {
+      return {
+        state: "incompatible",
+        artifactVersionId: summary.artifactVersionId,
+        freshness: input.freshness,
+      };
+    }
+    const locators = this.repository.listLocators(summary.artifactVersionId);
+    if (locators.length === 0) {
+      return {
+        state: "missing",
+        artifactVersionId: summary.artifactVersionId,
+        locators: [],
+        freshness: input.freshness,
+      };
+    }
+    for (const locator of locators) {
+      try {
+        const verified = await this.verifyLocator(locator.id, summary);
+        if (verified.availability !== "verified") continue;
+        if (
+          !verified.manifestSchemaVersion ||
+          !input.requirements.acceptedManifestSchemas.includes(
+            verified.manifestSchemaVersion,
+          )
+        ) {
+          return {
+            state: "incompatible",
+            artifactVersionId: summary.artifactVersionId,
+            freshness: input.freshness,
+          };
+        }
+        return {
+          state: "reusable_local",
+          artifactVersionId: summary.artifactVersionId,
+          locator: verified,
+          freshness: input.freshness,
+        };
+      } catch {
+        // Resolution checks every configured copy before choosing the result.
+      }
+    }
+    const checked = this.repository.listLocators(summary.artifactVersionId);
+    return checked.some((locator) => locator.availability === "invalid")
+      ? {
+          state: "invalid",
+          artifactVersionId: summary.artifactVersionId,
+          locators: checked,
+          freshness: input.freshness,
+        }
+      : {
+          state: "missing",
+          artifactVersionId: summary.artifactVersionId,
+          locators: checked,
+          freshness: input.freshness,
+        };
+  }
+
+  async resolveArtifactHistory(input: {
+    summaries: ArtifactVersionSummary[];
+    requirements: ArtifactCompatibilityRequirements;
+    freshness: ArtifactResolutionFreshness;
+  }): Promise<ArtifactResolutionResult> {
+    if (input.summaries.length === 0) {
+      return { state: "needs_export", freshness: input.freshness };
+    }
+    const compatible = input.summaries.filter((summary) =>
+      artifactVersionMatchesRequirements(summary, input.requirements),
+    );
+    if (compatible.length === 0) {
+      return {
+        state: "incompatible",
+        artifactVersionId: input.summaries[0]?.artifactVersionId,
+        freshness: input.freshness,
+      };
+    }
+    const unavailable: ArtifactResolutionResult[] = [];
+    for (const summary of compatible) {
+      const resolution = await this.resolveArtifactVersion({
+        summary,
+        requirements: input.requirements,
+        freshness: input.freshness,
+      });
+      if (resolution.state === "reusable_local") return resolution;
+      unavailable.push(resolution);
+    }
+    return (
+      unavailable.find((result) => result.state === "invalid") ??
+      unavailable[0]!
+    );
+  }
+
+  async verifyLocator(
+    locatorId: string,
+    input: ArtifactVersionSummary,
+  ): Promise<ArtifactLocatorSummary> {
+    const summary = ArtifactVersionSummarySchema.parse(input);
+    const locator = this.requireMatchingLocator(locatorId, summary);
+    return this.verifyArtifactVersion(locator.rootId, summary);
+  }
+
+  async relinkLocator(
+    locatorId: string,
+    targetRootId: string,
+    input: ArtifactVersionSummary,
+  ): Promise<ArtifactLocatorSummary> {
+    const summary = ArtifactVersionSummarySchema.parse(input);
+    this.requireMatchingLocator(locatorId, summary);
+    return this.verifyArtifactVersion(targetRootId, summary);
+  }
+
+  async revealLocator(
+    locatorId: string,
+    input: ArtifactVersionSummary,
+    freshness: ArtifactResolutionFreshness,
+  ): Promise<ArtifactLocatorActionResult> {
+    return this.launchLocator(locatorId, input, freshness, "reveal");
+  }
+
+  async openLocator(
+    locatorId: string,
+    input: ArtifactVersionSummary,
+    freshness: ArtifactResolutionFreshness,
+  ): Promise<ArtifactLocatorActionResult> {
+    return this.launchLocator(locatorId, input, freshness, "open");
   }
 
   async verifyArtifactVersion(
@@ -108,6 +306,82 @@ export class LocalArtifactLocatorService {
       manifestSchemaVersion: verified.manifestSchemaVersion,
       resultFingerprint: summary.resultFingerprint,
     });
+  }
+
+  private async launchLocator(
+    locatorId: string,
+    input: ArtifactVersionSummary,
+    freshness: ArtifactResolutionFreshness,
+    action: "reveal" | "open",
+  ): Promise<ArtifactLocatorActionResult> {
+    const summary = ArtifactVersionSummarySchema.parse(input);
+    const stored = this.requireMatchingLocator(locatorId, summary);
+    if (!this.launcher) throw new LocalArtifactActionError("unsupported");
+    let verified: VerifiedArtifactPaths;
+    try {
+      verified = await verifyPackage(this.requireRoot(stored.rootId), summary);
+    } catch (error) {
+      const failure = asVerificationError(error);
+      this.repository.recordUnavailable({
+        rootId: stored.rootId,
+        artifactVersionId: stored.artifactVersionId,
+        availability:
+          failure.failureClass === "package_missing" ||
+          failure.failureClass === "root_unavailable"
+            ? "missing"
+            : "invalid",
+        failureClass: failure.failureClass,
+      });
+      throw failure;
+    }
+    const locator = this.repository.recordVerified({
+      artifactVersionId: summary.artifactVersionId,
+      rootId: stored.rootId,
+      relativePackagePath: summary.packageIdentity,
+      platform: verified.platform,
+      projectId: summary.projectId,
+      clipId: summary.clipId,
+      requestId: summary.requestId,
+      packageIdentity: summary.packageIdentity,
+      manifestSha256: summary.manifest.contentSha256,
+      manifestSchemaVersion: verified.manifestSchemaVersion,
+      resultFingerprint: summary.resultFingerprint,
+    });
+    try {
+      if (action === "reveal") {
+        await this.launcher.revealPackage(verified.packagePath);
+      } else {
+        await this.launcher.openMedia(verified.mediaPath);
+      }
+    } catch {
+      throw new LocalArtifactActionError("launch_failed");
+    }
+    return { locator, freshness };
+  }
+
+  private requireLocator(locatorId: string): LocalArtifactLocatorRecord {
+    const locator = this.repository.getLocatorById(locatorId);
+    if (!locator) throw new LocalArtifactActionError("not_found", 404);
+    return locator;
+  }
+
+  private requireMatchingLocator(
+    locatorId: string,
+    summary: ArtifactVersionSummary,
+  ): LocalArtifactLocatorRecord {
+    const locator = this.requireLocator(locatorId);
+    if (
+      locator.artifactVersionId !== summary.artifactVersionId ||
+      locator.projectId !== summary.projectId ||
+      locator.clipId !== summary.clipId ||
+      locator.requestId !== summary.requestId ||
+      locator.packageIdentity !== summary.packageIdentity ||
+      locator.manifestSha256 !== summary.manifest.contentSha256 ||
+      locator.resultFingerprint !== summary.resultFingerprint
+    ) {
+      throw new LocalArtifactActionError("identity_mismatch", 409);
+    }
+    return locator;
   }
 
   private requireRoot(rootId: string): LocalArtifactRootRecord {
@@ -169,10 +443,7 @@ export function validateConfiguredRootPath(
 async function verifyPackage(
   root: LocalArtifactRootRecord,
   summary: ArtifactVersionSummary,
-): Promise<{
-  platform: ArtifactStoragePlatform;
-  manifestSchemaVersion: 1 | 2;
-}> {
+): Promise<VerifiedArtifactPaths> {
   requireHostPlatform(root.platform);
   const packageIdentity = validateArtifactPackageSegment(
     summary.packageIdentity,
@@ -309,6 +580,16 @@ async function verifyPackage(
   return {
     platform: root.platform,
     manifestSchemaVersion: manifest.schemaVersion,
+    packagePath,
+    mediaPath: resolve(
+      packagePath,
+      expectedFilename(
+        summary.artifacts.find((artifact) =>
+          artifact.role.startsWith("video_"),
+        )!.role,
+        summary.requestId,
+      ),
+    ),
   };
 }
 
@@ -594,6 +875,70 @@ function expectedFilename(role: string, requestId: string): string {
   return filename;
 }
 
+export function artifactVersionMatchesRequirements(
+  summary: ArtifactVersionSummary,
+  requirements: ArtifactCompatibilityRequirements,
+): boolean {
+  const selection = summary.selection;
+  const sanitizedSelection = {
+    trackId: selection.trackId,
+    transcriptVersion: selection.transcriptVersion,
+    firstSegmentId: selection.firstSegmentId,
+    lastSegmentId: selection.lastSegmentId,
+    ...(selection.firstTokenId ? { firstTokenId: selection.firstTokenId } : {}),
+    ...(selection.lastTokenId ? { lastTokenId: selection.lastTokenId } : {}),
+    transcriptStartMs: selection.transcriptStartMs,
+    transcriptEndMs: selection.transcriptEndMs,
+    exportStartMs: selection.exportStartMs,
+    exportEndMs: selection.exportEndMs,
+    timingPrecision: selection.timingPrecision,
+  };
+  const subtitlePolicy = summary.subtitleOmissionProvenance
+    ? {
+        requiredSidecars: [] as string[],
+        omittedReason: summary.subtitleOmissionProvenance.policy,
+      }
+    : summary.sourceLanguageClass === "confirmed_english"
+      ? { requiredSidecars: ["english"] }
+      : { requiredSidecars: ["original", "english"] };
+  if (
+    summary.clipId !== requirements.clipId ||
+    canonicalJson(sanitizedSelection) !==
+      canonicalJson(requirements.selection) ||
+    canonicalJson({
+      startMs: summary.resolvedExportBounds.startMs,
+      endMs: summary.resolvedExportBounds.endMs,
+    }) !== canonicalJson(requirements.resolvedBounds) ||
+    summary.sourceLanguageClass !== requirements.sourceLanguageClass ||
+    canonicalJson(summary.subtitleTracks) !==
+      canonicalJson(requirements.subtitleTracks) ||
+    canonicalJson(subtitlePolicy) !==
+      canonicalJson(requirements.subtitlePolicy) ||
+    (summary.manifest.schemaVersion !== "unknown" &&
+      !requirements.acceptedManifestSchemas.includes(
+        summary.manifest.schemaVersion,
+      )) ||
+    requirements.requiredArtifactRoles.some(
+      (role) => !summary.artifacts.some((artifact) => artifact.role === role),
+    )
+  ) {
+    return false;
+  }
+  if (requirements.settings.mode === "exact_fingerprint") {
+    return (
+      summary.resolvedSettingsSnapshot.resolutionFingerprint ===
+      requirements.settings.resolutionFingerprint
+    );
+  }
+  const renderer = rendererCapabilityForSettings(
+    summary.resolvedSettingsSnapshot.settings,
+  );
+  return Boolean(
+    renderer &&
+    requirements.settings.rendererCapabilityIds.includes(renderer.id),
+  );
+}
+
 async function inspectRoot(path: string) {
   const info = await lstat(path, { bigint: true });
   if (!info.isDirectory() || info.isSymbolicLink()) {
@@ -698,6 +1043,19 @@ export class LocalArtifactVerificationError extends Error {
   constructor(readonly failureClass: ArtifactVerificationFailureClass) {
     super("Local artifact verification failed.");
     this.code = `artifact_verification_${failureClass}`;
+  }
+}
+
+export class LocalArtifactActionError extends Error {
+  readonly code: string;
+
+  constructor(
+    actionClass:
+      "not_found" | "identity_mismatch" | "unsupported" | "launch_failed",
+    readonly statusCode = 422,
+  ) {
+    super("Local artifact action failed.");
+    this.code = `artifact_action_${actionClass}`;
   }
 }
 

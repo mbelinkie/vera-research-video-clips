@@ -239,6 +239,53 @@ describe("Clip Library export storage preflight", () => {
     );
   });
 
+  it("preflights an explicit completed-version re-export and keeps its identity in replay", async () => {
+    const projectId = randomUUID();
+    const candidate = clip(projectId, "source-a", 1);
+    candidate.exportStatus = "complete";
+    const artifactVersionId = randomUUID();
+    const createReexport = vi.fn(async ({ command }) =>
+      exportRequestFixture(candidate, command),
+    );
+    const service = serviceFixture([candidate], {
+      availableBytes: Number.MAX_SAFE_INTEGER,
+      createReexport,
+    });
+    const request = {
+      clipIds: [candidate.id],
+      reexportArtifactVersionId: artifactVersionId,
+      settingsSelection: {
+        base: "application_default" as const,
+        overrides: {},
+      },
+    };
+    const preflight = await service.prepare({
+      projectId,
+      authorization: "Bearer test",
+      request,
+    });
+    const submit = () =>
+      service.submit({
+        projectId,
+        authorization: "Bearer test",
+        request: {
+          ...request,
+          expectedPreflightFingerprint: preflight.preflightFingerprint,
+          confirmUnknownSourceSizes: true,
+        },
+      });
+    await expect(submit()).resolves.toMatchObject({ kind: "individual" });
+    await expect(submit()).resolves.toMatchObject({ kind: "individual" });
+    expect(createReexport).toHaveBeenCalledTimes(2);
+    expect(createReexport.mock.calls[0]![0]).toMatchObject({
+      artifactVersionId,
+      command: { requestOrigin: "clip_library" },
+    });
+    expect(createReexport.mock.calls[1]![0].command).toEqual(
+      createReexport.mock.calls[0]![0].command,
+    );
+  });
+
   it("rechecks remaining bytes after acquisition without double-counting the source", async () => {
     const projectId = randomUUID();
     const candidate = clip(projectId, "source-a", 1);
@@ -351,6 +398,13 @@ function serviceFixture(
       authorization: string;
       command: CreateLoggedExportBatchRequest;
     }) => Promise<LoggedExportBatch>;
+    createReexport?: (input: {
+      projectId: string;
+      clipId: string;
+      artifactVersionId: string;
+      authorization: string;
+      command: CreateClipExportRequest;
+    }) => Promise<ExportRequest>;
   },
 ) {
   return new ClipLibraryExportOperationService({
@@ -362,6 +416,9 @@ function serviceFixture(
       (async () => {
         throw new Error("createIndividual is not configured");
       }),
+    ...(options.createReexport
+      ? { createReexport: options.createReexport }
+      : {}),
     createBatch:
       options.createBatch ??
       (async () => {
@@ -441,6 +498,36 @@ function clip(
     exportStatus: "not_requested",
     createdBy: randomUUID(),
     version: 1,
+    createdAt: now,
+    updatedAt: now,
+  };
+}
+
+function exportRequestFixture(
+  candidate: ClipCandidate,
+  command: CreateClipExportRequest,
+): ExportRequest {
+  const snapshot = preview(command.sourceLanguageClass).snapshot;
+  return {
+    id: randomUUID(),
+    jobId: randomUUID(),
+    mode: "logged",
+    requestOrigin: "clip_library",
+    projectId: candidate.projectId,
+    clipId: candidate.id,
+    video: candidate.video,
+    selection: candidate.selection,
+    sourceLanguageClass: command.sourceLanguageClass,
+    ...(command.subtitleTracks
+      ? { subtitleTracks: command.subtitleTracks }
+      : {}),
+    preset: {
+      presetVersion: 1,
+      name: "Editing MP4",
+      settings: snapshot.settings,
+    },
+    resolvedSettingsSnapshot: snapshot,
+    state: "queued",
     createdAt: now,
     updatedAt: now,
   };

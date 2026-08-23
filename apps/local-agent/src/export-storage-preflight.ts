@@ -88,6 +88,13 @@ export class ClipLibraryExportOperationService {
         authorization: string;
         command: CreateClipExportRequest;
       }): Promise<ExportRequest>;
+      createReexport?(input: {
+        projectId: string;
+        clipId: string;
+        artifactVersionId: string;
+        authorization: string;
+        command: CreateClipExportRequest;
+      }): Promise<ExportRequest>;
       createBatch(input: {
         projectId: string;
         authorization: string;
@@ -120,6 +127,11 @@ export class ClipLibraryExportOperationService {
         request: {
           clipIds: request.clipIds,
           settingsSelection: request.settingsSelection,
+          ...(request.reexportArtifactVersionId
+            ? {
+                reexportArtifactVersionId: request.reexportArtifactVersionId,
+              }
+            : {}),
         },
       },
       false,
@@ -155,6 +167,25 @@ export class ClipLibraryExportOperationService {
     const idempotencyKey = `clip-library:${prepared.preflight.preflightFingerprint}`;
     if (prepared.items.length === 1) {
       const item = prepared.items[0]!;
+      if (request.reexportArtifactVersionId) {
+        if (!this.dependencies.createReexport) {
+          throw new ClipLibraryExportOperationError(
+            "Artifact re-export is unavailable.",
+            "artifact_reexport_unavailable",
+            503,
+          );
+        }
+        return ClipLibraryExportSubmissionSchema.parse({
+          kind: "individual",
+          request: await this.dependencies.createReexport({
+            projectId: input.projectId,
+            clipId: item.clip.id,
+            artifactVersionId: request.reexportArtifactVersionId,
+            authorization: input.authorization,
+            command: { ...item.command, idempotencyKey },
+          }),
+        });
+      }
       return ClipLibraryExportSubmissionSchema.parse({
         kind: "individual",
         request: await this.dependencies.createIndividual({
@@ -214,6 +245,7 @@ export class ClipLibraryExportOperationService {
     }
     if (
       requireEligible &&
+      !request.reexportArtifactVersionId &&
       clips.some((clip) => clip.exportStatus !== "not_requested")
     ) {
       throw new ClipLibraryExportOperationError(
@@ -346,6 +378,7 @@ export class ClipLibraryExportOperationService {
       })),
       sourceGroups: [...uniqueSources.keys()].toSorted(),
       settingsSelection: request.settingsSelection,
+      reexportArtifactVersionId: request.reexportArtifactVersionId ?? null,
     });
     return {
       items,

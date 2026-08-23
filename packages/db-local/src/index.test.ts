@@ -483,6 +483,8 @@ describe("local migrations", () => {
         page,
       }),
     ).toEqual({ query, page, cachedAt: now });
+    expect(cache.hasAuthorizationScope(firstScope)).toBe(true);
+    expect(cache.hasAuthorizationScope(secondScope)).toBe(false);
     expect(
       cache.getPage({
         projectId,

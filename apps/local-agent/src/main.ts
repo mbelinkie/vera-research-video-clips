@@ -8,6 +8,7 @@ import {
   LoggedExportBatchSchema,
   ClipCandidateSchema,
   ArtifactVersionSummarySchema,
+  ArtifactVersionHistoryResponseSchema,
   ClipLibraryPageSchema,
   ClipLibraryQuerySchema,
   ClaimLoggedExportDeliveryResponseSchema,
@@ -52,7 +53,12 @@ import {
 import { withInstalledExportWorkerAvailability } from "@research-video/export-settings";
 
 import { createLocalAgent } from "./app.ts";
-import { LocalArtifactLocatorService } from "./artifact-locators.ts";
+import {
+  LocalArtifactActionError,
+  LocalArtifactLocatorService,
+  resolveArtifactActionEvidence,
+} from "./artifact-locators.ts";
+import { PlatformArtifactLauncher } from "./artifact-launcher.ts";
 import { LocalClipLibraryService } from "./clip-library.ts";
 import {
   ClipLibraryExportOperationService,
@@ -76,6 +82,7 @@ const exportQueue = new LocalExportQueue(database);
 const artifactLocatorRepository = new LocalArtifactLocatorRepository(database);
 const artifactLocators = new LocalArtifactLocatorService(
   artifactLocatorRepository,
+  new PlatformArtifactLauncher(),
 );
 const clipLibrary = new LocalClipLibraryService(
   new LocalClipLibraryCacheRepository(database),
@@ -143,6 +150,20 @@ const clipLibraryExports = new ClipLibraryExportOperationService({
     ),
   createIndividual: ({ projectId, clipId, authorization, command }) =>
     callCloudClipExport(projectId, clipId, command, authorization),
+  createReexport: ({
+    projectId,
+    clipId,
+    artifactVersionId,
+    authorization,
+    command,
+  }) =>
+    callCloudArtifactReexport(
+      projectId,
+      clipId,
+      artifactVersionId,
+      command,
+      authorization,
+    ),
   createBatch: ({ projectId, authorization, command }) =>
     callCloudExportBatch(projectId, command, authorization),
   capacity: exportStorageCapacity,
@@ -202,6 +223,87 @@ const app = createLocalAgent({
     ),
   verifyArtifactVersion: ({ rootId, artifactVersion }) =>
     artifactLocators.verifyArtifactVersion(rootId, artifactVersion),
+  resolveArtifact: async ({
+    projectId,
+    clipId,
+    authorization,
+    requirements,
+  }) => {
+    try {
+      return await artifactLocators.resolveArtifactHistory({
+        summaries: await callCloudArtifactHistory(
+          projectId,
+          clipId,
+          authorization,
+        ),
+        requirements,
+        freshness: "fresh",
+      });
+    } catch (error) {
+      clipLibrary.purgeRevokedAuthorization({
+        projectId,
+        authorization,
+        statusCode: (error as { statusCode?: number }).statusCode,
+      });
+      throw error;
+    }
+  },
+  actOnArtifactLocator: async ({ locatorId, authorization, action }) => {
+    const identity = artifactLocators.getLocatorCloudIdentity(locatorId);
+    const { summary, freshness } = await resolveArtifactActionEvidence({
+      fetchCloud: () =>
+        callCloudArtifactVersion(
+          identity.projectId,
+          identity.clipId,
+          identity.artifactVersionId,
+          authorization,
+        ),
+      findCached: () =>
+        clipLibrary.findCachedArtifactVersion({ ...identity, authorization }),
+      onAuthorizationDenied: (statusCode) =>
+        clipLibrary.purgeRevokedAuthorization({
+          projectId: identity.projectId,
+          authorization,
+          statusCode,
+        }),
+    });
+    if (action === "verify") {
+      return {
+        locator: await artifactLocators.verifyLocator(locatorId, summary),
+        freshness,
+      };
+    }
+    return action === "reveal"
+      ? artifactLocators.revealLocator(locatorId, summary, freshness)
+      : artifactLocators.openLocator(locatorId, summary, freshness);
+  },
+  relinkArtifactLocator: async ({ locatorId, targetRootId, authorization }) => {
+    const identity = artifactLocators.getLocatorCloudIdentity(locatorId);
+    try {
+      const summary = await callCloudArtifactVersion(
+        identity.projectId,
+        identity.clipId,
+        identity.artifactVersionId,
+        authorization,
+      );
+      return artifactLocators.relinkLocator(locatorId, targetRootId, summary);
+    } catch (error) {
+      clipLibrary.purgeRevokedAuthorization({
+        projectId: identity.projectId,
+        authorization,
+        statusCode: (error as { statusCode?: number }).statusCode,
+      });
+      const statusCode = (error as { statusCode?: number }).statusCode;
+      if (statusCode === 401 || statusCode === 403) {
+        throw new LocalArtifactActionError("not_found", 404);
+      }
+      throw error;
+    }
+  },
+  listArtifactRoots: ({ authorization }) =>
+    clipLibrary.hasCachedAuthorization(authorization)
+      ? artifactLocators.listRoots()
+      : [],
   capabilityProvider,
   workerIdentity,
   registerExportWorker: async ({ request, authorization }) =>
@@ -379,7 +481,12 @@ async function callCloudArtifactVersion(
   const response = await fetch(
     `${cloudApiUrl}/api/projects/${projectId}/clips/${clipId}/artifact-versions/${artifactVersionId}`,
     { headers: { authorization } },
-  );
+  ).catch(() => {
+    throw Object.assign(new Error("Cloud artifact lookup is unreachable."), {
+      statusCode: 503,
+      code: "cloud_unreachable",
+    });
+  });
   const payload = await response.json().catch(() => undefined);
   if (!response.ok) {
     const remote = payload as
@@ -396,6 +503,35 @@ async function callCloudArtifactVersion(
     );
   }
   return ArtifactVersionSummarySchema.parse(payload);
+}
+
+async function callCloudArtifactHistory(
+  projectId: string,
+  clipId: string,
+  authorization: string,
+) {
+  const response = await fetch(
+    `${cloudApiUrl}/api/projects/${projectId}/clips/${clipId}/artifact-versions?limit=100`,
+    { headers: { authorization } },
+  ).catch(() => {
+    throw Object.assign(new Error("Cloud artifact history is unreachable."), {
+      statusCode: 503,
+      code: "cloud_unreachable",
+    });
+  });
+  const payload = await response.json().catch(() => undefined);
+  if (!response.ok) {
+    const remote = payload as
+      { error?: { code?: string; message?: string } } | undefined;
+    throw Object.assign(
+      new Error(remote?.error?.message ?? "Cloud artifact history failed."),
+      {
+        statusCode: response.status,
+        code: remote?.error?.code ?? "artifact_history_unavailable",
+      },
+    );
+  }
+  return ArtifactVersionHistoryResponseSchema.parse(payload).versions;
 }
 
 async function callCloudClipLibrary(
@@ -482,6 +618,23 @@ async function callCloudClipExport(
     await callCloudProjectExport(
       "POST",
       `/api/projects/${projectId}/clips/${clipId}/exports`,
+      command,
+      authorization,
+    ),
+  );
+}
+
+async function callCloudArtifactReexport(
+  projectId: string,
+  clipId: string,
+  artifactVersionId: string,
+  command: CreateClipExportRequest,
+  authorization: string,
+) {
+  return ExportRequestSchema.parse(
+    await callCloudProjectExport(
+      "POST",
+      `/api/projects/${projectId}/clips/${clipId}/artifact-versions/${artifactVersionId}/reexport`,
       command,
       authorization,
     ),

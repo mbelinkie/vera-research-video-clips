@@ -30,6 +30,7 @@ import {
   type ArtifactRootSummary,
   type ArtifactStoragePlatform,
   type ArtifactVerificationFailureClass,
+  type ArtifactVersionSummary,
   type ClipLibraryPage,
   type ClipLibraryQuery,
   type DerivedTranslationIdentity,
@@ -3477,6 +3478,15 @@ export type LocalArtifactRootRecord = ArtifactRootSummary & {
   filesystemIdentity: string;
 };
 
+export type LocalArtifactLocatorRecord = ArtifactLocatorSummary & {
+  relativePackagePath: string;
+  projectId: string;
+  clipId: string;
+  requestId: string;
+  packageIdentity: string;
+  resultFingerprint: string;
+};
+
 export class LocalArtifactLocatorRepository {
   constructor(
     private readonly database: DatabaseSync,
@@ -3573,6 +3583,13 @@ export class LocalArtifactLocatorRepository {
       )
       .get(rootId, artifactVersionId) as Record<string, unknown> | undefined;
     return row ? mapArtifactLocator(row) : undefined;
+  }
+
+  getLocatorById(locatorId: string): LocalArtifactLocatorRecord | undefined {
+    const row = this.database
+      .prepare("SELECT * FROM export_artifact_locators WHERE id = ?")
+      .get(locatorId) as Record<string, unknown> | undefined;
+    return row ? mapArtifactLocatorRecord(row) : undefined;
   }
 
   listLocators(artifactVersionId?: string): ArtifactLocatorSummary[] {
@@ -3768,6 +3785,17 @@ export class LocalClipLibraryCacheRepository {
     return { query: keys.query, page, cachedAt };
   }
 
+  hasAuthorizationScope(authorizationScopeSha256: string): boolean {
+    return Boolean(
+      this.database
+        .prepare(
+          `SELECT 1 FROM clip_library_cache_pages
+           WHERE authorization_scope_sha256 = ? LIMIT 1`,
+        )
+        .get(authorizationScopeSha256),
+    );
+  }
+
   getPage(input: {
     projectId: string;
     authorizationScopeSha256: string;
@@ -3836,6 +3864,34 @@ export class LocalClipLibraryCacheRepository {
           cachedAt: row.cached_at,
         }
       : undefined;
+  }
+
+  findArtifactVersion(input: {
+    projectId: string;
+    authorizationScopeSha256: string;
+    clipId: string;
+    artifactVersionId: string;
+  }): ArtifactVersionSummary | undefined {
+    const rows = this.database
+      .prepare(
+        `SELECT response_json FROM clip_library_cache_pages
+         WHERE project_id = ? AND authorization_scope_sha256 = ?
+         ORDER BY last_viewed_sequence DESC`,
+      )
+      .all(input.projectId, input.authorizationScopeSha256) as Array<{
+      response_json: string;
+    }>;
+    for (const row of rows) {
+      const page = ClipLibraryPageSchema.parse(JSON.parse(row.response_json));
+      const entry = page.entries.find(
+        (candidate) => candidate.clip.id === input.clipId,
+      );
+      const version = entry?.recentArtifactVersions.find(
+        (candidate) => candidate.artifactVersionId === input.artifactVersionId,
+      );
+      if (version) return version;
+    }
+    return undefined;
   }
 
   replaceSelection(input: {
@@ -4056,6 +4112,20 @@ function mapArtifactLocator(
     lastVerifiedAt: row.last_verified_at,
     ...(row.failure_class ? { failureClass: row.failure_class } : {}),
   });
+}
+
+function mapArtifactLocatorRecord(
+  row: Record<string, unknown>,
+): LocalArtifactLocatorRecord {
+  return {
+    ...mapArtifactLocator(row),
+    relativePackagePath: String(row.relative_package_path),
+    projectId: String(row.project_id),
+    clipId: String(row.clip_id),
+    requestId: String(row.request_id),
+    packageIdentity: String(row.package_identity),
+    resultFingerprint: String(row.result_fingerprint),
+  };
 }
 
 function mapLocalLoggedExportSourceGroup(

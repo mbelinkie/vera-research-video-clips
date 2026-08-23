@@ -6,6 +6,10 @@ import {
   ArtifactVersionHistoryResponseSchema,
   ArtifactVersionSummarySchema,
   ArtifactLocatorSummarySchema,
+  ArtifactCompatibilityRequirementsSchema,
+  ArtifactLocatorActionRequestSchema,
+  ArtifactResolutionResultSchema,
+  RelinkArtifactLocatorRequestSchema,
   ArtifactRootSummarySchema,
   ConfigureLocalArtifactRootRequestSchema,
   CancelLoggedExportRequestSchema,
@@ -47,6 +51,7 @@ import {
   ReconcileLoggedExportCanceledRequestSchema,
   ReconcileLoggedExportFailureRequestSchema,
   ReconcileLoggedExportSuccessRequestSchema,
+  ReexportArtifactVersionRequestSchema,
   RetryLoggedExportRequestSchema,
   RetryLoggedExportResponseSchema,
   StartLoggedExportExecutionResponseSchema,
@@ -493,6 +498,110 @@ describe("shared contracts", () => {
       ArtifactLocatorSummarySchema.safeParse({
         ...locator,
         relativePackagePath: `clip-${artifactVersionId}`,
+      }).success,
+    ).toBe(false);
+  });
+
+  it("keeps artifact resolution strict, exhaustive, and locator-ID-only", () => {
+    const locator = ArtifactLocatorSummarySchema.parse({
+      id: "019fbb95-cd76-7920-93fa-e23ba755ee63",
+      artifactVersionId: "019fbb95-cd76-7920-93fa-e23ba755ee62",
+      rootId: "019fbb95-cd76-7920-93fa-e23ba755ee61",
+      platform: "posix",
+      availability: "verified",
+      manifestSha256: "a".repeat(64),
+      manifestSchemaVersion: 2,
+      checkedAt: now,
+      lastVerifiedAt: now,
+    });
+    const shared = { freshness: "fresh" as const };
+    for (const result of [
+      {
+        state: "reusable_local",
+        artifactVersionId: locator.artifactVersionId,
+        locator,
+        ...shared,
+      },
+      {
+        state: "missing",
+        artifactVersionId: locator.artifactVersionId,
+        locators: [],
+        ...shared,
+      },
+      {
+        state: "invalid",
+        artifactVersionId: locator.artifactVersionId,
+        locators: [
+          {
+            ...locator,
+            availability: "invalid",
+            failureClass: "artifact_mismatch",
+          },
+        ],
+        ...shared,
+      },
+      {
+        state: "incompatible",
+        artifactVersionId: locator.artifactVersionId,
+        ...shared,
+      },
+      {
+        state: "remote_only",
+        artifactVersionId: locator.artifactVersionId,
+        ...shared,
+      },
+      { state: "needs_export", ...shared },
+    ]) {
+      expect(ArtifactResolutionResultSchema.safeParse(result).success).toBe(
+        true,
+      );
+      expect(
+        ArtifactResolutionResultSchema.safeParse({
+          ...result,
+          absolutePath: "/private/export",
+        }).success,
+      ).toBe(false);
+    }
+    expect(
+      ArtifactLocatorActionRequestSchema.parse({ locatorId: locator.id }),
+    ).toEqual({ locatorId: locator.id });
+    expect(
+      ArtifactLocatorActionRequestSchema.safeParse({
+        locatorId: locator.id,
+        path: "/private/export",
+      }).success,
+    ).toBe(false);
+    expect(
+      RelinkArtifactLocatorRequestSchema.parse({
+        locatorId: locator.id,
+        targetRootId: locator.rootId,
+      }),
+    ).toBeTruthy();
+    expect(
+      ArtifactCompatibilityRequirementsSchema.safeParse({
+        clipId: id,
+        selection: { text: "must not cross the boundary" },
+      }).success,
+    ).toBe(false);
+  });
+
+  it("fixes explicit artifact re-export provenance to the Clip Library", () => {
+    const command = {
+      idempotencyKey: "reexport-v1",
+      sourceLanguageClass: "confirmed_english" as const,
+      settingsSelection: {
+        base: "application_default" as const,
+        overrides: {},
+      },
+      expectedResolutionFingerprint: "a".repeat(64),
+    };
+    expect(ReexportArtifactVersionRequestSchema.parse(command)).toMatchObject({
+      requestOrigin: "clip_library",
+    });
+    expect(
+      ReexportArtifactVersionRequestSchema.safeParse({
+        ...command,
+        requestOrigin: "authoring_build",
       }).success,
     ).toBe(false);
   });

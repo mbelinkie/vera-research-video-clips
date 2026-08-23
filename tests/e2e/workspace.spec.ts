@@ -283,7 +283,14 @@ test("maps transcript text selection to stable source and export bounds", async 
   let loggedExportPostCount = 0;
   let exportOnlyPostCount = 0;
   let batchExportPostCount = 0;
+  let artifactResolutionPostCount = 0;
+  let artifactOpenPostCount = 0;
+  const artifactActions: string[] = [];
   let batchFixtureEnabled = false;
+  const artifactVersionId = "019fbb95-cd76-7920-93fa-e23ba755eec1";
+  const artifactLocatorId = "019fbb95-cd76-7920-93fa-e23ba755eec2";
+  const artifactRootId = "019fbb95-cd76-7920-93fa-e23ba755eec3";
+  const recoveryRootId = "019fbb95-cd76-7920-93fa-e23ba755eec6";
   const clipLibrarySelected = new Set<string>();
   let loggedClip: Record<string, unknown> | undefined;
   let lastClipBody: Record<string, any> | undefined;
@@ -594,6 +601,63 @@ test("maps transcript text selection to stable source and export bounds", async 
     }
     return route.fulfill({ status: 404, json: { error: "not found" } });
   });
+  await page.route("**/local-agent/api/artifact-roots", async (route) => {
+    return route.fulfill({
+      json: {
+        roots: [
+          {
+            id: artifactRootId,
+            label: "Managed exports",
+            platform: "posix",
+            enabled: true,
+            createdAt: now,
+            updatedAt: now,
+          },
+          {
+            id: recoveryRootId,
+            label: "Recovery exports",
+            platform: "posix",
+            enabled: true,
+            createdAt: now,
+            updatedAt: now,
+          },
+        ],
+      },
+    });
+  });
+  await page.route(
+    "**/local-agent/api/projects/*/clips/*/artifact-resolution",
+    async (route) => {
+      artifactResolutionPostCount += 1;
+      return route.fulfill({
+        json: {
+          state: "reusable_local",
+          artifactVersionId,
+          locator: artifactLocatorFixture(
+            artifactLocatorId,
+            artifactVersionId,
+            artifactRootId,
+            now,
+          ),
+          freshness: "fresh",
+        },
+      });
+    },
+  );
+  await page.route("**/local-agent/api/artifact-locators/**", async (route) => {
+    const action = new URL(route.request().url()).pathname.split("/").at(-1);
+    artifactActions.push(String(action));
+    if (action === "open") artifactOpenPostCount += 1;
+    const locator = artifactLocatorFixture(
+      artifactLocatorId,
+      artifactVersionId,
+      artifactRootId,
+      now,
+    );
+    return route.fulfill({
+      json: action === "relink" ? locator : { locator, freshness: "fresh" },
+    });
+  });
   await page.route(
     "**/local-agent/api/projects/*/clip-library**",
     async (route) => {
@@ -680,12 +744,15 @@ test("maps transcript text selection to stable source and export bounds", async 
               ]
             : [loggedClip]
           : [];
-      const entries = pageClips.map((clip) => ({
+      const entries = pageClips.map((clip, index) => ({
         clip,
         currentLeaves: [],
         hasMoreLeaves: false,
-        completedVersionCount: 0,
-        recentArtifactVersions: [],
+        completedVersionCount: batchFixtureEnabled && index === 0 ? 1 : 0,
+        recentArtifactVersions:
+          batchFixtureEnabled && index === 0
+            ? [artifactVersionFixture(clip, artifactVersionId, now)]
+            : [],
       }));
       return route.fulfill({
         json: {
@@ -706,7 +773,22 @@ test("maps transcript text selection to stable source and export bounds", async 
           selectedClipIds: pageClips
             .map((clip) => String(clip.id))
             .filter((clipId) => clipLibrarySelected.has(clipId)),
-          localAvailability: [],
+          localAvailability:
+            batchFixtureEnabled && pageClips.length
+              ? [
+                  {
+                    artifactVersionId,
+                    locators: [
+                      artifactLocatorFixture(
+                        artifactLocatorId,
+                        artifactVersionId,
+                        artifactRootId,
+                        now,
+                      ),
+                    ],
+                  },
+                ]
+              : [],
         },
       });
     },
@@ -1044,6 +1126,22 @@ test("maps transcript text selection to stable source and export bounds", async 
   await expect(clipQueue).toContainText("Native (ro)");
   await expect(clipQueue).toContainText("English");
   await expect(clipQueue).toContainText("Preferred (es)");
+  await clipQueue.getByText("Recent immutable artifact history").click();
+  await clipQueue.getByRole("button", { name: "Resolve" }).click();
+  await expect(clipQueue).toContainText("workstation reusable local");
+  await clipQueue.getByRole("button", { name: "Verify" }).click();
+  await clipQueue.getByRole("button", { name: "Reveal" }).click();
+  await clipQueue.getByRole("button", { name: "Open clip" }).click();
+  await clipQueue
+    .getByRole("button", { name: "Relink to Recovery exports" })
+    .click();
+  expect(artifactResolutionPostCount).toBe(1);
+  expect(artifactOpenPostCount).toBe(1);
+  expect(artifactActions).toEqual(["verify", "reveal", "open", "relink"]);
+  await clipQueue.getByRole("button", { name: "Preflight re-export" }).click();
+  await expect(clipQueue).toContainText(
+    "Source sizes are unavailable until acquisition",
+  );
   await expect(clipQueue).toContainText(
     "La selección permanece vinculada por tiempo.",
   );
@@ -1214,3 +1312,150 @@ test("connects an explicit project, controls a batch, and updates review state",
   await page.getByRole("button", { name: "Pause pending" }).click();
   await expect(page.getByText(/paused · 1 ready/)).toBeVisible();
 });
+
+function artifactLocatorFixture(
+  id: string,
+  artifactVersionId: string,
+  rootId: string,
+  now: string,
+) {
+  return {
+    id,
+    artifactVersionId,
+    rootId,
+    platform: "posix",
+    availability: "verified",
+    manifestSha256: "2".repeat(64),
+    manifestSchemaVersion: 2,
+    checkedAt: now,
+    lastVerifiedAt: now,
+  };
+}
+
+function artifactVersionFixture(
+  clip: Record<string, any>,
+  artifactVersionId: string,
+  now: string,
+) {
+  const requestId = "019fbb95-cd76-7920-93fa-e23ba755eec4";
+  const packageIdentity = `clip-${requestId}`;
+  const settings = {
+    container: "mp4",
+    videoCodec: "h264",
+    videoRateControl: { mode: "crf", value: 20 },
+    maxWidth: 1920,
+    frameRate: "source",
+    audioCodec: "aac",
+    audioKilobitsPerSecond: 192,
+    omitSubtitleFilesForConfirmedEnglish: true,
+    embedEnglishSubtitleTrack: false,
+  };
+  const resolvedSettingsSnapshot = {
+    schemaVersion: 1,
+    resolutionKind: "catalog",
+    context: "logged",
+    base: "application_default",
+    applicationDefaultVersion: 1,
+    overrides: {},
+    overrideFields: [],
+    settings,
+    capability: {
+      ...CURRENT_EXPORT_WORKER_CAPABILITY,
+      validation: "validated",
+    },
+    resolutionFingerprint: "a".repeat(64),
+    resolvedAt: now,
+  };
+  const artifact = (role: string, hash: string) => ({
+    role,
+    packageIdentity,
+    byteSize: 128,
+    contentSha256: hash.repeat(64),
+    sourceAttempt: 1,
+    validatedAt: now,
+  });
+  const durationMs = clip.selection.exportEndMs - clip.selection.exportStartMs;
+  return {
+    artifactVersionId,
+    requestId,
+    jobId: "019fbb95-cd76-7920-93fa-e23ba755eec5",
+    projectId: clip.projectId,
+    clipId: clip.id,
+    requestOrigin: "clip_library",
+    packageIdentity,
+    video: clip.video,
+    selection: clip.selection,
+    sourceLanguageClass: "confirmed_english",
+    preset: { presetVersion: 1, name: "Editing MP4", settings },
+    resolvedSettingsSnapshot,
+    resolvedExportBounds: {
+      startMs: clip.selection.exportStartMs,
+      endMs: clip.selection.exportEndMs,
+      sourceAttempt: 1,
+      resolvedAt: now,
+    },
+    renderedMediaProvenance: {
+      durationMs,
+      containerFormat: "mp4",
+      videoCodec: "h264",
+      audioCodec: "aac",
+      ffprobeVersion: "8.1.2",
+      ffmpegVersion: "8.1.2",
+      verificationSchemaVersion: 1,
+      settingsSha256: "b".repeat(64),
+      observedProperties: {
+        schemaVersion: 1,
+        container: { formatNames: ["mp4"] },
+        streamCounts: {
+          total: 2,
+          video: 1,
+          audio: 1,
+          subtitle: 0,
+          data: 0,
+          other: 0,
+        },
+        video: {
+          codec: "h264",
+          profile: "High",
+          pixelFormat: "yuv420p",
+          width: 1920,
+          height: 1080,
+          sampleAspectRatio: { numerator: 1, denominator: 1 },
+          displayAspectRatio: { numerator: 16, denominator: 9 },
+          averageFrameRate: { numerator: 30, denominator: 1 },
+        },
+        audio: {
+          codec: "aac",
+          sampleRate: 48000,
+          channels: 2,
+          channelLayout: "stereo",
+        },
+        durationMs,
+        ffprobeVersion: "8.1.2",
+      },
+      sourceAttempt: 1,
+      validatedAt: now,
+    },
+    thumbnailProvenance: {
+      extractionTimeMs: Math.floor(durationMs / 2),
+      width: 640,
+      height: 360,
+      sourceAttempt: 1,
+      validatedAt: now,
+    },
+    subtitleOmissionProvenance: {
+      policy: "confirmed_english_user_setting",
+      sourceAttempt: 1,
+      validatedAt: now,
+    },
+    artifacts: [
+      artifact("clip_metadata_json", "1"),
+      artifact("manifest_json", "2"),
+      artifact("thumbnail_jpg", "3"),
+      artifact("video_mp4", "4"),
+    ],
+    manifest: { contentSha256: "2".repeat(64), schemaVersion: "unknown" },
+    resultFingerprint: "f".repeat(64),
+    completedAt: now,
+  };
+}
