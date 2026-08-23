@@ -1,6 +1,6 @@
 # M6-06 — Authoring-client handoff
 
-- Status: active
+- Status: complete
 - Task/thread: M6-06 only
 - Dependencies: M6-01 through M6-05 are complete
 
@@ -137,3 +137,32 @@ rehashes copied fixture bytes, and falls back to one export when bytes are
 missing. Then run typecheck, scoped formatting, the full network-free suite, web
 build, migration validators, Playwright where relevant, a clean detached
 `npm run check`, and `git diff --check` before independent Terra review.
+
+## Completion evidence
+
+- Added one shared exact compatibility predicate used by cloud candidate and
+  local byte-resolution decisions. The exact cloud candidate route is bounded
+  to a chosen immutable version, membership-authorized, and path-free; legacy
+  unknown manifest schema remains only a candidate until local byte verification.
+- Added a strict local-only descriptor command bound to project, clip, artifact
+  version, locator, request, package, manifest, and result identity. It requires
+  a fresh exact cloud read and never uses M6-05's stale offline action evidence.
+- The M6-02 verifier runs immediately before descriptor construction. Descriptor
+  paths are canonical, absolute, internally derived, package-contained, and
+  response-parsed at the HTTP boundary; path traversal and faulty dependency
+  output fail closed.
+- Reused the M6-04 storage preflight and M5 individual/batch/re-export pipeline
+  for `authoring_build`. Origin remains outside material fingerprints and exact
+  cross-origin replay adopts the first request and preserves its stored origin.
+- A simulated same-workstation authoring client searched cloud clips/history,
+  selected a compatibility candidate, received a verified descriptor, copied
+  and independently rehashed every role without mutating canonical bytes, then
+  submitted one missing clip through the authoring storage gate.
+- No migration was added. The full network-free suite passed with 312 tests and
+  2 skips; the focused implementation matrix passed with 115 tests and one
+  Windows-only skip; typecheck, web build, both migration validators, Playwright
+  (4 tests), scoped formatting, and `git diff --check` passed.
+- Independent Terra review found no remaining P0/P1 blocker after its descriptor
+  containment finding was fixed and regression-tested. The pre-existing M6-02
+  real-Windows junction/reparse physical-containment proof remains a release
+  gate and was not claimed from macOS.
