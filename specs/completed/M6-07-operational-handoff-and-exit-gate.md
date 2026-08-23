@@ -1,6 +1,6 @@
 # M6-07 — Operational handoff and exit gate
 
-- Status: complete
+- Status: complete; Milestone 6 closed 2026-08-23
 - Task/thread: M6-07 only
 - Dependencies: M6-01 through M6-06 are complete
 
@@ -86,12 +86,68 @@ fail-closed decision.
 5. Focused tests, the full network-free check, web build, migration validators,
    formatting, and `git diff --check` pass before independent Sol review.
 
-## Exit gates retained outside implementation
+## Exit gates completed after implementation
 
-Milestone 6 cannot be declared fully closed until the already-declared real
-Windows junction/reparse physical-containment proof is obtained and one new
-explicitly authorized real-source M6 smoke passes. M6-07 must report those gates
-honestly and must not initiate live access without user authorization.
+The implementation completed with two deliberately open external gates: a real
+Windows junction/reparse physical-containment proof and one new explicitly
+authorized real-source M6 smoke. Both were subsequently completed on 2026-08-23
+without starting Milestone 7.
+
+### Real-Windows physical containment
+
+- The user explicitly authorized a temporary `windows-latest` GitHub Actions
+  workflow. Addition commit `70fd49b` checked out exact revision
+  `70fd49b65741d9d13d3ec2976e184ec9abfb7ca1` and ran the committed physical
+  package-junction test rather than accepting a platform skip.
+- GitHub Actions run
+  [32648253167](https://github.com/mbelinkie/youtube-clip-converter/actions/runs/32648253167)
+  passed on Windows Server 2025 Datacenter, Windows version 2009/build 26100,
+  Node `v22.23.2`, and npm `10.9.8`.
+- Exact command:
+  `npm exec vitest -- run apps/local-agent/src/artifact-locators.test.ts --testNamePattern "rejects a physical Windows package junction" --reporter=verbose --no-color`.
+  The named test ran and passed in 744 ms; the file reported one passed test and
+  twelve unrelated skips. This proves a real Windows junction fails closed as
+  untrusted and persists no locator.
+- Cleanup commit `789fe9e` removed the temporary workflow and was pushed. No
+  workflow, deployment, main-branch mutation, or M7 implementation remains from
+  the gate.
+
+### Newly authorized real-source smoke
+
+- The user supplied a source-specific rights-cleared authorization and exact
+  17-second range. Caption discovery exposed a coherent Spanish-original
+  automatic track. YouTube rate-limited its generated-English alias, so the
+  external descriptor used eight exact source-video Spanish cue ranges plus an
+  eight-cue English derivative linked to the exact original track.
+- The strict external descriptor passed schema validation with matching eight-
+  segment original/English tracks and was stored outside the repository with
+  private permissions. The guarded command ran once with both authorization
+  flags and `EXPORT_SOURCE_PROVIDER=yt-dlp`.
+- Result: `passed`. FFprobe verified exactly 17,000 ms of H.264/AAC MP4 at
+  1920x1080. Original and English SRTs each contained eight clip-relative cues
+  bounded from 0 through 17,000 ms. `sourceScratchAbsent` and
+  `temporaryWorkspaceRemoved` were both true.
+- Six verified artifacts were produced before cleanup:
+  - `video_mp4`: 7,564,675 bytes,
+    SHA-256 `2b3099e7c9fedc764c29422e4efe0f3f58c272089f1a8837803d046827ad09e4`
+  - `original_srt`: 625 bytes,
+    SHA-256 `e36cae69b49d84e339c04b6afffa1ae739113211f90e813c220f0b0c2cb70190`
+  - `english_srt`: 706 bytes,
+    SHA-256 `cae8930140995fd94246451ae614071e411e83ee64ae57426fb26cdf71fa3a89`
+  - `thumbnail_jpg`: 97,021 bytes,
+    SHA-256 `406e013eb5db010f6f785e1f2076942a4320e821bbc4842e9130118181129ec3`
+  - `clip_metadata_json`: 2,647 bytes,
+    SHA-256 `0cfcb3b7b06a82180e35853bd2573d1a5285da0b2d38bd6c1e7054b68e6bd85a`
+  - `manifest_json`: 5,196 bytes,
+    SHA-256 `28dcb3954bc67fa884be55f1fbb1026d42a62b919fcf6061f8d9d8702d8d2036`
+- The external descriptor, acquired caption, generator, downloaded source,
+  rendered package, and private temporary workspaces were deleted and verified
+  absent. Only this sanitized evidence remains.
+- An earlier authorized candidate was deliberately interrupted after human
+  review exposed conflicting provider and creator language evidence. Its
+  workspace cleanup succeeded, no result was claimed, its temporary evidence
+  was deleted, and the production enhancement was scoped as `PUNCH-001` in the
+  future pilot punch list.
 
 ## Completion evidence
 
@@ -118,7 +174,6 @@ honestly and must not initiate live access without user authorization.
   tests. The full network-free suite passed with 323 tests and two skips;
   typecheck, web production build, all 27 local and 20 cloud migrations, scoped
   formatting, and `git diff --check` passed.
-- Independent Sol review returned PASS with no remaining P0/P1 findings. The
-  previously declared real-Windows physical-containment proof and a newly
-  authorized real-source M6 smoke remain external milestone exit gates and were
-  not claimed or run.
+- Independent Sol review returned PASS with no remaining P0/P1 findings.
+- The two retained external exit gates were completed with the evidence above.
+  Milestone 6 is closed; Milestone 7 has not started.
