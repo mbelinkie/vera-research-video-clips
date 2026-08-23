@@ -35,6 +35,9 @@ In a shared project, load or batch-submit YouTube videos, reuse an online Englis
 - `Export only` creates a durable local technical job but no project clip/log/spreadsheet entry.
 - Both logging actions accept optional multiline usage notes and reusable project-scoped free-form tags, committed atomically with the clip and available to search/filter, CSV, and optional external catalog projections.
 - A completed export record is not sufficient proof that package bytes are still reachable; reusable artifacts are resolved by immutable manifest/hash identity and verified locators.
+- The immutable logged-export success-result ID is `artifactVersionId`; every
+  re-export creates a new request, package, and artifact version without
+  overwriting history.
 - Direct Clip Library exports and script-driven exports use the same durable request, worker, and immutable artifact boundaries.
 - Export actions use selectable named conversion presets and supported per-export overrides.
 - Every render job stores an immutable resolved-settings snapshot so later preset edits cannot change queued work or retries.
@@ -50,6 +53,14 @@ In a shared project, load or batch-submit YouTube videos, reuse an online Englis
   changes never rewrite existing clips.
 - Use stable IDs and integer source-video milliseconds.
 - Never regenerate or replace a completed version silently.
+- Recommend 10 GB free without using it as a global gate. Heavy operations
+  preflight known input/output plus a 2 GB reserve; unknown source size warns and
+  is rechecked after acquisition, while browsing/review/logging stay available.
+- M7 delivers Research Video Clips on the current Intel macOS 15 workstation as
+  a locally built Electron `.app` that retains the authenticated loopback local-
+  agent boundary and needs no terminal for ordinary use.
+- M8 turns the M7-validated application into signed, self-updating macOS 15+
+  Universal and Windows 11 23H2+ x64 releases for remote testers.
 - Keep platform, media, transcription, translation, alignment, object storage, dispatch, and sync details behind adapters.
 
 ## Main workflows
@@ -355,69 +366,111 @@ Gate: representative presets produce the requested FFprobe properties, queued jo
 
 ### 6. Project Clip Library + authoring handoff
 
-- [ ] Promote logged clips into a dedicated project-level Clips surface.
-- [ ] Search/filter by transcript, video, notes, tags, research/export status,
-      and verified artifact availability.
-- [ ] Compose the Clip Library over Milestone 5's individual/batch request,
-      immutable settings, progress, sibling isolation, retry, safe cancellation,
-      and same-source grouping primitives; do not create a second executor.
-- [ ] List completed package versions with reveal/open, verify, and explicit
-      re-export actions.
-- [ ] Separate immutable artifact identity from local/cloud/consumer locators.
-- [ ] Add verified relink for relocated packages and explicit missing/invalid/
-      incompatible states.
-- [ ] Expose authorized clip search, exact artifact resolution, and durable
-      export requests to the separate scriptwriting client.
-- [ ] Record direct versus authoring request origin without creating separate
-      rendering paths.
+- [x] M6-01 artifact identity/history: use the immutable M5 logged-export
+      success-result ID as `artifactVersionId`, expose completed history, and add
+      diagnostic-only `selection_action | clip_library | authoring_build`
+      request origin.
+- [x] M6-02 local roots/locators: migrate configured roots and verified relative
+      package locators, safely backfill M5 packages, and prove macOS/Windows
+      containment without sending local paths to the cloud.
+- [x] M6-03 restart-safe Clip Library: add bounded search/filter/pagination,
+      merge cloud history with distinct local availability, cache authorized
+      snapshots, and reconstruct selections/progress/retry state after restart.
+- [x] M6-04 export operations: compose M5 individual/batch behavior, show one
+      immutable settings snapshot per clip, and run storage preflight over unique
+      sources, outputs, active update/checkpoint reserve, and a 2 GB margin.
+- [x] M6-05 artifact recovery: implement verified locator-ID-only reveal/open/
+      verify/relink and explicit `reusable_local | missing | invalid |
+      incompatible | remote_only | needs_export` resolution; preserve old
+      versions across re-export.
+- [x] M6-06 authoring handoff: expose the same authorized clip/history/
+      compatibility/export APIs and return a verified local descriptor only to
+      an online-authorized same-workstation client.
+- [x] M6-07 M7 handoff: add sanitized operation failures/correlation IDs plus
+      drain/quiescence and prove restart recovery for every durable job state.
 
-Gate: several clips across multiple videos export as one durable batch with
-independent recovery; a simulated authoring client reuses verified compatible
-packages, while a missing locator produces relink or idempotent re-export rather
-than a false cache hit.
+Gate: three clips from two videos can be searched, storage-preflighted, and
+submitted as one restart-safe batch; same-source acquisition is shared without
+coupling sibling progress/failure/retry/cancel; immutable artifact history stays
+separate from local availability; missing, relinked, tampered, incompatible, and
+re-exported packages resolve correctly; a simulated same-workstation authoring
+client reuses or requests through the same executor; diagnostics contain no
+paths or sensitive content; and low disk blocks only the affected heavy
+operation.
 
 Google Sheets is optional later catalog publishing, not an export control
 surface. Keep CSV; begin with one-way stable-ID publishing only if collaboration
 usage justifies it, and defer selective notes/tags sync until field ownership and
 conflict behavior are proven.
 
-### 7. Pilot distribution + independent QA
+### 7. Local desktop completion + personal validation
 
-- [ ] Choose and document one supported pilot operating-system/provider/worker
-      profile.
-- [ ] Produce a versioned, checksummed, platform-trusted release artifact.
-- [ ] Add install, update, recovery/rollback, and uninstall flows that require no
-      source checkout, package manager, terminal, or cloud console.
-- [ ] Launch and supervise the web client plus loopback local agent automatically.
-- [ ] Add first-run sign-in/setup and readiness checks for tools, worker,
-      providers, permissions, network, disk, output/cache roots, and source
-      authorization.
-- [ ] Store credentials behind an operating-system or equivalently protected
-      secret boundary and redact all diagnostics/support output.
-- [ ] Preserve durable data across updates/reinstalls and test explicit
-      preserve/remove choices during uninstall.
-- [ ] Add understandable health/remediation screens and a user-created redacted
-      support bundle with build ID and bounded logs.
-- [ ] Publish version-matched shareable quick-start, operator, privacy/rights,
-      troubleshooting, known-issues, and issue-reporting documentation.
-- [ ] Prepare an outsourced-QA kit with rights-cleared fixtures, dedicated test
-      accounts/projects, acceptance matrix, severity rubric, issue template,
-      expected evidence, and reset instructions.
-- [ ] Complete independent clean-install, upgrade, core-workflow, restart/resume,
-      degraded-state, artifact, diagnostics, and uninstall/reinstall testing.
-- [ ] Fix all critical/high defects and publish triage for every accepted lower-
-      severity issue.
+- [ ] M7-01 production cloud/auth: deploy the ECS Fargate, RDS PostgreSQL,
+      Cognito PKCE, S3/SQS, TLS, secrets, backups, alarms, and least-privilege
+      production boundary; keep PGlite for tests and run Amazon Translate only
+      behind the authenticated project API with explicit opt-in.
+- [ ] M7-02 local Intel Mac Electron app: build an unsigned x64 macOS 15 `.app`,
+      harden the renderer/preload boundary, protect OAuth with Keychain-backed
+      `safeStorage`, retain the authenticated loopback agent, and supervise the
+      local agent plus transcription/export workers.
+- [ ] M7-03 terminal-free first run/readiness: guide login, projects, roots,
+      rights/privacy, providers, and translation consent; detect or Finder-select
+      installed FFmpeg/FFprobe, yt-dlp, and whisper-cli; download or select and
+      checksum-verify the pinned model; expose `ComponentHealth` and
+      `ReadinessReport` without globally blocking lightweight work.
+- [ ] M7-04 complete transcript integration: hydrate verified local/shared
+      transcripts for arbitrary supported videos instead of fixtures only;
+      automatically supervise caption/audio/Whisper/translation/publication and
+      expose progress, retry/cancel, degraded states, review readiness, and all
+      language views without a manual worker command.
+- [ ] M7-05 complete export integration: automatically register/heartbeat the
+      local export worker and claim/process logged plus export-only work; replace
+      manual register, claim/process, one-shot, and `curl` operations with UI
+      rights confirmation while preserving every M5/M6 export, Clip Library,
+      artifact, retry, cancellation, and recovery boundary.
+- [ ] M7-06 personal dogfood/iteration: install and use the local `.app` against
+      the real cloud with authorized English and foreign-language sources; fix
+      blockers and retain restart, degraded-state, low-space, cleanup, and
+      persistence evidence.
 
-Gate: a nontechnical collaborator uses only the release artifact and supplied
-documentation to install on the supported clean machine, complete setup, run
-fixture and authorized-real-source workflows, restart/update without data loss,
-recover from a seeded failure, find artifacts, produce a useful redacted support
-bundle, and uninstall or preserve data deliberately. No terminal, source code,
-package manager, cloud console, production secret, or live developer coaching is
-required. A separate outsourced tester completes the release matrix with no open
-critical/high defects.
+Gate: the locally built Intel macOS `.app` completes project creation, real
+transcript resolution/transcription/translation, review, all three selection
+actions, Clip Library operations, and real export/recovery without a terminal,
+manually launched service, development credential, or manual API call. Signing,
+updating, public documentation/reporting, remote installation, cross-platform
+packaging, and independent QA are not M7 exit requirements.
 
-### 8. Research + capacity expansion
+### 8. Signed cross-platform pilot distribution + independent QA
+
+- [ ] M8-01 release identity/dependencies: add semantic build identity, release
+      channels, reproducible manifests, checksums, SBOM, licenses/notices, and
+      signed platform-specific tool/model packs.
+- [ ] M8-02 signed packaging/GitHub publication: produce and verify notarized
+      macOS 15+ Universal DMG/ZIP artifacts and Azure-signed Windows 11 x64
+      Squirrel artifacts from approved tags, then publish public GitHub Releases.
+- [ ] M8-03 updates/recovery/removal: expose `checking | available |
+      downloading | ready | installing | current | failed`, install on quit
+      after M6 quiescence, enforce minimum version only by signed policy,
+      checkpoint/migrate/recover data, and contain reinstall/uninstall/reset.
+- [ ] M8-04 diagnostics/reporting: add previewed bounded support bundles and
+      authenticated `bug | feedback | suggestion` reports with consented
+      contact, default-off diagnostics, durable SQS delivery, and idempotent
+      private `mbelinkie/youtube-clip-converter-feedback` issues.
+- [ ] M8-05 documentation/QA kit: bundle and publish version-matched help; prepare
+      isolated Cognito accounts/projects, fixtures, an authorized-real-source
+      slot, teardown automation, severity rubric, templates, and evidence rules.
+- [ ] M8-06 independent release QA: execute clean install, N-1-to-N update, core
+      workflow, degraded states, reporting, recovery, and uninstall on macOS
+      Apple Silicon, macOS Intel, and Windows 11 x64; fix/retest through newer
+      signed pilot releases and retain the final decision record.
+
+Gate: OPS-01 is complete; all three independent profiles pass with no open
+critical/high defects; the signed updater preserves and drains durable work;
+in-app reports reach private triage exactly once without prohibited content;
+and final artifacts/checksums, help version, QA evidence, teardown, known
+issues, and the release decision are retained.
+
+### 9. Research + capacity expansion
 
 - [ ] Bookmarks, timeline markers, and segment notes.
 - [ ] Fuzzy/regex/cross-video/semantic search.
@@ -442,8 +495,7 @@ Project
   -> ClipCandidate
        -> ExportJob (optional)
             -> LoggedExportDelivery (reservation generation + acceptance)
-            -> ExportArtifact
-                 -> ArtifactLocator (verified availability, not identity)
+            -> ArtifactVersion (immutable logged-export success result)
   -> ExportPreset
        -> ExportPresetVersion
   -> IntegrationBinding
@@ -451,8 +503,26 @@ Project
 
 LocalWorkspace
   -> VerifiedTranscriptCache
+  -> CachedClipLibrarySnapshot
+  -> ConfiguredArtifactRoot
+       -> ArtifactLocator (verified local availability)
+            -> ArtifactVersion (identity reference only)
   -> SyncOutbox
   -> LocalProcessHistory
+
+DesktopInstallation
+  -> ComponentHealth
+       -> ReadinessReport
+  -> BuildIdentity
+  -> UpdateState
+       -> SignedReleasePolicy
+       -> LocalUpdateCheckpoint
+  -> SupportBundleManifest
+
+AuthenticatedUser
+  -> FeedbackReport
+       -> FeedbackDelivery
+            -> PrivateGitHubIssue (triage authority)
 
 SelectionSnapshot
   -> ExportJob (logged clip optional)
@@ -464,6 +534,7 @@ SelectionSnapshot
 
 ```text
 apps/web         UI, player, transcript/batch/review interaction
+apps/desktop     Electron lifecycle/auth/update/supervision shell
 apps/local-agent loopback API, local cache/tools/exports
 apps/cloud-api   auth, projects, manifests, batches, presigning/finalize
 apps/worker      local or hosted acquisition/transcription pipeline
@@ -536,5 +607,5 @@ infra/aws        storage, API, database, queues, identity, monitoring
 
 ## Next action
 
-Milestone 5 is complete through M5-27. Stop this completion task here; do not
-begin M6 Clip Library or M7 pilot distribution without a separate bounded task.
+Milestones 1–6 are complete. The next implementation slice is M7-01 production
+cloud/authentication, and it must begin with its own bounded active specification.

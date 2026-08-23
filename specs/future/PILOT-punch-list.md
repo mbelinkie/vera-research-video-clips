@@ -202,8 +202,9 @@ reviewable and migration-safe.
   already incompatible with the confirmed language.
 - In-place editing of immutable published transcript bundles.
 - A general transcript editor, subtitle-authoring suite, or new media executor.
-- M7 packaging, provider installation, model download, deployment, or live
-  source access as part of this fix.
+- M7 desktop integration, provider/model setup, production deployment, or live
+  source access as part of this fix; M8 packaging/distribution also remains
+  outside this fix.
 
 ## Entry template
 

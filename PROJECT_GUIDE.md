@@ -1,4 +1,4 @@
-# Research Video Transcript & Clip Extraction Tool
+# Research Video Clips
 
 ## Project guide and implementation plan
 
@@ -210,12 +210,17 @@ rewrites an existing logged clip.
 - Show queue status and retry failed jobs.
 - Export the clip log as CSV.
 - Provide settings for tool paths, output paths, local/cloud worker choice, transcription/translation provider, and optional credentials.
-- Distribute one supported pilot build that a nontechnical collaborator can
-  install, update, launch, diagnose, and uninstall without a source checkout,
-  package manager, terminal, or cloud console.
-- Provide version-matched quick-start, operator, privacy/rights, troubleshooting,
-  and issue-reporting documentation suitable for sharing outside the development
-  team.
+- Produce a locally built Intel macOS 15 Electron application that launches
+  from Finder or the Dock and provides the complete supported workflow on the
+  development workstation without a terminal, manual service launch,
+  development credential, or manual API call.
+- Distribute signed macOS 15+ Universal and Windows 11 23H2+ x64 Electron builds
+  that a nontechnical collaborator can install, update, launch, diagnose, and
+  uninstall without a source checkout, package manager, terminal, or cloud
+  console.
+- Provide the distributed builds with version-matched quick-start, operator,
+  privacy/rights, troubleshooting, and issue-reporting documentation suitable
+  for sharing outside the development team.
 
 ### 4.2 Deferred until the core loop is stable
 
@@ -682,7 +687,8 @@ At minimum persist:
 - optional preferred export preset ID/version for later conversion
 - created/updated/exported timestamps
 - optional external integration binding/record ID when projected
-- export manifest path when complete
+- latest completed `artifactVersionId` and manifest hash when complete; local
+  workstation locators remain separate
 
 ### 7.4 Export request snapshot
 
@@ -852,14 +858,33 @@ Conflict policy:
 
 ### 9.1 Runtime shape
 
-Build a hybrid application with four clear roles:
+Build **Research Video Clips** as a local-first hybrid desktop application with
+five clear roles:
 
-- **Web client:** React + TypeScript + Vite, using the YouTube IFrame API.
-- **Local agent:** loopback Node.js service for filesystem access, local cache, installed tools, local transcription, and FFmpeg export.
-- **Shared control plane:** authenticated project API for membership, project videos, transcript manifests, batches/jobs, sync commands, and presigned object access.
-- **Workers:** registered local agents initially and optional hosted containers for unattended transcription at scale.
+- **Electron desktop shell:** hardened packaged application that owns lifecycle,
+  single-instance behavior, authentication, protected credentials, updates, and
+  supervision of local services.
+- **Web client:** React + TypeScript + Vite renderer, using the YouTube IFrame
+  API and only a minimal typed preload bridge.
+- **Local agent:** authenticated loopback Node.js service for filesystem access,
+  local cache, installed tools, local transcription, and FFmpeg export. It also
+  serves the packaged web client and proxies authenticated cloud API requests.
+- **Shared control plane:** authenticated project API for membership, project
+  videos, transcript manifests, batches/jobs, sync commands, feedback delivery,
+  and presigned transcript-object access.
+- **Workers:** supervised registered local workers for the pilot and optional
+  hosted containers later when scale justifies them.
 
-A browser-only design cannot provide the required filesystem, transcription, and FFmpeg workflow reliably. A purely local design cannot share transcripts or queues across workstations. Keep local/cloud contracts explicit and shared so processing location can change without changing transcript semantics.
+M7 first proves the complete application on this workstation as a locally built,
+unsigned Intel macOS 15 `.app`. M8 turns that proven application into signed
+macOS 15+ Universal and Windows 11 23H2+ x64 releases for remote testers. Retain
+the loopback local-agent boundary inside Electron rather than granting
+filesystem or tool access to the renderer. A browser-only design cannot provide
+the required filesystem, transcription, FFmpeg, protected credential, and
+updater workflow reliably. A purely local design cannot share transcripts or
+queues across workstations. Keep local/cloud contracts explicit so packaging
+and processing location do not change project, transcript, export, or artifact
+authority.
 
 ### 9.2 Suggested implementation choices
 
@@ -871,25 +896,45 @@ A browser-only design cannot provide the required filesystem, transcription, and
 - Fastify for a small typed local API.
 - Zod schemas shared across client/server boundaries.
 - Node's SQLite API with explicit SQL migrations for local cache, FTS, job history, and sync outbox.
-- Managed PostgreSQL for the shared catalog, memberships, batches, jobs, manifests, and synchronized project records; use embedded PGlite only for deterministic local migration tests.
+- Amazon RDS PostgreSQL for the production shared catalog, memberships, batches,
+  jobs, manifests, feedback delivery state, and synchronized project records;
+  use embedded PGlite only for deterministic migration tests.
 - SQLite FTS5 for transcript/notes search once basic in-memory search is proven.
 - A database-backed job model plus SQS Standard queue/DLQ as cloud delivery transport; never treat queue delivery as exactly-once.
 - Private versioned Amazon S3 storage for compressed transcript bundles, accessed through short-lived presigned URLs.
-- Plain AWS CloudFormation as the initial infrastructure-as-code format, with separate development and production parameters.
-- An authenticated AWS API surface and project-scoped authorization; choose Cognito or an equivalent OIDC provider during the infrastructure spike.
-- Registered local workers first; make the worker container compatible with AWS Batch GPU jobs for optional hosted capacity.
+- Plain AWS CloudFormation as the infrastructure-as-code format, with separate
+  development and production parameters. The M7 production control plane uses
+  ECS Fargate behind HTTPS, private RDS, Cognito, S3, SQS/DLQs, Secrets Manager,
+  backups, alarms, and least-privilege roles.
+- Cognito managed login with authorization-code grant, S256 PKCE, no client
+  secret, and `research-video-clips://oauth/callback`. OAuth tokens stay in the
+  desktop authentication broker and never enter React state.
+- Electron asynchronous `safeStorage` for refresh tokens and local secrets,
+  using Keychain on macOS and DPAPI on Windows; SQLite stores opaque credential
+  references only.
+- Registered local workers are the supported pilot execution profile; keep the
+  worker container compatible with AWS Batch GPU jobs for optional later
+  capacity.
 - FFmpeg/FFprobe for media inspection and export.
 - A configurable media acquisition adapter and a multilingual speech-to-text adapter.
 - `yt-dlp` for opt-in authorized audio acquisition and `whisper.cpp` for the first opt-in local multilingual speech-recognition implementation; keep both behind typed adapters.
-- Amazon Translate through the official AWS SDK as the first opt-in text-translation adapter; keep the canonical translation contract vendor-neutral.
+- Amazon Translate through a project-authorized cloud endpoint and the ECS task
+  role as the first opt-in text-translation adapter; users receive no AWS
+  credentials, and the UI discloses that transcript text leaves the workstation.
+- Electron 43.4.1 and Electron Forge 7.11.2 for the M7 local desktop and the M8
+  distribution implementation, with sandboxed renderers, context isolation, no
+  Node integration, restrictive CSP, validated IPC, and a minimal preload API.
 - Vitest for units/integration tests and Playwright for the critical browser flow.
 
-Confirm versions and operating-system packaging during bootstrap rather than pinning them in this planning document.
+Except for the approved M7/M8 Electron/Forge compatibility pins, confirm
+remaining dependency versions and platform packaging inputs during each bounded
+bootstrap or release slice.
 
 ### 9.3 Repository shape
 
 ```text
 apps/
+  desktop/                # Electron lifecycle/auth/update/supervision shell
   web/                    # React UI
   local-agent/            # loopback API, local cache/tools/exports
   cloud-api/              # authenticated shared-project control plane
@@ -918,7 +963,11 @@ PROJECT_GUIDE.md
 outline.md
 ```
 
-Keep the deployable set minimal: one cloud API, one worker image, and the local agent/web client. Package boundaries are for testability and shared semantics, not unnecessary network hops.
+Keep the deployable set minimal: one desktop shell supervising the local agent
+and local worker, plus one production cloud API. The Electron boundary does not
+change project, transcript, export, or artifact authority. Package boundaries
+are for security, testability, and shared semantics, not unnecessary network
+hops.
 
 ### 9.4 Core APIs
 
@@ -967,11 +1016,42 @@ POST   /api/jobs/:id/retry
 GET    /api/settings
 PATCH  /api/settings
 POST   /api/integrations/csv/export
+POST   /api/feedback-reports
+GET    /api/feedback-reports/:reportId
 ```
 
 Return job IDs for long operations. Stream progress via server-sent events or poll initially; choose the simpler reliable implementation before adding WebSockets.
 
 Registered local workers claim eligible `execution_location = local` jobs through the authenticated API and heartbeat their lease; they do not receive broad SQS or S3 credentials. Hosted workers consume SQS using a narrow service role and use the same executor/finalize contracts. The database remains authoritative for state in both modes.
+
+### 9.5 Desktop, update, and reporting domains
+
+Electron adds lifecycle boundaries; it does not become a new owner of project,
+transcript, clip, export, or artifact records.
+
+```text
+DesktopInstallation
+  -> ComponentHealth
+       -> ReadinessReport
+  -> BuildIdentity
+  -> UpdateState
+       -> SignedReleasePolicy
+       -> LocalUpdateCheckpoint
+  -> SupportBundleManifest
+
+AuthenticatedUser
+  -> FeedbackReport
+       -> FeedbackDelivery
+            -> PrivateGitHubIssue
+```
+
+M7 introduces protected credentials plus component health and readiness for the
+local application. M8 adds semantic build identity, update/checkpoint state,
+support bundles, and feedback delivery. The authenticated cloud catalog owns
+report delivery status and issue mapping only until delivery; after submission
+it retains status, hashes, and mapping while the private GitHub issue is the
+triage authority. Neither domain may absorb transcript text, notes/tags, media,
+URLs, local paths, credentials, or command output.
 
 ## 10. Persistence model
 
@@ -999,10 +1079,10 @@ Shared PostgreSQL tables or equivalent aggregates:
 - `export_jobs` (may reference a logged clip or contain an export-only request snapshot)
 - `logged_export_deliveries` and mutually exclusive immutable sanitized success
   or failure results bound to one accepted request, delivery generation, worker,
-  and epoch
+  and epoch; the success-result ID is `artifactVersionId`
 - `export_presets` and immutable preset versions
-- `export_artifacts` (immutable package identity/provenance; no
-  workstation-private path as identity)
+- `feedback_reports` and an SQS-backed delivery outbox retaining authenticated
+  submission state, idempotency, hashes, and final private-issue mapping
 - `integration_bindings`
 - `sync_events`
 
@@ -1010,13 +1090,13 @@ Local SQLite tables mirror required shared records and add:
 
 - normalized `transcript_tracks`, `transcript_segments`, and `transcript_tokens`
 - local `video_assets` and cache manifests
+- configured artifact roots and `export_artifact_locators` keyed to the
+  immutable logged-export success-result ID used as `artifactVersionId`
 - job-scoped `source_scratch_assets` lifecycle records without permanent media retention
 - local job/process history
-- `export_artifact_locators` with independently verified availability keyed to
-  an immutable artifact/package ID; keep workstation-private paths local
-- configured artifact roots used for bounded locate/relink checks
 - `sync_outbox` and `sync_cursors`
-- local settings/credential references
+- cached authorized Clip Library snapshots with server versions and sync cursor
+- local settings, updater/checkpoint state, and opaque credential references
 - FTS indexes
 
 Important constraints:
@@ -1686,7 +1766,8 @@ pre-existing `docs/Script-to-Resolve Product Spec.md` formatting change remains
 untouched and excluded from milestone commits. The known pre-M5-19 manual legacy
 scratch recovery and M5-18 refusal to infer multi-attempt failure ownership
 remain intentional fail-closed limitations. No unresolved Milestone 5 integrity
-blocker remains, and this task stops before M6 Clip Library or M7 distribution.
+blocker remains, and this task stops before M6 Clip Library or later desktop
+delivery work.
 
 M5-09 completed 2026-08-19. Every promoted clip package now also contains one
 `manifest.json`, written into attempt-private staging and promoted through the
@@ -1712,87 +1793,175 @@ M5-08 completed 2026-08-15. `npm run export:run-once -- --request-id <uuid> --au
 
 ### Milestone 6 — Project Clip Library and authoring handoff
 
-Deliver:
+Execute seven bounded slices:
 
-- dedicated project-level Clip Library with search/filter and artifact availability
-- Clip Library composition over Milestone 5's individual/batch export,
-  immutable settings, progress, sibling isolation, retry, safe cancellation,
-  and same-source grouping primitives; do not build a second executor
-- completed package version history plus reveal/open, verify, and explicit
-  re-export actions
-- stable authorized clip search and exact artifact-resolution API for the
-  separate scriptwriting product
-- manifest/hash verification that distinguishes a completed record from
-  reachable compatible bytes
-- missing/relocated/invalid artifact states plus verified relink and durable
-  re-export recovery
-- request-origin provenance without separate direct-versus-script export engines
+1. **Artifact identity and history:** use the immutable logged-export
+   success-result ID as `artifactVersionId`; expose completed history and
+   `requestOrigin = selection_action | clip_library | authoring_build` without
+   including origin in compatibility or deduplication.
+2. **Local roots and locators:** migrate configured roots and verified relative
+   locators in SQLite, backfill M5 packages only after complete manifest/role/
+   size/hash/snapshot verification, and never send workstation paths to cloud
+   contracts, events, or diagnostics.
+3. **Restart-safe Clip Library:** add bounded project clip search/filter/
+   pagination, merge immutable cloud history with separate local availability,
+   cache the last authorized snapshot, and reconstruct selection/progress/retry
+   state after browser or local-agent restart.
+4. **Individual and batch export:** compose M5's existing durable primitives,
+   display immutable settings per clip, and run an `ExportStoragePreflight` that
+   deduplicates same-source estimates and includes a 2 GB safety reserve.
+5. **Artifact actions and recovery:** verify, reveal, open, and relink only by
+   validated local locator IDs; return `reusable_local`, `missing`, `invalid`,
+   `incompatible`, `remote_only`, or `needs_export`; make every re-export a new
+   immutable version.
+6. **Authoring handoff:** expose the same authorized clip/history/resolution/
+   export APIs and permit only an online-authorized same-workstation client to
+   receive a verified local descriptor. The authoring product owns destination,
+   copy/clone, timeline, and build history.
+7. **M7 operational handoff:** add sanitized failure/correlation contracts and
+   local drain/quiescence so new claims stop and `safeToStop` is true only after
+   child processes and source-scratch lifecycles are inactive.
 
-Exit when a researcher can select several logged clips across multiple source
-videos, export them as one durable batch with independent recovery, and reuse the
-verified packages from a simulated authoring client. A missing locator must
-produce an explicit relink/re-export path, and duplicate direct or authoring
-requests must not create duplicate renders.
+The supported-system guidance recommends 10 GB free rather than imposing a
+global disk gate. Browsing, transcript review, and clip logging remain available
+below it. Transcription, export, update/checkpoint, and tool/model operations use
+known input/output estimates plus a 2 GB reserve; unknown-size work warns before
+acquisition and is rechecked against actual size before rendering.
+
+Exit when three clips from two videos can be searched, storage-preflighted, and
+submitted as one restart-safe batch; compatible same-source work shares
+acquisition while sibling failure/retry/cancellation stays independent;
+completed history remains separate from local availability; moved, relinked,
+tampered, incompatible, and re-exported packages resolve correctly; the
+simulated same-workstation authoring client reuses or requests through the same
+pipeline; and cloud/diagnostic evidence contains no paths or sensitive content.
 
 Google Sheets is no longer this milestone's control surface. Keep CSV, and add
 optional one-way Sheets catalog publishing only after core usage demonstrates a
 collaboration need; two-way metadata sync remains a later evidence-driven
 integration.
 
-### Milestone 7 — Pilot distribution, independent QA, and operator documentation
+### Milestone 7 — Local desktop completion and personal validation
 
-Deliver:
+Deliver the complete supported workflow on the current Intel Mac running macOS
+15 as a locally built, unsigned and unnotarized **Research Video Clips**
+Electron `.app`. Building and placing the application may use developer tooling;
+launching, configuring, and using it afterward must not require a terminal,
+manual service launch, a pasted development credential, or manual API calls.
 
-- one explicitly supported pilot platform and a versioned release artifact with
-  checksum/build identity and the platform's normal trust/signing requirements
-- installation, update, rollback/recovery, and uninstall flows that do not
-  require a source checkout, package manager, terminal, or cloud console
-- automatic launch/supervision of the web client and loopback local agent, with
-  bundled or guided acquisition of required runtimes/tools
-- first-run sign-in and setup for projects, output/cache locations, provider
-  choices, credentials, authorized-source acknowledgement, and a complete
-  readiness check before real work begins
-- operating-system credential storage or an equivalently protected secret
-  boundary; never place credentials in documentation, logs, support bundles, or
-  ordinary application data
-- safe database migration and data-directory handling across update/reinstall,
-  with explicit backup/recovery and preserve-versus-remove choices on uninstall
-- understandable health, disk, permissions, network, provider, worker, and tool
-  diagnostics plus a user-triggered redacted support bundle carrying build ID
-  and bounded logs
-- version-matched shareable documentation: system requirements, install/update/
-  uninstall, quick start, the three selection actions, batch preparation, Clip
-  Library use, provider/tool setup, storage/privacy/rights behavior,
-  troubleshooting/recovery, known limitations, and issue reporting
-- a release-candidate QA kit containing rights-cleared fixtures, dedicated test
-  accounts/projects, an acceptance matrix, severity definitions, issue template,
-  expected evidence, and reset instructions
-- independent human QA of clean install, upgrade, first run, the core workflows,
-  restart/resume, offline/provider/permission/disk failure recovery, artifact
-  opening, diagnostics, and uninstall/reinstall; automated CI alone cannot close
-  this milestone
-- a triaged release report with all release-blocking defects fixed and lesser
-  known issues documented
+Execute six bounded slices:
 
-Exit when a nontechnical collaborator on the supported clean machine can use
-only the release artifact and supplied documentation to install, sign in,
-complete readiness checks, run the fixture-backed core workflow and one
-authorized real-source workflow, restart/update without losing durable work,
-find the completed artifacts, recover from one seeded failure, create a useful
-redacted support bundle, and uninstall or preserve their data deliberately.
-They must not need live developer coaching, a terminal, source code, package
-manager, AWS console, or production secrets. A separate outsourced QA pass must
-complete the published matrix; all critical/high defects are closed, and every
-accepted lower-severity issue is recorded in the release notes or known-issues
-guide.
+1. **Production cloud and authentication:** deploy the CloudFormation-managed
+   ECS Fargate/RDS PostgreSQL/S3/SQS control plane behind HTTPS; use Cognito
+   managed login with authorization-code grant, S256 PKCE, no client secret, and
+   `research-video-clips://oauth/callback`; keep PGlite only for tests; move
+   Amazon Translate behind the authenticated project-authorized API and its
+   explicit opt-in disclosure.
+2. **Local Intel Mac Electron application:** add `apps/desktop` with Electron
+   43.4.1 and Forge 7.11.2, package only trusted renderer code, sandbox and
+   context-isolate it, disable Node integration, enforce restrictive CSP and
+   validated IPC, keep OAuth tokens out of React, protect refresh tokens with
+   Keychain-backed `safeStorage`, retain the authenticated loopback local-agent
+   boundary, and supervise the local agent plus transcription/export workers.
+   Produce a local x64 `.app` that launches from Finder or the Dock; do not sign,
+   notarize, publish, or add an updater in M7.
+3. **Terminal-free first run and readiness:** guide login, project access,
+   output/cache roots, rights/privacy acknowledgement, provider selection, and
+   cloud-translation consent. Detect and validate the workstation's installed
+   FFmpeg/FFprobe, yt-dlp, and whisper-cli; permit Finder-based replacement
+   selection; download or select the pinned Whisper model in-app and verify its
+   checksum. Expose `ComponentHealth` and `ReadinessReport` for API/database,
+   worker, provider, network, permission, storage, tool, and model state without
+   blocking unrelated lightweight work.
+4. **Complete transcript workflow integration:** replace fixture-only research
+   hydration with the verified local/shared transcript resolver for every
+   supported loaded project video. Automatically supervise caption discovery,
+   authorized audio acquisition, Whisper transcription, translation,
+   publication, cache resolution, and `Ready for review`; expose durable
+   progress, retry, cancellation, actionable degraded states, and preferred,
+   English, original, and paired views without manual worker commands.
+5. **Complete export workflow integration:** automatically register and
+   heartbeat the local export worker, claim and process accepted logged work,
+   and process export-only requests. Replace manual `curl`, register,
+   claim/process, and one-shot commands with UI rights confirmation and durable
+   execution. Keep all three selection actions, presets, individual/batch Clip
+   Library export, progress, retry/cancel, verify, reveal/open, relink, and
+   immutable re-export on the established M5/M6 boundaries.
+6. **Personal dogfood and iteration:** install and exercise the local `.app`
+   against the real cloud using authorized English and foreign-language sources;
+   fix discovered defects; verify restart recovery, network/provider/cloud
+   degradation, low-space behavior, source cleanup, and persistent projects,
+   transcripts, clips, jobs, and artifacts.
 
-The first pilot may support one operating system and one documented provider/
-worker profile. App-store publication, unattended enterprise deployment,
-multi-platform parity, 24/7 operations, public marketing documentation, and new
-research features are separate work unless a bounded M7 slice explicitly adds
-them.
+Exit only when the local `.app` completes project creation, real transcript
+resolution/transcription/translation, review, all three selection actions, the
+Clip Library, and real export/recovery without a terminal, manually launched
+service, development credential, or manual API call. The personal dogfood gate
+must retain actual evidence and leave no unresolved defect that blocks the
+normal supported workflow on this workstation.
 
-### Milestone 8 — Research and capacity enhancements
+Remote installation, code signing/notarization, GitHub Releases, macOS Universal
+or Windows builds, automatic updates, public/offline operator documentation,
+support bundles, in-app issue delivery, tester provisioning, and independent QA
+remain outside M7.
+
+### Milestone 8 — Signed cross-platform pilot distribution and independent QA
+
+Turn the M7-validated application into a self-updating release for nontechnical
+remote testers. Support macOS 15+ on Intel and Apple Silicon through one
+Universal build and Windows 11 23H2+ on x64. The supported hardware baseline is
+four CPU cores and 16 GB RAM. Recommend 10 GB free without globally blocking
+lightweight research; every space-intensive operation performs its own measured
+preflight plus a 2 GB safety reserve.
+
+OPS-01 production observability remains a separate prerequisite and must be
+complete before external M8 testing.
+
+Execute six bounded slices:
+
+1. **Release identity and portable dependencies:** add semantic `BuildIdentity`,
+   release channels, reproducible build/commit manifests, checksums, SBOM,
+   licenses/notices, and signed platform-specific FFmpeg/FFprobe, yt-dlp/
+   JavaScript-runtime, whisper.cpp, and model packs.
+2. **Signed cross-platform packaging and GitHub publication:** adapt and verify
+   the M7 desktop/runtime boundaries for macOS Universal and Windows x64; produce
+   signed/notarized macOS DMG and Universal ZIP artifacts plus Azure Trusted
+   Signing-signed Windows Squirrel artifacts; publish them from approved
+   semantic-version tags through public GitHub Releases after fresh-runner
+   signature and checksum verification.
+3. **Updates, recovery, and removal:** implement `UpdateState`, background
+   startup/network-resume/four-hour/manual update checks, install-on-quit after
+   M6 quiescence, an Ed25519-signed minimum-version `ReleasePolicy`, SQLite/WAL
+   checkpoints and copy migration, recovery from the two retained checkpoints,
+   reinstall behavior, and contained preserve-by-default uninstall/reset.
+4. **Diagnostics and reporting:** add a previewable bounded
+   `SupportBundleManifest` workflow and authenticated in-app
+   `bug | feedback | suggestion` reports. Keep contact consented/optional and
+   bug diagnostics default-off, allowlisted, previewed, and at most 20 KB;
+   deliver idempotently through an SQS outbox and least-privilege GitHub App to
+   private `mbelinkie/youtube-clip-converter-feedback` issues.
+5. **Versioned documentation and QA kit:** bundle offline help, publish matching
+   versioned public help, and prepare dedicated Cognito tester identities and
+   projects, teardown automation, rights-cleared fixtures, one authorized-real-
+   source slot, severity rubric, report template, and evidence requirements.
+6. **Independent three-profile QA and release decision:** independently run the
+   clean-install, N-1-to-N update, core workflow, degraded states, diagnostics/
+   reporting, recovery, and uninstall matrix on macOS Apple Silicon, macOS
+   Intel, and Windows 11 x64. Publish fixes as newer signed builds so testers
+   exercise the real updater.
+
+Exit only after all three independent profiles pass, all critical/high defects
+are fixed and retested, accepted medium/low defects are in release notes or
+known issues, and final artifacts/checksums, build identity, documentation
+version, feedback-repository reference, QA evidence, teardown record, and the
+release decision are retained. No tester needs live developer coaching, a
+terminal, source code, package manager, AWS console, or production secret.
+
+Linux, mobile, app stores, managed enterprise deployment, silent installation,
+percentage rollout, automatic screenshots, cloud export workers, cloud clip
+storage, and new research features remain outside M8.
+
+### Milestone 9 — Research and capacity enhancements
 
 Deliver in small vertical slices:
 
@@ -1803,7 +1972,9 @@ Deliver in small vertical slices:
 - optional AI analysis behind provider interfaces
 - AWS Batch GPU worker deployment, autoscaling/cost controls, and notifications when sustained workload justifies hosted capacity
 
-Add real-time presence/editing, rich conflict resolution, cloud clip storage, and broader collaboration only after shared transcripts, batch jobs, and the local review loop have stable usage evidence.
+Add real-time presence/editing, rich conflict resolution, cloud clip storage,
+and broader collaboration only after shared transcripts, batch jobs, and the
+local review loop have stable usage evidence.
 
 ## 15. Definition of done for every implementation slice
 
@@ -1853,22 +2024,19 @@ A slice is done only when:
 | Authoring build moves or mutates a reusable research package | Other projects or prior builds lose their media | Keep research packages immutable; copy or copy-on-write clone into the authoring project and snapshot hashes |
 | Optional Sheets projection and shared catalog diverge | Stale external metadata or confusing links | Keep Sheets subordinate and one-way initially; stable IDs, field ownership, versions, and explicit sync logs before any selective write-back |
 | Local artifact links do not work remotely | External projections cannot open package bytes | Report locator availability honestly; add an authorized storage/download provider later rather than treating a local path as portable |
-| Cache consumes excessive disk | Workstation fills | Size reporting, configurable root, LRU/manual cleanup with protected records |
-| A pilot requires developer tools or undocumented setup | A nontechnical collaborator cannot begin or recover independently | One supported packaged release, first-run readiness checks, version-matched documentation, and an independent clean-machine acceptance gate |
+| Transcription, export, update, or tool/model work exceeds available disk | Workstation fills or durable work is interrupted | Recommend 10 GB free without a global gate; preflight known input/output plus a 2 GB reserve, avoid same-source double counting, warn on unknown size, and recheck after acquisition before render |
+| A pilot requires developer tools or undocumented setup | A nontechnical collaborator cannot begin or recover independently | Signed macOS Universal and Windows x64 releases, first-run readiness, version-matched documentation, and independent clean-machine acceptance on all three profiles |
 | Outsourced QA receives secrets or personal media | Credential or rights exposure | Dedicated least-privilege test accounts/projects, rights-cleared fixtures, redacted support bundles, reset instructions, and no production credentials |
 | An update or uninstall damages durable work | Lost projects, jobs, caches, or exports | Preflighted migrations, backup/recovery instructions, versioned release identity, tested update/rollback, and explicit preserve/remove choices |
+| An updater terminates active media processing | Lost work or retained source scratch | Consume M6 drain/quiescence, stop new claims, install on ordinary quit, and never stop while child or source-scratch work remains active |
+| In-app feedback leaks research content or duplicates issues | Privacy exposure or noisy triage | Authenticated consent-aware reports, default-off allowlisted diagnostics, preview/fail-closed redaction, idempotent SQS outbox, and least-privilege private GitHub issue delivery |
 
 ## 17. Decisions intentionally left configurable
 
 Resolve these during the relevant milestone with a small spike, not before:
 
-- local speech-to-text engine versus remote provider default
-- managed PostgreSQL deployment choice and development substitute
-- identity provider/OIDC implementation and project invitation UX
-- registered local worker versus AWS Batch as the default execution location
 - hosted worker instance/model profiles and cost/priority policy
 - forced-alignment provider for cue-only sources
-- packaged desktop wrapper versus browser + local service
 - exact editing bitrate/preset defaults
 - whether real collaboration usage justifies one-way Sheets publishing or later
   selective notes/tags sync; export requests remain in the product/API
@@ -1879,6 +2047,10 @@ The provider interfaces, canonical transcript bundle/manifest, stable IDs, sync 
 
 ## 18. Platform references
 
+- [Electron security guidance](https://www.electronjs.org/docs/latest/tutorial/security) — renderer sandboxing, context isolation, restrictive content loading, and narrow IPC/preload boundaries.
+- [Electron `safeStorage`](https://www.electronjs.org/docs/latest/api/safe-storage) — asynchronous operating-system-backed protection for local desktop secrets.
+- [Electron `autoUpdater`](https://www.electronjs.org/docs/latest/api/auto-updater) and [Electron Forge update flow](https://www.electronforge.io/advanced/auto-update) — signed desktop update publication, discovery, download, and installation boundaries.
+- [Amazon Cognito authorization code with PKCE](https://docs.aws.amazon.com/cognito/latest/developerguide/using-pkce-in-authorization-code.html) and [application callback rules](https://docs.aws.amazon.com/cognito/latest/developerguide/user-pool-settings-client-apps.html) — S256 PKCE and registered native callback configuration.
 - [YouTube IFrame Player API](https://developers.google.com/youtube/iframe_api_reference) — embedded playback and programmatic seek behavior.
 - [YouTube caption download API](https://developers.google.com/youtube/v3/docs/captions/download) — official download requires permission to edit the video, so it is not the arbitrary-public-video transcript path.
 - [yt-dlp subtitle options](https://github.com/yt-dlp/yt-dlp/blob/master/README.md#subtitle-options) — optional local subtitle discovery/acquisition adapter; availability can still vary by video, authentication, region, and platform changes.

@@ -1,194 +1,290 @@
 # M6 — Project Clip Library and authoring handoff
 
-Status: future milestone specification. Promote to `specs/active/` and split
-into bounded vertical slices before implementation.
+Status: future milestone specification. Milestone 5 is complete and unchanged.
+When M6 is authorized, execute the seven slices below sequentially with exactly
+one bounded specification in `specs/active/` at a time.
 
 ## User-visible outcome
 
 A researcher can open one project's Clip Library, find clips logged during
-review, export one or many without entering a script, follow independent job
-status, and open or re-export completed packages. The future scriptwriting
-product can search the same authorized records and reuse an exact verified
-package or request the same durable export when compatible bytes are unavailable.
+review, export one or many without reopening a transcript, follow independent
+job status across restarts, and verify, reveal, relink, or re-export completed
+packages. The future scriptwriting product can use the same authorized cloud
+records to find clips and either reuse an exact verified package on the same
+workstation or request the same durable export when compatible bytes are not
+available.
 
 Google Sheets is not required for either path.
 
-## Product decision
+## Product and authority decisions
 
-Milestone 6 is no longer a Google Sheets job-control surface. The shared project
-catalog remains authoritative for clip records and export state; the research
-export boundary remains authoritative for reusable editing packages. CSV and any
-later Sheets integration are subordinate projections.
+M6 composes Milestone 5's request, delivery, worker, progress, retry,
+cancellation, same-source grouping, immutable package, and success-result
+primitives. It does not create a second renderer or job system.
 
-The research product owns:
+- The immutable logged-export success-result ID is `artifactVersionId`. Do not
+  create a competing artifact-version identity.
+- The cloud project catalog remains authoritative for clip records, immutable
+  request/success lineage, and completed artifact-version history.
+- A workstation's SQLite catalog is authoritative only for its configured local
+  roots, artifact locators, verification state, and cached authorized reads.
+- `export_status = complete` proves historical export success; it never proves
+  that package bytes are currently reachable on a workstation.
+- Re-export always creates a new request, package identity, success result, and
+  `artifactVersionId`. It never overwrites or repairs an earlier version.
+- `requestOrigin = selection_action | clip_library | authoring_build` records
+  diagnostic provenance only. It is excluded from export compatibility,
+  idempotent deduplication, renderer selection, package identity, and artifact
+  identity.
 
-- clip identity, transcript/version provenance, selected and export bounds,
-  notes/tags, and rights/provenance context;
-- durable export requests, resolved conversion snapshots, status, retries, and
-  immutable verified package versions;
-- artifact identity and authorized resolution.
+The research product owns clip identity, transcript/version provenance,
+selection and export bounds, notes/tags, rights context, durable exports,
+immutable settings snapshots, artifact-version history, and authorized
+resolution. The scriptwriting product owns destination selection, copy or clone
+policy, narrative use, timeline placement, and build history. It must not scrape
+a sheet, duplicate acquisition/conversion logic, or mutate a canonical research
+package.
 
-The scriptwriting product owns narrative use, build policy, project-local media
-materialization, timeline placement, and build history. It must not scrape a
-sheet, duplicate source acquisition/conversion logic, or move/mutate a canonical
-research package.
+## Sequential bounded slices
 
-## Smallest end-to-end proof
+### 1. Artifact identity and project history
 
-1. Log three fixture clips from two source videos to one project.
-2. In the Clip Library, select all three and request one batch using a resolved
-   editing preset.
-3. Process siblings independently and reuse one acquisition for the two
-   same-source clips where practical.
-4. Finalize immutable packages with verified manifests/hashes and expose their
-   availability.
-5. From a simulated authorized authoring client, resolve and reuse one exact
-   compatible package.
-6. Remove another package from its recorded locator. Resolution must report
-   `missing`, accept a verified relink when the exact package is supplied, or
-   create one idempotent re-export request.
+- Expose `ArtifactVersionSummary` records derived from immutable
+  request/success lineage on authorized project and clip reads.
+- Add bounded completed-version history for a project clip. A history entry
+  identifies the success result, request and package identity, immutable clip
+  and settings snapshot, artifact roles, manifest hash/schema, completion time,
+  and sanitized provenance needed for compatibility decisions.
+- Extend new individual/batch export requests and retries with
+  `ExportRequestOrigin`. Preserve the originating surface through retry lineage
+  for diagnostics while excluding it from compatibility and deduplication.
+- Preserve all older completed versions when a package is missing, invalid, or
+  superseded by a re-export.
+- Prove that existing M5 success results remain the only source of
+  `artifactVersionId`; do not backfill a parallel identity table.
 
-## In scope
+### 2. Local roots, locators, and verification
 
-### Project Clip Library
+- Add local migrations for configured artifact roots and
+  `export_artifact_locators`.
+- Store a root ID plus a validated relative package path, platform,
+  `artifactVersionId`, manifest hash, availability state, verification time,
+  and bounded failure class. Absolute paths remain local implementation detail
+  and never enter shared/cloud forms, cloud events, or support diagnostics.
+- Backfill an existing M5 package only after its manifest, required artifact
+  roles, byte sizes, SHA-256 hashes, request snapshot, and package identity all
+  match its immutable success lineage.
+- Bound automatic lookup to configured roots. Validate containment across macOS
+  and Windows path syntax, case behavior, Unicode normalization, symlinks,
+  junctions, reserved names, and non-regular files; fail closed on uncertainty.
+- Keep locator verification idempotent and reconstructable after restart.
 
-- A dedicated project-level `Clips` surface rather than additional controls in
-  the transcript selection panel.
-- Search/filter across transcript text, video title, notes, tags, research
-  status, export status, and verified artifact availability.
-- Per-clip export plus multi-select `Export selected`, composed over the
-  Milestone 5 request/worker boundary rather than a new executor.
-- Project/default preset resolution with an immutable settings summary before
+### 3. Restart-safe Clip Library
+
+- Add a dedicated project-level `Clips` surface with bounded pagination and
+  search/filter over transcript text, video title, notes, tags, research status,
+  export status, completed-version presence, and local availability.
+- Merge cloud-authoritative clip/artifact history with workstation-local locator
+  availability. Label the facts separately and never infer reachability from a
+  completed cloud record.
+- Cache the last authorized Clip Library snapshot in SQLite with server
+  versions and a sync cursor. Offline mode may browse clearly stale cached
+  records and reveal or verify previously verified local packages.
+- Require connectivity for cloud mutations. Preserve their idempotency keys and
+  explicit pending state so a retry does not duplicate work.
+- Reconstruct selections, current retry leaves, durable progress, terminal
+  state, artifact history, and local availability after browser or local-agent
+  restart instead of relying on React memory.
+
+### 4. Individual and batch export operations
+
+- Reuse M5's individual/batch request, immutable settings resolution, delivery,
+  progress, retry, cancellation, execution, and same-source grouping paths.
+- Resolve and display one immutable settings snapshot per selected clip before
   submission.
-- Independent progress, actionable errors, retry, safe cancellation, and
-  sibling failure isolation.
-- Surface Milestone 5 same-source grouping where compatible and practical.
-- Completed package history with artifact identity, settings/version summary,
-  verification/availability state, and `Reveal/Open`, `Verify`, and explicit
-  `Re-export` actions.
+- Run an `ExportStoragePreflight` before submission. Estimate unique source
+  acquisition, output packages, active update/checkpoint reserve, and a 2 GB
+  safety margin without double-counting compatible same-source siblings.
+- The supported-system baseline recommends 10 GB free, but it is not a global
+  gate. Browsing, transcript review, clip logging, and other unaffected work
+  remain available below it.
+- If a source size is unknown, warn before acquisition, continue only with user
+  confirmation, and recheck using the acquired byte size before rendering.
+  Block only the acquisition/render or other operation whose preflight fails.
+- One sibling's failure or cancellation must not block others. Duplicate direct
+  or authoring requests adopt an existing compatible request or artifact rather
+  than creating duplicate work.
 
-### Artifact resolution
+### 5. Artifact actions and recovery
 
-- Treat artifact/package ID plus immutable manifest and hashes as identity.
-- Treat local paths, object keys, download grants, and consumer copies as
-  replaceable locators with separately verified availability.
-- Match the exact clip snapshot, transcript/track versions, export bounds,
-  required handles, language-policy sidecars, and conversion requirements.
-- Verify the manifest and required bytes before returning `reusable`.
-- Return explicit `missing`, `invalid`, `remote_only`, or `incompatible` results
-  instead of inferring availability from `export_status = complete`.
-- Search only configured artifact roots automatically. An explicit user-located
-  package must pass full manifest/hash/snapshot verification before relink.
-- Preserve completed provenance when bytes disappear; locator failure does not
-  rewrite history into a render failure.
+- Implement local-only `Verify`, `Reveal`, `Open`, and `Relink` commands using
+  locator IDs. Never execute an arbitrary path supplied by a cloud response.
+- Return `reusable_local`, `missing`, `invalid`, `incompatible`, `remote_only`,
+  or `needs_export` through `ArtifactResolutionResult`.
+- Accept an explicitly selected relink package only after verifying identity,
+  manifest/schema, required roles, byte sizes, hashes, clip bounds,
+  transcript/version provenance, subtitle policy, package identity, and settings
+  compatibility.
+- Preserve completed provenance when a locator is missing or invalid. A
+  re-export creates a new immutable version and leaves the older availability
+  record intact.
+- Return `remote_only` only when an authorized remote artifact provider really
+  exists. Without cloud clip storage, bytes unavailable on this workstation are
+  `missing`, not remote.
 
-### Authoring boundary
+### 6. Authoring-client handoff
 
-- Authorized clip search by project, tags, notes, video metadata, and transcript
-  text with stable clip IDs.
-- Exact artifact-resolution capability with compatibility requirements supplied
-  by the caller.
-- Idempotent durable export request when no compatible reachable package exists.
-- Request-origin provenance such as `clip_library` or `authoring_build` for
-  diagnostics only; origin does not fork export semantics or artifact identity.
-- Consumer materialization metadata sufficient for the authoring product to
-  copy or copy-on-write clone verified bytes into its own project workspace.
+- Offer authorized project clip search, artifact history, compatibility
+  resolution, and idempotent export requests through the same cloud APIs used
+  by the Clip Library.
+- On the same workstation, the loopback local agent may return a verified local
+  package descriptor to an authenticated, online-authorized authoring client.
+  Paths remain local-only and must never enter cloud events, logs, telemetry, or
+  support diagnostics.
+- Check exact clip snapshot, export bounds/handles, required artifact roles,
+  subtitle policy, accepted manifest schemas, settings fingerprint or accepted
+  renderer profiles, and verified hashes before reuse.
+- Leave destination choice, copy/clone behavior, timeline placement, and build
+  history to the scriptwriting product. M6 adds no script editor, cloud clip
+  storage, remote authoring reuse, or second rendering pipeline.
 
-### Optional external catalog projection
+### 7. M7 operational handoff and exit gate
 
-- Keep the existing stable-ID CSV export.
-- Define one-way Sheets publishing only as later optional integration work.
-- Do not include a Sheets export checkbox, Apps Script trigger, polling worker,
-  or hosted job relay in this milestone.
+- Add `LocalRuntimeQuiescence` and a local `drain` command. Draining stops new
+  claims, reports active durable work, lets safe work finish or checkpoint, and
+  declares `safeToStop` only when no child process or source-scratch lifecycle
+  remains active.
+- Expose stable, sanitized operation/failure classes plus opaque correlation IDs
+  for Clip Library, artifact, and export actions.
+- Never place transcript/subtitle text, notes/tags, video URLs, local paths,
+  filenames, credentials, headers, tokens, object keys, commands, or command
+  output in diagnostic fields.
+- Prove shutdown/restart recovery for queued, accepted, executing, completed,
+  failed, and canceled work so M7's desktop supervisor and M8's updater can
+  consume the boundary without changing export semantics.
+- Close M6 only after the browser workflow and simulated same-workstation
+  authoring client pass the revised gate below.
 
-## Explicit non-goals
+## Shared contracts
 
-- Building the script editor or Resolve compiler in this repository.
-- Packaging a nontechnical pilot installer, first-run operator experience,
-  shareable support documentation, or outsourced release QA; Milestone 7 owns
-  that handoff after this product workflow passes.
-- Moving canonical research packages into an authoring project.
-- Mutating or overwriting a package used by an earlier build.
-- Treating a filesystem path as artifact identity.
-- Automatically scanning the entire workstation for missing media.
-- Cloud clip storage unless a separate bounded specification authorizes it.
-- Two-way Google Sheets sync or spreadsheet-driven job requests.
-- Silent regeneration when a completed artifact cannot be found.
+Add or extend schemas for:
 
-## Affected boundaries
+- `ExportRequestOrigin`
+- `ArtifactVersionSummary`
+- `ArtifactCompatibilityRequirements`
+- `ArtifactAvailabilityState`
+- `ArtifactResolutionResult`
+- `ArtifactLocatorSummary`, with no absolute path in shared/cloud forms
+- `ExportStoragePreflight`
+- `LocalRuntimeQuiescence`
+- sanitized `OperationFailure` and opaque correlation metadata
 
-- Shared contracts: batch export commands, artifact summaries, compatibility
-  requirements, resolution results, availability states, and request origin.
-- Cloud catalog/API: authorized clip search/list, request idempotency, package
-  version history, resolution metadata, and logged export status.
-- Local agent/database: locator availability, manifest/hash verification,
-  configured-root lookup, verified relink, and local package reveal.
-- Worker/media: consume Milestone 5 logged-request delivery, same-source
-  grouping, sibling isolation, immutable re-export, progress, retry, and
-  cancellation; extend it only through a separate bounded slice when the
-  artifact-resolution contract proves a missing primitive.
-- Web UI: project Clip Library, selection, batch settings, status, artifact
-  actions, relink, and remediation.
-- Sync: stable project/clip/artifact IDs and offline-safe commands; external
-  projections remain downstream.
+Compatibility requirements include the exact clip snapshot, transcript/track
+versions, export bounds and handles, required artifact roles, subtitle policy,
+accepted manifest schemas, and either an exact settings fingerprint or explicit
+accepted renderer profiles.
 
-Every persistent schema change requires a local and/or cloud migration as
-appropriate. Do not overload the existing export-status field to represent
-current local byte availability; these are separate facts.
+## Cloud capabilities
+
+- Extend project clip listing with bounded search, filters, and pagination.
+- Add completed artifact-version history for a project clip.
+- Add compatibility resolution that returns immutable candidates without any
+  workstation locator.
+- Reuse individual/batch export, retry, cancel, and progress routes with
+  `requestOrigin`.
+- Require current project membership for all shared reads and mutations and
+  preserve idempotency across retries.
+
+## Local-agent capabilities
+
+- List configured roots and locally known availability.
+- Resolve, verify, relink, reveal, or open an artifact version by validated
+  local IDs.
+- Run individual or batch storage preflight.
+- Begin drain and read quiescence state.
+- Return a verified local descriptor to an online-authorized same-workstation
+  authoring client.
+
+When online, local artifact commands validate the matching cloud artifact
+identity and current project authorization. Offline access is limited to
+previously verified local packages already present on that workstation and is
+clearly labeled stale; it cannot create a shared mutation or widen membership.
 
 ## Failure states
 
-- Catalog record is complete but no locator resolves: report `missing`; offer
-  relink or re-export.
-- Located package has the wrong manifest, clip snapshot, settings, or hash:
-  reject it as `invalid`; never adopt by filename alone.
-- Existing package lacks required handles or build-compatible settings: report
-  `incompatible` and offer a new export.
-- Package exists only behind an authorized remote provider: report `remote_only`
-  and request/download through that provider when available.
-- One batch sibling fails acquisition/render/subtitle verification: keep its
-  error and let other siblings continue.
-- Duplicate direct or authoring request: return/adopt the same eligible job or
-  verified package through a stable idempotency key.
-- Re-export succeeds but an older locator remains missing: retain both versions
-  and their independent availability history.
-- Source reacquisition is unavailable or no longer authorized: preserve the
-  clip/transcript record and return actionable remediation; never substitute
-  unrelated footage.
+- Completed history exists but no local locator resolves: return `missing` and
+  offer relink or re-export without rewriting completed provenance.
+- Located bytes fail manifest, snapshot, role, size, or hash verification:
+  return `invalid`; never adopt by filename or location alone.
+- A verified package does not meet the caller's compatibility requirements:
+  return `incompatible` and offer a new export.
+- No compatible version exists: return `needs_export`.
+- A package exists only behind a configured and authorized remote provider:
+  return `remote_only`; otherwise use `missing`.
+- One batch sibling fails, cancels, or runs out of operation-specific space:
+  preserve its actionable state and let siblings continue.
+- A duplicate request is delivered or submitted: adopt the same compatible
+  request/artifact through the existing idempotency boundary.
+- Authorization expires while offline: allow only previously verified local
+  reads/actions and require renewed authorization before cloud mutation or
+  authoring handoff.
+- Drain finds live child/source work: report the blocker and remain unsafe to
+  stop until it completes, checkpoints safely, or reaches a durable terminal
+  state with scratch cleanup.
 
-## Acceptance criteria
+## Revised M6 acceptance gate
 
-1. Project membership is enforced for clip search, artifact history,
-   resolution, export, relink, and any download/reveal capability.
-2. A researcher can search/filter and export one logged clip without reopening
-   its source transcript.
-3. A multi-select batch snapshots resolved settings once per requested clip,
-   isolates sibling failures, and groups compatible same-source work where
-   practical.
-4. Duplicate submission cannot create duplicate active renders or packages.
-5. Completed packages expose immutable IDs, manifest/hash provenance, and a
-   distinct current availability state.
-6. Resolution returns `reusable` only after exact snapshot, compatibility,
-   manifest, required-file, hash, and locator verification.
-7. A moved exact package can be relinked only after full verification.
-8. A missing/invalid/incompatible package can create a new immutable export;
-   no prior package or build snapshot is overwritten.
-9. A simulated authoring client can search a clip, reuse a compatible package,
-   and request one idempotent export when none is reachable.
-10. Direct and authoring origins use the same worker/finalization pipeline and
-    yield the same artifact identity for equivalent requests.
-11. The milestone requires no Google OAuth, spreadsheet, Apps Script, polling
-    relay, or two-way integration.
+1. Three clips from two source videos can be searched, selected,
+   storage-preflighted, and submitted as one batch.
+2. Compatible same-source siblings share acquisition while progress, failure,
+   retry, and cancellation remain independent.
+3. Restart during queued and active work reconstructs the Clip Library and
+   durable job state without duplicate requests or lost packages.
+4. Completed artifact versions show immutable history separately from current
+   workstation availability.
+5. Reveal/open accepts only a verified local locator.
+6. Moving a package yields `missing`; verified relink restores
+   `reusable_local`; tampered or incompatible packages are rejected.
+7. Re-export creates a new immutable artifact version while preserving the
+   missing older version and locator state.
+8. A simulated same-workstation authoring client can search, resolve, reuse, and
+   request a missing compatible artifact without Google Sheets or a second
+   executor.
+9. Cloud responses, project events, and sanitized diagnostics contain no local
+   paths or prohibited sensitive content.
+10. Low disk blocks only the affected acquisition, render, update, model, or
+    tool operation; transcript review and clip logging remain available.
+11. Drain/restart evidence covers queued, accepted, executing, completed,
+    failed, and canceled work and never reports safe stop while child or source
+    scratch activity remains.
 
 ## Verification plan when activated
 
-- Contract tests for resolution/availability unions and idempotency identity.
-- Cloud authorization and batch-command integration tests.
-- Local manifest/hash, missing-locator, configured-root, and relink tests.
-- Worker fixture tests for grouping, sibling isolation, retry, and immutable
-  re-export.
-- Browser tests for Clip Library search/filter, selection, batch request,
-  progress, failure, artifact actions, and remediation.
-- A simulated authoring-consumer integration test covering reuse, relink, and
-  re-export fallback.
-- One small authorized real-source smoke test before the milestone exit gate.
+- Contract tests for request-origin and resolution/availability unions plus
+  compatibility decisions.
+- Cloud membership, bounded listing, artifact-history, authorization,
+  idempotency, retry, and duplicate-delivery tests.
+- Local migration and verified M5 backfill tests.
+- macOS/Windows containment fixtures covering case, Unicode, symlinks,
+  junctions, reserved names, and non-regular files.
+- Manifest, artifact-role, byte-size, hash, missing-locator, relink, tamper, and
+  incompatible-package tests.
+- Storage-estimation tests for unique sources, same-source batching, outputs,
+  active update/checkpoint reserve, the 2 GB margin, and unknown-size recheck.
+- Restart and drain tests across every durable lifecycle state.
+- Browser Clip Library flows for search/filter, pagination, selection, batch
+  request, progress, retry/cancel, offline stale state, and artifact actions.
+- Simulated same-workstation authoring-client integration covering search,
+  resolution, reuse, and idempotent re-export fallback.
+- One small, explicitly authorized real-source smoke before closing M6.
+
+## Explicit non-goals and assumptions
+
+- M5 remains complete and unchanged; M6 composes its existing primitives.
+- Cloud clip storage and remote authoring reuse are outside M6.
+- Google Sheets remains an optional later one-way catalog projection and is not
+  job control.
+- The Electron shell and cloud production deployment belong to M7. Installers,
+  the automatic updater, in-app reporting delivery, and independent pilot QA
+  belong to M8.
+- No M6 slice may begin until it has its own bounded active specification.
