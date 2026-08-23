@@ -18,6 +18,83 @@ import transcriptFixture from "../../../tests/fixtures/transcripts/english-word.
 import { createLocalAgent } from "./app.ts";
 import { LocalRuntimeCoordinator } from "./local-runtime.ts";
 
+describe("desktop launch session", () => {
+  it("requires the exact per-launch secret and trusted origin", async () => {
+    const secret = "s".repeat(64);
+    const app = createLocalAgent({
+      desktopSession: { secret, origin: "rvc://app" },
+      listExportRequests: () => [],
+    });
+
+    for (const headers of [
+      {},
+      {
+        origin: "https://attacker.example",
+        "x-research-video-session": secret,
+      },
+      { origin: "rvc://app", "x-research-video-session": "x".repeat(64) },
+    ]) {
+      const denied = await app.inject({
+        method: "GET",
+        url: "/api/exports",
+        headers,
+      });
+      expect(denied.statusCode).toBe(401);
+    }
+
+    const allowed = await app.inject({
+      method: "GET",
+      url: "/api/exports",
+      headers: {
+        origin: "rvc://app",
+        "x-research-video-session": secret,
+      },
+    });
+    expect(allowed.statusCode).toBe(200);
+    await app.close();
+  });
+
+  it("allows the authenticated desktop main process to drain after sign-out", async () => {
+    const secret = "s".repeat(64);
+    const runtime = new LocalRuntimeCoordinator(() => ({
+      pendingAcceptance: 0,
+      accepted: 0,
+      executing: 0,
+      complete: 0,
+      failed: 0,
+      canceled: 0,
+      needsAttention: 0,
+      recoveryRequired: 0,
+      activeSourceLifecycleCount: 0,
+    }));
+    const authorizeRuntime = vi.fn(async () => {
+      throw new Error("Cloud authorization must not gate desktop shutdown.");
+    });
+    const app = createLocalAgent({
+      desktopSession: { secret, origin: "rvc://app" },
+      runtime,
+      authorizeRuntime,
+    });
+
+    const drained = await app.inject({
+      method: "POST",
+      url: "/api/runtime/drain",
+      headers: {
+        authorization: `Bearer ${secret}`,
+        origin: "rvc://app",
+        "x-research-video-session": secret,
+      },
+    });
+
+    expect(drained.statusCode).toBe(200);
+    expect(drained.json()).toMatchObject({
+      quiescence: { draining: true, safeToStop: true },
+    });
+    expect(authorizeRuntime).not.toHaveBeenCalled();
+    await app.close();
+  });
+});
+
 const apps = new Set<ReturnType<typeof createLocalAgent>>();
 
 afterEach(async () => {

@@ -14,6 +14,7 @@ import {
   UserSchema,
   languagesEquivalent,
   type ClipCandidate,
+  type DesktopAuthStatus,
   type ExportPresetCatalogEntry,
   type ExportPresetDefault,
   type ExportPresetSnapshot,
@@ -41,6 +42,11 @@ import transcriptFixture from "../../../tests/fixtures/transcripts/english-word.
 import multilingualFixture from "../../../tests/fixtures/transcripts/romanian-multilingual.json" with { type: "json" };
 
 import "./styles.css";
+import {
+  apiFetch,
+  desktopBridge,
+  DESKTOP_CONNECTED_SENTINEL,
+} from "./api-client.ts";
 import { BatchWorkspace } from "./batch-workspace.tsx";
 import { YouTubePlayer, type YouTubePlayerHandle } from "./youtube-player.tsx";
 import { VirtualTranscript } from "./virtual-transcript.tsx";
@@ -125,6 +131,8 @@ function App() {
   const [selectionError, setSelectionError] = useState<string>();
   const [previewingSelection, setPreviewingSelection] = useState(false);
   const [authorization, setAuthorization] = useState("");
+  const [desktopAuthStatus, setDesktopAuthStatus] =
+    useState<DesktopAuthStatus>();
   const [user, setUser] = useState<User>();
   const [preferredLanguageDraft, setPreferredLanguageDraft] = useState("en");
   const [preferenceMessage, setPreferenceMessage] = useState(
@@ -204,6 +212,55 @@ function App() {
   const [omitEnglishSubtitles, setOmitEnglishSubtitles] = useState(false);
   const [embedEnglishSubtitles, setEmbedEnglishSubtitles] = useState(false);
   const playerRef = useRef<YouTubePlayerHandle>(null);
+
+  async function refreshDesktopStatus() {
+    const bridge = desktopBridge();
+    if (!bridge) return;
+    const status = await bridge.getStatus();
+    setDesktopAuthStatus(status.auth);
+    setAuthorization(
+      status.auth.state === "signed_in" ? DESKTOP_CONNECTED_SENTINEL : "",
+    );
+  }
+
+  async function beginDesktopSignIn() {
+    const bridge = desktopBridge();
+    if (!bridge) return;
+    await bridge.signIn();
+    await refreshDesktopStatus();
+  }
+
+  async function completeDesktopSignOut() {
+    const bridge = desktopBridge();
+    if (!bridge) return;
+    await bridge.signOut();
+    await refreshDesktopStatus();
+    setProjects([]);
+    setProjectId("");
+    setProjectMessage(undefined);
+  }
+
+  useEffect(() => {
+    void refreshDesktopStatus().catch(() => {
+      setDesktopAuthStatus({
+        state: "unavailable",
+        issue: "authentication_failed",
+      });
+      setAuthorization("");
+    });
+  }, []);
+
+  useEffect(() => {
+    if (
+      !desktopBridge() ||
+      !["signing_in", "refreshing"].includes(desktopAuthStatus?.state ?? "")
+    )
+      return;
+    const timer = window.setInterval(() => {
+      void refreshDesktopStatus().catch(() => undefined);
+    }, 1_000);
+    return () => window.clearInterval(timer);
+  }, [desktopAuthStatus?.state]);
   const transcriptTracks = useMemo(() => {
     if (videoId === demoVideoId) {
       const english = normalizeTranscriptFixture({
@@ -462,9 +519,7 @@ function App() {
       setPreferredLanguageDraft("en");
       return;
     }
-    void fetch("/cloud-api/api/session/profile", {
-      headers: { accept: "application/json", authorization },
-    })
+    void apiFetch("cloud", "/api/session/profile", {}, authorization)
       .then(async (response) => {
         const payload = await response.json();
         if (!response.ok) throw new Error("Unable to load account settings.");
@@ -501,9 +556,7 @@ function App() {
       return;
     }
     setExportOnlySettingsState("loading");
-    void fetch("/cloud-api/api/export-presets", {
-      headers: { accept: "application/json", authorization },
-    })
+    void apiFetch("cloud", "/api/export-presets", {}, authorization)
       .then(async (response) => {
         const payload = await response.json().catch(() => undefined);
         if (!response.ok) {
@@ -555,9 +608,12 @@ function App() {
     );
     if (!authorization || !projectId) return;
     setLoggedSettingsState("loading");
-    void fetch(`/cloud-api/api/projects/${projectId}/export-presets`, {
-      headers: { accept: "application/json", authorization },
-    })
+    void apiFetch(
+      "cloud",
+      `/api/projects/${projectId}/export-presets`,
+      {},
+      authorization,
+    )
       .then(async (response) => {
         const payload = await response.json().catch(() => undefined);
         if (!response.ok) {
@@ -616,7 +672,8 @@ function App() {
     }
     const controller = new AbortController();
     const resolvePreview = async (
-      url: string,
+      target: "cloud" | "local",
+      path: string,
       selection: ExportSettingsSelection,
       setPreview: (preview: ExportSettingsPreview | undefined) => void,
       setState: (state: string) => void,
@@ -624,16 +681,16 @@ function App() {
       setState("resolving");
       setPreview(undefined);
       try {
-        const response = await fetch(url, {
-          method: "POST",
-          headers: {
-            accept: "application/json",
-            authorization,
-            "content-type": "application/json",
+        const response = await apiFetch(
+          target,
+          path,
+          {
+            method: "POST",
+            body: JSON.stringify({ sourceLanguageClass, selection }),
+            signal: controller.signal,
           },
-          body: JSON.stringify({ sourceLanguageClass, selection }),
-          signal: controller.signal,
-        });
+          authorization,
+        );
         const payload = await response.json().catch(() => undefined);
         if (!response.ok) {
           const parsed = ApiErrorSchema.safeParse(payload);
@@ -665,7 +722,8 @@ function App() {
     };
     if (projectId) {
       void resolvePreview(
-        `/cloud-api/api/projects/${projectId}/export-settings/preview`,
+        "cloud",
+        `/api/projects/${projectId}/export-settings/preview`,
         loggedSettingsSelection,
         setLoggedSettingsPreview,
         setLoggedSettingsState,
@@ -675,7 +733,8 @@ function App() {
       setLoggedSettingsState("missing");
     }
     void resolvePreview(
-      "/local-agent/api/export-settings/preview",
+      "local",
+      "/api/export-settings/preview",
       exportOnlySettingsSelection,
       setExportOnlySettingsPreview,
       setExportOnlySettingsState,
@@ -737,15 +796,15 @@ function App() {
   async function savePreferredLanguage() {
     if (!authorization) return;
     try {
-      const response = await fetch("/cloud-api/api/session/profile", {
-        method: "PATCH",
-        headers: {
-          accept: "application/json",
-          authorization,
-          "content-type": "application/json",
+      const response = await apiFetch(
+        "cloud",
+        "/api/session/profile",
+        {
+          method: "PATCH",
+          body: JSON.stringify({ preferredLanguage: preferredLanguageDraft }),
         },
-        body: JSON.stringify({ preferredLanguage: preferredLanguageDraft }),
-      });
+        authorization,
+      );
       const payload = await response.json().catch(() => undefined);
       if (!response.ok) {
         const parsed = ApiErrorSchema.safeParse(payload);
@@ -854,18 +913,18 @@ function App() {
     if (!authorization || !newProjectName.trim()) return;
     setProjectBusy(true);
     try {
-      const response = await fetch("/cloud-api/api/projects", {
-        method: "POST",
-        headers: {
-          accept: "application/json",
-          authorization,
-          "content-type": "application/json",
+      const response = await apiFetch(
+        "cloud",
+        "/api/projects",
+        {
+          method: "POST",
+          body: JSON.stringify({
+            name: newProjectName,
+            description: newProjectDescription,
+          }),
         },
-        body: JSON.stringify({
-          name: newProjectName,
-          description: newProjectDescription,
-        }),
-      });
+        authorization,
+      );
       const payload = await response.json().catch(() => undefined);
       if (!response.ok) {
         const parsed = ApiErrorSchema.safeParse(payload);
@@ -916,15 +975,11 @@ function App() {
     });
     setClipActionBusy(true);
     try {
-      const response = await fetch(
-        `/cloud-api/api/projects/${projectId}/clips`,
+      const response = await apiFetch(
+        "cloud",
+        `/api/projects/${projectId}/clips`,
         {
           method: "POST",
-          headers: {
-            accept: "application/json",
-            authorization,
-            "content-type": "application/json",
-          },
           body: JSON.stringify({
             idempotencyKey: `queue:${selectionCommandId}`,
             video: {
@@ -947,6 +1002,7 @@ function App() {
               .filter(Boolean),
           }),
         },
+        authorization,
       );
       const payload = await response.json().catch(() => undefined);
       if (!response.ok) {
@@ -986,15 +1042,11 @@ function App() {
     if (!clipId) return;
     setClipActionBusy(true);
     try {
-      const response = await fetch(
-        `/cloud-api/api/projects/${projectId}/clips/${clipId}/exports`,
+      const response = await apiFetch(
+        "cloud",
+        `/api/projects/${projectId}/clips/${clipId}/exports`,
         {
           method: "POST",
-          headers: {
-            accept: "application/json",
-            authorization,
-            "content-type": "application/json",
-          },
           body: JSON.stringify({
             idempotencyKey: `logged-export:${selectionCommandId}`,
             requestOrigin: "selection_action",
@@ -1022,6 +1074,7 @@ function App() {
               loggedSettingsPreview.snapshot.resolutionFingerprint,
           }),
         },
+        authorization,
       );
       const payload = await response.json().catch(() => undefined);
       if (!response.ok) {
@@ -1064,48 +1117,51 @@ function App() {
       return;
     setClipActionBusy(true);
     try {
-      const response = await fetch("/local-agent/api/exports", {
-        method: "POST",
-        headers: {
-          accept: "application/json",
-          authorization,
-          "content-type": "application/json",
+      const response = await apiFetch(
+        "local",
+        "/api/exports",
+        {
+          method: "POST",
+          body: JSON.stringify({
+            idempotencyKey: `export-only:${selectionCommandId}`,
+            video: {
+              youtubeVideoId: videoId,
+              canonicalUrl: `https://www.youtube.com/watch?v=${videoId}`,
+              title:
+                videoId === demoVideoId
+                  ? "YouTube IFrame API demo"
+                  : videoId === multilingualDemoVideoId
+                    ? "Romanian multilingual proof fixture"
+                    : `YouTube video ${videoId}`,
+              sourceLanguage: transcriptTracks.original.track.language,
+            },
+            selection,
+            sourceLanguageClass:
+              transcriptTracks.original.track.id ===
+                transcriptTracks.english.track.id &&
+              languagesEquivalent(
+                transcriptTracks.original.track.language,
+                "en",
+              )
+                ? "confirmed_english"
+                : "foreign",
+            subtitleTracks: {
+              original: {
+                trackId: transcriptTracks.original.track.id,
+                trackVersion: transcriptTracks.original.track.version,
+              },
+              english: {
+                trackId: transcriptTracks.english.track.id,
+                trackVersion: transcriptTracks.english.track.version,
+              },
+            },
+            settingsSelection: exportOnlySettingsSelection,
+            expectedResolutionFingerprint:
+              exportOnlySettingsPreview.snapshot.resolutionFingerprint,
+          }),
         },
-        body: JSON.stringify({
-          idempotencyKey: `export-only:${selectionCommandId}`,
-          video: {
-            youtubeVideoId: videoId,
-            canonicalUrl: `https://www.youtube.com/watch?v=${videoId}`,
-            title:
-              videoId === demoVideoId
-                ? "YouTube IFrame API demo"
-                : videoId === multilingualDemoVideoId
-                  ? "Romanian multilingual proof fixture"
-                  : `YouTube video ${videoId}`,
-            sourceLanguage: transcriptTracks.original.track.language,
-          },
-          selection,
-          sourceLanguageClass:
-            transcriptTracks.original.track.id ===
-              transcriptTracks.english.track.id &&
-            languagesEquivalent(transcriptTracks.original.track.language, "en")
-              ? "confirmed_english"
-              : "foreign",
-          subtitleTracks: {
-            original: {
-              trackId: transcriptTracks.original.track.id,
-              trackVersion: transcriptTracks.original.track.version,
-            },
-            english: {
-              trackId: transcriptTracks.english.track.id,
-              trackVersion: transcriptTracks.english.track.version,
-            },
-          },
-          settingsSelection: exportOnlySettingsSelection,
-          expectedResolutionFingerprint:
-            exportOnlySettingsPreview.snapshot.resolutionFingerprint,
-        }),
-      });
+        authorization,
+      );
       const payload = await response.json().catch(() => undefined);
       if (!response.ok) {
         const parsed = ApiErrorSchema.safeParse(payload);
@@ -2107,6 +2163,9 @@ function App() {
       </section>
       <BatchWorkspace
         authorization={authorization}
+        {...(desktopAuthStatus ? { desktopAuthStatus } : {})}
+        onDesktopSignIn={beginDesktopSignIn}
+        onDesktopSignOut={completeDesktopSignOut}
         onAuthorizationChange={(value) => {
           setAuthorization(value);
           setProjects([]);

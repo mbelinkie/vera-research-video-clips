@@ -81,6 +81,18 @@ describe("configuration", () => {
     );
   });
 
+  it("allows only the supervised desktop agent to bind an ephemeral port", () => {
+    expect(
+      loadConfig({
+        APP_RUNTIME_ROLE: "desktop-local",
+        LOCAL_AGENT_PORT: "0",
+      }).localAgentPort,
+    ).toBe(0);
+    expect(() => loadConfig({ LOCAL_AGENT_PORT: "0" })).toThrow(
+      "Only the supervised desktop agent",
+    );
+  });
+
   it("requires an explicit bucket for S3 mode", () => {
     expect(() => loadConfig({ OBJECT_STORE_MODE: "s3" })).toThrow(
       "TRANSCRIPT_BUCKET is required",

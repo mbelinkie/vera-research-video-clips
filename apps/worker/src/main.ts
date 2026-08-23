@@ -45,7 +45,9 @@ if (!config.workerAuthorization) {
     mode: config.captionProvider,
     ytDlpPath: config.ytDlpPath,
   });
-  const baseUrl = `http://${config.cloudApiHost}:${config.cloudApiPort}`;
+  const baseUrl =
+    config.publicApiOrigin ??
+    `http://${config.cloudApiHost}:${config.cloudApiPort}`;
   const controlPlane = new HttpTranscriptionWorkerControlPlane({
     baseUrl,
     authorization: config.workerAuthorization,

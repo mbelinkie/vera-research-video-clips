@@ -140,7 +140,9 @@ const cache = new VerifiedTranscriptCache(
 const reader = new CachedTranscriptDocumentReader(
   new LocalTranscriptIndex(database),
 );
-const cloudApiUrl = `http://${config.cloudApiHost}:${config.cloudApiPort}`;
+const cloudApiUrl =
+  config.publicApiOrigin ??
+  `http://${config.cloudApiHost}:${config.cloudApiPort}`;
 const exportStorageCapacity = createFileSystemStorageCapacityProvider(
   config.dataDir,
 );
@@ -186,6 +188,14 @@ const clipLibraryExports = new ClipLibraryExportOperationService({
   capacity: exportStorageCapacity,
 });
 const app = createLocalAgent({
+  ...(process.env.DESKTOP_SESSION_SECRET
+    ? {
+        desktopSession: {
+          secret: process.env.DESKTOP_SESSION_SECRET,
+          origin: "rvc://app",
+        },
+      }
+    : {}),
   runtime,
   authorizeRuntime: (authorization) =>
     callCloudRuntimeAuthorization(authorization),
@@ -526,8 +536,16 @@ const app = createLocalAgent({
 app.addHook("onClose", () => database.close());
 
 await app.listen({ host: config.localAgentHost, port: config.localAgentPort });
+const localAddress = app.server.address();
+if (!localAddress || typeof localAddress === "string") {
+  throw new Error("Local agent did not bind a TCP loopback port.");
+}
+process.parentPort?.postMessage({
+  type: "local-agent-ready",
+  port: localAddress.port,
+});
 app.log.info(
-  `Local agent listening on http://${config.localAgentHost}:${config.localAgentPort}`,
+  `Local agent listening on http://${config.localAgentHost}:${localAddress.port}`,
 );
 
 async function callCloudRuntimeAuthorization(

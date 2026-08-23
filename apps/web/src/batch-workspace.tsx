@@ -9,6 +9,7 @@ import {
   TranscriptionBatchListResponseSchema,
   type BatchPreflightResponse,
   type CreateTranscriptionBatchResponse,
+  type DesktopAuthStatus,
   type Project,
   type ReviewInboxItem,
   type TranscriptionBatchControlRequest,
@@ -23,10 +24,14 @@ import {
   type CsvImportDocument,
 } from "./csv-import.ts";
 import { ClipQueue } from "./clip-queue.tsx";
+import { apiFetch, isDesktopRuntime } from "./api-client.ts";
 
 type BatchWorkspaceProps = {
   authorization: string;
   onAuthorizationChange(value: string): void;
+  desktopAuthStatus?: DesktopAuthStatus;
+  onDesktopSignIn?(): Promise<void>;
+  onDesktopSignOut?(): Promise<void>;
   onOpenVideo(canonicalUrl: string): void;
   onProjectChange(projectId: string): void;
   onProjectsChange(projects: Project[]): void;
@@ -34,11 +39,12 @@ type BatchWorkspaceProps = {
   projects: readonly Project[];
 };
 
-const apiRoot = "/cloud-api";
-
 export function BatchWorkspace({
   authorization,
   onAuthorizationChange,
+  desktopAuthStatus,
+  onDesktopSignIn,
+  onDesktopSignOut,
   onOpenVideo,
   onProjectChange,
   onProjectsChange,
@@ -74,16 +80,11 @@ export function BatchWorkspace({
     [inputsText],
   );
 
-  async function request(path: string, init: RequestInit = {}) {
-    const response = await fetch(`${apiRoot}${path}`, {
-      ...init,
-      headers: {
-        accept: "application/json",
-        authorization,
-        ...(init.body ? { "content-type": "application/json" } : {}),
-        ...init.headers,
-      },
-    });
+  async function request(
+    path: string,
+    init: Pick<RequestInit, "body" | "method" | "signal"> = {},
+  ) {
+    const response = await apiFetch("cloud", path, init, authorization);
     const payload = await response.json().catch(() => undefined);
     if (!response.ok) {
       const parsed = ApiErrorSchema.safeParse(payload);
@@ -321,26 +322,74 @@ export function BatchWorkspace({
       </div>
 
       <div className="session-panel">
-        <label htmlFor="development-authorization">
-          Development session credential
-        </label>
-        <div className="loader-row">
-          <input
-            id="development-authorization"
-            type="password"
-            autoComplete="off"
-            value={authorization}
-            onChange={(event) => onAuthorizationChange(event.target.value)}
-            placeholder="Bearer user-uuid|external-subject"
-          />
-          <button
-            type="button"
-            disabled={busy || !authorization}
-            onClick={connect}
-          >
-            Connect
-          </button>
-        </div>
+        {isDesktopRuntime() ? (
+          <>
+            <p>
+              Desktop account:{" "}
+              {desktopAuthStatus?.state.replaceAll("_", " ") ?? "checking"}
+            </p>
+            {desktopAuthStatus?.state === "unavailable" ? (
+              <p role="status">
+                {desktopAuthenticationIssue(desktopAuthStatus)}
+              </p>
+            ) : null}
+            <div className="loader-row">
+              {desktopAuthStatus?.state === "signed_in" ? (
+                <>
+                  <button
+                    type="button"
+                    disabled={busy || !authorization}
+                    onClick={connect}
+                  >
+                    Connect
+                  </button>
+                  <button
+                    type="button"
+                    disabled={busy || !onDesktopSignOut}
+                    onClick={() => void onDesktopSignOut?.()}
+                  >
+                    Sign out
+                  </button>
+                </>
+              ) : (
+                <button
+                  type="button"
+                  disabled={
+                    busy ||
+                    !onDesktopSignIn ||
+                    desktopAuthStatus?.state === "unavailable"
+                  }
+                  onClick={() => void onDesktopSignIn?.()}
+                >
+                  Sign in
+                </button>
+              )}
+            </div>
+          </>
+        ) : (
+          <>
+            <label htmlFor="development-authorization">
+              Development session credential
+            </label>
+            <div className="loader-row">
+              <input
+                id="development-authorization"
+                type="password"
+                autoComplete="off"
+                value={authorization}
+                onChange={(event) => onAuthorizationChange(event.target.value)}
+                placeholder="Bearer user-uuid|external-subject"
+              />
+              <button
+                type="button"
+                disabled={busy || !authorization}
+                onClick={connect}
+              >
+                Connect
+              </button>
+            </div>
+          </>
+        )}
         <p className="form-message" role="status">
           {message}
         </p>
@@ -722,4 +771,14 @@ function BatchDetail({
 
 function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : "Unexpected request failure.";
+}
+
+function desktopAuthenticationIssue(status: DesktopAuthStatus): string {
+  if (status.issue === "protected_storage_unavailable") {
+    return "macOS protected credential storage is unavailable. No token was retained.";
+  }
+  if (status.issue === "configuration_required") {
+    return "Cloud sign-in configuration is required before this desktop app can connect.";
+  }
+  return "Desktop sign-in is unavailable. Try signing in again.";
 }

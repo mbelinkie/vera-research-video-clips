@@ -2,44 +2,10 @@ import {
   forwardRef,
   useEffect,
   useImperativeHandle,
+  useMemo,
   useRef,
   useState,
 } from "react";
-
-type PlayerStateEvent = { data: number };
-type PlayerErrorEvent = { data: number };
-
-type YouTubePlayerInstance = {
-  cueVideoById(videoId: string): void;
-  destroy(): void;
-  getCurrentTime(): number;
-  pauseVideo(): void;
-  playVideo(): void;
-  seekTo(seconds: number, allowSeekAhead: boolean): void;
-};
-
-type YouTubeNamespace = {
-  Player: new (
-    element: HTMLElement,
-    options: {
-      videoId: string;
-      playerVars: Record<string, string | number>;
-      events: {
-        onReady(): void;
-        onStateChange(event: PlayerStateEvent): void;
-        onError(event: PlayerErrorEvent): void;
-      };
-    },
-  ) => YouTubePlayerInstance;
-  PlayerState: { PLAYING: number };
-};
-
-declare global {
-  interface Window {
-    YT?: YouTubeNamespace;
-    onYouTubeIframeAPIReady?: () => void;
-  }
-}
 
 export type YouTubePlayerHandle = {
   seekTo(milliseconds: number): boolean;
@@ -52,104 +18,107 @@ type YouTubePlayerProps = {
   onTimeChange(milliseconds: number): void;
 };
 
-let apiPromise: Promise<YouTubeNamespace> | undefined;
+const playerOrigin = "https://www.youtube-nocookie.com";
 
-function loadYouTubeApi(): Promise<YouTubeNamespace> {
-  if (window.YT?.Player) return Promise.resolve(window.YT);
-  if (apiPromise) return apiPromise;
-  apiPromise = new Promise((resolve, reject) => {
-    const previousReady = window.onYouTubeIframeAPIReady;
-    window.onYouTubeIframeAPIReady = () => {
-      previousReady?.();
-      if (window.YT?.Player) resolve(window.YT);
-      else reject(new Error("YouTube player API loaded without a Player."));
-    };
-    const existing = document.querySelector<HTMLScriptElement>(
-      'script[src="https://www.youtube.com/iframe_api"]',
-    );
-    if (existing) return;
-    const script = document.createElement("script");
-    script.src = "https://www.youtube.com/iframe_api";
-    script.async = true;
-    script.onerror = () =>
-      reject(new Error("YouTube player API failed to load."));
-    document.head.append(script);
-  });
-  return apiPromise;
-}
-
+/**
+ * The privileged desktop renderer never imports YouTube JavaScript. Commands
+ * cross only the isolated iframe's postMessage boundary, so remote player code
+ * cannot see the preload bridge or invoke authenticated desktop IPC.
+ */
 export const YouTubePlayer = forwardRef<
   YouTubePlayerHandle,
   YouTubePlayerProps
 >(function YouTubePlayer({ videoId, onTimeChange }, forwardedRef) {
-  const mountRef = useRef<HTMLDivElement>(null);
-  const playerRef = useRef<YouTubePlayerInstance | undefined>(undefined);
+  const iframeRef = useRef<HTMLIFrameElement>(null);
   const playingRef = useRef(false);
+  const latestTimeMs = useRef(0);
   const [state, setState] = useState<"loading" | "ready" | "error">("loading");
+  const source = useMemo(() => {
+    const parameters = new URLSearchParams({
+      enablejsapi: "1",
+      playsinline: "1",
+      origin: window.location.origin,
+    });
+    return `${playerOrigin}/embed/${encodeURIComponent(videoId)}?${parameters}`;
+  }, [videoId]);
+
+  const command = (name: string, args: readonly unknown[] = []): boolean => {
+    const target = iframeRef.current?.contentWindow;
+    if (!target) return false;
+    target.postMessage(
+      JSON.stringify({ event: "command", func: name, args }),
+      playerOrigin,
+    );
+    return true;
+  };
 
   useImperativeHandle(
     forwardedRef,
     () => ({
       seekTo(milliseconds) {
-        if (!playerRef.current) return false;
-        playerRef.current.seekTo(milliseconds / 1_000, true);
+        latestTimeMs.current = milliseconds;
+        if (!command("seekTo", [milliseconds / 1_000, true])) return false;
         onTimeChange(milliseconds);
         return true;
       },
-      play() {
-        if (!playerRef.current) return false;
-        playerRef.current.playVideo();
-        return true;
-      },
-      pause() {
-        if (!playerRef.current) return false;
-        playerRef.current.pauseVideo();
-        return true;
-      },
+      play: () => command("playVideo"),
+      pause: () => command("pauseVideo"),
     }),
     [onTimeChange],
   );
 
   useEffect(() => {
-    let disposed = false;
-    const interval = window.setInterval(() => {
-      if (!playingRef.current || !playerRef.current) return;
-      onTimeChange(
-        Math.max(0, Math.round(playerRef.current.getCurrentTime() * 1_000)),
-      );
-    }, 250);
-
-    void loadYouTubeApi()
-      .then((youtube) => {
-        if (disposed || !mountRef.current) return;
-        playerRef.current = new youtube.Player(mountRef.current, {
-          videoId,
-          playerVars: {
-            playsinline: 1,
-            origin: window.location.origin,
-          },
-          events: {
-            onReady: () => setState("ready"),
-            onStateChange: (event) => {
-              playingRef.current = event.data === youtube.PlayerState.PLAYING;
-            },
-            onError: () => setState("error"),
-          },
-        });
-      })
-      .catch(() => setState("error"));
-
-    return () => {
-      disposed = true;
-      window.clearInterval(interval);
-      playerRef.current?.destroy();
-      playerRef.current = undefined;
+    const receivePlayerMessage = (event: MessageEvent) => {
+      if (
+        event.origin !== playerOrigin ||
+        event.source !== iframeRef.current?.contentWindow
+      ) {
+        return;
+      }
+      const message = parsePlayerMessage(event.data);
+      if (!message) return;
+      const playerState = message.info?.playerState;
+      if (typeof playerState === "number") {
+        playingRef.current = playerState === 1;
+        setState("ready");
+      }
+      const seconds = message.info?.currentTime;
+      if (typeof seconds === "number" && Number.isFinite(seconds)) {
+        latestTimeMs.current = Math.max(0, Math.round(seconds * 1_000));
+        onTimeChange(latestTimeMs.current);
+      }
     };
-  }, [onTimeChange, videoId]);
+    window.addEventListener("message", receivePlayerMessage);
+    return () => window.removeEventListener("message", receivePlayerMessage);
+  }, [onTimeChange]);
+
+  useEffect(() => {
+    const interval = window.setInterval(() => {
+      if (playingRef.current) command("getCurrentTime");
+    }, 250);
+    return () => window.clearInterval(interval);
+  });
 
   return (
     <div className="player-frame" data-player-state={state}>
-      <div ref={mountRef} className="player-mount" />
+      <iframe
+        ref={iframeRef}
+        className="player-mount"
+        src={source}
+        title="YouTube video player"
+        sandbox="allow-scripts allow-same-origin allow-presentation"
+        allow="encrypted-media; fullscreen; picture-in-picture"
+        allowFullScreen
+        referrerPolicy="strict-origin-when-cross-origin"
+        onLoad={() => {
+          setState("ready");
+          iframeRef.current?.contentWindow?.postMessage(
+            JSON.stringify({ event: "listening" }),
+            playerOrigin,
+          );
+        }}
+        onError={() => setState("error")}
+      />
       {state !== "ready" ? (
         <div className="player-status" role="status">
           {state === "error" ? "Player unavailable" : "Loading YouTube player…"}
@@ -158,3 +127,19 @@ export const YouTubePlayer = forwardRef<
     </div>
   );
 });
+
+function parsePlayerMessage(
+  value: unknown,
+): { info?: { playerState?: unknown; currentTime?: unknown } } | undefined {
+  try {
+    const parsed =
+      typeof value === "string" ? (JSON.parse(value) as unknown) : value;
+    if (typeof parsed !== "object" || parsed === null) return undefined;
+    const info = (parsed as { info?: unknown }).info;
+    return typeof info === "object" && info !== null
+      ? { info: info as { playerState?: unknown; currentTime?: unknown } }
+      : {};
+  } catch {
+    return undefined;
+  }
+}

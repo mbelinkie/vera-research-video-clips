@@ -81,6 +81,10 @@ import type { LocalExportOnceResult } from "./export-run-once.ts";
 import type { LocalRuntimeCoordinator } from "./local-runtime.ts";
 
 export interface LocalAgentDependencies {
+  desktopSession?: {
+    secret: string;
+    origin: string;
+  };
   runtime?: Pick<
     LocalRuntimeCoordinator,
     "beginDrain" | "getQuiescence" | "beginOperation" | "isDraining"
@@ -316,6 +320,13 @@ async function withLocalWorkerCapability(
 export function createLocalAgent(
   dependencies?: LocalAgentDependencies,
 ): FastifyInstance {
+  if (
+    dependencies?.desktopSession &&
+    (dependencies.desktopSession.secret.length < 43 ||
+      dependencies.desktopSession.origin !== "rvc://app")
+  ) {
+    throw new RangeError("Desktop launch-session configuration is invalid.");
+  }
   const app = Fastify({ logger: false });
   const requestCorrelations = new WeakMap<object, string>();
   const requestRuntimeOperations = new WeakMap<object, () => void>();
@@ -339,6 +350,19 @@ export function createLocalAgent(
     done();
   });
   app.addHook("preHandler", async (request) => {
+    if (dependencies?.desktopSession && request.url !== "/health") {
+      const suppliedSession = request.headers["x-research-video-session"];
+      const origin = request.headers.origin;
+      if (
+        typeof suppliedSession !== "string" ||
+        suppliedSession !== dependencies.desktopSession.secret ||
+        origin !== dependencies.desktopSession.origin
+      ) {
+        throw new LocalAuthenticationError(
+          "The desktop launch session is required for local access.",
+        );
+      }
+    }
     if (
       !dependencies?.runtime ||
       !tracksRuntimeOperation(request.method, request.url)
@@ -403,12 +427,17 @@ export function createLocalAgent(
     }),
   );
 
-  if (dependencies?.runtime && dependencies.authorizeRuntime) {
+  if (
+    dependencies?.runtime &&
+    (dependencies.authorizeRuntime || dependencies.desktopSession)
+  ) {
     app.post("/api/runtime/drain", async (request) => {
       const authorization = requireRuntimeAuthorization(
         request.headers.authorization,
       );
-      await dependencies.authorizeRuntime!(authorization);
+      if (!dependencies.desktopSession) {
+        await dependencies.authorizeRuntime!(authorization);
+      }
       return LocalRuntimeDrainResultSchema.parse(
         dependencies.runtime!.beginDrain(),
       );
@@ -417,7 +446,9 @@ export function createLocalAgent(
       const authorization = requireRuntimeAuthorization(
         request.headers.authorization,
       );
-      await dependencies.authorizeRuntime!(authorization);
+      if (!dependencies.desktopSession) {
+        await dependencies.authorizeRuntime!(authorization);
+      }
       return LocalRuntimeQuiescenceSchema.parse(
         dependencies.runtime!.getQuiescence(),
       );

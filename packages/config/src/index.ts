@@ -12,13 +12,15 @@ const LoopbackHostSchema = z
   );
 
 const PortSchema = z.coerce.number().int().min(1).max(65_535);
+const LocalAgentPortSchema = z.coerce.number().int().min(0).max(65_535);
 const MillisecondsSchema = z.coerce.number().int().min(1).max(60_000);
 
 export const AppConfigSchema = z
   .object({
     nodeEnv: z.enum(["development", "test", "production"]),
+    runtimeRole: z.enum(["cloud-api", "desktop-local", "desktop-worker"]),
     localAgentHost: LoopbackHostSchema,
-    localAgentPort: PortSchema,
+    localAgentPort: LocalAgentPortSchema,
     cloudApiHost: z.string().min(1),
     cloudApiPort: PortSchema,
     publicApiOrigin: z.url().optional(),
@@ -67,6 +69,14 @@ export const AppConfigSchema = z
     workerLeaseSeconds: z.coerce.number().int().min(30).max(900),
   })
   .superRefine((config, context) => {
+    if (config.localAgentPort === 0 && config.runtimeRole !== "desktop-local") {
+      context.addIssue({
+        code: "custom",
+        path: ["localAgentPort"],
+        message:
+          "Only the supervised desktop agent may request an ephemeral port",
+      });
+    }
     if (config.objectStoreMode === "s3" && !config.transcriptBucket) {
       context.addIssue({
         code: "custom",
@@ -121,7 +131,7 @@ export const AppConfigSchema = z
         }
       }
     }
-    if (config.nodeEnv === "production") {
+    if (config.nodeEnv === "production" && config.runtimeRole === "cloud-api") {
       const productionRequirements = [
         [
           config.cloudDatabaseMode === "postgres",
@@ -193,6 +203,7 @@ export type AppConfig = z.infer<typeof AppConfigSchema>;
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   return AppConfigSchema.parse({
     nodeEnv: env.NODE_ENV ?? "development",
+    runtimeRole: env.APP_RUNTIME_ROLE ?? "cloud-api",
     localAgentHost: env.LOCAL_AGENT_HOST ?? "127.0.0.1",
     localAgentPort: env.LOCAL_AGENT_PORT ?? 43_110,
     cloudApiHost: env.CLOUD_API_HOST ?? "127.0.0.1",

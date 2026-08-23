@@ -901,7 +901,10 @@ describe("one-shot local export runtime", () => {
     );
     const database = openLocalDatabase(join(root, "local.sqlite"));
     try {
-      const queue = new LocalExportQueue(database);
+      const queue = new LocalExportQueue(
+        database,
+        () => new Date("2026-08-20T12:00:08.000Z"),
+      );
       for (const requestId of [first.requestId, second.requestId]) {
         const delivery = queue.getAcceptedLoggedDelivery(requestId)!;
         queue.activateLoggedExecution({

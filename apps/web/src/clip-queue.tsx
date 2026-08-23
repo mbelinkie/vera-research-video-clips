@@ -21,6 +21,7 @@ import {
   type ExportStoragePreflight,
   type LocalClipLibraryPage,
 } from "@research-video/contracts";
+import { apiFetch } from "./api-client.ts";
 
 type CloudRequest = (path: string, init?: RequestInit) => Promise<unknown>;
 
@@ -80,7 +81,7 @@ export function ClipQueue({
     restoreLatest = false,
   ) {
     if (restoreLatest) {
-      return `/local-agent/api/projects/${projectId}/clip-library/latest`;
+      return `/api/projects/${projectId}/clip-library/latest`;
     }
     const parameters = new URLSearchParams({
       limit: "25",
@@ -93,7 +94,7 @@ export function ClipQueue({
       parameters.set("researchStatus", researchFilter);
     if (!resetFilters && statusFilter !== "all")
       parameters.set("exportStatus", statusFilter);
-    return `/local-agent/api/projects/${projectId}/clip-library?${parameters}`;
+    return `/api/projects/${projectId}/clip-library?${parameters}`;
   }
 
   async function reload(
@@ -105,11 +106,11 @@ export function ClipQueue({
     const generation = ++requestGeneration.current;
     setBusy(true);
     try {
-      const response = await fetch(
+      const response = await apiFetch(
+        "local",
         pagePath(cursor, resetFilters, restoreLatest),
-        {
-          headers: { accept: "application/json", authorization },
-        },
+        {},
+        authorization,
       );
       if (restoreLatest && response.status === 503) {
         await reload(undefined, true);
@@ -217,9 +218,7 @@ export function ClipQueue({
             ]);
           })
           .catch(() => undefined);
-        void fetch("/local-agent/api/artifact-roots", {
-          headers: { accept: "application/json", authorization },
-        })
+        void apiFetch("local", "/api/artifact-roots", {}, authorization)
           .then(async (response) => {
             if (!response.ok) return undefined;
             return ArtifactRootListResponseSchema.parse(await response.json());
@@ -363,20 +362,17 @@ export function ClipQueue({
     setConfirmUnknownSources(false);
     setReexportArtifactVersionId(undefined);
     try {
-      const response = await fetch(
-        `/local-agent/api/projects/${projectId}/clip-library/selection`,
+      const response = await apiFetch(
+        "local",
+        `/api/projects/${projectId}/clip-library/selection`,
         {
           method: "PUT",
-          headers: {
-            accept: "application/json",
-            authorization,
-            "content-type": "application/json",
-          },
           body: JSON.stringify({
             pageClipIds: [clipId],
             selectedClipIds: checked ? [clipId] : [],
           }),
         },
+        authorization,
       );
       const payload: unknown = await response.json().catch(() => undefined);
       if (!response.ok) throw new Error("Unable to persist clip selection.");
@@ -407,15 +403,11 @@ export function ClipQueue({
     setConfirmUnknownSources(false);
     setMessage("Resolving immutable settings and measuring storage…");
     try {
-      const response = await fetch(
-        `/local-agent/api/projects/${projectId}/clip-library/export-preflight`,
+      const response = await apiFetch(
+        "local",
+        `/api/projects/${projectId}/clip-library/export-preflight`,
         {
           method: "POST",
-          headers: {
-            accept: "application/json",
-            authorization,
-            "content-type": "application/json",
-          },
           body: JSON.stringify({
             clipIds,
             settingsSelection,
@@ -424,6 +416,7 @@ export function ClipQueue({
               : {}),
           }),
         },
+        authorization,
       );
       const payload: unknown = await response.json().catch(() => undefined);
       if (!response.ok) throw apiError(payload, "Unable to preflight export.");
@@ -456,15 +449,11 @@ export function ClipQueue({
     setBusy(true);
     setMessage("Submitting the durable export command…");
     try {
-      const response = await fetch(
-        `/local-agent/api/projects/${projectId}/clip-library/exports`,
+      const response = await apiFetch(
+        "local",
+        `/api/projects/${projectId}/clip-library/exports`,
         {
           method: "POST",
-          headers: {
-            accept: "application/json",
-            authorization,
-            "content-type": "application/json",
-          },
           body: JSON.stringify({
             clipIds: [...selected].toSorted(),
             settingsSelection,
@@ -473,6 +462,7 @@ export function ClipQueue({
             confirmUnknownSourceSizes: confirmUnknownSources,
           }),
         },
+        authorization,
       );
       const payload: unknown = await response.json().catch(() => undefined);
       if (!response.ok) throw apiError(payload, "Unable to submit export.");
@@ -510,19 +500,16 @@ export function ClipQueue({
     const generation = requestGeneration.current;
     setBusy(true);
     try {
-      const response = await fetch(
-        `/cloud-api/api/projects/${projectId}/export-requests/${requestId}/${action}`,
+      const response = await apiFetch(
+        "cloud",
+        `/api/projects/${projectId}/export-requests/${requestId}/${action}`,
         {
           method: "POST",
-          headers: {
-            accept: "application/json",
-            authorization,
-            "content-type": "application/json",
-          },
           body: JSON.stringify({
             idempotencyKey: `clip-library-${action}:${requestId}`,
           }),
         },
+        authorization,
       );
       const payload: unknown = await response.json().catch(() => undefined);
       if (!response.ok)
@@ -561,15 +548,11 @@ export function ClipQueue({
           : "h264_mp4";
     setBusy(true);
     try {
-      const response = await fetch(
-        `/local-agent/api/projects/${projectId}/clips/${clip.id}/artifact-resolution`,
+      const response = await apiFetch(
+        "local",
+        `/api/projects/${projectId}/clips/${clip.id}/artifact-resolution`,
         {
           method: "POST",
-          headers: {
-            accept: "application/json",
-            authorization,
-            "content-type": "application/json",
-          },
           body: JSON.stringify({
             requirements: {
               clipId: clip.id,
@@ -610,6 +593,7 @@ export function ClipQueue({
             },
           }),
         },
+        authorization,
       );
       const payload: unknown = await response.json().catch(() => undefined);
       if (!response.ok) throw apiError(payload, "Unable to resolve artifact.");
@@ -647,20 +631,17 @@ export function ClipQueue({
     const generation = requestGeneration.current;
     setBusy(true);
     try {
-      const response = await fetch(
-        `/local-agent/api/artifact-locators/${locatorId}/${action}`,
+      const response = await apiFetch(
+        "local",
+        `/api/artifact-locators/${locatorId}/${action}`,
         {
           method: "POST",
-          headers: {
-            accept: "application/json",
-            authorization,
-            "content-type": "application/json",
-          },
           body:
             action === "relink"
               ? JSON.stringify({ targetRootId })
               : JSON.stringify({}),
         },
+        authorization,
       );
       const payload: unknown = await response.json().catch(() => undefined);
       if (!response.ok)
@@ -697,9 +678,11 @@ export function ClipQueue({
   async function downloadCsv() {
     setBusy(true);
     try {
-      const response = await fetch(
-        `/cloud-api/api/projects/${projectId}/clips.csv`,
-        { headers: { authorization } },
+      const response = await apiFetch(
+        "cloud",
+        `/api/projects/${projectId}/clips.csv`,
+        {},
+        authorization,
       );
       if (!response.ok) throw new Error("Unable to export the project CSV.");
       const blob = await response.blob();

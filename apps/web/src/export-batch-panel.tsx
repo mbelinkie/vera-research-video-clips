@@ -10,6 +10,7 @@ import {
   type ClipCandidate,
   type LoggedExportBatch,
 } from "@research-video/contracts";
+import { apiFetch } from "./api-client.ts";
 
 export function ExportBatchPanel(props: {
   authorization: string;
@@ -23,12 +24,11 @@ export function ExportBatchPanel(props: {
 
   async function loadClips(signal?: AbortSignal) {
     if (!props.authorization || !props.projectId) return;
-    const response = await fetch(
-      `/cloud-api/api/projects/${props.projectId}/clips`,
-      {
-        headers: { authorization: props.authorization },
-        ...(signal ? { signal } : {}),
-      },
+    const response = await apiFetch(
+      "cloud",
+      `/api/projects/${props.projectId}/clips`,
+      signal ? { signal } : {},
+      props.authorization,
     );
     const payload: unknown = await response.json();
     if (!response.ok) throw apiError(payload, "Unable to load batch clips.");
@@ -56,9 +56,11 @@ export function ExportBatchPanel(props: {
     if (!batch || ["complete", "mixed_terminal"].includes(batch.summary.status))
       return;
     const timer = window.setInterval(() => {
-      void fetch(
-        `/cloud-api/api/projects/${props.projectId}/export-batches/${batch.id}`,
-        { headers: { authorization: props.authorization } },
+      void apiFetch(
+        "cloud",
+        `/api/projects/${props.projectId}/export-batches/${batch.id}`,
+        {},
+        props.authorization,
       )
         .then(async (response) => {
           const payload: unknown = await response.json();
@@ -87,19 +89,17 @@ export function ExportBatchPanel(props: {
             base: "context_default" as const,
             overrides: {},
           };
-          const previewResponse = await fetch(
-            `/cloud-api/api/projects/${props.projectId}/export-settings/preview`,
+          const previewResponse = await apiFetch(
+            "cloud",
+            `/api/projects/${props.projectId}/export-settings/preview`,
             {
               method: "POST",
-              headers: {
-                authorization: props.authorization,
-                "content-type": "application/json",
-              },
               body: JSON.stringify({
                 sourceLanguageClass,
                 selection: settingsSelection,
               }),
             },
+            props.authorization,
           );
           const previewPayload: unknown = await previewResponse.json();
           if (!previewResponse.ok)
@@ -151,19 +151,17 @@ export function ExportBatchPanel(props: {
           })),
         ),
       );
-      const response = await fetch(
-        `/cloud-api/api/projects/${props.projectId}/export-batches`,
+      const response = await apiFetch(
+        "cloud",
+        `/api/projects/${props.projectId}/export-batches`,
         {
           method: "POST",
-          headers: {
-            authorization: props.authorization,
-            "content-type": "application/json",
-          },
           body: JSON.stringify({
             idempotencyKey: `web-batch:${commandFingerprint}`,
             items,
           }),
         },
+        props.authorization,
       );
       const payload: unknown = await response.json();
       if (!response.ok)

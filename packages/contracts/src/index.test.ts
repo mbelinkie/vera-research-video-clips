@@ -23,6 +23,8 @@ import {
   CreateClipExportRequestSchema,
   CreateLoggedExportBatchRequestSchema,
   CreateTranscriptionBatchRequestSchema,
+  DesktopApiRequestSchema,
+  DesktopStatusSchema,
   ExportRequestOriginSchema,
   ExportClipManifestSchema,
   ExportClipMetadataSchema,
@@ -72,6 +74,7 @@ import {
   UpdatePreferredLanguageRequestSchema,
   WorkerTranslateTranscriptRequestSchema,
   languagesEquivalent,
+  primaryLanguage,
 } from "./index.ts";
 
 const now = "2026-08-01T12:00:00.000Z";
@@ -1111,6 +1114,8 @@ describe("shared contracts", () => {
       }),
     ).toEqual({ preferredLanguage: "es-MX" });
     expect(languagesEquivalent("en-US", "en-GB")).toBe(true);
+    expect(primaryLanguage("und")).toBe("und");
+    expect(primaryLanguage("mul")).toBe("mul");
     expect(
       UpdatePreferredLanguageRequestSchema.safeParse({
         preferredLanguage: "not a language",
@@ -1626,6 +1631,50 @@ function deliveryContractFixture() {
     },
   };
 }
+
+describe("desktop boundary contracts", () => {
+  it("accepts only closed token-free renderer requests", () => {
+    expect(
+      DesktopApiRequestSchema.parse({
+        target: "cloud",
+        method: "POST",
+        path: "/api/projects?limit=25",
+        body: "{}",
+        contentType: "application/json",
+      }),
+    ).not.toHaveProperty("authorization");
+    expect(() =>
+      DesktopApiRequestSchema.parse({
+        target: "local",
+        method: "DELETE",
+        path: "/api/runtime/drain",
+        authorization: "Bearer secret",
+      }),
+    ).toThrow();
+    for (const path of [
+      "/api/%2e%2e/session",
+      "/api/%2E./session",
+      "/api/%2f%2fevil.example",
+      "/api/..\\session",
+    ]) {
+      expect(() =>
+        DesktopApiRequestSchema.parse({
+          target: "cloud",
+          method: "GET",
+          path,
+        }),
+      ).toThrow();
+    }
+  });
+
+  it("keeps desktop status closed and credential-free", () => {
+    const status = DesktopStatusSchema.parse({
+      auth: { state: "signed_in", expiresAt: "2026-08-23T21:00:00.000Z" },
+      services: [{ service: "local_agent", state: "healthy", restartCount: 0 }],
+    });
+    expect(JSON.stringify(status)).not.toMatch(/token|path|authorization/i);
+  });
+});
 
 function successResultContractFixture() {
   const requestId = "019fbb95-cd76-7920-93fa-e23ba755ee51";

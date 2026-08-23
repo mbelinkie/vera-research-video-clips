@@ -1,8 +1,10 @@
 {
   "name": "research-video-clip-tool",
+  "productName": "Research Video Clips",
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "main": "dist/desktop/main.cjs",
   "engines": {
     "node": ">=22"
   },
@@ -13,6 +15,7 @@
   "scripts": {
     "aws:deploy": "bash scripts/deploy-aws.sh",
     "build": "npm run typecheck && npm run build:web",
+    "build:desktop": "npm run build:web && node --import tsx scripts/build-desktop.ts",
     "build:web": "vite build --config apps/web/vite.config.ts",
     "check": "npm run format:check && npm run typecheck && npm run test && npm run build:web && npm run db:migrate:local:test && npm run db:migrate:cloud:test",
     "db:migrate:cloud:test": "node --import tsx packages/db-cloud/src/cli.ts --test",
@@ -23,6 +26,7 @@
     "dev:local-agent": "node --import tsx apps/local-agent/src/main.ts",
     "dev:web": "vite --config apps/web/vite.config.ts",
     "dev:worker": "node --import tsx apps/worker/src/main.ts",
+    "desktop:package:x64": "npm run build:desktop && node_modules/node/bin/node node_modules/@electron-forge/cli/dist/electron-forge-package.js --platform=darwin --arch=x64",
     "export:recover-source-scratch": "node --import tsx apps/local-agent/src/export-scratch-sweeper.ts",
     "export:live-smoke": "node --import tsx apps/local-agent/src/live-youtube-smoke.ts",
     "export:run-once": "node --import tsx apps/local-agent/src/export-run-once.ts",
@@ -46,12 +50,16 @@
     "zod": "^4.4.3"
   },
   "devDependencies": {
+    "@electron-forge/cli": "7.11.2",
     "@playwright/test": "^1.62.1",
     "@types/node": "^26.1.2",
     "@types/react": "^19.2.18",
     "@types/react-dom": "^19.2.4",
     "@vitejs/plugin-react": "^6.0.5",
     "concurrently": "^10.0.4",
+    "electron": "43.4.1",
+    "esbuild": "0.28.1",
+    "node": "22.23.2",
     "prettier": "^3.9.6",
     "tsx": "^4.23.1",
     "typescript": "^7.0.2",

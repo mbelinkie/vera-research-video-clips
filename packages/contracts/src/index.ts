@@ -16,7 +16,10 @@ export function normalizeLanguageTag(value: string): string {
 }
 
 export function primaryLanguage(value: string): string {
-  return new Intl.Locale(normalizeLanguageTag(value)).language.toLowerCase();
+  const normalized = normalizeLanguageTag(value);
+  return (
+    new Intl.Locale(normalized).language ?? normalized.split("-", 1)[0]!
+  ).toLowerCase();
 }
 
 export function languagesEquivalent(left: string, right: string): boolean {
@@ -54,6 +57,104 @@ export const AuthenticatedActorSchema = z.object({
   userId: IdSchema,
   externalSubject: z.string().min(1).max(512),
 });
+
+export const DesktopAuthStatusSchema = z
+  .object({
+    state: z.enum([
+      "signed_out",
+      "signing_in",
+      "signed_in",
+      "refreshing",
+      "unavailable",
+    ]),
+    expiresAt: UtcTimestampSchema.optional(),
+    issue: z
+      .enum([
+        "protected_storage_unavailable",
+        "configuration_required",
+        "authentication_failed",
+        "session_expired",
+      ])
+      .optional(),
+  })
+  .strict();
+
+export const DesktopServiceStatusSchema = z
+  .object({
+    service: z.enum(["local_agent", "transcription_worker"]),
+    state: z.enum([
+      "stopped",
+      "starting",
+      "healthy",
+      "backing_off",
+      "draining",
+      "failed",
+    ]),
+    restartCount: z.number().int().min(0).max(5),
+    issue: z
+      .enum([
+        "spawn_failed",
+        "health_timeout",
+        "unexpected_exit",
+        "drain_timeout",
+      ])
+      .optional(),
+  })
+  .strict();
+
+export const DesktopStatusSchema = z
+  .object({
+    auth: DesktopAuthStatusSchema,
+    services: z.array(DesktopServiceStatusSchema).max(2),
+  })
+  .strict();
+
+export const DesktopApiRequestSchema = z
+  .object({
+    target: z.enum(["cloud", "local"]),
+    method: z.enum(["GET", "POST", "PUT", "PATCH"]),
+    path: z
+      .string()
+      .min(4)
+      .max(2_048)
+      .regex(/^\/api\/[A-Za-z0-9?&=._~!$'()*+,;:@%\/-]*$/),
+    body: z.string().max(2_000_000).optional(),
+    contentType: z.literal("application/json").optional(),
+  })
+  .strict()
+  .superRefine((request, context) => {
+    let canonical: URL;
+    try {
+      canonical = new URL(request.path, "https://desktop.invalid");
+    } catch {
+      context.addIssue({
+        code: "custom",
+        path: ["path"],
+        message: "Desktop API path must be canonical.",
+      });
+      return;
+    }
+    if (
+      canonical.origin !== "https://desktop.invalid" ||
+      !canonical.pathname.startsWith("/api/") ||
+      request.path.includes("\\") ||
+      /%(?:2e|2f|5c)/iu.test(request.path.split("?", 1)[0] ?? "")
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["path"],
+        message: "Desktop API path must remain inside /api/.",
+      });
+    }
+  });
+
+export const DesktopApiResponseSchema = z
+  .object({
+    status: z.number().int().min(100).max(599),
+    body: z.string().max(4_000_000),
+    contentType: z.string().max(160).optional(),
+  })
+  .strict();
 
 export const UserSchema = z.object({
   id: IdSchema,
@@ -4157,6 +4258,11 @@ export type TranscriptionJobPayload = z.infer<
   typeof TranscriptionJobPayloadSchema
 >;
 export type HealthResponse = z.infer<typeof HealthResponseSchema>;
+export type DesktopAuthStatus = z.infer<typeof DesktopAuthStatusSchema>;
+export type DesktopServiceStatus = z.infer<typeof DesktopServiceStatusSchema>;
+export type DesktopStatus = z.infer<typeof DesktopStatusSchema>;
+export type DesktopApiRequest = z.infer<typeof DesktopApiRequestSchema>;
+export type DesktopApiResponse = z.infer<typeof DesktopApiResponseSchema>;
 export type RegisteredExportWorker = z.infer<
   typeof RegisteredExportWorkerSchema
 >;

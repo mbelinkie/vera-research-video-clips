@@ -1927,7 +1927,10 @@ describe("logged export delivery import", () => {
     temporaryDirectories.add(directory);
     const database = openLocalDatabase(join(directory, "group.sqlite"));
     runLocalMigrations(database);
-    const queue = new LocalExportQueue(database);
+    const queue = new LocalExportQueue(
+      database,
+      () => new Date("2026-08-20T12:00:08.000Z"),
+    );
     const batchId = "019fbb95-cd76-7920-93fa-e23ba755ef20";
     const firstBase = fixtureLoggedDelivery();
     const first: LoggedExportDelivery = {
