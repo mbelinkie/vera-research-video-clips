@@ -18,6 +18,12 @@ import {
   ExportSettingsPreviewRequestSchema,
   ProcessAcceptedLoggedExportRequestSchema,
   ProcessAcceptedLoggedExportResponseSchema,
+  ReadinessReportSchema,
+  SetupActionSchema,
+  SetupSnapshotSchema,
+  type ReadinessReport,
+  type SetupAction,
+  type SetupSnapshot,
   type HeartbeatExportWorkerRequest,
   type ArtifactLocatorSummary,
   type ArtifactRootSummary,
@@ -80,10 +86,87 @@ import type { WorkspaceTranscriptResolution } from "@research-video/sync";
 import type { LocalExportOnceResult } from "./export-run-once.ts";
 import type { LocalRuntimeCoordinator } from "./local-runtime.ts";
 
+const DesktopModelPinSchema = z
+  .object({
+    displayName: z.string().trim().min(1).max(160),
+    expectedBytes: z
+      .number()
+      .int()
+      .positive()
+      .max(8 * 1024 * 1024 * 1024),
+    expectedSha256: z.string().regex(/^[a-f0-9]{64}$/u),
+    version: z.string().trim().min(1).max(160),
+  })
+  .strict();
+
+const DesktopNativeSelectionSchema = z.discriminatedUnion("target", [
+  z
+    .object({
+      target: z.enum(["output_root", "cache_root"]),
+      path: z.string().min(1).max(4_096),
+    })
+    .strict(),
+  z
+    .object({
+      target: z.enum(["ffmpeg", "ffprobe", "yt_dlp", "whisper_cli"]),
+      path: z.string().min(1).max(4_096),
+    })
+    .strict(),
+  z
+    .object({
+      target: z.literal("whisper_model"),
+      path: z.string().min(1).max(4_096),
+      pin: DesktopModelPinSchema,
+    })
+    .strict(),
+]);
+
+const DesktopModelActivationSchema = z
+  .object({
+    target: z.literal("whisper_model"),
+    path: z.string().min(1).max(4_096),
+    pin: DesktopModelPinSchema,
+  })
+  .strict();
+
 export interface LocalAgentDependencies {
   desktopSession?: {
     secret: string;
     origin: string;
+  };
+  desktopNativeActionSecret?: string;
+  desktopSetup?: {
+    getSnapshot(): SetupSnapshot;
+    updateSetup(action: SetupAction): SetupSnapshot;
+    getReadinessReport(): Promise<ReadinessReport>;
+    selectRoot(input: {
+      target: "output_root" | "cache_root";
+      absolutePath: string;
+      displayName?: string;
+    }): Promise<SetupSnapshot>;
+    selectTool(input: {
+      target: "ffmpeg" | "ffprobe" | "yt_dlp" | "whisper_cli";
+      absolutePath: string;
+      displayName?: string;
+    }): Promise<SetupSnapshot>;
+    activateWhisperModel(input: {
+      absolutePath: string;
+      pin: {
+        displayName: string;
+        expectedBytes: number;
+        expectedSha256: string;
+        version: string;
+      };
+    }): Promise<SetupSnapshot>;
+    getTrustedRuntimeConfig(): Readonly<{
+      outputRoot: string | undefined;
+      cacheRoot: string | undefined;
+      ffmpeg: string | undefined;
+      ffprobe: string | undefined;
+      ytDlp: string | undefined;
+      whisperCli: string | undefined;
+      whisperModel: string | undefined;
+    }>;
   };
   runtime?: Pick<
     LocalRuntimeCoordinator,
@@ -327,6 +410,14 @@ export function createLocalAgent(
   ) {
     throw new RangeError("Desktop launch-session configuration is invalid.");
   }
+  if (
+    dependencies?.desktopSetup &&
+    (!dependencies.desktopSession ||
+      !dependencies.desktopNativeActionSecret ||
+      dependencies.desktopNativeActionSecret.length < 43)
+  ) {
+    throw new RangeError("Desktop native-action configuration is invalid.");
+  }
   const app = Fastify({ logger: false });
   const requestCorrelations = new WeakMap<object, string>();
   const requestRuntimeOperations = new WeakMap<object, () => void>();
@@ -426,6 +517,90 @@ export function createLocalAgent(
       timestamp: new Date().toISOString(),
     }),
   );
+
+  if (dependencies?.desktopSetup) {
+    app.get("/api/desktop-setup", async () =>
+      SetupSnapshotSchema.parse(dependencies.desktopSetup!.getSnapshot()),
+    );
+    app.get("/api/readiness", async () =>
+      ReadinessReportSchema.parse(
+        await dependencies.desktopSetup!.getReadinessReport(),
+      ),
+    );
+    app.post("/api/desktop-setup/actions", async (request) =>
+      SetupSnapshotSchema.parse(
+        dependencies.desktopSetup!.updateSetup(
+          SetupActionSchema.parse(request.body),
+        ),
+      ),
+    );
+    app.post("/api/desktop-setup/native-selection", async (request, reply) => {
+      requireDesktopNativeAction(request, dependencies);
+      const body = DesktopNativeSelectionSchema.parse(request.body);
+      const snapshot =
+        body.target === "output_root" || body.target === "cache_root"
+          ? await dependencies.desktopSetup!.selectRoot({
+              target: body.target,
+              absolutePath: body.path,
+            })
+          : body.target === "whisper_model"
+            ? await dependencies.desktopSetup!.activateWhisperModel({
+                absolutePath: body.path,
+                pin: body.pin,
+              })
+            : await dependencies.desktopSetup!.selectTool({
+                target: body.target,
+                absolutePath: body.path,
+              });
+      return reply.send(SetupSnapshotSchema.parse(snapshot));
+    });
+    app.post(
+      "/api/desktop-setup/model-download/activate",
+      async (request, reply) => {
+        requireDesktopNativeAction(request, dependencies);
+        const body = DesktopModelActivationSchema.parse(request.body);
+        return reply.send(
+          SetupSnapshotSchema.parse(
+            await dependencies.desktopSetup!.activateWhisperModel({
+              absolutePath: body.path,
+              pin: body.pin,
+            }),
+          ),
+        );
+      },
+    );
+    app.get("/api/desktop-setup/runtime-config", async (request, reply) => {
+      requireDesktopNativeAction(request, dependencies);
+      const readiness = await dependencies.desktopSetup!.getReadinessReport();
+      const ready = new Set(
+        readiness.components
+          .filter((component) => component.state === "ready")
+          .map((component) => component.component),
+      );
+      const stored = dependencies.desktopSetup!.getTrustedRuntimeConfig();
+      return reply.send({
+        ...(ready.has("output_root") && stored.outputRoot
+          ? { outputRoot: stored.outputRoot }
+          : {}),
+        ...(ready.has("cache_root") && stored.cacheRoot
+          ? { cacheRoot: stored.cacheRoot }
+          : {}),
+        ...(ready.has("ffmpeg") && stored.ffmpeg
+          ? { ffmpeg: stored.ffmpeg }
+          : {}),
+        ...(ready.has("ffprobe") && stored.ffprobe
+          ? { ffprobe: stored.ffprobe }
+          : {}),
+        ...(ready.has("yt_dlp") && stored.ytDlp ? { ytDlp: stored.ytDlp } : {}),
+        ...(ready.has("whisper_cli") && stored.whisperCli
+          ? { whisperCli: stored.whisperCli }
+          : {}),
+        ...(ready.has("whisper_model") && stored.whisperModel
+          ? { whisperModel: stored.whisperModel }
+          : {}),
+      });
+    });
+  }
 
   if (
     dependencies?.runtime &&
@@ -1516,11 +1691,28 @@ function requireRuntimeAuthorization(
   return authorization;
 }
 
+function requireDesktopNativeAction(
+  request: FastifyRequest,
+  dependencies: LocalAgentDependencies,
+): void {
+  const supplied = request.headers["x-research-video-native-action"];
+  if (
+    typeof supplied !== "string" ||
+    !dependencies.desktopNativeActionSecret ||
+    supplied !== dependencies.desktopNativeActionSecret
+  ) {
+    throw new LocalAuthenticationError(
+      "The desktop native-action session is required for this operation.",
+    );
+  }
+}
+
 function tracksRuntimeOperation(method: string, url: string): boolean {
   return (
     !["GET", "HEAD", "OPTIONS"].includes(method) &&
     url.startsWith("/api/") &&
     !url.startsWith("/api/runtime/") &&
+    !url.startsWith("/api/desktop-setup") &&
     url !== "/api/export-deliveries/claim" &&
     url !== "/api/export-deliveries/process"
   );
@@ -1613,7 +1805,11 @@ const SafeLocalErrorCodes = new Set([
   "export_storage_unknown_confirmation_required",
   "identity_mismatch",
   "incompatible",
+  "invalid_model",
+  "invalid_path",
+  "invalid_root",
   "invalid_request",
+  "invalid_tool",
   "launch_failed",
   "logged_export_delivery_not_accepted",
   "logged_export_execution_ownership_mismatch",
@@ -1621,6 +1817,8 @@ const SafeLocalErrorCodes = new Set([
   "not_found",
   "runtime_draining",
   "runtime_operation_conflict",
+  "model_pin_invalid",
+  "tool_probe_failed",
   "unsupported",
   "worker_registration_required",
 ]);

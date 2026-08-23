@@ -30,6 +30,7 @@ import {
   LocalArtifactLocatorRepository,
   LocalClipLibraryCacheRepository,
   LocalExportWorkerIdentityRepository,
+  LocalDesktopSetupRepository,
   LocalTranscriptIndex,
   openLocalDatabase,
   runLocalMigrations,
@@ -65,6 +66,7 @@ import {
   ClipLibraryExportOperationService,
   createFileSystemStorageCapacityProvider,
   createPostAcquisitionExportStorageGuard,
+  estimateOutputPackageBytes,
 } from "./export-storage-preflight.ts";
 import { runLocalSourceScratchSweep } from "./export-scratch-sweeper.ts";
 import {
@@ -73,14 +75,67 @@ import {
 } from "./export-run-once.ts";
 import { LocalLoggedExportSourceGroupCoordinator } from "./shared-source-group.ts";
 import { LocalRuntimeCoordinator } from "./local-runtime.ts";
+import { LocalDesktopSetupService } from "./desktop-setup.ts";
 
 const config = loadConfig();
 await mkdir(config.dataDir, { recursive: true });
-const managedExportRoot = join(config.dataDir, "exports");
-await mkdir(managedExportRoot, { recursive: true });
 const database = openLocalDatabase(join(config.dataDir, "local.sqlite"));
 runLocalMigrations(database);
 const exportQueue = new LocalExportQueue(database);
+const desktopSetupRepository = new LocalDesktopSetupRepository(database);
+const desktopSetup = new LocalDesktopSetupService(desktopSetupRepository, {
+  measuredOperationBytes: (target) =>
+    target === "output_root" ? measurePendingExportOutputBytes(exportQueue) : 0,
+});
+const startupReadiness = await desktopSetup.getReadinessReport();
+const readyComponents = new Set(
+  startupReadiness.components
+    .filter((component) => component.state === "ready")
+    .map((component) => component.component),
+);
+const storedDesktopConfig = desktopSetup.getTrustedRuntimeConfig();
+const trustedDesktopConfig = {
+  outputRoot: readyComponents.has("output_root")
+    ? storedDesktopConfig.outputRoot
+    : undefined,
+  cacheRoot: readyComponents.has("cache_root")
+    ? storedDesktopConfig.cacheRoot
+    : undefined,
+  ffmpeg: readyComponents.has("ffmpeg")
+    ? storedDesktopConfig.ffmpeg
+    : undefined,
+  ffprobe: readyComponents.has("ffprobe")
+    ? storedDesktopConfig.ffprobe
+    : undefined,
+  ytDlp: readyComponents.has("yt_dlp") ? storedDesktopConfig.ytDlp : undefined,
+  whisperCli: readyComponents.has("whisper_cli")
+    ? storedDesktopConfig.whisperCli
+    : undefined,
+  whisperModel: readyComponents.has("whisper_model")
+    ? storedDesktopConfig.whisperModel
+    : undefined,
+};
+const persistedDesktopSetup = desktopSetup.getSnapshot().setup;
+const isDesktopRuntime = Boolean(process.env.DESKTOP_SESSION_SECRET);
+const unconfiguredTool = (name: string) =>
+  join(config.dataDir, ".unconfigured-tools", name);
+const ffmpegPath =
+  trustedDesktopConfig.ffmpeg ??
+  (isDesktopRuntime ? unconfiguredTool("ffmpeg") : "ffmpeg");
+const ffprobePath =
+  trustedDesktopConfig.ffprobe ??
+  (isDesktopRuntime ? unconfiguredTool("ffprobe") : "ffprobe");
+const ytDlpPath =
+  trustedDesktopConfig.ytDlp ??
+  (isDesktopRuntime ? unconfiguredTool("yt-dlp") : config.ytDlpPath);
+const managedExportRoot = trustedDesktopConfig.outputRoot
+  ? join(trustedDesktopConfig.outputRoot, "Research Video Clips Exports")
+  : join(config.dataDir, "exports");
+const transcriptCacheRoot = trustedDesktopConfig.cacheRoot
+  ? join(trustedDesktopConfig.cacheRoot, "Research Video Clips Cache")
+  : join(config.dataDir, "transcript-cache");
+await mkdir(managedExportRoot, { recursive: true });
+await mkdir(transcriptCacheRoot, { recursive: true });
 const runtime = new LocalRuntimeCoordinator(() =>
   exportQueue.getRuntimeQuiescenceEvidence(),
 );
@@ -101,41 +156,54 @@ await artifactLocators.configureRoot({
 });
 await runLocalSourceScratchSweep(
   { recoverOrphanedGroups: true },
-  { queue: exportQueue, dataRoot: config.dataDir },
+  { queue: exportQueue, dataRoot: managedExportRoot },
 );
 const workerIdentity = new LocalExportWorkerIdentityRepository(database);
 const capabilityProvider = new FfmpegCapabilityDiscoveryProvider({
   runner: mediaRunner,
+  executable: ffmpegPath,
 });
 const sourceProvider = createExportSourceAcquisitionProvider(
   {
-    mode: config.exportSourceProvider,
-    ytDlpPath: config.ytDlpPath,
+    mode: persistedDesktopSetup
+      ? persistedDesktopSetup.exportSourceProvider === "yt_dlp"
+        ? "yt-dlp"
+        : "disabled"
+      : isDesktopRuntime
+        ? "disabled"
+        : config.exportSourceProvider,
+    ytDlpPath,
   },
   mediaRunner,
 );
-const sourceInspector = new FfprobeMediaInspector({ runner: mediaRunner });
+const sourceInspector = new FfprobeMediaInspector({
+  runner: mediaRunner,
+  executable: ffprobePath,
+});
 const rangeRenderer = new FfmpegCapabilityRangeRenderer({
   runner: mediaRunner,
+  executable: ffmpegPath,
 });
 const thumbnailExtractor = new FfmpegJpegThumbnailExtractor({
   runner: mediaRunner,
+  executable: ffmpegPath,
 });
 const thumbnailInspector = new FfprobeJpegThumbnailInspector({
   runner: mediaRunner,
+  executable: ffprobePath,
 });
 const sharedSourceCoordinator = sourceProvider
   ? new LocalLoggedExportSourceGroupCoordinator(
       exportQueue,
       sourceProvider,
       sourceInspector,
-      config.dataDir,
+      managedExportRoot,
     )
   : undefined;
 const cache = new VerifiedTranscriptCache(
   database,
   new HttpArtifactDownloader(),
-  join(config.dataDir, "transcript-cache"),
+  transcriptCacheRoot,
 );
 const reader = new CachedTranscriptDocumentReader(
   new LocalTranscriptIndex(database),
@@ -143,9 +211,8 @@ const reader = new CachedTranscriptDocumentReader(
 const cloudApiUrl =
   config.publicApiOrigin ??
   `http://${config.cloudApiHost}:${config.cloudApiPort}`;
-const exportStorageCapacity = createFileSystemStorageCapacityProvider(
-  config.dataDir,
-);
+const exportStorageCapacity =
+  createFileSystemStorageCapacityProvider(managedExportRoot);
 const exportStorageGuard = createPostAcquisitionExportStorageGuard(
   exportStorageCapacity,
 );
@@ -194,6 +261,9 @@ const app = createLocalAgent({
           secret: process.env.DESKTOP_SESSION_SECRET,
           origin: "rvc://app",
         },
+        desktopNativeActionSecret:
+          process.env.DESKTOP_NATIVE_ACTION_SECRET ?? "",
+        desktopSetup,
       }
     : {}),
   runtime,
@@ -480,12 +550,14 @@ const app = createLocalAgent({
       capabilityProvider,
       ...(sharedSourceCoordinator ? { sharedSourceCoordinator } : {}),
       storageGuard: exportStorageGuard,
-      dataRoot: config.dataDir,
+      dataRoot: managedExportRoot,
+      exportRoot: managedExportRoot,
     }),
   discardCompletedLoggedExportForCancellation: (requestId, reason) =>
     discardCompletedLoggedExportForCancellation(requestId, reason, {
       queue: exportQueue,
-      dataRoot: config.dataDir,
+      dataRoot: managedExportRoot,
+      exportRoot: managedExportRoot,
     }),
   reconcileLoggedExportSuccess: async ({ request, authorization }) =>
     callCloudLoggedExportSuccessReconcile(request, authorization),
@@ -929,4 +1001,27 @@ async function callCloudDelivery(
     );
   }
   return payload;
+}
+
+function measurePendingExportOutputBytes(queue: LocalExportQueue): number {
+  let measured = 0;
+  for (const request of queue.list()) {
+    if (
+      !["queued", "processing", "needs_user_action"].includes(request.state) ||
+      !request.resolvedSettingsSnapshot
+    ) {
+      continue;
+    }
+    const output = estimateOutputPackageBytes(
+      request.selection.exportEndMs - request.selection.exportStartMs,
+      request.resolvedSettingsSnapshot.settings,
+    );
+    measured += output * 2;
+    if (!Number.isSafeInteger(measured)) {
+      throw new Error(
+        "Pending export storage measurement exceeds safe bounds.",
+      );
+    }
+  }
+  return measured;
 }

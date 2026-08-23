@@ -99,6 +99,7 @@ describe("one-shot local export runtime", () => {
     let acquisitionCalls = 0;
     let inspectionCalls = 0;
     let renderCalls = 0;
+    const selectedExportRoot = join(root, "selected-output");
     const sourceProvider = fixtureSourceProvider(() => {
       acquisitionCalls += 1;
     });
@@ -121,6 +122,7 @@ describe("one-shot local export runtime", () => {
           },
           readVersion: (signal) => renderer.readVersion(signal),
         },
+        exportRoot: selectedExportRoot,
       },
     );
 
@@ -153,6 +155,7 @@ describe("one-shot local export runtime", () => {
           },
           readVersion: (signal) => renderer.readVersion(signal),
         },
+        exportRoot: selectedExportRoot,
       },
     );
 
@@ -176,7 +179,7 @@ describe("one-shot local export runtime", () => {
     expect(renderCalls).toBe(1);
 
     const packageIdentity = `clip-${firstAttempt.requestId}`;
-    const packageDirectory = join(root, "exports", packageIdentity);
+    const packageDirectory = join(selectedExportRoot, packageIdentity);
     const packageEntries = await readdir(packageDirectory);
     expect(packageEntries.sort()).toEqual([
       `${packageIdentity}.en.srt`,
@@ -187,7 +190,7 @@ describe("one-shot local export runtime", () => {
       "manifest.json",
     ]);
     expect(
-      (await readdir(join(root, "exports"))).filter((entry) =>
+      (await readdir(selectedExportRoot)).filter((entry) =>
         entry.startsWith("."),
       ),
     ).toEqual([]);
@@ -323,6 +326,7 @@ describe("one-shot local export runtime", () => {
         sourceProvider,
         inspector: inspection,
         renderer,
+        exportRoot: selectedExportRoot,
       },
     );
     expect(replay.status).toBe("already_complete");
@@ -353,7 +357,7 @@ describe("one-shot local export runtime", () => {
       state: "needs_user_action",
       error: { code: "fixture_acquisition_failed" },
     });
-    expect(await readdir(join(root, "exports"))).toEqual([packageIdentity]);
+    expect(await readdir(selectedExportRoot)).toEqual([packageIdentity]);
   });
 
   it("proves the deterministic 30-second foreign-language fixture gate", async () => {

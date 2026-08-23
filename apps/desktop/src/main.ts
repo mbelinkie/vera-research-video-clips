@@ -5,9 +5,12 @@ import { extname, join, relative, resolve, sep } from "node:path";
 import {
   app,
   BrowserWindow,
+  dialog,
   ipcMain,
+  net,
   protocol,
   utilityProcess,
+  type OpenDialogOptions,
   type UtilityProcess,
 } from "electron";
 
@@ -18,8 +21,18 @@ import {
   DesktopAuthStatusSchema,
   DesktopServiceStatusSchema,
   DesktopStatusSchema,
+  HealthResponseSchema,
+  ModelDownloadProgressSchema,
+  ReadinessReportSchema,
+  SetupActionSchema,
+  SetupSelectionTargetSchema,
+  SetupSnapshotSchema,
+  type ComponentHealth,
   type DesktopAuthStatus,
   type DesktopServiceStatus,
+  type ModelDownloadProgress,
+  type SetupSelectionTarget,
+  type SetupSnapshot,
 } from "@research-video/contracts";
 
 import { DesktopAuthenticationBroker } from "./auth/broker.ts";
@@ -34,8 +47,25 @@ import {
   MainProcessRefreshTokenFile,
   managedLoginBrowser,
 } from "./electron-auth-adapters.ts";
-import { desktopIpcChannels, requireTrustedRenderer } from "./ipc.ts";
+import {
+  desktopIpcChannels,
+  isPrivateDesktopSetupPath,
+  requireTrustedRenderer,
+} from "./ipc.ts";
+import {
+  applyModelPinAvailability,
+  mergeDesktopReadiness,
+  modelDownloadCanCancel,
+  parseTrustedRuntimePaths,
+  resolveWorkerConfiguration,
+  setupActionRequiresRuntimeRestart,
+  shouldRunTranscriptionWorker,
+} from "./desktop-setup-policy.ts";
 import { LocalAgentEndpointRegistry } from "./local-agent-endpoint.ts";
+import {
+  ModelDownloadCanceledError,
+  downloadPinnedModel,
+} from "./model-download.ts";
 import { loadDesktopRuntimeConfiguration } from "./runtime-config.ts";
 import {
   LocalServiceSupervisor,
@@ -51,6 +81,7 @@ const desktopRoot = __dirname;
 const rendererRoot = resolve(desktopRoot, "../web");
 const serviceRoot = resolve(desktopRoot, "services");
 const sessionSecret = randomBytes(32).toString("base64url");
+const nativeActionSecret = randomBytes(32).toString("base64url");
 const pendingCallbacks: string[] = [];
 
 protocol.registerSchemesAsPrivileged([
@@ -163,6 +194,8 @@ if (!app.requestSingleInstanceLock()) {
           userData,
           workerCloudOrigin: cloudProxy?.origin,
           sessionSecret,
+          nativeActionSecret,
+          getLocalAgentPort: () => localAgentEndpoint.currentPort() ?? 0,
           reportLocalAgentPort: (port) => {
             localAgentEndpoint.activate(port);
           },
@@ -185,7 +218,11 @@ if (!app.requestSingleInstanceLock()) {
       getPublicApiOrigin: () => publicApiOrigin,
       getLocalAgentPort: () => localAgentEndpoint.currentPort() ?? 0,
       getStartupAuthIssue: () => startupAuthIssue,
+      getWhisperModelPin: () => configuration?.whisperModelPin,
+      getModelsDirectory: () => join(userData, "models"),
       sessionSecret,
+      nativeActionSecret,
+      getMainWindow: () => mainWindow,
     });
     mainWindow = createMainWindow();
     await mainWindow.loadURL("rvc://app/index.html");
@@ -312,17 +349,164 @@ function installIpcHandlers(options: {
   getSupervisor(): LocalServiceSupervisor | undefined;
   getPublicApiOrigin(): string | undefined;
   getLocalAgentPort(): number;
+  getWhisperModelPin():
+    | {
+        name: string;
+        url: string;
+        byteSize: number;
+        sha256: string;
+      }
+    | undefined;
+  getModelsDirectory(): string;
+  getMainWindow(): BrowserWindow | undefined;
   getStartupAuthIssue():
     "configuration_required" | "protected_storage_unavailable";
   sessionSecret: string;
+  nativeActionSecret: string;
 }) {
+  let activeModelDownload:
+    | {
+        controller: AbortController;
+        progress: ModelDownloadProgress;
+      }
+    | undefined;
+  const updateModelDownloadProgress = (progress: ModelDownloadProgress) => {
+    activeModelDownload = activeModelDownload
+      ? { ...activeModelDownload, progress }
+      : activeModelDownload;
+    options
+      .getMainWindow()
+      ?.webContents.send(
+        desktopIpcChannels.modelDownloadProgress,
+        ModelDownloadProgressSchema.parse(progress),
+      );
+    return progress;
+  };
+  const requestSetup = async (
+    path: string,
+    init: { method: "GET" | "POST"; body?: unknown; native?: boolean },
+  ): Promise<unknown> => {
+    const port = options.getLocalAgentPort();
+    if (port === 0) throw new Error("Desktop setup service is unavailable.");
+    const response = await fetch(`http://127.0.0.1:${port}${path}`, {
+      method: init.method,
+      headers: {
+        accept: "application/json",
+        authorization: `Bearer ${options.sessionSecret}`,
+        origin: trustedRendererOrigin,
+        "x-research-video-session": options.sessionSecret,
+        ...(init.native
+          ? { "x-research-video-native-action": options.nativeActionSecret }
+          : {}),
+        ...(init.body === undefined
+          ? {}
+          : { "content-type": "application/json" }),
+      },
+      ...(init.body === undefined ? {} : { body: JSON.stringify(init.body) }),
+      redirect: "error",
+    });
+    if (!response.ok) {
+      const failure = (await response.json().catch(() => undefined)) as
+        { error?: { code?: unknown } } | undefined;
+      const code = failure?.error?.code;
+      const message =
+        code === "invalid_root" || code === "invalid_path"
+          ? "The selected folder is not a canonical writable folder."
+          : code === "invalid_tool" || code === "tool_probe_failed"
+            ? "The selected executable is missing required capabilities or changed during validation."
+            : code === "invalid_model" || code === "model_pin_invalid"
+              ? "The selected Whisper model does not match the configured size and SHA-256."
+              : "Desktop setup action failed.";
+      throw new Error(message);
+    }
+    return response.json();
+  };
+  const readSetup = async () =>
+    SetupSnapshotSchema.parse(
+      await requestSetup("/api/desktop-setup", { method: "GET" }),
+    );
+  const readLocalReadiness = async () =>
+    ReadinessReportSchema.parse(
+      await requestSetup("/api/readiness", { method: "GET" }),
+    );
+  const reconcileTranscriptionWorker = async () => {
+    const supervisor = options.getSupervisor();
+    const broker = options.getBroker();
+    if (!supervisor || options.getLocalAgentPort() === 0) return;
+    let shouldRun = false;
+    try {
+      const [snapshot, localReadiness] = await Promise.all([
+        readSetup(),
+        readLocalReadiness(),
+      ]);
+      shouldRun = shouldRunTranscriptionWorker({
+        signedIn: broker?.getRendererStatus().state === "signed_in",
+        snapshot,
+        localReadiness,
+      });
+    } catch {
+      shouldRun = false;
+    }
+    const worker = supervisor
+      .getStatus()
+      .find((status) => status.service === "transcription-worker");
+    if (shouldRun) await supervisor.start("transcription-worker");
+    else if (worker && worker.state !== "stopped") {
+      await supervisor.stop("transcription-worker");
+    }
+  };
+  const restartConfiguredRuntime = async () => {
+    const supervisor = options.getSupervisor();
+    if (!supervisor) return;
+    await supervisor.stop("transcription-worker");
+    const drain = (await requestSetup("/api/runtime/drain", {
+      method: "POST",
+    })) as { quiescence?: { draining?: unknown; safeToStop?: unknown } };
+    let safe =
+      drain.quiescence?.draining === true &&
+      drain.quiescence.safeToStop === true;
+    for (let attempt = 0; !safe && attempt < 40; attempt += 1) {
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 250));
+      const result = (await requestSetup("/api/runtime/quiescence", {
+        method: "GET",
+      })) as { draining?: unknown; safeToStop?: unknown };
+      safe = result.draining === true && result.safeToStop === true;
+    }
+    if (!safe) {
+      throw new Error(
+        "Local work is still active; setup will apply after it drains.",
+      );
+    }
+    await supervisor.stop("local-agent");
+    await supervisor.start("local-agent");
+    await reconcileTranscriptionWorker();
+  };
+  const readReadiness = async () => {
+    const localReport = await readLocalReadiness();
+    const checkedAt = new Date().toISOString();
+    const local = applyModelPinAvailability(
+      localReport,
+      Boolean(options.getWhisperModelPin()),
+      checkedAt,
+    );
+    const external = await desktopReadinessComponents({
+      checkedAt,
+      broker: options.getBroker(),
+      supervisor: options.getSupervisor(),
+      publicApiOrigin: options.getPublicApiOrigin(),
+    });
+    return mergeDesktopReadiness({
+      checkedAt,
+      local,
+      external,
+    });
+  };
+
   ipcMain.handle(desktopIpcChannels.getStatus, async (event) => {
     requireTrustedRenderer(event);
     const broker = options.getBroker();
     await broker?.drainNativeCallbacks();
-    if (broker?.getRendererStatus().state === "signed_in") {
-      await options.getSupervisor()?.start("transcription-worker");
-    }
+    await reconcileTranscriptionWorker();
     return DesktopStatusSchema.parse({
       auth: rendererAuthStatus(broker, options.getStartupAuthIssue()),
       services: rendererServiceStatus(options.getSupervisor()),
@@ -347,24 +531,206 @@ function installIpcHandlers(options: {
       rendererAuthStatus(broker, options.getStartupAuthIssue()),
     );
   });
+  ipcMain.handle(desktopIpcChannels.getSetup, async (event) => {
+    requireTrustedRenderer(event);
+    return readSetup();
+  });
+  ipcMain.handle(desktopIpcChannels.getReadiness, async (event) => {
+    requireTrustedRenderer(event);
+    return ReadinessReportSchema.parse(await readReadiness());
+  });
+  ipcMain.handle(desktopIpcChannels.updateSetup, async (event, rawAction) => {
+    requireTrustedRenderer(event);
+    const action = SetupActionSchema.parse(rawAction);
+    const snapshot = SetupSnapshotSchema.parse(
+      await requestSetup("/api/desktop-setup/actions", {
+        method: "POST",
+        body: action,
+      }),
+    );
+    if (setupActionRequiresRuntimeRestart(action)) {
+      await restartConfiguredRuntime();
+    } else {
+      await reconcileTranscriptionWorker();
+    }
+    return snapshot;
+  });
+  ipcMain.handle(
+    desktopIpcChannels.chooseSetupTarget,
+    async (event, rawTarget) => {
+      requireTrustedRenderer(event);
+      const target = SetupSelectionTargetSchema.parse(rawTarget);
+      const dialogOptions: OpenDialogOptions = {
+        title: dialogTitleForSetupTarget(target),
+        properties:
+          target === "output_root" || target === "cache_root"
+            ? ["openDirectory", "createDirectory", "noResolveAliases"]
+            : ["openFile", "noResolveAliases"],
+      };
+      const parent = options.getMainWindow();
+      const selected = parent
+        ? await dialog.showOpenDialog(parent, dialogOptions)
+        : await dialog.showOpenDialog(dialogOptions);
+      if (selected.canceled || selected.filePaths.length !== 1)
+        return readSetup();
+      // The dialog result is intentionally sent only over the authenticated
+      // main-to-local-agent native action boundary. It never crosses IPC back
+      // to the renderer, including on validation failure.
+      const pin = options.getWhisperModelPin();
+      if (target === "whisper_model" && !pin) {
+        throw new Error("Whisper model selection is not configured.");
+      }
+      const snapshot = SetupSnapshotSchema.parse(
+        await requestSetup("/api/desktop-setup/native-selection", {
+          method: "POST",
+          native: true,
+          body: {
+            target,
+            path: selected.filePaths[0],
+            ...(target === "whisper_model" && pin
+              ? { pin: localModelPin(pin) }
+              : {}),
+          },
+        }),
+      );
+      await restartConfiguredRuntime();
+      return snapshot;
+    },
+  );
+  ipcMain.handle(desktopIpcChannels.startModelDownload, async (event) => {
+    requireTrustedRenderer(event);
+    if (activeModelDownload) return activeModelDownload.progress;
+    const pin = options.getWhisperModelPin();
+    if (!pin) throw new Error("Whisper model download is not configured.");
+    const controller = new AbortController();
+    const initial = ModelDownloadProgressSchema.parse({
+      target: "whisper_model",
+      state: "preparing",
+      bytesDownloaded: 0,
+      expectedBytes: pin.byteSize,
+    });
+    activeModelDownload = { controller, progress: initial };
+    void (async () => {
+      try {
+        const candidatePath = await downloadPinnedModel({
+          modelsDirectory: options.getModelsDirectory(),
+          pin,
+          signal: controller.signal,
+          fetch: net.fetch,
+          onProgress: (update) => {
+            updateModelDownloadProgress(
+              ModelDownloadProgressSchema.parse({
+                target: "whisper_model",
+                state: "downloading",
+                ...update,
+              }),
+            );
+          },
+        });
+        if (controller.signal.aborted) throw new ModelDownloadCanceledError();
+        updateModelDownloadProgress(
+          ModelDownloadProgressSchema.parse({
+            target: "whisper_model",
+            state: "verifying",
+            bytesDownloaded: pin.byteSize,
+            expectedBytes: pin.byteSize,
+          }),
+        );
+        if (controller.signal.aborted) throw new ModelDownloadCanceledError();
+        // Promotion includes the local agent's second size/hash verification and
+        // atomic activation. Once entered it is intentionally non-cancelable.
+        updateModelDownloadProgress(
+          ModelDownloadProgressSchema.parse({
+            target: "whisper_model",
+            state: "promoting",
+            bytesDownloaded: pin.byteSize,
+            expectedBytes: pin.byteSize,
+          }),
+        );
+        await requestSetup("/api/desktop-setup/model-download/activate", {
+          method: "POST",
+          native: true,
+          body: {
+            target: "whisper_model",
+            path: candidatePath,
+            pin: localModelPin(pin),
+          },
+        });
+        await restartConfiguredRuntime();
+        updateModelDownloadProgress(
+          ModelDownloadProgressSchema.parse({
+            target: "whisper_model",
+            state: "completed",
+            bytesDownloaded: pin.byteSize,
+            expectedBytes: pin.byteSize,
+          }),
+        );
+      } catch (error) {
+        const current = activeModelDownload?.progress;
+        updateModelDownloadProgress(
+          ModelDownloadProgressSchema.parse({
+            target: "whisper_model",
+            state:
+              error instanceof ModelDownloadCanceledError
+                ? "canceled"
+                : "failed",
+            bytesDownloaded: current?.bytesDownloaded ?? 0,
+            expectedBytes: pin.byteSize,
+          }),
+        );
+      } finally {
+        activeModelDownload = undefined;
+      }
+    })();
+    return initial;
+  });
+  ipcMain.handle(desktopIpcChannels.cancelModelDownload, async (event) => {
+    requireTrustedRenderer(event);
+    const active = activeModelDownload;
+    if (!active) throw new Error("No model download is active.");
+    if (!modelDownloadCanCancel(active.progress.state)) {
+      throw new Error("Model activation has started and cannot be canceled.");
+    }
+    active.controller.abort();
+    return updateModelDownloadProgress(
+      ModelDownloadProgressSchema.parse({
+        ...active.progress,
+        state: "canceled",
+      }),
+    );
+  });
   ipcMain.handle(desktopIpcChannels.request, async (event, rawInput) => {
     requireTrustedRenderer(event);
     const input = DesktopApiRequestSchema.parse(rawInput);
-    const broker = options.getBroker();
-    let accessToken: string;
-    try {
-      accessToken = await broker!.getAccessTokenForTrustedProxy();
-    } catch {
+    if (isPrivateDesktopSetupPath(input.path)) {
       return DesktopApiResponseSchema.parse({
-        status: 401,
+        status: 403,
         body: JSON.stringify({
           error: {
-            code: "authentication_required",
-            message: "Sign in required.",
+            code: "forbidden",
+            message: "This desktop action requires the typed native bridge.",
           },
         }),
         contentType: "application/json",
       });
+    }
+    const broker = options.getBroker();
+    let accessToken: string | undefined;
+    if (input.target === "cloud") {
+      try {
+        accessToken = await broker!.getAccessTokenForTrustedProxy();
+      } catch {
+        return DesktopApiResponseSchema.parse({
+          status: 401,
+          body: JSON.stringify({
+            error: {
+              code: "authentication_required",
+              message: "Sign in required.",
+            },
+          }),
+          contentType: "application/json",
+        });
+      }
     }
     const localPort = options.getLocalAgentPort();
     const base =
@@ -402,7 +768,7 @@ function installIpcHandlers(options: {
         authorization:
           input.target === "local"
             ? `Bearer ${options.sessionSecret}`
-            : `Bearer ${accessToken}`,
+            : `Bearer ${accessToken!}`,
         ...(input.contentType ? { "content-type": input.contentType } : {}),
         ...(input.target === "local"
           ? {
@@ -422,6 +788,172 @@ function installIpcHandlers(options: {
         : {}),
     });
   });
+}
+
+function localModelPin(pin: {
+  name: string;
+  byteSize: number;
+  sha256: string;
+}) {
+  return {
+    displayName: pin.name,
+    expectedBytes: pin.byteSize,
+    expectedSha256: pin.sha256,
+    version: pin.name,
+  };
+}
+
+async function desktopReadinessComponents(input: {
+  checkedAt: string;
+  broker: DesktopAuthenticationBroker | undefined;
+  supervisor: LocalServiceSupervisor | undefined;
+  publicApiOrigin: string | undefined;
+}): Promise<ComponentHealth[]> {
+  const authentication: ComponentHealth =
+    input.broker?.getRendererStatus().state === "signed_in"
+      ? {
+          component: "authentication",
+          state: "ready",
+          reason: "ready",
+          remediation: "none",
+          checkedAt: input.checkedAt,
+        }
+      : {
+          component: "authentication",
+          state: "needs_action",
+          reason: "authentication_required",
+          remediation: "sign_in",
+          checkedAt: input.checkedAt,
+        };
+  const worker = input.supervisor
+    ?.getStatus()
+    .find((status) => status.service === "transcription-worker");
+  const transcriptionWorker: ComponentHealth =
+    worker?.state === "healthy"
+      ? {
+          component: "transcription_worker",
+          state: "ready",
+          reason: "ready",
+          remediation: "none",
+          checkedAt: input.checkedAt,
+        }
+      : {
+          component: "transcription_worker",
+          state: worker?.state === "backing_off" ? "degraded" : "needs_action",
+          reason:
+            worker?.state === "stopped"
+              ? "worker_disabled"
+              : "worker_unavailable",
+          remediation: worker?.state === "stopped" ? "enable_worker" : "retry",
+          checkedAt: input.checkedAt,
+        };
+  const desktop: ComponentHealth = {
+    component: "desktop",
+    state: "ready",
+    reason: "ready",
+    remediation: "none",
+    checkedAt: input.checkedAt,
+  };
+  if (!input.publicApiOrigin) {
+    return [
+      desktop,
+      authentication,
+      {
+        component: "network",
+        state: "needs_action",
+        reason: "configuration_required",
+        remediation: "retry",
+        checkedAt: input.checkedAt,
+      },
+      {
+        component: "cloud_api",
+        state: "needs_action",
+        reason: "configuration_required",
+        remediation: "retry",
+        checkedAt: input.checkedAt,
+      },
+      transcriptionWorker,
+    ];
+  }
+  try {
+    const response = await fetch(new URL("/health", input.publicApiOrigin), {
+      method: "GET",
+      headers: { accept: "application/json" },
+      redirect: "error",
+      signal: AbortSignal.timeout(3_000),
+    });
+    const health = HealthResponseSchema.safeParse(
+      await response.json().catch(() => undefined),
+    );
+    const cloudReady =
+      response.ok && health.success && health.data.service === "cloud-api";
+    return [
+      desktop,
+      authentication,
+      {
+        component: "network",
+        state: "ready",
+        reason: "ready",
+        remediation: "none",
+        checkedAt: input.checkedAt,
+      },
+      cloudReady
+        ? {
+            component: "cloud_api",
+            state: "ready",
+            reason: "ready",
+            remediation: "none",
+            checkedAt: input.checkedAt,
+          }
+        : {
+            component: "cloud_api",
+            state: "blocked",
+            reason: "cloud_unavailable",
+            remediation: "retry",
+            checkedAt: input.checkedAt,
+          },
+      transcriptionWorker,
+    ];
+  } catch {
+    return [
+      desktop,
+      authentication,
+      {
+        component: "network",
+        state: "blocked",
+        reason: "network_unavailable",
+        remediation: "retry",
+        checkedAt: input.checkedAt,
+      },
+      {
+        component: "cloud_api",
+        state: "blocked",
+        reason: "cloud_unavailable",
+        remediation: "retry",
+        checkedAt: input.checkedAt,
+      },
+      transcriptionWorker,
+    ];
+  }
+}
+
+function dialogTitleForSetupTarget(target: SetupSelectionTarget): string {
+  switch (target) {
+    case "output_root":
+      return "Choose output folder";
+    case "cache_root":
+      return "Choose cache folder";
+    case "ffmpeg":
+      return "Choose FFmpeg executable";
+    case "ffprobe":
+      return "Choose FFprobe executable";
+    case "yt_dlp":
+      return "Choose yt-dlp executable";
+    case "whisper_cli":
+      return "Choose whisper-cli executable";
+    case "whisper_model":
+      return "Choose Whisper model";
+  }
 }
 
 function rendererAuthStatus(
@@ -479,6 +1011,8 @@ function createElectronProcessLauncher(input: {
   userData: string;
   workerCloudOrigin: string | undefined;
   sessionSecret: string;
+  nativeActionSecret: string;
+  getLocalAgentPort(): number;
   reportLocalAgentPort(port: number): void;
   clearLocalAgentPort(port: number): void;
 }): ProcessLauncher {
@@ -500,15 +1034,31 @@ function createElectronProcessLauncher(input: {
         environment.LOCAL_AGENT_HOST = "127.0.0.1";
         environment.LOCAL_AGENT_PORT = "0";
         environment.DESKTOP_SESSION_SECRET = input.sessionSecret;
+        environment.DESKTOP_NATIVE_ACTION_SECRET = input.nativeActionSecret;
       } else {
         if (!input.workerCloudOrigin) {
           throw new Error("Worker credential proxy unavailable.");
         }
+        const workerConfiguration = await readTrustedWorkerConfiguration(input);
         modulePath = join(serviceRoot, "transcription-worker.mjs");
+        environment.DATA_DIR = join(
+          workerConfiguration.cacheRoot,
+          "Research Video Clips Cache",
+        );
         environment.PUBLIC_API_ORIGIN = input.workerCloudOrigin;
         environment.WORKER_AUTHORIZATION = `Bearer ${input.sessionSecret}`;
         environment.WORKER_MODE = "continuous";
         environment.WORKER_EXECUTION_LOCATION = "local";
+        environment.CAPTION_PROVIDER = workerConfiguration.captionProvider;
+        environment.MEDIA_PROVIDER = workerConfiguration.mediaProvider;
+        environment.SPEECH_TO_TEXT_PROVIDER = "whisper-cpp";
+        environment.TRANSLATION_PROVIDER =
+          workerConfiguration.translationProvider;
+        environment.YT_DLP_PATH = workerConfiguration.ytDlp;
+        environment.WHISPER_CPP_PATH = workerConfiguration.whisperCli;
+        environment.WHISPER_CPP_MODEL_PATH = workerConfiguration.whisperModel;
+        environment.WHISPER_CPP_MODEL_NAME =
+          workerConfiguration.whisperModelName;
       }
       const child = utilityProcess.fork(modulePath, [], {
         env: environment,
@@ -573,6 +1123,40 @@ function wrapUtilityProcess(
       if (pid) process.kill(pid, "SIGKILL");
     },
   };
+}
+
+async function readTrustedWorkerConfiguration(input: {
+  getLocalAgentPort(): number;
+  sessionSecret: string;
+  nativeActionSecret: string;
+}) {
+  const port = input.getLocalAgentPort();
+  if (port === 0) throw new Error("Local setup is unavailable.");
+  const headers = {
+    accept: "application/json",
+    authorization: `Bearer ${input.sessionSecret}`,
+    origin: trustedRendererOrigin,
+    "x-research-video-session": input.sessionSecret,
+  };
+  const [snapshotResponse, runtimeResponse] = await Promise.all([
+    fetch(`http://127.0.0.1:${port}/api/desktop-setup`, {
+      headers,
+      redirect: "error",
+    }),
+    fetch(`http://127.0.0.1:${port}/api/desktop-setup/runtime-config`, {
+      headers: {
+        ...headers,
+        "x-research-video-native-action": input.nativeActionSecret,
+      },
+      redirect: "error",
+    }),
+  ]);
+  if (!snapshotResponse.ok || !runtimeResponse.ok) {
+    throw new Error("Local setup is unavailable.");
+  }
+  const snapshot = await snapshotResponse.json();
+  const paths = parseTrustedRuntimePaths(await runtimeResponse.json());
+  return resolveWorkerConfiguration(snapshot, paths);
 }
 
 async function waitForLocalAgentReady(

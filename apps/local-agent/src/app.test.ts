@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   HealthResponseSchema,
+  deriveReadinessReport,
   type LoggedExportDelivery,
   type LoggedExportCanceledResult,
   type LoggedExportFailureResult,
@@ -91,6 +92,133 @@ describe("desktop launch session", () => {
       quiescence: { draining: true, safeToStop: true },
     });
     expect(authorizeRuntime).not.toHaveBeenCalled();
+    await app.close();
+  });
+
+  it("keeps native paths behind the separate main-process action secret", async () => {
+    const sessionSecret = "s".repeat(64);
+    const nativeSecret = "n".repeat(64);
+    const now = "2026-08-23T12:00:00.000Z";
+    const snapshot = { activeComponents: [] };
+    const selectTool = vi.fn(async (input: { absolutePath: string }) => {
+      if (input.absolutePath === "/invalid/ffmpeg") {
+        throw Object.assign(new Error("private validation detail"), {
+          code: "invalid_tool",
+          statusCode: 400,
+        });
+      }
+      return snapshot;
+    });
+    const desktopSetup = {
+      getSnapshot: vi.fn(() => snapshot),
+      updateSetup: vi.fn(() => snapshot),
+      getReadinessReport: vi.fn(async () =>
+        deriveReadinessReport({
+          checkedAt: now,
+          components: [
+            {
+              component: "local_database" as const,
+              state: "ready" as const,
+              reason: "ready" as const,
+              remediation: "none" as const,
+              checkedAt: now,
+            },
+          ],
+          requirements: {
+            project_browsing: [],
+            verified_cached_review: ["local_database"],
+            project_logging: [],
+            transcript_processing: [],
+            export_processing: [],
+          },
+        }),
+      ),
+      selectRoot: vi.fn(async () => snapshot),
+      selectTool,
+      activateWhisperModel: vi.fn(async () => snapshot),
+      getTrustedRuntimeConfig: vi.fn(() => ({
+        outputRoot: undefined,
+        cacheRoot: undefined,
+        ffmpeg: "/validated/private/ffmpeg",
+        ffprobe: undefined,
+        ytDlp: undefined,
+        whisperCli: undefined,
+        whisperModel: undefined,
+      })),
+    };
+    const app = createLocalAgent({
+      desktopSession: { secret: sessionSecret, origin: "rvc://app" },
+      desktopNativeActionSecret: nativeSecret,
+      desktopSetup,
+    });
+    const sessionHeaders = {
+      origin: "rvc://app",
+      "x-research-video-session": sessionSecret,
+    };
+
+    const publicSnapshot = await app.inject({
+      method: "GET",
+      url: "/api/desktop-setup",
+      headers: sessionHeaders,
+    });
+    expect(publicSnapshot.statusCode).toBe(200);
+    expect(JSON.stringify(publicSnapshot.json())).not.toContain("/validated");
+
+    const deniedSelection = await app.inject({
+      method: "POST",
+      url: "/api/desktop-setup/native-selection",
+      headers: sessionHeaders,
+      payload: { target: "ffmpeg", path: "/untrusted/ffmpeg" },
+    });
+    expect(deniedSelection.statusCode).toBe(401);
+    expect(selectTool).not.toHaveBeenCalled();
+
+    const acceptedSelection = await app.inject({
+      method: "POST",
+      url: "/api/desktop-setup/native-selection",
+      headers: {
+        ...sessionHeaders,
+        "x-research-video-native-action": nativeSecret,
+      },
+      payload: { target: "ffmpeg", path: "/selected/ffmpeg" },
+    });
+    expect(acceptedSelection.statusCode).toBe(200);
+    expect(selectTool).toHaveBeenCalledWith({
+      target: "ffmpeg",
+      absolutePath: "/selected/ffmpeg",
+    });
+
+    const invalidSelection = await app.inject({
+      method: "POST",
+      url: "/api/desktop-setup/native-selection",
+      headers: {
+        ...sessionHeaders,
+        "x-research-video-native-action": nativeSecret,
+      },
+      payload: { target: "ffmpeg", path: "/invalid/ffmpeg" },
+    });
+    expect(invalidSelection.statusCode).toBe(400);
+    expect(invalidSelection.json()).toMatchObject({
+      error: { code: "invalid_tool", message: "The request is invalid." },
+    });
+    expect(invalidSelection.body).not.toContain("private validation detail");
+
+    const deniedRuntimeConfig = await app.inject({
+      method: "GET",
+      url: "/api/desktop-setup/runtime-config",
+      headers: sessionHeaders,
+    });
+    expect(deniedRuntimeConfig.statusCode).toBe(401);
+    const filteredRuntimeConfig = await app.inject({
+      method: "GET",
+      url: "/api/desktop-setup/runtime-config",
+      headers: {
+        ...sessionHeaders,
+        "x-research-video-native-action": nativeSecret,
+      },
+    });
+    expect(filteredRuntimeConfig.statusCode).toBe(200);
+    expect(filteredRuntimeConfig.json()).toEqual({});
     await app.close();
   });
 });

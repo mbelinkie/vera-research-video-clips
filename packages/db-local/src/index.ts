@@ -10,6 +10,7 @@ import {
   ArtifactRootSummarySchema,
   ClipLibraryPageSchema,
   ClipLibraryQuerySchema,
+  DesktopSetupSchema,
   ExportObservedMediaPropertiesSchema,
   ExportRequestSchema,
   LoggedExportDeliverySchema,
@@ -20,6 +21,9 @@ import {
   LoggedExportSuccessResultSchema,
   NormalizedTranscriptSchema,
   ResolvedExportSettingsSnapshotSchema,
+  LocalComponentReferenceSchema,
+  SetupSelectionTargetSchema,
+  SetupSnapshotSchema,
   languagesEquivalent,
   primaryLanguage,
   sanitizeLoggedExportFailureCode,
@@ -33,6 +37,7 @@ import {
   type ArtifactVersionSummary,
   type ClipLibraryPage,
   type ClipLibraryQuery,
+  type DesktopSetup,
   type DerivedTranslationIdentity,
   type ExportRequest,
   type LoggedExportDelivery,
@@ -45,6 +50,9 @@ import {
   type ExportObservedMediaProperties,
   type ResolvedExportSettingsSnapshot,
   type NormalizedTranscript,
+  type LocalComponentReference,
+  type SetupSelectionTarget,
+  type SetupSnapshot,
 } from "@research-video/contracts";
 import {
   resolveExportSettings,
@@ -3535,6 +3543,253 @@ export class LocalExportWorkerIdentityRepository {
   }
 }
 
+/**
+ * Trusted-machine-only record.  Unlike `LocalComponentReference`, this type
+ * intentionally retains the validated path and identity needed by the local
+ * agent to recheck a reference before use.  It must not cross a renderer,
+ * cloud, diagnostic, or support boundary.
+ */
+export type TrustedLocalComponentReference = LocalComponentReference & {
+  absolutePath: string;
+  filesystemIdentity: string;
+  byteSize?: number;
+  contentSha256?: string;
+  validationEvidence: unknown;
+  state: "candidate" | "active" | "superseded";
+  activatedAt?: string;
+  supersededAt?: string;
+};
+
+export class LocalDesktopSetupRepository {
+  constructor(
+    private readonly database: DatabaseSync,
+    private readonly now: () => Date = () => new Date(),
+  ) {}
+
+  getSetup(): DesktopSetup | undefined {
+    const row = this.database
+      .prepare("SELECT * FROM desktop_setup WHERE singleton = 1")
+      .get() as Record<string, unknown> | undefined;
+    return row ? mapDesktopSetup(row) : undefined;
+  }
+
+  saveSetup(input: Omit<DesktopSetup, "updatedAt">): DesktopSetup {
+    const setup = DesktopSetupSchema.parse({
+      ...input,
+      updatedAt: this.now().toISOString(),
+    });
+    this.database
+      .prepare(
+        `INSERT INTO desktop_setup
+           (singleton, schema_version, rights_acknowledged, privacy_acknowledged,
+            worker_enabled, translation_consent, caption_provider, media_provider,
+            export_source_provider, speech_to_text_provider, translation_provider,
+            updated_at)
+         VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(singleton) DO UPDATE SET
+           schema_version = excluded.schema_version,
+           rights_acknowledged = excluded.rights_acknowledged,
+           privacy_acknowledged = excluded.privacy_acknowledged,
+           worker_enabled = excluded.worker_enabled,
+           translation_consent = excluded.translation_consent,
+           caption_provider = excluded.caption_provider,
+           media_provider = excluded.media_provider,
+           export_source_provider = excluded.export_source_provider,
+           speech_to_text_provider = excluded.speech_to_text_provider,
+           translation_provider = excluded.translation_provider,
+           updated_at = excluded.updated_at`,
+      )
+      .run(
+        setup.schemaVersion,
+        setup.rightsAcknowledged ? 1 : 0,
+        setup.privacyAcknowledged ? 1 : 0,
+        setup.workerEnabled ? 1 : 0,
+        setup.translationConsent ? 1 : 0,
+        setup.captionProvider,
+        setup.mediaProvider,
+        setup.exportSourceProvider,
+        setup.speechToTextProvider,
+        setup.translationProvider,
+        setup.updatedAt,
+      );
+    return setup;
+  }
+
+  recordValidatedCandidate(input: {
+    target: SetupSelectionTarget;
+    displayName: string;
+    absolutePath: string;
+    filesystemIdentity: string;
+    version?: string;
+    byteSize?: number;
+    contentSha256?: string;
+    validationEvidence: unknown;
+  }): LocalComponentReference {
+    const target = SetupSelectionTargetSchema.parse(input.target);
+    const now = this.now().toISOString();
+    const summary = LocalComponentReferenceSchema.parse({
+      id: randomUUID(),
+      target,
+      displayName: input.displayName,
+      ...(input.version ? { version: input.version } : {}),
+      validatedAt: now,
+    });
+    const absolutePath = requireBoundedLocalString(
+      input.absolutePath,
+      "Local component path",
+      4_096,
+    );
+    const filesystemIdentity = requireBoundedLocalString(
+      input.filesystemIdentity,
+      "Local component filesystem identity",
+      200,
+    );
+    const byteSize = input.byteSize;
+    if (
+      byteSize !== undefined &&
+      (!Number.isSafeInteger(byteSize) || byteSize < 0)
+    ) {
+      throw new LocalArtifactCatalogError(
+        "Local component byte size is invalid.",
+      );
+    }
+    const contentSha256 = input.contentSha256;
+    if (contentSha256 !== undefined && !/^[a-f0-9]{64}$/u.test(contentSha256)) {
+      throw new LocalArtifactCatalogError(
+        "Local component checksum is invalid.",
+      );
+    }
+    const validationEvidence = serializeValidationEvidence(
+      input.validationEvidence,
+    );
+    this.database
+      .prepare(
+        `INSERT INTO validated_local_component_references
+           (id, target, display_name, absolute_path, filesystem_identity, version,
+            byte_size, content_sha256, validation_evidence_json,
+            validation_schema_version, state, validated_at, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'candidate', ?, ?, ?)`,
+      )
+      .run(
+        summary.id,
+        summary.target,
+        summary.displayName,
+        absolutePath,
+        filesystemIdentity,
+        summary.version ?? null,
+        byteSize ?? null,
+        contentSha256 ?? null,
+        validationEvidence,
+        summary.validatedAt,
+        now,
+        now,
+      );
+    return summary;
+  }
+
+  /**
+   * Only a previously recorded, validated candidate can replace an active
+   * reference.  The transaction preserves the previous active reference if
+   * activation fails at any point.
+   */
+  activateValidatedCandidate(referenceId: string): LocalComponentReference {
+    const candidate = this.requireTrustedReference(referenceId);
+    if (candidate.state !== "candidate") {
+      throw new LocalArtifactCatalogError(
+        "Local component is not an activation candidate.",
+      );
+    }
+    const now = this.now().toISOString();
+    this.database.exec("BEGIN IMMEDIATE;");
+    try {
+      this.database
+        .prepare(
+          `UPDATE validated_local_component_references
+           SET state = 'superseded', superseded_at = ?, updated_at = ?
+           WHERE target = ? AND state = 'active'`,
+        )
+        .run(now, now, candidate.target);
+      const result = this.database
+        .prepare(
+          `UPDATE validated_local_component_references
+           SET state = 'active', activated_at = ?, updated_at = ?
+           WHERE id = ? AND state = 'candidate'`,
+        )
+        .run(now, now, referenceId);
+      if (result.changes !== 1) {
+        throw new LocalArtifactCatalogError(
+          "Local component activation changed unexpectedly.",
+        );
+      }
+      this.database.exec("COMMIT;");
+    } catch (error) {
+      this.database.exec("ROLLBACK;");
+      throw error;
+    }
+    return this.getActiveComponentReference(candidate.target)!;
+  }
+
+  getActiveComponentReference(
+    target: SetupSelectionTarget,
+  ): LocalComponentReference | undefined {
+    const row = this.database
+      .prepare(
+        `SELECT * FROM validated_local_component_references
+         WHERE target = ? AND state = 'active'`,
+      )
+      .get(SetupSelectionTargetSchema.parse(target)) as
+      Record<string, unknown> | undefined;
+    return row ? mapLocalComponentReference(row) : undefined;
+  }
+
+  getTrustedActiveComponentReference(
+    target: SetupSelectionTarget,
+  ): TrustedLocalComponentReference | undefined {
+    const row = this.database
+      .prepare(
+        `SELECT * FROM validated_local_component_references
+         WHERE target = ? AND state = 'active'`,
+      )
+      .get(SetupSelectionTargetSchema.parse(target)) as
+      Record<string, unknown> | undefined;
+    return row ? mapTrustedLocalComponentReference(row) : undefined;
+  }
+
+  listActiveComponentReferences(): LocalComponentReference[] {
+    return (
+      this.database
+        .prepare(
+          `SELECT * FROM validated_local_component_references
+           WHERE state = 'active' ORDER BY target`,
+        )
+        .all() as Record<string, unknown>[]
+    ).map(mapLocalComponentReference);
+  }
+
+  getSetupSnapshot(): SetupSnapshot {
+    return SetupSnapshotSchema.parse({
+      ...(this.getSetup() ? { setup: this.getSetup() } : {}),
+      activeComponents: this.listActiveComponentReferences(),
+    });
+  }
+
+  private requireTrustedReference(
+    referenceId: string,
+  ): TrustedLocalComponentReference {
+    const row = this.database
+      .prepare(
+        "SELECT * FROM validated_local_component_references WHERE id = ?",
+      )
+      .get(referenceId) as Record<string, unknown> | undefined;
+    if (!row)
+      throw new LocalArtifactCatalogError(
+        "Local component reference not found.",
+        404,
+      );
+    return mapTrustedLocalComponentReference(row);
+  }
+}
+
 export type LocalArtifactRootRecord = ArtifactRootSummary & {
   absolutePath: string;
   pathFingerprint: string;
@@ -4129,6 +4384,117 @@ function mapLocalExportWorkerIdentity(
     createdAt: String(row.created_at),
     updatedAt: String(row.updated_at),
   };
+}
+
+function mapDesktopSetup(row: Record<string, unknown>): DesktopSetup {
+  return DesktopSetupSchema.parse({
+    schemaVersion: Number(row.schema_version),
+    rightsAcknowledged: Boolean(row.rights_acknowledged),
+    privacyAcknowledged: Boolean(row.privacy_acknowledged),
+    workerEnabled: Boolean(row.worker_enabled),
+    translationConsent: Boolean(row.translation_consent),
+    captionProvider: row.caption_provider,
+    mediaProvider: row.media_provider,
+    exportSourceProvider: row.export_source_provider,
+    speechToTextProvider: row.speech_to_text_provider,
+    translationProvider: row.translation_provider,
+    updatedAt: row.updated_at,
+  });
+}
+
+function mapLocalComponentReference(
+  row: Record<string, unknown>,
+): LocalComponentReference {
+  return LocalComponentReferenceSchema.parse({
+    id: row.id,
+    target: row.target,
+    displayName: row.display_name,
+    ...(row.version ? { version: row.version } : {}),
+    validatedAt: row.validated_at,
+  });
+}
+
+function mapTrustedLocalComponentReference(
+  row: Record<string, unknown>,
+): TrustedLocalComponentReference {
+  const summary = mapLocalComponentReference(row);
+  let validationEvidence: unknown;
+  try {
+    validationEvidence = JSON.parse(String(row.validation_evidence_json));
+  } catch {
+    throw new LocalArtifactCatalogError(
+      "Stored local component validation evidence is invalid.",
+    );
+  }
+  const state = String(row.state);
+  if (state !== "candidate" && state !== "active" && state !== "superseded") {
+    throw new LocalArtifactCatalogError(
+      "Stored local component state is invalid.",
+    );
+  }
+  return {
+    ...summary,
+    absolutePath: requireBoundedLocalString(
+      String(row.absolute_path),
+      "Stored local component path",
+      4_096,
+    ),
+    filesystemIdentity: requireBoundedLocalString(
+      String(row.filesystem_identity),
+      "Stored local component filesystem identity",
+      200,
+    ),
+    ...(row.byte_size === null || row.byte_size === undefined
+      ? {}
+      : { byteSize: Number(row.byte_size) }),
+    ...(row.content_sha256
+      ? { contentSha256: String(row.content_sha256) }
+      : {}),
+    validationEvidence,
+    state,
+    ...(row.activated_at ? { activatedAt: String(row.activated_at) } : {}),
+    ...(row.superseded_at ? { supersededAt: String(row.superseded_at) } : {}),
+  };
+}
+
+function requireBoundedLocalString(
+  value: string,
+  label: string,
+  maximumLength: number,
+): string {
+  if (
+    !value ||
+    value.length > maximumLength ||
+    value.includes("\0") ||
+    value !== value.normalize("NFC")
+  ) {
+    throw new LocalArtifactCatalogError(`${label} is invalid.`);
+  }
+  return value;
+}
+
+function serializeValidationEvidence(value: unknown): string {
+  let serialized: string | undefined;
+  try {
+    serialized = JSON.stringify(value);
+  } catch {
+    throw new LocalArtifactCatalogError(
+      "Local component validation evidence is invalid.",
+    );
+  }
+  if (!serialized || Buffer.byteLength(serialized, "utf8") > 64 * 1_024) {
+    throw new LocalArtifactCatalogError(
+      "Local component validation evidence is invalid.",
+    );
+  }
+  try {
+    JSON.parse(serialized);
+  } catch {
+    throw new LocalArtifactCatalogError(
+      "Local component validation evidence is invalid.",
+    );
+  }
+  return serialized;
 }
 
 function mapLocalArtifactRoot(

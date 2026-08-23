@@ -25,6 +25,7 @@ import {
   LocalExportQueue,
   LocalArtifactLocatorRepository,
   LocalClipLibraryCacheRepository,
+  LocalDesktopSetupRepository,
   LocalExportWorkerIdentityRepository,
   LocalTranscriptIndex,
   openLocalDatabase,
@@ -154,6 +155,7 @@ describe("local migrations", () => {
       "0025_export_request_origin",
       "0026_artifact_roots_and_locators",
       "0027_clip_library_cache",
+      "0028_desktop_setup_and_validated_components",
     ]);
     expect(runLocalMigrations(database)).toEqual([]);
     expect(
@@ -446,6 +448,133 @@ describe("local migrations", () => {
     ).toThrow(/immutable/u);
   });
 
+  it("adds desktop setup tables to a populated 0027 database without rewriting prior rows", () => {
+    const directory = mkdtempSync(
+      join(tmpdir(), "research-video-desktop-setup-migration-"),
+    );
+    temporaryDirectories.add(directory);
+    const legacyMigrations = join(directory, "migrations-before-0028");
+    mkdirSync(legacyMigrations);
+    for (const filename of readdirSync(localMigrationDirectory)) {
+      if (filename < "0028_desktop_setup_and_validated_components.sql") {
+        copyFileSync(
+          join(localMigrationDirectory, filename),
+          join(legacyMigrations, filename),
+        );
+      }
+    }
+    const database = openLocalDatabase(join(directory, "legacy.sqlite"));
+    runLocalMigrations(database, legacyMigrations);
+    const rootId = randomUUID();
+    database
+      .prepare(
+        `INSERT INTO artifact_roots
+           (id, label, platform, absolute_path, path_fingerprint,
+            filesystem_identity, enabled, path_policy_version, created_at, updated_at)
+         VALUES (?, 'Existing root', 'posix', '/private/existing', ?, '7:11', 1, 1, ?, ?)`,
+      )
+      .run(
+        rootId,
+        "a".repeat(64),
+        "2026-08-23T12:00:00.000Z",
+        "2026-08-23T12:00:00.000Z",
+      );
+    expect(runLocalMigrations(database)).toEqual([
+      "0028_desktop_setup_and_validated_components",
+    ]);
+    expect(
+      database
+        .prepare("SELECT label FROM artifact_roots WHERE id = ?")
+        .get(rootId),
+    ).toEqual({ label: "Existing root" });
+    expect(
+      database.prepare("SELECT count(*) AS count FROM desktop_setup").get(),
+    ).toEqual({ count: 0 });
+    expect(runLocalMigrations(database)).toEqual([]);
+    database.close();
+  });
+
+  it("persists path-free setup summaries and activates only validated local candidates", () => {
+    const directory = mkdtempSync(
+      join(tmpdir(), "research-video-desktop-setup-"),
+    );
+    temporaryDirectories.add(directory);
+    const databasePath = join(directory, "setup.sqlite");
+    const clock = () => new Date("2026-08-23T12:00:00.000Z");
+    const database = openLocalDatabase(databasePath);
+    runLocalMigrations(database);
+    const repository = new LocalDesktopSetupRepository(database, clock);
+    const setup = repository.saveSetup({
+      schemaVersion: 1,
+      rightsAcknowledged: true,
+      privacyAcknowledged: true,
+      workerEnabled: false,
+      translationConsent: false,
+      captionProvider: "disabled",
+      mediaProvider: "disabled",
+      exportSourceProvider: "disabled",
+      speechToTextProvider: "disabled",
+      translationProvider: "disabled",
+    });
+    expect(setup.updatedAt).toBe("2026-08-23T12:00:00.000Z");
+    const first = repository.recordValidatedCandidate({
+      target: "ffmpeg",
+      displayName: "FFmpeg fixture",
+      absolutePath: "/private/validated/ffmpeg",
+      filesystemIdentity: "7:42",
+      version: "fixture-1",
+      validationEvidence: { schemaVersion: 1, capability: "fixture" },
+    });
+    expect(repository.listActiveComponentReferences()).toEqual([]);
+    const active = repository.activateValidatedCandidate(first.id);
+    expect(active).toEqual(first);
+    expect(JSON.stringify(active)).not.toContain("/private/validated");
+    expect(
+      repository.getTrustedActiveComponentReference("ffmpeg"),
+    ).toMatchObject({
+      id: first.id,
+      absolutePath: "/private/validated/ffmpeg",
+      state: "active",
+    });
+    const replacement = repository.recordValidatedCandidate({
+      target: "ffmpeg",
+      displayName: "Replacement fixture",
+      absolutePath: "/private/validated/ffmpeg-next",
+      filesystemIdentity: "7:43",
+      validationEvidence: { schemaVersion: 1, capability: "fixture-next" },
+    });
+    expect(repository.getActiveComponentReference("ffmpeg")).toEqual(first);
+    expect(() =>
+      repository.recordValidatedCandidate({
+        target: "ffmpeg",
+        displayName: "Invalid replacement",
+        absolutePath: "/private/validated/invalid\0",
+        filesystemIdentity: "7:44",
+        validationEvidence: {},
+      }),
+    ).toThrow("Local component path is invalid");
+    expect(repository.getActiveComponentReference("ffmpeg")).toEqual(first);
+    expect(repository.activateValidatedCandidate(replacement.id)).toEqual(
+      replacement,
+    );
+    expect(
+      repository.getTrustedActiveComponentReference("ffmpeg"),
+    ).toMatchObject({
+      id: replacement.id,
+      absolutePath: "/private/validated/ffmpeg-next",
+      state: "active",
+    });
+    database.close();
+
+    const reopened = openLocalDatabase(databasePath);
+    const restored = new LocalDesktopSetupRepository(reopened, clock);
+    expect(restored.getSetup()).toEqual(setup);
+    const snapshot = restored.getSetupSnapshot();
+    expect(snapshot).toMatchObject({ setup, activeComponents: [replacement] });
+    expect(JSON.stringify(snapshot)).not.toMatch(/absolutePath|validated\//u);
+    reopened.close();
+  });
+
   it("scopes restart-safe Clip Library pages and selection to authorization", () => {
     const directory = mkdtempSync(
       join(tmpdir(), "research-video-clip-library-cache-"),
@@ -640,6 +769,7 @@ describe("local migrations", () => {
       "0025_export_request_origin",
       "0026_artifact_roots_and_locators",
       "0027_clip_library_cache",
+      "0028_desktop_setup_and_validated_components",
     ]);
     expect(
       database
@@ -821,6 +951,7 @@ describe("local migrations", () => {
       "0025_export_request_origin",
       "0026_artifact_roots_and_locators",
       "0027_clip_library_cache",
+      "0028_desktop_setup_and_validated_components",
     ]);
     expect(
       database.prepare("SELECT * FROM export_final_artifacts").all(),
@@ -958,6 +1089,7 @@ describe("local migrations", () => {
       "0025_export_request_origin",
       "0026_artifact_roots_and_locators",
       "0027_clip_library_cache",
+      "0028_desktop_setup_and_validated_components",
     ]);
     expect(
       database
@@ -2104,6 +2236,7 @@ describe("logged export delivery import", () => {
       "0025_export_request_origin",
       "0026_artifact_roots_and_locators",
       "0027_clip_library_cache",
+      "0028_desktop_setup_and_validated_components",
     ]);
     const after = new LocalExportQueue(database).get(before.id);
     expect(after).toEqual(before);
@@ -2178,6 +2311,7 @@ describe("logged export delivery import", () => {
       "0025_export_request_origin",
       "0026_artifact_roots_and_locators",
       "0027_clip_library_cache",
+      "0028_desktop_setup_and_validated_components",
     ]);
     expect(
       new LocalExportQueue(database).getAcceptedLoggedDelivery(

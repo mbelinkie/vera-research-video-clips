@@ -25,6 +25,12 @@ import {
   CreateTranscriptionBatchRequestSchema,
   DesktopApiRequestSchema,
   DesktopStatusSchema,
+  ComponentHealthSchema,
+  ReadinessReportSchema,
+  SetupActionSchema,
+  SetupSnapshotSchema,
+  ModelDownloadProgressSchema,
+  deriveReadinessReport,
   ExportRequestOriginSchema,
   ExportClipManifestSchema,
   ExportClipMetadataSchema,
@@ -81,6 +87,142 @@ const now = "2026-08-01T12:00:00.000Z";
 const id = "019fbb95-cd76-7920-93fa-e23ba755ee3f";
 
 describe("shared contracts", () => {
+  it("keeps M7 setup and readiness contracts closed, path-free, and operation-specific", () => {
+    const health = [
+      {
+        component: "authentication",
+        state: "ready",
+        reason: "ready",
+        remediation: "none",
+        checkedAt: now,
+      },
+      {
+        component: "cloud_api",
+        state: "degraded",
+        reason: "cloud_unavailable",
+        remediation: "retry",
+        checkedAt: now,
+      },
+      {
+        component: "network",
+        state: "ready",
+        reason: "ready",
+        remediation: "none",
+        checkedAt: now,
+      },
+      {
+        component: "local_database",
+        state: "ready",
+        reason: "ready",
+        remediation: "none",
+        checkedAt: now,
+      },
+      {
+        component: "cache_root",
+        state: "ready",
+        reason: "ready",
+        remediation: "none",
+        checkedAt: now,
+      },
+      {
+        component: "export_source_provider",
+        state: "ready",
+        reason: "ready",
+        remediation: "choose_export_source_provider",
+        checkedAt: now,
+      },
+    ] as const;
+    expect(
+      ComponentHealthSchema.safeParse({ ...health[0], path: "/private" })
+        .success,
+    ).toBe(false);
+    const report = deriveReadinessReport({
+      checkedAt: now,
+      components: health,
+      requirements: {
+        project_browsing: ["authentication", "cloud_api", "network"],
+        verified_cached_review: ["local_database", "cache_root"],
+        project_logging: ["authentication", "cloud_api", "network"],
+        transcript_processing: ["authentication", "cloud_api", "network"],
+        export_processing: [
+          "authentication",
+          "cloud_api",
+          "network",
+          "export_source_provider",
+        ],
+      },
+    });
+    expect(report.operations).toEqual([
+      {
+        operation: "project_browsing",
+        state: "degraded",
+        blockingComponents: ["cloud_api"],
+      },
+      {
+        operation: "verified_cached_review",
+        state: "ready",
+        blockingComponents: [],
+      },
+      {
+        operation: "project_logging",
+        state: "degraded",
+        blockingComponents: ["cloud_api"],
+      },
+      {
+        operation: "transcript_processing",
+        state: "degraded",
+        blockingComponents: ["cloud_api"],
+      },
+      {
+        operation: "export_processing",
+        state: "degraded",
+        blockingComponents: ["cloud_api"],
+      },
+    ]);
+    expect(
+      ReadinessReportSchema.safeParse({
+        ...report,
+        operations: report.operations.slice(1),
+      }).success,
+    ).toBe(false);
+    expect(
+      SetupActionSchema.safeParse({
+        action: "set_worker_enabled",
+        enabled: true,
+      }).success,
+    ).toBe(true);
+    expect(
+      SetupActionSchema.safeParse({
+        action: "set_worker_enabled",
+        enabled: true,
+        path: "/private",
+      }).success,
+    ).toBe(false);
+    const snapshot = {
+      activeComponents: [
+        { id, target: "ffmpeg", displayName: "FFmpeg", validatedAt: now },
+      ],
+    };
+    expect(SetupSnapshotSchema.parse(snapshot)).toEqual(snapshot);
+    expect(
+      SetupSnapshotSchema.safeParse({
+        ...snapshot,
+        activeComponents: [
+          ...snapshot.activeComponents,
+          { ...snapshot.activeComponents[0] },
+        ],
+      }).success,
+    ).toBe(false);
+    expect(
+      ModelDownloadProgressSchema.safeParse({
+        target: "whisper_model",
+        state: "downloading",
+        bytesDownloaded: 9,
+        expectedBytes: 8,
+      }).success,
+    ).toBe(false);
+  });
+
   it("keeps runtime quiescence and operation diagnostics closed and content-free", () => {
     const correlationId = "019fbb95-cd76-7920-93fa-e23ba755ee3e";
     const quiescence = {
@@ -1656,6 +1798,7 @@ describe("desktop boundary contracts", () => {
       "/api/%2E./session",
       "/api/%2f%2fevil.example",
       "/api/..\\session",
+      "/api/desktop-setup/foo/../runtime-config",
     ]) {
       expect(() =>
         DesktopApiRequestSchema.parse({

@@ -4,6 +4,11 @@ import {
   type DesktopApiRequest,
   type DesktopApiResponse,
   type DesktopStatus,
+  type ModelDownloadProgress,
+  type ReadinessReport,
+  type SetupAction,
+  type SetupSelectionTarget,
+  type SetupSnapshot,
 } from "@research-video/contracts";
 
 export const DESKTOP_CONNECTED_SENTINEL = "desktop-connected";
@@ -12,6 +17,15 @@ export type DesktopBridge = Readonly<{
   getStatus(): Promise<DesktopStatus>;
   signIn(): Promise<void>;
   signOut(): Promise<void>;
+  getSetup(): Promise<SetupSnapshot>;
+  getReadiness(): Promise<ReadinessReport>;
+  updateSetup(action: SetupAction): Promise<SetupSnapshot>;
+  chooseSetupTarget(target: SetupSelectionTarget): Promise<SetupSnapshot>;
+  startModelDownload(): Promise<ModelDownloadProgress>;
+  cancelModelDownload(): Promise<ModelDownloadProgress>;
+  onModelDownloadProgress(
+    listener: (progress: ModelDownloadProgress) => void,
+  ): () => void;
   request(request: DesktopApiRequest): Promise<DesktopApiResponse>;
 }>;
 

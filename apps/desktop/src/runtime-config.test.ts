@@ -42,4 +42,50 @@ describe("desktop runtime configuration", () => {
       loadDesktopRuntimeConfiguration(directory, {}),
     ).resolves.toMatchObject({ cognitoClientId: "public-client" });
   });
+
+  it("accepts only an exact HTTPS checksum pin for an in-app model download", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "rvc-desktop-config-"));
+    directories.add(directory);
+    await writeFile(
+      join(directory, "desktop-config.json"),
+      JSON.stringify({
+        publicApiOrigin: "https://api.example.test",
+        cognitoAuthority: "https://login.example.test",
+        cognitoClientId: "public-client",
+        whisperModelPin: {
+          name: "fixture-model",
+          url: "https://models.example.test/fixture.bin",
+          byteSize: 4,
+          sha256: "a".repeat(64),
+        },
+      }),
+      { mode: 0o600 },
+    );
+    await expect(
+      loadDesktopRuntimeConfiguration(directory, {}),
+    ).resolves.toMatchObject({ whisperModelPin: { byteSize: 4 } });
+  });
+
+  it("fails closed for a non-HTTPS model pin", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "rvc-desktop-config-"));
+    directories.add(directory);
+    await writeFile(
+      join(directory, "desktop-config.json"),
+      JSON.stringify({
+        publicApiOrigin: "https://api.example.test",
+        cognitoAuthority: "https://login.example.test",
+        cognitoClientId: "public-client",
+        whisperModelPin: {
+          name: "fixture-model",
+          url: "http://models.example.test/fixture.bin",
+          byteSize: 4,
+          sha256: "a".repeat(64),
+        },
+      }),
+      { mode: 0o600 },
+    );
+    await expect(
+      loadDesktopRuntimeConfiguration(directory, {}),
+    ).resolves.toBeUndefined();
+  });
 });

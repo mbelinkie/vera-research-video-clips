@@ -81,6 +81,7 @@ export class LocalExportSourceProcessor {
     },
     private readonly sharedSourceCoordinator?: LocalLoggedExportSourceGroupCoordinator,
     private readonly storageGuard?: PostAcquisitionExportStorageGuard,
+    private readonly exportRoot: string = join(dataRoot, "exports"),
   ) {}
 
   async process(input: {
@@ -389,7 +390,7 @@ export class LocalExportSourceProcessor {
           request: this.queue.get(started.request.id) ?? started.request,
           stagingDirectory: scratchDirectory,
           sourcePath: source.scratchPath,
-          dataRoot: this.dataRoot,
+          outputRoot: this.exportRoot,
           attempt: started.attempt,
           ...(input.signal ? { signal: input.signal } : {}),
         });
@@ -401,7 +402,7 @@ export class LocalExportSourceProcessor {
           );
         } catch (error) {
           await removePromotedPackage(
-            this.dataRoot,
+            this.exportRoot,
             promoted[0]!.packageIdentity,
           );
           throw error;
@@ -758,13 +759,13 @@ async function promoteVerifiedFinalPackage(input: {
   request: ExportRequest;
   stagingDirectory: string;
   sourcePath: string;
-  dataRoot: string;
+  outputRoot: string;
   attempt: number;
   signal?: AbortSignal;
 }): Promise<FinalArtifact[]> {
   const policy = resolveVerifiedPackagePolicy(input.request, input.attempt);
   const packageIdentity = `clip-${input.request.id}`;
-  const outputRoot = join(input.dataRoot, "exports");
+  const outputRoot = resolve(input.outputRoot);
   const destination = join(outputRoot, packageIdentity);
   const promotionDirectory = join(
     outputRoot,
@@ -1521,11 +1522,11 @@ async function assertNoExistingPath(path: string, code: string) {
 }
 
 async function removePromotedPackage(
-  dataRoot: string,
+  outputRootInput: string,
   packageIdentity: string,
 ) {
   if (!/^clip-[a-f0-9-]{36}$/u.test(packageIdentity)) return;
-  const outputRoot = join(dataRoot, "exports");
+  const outputRoot = resolve(outputRootInput);
   const destination = join(outputRoot, packageIdentity);
   if (isInsideStaging(outputRoot, destination)) {
     await rm(destination, { recursive: true, force: true });

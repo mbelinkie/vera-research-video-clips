@@ -50,6 +50,7 @@ export type LocalExportRuntimeDependencies = {
   sharedSourceCoordinator?: LocalLoggedExportSourceGroupCoordinator;
   storageGuard?: PostAcquisitionExportStorageGuard;
   dataRoot: string;
+  exportRoot?: string;
 };
 
 /**
@@ -93,6 +94,7 @@ export async function runLocalExportOnce(
     dependencies.capabilityProvider ?? new FfmpegCapabilityDiscoveryProvider(),
     dependencies.sharedSourceCoordinator,
     dependencies.storageGuard,
+    dependencies.exportRoot ?? join(dependencies.dataRoot, "exports"),
   );
   try {
     await processor.process(input);
@@ -136,6 +138,7 @@ export async function runConfiguredLocalExportOnce(
     thumbnailExtractor?: FfmpegJpegThumbnailExtractionAdapter;
     thumbnailInspector?: JpegThumbnailInspector;
     capabilityProvider?: ExportWorkerCapabilityProvider;
+    exportRoot?: string;
   } = {},
 ): Promise<LocalExportOnceResult> {
   const config = options.config ?? loadConfig();
@@ -163,6 +166,7 @@ export async function runConfiguredLocalExportOnce(
         ? { capabilityProvider: options.capabilityProvider }
         : {}),
       dataRoot: config.dataDir,
+      ...(options.exportRoot ? { exportRoot: options.exportRoot } : {}),
     });
   } finally {
     database.close();
@@ -172,7 +176,9 @@ export async function runConfiguredLocalExportOnce(
 export async function discardCompletedLoggedExportForCancellation(
   requestId: string,
   reason: "user_requested" | "execution_lease_lost",
-  dependencies: Pick<LocalExportRuntimeDependencies, "queue" | "dataRoot">,
+  dependencies: Pick<LocalExportRuntimeDependencies, "queue" | "dataRoot"> & {
+    exportRoot?: string;
+  },
 ): Promise<void> {
   const request = dependencies.queue.get(requestId);
   const packageIdentity = request?.finalArtifacts?.[0]?.packageIdentity;
@@ -186,7 +192,9 @@ export async function discardCompletedLoggedExportForCancellation(
   ) {
     throw new Error("Completed cancellation package identity is invalid.");
   }
-  const outputRoot = resolve(dependencies.dataRoot, "exports");
+  const outputRoot = resolve(
+    dependencies.exportRoot ?? join(dependencies.dataRoot, "exports"),
+  );
   const destination = resolve(outputRoot, packageIdentity);
   if (!destination.startsWith(`${outputRoot}${sep}`)) {
     throw new Error(

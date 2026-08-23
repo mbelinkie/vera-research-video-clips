@@ -48,6 +48,7 @@ import {
   DESKTOP_CONNECTED_SENTINEL,
 } from "./api-client.ts";
 import { BatchWorkspace } from "./batch-workspace.tsx";
+import { DesktopSetup } from "./desktop-setup.tsx";
 import { YouTubePlayer, type YouTubePlayerHandle } from "./youtube-player.tsx";
 import { VirtualTranscript } from "./virtual-transcript.tsx";
 
@@ -1231,6 +1232,17 @@ function App() {
         </div>
         <span className="status">Multilingual clip logging</span>
       </header>
+
+      <DesktopSetup
+        authorization={authorization}
+        {...(desktopAuthStatus ? { authStatus: desktopAuthStatus } : {})}
+        projects={projects}
+        projectId={projectId}
+        onProjectsChange={setProjects}
+        onProjectChange={setProjectId}
+        onSignIn={beginDesktopSignIn}
+        onSignOut={completeDesktopSignOut}
+      />
 
       <form
         className="loader"

@@ -137,6 +137,7 @@ export const DesktopApiRequestSchema = z
     if (
       canonical.origin !== "https://desktop.invalid" ||
       !canonical.pathname.startsWith("/api/") ||
+      `${canonical.pathname}${canonical.search}` !== request.path ||
       request.path.includes("\\") ||
       /%(?:2e|2f|5c)/iu.test(request.path.split("?", 1)[0] ?? "")
     ) {
@@ -155,6 +156,356 @@ export const DesktopApiResponseSchema = z
     contentType: z.string().max(160).optional(),
   })
   .strict();
+
+/** Public M7 setup state is deliberately path-, token-, and command-free. */
+export const SetupSelectionTargetSchema = z.enum([
+  "output_root",
+  "cache_root",
+  "ffmpeg",
+  "ffprobe",
+  "yt_dlp",
+  "whisper_cli",
+  "whisper_model",
+]);
+export const ComponentKindSchema = z.enum([
+  "desktop",
+  "authentication",
+  "cloud_api",
+  "local_database",
+  "network",
+  "output_root",
+  "cache_root",
+  "output_storage",
+  "cache_storage",
+  "caption_provider",
+  "media_provider",
+  "export_source_provider",
+  "speech_to_text_provider",
+  "translation_provider",
+  "transcription_worker",
+  "export_worker",
+  "ffmpeg",
+  "ffprobe",
+  "yt_dlp",
+  "whisper_cli",
+  "whisper_model",
+]);
+export const ComponentHealthStateSchema = z.enum([
+  "ready",
+  "blocked",
+  "degraded",
+  "needs_action",
+]);
+export const ComponentHealthReasonSchema = z.enum([
+  "ready",
+  "configuration_required",
+  "authentication_required",
+  "cloud_unavailable",
+  "network_unavailable",
+  "permission_required",
+  "rights_acknowledgement_required",
+  "privacy_acknowledgement_required",
+  "translation_consent_required",
+  "root_unavailable",
+  "root_changed",
+  "storage_unavailable",
+  "storage_insufficient",
+  "storage_recommended",
+  "provider_disabled",
+  "worker_disabled",
+  "worker_unavailable",
+  "tool_missing",
+  "tool_invalid",
+  "tool_changed",
+  "tool_incompatible",
+  "model_missing",
+  "model_invalid",
+  "model_changed",
+  "model_pin_required",
+]);
+export const ComponentHealthRemediationSchema = z.enum([
+  "none",
+  "sign_in",
+  "retry",
+  "acknowledge_rights",
+  "acknowledge_privacy",
+  "grant_translation_consent",
+  "select_output_root",
+  "select_cache_root",
+  "free_storage",
+  "choose_caption_provider",
+  "choose_media_provider",
+  "choose_export_source_provider",
+  "choose_speech_to_text_provider",
+  "choose_translation_provider",
+  "enable_worker",
+  "select_ffmpeg",
+  "select_ffprobe",
+  "select_yt_dlp",
+  "select_whisper_cli",
+  "select_whisper_model",
+  "configure_model_pin",
+]);
+export const ComponentHealthSchema = z
+  .object({
+    component: ComponentKindSchema,
+    state: ComponentHealthStateSchema,
+    reason: ComponentHealthReasonSchema,
+    remediation: ComponentHealthRemediationSchema,
+    referenceId: IdSchema.optional(),
+    version: z.string().trim().min(1).max(160).optional(),
+    checkedAt: UtcTimestampSchema,
+  })
+  .strict();
+
+export const ReadinessOperationKindSchema = z.enum([
+  "project_browsing",
+  "verified_cached_review",
+  "project_logging",
+  "transcript_processing",
+  "export_processing",
+]);
+export const ReadinessOperationStateSchema = z.enum([
+  "ready",
+  "blocked",
+  "degraded",
+]);
+export const ReadinessOperationSchema = z
+  .object({
+    operation: ReadinessOperationKindSchema,
+    state: ReadinessOperationStateSchema,
+    blockingComponents: z.array(ComponentKindSchema).max(21),
+  })
+  .strict()
+  .superRefine((value, context) => {
+    if (value.state === "ready" && value.blockingComponents.length !== 0) {
+      context.addIssue({
+        code: "custom",
+        path: ["blockingComponents"],
+        message: "Ready operations cannot report blocking components.",
+      });
+    }
+  });
+export const ReadinessRequirementsSchema = z
+  .object({
+    project_browsing: z.array(ComponentKindSchema).max(21),
+    verified_cached_review: z.array(ComponentKindSchema).max(21),
+    project_logging: z.array(ComponentKindSchema).max(21),
+    transcript_processing: z.array(ComponentKindSchema).max(21),
+    export_processing: z.array(ComponentKindSchema).max(21),
+  })
+  .strict();
+export const ReadinessReportSchema = z
+  .object({
+    schemaVersion: z.literal(1),
+    generatedAt: UtcTimestampSchema,
+    components: z.array(ComponentHealthSchema).min(1).max(21),
+    operations: z.array(ReadinessOperationSchema).length(5),
+  })
+  .strict()
+  .superRefine((report, context) => {
+    const components = new Set<string>();
+    for (const [index, health] of report.components.entries()) {
+      if (components.has(health.component))
+        context.addIssue({
+          code: "custom",
+          path: ["components", index, "component"],
+          message: "Each component may appear only once.",
+        });
+      components.add(health.component);
+    }
+    const operations = new Set<string>();
+    for (const [index, operation] of report.operations.entries()) {
+      if (operations.has(operation.operation))
+        context.addIssue({
+          code: "custom",
+          path: ["operations", index, "operation"],
+          message: "Each operation may appear only once.",
+        });
+      operations.add(operation.operation);
+    }
+    for (const operation of ReadinessOperationKindSchema.options) {
+      if (!operations.has(operation))
+        context.addIssue({
+          code: "custom",
+          path: ["operations"],
+          message: "Every readiness operation must be reported.",
+        });
+    }
+  });
+
+export function deriveReadinessReport(input: {
+  checkedAt: string;
+  components: readonly ComponentHealth[];
+  requirements: ReadinessRequirements;
+}): ReadinessReport {
+  const checkedAt = UtcTimestampSchema.parse(input.checkedAt);
+  const components = z
+    .array(ComponentHealthSchema)
+    .min(1)
+    .max(21)
+    .parse(input.components);
+  const requirements = ReadinessRequirementsSchema.parse(input.requirements);
+  const healthByComponent = new Map(
+    components.map((health) => [health.component, health]),
+  );
+  const operations = ReadinessOperationKindSchema.options.map((operation) => {
+    const blockingComponents = requirements[operation].filter(
+      (component) => healthByComponent.get(component)?.state !== "ready",
+    );
+    const state =
+      blockingComponents.length === 0
+        ? "ready"
+        : blockingComponents.some((component) => {
+              const health = healthByComponent.get(component);
+              return (
+                !health ||
+                health.state === "blocked" ||
+                health.state === "needs_action"
+              );
+            })
+          ? "blocked"
+          : "degraded";
+    return { operation, state, blockingComponents };
+  });
+  return ReadinessReportSchema.parse({
+    schemaVersion: 1,
+    generatedAt: checkedAt,
+    components,
+    operations,
+  });
+}
+
+export const CaptionProviderSetupSchema = z.enum(["disabled", "yt_dlp"]);
+export const MediaProviderSetupSchema = z.enum(["disabled", "yt_dlp_audio"]);
+export const ExportSourceProviderSetupSchema = z.enum(["disabled", "yt_dlp"]);
+export const SpeechToTextProviderSetupSchema = z.enum([
+  "disabled",
+  "whisper_cpp",
+]);
+export const TranslationProviderSetupSchema = z.enum([
+  "disabled",
+  "aws_translate",
+]);
+export const DesktopSetupSchema = z
+  .object({
+    schemaVersion: z.literal(1),
+    rightsAcknowledged: z.boolean(),
+    privacyAcknowledged: z.boolean(),
+    workerEnabled: z.boolean(),
+    translationConsent: z.boolean(),
+    captionProvider: CaptionProviderSetupSchema,
+    mediaProvider: MediaProviderSetupSchema,
+    exportSourceProvider: ExportSourceProviderSetupSchema,
+    speechToTextProvider: SpeechToTextProviderSetupSchema,
+    translationProvider: TranslationProviderSetupSchema,
+    updatedAt: UtcTimestampSchema,
+  })
+  .strict();
+export const SetupActionSchema = z.discriminatedUnion("action", [
+  z
+    .object({
+      action: z.literal("set_rights_acknowledgement"),
+      acknowledged: z.boolean(),
+    })
+    .strict(),
+  z
+    .object({
+      action: z.literal("set_privacy_acknowledgement"),
+      acknowledged: z.boolean(),
+    })
+    .strict(),
+  z
+    .object({ action: z.literal("set_worker_enabled"), enabled: z.boolean() })
+    .strict(),
+  z
+    .object({
+      action: z.literal("set_translation_consent"),
+      consented: z.boolean(),
+    })
+    .strict(),
+  z
+    .object({
+      action: z.literal("set_caption_provider"),
+      provider: CaptionProviderSetupSchema,
+    })
+    .strict(),
+  z
+    .object({
+      action: z.literal("set_media_provider"),
+      provider: MediaProviderSetupSchema,
+    })
+    .strict(),
+  z
+    .object({
+      action: z.literal("set_export_source_provider"),
+      provider: ExportSourceProviderSetupSchema,
+    })
+    .strict(),
+  z
+    .object({
+      action: z.literal("set_speech_to_text_provider"),
+      provider: SpeechToTextProviderSetupSchema,
+    })
+    .strict(),
+  z
+    .object({
+      action: z.literal("set_translation_provider"),
+      provider: TranslationProviderSetupSchema,
+    })
+    .strict(),
+]);
+export const LocalComponentReferenceSchema = z
+  .object({
+    id: IdSchema,
+    target: SetupSelectionTargetSchema,
+    displayName: z.string().trim().min(1).max(160),
+    version: z.string().trim().min(1).max(160).optional(),
+    validatedAt: UtcTimestampSchema,
+  })
+  .strict();
+export const SetupSnapshotSchema = z
+  .object({
+    setup: DesktopSetupSchema.optional(),
+    activeComponents: z.array(LocalComponentReferenceSchema).max(7),
+  })
+  .strict()
+  .superRefine((snapshot, context) => {
+    const targets = new Set<string>();
+    for (const [index, reference] of snapshot.activeComponents.entries()) {
+      if (targets.has(reference.target))
+        context.addIssue({
+          code: "custom",
+          path: ["activeComponents", index, "target"],
+          message: "Only one active reference may exist for each target.",
+        });
+      targets.add(reference.target);
+    }
+  });
+export const ModelDownloadProgressSchema = z
+  .object({
+    target: z.literal("whisper_model"),
+    state: z.enum([
+      "preparing",
+      "downloading",
+      "verifying",
+      "promoting",
+      "completed",
+      "canceled",
+      "failed",
+    ]),
+    bytesDownloaded: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+    expectedBytes: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  })
+  .strict()
+  .superRefine((progress, context) => {
+    if (progress.bytesDownloaded > progress.expectedBytes)
+      context.addIssue({
+        code: "custom",
+        path: ["bytesDownloaded"],
+        message: "Downloaded model bytes cannot exceed the expected size.",
+      });
+  });
 
 export const UserSchema = z.object({
   id: IdSchema,
@@ -4258,6 +4609,41 @@ export type TranscriptionJobPayload = z.infer<
   typeof TranscriptionJobPayloadSchema
 >;
 export type HealthResponse = z.infer<typeof HealthResponseSchema>;
+export type SetupSelectionTarget = z.infer<typeof SetupSelectionTargetSchema>;
+export type ComponentKind = z.infer<typeof ComponentKindSchema>;
+export type ComponentHealthState = z.infer<typeof ComponentHealthStateSchema>;
+export type ComponentHealthReason = z.infer<typeof ComponentHealthReasonSchema>;
+export type ComponentHealthRemediation = z.infer<
+  typeof ComponentHealthRemediationSchema
+>;
+export type ComponentHealth = z.infer<typeof ComponentHealthSchema>;
+export type ReadinessOperationKind = z.infer<
+  typeof ReadinessOperationKindSchema
+>;
+export type ReadinessOperationState = z.infer<
+  typeof ReadinessOperationStateSchema
+>;
+export type ReadinessOperation = z.infer<typeof ReadinessOperationSchema>;
+export type ReadinessRequirements = z.infer<typeof ReadinessRequirementsSchema>;
+export type ReadinessReport = z.infer<typeof ReadinessReportSchema>;
+export type CaptionProviderSetup = z.infer<typeof CaptionProviderSetupSchema>;
+export type MediaProviderSetup = z.infer<typeof MediaProviderSetupSchema>;
+export type ExportSourceProviderSetup = z.infer<
+  typeof ExportSourceProviderSetupSchema
+>;
+export type SpeechToTextProviderSetup = z.infer<
+  typeof SpeechToTextProviderSetupSchema
+>;
+export type TranslationProviderSetup = z.infer<
+  typeof TranslationProviderSetupSchema
+>;
+export type DesktopSetup = z.infer<typeof DesktopSetupSchema>;
+export type SetupAction = z.infer<typeof SetupActionSchema>;
+export type LocalComponentReference = z.infer<
+  typeof LocalComponentReferenceSchema
+>;
+export type SetupSnapshot = z.infer<typeof SetupSnapshotSchema>;
+export type ModelDownloadProgress = z.infer<typeof ModelDownloadProgressSchema>;
 export type DesktopAuthStatus = z.infer<typeof DesktopAuthStatusSchema>;
 export type DesktopServiceStatus = z.infer<typeof DesktopServiceStatusSchema>;
 export type DesktopStatus = z.infer<typeof DesktopStatusSchema>;

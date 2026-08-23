@@ -3,11 +3,25 @@ import { join } from "node:path";
 
 import { z } from "zod";
 
+export const WhisperModelPinSchema = z
+  .object({
+    name: z.string().trim().min(1).max(160),
+    url: z.url().refine((value) => value.startsWith("https://")),
+    byteSize: z
+      .number()
+      .int()
+      .min(1)
+      .max(100 * 1024 * 1024 * 1024),
+    sha256: z.string().regex(/^[a-f0-9]{64}$/),
+  })
+  .strict();
+
 export const DesktopRuntimeConfigurationSchema = z
   .object({
     publicApiOrigin: z.url().refine((value) => value.startsWith("https://")),
     cognitoAuthority: z.url().refine((value) => value.startsWith("https://")),
     cognitoClientId: z.string().trim().min(1).max(512),
+    whisperModelPin: WhisperModelPinSchema.optional(),
   })
   .strict();
 
