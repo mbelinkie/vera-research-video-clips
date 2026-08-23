@@ -409,7 +409,7 @@ conflict behavior are proven.
       Cognito PKCE, S3/SQS, TLS, secrets, backups, alarms, and least-privilege
       production boundary; keep PGlite for tests and run Amazon Translate only
       behind the authenticated project API with explicit opt-in.
-- [ ] M7-02 local Intel Mac Electron app: build an unsigned x64 macOS 15 `.app`,
+- [x] M7-02 local Intel Mac Electron app: build an unsigned x64 macOS 15 `.app`,
       harden the renderer/preload boundary, protect OAuth with Keychain-backed
       `safeStorage`, retain the authenticated loopback agent, and supervise the
       local agent plus transcription/export workers.
@@ -607,5 +607,7 @@ infra/aws        storage, API, database, queues, identity, monitoring
 
 ## Next action
 
-Milestones 1–6 are complete. The next implementation slice is M7-01 production
-cloud/authentication, and it must begin with its own bounded active specification.
+Milestones 1–6 and M7-02 are complete. M7-01's real AWS change-set and Cognito
+acceptance remain an explicit external prerequisite. The next unstarted local
+implementation slice is M7-03 terminal-free first run/readiness, and it must
+begin with its own bounded active specification.

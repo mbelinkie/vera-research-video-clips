@@ -2,7 +2,7 @@
 
 ## Project guide and implementation plan
 
-Status: Milestones 1–6 complete; stop before Milestone 7
+Status: Milestones 1–6 and M7-02 complete; M7-01 real AWS acceptance remains blocked
 Last updated: 2026-08-23
 
 This document is the source of truth for product scope, architecture, sequencing, and acceptance criteria. Update it when a deliberate product or architectural decision changes. Use `outline.md` as the shorter execution checklist.
@@ -862,13 +862,16 @@ Build **Research Video Clips** as a local-first hybrid desktop application with
 five clear roles:
 
 - **Electron desktop shell:** hardened packaged application that owns lifecycle,
-  single-instance behavior, authentication, protected credentials, updates, and
-  supervision of local services.
+  single-instance behavior, authentication, protected credentials, trusted
+  renderer serving, cloud credential brokering, updates, and supervision of
+  local services.
 - **Web client:** React + TypeScript + Vite renderer, using the YouTube IFrame
   API and only a minimal typed preload bridge.
 - **Local agent:** authenticated loopback Node.js service for filesystem access,
-  local cache, installed tools, local transcription, and FFmpeg export. It also
-  serves the packaged web client and proxies authenticated cloud API requests.
+  local cache, installed tools, local transcription, and FFmpeg export. In the
+  desktop runtime it binds an ephemeral port, authenticates the main-process
+  broker with a per-launch secret and exact origin, and reports readiness over
+  private utility-process IPC.
 - **Shared control plane:** authenticated project API for membership, project
   videos, transcript manifests, batches/jobs, sync commands, feedback delivery,
   and presigned transcript-object access.
@@ -1865,6 +1868,15 @@ Execute six bounded slices:
    boundary, and supervise the local agent plus transcription/export workers.
    Produce a local x64 `.app` that launches from Finder or the Dock; do not sign,
    notarize, publish, or add an updater in M7.
+
+   Completed 2026-08-23 in implementation commit `865b9e0`. The packaged x64
+   application uses a local-only `rvc://app` renderer, a four-method token-free
+   preload bridge, Keychain-backed asynchronous `safeStorage`, exact native
+   callback handling, an authenticated dynamic loopback endpoint, a
+   credential-injecting worker proxy, bounded service restart/drain, and a
+   remote-code-isolated YouTube iframe. The unsigned package and launch smoke
+   passed on the current Intel Mac; real Cognito sign-in remains dependent on
+   the explicitly blocked M7-01 AWS acceptance values.
 3. **Terminal-free first run and readiness:** guide login, project access,
    output/cache roots, rights/privacy acknowledgement, provider selection, and
    cloud-translation consent. Detect and validate the workstation's installed
