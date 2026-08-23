@@ -1,6 +1,6 @@
 # M6-04 — Clip Library export operations and storage preflight
 
-- Status: active
+- Status: complete (2026-08-22)
 - Task/thread: M6-04 only
 - Dependencies: M5 durable individual/batch, immutable settings, delivery,
   progress, retry, cancellation, and same-source execution are complete; M6-03
@@ -26,9 +26,9 @@ boundaries; it does not add another queue or artifact version model.
 Select three eligible clips from two source videos in the Clip Library. Resolve
 and display one immutable settings preview per clip, calculate one local
 preflight that counts two compatible source groups rather than three when the
-siblings execute on the same worker/profile, includes all staged-output estimates,
-an equal promotion-copy reserve, active update/checkpoint reserve, and a 2 GiB
-safety margin, then submit one durable batch with
+siblings execute on the same worker/profile, includes all staged-output
+estimates, an equal promotion-copy reserve, active update/checkpoint reserve,
+and a 2 GiB safety margin, then submit one durable batch with
 `requestOrigin = clip_library`.
 Restart the browser/local-agent while the requests are active and recover the
 same batch and per-clip leaves. Prove one sibling can fail, retry, or cancel
@@ -69,9 +69,9 @@ M5's single acquisition behavior.
    result. Exact replay adopts the existing request/batch; divergent material
    input conflicts rather than creating duplicate work.
 4. Derive storage need from unique compatible same-worker/profile source
-   acquisitions, every
-   selected output package estimate, a second-copy promotion reserve, an explicit currently active
-   update/checkpoint reserve, and an exact 2 GiB safety margin. Same-source
+   acquisitions, every selected output package estimate, a second-copy promotion
+   reserve, an explicit currently active update/checkpoint reserve, and an exact
+   2 GiB safety margin. Same-source
    siblings are deduplicated only when M5 would actually share their acquisition.
    Report that assurance explicitly: cloud assignment to another worker may
    require another physical acquisition and therefore another measured worker
@@ -169,3 +169,34 @@ Then run both migration CLIs if persistence changes, TypeScript typecheck, web
 build, Playwright, aggregate `npm run check` in a clean worktree, formatting for
 owned files, and `git diff --check`. Record any platform/real-source skips
 without weakening the claimed proof.
+
+## Completion record
+
+- Implementation commit: `bc28174` (`feat: add Clip Library export preflight`).
+- The dedicated Clip Library now resolves locally installed renderer capability,
+  shows immutable per-clip settings evidence, measures sanitized workstation
+  capacity, and submits the existing M5 individual or batch commands with
+  `requestOrigin = clip_library`.
+- Production source sizes remain honestly unknown before acquisition. The UI
+  requires explicit confirmation, and each worker remeasures after acquisition.
+  Source-group counts are explicitly limited to compatible same-worker/profile
+  evidence; cloud assignment is not represented as a global sharing guarantee.
+- Peak storage includes every staged output, an equal second-copy promotion
+  reserve, active update/checkpoint reserve, and the exact 2 GiB safety margin.
+  In-memory render reservations prevent concurrent siblings from passing against
+  the same free bytes and are released after promotion or failure.
+- Lost-response replay uses one material operation fingerprint that excludes
+  mutable clip version and diagnostic origin. Exact sequential or concurrent
+  replay adopts the canonical request; divergent material conflicts. A new Clip
+  Library operation is allowed only while the clip is `not_requested`; explicit
+  re-export remains M6-05.
+- No migration was added. M6-03 already persists the authorized selection/page,
+  while cloud request, batch, progress, retry, cancellation, and idempotency
+  records remain authoritative across browser/local-agent restart.
+- Final independent Sol review reported no remaining P0/P1 findings after
+  renderer-capability, eligibility, replay, language-provenance, promotion-space,
+  and concurrent-reservation corrections.
+- Clean detached verification at `bc28174`: `npm run check` passed with 300 tests
+  passing and 2 intentionally skipped, the production web build passed, local
+  migration inventory passed with 27 migrations, cloud migration inventory
+  passed with 20 migrations, and `npm run test:e2e` passed all 4 Chromium flows.
