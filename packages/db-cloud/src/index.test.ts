@@ -11,17 +11,28 @@ import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { PGlite } from "@electric-sql/pglite";
-import { afterEach, describe, expect, it } from "vitest";
+import { Pool } from "pg";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { LoggedExportSuccessResultSchema } from "../../contracts/src/index.ts";
 
-import { runCloudMigrations } from "./index.ts";
+import {
+  asCloudDatabase,
+  createPostgresCloudDatabase,
+  PostgresCloudDatabase,
+  runCloudMigrations,
+  type CloudQueryRow,
+  type CloudQueryResult,
+  type PostgresClient,
+  type PostgresPool,
+} from "./index.ts";
 
 const databases = new Set<PGlite>();
 const temporaryDirectories = new Set<string>();
 const cloudMigrationDirectory = fileURLToPath(
   new URL("../migrations", import.meta.url),
 );
+const postgresIntegrationUrl = process.env.CLOUD_DATABASE_TEST_URL;
 
 afterEach(async () => {
   await Promise.all([...databases].map((database) => database.close()));
@@ -32,6 +43,185 @@ afterEach(async () => {
 });
 
 describe("cloud migrations", () => {
+  it("reuses one serialized adapter for the same embedded connection", () => {
+    const embedded = {
+      query: vi.fn(),
+      exec: vi.fn(),
+      close: vi.fn(),
+    };
+    expect(asCloudDatabase(embedded)).toBe(asCloudDatabase(embedded));
+  });
+
+  it("pins every PostgreSQL transaction query to one checked-out client", async () => {
+    const calls: string[] = [];
+    const client = fakePostgresClient(calls, "client");
+    const pool = fakePostgresPool(calls, client);
+    const database = new PostgresCloudDatabase(pool);
+
+    await database.query("SELECT outside_transaction");
+    await database.transaction(
+      async () => {
+        await database.query("SELECT first_transaction_query");
+        await database.query("SELECT second_transaction_query");
+      },
+      { repeatableRead: true, readOnly: true },
+    );
+    await database.close();
+
+    expect(calls).toEqual([
+      "pool:SELECT outside_transaction",
+      "pool:connect",
+      "client:BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY",
+      "client:SELECT first_transaction_query",
+      "client:SELECT second_transaction_query",
+      "client:COMMIT",
+      "client:release",
+      "pool:end",
+    ]);
+  });
+
+  it("rolls back and releases the PostgreSQL client after a transaction error", async () => {
+    const calls: string[] = [];
+    const client = fakePostgresClient(calls, "client");
+    const database = new PostgresCloudDatabase(fakePostgresPool(calls, client));
+
+    await expect(
+      database.transaction(async () => {
+        await database.query("SELECT before_failure");
+        throw new Error("expected failure");
+      }),
+    ).rejects.toThrow("expected failure");
+
+    expect(calls).toEqual([
+      "pool:connect",
+      "client:BEGIN",
+      "client:SELECT before_failure",
+      "client:ROLLBACK",
+      "client:release",
+    ]);
+  });
+
+  it("runs each migration through the PostgreSQL transaction boundary", async () => {
+    const calls: string[] = [];
+    const client = fakePostgresClient(calls, "client");
+    const database = new PostgresCloudDatabase(fakePostgresPool(calls, client));
+
+    const applied = await runCloudMigrations(database);
+
+    expect(applied).toHaveLength(22);
+    expect(calls.filter((call) => call === "pool:connect")).toHaveLength(23);
+    expect(calls.filter((call) => call === "client:BEGIN")).toHaveLength(23);
+    expect(
+      calls.filter((call) =>
+        call.startsWith("client:SELECT pg_advisory_xact_lock"),
+      ),
+    ).toHaveLength(23);
+    expect(
+      calls.some((call) =>
+        call.startsWith("pool:INSERT INTO schema_migrations"),
+      ),
+    ).toBe(false);
+  });
+
+  const postgresIt = postgresIntegrationUrl ? it : it.skip;
+  postgresIt(
+    "optionally migrates a clean isolated PostgreSQL schema and preserves populated rows",
+    async () => {
+      const schema = `m7_cloud_${randomUUID().replaceAll("-", "")}`;
+      const administrator = new Pool({
+        connectionString: postgresIntegrationUrl,
+      });
+      await administrator.query(`CREATE SCHEMA ${schema}`);
+      const database = createPostgresCloudDatabase({
+        connectionString: postgresIntegrationUrl,
+        options: `-c search_path=${schema},public`,
+      });
+      try {
+        const directory = mkdtempSync(
+          join(tmpdir(), "research-video-postgres-0010-"),
+        );
+        temporaryDirectories.add(directory);
+        const historicalMigrations = join(directory, "migrations");
+        mkdirSync(historicalMigrations);
+        for (const filename of readdirSync(cloudMigrationDirectory)) {
+          if (filename < "0011") {
+            copyFileSync(
+              resolve(cloudMigrationDirectory, filename),
+              join(historicalMigrations, filename),
+            );
+          }
+        }
+        expect(
+          await runCloudMigrations(database, historicalMigrations),
+        ).toHaveLength(10);
+        const userId = randomUUID();
+        await database.query(
+          `INSERT INTO users
+             (id, external_subject, display_name, preferred_language, created_at, updated_at)
+           VALUES ($1, $2, $3, 'en', now(), now())`,
+          [userId, "fixture:postgres-populated", "PostgreSQL fixture"],
+        );
+        expect(await runCloudMigrations(database)).toEqual([
+          "0011_resolved_export_settings_snapshots",
+          "0012_registered_export_workers",
+          "0013_logged_export_deliveries",
+          "0014_logged_export_success_results",
+          "0015_logged_export_failure_results",
+          "0016_logged_export_retry_lineage",
+          "0017_logged_export_safe_cancellation",
+          "0018_logged_export_execution_progress",
+          "0019_logged_export_batches",
+          "0020_export_request_origin",
+          "0021_cloud_translation_consent",
+          "0022_job_queue_delivery",
+        ]);
+        expect(
+          (
+            await database.query<{ id: string }>(
+              "SELECT id FROM users WHERE id = $1",
+              [userId],
+            )
+          ).rows,
+        ).toEqual([{ id: userId }]);
+        expect(await runCloudMigrations(database)).toEqual([]);
+      } finally {
+        await database.close();
+        await administrator.query(`DROP SCHEMA ${schema} CASCADE`);
+        await administrator.end();
+      }
+    },
+  );
+
+  postgresIt(
+    "serializes concurrent clean PostgreSQL migration runners",
+    async () => {
+      const schema = `m7_cloud_concurrent_${randomUUID().replaceAll("-", "")}`;
+      const administrator = new Pool({
+        connectionString: postgresIntegrationUrl,
+      });
+      await administrator.query(`CREATE SCHEMA ${schema}`);
+      const configuration = {
+        connectionString: postgresIntegrationUrl,
+        options: `-c search_path=${schema},public`,
+      };
+      const first = createPostgresCloudDatabase(configuration);
+      const second = createPostgresCloudDatabase(configuration);
+      try {
+        const results = await Promise.all([
+          runCloudMigrations(first),
+          runCloudMigrations(second),
+        ]);
+        expect(results.flat()).toHaveLength(22);
+        expect(new Set(results.flat()).size).toBe(22);
+        expect(await runCloudMigrations(first)).toEqual([]);
+      } finally {
+        await Promise.all([first.close(), second.close()]);
+        await administrator.query(`DROP SCHEMA ${schema} CASCADE`);
+        await administrator.end();
+      }
+    },
+  );
+
   it("migrates an empty PostgreSQL-compatible database idempotently", async () => {
     const database = new PGlite();
     databases.add(database);
@@ -57,6 +247,8 @@ describe("cloud migrations", () => {
       "0018_logged_export_execution_progress",
       "0019_logged_export_batches",
       "0020_export_request_origin",
+      "0021_cloud_translation_consent",
+      "0022_job_queue_delivery",
     ]);
     expect(await runCloudMigrations(database)).toEqual([]);
     expect(
@@ -722,6 +914,37 @@ describe("cloud migrations", () => {
     ).rejects.toThrow(/immutable/u);
   });
 });
+
+function fakePostgresClient(calls: string[], label: string): PostgresClient {
+  return {
+    async query<Row extends CloudQueryRow>(sql: string) {
+      calls.push(`${label}:${sql}`);
+      return { rows: [] } as CloudQueryResult<Row>;
+    },
+    release() {
+      calls.push(`${label}:release`);
+    },
+  };
+}
+
+function fakePostgresPool(
+  calls: string[],
+  client: PostgresClient,
+): PostgresPool {
+  return {
+    async query<Row extends CloudQueryRow>(sql: string) {
+      calls.push(`pool:${sql}`);
+      return { rows: [] } as CloudQueryResult<Row>;
+    },
+    async connect() {
+      calls.push("pool:connect");
+      return client;
+    },
+    async end() {
+      calls.push("pool:end");
+    },
+  };
+}
 
 function legacyLoggedExportSuccessResult(input: {
   requestId: string;

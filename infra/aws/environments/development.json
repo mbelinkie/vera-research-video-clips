@@ -2,5 +2,16 @@
   "EnvironmentName": "development",
   "TranscriptBucketName": "replace-with-development-bucket-name",
   "AllowedUploadOrigins": "http://localhost:43112",
-  "CloudApiRoleArn": ""
+  "CloudApiRoleArn": "",
+  "VpcId": "replace-with-development-vpc-id",
+  "VpcDnsResolverCidr": "replace-with-development-vpc-resolver-cidr",
+  "PublicSubnetIds": "replace-with-development-public-subnet-a,replace-with-development-public-subnet-b",
+  "PrivateSubnetIds": "replace-with-development-private-subnet-a,replace-with-development-private-subnet-b",
+  "AcmCertificateArn": "replace-with-development-acm-certificate-arn",
+  "HostedZoneId": "",
+  "ApiDomainName": "replace-with-development-api-domain",
+  "ApiContainerImage": "replace-with-development-api-image-uri-at-digest",
+  "CognitoDomainPrefix": "replace-with-development-cognito-domain-prefix",
+  "DatabaseRuntimePasswordSecretArn": "replace-with-development-runtime-database-secret-arn",
+  "AlarmTopicArn": ""
 }

@@ -9,6 +9,8 @@ describe("configuration", () => {
     expect(config.localAgentHost).toBe("127.0.0.1");
     expect(config.objectStoreMode).toBe("memory");
     expect(config.queueMode).toBe("memory");
+    expect(config.cloudDatabaseMode).toBe("pglite");
+    expect(config.cloudAuthMode).toBe("development");
     expect(config.captionProvider).toBe("disabled");
     expect(config.mediaProvider).toBe("disabled");
     expect(config.exportSourceProvider).toBe("disabled");
@@ -83,6 +85,41 @@ describe("configuration", () => {
     expect(() => loadConfig({ OBJECT_STORE_MODE: "s3" })).toThrow(
       "TRANSCRIPT_BUCKET is required",
     );
+  });
+
+  it("fails closed unless every production cloud boundary is explicit", () => {
+    expect(() => loadConfig({ NODE_ENV: "production" })).toThrow(
+      "Production requires PostgreSQL",
+    );
+
+    const config = loadConfig({
+      NODE_ENV: "production",
+      CLOUD_DATABASE_MODE: "postgres",
+      DATABASE_URL: "postgresql://runtime@db.internal/research_video_clips",
+      DATABASE_SSL_MODE: "verify-full",
+      DATABASE_CA_CERT_PATH: "/fixtures/rds-ca.pem",
+      CLOUD_AUTH_MODE: "cognito",
+      COGNITO_USER_POOL_ID: "us-east-1_example",
+      COGNITO_CLIENT_ID: "public-client-id",
+      COGNITO_DOMAIN: "https://auth.example.test",
+      COGNITO_REDIRECT_URI: "research-video-clips://oauth/callback",
+      COGNITO_LOGOUT_URI: "research-video-clips://oauth/logout",
+      OBJECT_STORE_MODE: "s3",
+      TRANSCRIPT_BUCKET: "private-production-transcripts",
+      QUEUE_MODE: "sqs",
+      JOB_QUEUE_URL: "https://sqs.us-east-1.amazonaws.com/123/jobs",
+      TRANSLATION_PROVIDER: "aws-translate",
+      PUBLIC_API_ORIGIN: "https://api.example.test",
+    });
+
+    expect(config).toMatchObject({
+      cloudDatabaseMode: "postgres",
+      databaseSslMode: "verify-full",
+      cloudAuthMode: "cognito",
+      objectStoreMode: "s3",
+      queueMode: "sqs",
+      translationProvider: "aws-translate",
+    });
   });
 
   it("accepts bounded continuous hosted worker settings", () => {

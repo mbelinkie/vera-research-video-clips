@@ -39,6 +39,8 @@ import {
   WorkerFinalizeTranscriptRequestSchema,
   WorkerHeartbeatRequestSchema,
   WorkerSourcePlanRequestSchema,
+  WorkerTranslateTranscriptRequestSchema,
+  WorkerTranslateTranscriptResponseSchema,
   ExportWorkerCompatibilityRequestSchema,
   HeartbeatExportWorkerRequestSchema,
   RegisterExportWorkerRequestSchema,
@@ -56,13 +58,18 @@ import {
 } from "@research-video/contracts";
 import {
   normalizeYouTubeUrl,
+  translateCanonicalTranscript,
+  type TranslationProvider,
   type VideoMetadataProvider,
 } from "@research-video/providers";
+import { transcriptToSrt } from "@research-video/transcript";
 
 export interface CloudApiDependencies {
   catalog: SharedProjectCatalog;
   authenticate(request: FastifyRequest): Promise<AuthenticatedActor>;
   videoMetadataProvider?: VideoMetadataProvider;
+  translationProvider?: TranslationProvider;
+  queueDeliveryRequired?: boolean;
 }
 
 const IdParamsSchema = z.object({ projectId: z.uuid() });
@@ -848,10 +855,12 @@ export function createCloudApi(
 
   app.post("/api/transcription-jobs/claim", async (request, reply) => {
     const body = WorkerClaimRequestSchema.parse(request.body);
+    const actor = await authenticate(request);
     const claimed = await catalog.claimTranscriptionJob(
-      await authenticate(request),
+      actor,
       body.executionLocation,
       body.leaseSeconds,
+      dependencies.queueDeliveryRequired ?? false,
     );
     return claimed === undefined
       ? reply.status(204).send()
@@ -861,13 +870,15 @@ export function createCloudApi(
   app.post("/api/transcription-jobs/:jobId/heartbeat", async (request) => {
     const { jobId } = JobParamsSchema.parse(request.params);
     const body = WorkerHeartbeatRequestSchema.parse(request.body);
-    return catalog.heartbeatTranscriptionJob(
-      await authenticate(request),
+    const actor = await authenticate(request);
+    const lease = await catalog.heartbeatTranscriptionJob(
+      actor,
       jobId,
       body.attempt,
       body.leaseSeconds,
       body.stage,
     );
+    return lease;
   });
 
   app.post(
@@ -885,14 +896,56 @@ export function createCloudApi(
     },
   );
 
+  app.post("/api/transcription-jobs/:jobId/translate", async (request) => {
+    const { jobId } = JobParamsSchema.parse(request.params);
+    const body = WorkerTranslateTranscriptRequestSchema.parse(request.body);
+    const actor = await authenticate(request);
+    const source = await catalog.loadClaimedTranscriptTranslationSource(
+      actor,
+      jobId,
+      {
+        attempt: body.attempt,
+        consent: body.consent,
+        uploadId: body.uploadId,
+        sourceArtifact: body.sourceArtifact,
+        targetLanguage: body.targetLanguage,
+      },
+    );
+    const cached = await catalog.getClaimedTranscriptTranslationPublication(
+      actor,
+      jobId,
+      {
+        attempt: body.attempt,
+        uploadId: body.uploadId,
+        sourceArtifact: body.sourceArtifact,
+        targetLanguage: body.targetLanguage,
+      },
+    );
+    if (cached) return WorkerTranslateTranscriptResponseSchema.parse(cached);
+    if (!dependencies.translationProvider) {
+      throw new CloudTranslationUnavailableError();
+    }
+    const transcript = await translateCanonicalTranscript(
+      dependencies.translationProvider,
+      source,
+      body.targetLanguage,
+    );
+    return catalog.publishClaimedTranscriptTranslation(actor, jobId, {
+      attempt: body.attempt,
+      consent: body.consent,
+      uploadId: body.uploadId,
+      sourceArtifact: body.sourceArtifact,
+      targetLanguage: body.targetLanguage,
+      transcript,
+      subtitleBytes: new TextEncoder().encode(transcriptToSrt(transcript)),
+    });
+  });
+
   app.post("/api/transcription-jobs/:jobId/fail", async (request, reply) => {
     const { jobId } = JobParamsSchema.parse(request.params);
     const body = WorkerFailureRequestSchema.parse(request.body);
-    await catalog.failTranscriptionJob(
-      await authenticate(request),
-      jobId,
-      body,
-    );
+    const actor = await authenticate(request);
+    await catalog.failTranscriptionJob(actor, jobId, body);
     return reply.status(204).send();
   });
 
@@ -920,8 +973,9 @@ export function createCloudApi(
   app.post("/api/transcription-jobs/:jobId/finalize", async (request) => {
     const { jobId } = JobParamsSchema.parse(request.params);
     const body = WorkerFinalizeTranscriptRequestSchema.parse(request.body);
-    return catalog.finalizeTranscript(
-      await authenticate(request),
+    const actor = await authenticate(request);
+    const finalized = await catalog.finalizeTranscript(
+      actor,
       {
         uploadId: body.uploadId,
         idempotencyKey: body.idempotencyKey,
@@ -929,6 +983,7 @@ export function createCloudApi(
       },
       { jobId, attempt: body.attempt },
     );
+    return finalized;
   });
 
   app.post(
@@ -974,6 +1029,14 @@ export function createCloudApi(
   );
 
   return app;
+}
+
+class CloudTranslationUnavailableError extends Error {
+  readonly statusCode = 503;
+  readonly code = "cloud_translation_unavailable";
+  constructor() {
+    super("Cloud translation is currently unavailable.");
+  }
 }
 
 export async function preflightTranscriptionBatch(

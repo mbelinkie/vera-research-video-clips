@@ -5,13 +5,16 @@
   "type": "module",
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1101.0",
+    "@aws-sdk/client-sqs": "^3.1101.0",
     "@electric-sql/pglite": "^0.5.4",
     "@research-video/auth": "*",
     "@research-video/catalog": "*",
     "@research-video/config": "*",
     "@research-video/contracts": "*",
     "@research-video/db-cloud": "*",
+    "@research-video/providers": "*",
     "@research-video/storage": "*",
+    "@research-video/transcript": "*",
     "fastify": "^5.11.0",
     "zod": "^4.4.3"
   }

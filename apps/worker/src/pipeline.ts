@@ -13,6 +13,8 @@ import {
   WorkerCreateTranscriptUploadRequestSchema,
   WorkerFinalizeTranscriptRequestSchema,
   type ActiveTranscriptBundle,
+  type ClaimedTranscriptionJob,
+  type CloudTranslationConsent,
   type DerivedTranslation,
   type DerivedTranslationIdentity,
   type FinalizedObject,
@@ -20,6 +22,7 @@ import {
   type TranscriptArtifact,
   type TranscriptManifest,
   type TranscriptUploadGrant,
+  type WorkerTranslateTranscriptResponse,
 } from "@research-video/contracts";
 import { languagesEquivalent } from "@research-video/contracts";
 import type { MediaAcquisitionProvider } from "@research-video/media";
@@ -71,10 +74,23 @@ export type TranscriptPipelineOptions = {
   media: MediaAcquisitionProvider;
   speechToText: SpeechToTextProvider;
   translation?: TranslationProvider;
+  claimedTranslation?: ClaimedTranslationClient;
   publication: TranscriptPublicationClient;
   scratchRoot: string;
   now?: () => Date;
 };
+
+export interface ClaimedTranslationClient {
+  translate(input: {
+    jobId: string;
+    attempt: number;
+    consent: CloudTranslationConsent;
+    uploadId: string;
+    sourceArtifact: FinalizedObject & { type: "original-normalized" };
+    targetLanguage: string;
+    signal?: AbortSignal;
+  }): Promise<WorkerTranslateTranscriptResponse>;
+}
 
 export interface DerivedTranslationPublicationClient {
   publish(input: {
@@ -170,26 +186,71 @@ export function createTranscriptPipelineExecutor(
         scratch,
         context,
       );
-      const english = await resolveEnglishTranscript(
-        options.translation,
-        source,
-        payload.targetLanguage,
-        context,
-      );
-      await context.setStage("uploading");
       const lineageId = await stableUuid(
         `lineage:${claimed.job.projectId}:${payload.catalogVideoId}:${source.track.language}:${payload.targetLanguage}`,
       );
       const version = 1;
-      const artifacts = artifactPayloads(source, english);
+      const requiresTranslation =
+        primaryLanguage(source.track.language) !==
+        primaryLanguage(payload.targetLanguage);
+      const artifactTypes: UploadArtifactType[] = requiresTranslation
+        ? [
+            "original-normalized",
+            "original-srt",
+            "english-normalized",
+            "english-srt",
+          ]
+        : ["english-normalized", "english-srt"];
       const grant = await options.publication.createUpload(claimed.job.id, {
         attempt: claimed.lease.attempt,
         lineageId,
         version,
-        artifactTypes: artifacts.map((artifact) => artifact.type),
+        artifactTypes,
       });
       const finalizedArtifacts: FinalizedObject[] = [];
+      let uploadedTranslationSource:
+        (FinalizedObject & { type: "original-normalized" }) | undefined;
+      if (requiresTranslation && options.claimedTranslation) {
+        const artifact = await options.publication.upload(
+          requiredTarget(grant, "original-normalized"),
+          encodeJson(source),
+          "application/json",
+        );
+        if (artifact.type !== "original-normalized") {
+          throw new TranscriptPipelineError(
+            "Publication adapter returned the wrong translation source artifact type.",
+          );
+        }
+        uploadedTranslationSource = {
+          ...artifact,
+          type: "original-normalized",
+        };
+      }
+      const resolvedEnglish = await resolveEnglishTranscript(
+        options,
+        claimed,
+        payload,
+        source,
+        grant.uploadId,
+        uploadedTranslationSource,
+        context,
+      );
+      const english = resolvedEnglish.transcript;
+      await context.setStage("uploading");
+      const artifacts = artifactPayloads(source, english);
+      if (uploadedTranslationSource) {
+        finalizedArtifacts.push(uploadedTranslationSource);
+      }
+      finalizedArtifacts.push(...resolvedEnglish.serverArtifacts);
+      const serverArtifactTypes = new Set<UploadArtifactType>(
+        resolvedEnglish.serverArtifacts.map((artifact) => artifact.type),
+      );
       for (const artifact of artifacts) {
+        if (
+          artifact.type === uploadedTranslationSource?.type ||
+          serverArtifactTypes.has(artifact.type)
+        )
+          continue;
         const target = requiredTarget(grant, artifact.type);
         finalizedArtifacts.push(
           await options.publication.upload(
@@ -305,28 +366,65 @@ async function resolveSourceTranscript(
 }
 
 async function resolveEnglishTranscript(
-  translation: TranslationProvider | undefined,
+  options: TranscriptPipelineOptions,
+  claimed: ClaimedTranscriptionJob,
+  payload: ReturnType<typeof TranscriptionJobPayloadSchema.parse>,
   source: NormalizedTranscript,
-  targetLanguage: string,
+  uploadId: string,
+  uploadedSource:
+    (FinalizedObject & { type: "original-normalized" }) | undefined,
   context: TranscriptionExecutionContext,
 ) {
   if (
-    primaryLanguage(source.track.language) === primaryLanguage(targetLanguage)
+    primaryLanguage(source.track.language) ===
+    primaryLanguage(payload.targetLanguage)
   ) {
-    return source;
+    return { transcript: source, serverArtifacts: [] };
   }
-  if (!translation) {
+  if (options.claimedTranslation) {
+    if (!payload.translationConsent) {
+      throw new TranscriptPipelineError(
+        "Cloud translation requires the submitting user's explicit transcript-transfer consent.",
+      );
+    }
+    await context.setStage("translating");
+    if (!uploadedSource) {
+      throw new TranscriptPipelineError(
+        "Cloud translation requires a verified uploaded source artifact.",
+      );
+    }
+    const published = await options.claimedTranslation.translate({
+      jobId: claimed.job.id,
+      attempt: claimed.lease.attempt,
+      consent: payload.translationConsent,
+      uploadId,
+      sourceArtifact: uploadedSource,
+      targetLanguage: payload.targetLanguage,
+      signal: context.signal,
+    });
+    return {
+      transcript: published.transcript,
+      serverArtifacts: [
+        published.normalizedArtifact,
+        published.subtitleArtifact,
+      ],
+    };
+  }
+  if (!options.translation) {
     throw new TranscriptPipelineError(
       "A translation provider is required for the detected source language.",
     );
   }
   await context.setStage("translating");
-  return translateCanonicalTranscript(
-    translation,
-    source,
-    targetLanguage,
-    context.signal,
-  );
+  return {
+    transcript: await translateCanonicalTranscript(
+      options.translation,
+      source,
+      payload.targetLanguage,
+      context.signal,
+    ),
+    serverArtifacts: [],
+  };
 }
 
 function artifactPayloads(

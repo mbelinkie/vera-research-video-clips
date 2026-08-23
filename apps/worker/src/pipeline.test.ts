@@ -11,16 +11,21 @@ import type {
   FinalizedObject,
   TranscriptUploadGrant,
 } from "@research-video/contracts";
-import { DerivedTranslationSchema } from "@research-video/contracts";
+import {
+  DerivedTranslationSchema,
+  NormalizedTranscriptSchema,
+} from "@research-video/contracts";
 import {
   normalizeGeneratedTranscript,
   normalizeTranscriptFixture,
 } from "@research-video/transcript";
+import { translateCanonicalTranscript } from "@research-video/providers";
 import multilingualFixture from "../../../tests/fixtures/transcripts/romanian-multilingual.json" with { type: "json" };
 
 import {
   createTranscriptPipelineExecutor,
   executeDerivedTranslation,
+  type ClaimedTranslationClient,
   type TranscriptPublicationClient,
 } from "./pipeline.ts";
 
@@ -185,6 +190,113 @@ function publicationFixture() {
 }
 
 describe("transcript pipeline", () => {
+  it("uploads and pins original evidence before requesting claimed cloud translation", async () => {
+    const scratchRoot = await mkdtemp(join(tmpdir(), "pipeline-"));
+    temporaryDirectories.add(scratchRoot);
+    const publication = publicationFixture();
+    const claimed = claimedJob();
+    const consent = {
+      provider: "amazon-translate" as const,
+      disclosureVersion: 1 as const,
+      transcriptTextTransferAccepted: true as const,
+    };
+    claimed.job.payload = {
+      ...claimed.job.payload,
+      translationConsent: consent,
+    };
+    const translate = vi.fn<ClaimedTranslationClient["translate"]>(
+      async (input) => {
+        const uploaded = publication.uploaded.get("original-normalized");
+        expect(uploaded).toBeDefined();
+        expect(input).not.toHaveProperty("source");
+        const source = NormalizedTranscriptSchema.parse(
+          JSON.parse(new TextDecoder().decode(uploaded)),
+        );
+        const transcript = await translateCanonicalTranscript(
+          {
+            translate: async (request) => ({
+              provider: "amazon-translate",
+              segments: request.segments.map((segment) => ({
+                sourceSegmentId: segment.id,
+                text: "Cloud-produced English.",
+              })),
+            }),
+          },
+          source,
+          "en",
+        );
+        return {
+          transcript,
+          normalizedArtifact: {
+            type: "english-normalized",
+            objectKey: "fixture/english-normalized.json",
+            objectVersionId: randomUUID(),
+            byteSize: 512,
+            sha256: "d".repeat(64),
+          },
+          subtitleArtifact: {
+            type: "english-srt",
+            objectKey: "fixture/english-srt.json",
+            objectVersionId: randomUUID(),
+            byteSize: 80,
+            sha256: "e".repeat(64),
+          },
+        };
+      },
+    );
+    const executor = createTranscriptPipelineExecutor({
+      scratchRoot,
+      publication: publication.client,
+      captions: {
+        discover: async () => [
+          {
+            id: "fixture:manual:ro",
+            language: "ro",
+            kind: "manual",
+            translatable: false,
+            downloadAccess: "available",
+          },
+        ],
+        acquire: async (videoId, track, scratch) => {
+          const path = join(scratch, "caption.vtt");
+          const contents = "WEBVTT\n\n00:00.000 --> 00:00:01.000\nBună ziua.\n";
+          await writeFile(path, contents);
+          return {
+            videoId,
+            track,
+            path,
+            format: "vtt",
+            byteSize: Buffer.byteLength(contents),
+            provider: "fixture",
+          };
+        },
+      },
+      media: { acquireAuthorizedSource: vi.fn() },
+      speechToText: { transcribe: vi.fn() },
+      claimedTranslation: { translate },
+    });
+
+    await executor(claimed, {
+      signal: new AbortController().signal,
+      setStage: async () => undefined,
+      recordSourcePlan: async () => undefined,
+    });
+
+    expect(translate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        jobId: claimed.job.id,
+        attempt: claimed.lease.attempt,
+        consent,
+        uploadId: expect.any(String),
+        sourceArtifact: expect.objectContaining({
+          type: "original-normalized",
+          objectVersionId: expect.any(String),
+        }),
+      }),
+    );
+    expect(publication.finalize).toHaveBeenCalledOnce();
+  });
+
   it("publishes separate time-linked original and English caption tracks", async () => {
     const scratchRoot = await mkdtemp(join(tmpdir(), "pipeline-"));
     temporaryDirectories.add(scratchRoot);

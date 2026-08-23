@@ -10,6 +10,7 @@ import type {
   ExportRequest,
   LoggedExportFailureResult,
   LoggedExportSuccessResult,
+  NormalizedTranscript,
   TranscriptManifest,
 } from "@research-video/contracts";
 import { runCloudMigrations } from "@research-video/db-cloud";
@@ -70,20 +71,63 @@ describe("claimed transcript finalization", () => {
       ],
     });
     const item = created.items[0]!;
-    const claimed = await catalog.claimTranscriptionJob(actor, "local", 120);
+    await expect(catalog.listUndispatchedTranscriptionJobs()).resolves.toEqual([
+      { jobId: item.jobId, executionLocation: "local" },
+    ]);
+    await catalog.markTranscriptionJobDispatched(item.jobId!);
+    await expect(catalog.listUndispatchedTranscriptionJobs()).resolves.toEqual(
+      [],
+    );
+    await database.query(
+      `UPDATE jobs
+       SET payload = payload || jsonb_build_object(
+             'queueDispatchedAt', '2000-01-01T00:00:00.000Z'
+           )
+       WHERE id = $1`,
+      [item.jobId],
+    );
+    await expect(catalog.listUndispatchedTranscriptionJobs()).resolves.toEqual([
+      { jobId: item.jobId, executionLocation: "local" },
+    ]);
+    await catalog.markTranscriptionJobDispatched(item.jobId!);
+    await expect(
+      catalog.claimTranscriptionJob(actor, "local", 120, true),
+    ).resolves.toBeUndefined();
+    await expect(
+      catalog.markTranscriptionJobQueueDelivered(item.jobId!, "local"),
+    ).resolves.toBe(true);
+    const claimed = await catalog.claimTranscriptionJob(
+      actor,
+      "local",
+      120,
+      true,
+    );
     expect(claimed?.job.id).toBe(item.jobId);
 
     const lineageId = randomUUID();
-    const grant = await catalog.createClaimedTranscriptUpload(
-      actor,
-      claimed!.job.id,
-      claimed!.lease.attempt,
-      {
-        lineageId,
-        version: 1,
-        artifactTypes: ["english-normalized", "english-srt"],
-      },
-    );
+    const [grant, replayedGrant] = await Promise.all([
+      catalog.createClaimedTranscriptUpload(
+        actor,
+        claimed!.job.id,
+        claimed!.lease.attempt,
+        {
+          lineageId,
+          version: 1,
+          artifactTypes: ["english-normalized", "english-srt"],
+        },
+      ),
+      catalog.createClaimedTranscriptUpload(
+        actor,
+        claimed!.job.id,
+        claimed!.lease.attempt,
+        {
+          lineageId,
+          version: 1,
+          artifactTypes: ["english-normalized", "english-srt"],
+        },
+      ),
+    ]);
+    expect(replayedGrant.uploadId).toBe(grant.uploadId);
     const storedArtifacts = [];
     for (const type of ["english-normalized", "english-srt"] as const) {
       const target = grant.targets.find(
@@ -177,6 +221,288 @@ describe("claimed transcript finalization", () => {
         "uploading",
       ),
     ).rejects.toMatchObject({ statusCode: 403 });
+  });
+});
+
+describe("claimed cloud translation source", () => {
+  it("persists consent and reloads only the exact versioned upload bytes", async () => {
+    const database = new PGlite();
+    databases.add(database);
+    await runCloudMigrations(database);
+    const store = new MemoryTranscriptObjectStore();
+    const catalog = new SharedProjectCatalog(database, store);
+    const actor: AuthenticatedActor = {
+      userId: randomUUID(),
+      externalSubject: "fixture:translation-owner",
+    };
+    await catalog.registerUser(actor, "Translation owner");
+    const project = await catalog.createProject(actor, {
+      name: "Translation project",
+    });
+    const consent = {
+      provider: "amazon-translate" as const,
+      disclosureVersion: 1 as const,
+      transcriptTextTransferAccepted: true as const,
+    };
+    const created = await catalog.createTranscriptionBatch(actor, {
+      projectId: project.id,
+      name: "Consented batch",
+      options: {
+        targetLanguage: "en",
+        transcriptionProfile: "default",
+        sourcePolicy: "prefer-existing",
+        executionLocation: "local",
+        priority: "normal",
+        translationConsent: consent,
+      },
+      items: [
+        {
+          inputIndex: 0,
+          input: "https://youtu.be/Romanian001",
+          status: "ready",
+          processingNeed: "transcription",
+          youtubeVideoId: "Romanian001",
+          canonicalUrl: "https://www.youtube.com/watch?v=Romanian001",
+          title: "Romanian fixture",
+        },
+      ],
+    });
+    expect(created.batch.translationConsent).toEqual(consent);
+    const claimed = (await catalog.claimTranscriptionJob(actor, "local", 120))!;
+    expect(claimed.job.payload).toMatchObject({ translationConsent: consent });
+    const grant = await catalog.createClaimedTranscriptUpload(
+      actor,
+      claimed.job.id,
+      claimed.lease.attempt,
+      {
+        lineageId: randomUUID(),
+        version: 1,
+        artifactTypes: [
+          "original-normalized",
+          "original-srt",
+          "english-normalized",
+          "english-srt",
+        ],
+      },
+    );
+    const source: NormalizedTranscript = {
+      track: {
+        id: randomUUID(),
+        videoId: "Romanian001",
+        language: "ro",
+        kind: "original",
+        source: "generated",
+        provider: "fixture",
+        timingPrecision: "cue",
+        schemaVersion: 1,
+        contentSha256: "a".repeat(64),
+        version: 1,
+      },
+      segments: [
+        {
+          id: randomUUID(),
+          trackId: "placeholder",
+          ordinal: 0,
+          startMs: 0,
+          endMs: 1_000,
+          text: "Bună ziua",
+        },
+      ],
+      tokens: [],
+    };
+    source.segments[0]!.trackId = source.track.id;
+    const bytes = new TextEncoder().encode(JSON.stringify(source));
+    const target = grant.targets.find(
+      (candidate) => candidate.type === "original-normalized",
+    )!;
+    const stored = await store.put({
+      key: target.objectKey,
+      bytes,
+      contentType: "application/json",
+      sha256: digest(bytes),
+    });
+    const descriptor = {
+      type: "original-normalized" as const,
+      objectKey: stored.key,
+      objectVersionId: stored.versionId,
+      byteSize: bytes.byteLength,
+      sha256: stored.sha256,
+    };
+
+    await expect(
+      catalog.loadClaimedTranscriptTranslationSource(actor, claimed.job.id, {
+        attempt: claimed.lease.attempt,
+        consent,
+        uploadId: grant.uploadId,
+        sourceArtifact: { ...descriptor, sha256: "b".repeat(64) },
+        targetLanguage: "en",
+      }),
+    ).rejects.toMatchObject({ code: "transcript_integrity_failed" });
+    await expect(
+      catalog.loadClaimedTranscriptTranslationSource(actor, claimed.job.id, {
+        attempt: claimed.lease.attempt,
+        consent,
+        uploadId: grant.uploadId,
+        sourceArtifact: descriptor,
+        targetLanguage: "en",
+      }),
+    ).resolves.toEqual(source);
+
+    const translated: NormalizedTranscript = {
+      track: {
+        ...source.track,
+        id: randomUUID(),
+        language: "en",
+        kind: "english",
+        source: "translated",
+        provider: "amazon-translate",
+        sourceTrackId: source.track.id,
+        contentSha256: "d".repeat(64),
+      },
+      segments: source.segments.map((segment) => ({
+        ...segment,
+        id: randomUUID(),
+        trackId: "placeholder",
+        text: "Hello",
+      })),
+      tokens: [],
+    };
+    translated.segments[0]!.trackId = translated.track.id;
+    const subtitleBytes = new TextEncoder().encode(
+      "1\n00:00:00,000 --> 00:00:01,000\nHello\n",
+    );
+    const published = await catalog.publishClaimedTranscriptTranslation(
+      actor,
+      claimed.job.id,
+      {
+        attempt: claimed.lease.attempt,
+        consent,
+        uploadId: grant.uploadId,
+        sourceArtifact: descriptor,
+        targetLanguage: "en",
+        transcript: translated,
+        subtitleBytes,
+      },
+    );
+    expect(published.transcript).toEqual(translated);
+    await expect(
+      catalog.getClaimedTranscriptTranslationPublication(
+        actor,
+        claimed.job.id,
+        {
+          attempt: claimed.lease.attempt,
+          uploadId: grant.uploadId,
+          sourceArtifact: descriptor,
+          targetLanguage: "en",
+        },
+      ),
+    ).resolves.toEqual(published);
+
+    const originalSrtBytes = new TextEncoder().encode(
+      "1\n00:00:00,000 --> 00:00:01,000\nBună ziua\n",
+    );
+    const originalSrtTarget = grant.targets.find(
+      (candidate) => candidate.type === "original-srt",
+    )!;
+    const originalSrtStored = await store.put({
+      key: originalSrtTarget.objectKey,
+      bytes: originalSrtBytes,
+      contentType: "application/x-subrip",
+      sha256: digest(originalSrtBytes),
+    });
+    const originalSrtArtifact = {
+      type: "original-srt" as const,
+      objectKey: originalSrtStored.key,
+      objectVersionId: originalSrtStored.versionId,
+      byteSize: originalSrtBytes.byteLength,
+      sha256: originalSrtStored.sha256,
+    };
+    const manifestBase: TranscriptManifest = {
+      schemaVersion: 1,
+      id: randomUUID(),
+      projectId: project.id,
+      catalogVideoId: created.items[0]!.catalogVideoId!,
+      videoId: "Romanian001",
+      lineageId: grant.lineageId,
+      version: 1,
+      sourceLanguage: "ro",
+      targetLanguage: "en",
+      timingPrecision: "cue",
+      provider: "fixture",
+      normalizationSchemaVersion: 1,
+      jobId: claimed.job.id,
+      createdBy: actor.userId,
+      createdAt: new Date().toISOString(),
+      artifacts: [
+        descriptor,
+        originalSrtArtifact,
+        published.normalizedArtifact,
+        published.subtitleArtifact,
+      ],
+    };
+    const putManifest = async (manifest: TranscriptManifest) => {
+      const manifestBytes = new TextEncoder().encode(JSON.stringify(manifest));
+      const manifestTarget = grant.targets.find(
+        (candidate) => candidate.type === "manifest",
+      )!;
+      const storedManifest = await store.put({
+        key: manifestTarget.objectKey,
+        bytes: manifestBytes,
+        contentType: "application/json",
+        sha256: digest(manifestBytes),
+      });
+      return {
+        type: "manifest" as const,
+        objectKey: storedManifest.key,
+        objectVersionId: storedManifest.versionId,
+        byteSize: manifestBytes.byteLength,
+        sha256: storedManifest.sha256,
+      };
+    };
+    const tamperedManifest = {
+      ...manifestBase,
+      artifacts: manifestBase.artifacts.map((artifact) =>
+        artifact.type === "english-normalized"
+          ? { ...artifact, sha256: "f".repeat(64) }
+          : artifact,
+      ),
+    } satisfies TranscriptManifest;
+    await expect(
+      catalog.finalizeTranscript(
+        actor,
+        {
+          uploadId: grant.uploadId,
+          idempotencyKey: `finalize:${manifestBase.id}`,
+          manifest: await putManifest(tamperedManifest),
+        },
+        { jobId: claimed.job.id, attempt: claimed.lease.attempt },
+      ),
+    ).rejects.toThrow("server-produced result");
+    await expect(
+      catalog.finalizeTranscript(
+        actor,
+        {
+          uploadId: grant.uploadId,
+          idempotencyKey: `finalize:${manifestBase.id}`,
+          manifest: await putManifest({
+            ...manifestBase,
+            provider: "forged-provider",
+          }),
+        },
+        { jobId: claimed.job.id, attempt: claimed.lease.attempt },
+      ),
+    ).rejects.toThrow("manifest metadata");
+    await expect(
+      catalog.finalizeTranscript(
+        actor,
+        {
+          uploadId: grant.uploadId,
+          idempotencyKey: `finalize:${manifestBase.id}`,
+          manifest: await putManifest(manifestBase),
+        },
+        { jobId: claimed.job.id, attempt: claimed.lease.attempt },
+      ),
+    ).resolves.toMatchObject({ transcriptVersionId: manifestBase.id });
   });
 });
 

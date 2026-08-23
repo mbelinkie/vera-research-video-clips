@@ -1,7 +1,11 @@
 import { createHash, randomUUID } from "node:crypto";
 
-import type { PGlite } from "@electric-sql/pglite";
 import { AuthorizationError, requirePermission } from "@research-video/auth";
+import {
+  asCloudDatabase,
+  type CloudDatabase,
+  type CloudDatabaseInput,
+} from "@research-video/db-cloud";
 import {
   ActiveTranscriptBundleSchema,
   ArtifactVersionHistoryResponseSchema,
@@ -65,12 +69,15 @@ import {
   ReviewInboxItemSchema,
   ReviewInboxResponseSchema,
   TranscriptManifestSchema,
+  FinalizedObjectSchema,
+  TranscriptionJobPayloadSchema,
   TranscriptionBatchItemSchema,
   TranscriptUploadGrantSchema,
   TranscriptionBatchListResponseSchema,
   UserSchema,
   VideoSchema,
   WorkerLeaseSchema,
+  WorkerTranslateTranscriptResponseSchema,
   languagesEquivalent,
   primaryLanguage,
   type ActiveTranscriptBundle,
@@ -86,6 +93,7 @@ import {
   type BatchOptions,
   type BatchPreflightItem,
   type ClaimedTranscriptionJob,
+  type CloudTranslationConsent,
   type ClipCandidate,
   type ClipLibraryPage,
   type ClipLibraryQuery,
@@ -101,6 +109,7 @@ import {
   type DerivedTranslationIdentity,
   type DerivedTranslationJob,
   type FinalizeTranscriptRequest,
+  type FinalizedObject,
   type ExportRequest,
   type ExportPresetCatalogEntry,
   type ExportPresetDefault,
@@ -126,6 +135,7 @@ import {
   type LoggedExportProgressStage,
   type LoggedExportSuccess,
   type LoggedExportSuccessResult,
+  type NormalizedTranscript,
   type ReconcileLoggedExportFailureRequest,
   type ReconcileLoggedExportSuccessRequest,
   type ReconcileLoggedExportCanceledRequest,
@@ -158,6 +168,7 @@ import {
   type User,
   type Video,
   type WorkerLease,
+  type WorkerTranslateTranscriptResponse,
   type WorkerFailureRequest,
   type WorkerProgressStage,
 } from "@research-video/contracts";
@@ -264,8 +275,36 @@ export const LoggedExportExecutionLeaseTtlMs = 30_000;
 const iso = (value: unknown) =>
   value instanceof Date ? value.toISOString() : String(value);
 
+const jsonRecord = (value: unknown): Record<string, unknown> | undefined => {
+  if (typeof value === "string") {
+    try {
+      return jsonRecord(JSON.parse(value));
+    } catch {
+      return undefined;
+    }
+  }
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+};
+
 const sha256 = (bytes: Uint8Array) =>
   createHash("sha256").update(bytes).digest("hex");
+
+const sameFinalizedObject = (
+  left: Pick<
+    FinalizedObject,
+    "type" | "objectKey" | "objectVersionId" | "byteSize" | "sha256"
+  >,
+  right: Pick<FinalizedObject, "type" | "objectKey" | "byteSize" | "sha256"> & {
+    objectVersionId?: string | undefined;
+  },
+) =>
+  left.type === right.type &&
+  left.objectKey === right.objectKey &&
+  left.objectVersionId === right.objectVersionId &&
+  left.byteSize === right.byteSize &&
+  left.sha256 === right.sha256;
 
 type ClipLibraryCursor = {
   projectId: string;
@@ -344,14 +383,16 @@ const loggedExportDeliverySelect = `SELECT
    ON export_success.export_request_id = er.id`;
 
 export class SharedProjectCatalog {
-  private transactionTail: Promise<void> = Promise.resolve();
+  private readonly database: CloudDatabase;
 
   constructor(
-    private readonly database: PGlite,
+    database: CloudDatabaseInput,
     private readonly store: TranscriptObjectStore,
     private readonly now: () => Date = () => new Date(),
     private readonly uploadUrlIssuer: StagedUploadUrlIssuer = new MemoryStagedUploadUrlIssuer(),
-  ) {}
+  ) {
+    this.database = asCloudDatabase(database);
+  }
 
   async registerUser(
     actor: AuthenticatedActor,
@@ -4011,8 +4052,10 @@ export class SharedProjectCatalog {
         `INSERT INTO transcription_batches
            (id, project_id, name, target_language, execution_location,
             transcription_profile, source_policy, priority, created_by,
-            version, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 1, $10, $10)`,
+            translation_provider, translation_disclosure_version,
+            translation_consent_accepted_at, version, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                 1, $13, $13)`,
         [
           batchId,
           input.projectId,
@@ -4023,6 +4066,9 @@ export class SharedProjectCatalog {
           input.options.sourcePolicy,
           input.options.priority,
           actor.userId,
+          input.options.translationConsent?.provider ?? null,
+          input.options.translationConsent?.disclosureVersion ?? null,
+          input.options.translationConsent ? createdAt : null,
           createdAt,
         ],
       );
@@ -4078,36 +4124,52 @@ export class SharedProjectCatalog {
             input.options.transcriptionProfile,
             input.options.targetLanguage,
             input.options.sourcePolicy,
+            input.options.translationConsent
+              ? `translate-${input.options.translationConsent.provider}-v${input.options.translationConsent.disclosureVersion}`
+              : "translate-disabled",
             "schema-1",
           ].join(":");
-          const existingJob = await this.database.query<DbRow>(
-            "SELECT id FROM jobs WHERE idempotency_key = $1",
-            [idempotencyKey],
-          );
-          jobId = String(existingJob.rows[0]?.id ?? randomUUID());
-          if (!existingJob.rows[0]) {
-            await this.database.query(
-              `INSERT INTO jobs
+          const candidateJobId = randomUUID();
+          const insertedJob = await this.database.query<DbRow>(
+            `INSERT INTO jobs
                  (id, project_id, kind, state, idempotency_key, attempt,
                   payload, created_at, updated_at)
-               VALUES ($1, $2, 'transcription', 'queued', $3, 0, $4, $5, $5)`,
-              [
-                jobId,
-                input.projectId,
-                idempotencyKey,
-                JSON.stringify({
-                  batchId,
-                  catalogVideoId,
-                  youtubeVideoId: persistedItem.youtubeVideoId,
-                  targetLanguage: input.options.targetLanguage,
-                  transcriptionProfile: input.options.transcriptionProfile,
-                  sourcePolicy: input.options.sourcePolicy,
-                  executionLocation: input.options.executionLocation,
-                  priority: input.options.priority,
-                }),
-                createdAt,
-              ],
+               VALUES ($1, $2, 'transcription', 'queued', $3, 0, $4, $5, $5)
+               ON CONFLICT (idempotency_key) DO NOTHING
+               RETURNING id`,
+            [
+              candidateJobId,
+              input.projectId,
+              idempotencyKey,
+              JSON.stringify({
+                batchId,
+                catalogVideoId,
+                youtubeVideoId: persistedItem.youtubeVideoId,
+                targetLanguage: input.options.targetLanguage,
+                transcriptionProfile: input.options.transcriptionProfile,
+                sourcePolicy: input.options.sourcePolicy,
+                executionLocation: input.options.executionLocation,
+                priority: input.options.priority,
+                ...(input.options.translationConsent
+                  ? { translationConsent: input.options.translationConsent }
+                  : {}),
+              }),
+              createdAt,
+            ],
+          );
+          if (insertedJob.rows[0]) {
+            jobId = String(insertedJob.rows[0].id);
+          } else {
+            const existingJob = await this.database.query<DbRow>(
+              "SELECT id FROM jobs WHERE idempotency_key = $1",
+              [idempotencyKey],
             );
+            if (!existingJob.rows[0]) {
+              throw new CatalogConflictError(
+                "The transcription job could not be resolved after deduplication.",
+              );
+            }
+            jobId = String(existingJob.rows[0].id);
           }
           state = "queued";
         } else if (persistedItem.status === "existing-transcript") {
@@ -4187,6 +4249,15 @@ export class SharedProjectCatalog {
         sourcePolicy: batch.source_policy,
         executionLocation: batch.execution_location,
         priority: batch.priority,
+        ...(batch.translation_provider === null
+          ? {}
+          : {
+              translationConsent: {
+                provider: batch.translation_provider,
+                disclosureVersion: Number(batch.translation_disclosure_version),
+                transcriptTextTransferAccepted: true,
+              },
+            }),
         dispatchStatus: batch.dispatch_status,
         createdBy: batch.created_by,
         version: batch.version,
@@ -4333,6 +4404,17 @@ export class SharedProjectCatalog {
         dispatchStatus = "paused";
       } else if (command.action === "resume") {
         dispatchStatus = "active";
+        await this.database.query(
+          `UPDATE jobs j
+           SET payload = payload - 'queueDispatchedAt' - 'queueDeliveredAt', updated_at = $1
+           WHERE j.kind = 'transcription' AND j.state = 'queued'
+             AND EXISTS (
+               SELECT 1 FROM transcription_batch_items bi
+               WHERE bi.batch_id = $2 AND bi.job_id = j.id
+                 AND bi.state = 'queued'
+             )`,
+          [updatedAt, batchId],
+        );
       } else if (command.action === "cancel_unstarted") {
         dispatchStatus = "canceled";
         await this.database.query(
@@ -4371,7 +4453,8 @@ export class SharedProjectCatalog {
         for (const row of retryJobs.rows) {
           await this.database.query(
             `UPDATE jobs
-             SET state = 'queued', payload = payload - 'lastError',
+             SET state = 'queued',
+                 payload = payload - 'lastError' - 'queueDispatchedAt' - 'queueDeliveredAt',
                  updated_at = $1
              WHERE id = $2 AND state = 'failed'`,
             [updatedAt, row.job_id],
@@ -4398,16 +4481,77 @@ export class SharedProjectCatalog {
     return this.getTranscriptionBatch(actor, projectId, batchId);
   }
 
+  async listUndispatchedTranscriptionJobs(
+    limit = 25,
+  ): Promise<Array<{ jobId: string; executionLocation: "local" | "hosted" }>> {
+    const result = await this.database.query<DbRow>(
+      `SELECT DISTINCT j.id, j.payload->>'executionLocation' AS execution_location
+       FROM jobs j
+       JOIN transcription_batch_items bi ON bi.job_id = j.id
+       JOIN transcription_batches b ON b.id = bi.batch_id
+       WHERE j.kind = 'transcription' AND j.state = 'queued'
+         AND j.payload->>'queueDeliveredAt' IS NULL
+         AND (
+           j.payload->>'queueDispatchedAt' IS NULL
+           OR (j.payload->>'queueDispatchedAt')::timestamptz <= $2::timestamptz
+         )
+         AND b.dispatch_status = 'active' AND bi.state = 'queued'
+       ORDER BY j.id
+       LIMIT $1::integer`,
+      [
+        Math.max(1, Math.min(100, limit)),
+        new Date(this.now().getTime() - 5 * 60_000).toISOString(),
+      ],
+    );
+    return result.rows.map((row) => ({
+      jobId: String(row.id),
+      executionLocation:
+        row.execution_location === "hosted" ? "hosted" : "local",
+    }));
+  }
+
+  async markTranscriptionJobDispatched(jobId: string): Promise<void> {
+    await this.database.query(
+      `UPDATE jobs
+       SET payload = payload || jsonb_build_object(
+             'queueDispatchedAt', $1::text
+           ),
+           updated_at = $1::timestamptz
+       WHERE id = $2 AND kind = 'transcription' AND state = 'queued'
+         AND payload->>'queueDeliveredAt' IS NULL`,
+      [this.now().toISOString(), jobId],
+    );
+  }
+
+  async markTranscriptionJobQueueDelivered(
+    jobId: string,
+    executionLocation: "local" | "hosted",
+  ): Promise<boolean> {
+    const deliveredAt = this.now().toISOString();
+    const result = await this.database.query<DbRow>(
+      `UPDATE jobs
+       SET payload = payload || jsonb_build_object(
+             'queueDeliveredAt', $1::text
+           ),
+           updated_at = $1::timestamptz
+       WHERE id = $2 AND kind = 'transcription' AND state = 'queued'
+         AND payload->>'executionLocation' = $3
+       RETURNING id`,
+      [deliveredAt, jobId, executionLocation],
+    );
+    return Boolean(result.rows[0]);
+  }
+
   async claimTranscriptionJob(
     actor: AuthenticatedActor,
     executionLocation: "local" | "hosted",
     leaseSeconds: number,
+    requireQueueDelivery = false,
   ): Promise<ClaimedTranscriptionJob | undefined> {
     await this.requireRegistered(actor);
     const claimedAt = this.now();
     const expiresAt = new Date(claimedAt.getTime() + leaseSeconds * 1_000);
-    await this.database.exec("BEGIN");
-    try {
+    return this.transaction(async () => {
       const candidate = await this.database.query<DbRow>(
         `SELECT j.*
          FROM jobs j
@@ -4417,6 +4561,7 @@ export class SharedProjectCatalog {
          WHERE j.kind = 'transcription'
            AND pm.role IN ('owner', 'editor', 'researcher')
            AND j.payload->>'executionLocation' = $2
+           ${requireQueueDelivery ? "AND j.payload->>'queueDeliveredAt' IS NOT NULL" : ""}
            AND EXISTS (
              SELECT 1
              FROM transcription_batch_items bi
@@ -4445,10 +4590,7 @@ export class SharedProjectCatalog {
         [actor.userId, executionLocation, claimedAt.toISOString()],
       );
       const row = candidate.rows[0];
-      if (!row) {
-        await this.database.exec("COMMIT");
-        return undefined;
-      }
+      if (!row) return undefined;
       const attempt = Number(row.attempt) + 1;
       await this.database.query(
         `UPDATE jobs
@@ -4481,7 +4623,6 @@ export class SharedProjectCatalog {
          WHERE job_id = $3 AND state NOT IN ('ready_for_review', 'canceled')`,
         [attempt, claimedAt.toISOString(), row.id],
       );
-      await this.database.exec("COMMIT");
       return ClaimedTranscriptionJobSchema.parse({
         job: mapJob({
           ...row,
@@ -4498,10 +4639,7 @@ export class SharedProjectCatalog {
           expiresAt: expiresAt.toISOString(),
         },
       });
-    } catch (error) {
-      await this.database.exec("ROLLBACK");
-      throw error;
-    }
+    });
   }
 
   async heartbeatTranscriptionJob(
@@ -4770,10 +4908,24 @@ export class SharedProjectCatalog {
           "The claimed job already has different artifact targets.",
         );
       }
-      await this.database.query(
-        "UPDATE transcript_uploads SET state = 'staged', expires_at = $1 WHERE id = $2",
-        [expiresAt.toISOString(), existing.id],
-      );
+      await this.transaction(async () => {
+        const activeLease = await this.database.query<DbRow>(
+          `SELECT 1 FROM worker_leases
+           WHERE job_id = $1 AND worker_id = $2 AND attempt = $3
+             AND expires_at > $4
+           FOR UPDATE`,
+          [jobId, actor.userId, attempt, this.now().toISOString()],
+        );
+        if (!activeLease.rows[0]) {
+          throw new CatalogConflictError(
+            "Worker lease is no longer active for this attempt.",
+          );
+        }
+        await this.database.query(
+          "UPDATE transcript_uploads SET state = 'staged', expires_at = $1 WHERE id = $2",
+          [expiresAt.toISOString(), existing.id],
+        );
+      });
       return TranscriptUploadGrantSchema.parse({
         uploadId: existing.id,
         jobId,
@@ -4812,12 +4964,26 @@ export class SharedProjectCatalog {
         };
       }),
     );
-    await this.transaction(async () => {
-      await this.database.query(
+    const inserted = await this.transaction(async () => {
+      const activeLease = await this.database.query<DbRow>(
+        `SELECT 1 FROM worker_leases
+         WHERE job_id = $1 AND worker_id = $2 AND attempt = $3
+           AND expires_at > $4
+         FOR UPDATE`,
+        [jobId, actor.userId, attempt, this.now().toISOString()],
+      );
+      if (!activeLease.rows[0]) {
+        throw new CatalogConflictError(
+          "Worker lease is no longer active for this attempt.",
+        );
+      }
+      const created = await this.database.query<DbRow>(
         `INSERT INTO transcript_uploads
            (id, job_id, project_id, video_id, lineage_id, version, state,
             expires_at, created_by, created_at)
-         VALUES ($1, $2, $3, $4, $5, $6, 'staged', $7, $8, $9)`,
+         VALUES ($1, $2, $3, $4, $5, $6, 'staged', $7, $8, $9)
+         ON CONFLICT (job_id) DO NOTHING
+         RETURNING id`,
         [
           uploadId,
           jobId,
@@ -4830,6 +4996,7 @@ export class SharedProjectCatalog {
           createdAt.toISOString(),
         ],
       );
+      if (!created.rows[0]) return false;
       for (const target of targets) {
         await this.database.query(
           `INSERT INTO transcript_upload_targets
@@ -4838,7 +5005,11 @@ export class SharedProjectCatalog {
           [uploadId, target.type, target.objectKey],
         );
       }
+      return true;
     });
+    if (!inserted) {
+      return this.createClaimedTranscriptUpload(actor, jobId, attempt, input);
+    }
     return TranscriptUploadGrantSchema.parse({
       uploadId,
       jobId,
@@ -4848,6 +5019,261 @@ export class SharedProjectCatalog {
       version: input.version,
       expiresAt: expiresAt.toISOString(),
       targets,
+    });
+  }
+
+  async loadClaimedTranscriptTranslationSource(
+    actor: AuthenticatedActor,
+    jobId: string,
+    input: {
+      attempt: number;
+      consent: CloudTranslationConsent;
+      uploadId: string;
+      sourceArtifact: FinalizedObject & { type: "original-normalized" };
+      targetLanguage: string;
+    },
+  ): Promise<NormalizedTranscript> {
+    await this.requireActiveWorkerLease(actor, jobId, input.attempt);
+    const jobResult = await this.database.query<DbRow>(
+      "SELECT project_id, payload FROM jobs WHERE id = $1 AND kind = 'transcription'",
+      [jobId],
+    );
+    const job = jobResult.rows[0];
+    if (!job) throw new CatalogNotFoundError("Transcription job not found.");
+    const payload = TranscriptionJobPayloadSchema.parse(
+      typeof job.payload === "string" ? JSON.parse(job.payload) : job.payload,
+    );
+    const projectId = String(job.project_id ?? "");
+    await this.authorize(actor, projectId, "write");
+    if (
+      !payload.translationConsent ||
+      JSON.stringify(payload.translationConsent) !==
+        JSON.stringify(input.consent)
+    ) {
+      throw new AuthorizationError(
+        "This job does not carry the required translation consent.",
+      );
+    }
+    if (!languagesEquivalent(payload.targetLanguage, input.targetLanguage)) {
+      throw new CatalogConflictError(
+        "Translation target does not match the claimed job.",
+      );
+    }
+
+    const upload = await this.loadUpload(input.uploadId);
+    if (
+      String(upload.job_id) !== jobId ||
+      String(upload.project_id) !== projectId ||
+      String(upload.video_id) !== payload.catalogVideoId ||
+      String(upload.state) !== "staged" ||
+      new Date(iso(upload.expires_at)).getTime() <= this.now().getTime()
+    ) {
+      throw new CatalogConflictError(
+        "Translation source upload does not match the active claimed job.",
+      );
+    }
+    const targets = await this.loadTargets(input.uploadId);
+    if (targets.get("original-normalized") !== input.sourceArtifact.objectKey) {
+      throw new TranscriptIntegrityError(
+        "Translation source was uploaded outside its grant.",
+      );
+    }
+    const sourceBytes = await this.verifyObject(input.sourceArtifact);
+    let sourceValue: unknown;
+    try {
+      sourceValue = JSON.parse(new TextDecoder().decode(sourceBytes));
+    } catch {
+      throw new TranscriptIntegrityError(
+        "Translation source is not valid JSON.",
+      );
+    }
+    const source = NormalizedTranscriptSchema.parse(sourceValue);
+    if (
+      source.track.videoId !== payload.youtubeVideoId ||
+      source.track.kind !== "original" ||
+      languagesEquivalent(source.track.language, input.targetLanguage)
+    ) {
+      throw new TranscriptIntegrityError(
+        "Translation source identity does not match the claimed job.",
+      );
+    }
+    return source;
+  }
+
+  async getClaimedTranscriptTranslationPublication(
+    actor: AuthenticatedActor,
+    jobId: string,
+    input: {
+      attempt: number;
+      uploadId: string;
+      sourceArtifact: FinalizedObject & { type: "original-normalized" };
+      targetLanguage: string;
+    },
+  ): Promise<WorkerTranslateTranscriptResponse | undefined> {
+    await this.requireActiveWorkerLease(actor, jobId, input.attempt);
+    const result = await this.database.query<DbRow>(
+      "SELECT payload FROM jobs WHERE id = $1 AND kind = 'transcription'",
+      [jobId],
+    );
+    const payload = jsonRecord(result.rows[0]?.payload);
+    const receipt = jsonRecord(payload?.cloudTranslationReceipt);
+    if (!receipt) return undefined;
+    if (
+      receipt.uploadId !== input.uploadId ||
+      !sameFinalizedObject(
+        FinalizedObjectSchema.parse(receipt.sourceArtifact),
+        input.sourceArtifact,
+      ) ||
+      !languagesEquivalent(
+        String(receipt.targetLanguage ?? ""),
+        input.targetLanguage,
+      )
+    ) {
+      throw new CatalogConflictError(
+        "The claimed job already has a different cloud translation result.",
+      );
+    }
+    const normalizedArtifact = FinalizedObjectSchema.extend({
+      type: FinalizedObjectSchema.shape.type.extract(["english-normalized"]),
+    }).parse(receipt.normalizedArtifact);
+    const subtitleArtifact = FinalizedObjectSchema.extend({
+      type: FinalizedObjectSchema.shape.type.extract(["english-srt"]),
+    }).parse(receipt.subtitleArtifact);
+    const normalizedBytes = await this.verifyObject(normalizedArtifact);
+    await this.verifyObject(subtitleArtifact);
+    let transcriptValue: unknown;
+    try {
+      transcriptValue = JSON.parse(new TextDecoder().decode(normalizedBytes));
+    } catch {
+      throw new TranscriptIntegrityError(
+        "Cloud translation result is not valid JSON.",
+      );
+    }
+    return WorkerTranslateTranscriptResponseSchema.parse({
+      transcript: transcriptValue,
+      normalizedArtifact,
+      subtitleArtifact,
+    });
+  }
+
+  async publishClaimedTranscriptTranslation(
+    actor: AuthenticatedActor,
+    jobId: string,
+    input: {
+      attempt: number;
+      consent: CloudTranslationConsent;
+      uploadId: string;
+      sourceArtifact: FinalizedObject & { type: "original-normalized" };
+      targetLanguage: string;
+      transcript: NormalizedTranscript;
+      subtitleBytes: Uint8Array;
+    },
+  ): Promise<WorkerTranslateTranscriptResponse> {
+    const source = await this.loadClaimedTranscriptTranslationSource(
+      actor,
+      jobId,
+      input,
+    );
+    const transcript = NormalizedTranscriptSchema.parse(input.transcript);
+    if (
+      transcript.track.kind !== "english" ||
+      transcript.track.provider !== "amazon-translate" ||
+      transcript.track.sourceTrackId !== source.track.id ||
+      transcript.track.videoId !== source.track.videoId ||
+      !languagesEquivalent(transcript.track.language, input.targetLanguage)
+    ) {
+      throw new TranscriptIntegrityError(
+        "Cloud translation output does not match its verified source.",
+      );
+    }
+    const existing = await this.getClaimedTranscriptTranslationPublication(
+      actor,
+      jobId,
+      {
+        attempt: input.attempt,
+        uploadId: input.uploadId,
+        sourceArtifact: input.sourceArtifact,
+        targetLanguage: input.targetLanguage,
+      },
+    );
+    if (existing) return existing;
+
+    const targets = await this.loadTargets(input.uploadId);
+    const normalizedKey = targets.get("english-normalized");
+    const subtitleKey = targets.get("english-srt");
+    if (!normalizedKey || !subtitleKey) {
+      throw new TranscriptIntegrityError(
+        "Transcript upload grant omitted cloud translation targets.",
+      );
+    }
+    const normalizedBytes = new TextEncoder().encode(
+      JSON.stringify(transcript),
+    );
+    const normalizedStored = await this.store.put({
+      key: normalizedKey,
+      bytes: normalizedBytes,
+      contentType: "application/json",
+      sha256: sha256(normalizedBytes),
+    });
+    const subtitleStored = await this.store.put({
+      key: subtitleKey,
+      bytes: input.subtitleBytes,
+      contentType: "application/x-subrip",
+      sha256: sha256(input.subtitleBytes),
+    });
+    const normalizedArtifact = FinalizedObjectSchema.parse({
+      type: "english-normalized",
+      objectKey: normalizedStored.key,
+      objectVersionId: normalizedStored.versionId,
+      byteSize: normalizedStored.bytes.byteLength,
+      sha256: normalizedStored.sha256,
+    });
+    const subtitleArtifact = FinalizedObjectSchema.parse({
+      type: "english-srt",
+      objectKey: subtitleStored.key,
+      objectVersionId: subtitleStored.versionId,
+      byteSize: subtitleStored.bytes.byteLength,
+      sha256: subtitleStored.sha256,
+    });
+    const receipt = {
+      uploadId: input.uploadId,
+      sourceArtifact: input.sourceArtifact,
+      targetLanguage: input.targetLanguage,
+      normalizedArtifact,
+      subtitleArtifact,
+    };
+    const stored = await this.database.query<DbRow>(
+      `UPDATE jobs
+       SET payload = payload || jsonb_build_object(
+             'cloudTranslationReceipt', $1::jsonb
+           ),
+           updated_at = $2
+       WHERE id = $3 AND payload->'cloudTranslationReceipt' IS NULL
+       RETURNING id`,
+      [JSON.stringify(receipt), this.now().toISOString(), jobId],
+    );
+    if (!stored.rows[0]) {
+      const winner = await this.getClaimedTranscriptTranslationPublication(
+        actor,
+        jobId,
+        {
+          attempt: input.attempt,
+          uploadId: input.uploadId,
+          sourceArtifact: input.sourceArtifact,
+          targetLanguage: input.targetLanguage,
+        },
+      );
+      if (!winner) {
+        throw new CatalogConflictError(
+          "Cloud translation publication could not be resolved.",
+        );
+      }
+      return winner;
+    }
+    return WorkerTranslateTranscriptResponseSchema.parse({
+      transcript,
+      normalizedArtifact,
+      subtitleArtifact,
     });
   }
 
@@ -4893,6 +5319,97 @@ export class SharedProjectCatalog {
       throw new TranscriptIntegrityError(
         "Manifest was uploaded outside its grant.",
       );
+    }
+    if (claim) {
+      const jobResult = await this.database.query<DbRow>(
+        "SELECT payload FROM jobs WHERE id = $1 AND kind = 'transcription'",
+        [claim.jobId],
+      );
+      const jobPayload = jsonRecord(jobResult.rows[0]?.payload);
+      if (
+        jobPayload?.translationConsent &&
+        !languagesEquivalent(manifest.sourceLanguage, manifest.targetLanguage)
+      ) {
+        const receipt = jsonRecord(jobPayload.cloudTranslationReceipt);
+        const sourceReceipt = FinalizedObjectSchema.safeParse(
+          receipt?.sourceArtifact,
+        );
+        const normalizedReceipt = FinalizedObjectSchema.safeParse(
+          receipt?.normalizedArtifact,
+        );
+        const subtitleReceipt = FinalizedObjectSchema.safeParse(
+          receipt?.subtitleArtifact,
+        );
+        const normalizedManifest = manifest.artifacts.find(
+          (artifact) => artifact.type === "english-normalized",
+        );
+        const sourceManifest = manifest.artifacts.find(
+          (artifact) => artifact.type === "original-normalized",
+        );
+        const subtitleManifest = manifest.artifacts.find(
+          (artifact) => artifact.type === "english-srt",
+        );
+        if (
+          receipt?.uploadId !== request.uploadId ||
+          !languagesEquivalent(
+            String(receipt?.targetLanguage ?? ""),
+            manifest.targetLanguage,
+          ) ||
+          !sourceReceipt.success ||
+          sourceReceipt.data.type !== "original-normalized" ||
+          !normalizedReceipt.success ||
+          normalizedReceipt.data.type !== "english-normalized" ||
+          !subtitleReceipt.success ||
+          subtitleReceipt.data.type !== "english-srt" ||
+          !sourceManifest ||
+          !normalizedManifest ||
+          !subtitleManifest ||
+          !sameFinalizedObject(sourceReceipt.data, sourceManifest) ||
+          !sameFinalizedObject(normalizedReceipt.data, normalizedManifest) ||
+          !sameFinalizedObject(subtitleReceipt.data, subtitleManifest)
+        ) {
+          throw new TranscriptIntegrityError(
+            "Translated artifacts do not match the server-produced result.",
+          );
+        }
+        const decodeTranscript = async (artifact: FinalizedObject) => {
+          const bytes = await this.verifyObject(artifact);
+          try {
+            return NormalizedTranscriptSchema.parse(
+              JSON.parse(new TextDecoder().decode(bytes)),
+            );
+          } catch {
+            throw new TranscriptIntegrityError(
+              "Server-bound transcript artifact is invalid.",
+            );
+          }
+        };
+        const source = await decodeTranscript(sourceReceipt.data);
+        const translated = await decodeTranscript(normalizedReceipt.data);
+        if (
+          source.track.kind !== "original" ||
+          source.track.videoId !== manifest.videoId ||
+          !languagesEquivalent(
+            source.track.language,
+            manifest.sourceLanguage,
+          ) ||
+          source.track.provider !== manifest.provider ||
+          translated.track.kind !== "english" ||
+          translated.track.provider !== "amazon-translate" ||
+          translated.track.sourceTrackId !== source.track.id ||
+          translated.track.videoId !== manifest.videoId ||
+          !languagesEquivalent(
+            translated.track.language,
+            manifest.targetLanguage,
+          ) ||
+          translated.track.timingPrecision !== manifest.timingPrecision ||
+          translated.track.schemaVersion !== manifest.normalizationSchemaVersion
+        ) {
+          throw new TranscriptIntegrityError(
+            "Transcript manifest metadata does not match the server-produced result.",
+          );
+        }
+      }
     }
     const seenTypes = new Set<string>();
     for (const artifact of manifest.artifacts) {
@@ -6151,29 +6668,12 @@ export class SharedProjectCatalog {
     action: () => Promise<Result>,
     options: { repeatableRead?: boolean } = {},
   ) {
-    const predecessor = this.transactionTail;
-    let release!: () => void;
-    this.transactionTail = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    await predecessor;
-    try {
-      await this.database.exec(
-        options.repeatableRead
-          ? "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY"
-          : "BEGIN",
-      );
-      try {
-        const result = await action();
-        await this.database.exec("COMMIT");
-        return result;
-      } catch (error) {
-        await this.database.exec("ROLLBACK");
-        throw error;
-      }
-    } finally {
-      release();
-    }
+    return options.repeatableRead
+      ? this.database.transaction(action, {
+          repeatableRead: true,
+          readOnly: true,
+        })
+      : this.database.transaction(action);
   }
 }
 

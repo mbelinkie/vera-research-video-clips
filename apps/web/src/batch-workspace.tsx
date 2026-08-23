@@ -50,6 +50,8 @@ export function BatchWorkspace({
   const [sourcePolicy, setSourcePolicy] = useState("prefer-existing");
   const [executionLocation, setExecutionLocation] = useState("local");
   const [priority, setPriority] = useState("normal");
+  const [translationConsentAccepted, setTranslationConsentAccepted] =
+    useState(false);
   const [preflight, setPreflight] = useState<BatchPreflightResponse>();
   const [csvDocument, setCsvDocument] = useState<CsvImportDocument>();
   const [csvColumnIndex, setCsvColumnIndex] = useState("");
@@ -165,6 +167,15 @@ export function BatchWorkspace({
     sourcePolicy,
     executionLocation,
     priority,
+    ...(translationConsentAccepted
+      ? {
+          translationConsent: {
+            provider: "amazon-translate" as const,
+            disclosureVersion: 1 as const,
+            transcriptTextTransferAccepted: true as const,
+          },
+        }
+      : {}),
   };
 
   async function runPreflight() {
@@ -461,6 +472,21 @@ export function BatchWorkspace({
                   </select>
                 </label>
               </div>
+              <label className="cloud-translation-consent">
+                <input
+                  type="checkbox"
+                  checked={translationConsentAccepted}
+                  onChange={(event) => {
+                    setTranslationConsentAccepted(event.target.checked);
+                    setPreflight(undefined);
+                  }}
+                />
+                <span>
+                  Allow Amazon Translate when a source is not English. The
+                  version-pinned transcript text will be sent to Amazon only for
+                  this batch; no media or local AWS credentials are sent.
+                </span>
+              </label>
               <div className="action-row">
                 <button
                   type="button"
@@ -622,6 +648,12 @@ function BatchDetail({
   const canDispatch = batch.batch.dispatchStatus !== "canceled";
   return (
     <div className="batch-detail">
+      {batch.batch.translationConsent ? (
+        <p className="translation-consent-summary">
+          Amazon Translate consent recorded for this batch (disclosure v
+          {batch.batch.translationConsent.disclosureVersion}).
+        </p>
+      ) : null}
       <div className="action-row">
         {batch.batch.dispatchStatus === "active" ? (
           <button

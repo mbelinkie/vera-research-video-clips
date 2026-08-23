@@ -16,6 +16,7 @@ import {
   ConfigureLocalArtifactRootRequestSchema,
   CancelLoggedExportRequestSchema,
   BatchPreflightRequestSchema,
+  CloudTranslationConsentSchema,
   ClipLanguageEvidenceV2Schema,
   ClipLibraryPageSchema,
   ClipLibraryQuerySchema,
@@ -69,6 +70,7 @@ import {
   TranscriptionBatchControlRequestSchema,
   UpdateReviewStatusRequestSchema,
   UpdatePreferredLanguageRequestSchema,
+  WorkerTranslateTranscriptRequestSchema,
   languagesEquivalent,
 } from "./index.ts";
 
@@ -1197,6 +1199,36 @@ describe("shared contracts", () => {
     expect(BatchPreflightRequestSchema.safeParse({ inputs: [] }).success).toBe(
       false,
     );
+  });
+
+  it("requires an explicit closed disclosure for cloud translation", () => {
+    const consent = CloudTranslationConsentSchema.parse({
+      provider: "amazon-translate",
+      disclosureVersion: 1,
+      transcriptTextTransferAccepted: true,
+    });
+    expect(
+      CreateTranscriptionBatchRequestSchema.parse({
+        name: "Consented translation",
+        inputs: ["M7lc1UVf-VE"],
+        translationConsent: consent,
+      }).translationConsent,
+    ).toEqual(consent);
+    expect(
+      CloudTranslationConsentSchema.safeParse({
+        provider: "amazon-translate",
+        disclosureVersion: 1,
+        transcriptTextTransferAccepted: false,
+      }).success,
+    ).toBe(false);
+    expect(
+      WorkerTranslateTranscriptRequestSchema.safeParse({
+        attempt: 1,
+        consent,
+        targetLanguage: "en",
+        source: {},
+      }).success,
+    ).toBe(false);
   });
 
   it("requires optimistic versions for batch control commands", () => {

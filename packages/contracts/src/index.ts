@@ -1233,12 +1233,21 @@ export const BatchInputListSchema = z
   .min(1)
   .max(500);
 
+export const CloudTranslationConsentSchema = z
+  .object({
+    provider: z.literal("amazon-translate"),
+    disclosureVersion: z.literal(1),
+    transcriptTextTransferAccepted: z.literal(true),
+  })
+  .strict();
+
 export const BatchOptionsSchema = z.object({
   targetLanguage: z.string().min(2).max(35).default("en"),
   transcriptionProfile: z.string().trim().min(1).max(160).default("default"),
   sourcePolicy: BatchSourcePolicySchema.default("prefer-existing"),
   executionLocation: z.enum(["local", "hosted"]).default("local"),
   priority: BatchPrioritySchema.default("normal"),
+  translationConsent: CloudTranslationConsentSchema.optional(),
 });
 
 export const BatchPreflightRequestSchema = BatchOptionsSchema.extend({
@@ -1297,6 +1306,7 @@ export const TranscriptionBatchSchema = z.object({
   sourcePolicy: BatchSourcePolicySchema,
   executionLocation: z.enum(["local", "hosted"]),
   priority: BatchPrioritySchema,
+  translationConsent: CloudTranslationConsentSchema.optional(),
   dispatchStatus: z.enum(["active", "paused", "canceled"]),
   createdBy: IdSchema,
   createdAt: UtcTimestampSchema,
@@ -3670,6 +3680,30 @@ export const WorkerFinalizeTranscriptRequestSchema =
     attempt: z.number().int().positive(),
   });
 
+export const WorkerTranslateTranscriptRequestSchema = z
+  .object({
+    attempt: z.number().int().positive(),
+    consent: CloudTranslationConsentSchema,
+    uploadId: IdSchema,
+    sourceArtifact: FinalizedObjectSchema.extend({
+      type: z.literal("original-normalized"),
+    }),
+    targetLanguage: LanguageTagSchema,
+  })
+  .strict();
+
+export const WorkerTranslateTranscriptResponseSchema = z
+  .object({
+    transcript: NormalizedTranscriptSchema,
+    normalizedArtifact: FinalizedObjectSchema.extend({
+      type: z.literal("english-normalized"),
+    }),
+    subtitleArtifact: FinalizedObjectSchema.extend({
+      type: z.literal("english-srt"),
+    }),
+  })
+  .strict();
+
 export const TranscriptionJobPayloadSchema = z.object({
   batchId: IdSchema,
   catalogVideoId: IdSchema,
@@ -3679,6 +3713,7 @@ export const TranscriptionJobPayloadSchema = z.object({
   sourcePolicy: BatchSourcePolicySchema,
   executionLocation: z.enum(["local", "hosted"]),
   priority: BatchPrioritySchema,
+  translationConsent: CloudTranslationConsentSchema.optional(),
   sourcePlan: TranscriptSourcePlanSchema.optional(),
 });
 
@@ -4066,6 +4101,9 @@ export type ActiveTranscriptBundle = z.infer<
 >;
 export type TranscriptionBatch = z.infer<typeof TranscriptionBatchSchema>;
 export type BatchOptions = z.infer<typeof BatchOptionsSchema>;
+export type CloudTranslationConsent = z.infer<
+  typeof CloudTranslationConsentSchema
+>;
 export type BatchSourcePolicy = z.infer<typeof BatchSourcePolicySchema>;
 export type CaptionTrackCandidate = z.infer<typeof CaptionTrackCandidateSchema>;
 export type TranscriptSourcePlan = z.infer<typeof TranscriptSourcePlanSchema>;
@@ -4108,6 +4146,12 @@ export type WorkerCreateTranscriptUploadRequest = z.infer<
 >;
 export type WorkerFinalizeTranscriptRequest = z.infer<
   typeof WorkerFinalizeTranscriptRequestSchema
+>;
+export type WorkerTranslateTranscriptRequest = z.infer<
+  typeof WorkerTranslateTranscriptRequestSchema
+>;
+export type WorkerTranslateTranscriptResponse = z.infer<
+  typeof WorkerTranslateTranscriptResponseSchema
 >;
 export type TranscriptionJobPayload = z.infer<
   typeof TranscriptionJobPayloadSchema

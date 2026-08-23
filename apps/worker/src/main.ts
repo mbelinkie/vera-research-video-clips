@@ -4,12 +4,12 @@ import { loadConfig } from "@research-video/config";
 import { createMediaAcquisitionProvider } from "@research-video/media";
 import { createCaptionProvider } from "@research-video/providers/captions-local";
 import { createSpeechToTextProvider } from "@research-video/providers/speech-whisper-cpp";
-import { createTranslationProvider } from "@research-video/providers/translation-aws";
 
 import {
   HttpTranscriptPublicationClient,
   createTranscriptPipelineExecutor,
 } from "./pipeline.ts";
+import { HttpClaimedTranslationClient } from "./translation-cloud.ts";
 import {
   ClaimingTranscriptionWorker,
   HttpTranscriptionWorkerControlPlane,
@@ -45,13 +45,6 @@ if (!config.workerAuthorization) {
     mode: config.captionProvider,
     ytDlpPath: config.ytDlpPath,
   });
-  const translation = createTranslationProvider({
-    mode: config.translationProvider,
-    region: config.awsRegion,
-    ...(config.awsTranslateTerminology
-      ? { terminologyName: config.awsTranslateTerminology }
-      : {}),
-  });
   const baseUrl = `http://${config.cloudApiHost}:${config.cloudApiPort}`;
   const controlPlane = new HttpTranscriptionWorkerControlPlane({
     baseUrl,
@@ -67,7 +60,14 @@ if (!config.workerAuthorization) {
     ...(captions ? { captions } : {}),
     media,
     speechToText,
-    ...(translation ? { translation } : {}),
+    ...(config.translationProvider === "aws-translate"
+      ? {
+          claimedTranslation: new HttpClaimedTranslationClient({
+            baseUrl,
+            authorization: config.workerAuthorization,
+          }),
+        }
+      : {}),
     publication,
     scratchRoot: join(config.dataDir, "jobs", "transcription-scratch"),
   });
