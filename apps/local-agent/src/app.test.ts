@@ -148,9 +148,16 @@ describe("local agent", () => {
       kind: "individual" as const,
       request: { id: clipId },
     })) as never;
+    const prepareAuthoringExport = vi.fn(async () => preflight);
+    const submitAuthoringExport = vi.fn(async () => ({
+      kind: "individual" as const,
+      request: { id: clipId },
+    })) as never;
     const app = createLocalAgent({
       prepareClipLibraryExport,
       submitClipLibraryExport,
+      prepareAuthoringExport,
+      submitAuthoringExport,
     });
     apps.add(app);
     const preflightUrl = `/api/projects/${projectId}/clip-library/export-preflight`;
@@ -206,6 +213,46 @@ describe("local agent", () => {
         })
       ).statusCode,
     ).toBe(201);
+    const authoringPreflightUrl = `/api/authoring/projects/${projectId}/export-preflight`;
+    const authoringSubmitUrl = `/api/authoring/projects/${projectId}/exports`;
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: authoringPreflightUrl,
+          payload: request,
+        })
+      ).statusCode,
+    ).toBe(401);
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: authoringPreflightUrl,
+          headers: { authorization: "Bearer project-session" },
+          payload: request,
+        })
+      ).statusCode,
+    ).toBe(200);
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: authoringSubmitUrl,
+          headers: { authorization: "Bearer project-session" },
+          payload: {
+            ...request,
+            expectedPreflightFingerprint: "a".repeat(64),
+            confirmUnknownSourceSizes: true,
+          },
+        })
+      ).statusCode,
+    ).toBe(201);
+    expect(prepareAuthoringExport).toHaveBeenCalledWith({
+      projectId,
+      authorization: "Bearer project-session",
+      request,
+    });
   });
 
   it("keeps root paths local and resolves verification evidence through authorization", async () => {
@@ -354,6 +401,121 @@ describe("local agent", () => {
     expect(relinkArtifactLocator).not.toHaveBeenCalled();
     expect(resolveArtifact).not.toHaveBeenCalled();
     expect(JSON.stringify(locator)).not.toMatch(/path|filename/iu);
+  });
+
+  it("returns local paths only through an authorized strict authoring descriptor command", async () => {
+    const projectId = "019fbb95-cd76-7920-93fa-e23ba755ee73";
+    const clipId = "019fbb95-cd76-7920-93fa-e23ba755ee74";
+    const artifactVersionId = "019fbb95-cd76-7920-93fa-e23ba755ee72";
+    const locatorId = "019fbb95-cd76-7920-93fa-e23ba755ee75";
+    const requestId = "019fbb95-cd76-7920-93fa-e23ba755ee76";
+    const packageIdentity = `clip-${requestId}`;
+    const requirements = {
+      clipId,
+      selection: {
+        trackId: "019fbb95-cd76-7920-93fa-e23ba755ee77",
+        transcriptVersion: 1,
+        firstSegmentId: "019fbb95-cd76-7920-93fa-e23ba755ee78",
+        lastSegmentId: "019fbb95-cd76-7920-93fa-e23ba755ee79",
+        transcriptStartMs: 1_000,
+        transcriptEndMs: 2_000,
+        exportStartMs: 1_000,
+        exportEndMs: 2_000,
+        timingPrecision: "word" as const,
+      },
+      resolvedBounds: { startMs: 1_000, endMs: 2_000 },
+      sourceLanguageClass: "confirmed_english" as const,
+      subtitlePolicy: { requiredSidecars: ["english" as const] },
+      requiredArtifactRoles: [
+        "video_mp4" as const,
+        "clip_metadata_json" as const,
+        "thumbnail_jpg" as const,
+        "manifest_json" as const,
+      ],
+      acceptedManifestSchemas: [2 as const],
+      settings: {
+        mode: "exact_fingerprint" as const,
+        resolutionFingerprint: "a".repeat(64),
+      },
+    };
+    const packagePath = `/private/exports/${packageIdentity}`;
+    const manifestSha256 = "c".repeat(64);
+    const createAuthoringArtifactDescriptor = vi.fn(async () => ({
+      schemaVersion: 1 as const,
+      projectId,
+      clipId,
+      artifactVersionId,
+      requestId,
+      locatorId,
+      packageIdentity,
+      resultFingerprint: "b".repeat(64),
+      manifest: { schemaVersion: 2 as const, contentSha256: manifestSha256 },
+      packagePath,
+      artifacts: [
+        "video_mp4",
+        "clip_metadata_json",
+        "thumbnail_jpg",
+        "manifest_json",
+      ].map((role) => ({
+        role,
+        absolutePath: `${packagePath}/${role}`,
+        byteSize: 1,
+        contentSha256:
+          role === "manifest_json" ? manifestSha256 : "d".repeat(64),
+      })) as never,
+    }));
+    const app = createLocalAgent({ createAuthoringArtifactDescriptor });
+    apps.add(app);
+    const url = `/api/authoring/projects/${projectId}/clips/${clipId}/artifact-descriptor`;
+    const command = { artifactVersionId, locatorId, requirements };
+    expect(
+      (await app.inject({ method: "POST", url, payload: command })).statusCode,
+    ).toBe(401);
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url,
+          headers: { authorization: "Bearer project-session" },
+          payload: { ...command, packagePath },
+        })
+      ).statusCode,
+    ).toBe(400);
+    const response = await app.inject({
+      method: "POST",
+      url,
+      headers: { authorization: "Bearer project-session" },
+      payload: command,
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({ packagePath, artifactVersionId });
+    expect(createAuthoringArtifactDescriptor).toHaveBeenCalledWith({
+      projectId,
+      clipId,
+      authorization: "Bearer project-session",
+      request: command,
+    });
+    const validDescriptor = response.json<{
+      artifacts: Array<{ absolutePath: string }>;
+    }>();
+    createAuthoringArtifactDescriptor.mockResolvedValueOnce({
+      ...validDescriptor,
+      artifacts: validDescriptor.artifacts.map((artifact, index) =>
+        index === 0
+          ? { ...artifact, absolutePath: `${packagePath}/../outside.mp4` }
+          : artifact,
+      ),
+    } as never);
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url,
+          headers: { authorization: "Bearer project-session" },
+          payload: command,
+        })
+      ).statusCode,
+    ).toBe(400);
   });
 
   it("requires authentication and returns a resolved normalized transcript", async () => {

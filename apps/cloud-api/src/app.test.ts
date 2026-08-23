@@ -59,8 +59,15 @@ describe("cloud API", () => {
       externalSubject: "fixture:artifact-researcher",
     };
     const reexportArtifactVersion = vi.fn(async () => ({ id: randomUUID() }));
+    const resolveArtifactVersionCompatibility = vi.fn(async () => ({
+      state: "incompatible" as const,
+      artifactVersionId,
+    }));
     const app = createCloudApi({
-      catalog: { reexportArtifactVersion } as unknown as SharedProjectCatalog,
+      catalog: {
+        reexportArtifactVersion,
+        resolveArtifactVersionCompatibility,
+      } as unknown as SharedProjectCatalog,
       authenticate: async () => actor,
     });
     apps.add(app);
@@ -91,7 +98,60 @@ describe("cloud API", () => {
           payload: { ...command, requestOrigin: "authoring_build" },
         })
       ).statusCode,
-    ).toBe(400);
+    ).toBe(201);
+    expect(reexportArtifactVersion).toHaveBeenLastCalledWith(
+      actor,
+      projectId,
+      clipId,
+      artifactVersionId,
+      { ...command, requestOrigin: "authoring_build" },
+    );
+
+    const requirements = {
+      clipId,
+      selection: {
+        trackId: randomUUID(),
+        transcriptVersion: 1,
+        firstSegmentId: randomUUID(),
+        lastSegmentId: randomUUID(),
+        transcriptStartMs: 1_000,
+        transcriptEndMs: 2_000,
+        exportStartMs: 1_000,
+        exportEndMs: 2_000,
+        timingPrecision: "word",
+      },
+      resolvedBounds: { startMs: 1_000, endMs: 2_000 },
+      sourceLanguageClass: "confirmed_english",
+      subtitlePolicy: { requiredSidecars: ["english"] },
+      requiredArtifactRoles: [
+        "video_mp4",
+        "clip_metadata_json",
+        "thumbnail_jpg",
+        "manifest_json",
+      ],
+      acceptedManifestSchemas: [2],
+      settings: {
+        mode: "exact_fingerprint",
+        resolutionFingerprint: "a".repeat(64),
+      },
+    };
+    const compatibility = await app.inject({
+      method: "POST",
+      url: `/api/projects/${projectId}/clips/${clipId}/artifact-versions/${artifactVersionId}/compatibility`,
+      payload: { requirements },
+    });
+    expect(compatibility.statusCode).toBe(200);
+    expect(compatibility.json()).toEqual({
+      state: "incompatible",
+      artifactVersionId,
+    });
+    expect(resolveArtifactVersionCompatibility).toHaveBeenCalledWith(
+      actor,
+      projectId,
+      clipId,
+      artifactVersionId,
+      requirements,
+    );
   });
 
   it("authenticates a user and exposes only their project catalog", async () => {

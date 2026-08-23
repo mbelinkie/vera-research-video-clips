@@ -4,6 +4,7 @@ import {
   mkdtemp,
   link,
   readFile,
+  realpath,
   rename,
   rm,
   symlink,
@@ -24,6 +25,7 @@ import {
 } from "@research-video/contracts";
 import {
   canonicalJson,
+  artifactVersionMatchesRequirements,
   resolveExportSettings,
   resolvedPresetForCompatibility,
   sha256Fingerprint,
@@ -36,8 +38,8 @@ import {
 
 import {
   LocalArtifactLocatorService,
-  artifactVersionMatchesRequirements,
   resolveArtifactActionEvidence,
+  resolveAuthoringArtifactEvidence,
   validateArtifactPackageSegment,
   validateConfiguredRootPath,
 } from "./artifact-locators.ts";
@@ -54,6 +56,43 @@ afterEach(async () => {
 });
 
 describe("local artifact locator verification", () => {
+  it("requires fresh online evidence for authoring handoff", async () => {
+    const root = await mkdtemp(join(tmpdir(), "authoring-evidence-"));
+    temporaryRoots.add(root);
+    const fixture = await writeVerifiedPackage(root);
+    await expect(
+      resolveAuthoringArtifactEvidence({
+        fetchCloud: async () => fixture.summary,
+        onAuthorizationDenied: vi.fn(),
+      }),
+    ).resolves.toEqual(fixture.summary);
+    for (const failure of [
+      new Error("contract drift"),
+      Object.assign(new Error("unavailable"), { statusCode: 503 }),
+    ]) {
+      await expect(
+        resolveAuthoringArtifactEvidence({
+          fetchCloud: async () => Promise.reject(failure),
+          onAuthorizationDenied: vi.fn(),
+        }),
+      ).rejects.toBe(failure);
+    }
+    const denied = vi.fn();
+    await expect(
+      resolveAuthoringArtifactEvidence({
+        fetchCloud: async () =>
+          Promise.reject(
+            Object.assign(new Error("forbidden"), { statusCode: 403 }),
+          ),
+        onAuthorizationDenied: denied,
+      }),
+    ).rejects.toMatchObject({
+      code: "artifact_action_not_found",
+      statusCode: 404,
+    });
+    expect(denied).toHaveBeenCalledWith(403);
+  });
+
   it("uses only exact cached evidence for offline actions and purges denied scopes", async () => {
     const root = await mkdtemp(join(tmpdir(), "artifact-action-scope-"));
     temporaryRoots.add(root);
@@ -221,6 +260,39 @@ describe("local artifact locator verification", () => {
       fixture.summary,
     );
 
+    const originalVideo = await readFile(fixture.videoPath);
+    const verifiedPackagePath = await realpath(fixture.packagePath);
+    const descriptor = await service.createAuthoringDescriptor(
+      locator.id,
+      fixture.summary,
+      requirements,
+    );
+    expect(descriptor).toMatchObject({
+      schemaVersion: 1,
+      projectId: fixture.summary.projectId,
+      clipId: fixture.summary.clipId,
+      artifactVersionId: fixture.summary.artifactVersionId,
+      locatorId: locator.id,
+      packagePath: verifiedPackagePath,
+      manifest: { schemaVersion: 2 },
+    });
+    expect(descriptor.artifacts).toHaveLength(fixture.summary.artifacts.length);
+    expect(
+      descriptor.artifacts.every((artifact) =>
+        artifact.absolutePath.startsWith(`${verifiedPackagePath}/`),
+      ),
+    ).toBe(true);
+    expect(await readFile(fixture.videoPath)).toEqual(originalVideo);
+    await expect(
+      service.createAuthoringDescriptor(locator.id, fixture.summary, {
+        ...requirements,
+        resolvedBounds: {
+          ...requirements.resolvedBounds,
+          endMs: requirements.resolvedBounds.endMs + 1,
+        },
+      }),
+    ).rejects.toMatchObject({ code: "artifact_action_incompatible" });
+
     await expect(
       service.resolveArtifactHistory({
         summaries: [fixture.summary],
@@ -257,6 +329,15 @@ describe("local artifact locator verification", () => {
     const relocated = join(secondRoot, fixture.summary.packageIdentity);
     await rename(fixture.packagePath, relocated);
     await expect(
+      service.createAuthoringDescriptor(
+        locator.id,
+        fixture.summary,
+        requirements,
+      ),
+    ).rejects.toMatchObject({
+      code: "artifact_verification_package_missing",
+    });
+    await expect(
       service.resolveArtifactHistory({
         summaries: [fixture.summary],
         requirements,
@@ -275,11 +356,31 @@ describe("local artifact locator verification", () => {
     expect(repository.getLocatorById(locator.id)).toMatchObject({
       availability: "missing",
     });
+    const relocatedRealPath = await realpath(relocated);
+    await expect(
+      service.createAuthoringDescriptor(
+        relinked.id,
+        fixture.summary,
+        requirements,
+      ),
+    ).resolves.toMatchObject({
+      locatorId: relinked.id,
+      packagePath: relocatedRealPath,
+    });
 
     await writeFile(
       join(relocated, fixture.summary.packageIdentity + ".mp4"),
       "x",
     );
+    await expect(
+      service.createAuthoringDescriptor(
+        relinked.id,
+        fixture.summary,
+        requirements,
+      ),
+    ).rejects.toMatchObject({
+      code: "artifact_verification_filesystem_untrusted",
+    });
     await expect(
       service.resolveArtifactHistory({
         summaries: [fixture.summary],

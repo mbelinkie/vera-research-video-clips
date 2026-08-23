@@ -7,6 +7,7 @@ import {
   AddProjectMemberRequestSchema,
   AcceptLoggedExportDeliveryRequestSchema,
   ArtifactVersionHistoryQuerySchema,
+  ResolveArtifactCompatibilityRequestSchema,
   CancelLoggedExportRequestSchema,
   AddProjectVideoRequestSchema,
   BatchPreflightRequestSchema,
@@ -214,6 +215,35 @@ export function createCloudApi(
         await authenticate(request),
         projectId,
         requestId,
+      );
+    },
+  );
+
+  app.post(
+    "/api/projects/:projectId/clips/:clipId/artifact-versions/:artifactVersionId/compatibility",
+    async (request) => {
+      const { projectId, clipId, artifactVersionId } = z
+        .object({
+          projectId: z.uuid(),
+          clipId: z.uuid(),
+          artifactVersionId: z.uuid(),
+        })
+        .parse(request.params);
+      const command = ResolveArtifactCompatibilityRequestSchema.parse(
+        request.body,
+      );
+      if (command.requirements.clipId !== clipId) {
+        throw Object.assign(
+          new Error("Compatibility requirements must target the route clip."),
+          { statusCode: 400, code: "invalid_request" },
+        );
+      }
+      return catalog.resolveArtifactVersionCompatibility(
+        await authenticate(request),
+        projectId,
+        clipId,
+        artifactVersionId,
+        command.requirements,
       );
     },
   );

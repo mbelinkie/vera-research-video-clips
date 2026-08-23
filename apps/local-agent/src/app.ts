@@ -4,6 +4,8 @@ import { z, ZodError } from "zod";
 import {
   CreateExportOnlyRequestSchema,
   ArtifactLocatorActionRequestSchema,
+  AuthoringArtifactDescriptorRequestSchema,
+  LocalAuthoringArtifactDescriptorSchema,
   RelinkArtifactLocatorRequestSchema,
   ResolveLocalArtifactRequestSchema,
   ClipLibraryQuerySchema,
@@ -20,6 +22,8 @@ import {
   type ArtifactRootSummary,
   type ArtifactCompatibilityRequirements,
   type ArtifactLocatorActionResult,
+  type AuthoringArtifactDescriptorRequest,
+  type LocalAuthoringArtifactDescriptor,
   type ArtifactResolutionResult,
   type ArtifactVersionSummary,
   type ClipLibraryQuery,
@@ -96,6 +100,16 @@ export interface LocalAgentDependencies {
     authorization: string;
     request: SubmitClipLibraryExportRequest;
   }): Promise<ClipLibraryExportSubmission>;
+  prepareAuthoringExport?(input: {
+    projectId: string;
+    authorization: string;
+    request: PrepareClipLibraryExportRequest;
+  }): Promise<ExportStoragePreflight>;
+  submitAuthoringExport?(input: {
+    projectId: string;
+    authorization: string;
+    request: SubmitClipLibraryExportRequest;
+  }): Promise<ClipLibraryExportSubmission>;
   resolveArtifactVersion?(input: {
     projectId: string;
     clipId: string;
@@ -122,6 +136,12 @@ export interface LocalAgentDependencies {
     targetRootId: string;
     authorization: string;
   }): Promise<ArtifactLocatorSummary>;
+  createAuthoringArtifactDescriptor?(input: {
+    projectId: string;
+    clipId: string;
+    authorization: string;
+    request: AuthoringArtifactDescriptorRequest;
+  }): Promise<LocalAuthoringArtifactDescriptor>;
   listArtifactRoots?(input: { authorization: string }): ArtifactRootSummary[];
   resolveTranscript?(input: {
     projectId: string;
@@ -415,6 +435,47 @@ export function createLocalAgent(
     );
   }
 
+  if (dependencies?.prepareAuthoringExport) {
+    app.post(
+      "/api/authoring/projects/:projectId/export-preflight",
+      async (request) => {
+        const { projectId } = LocalProjectParamsSchema.parse(request.params);
+        const authorization = request.headers.authorization;
+        if (!authorization) {
+          throw new LocalAuthenticationError(
+            "Authentication is required to preflight an authoring export.",
+          );
+        }
+        return dependencies.prepareAuthoringExport!({
+          projectId,
+          authorization,
+          request: PrepareClipLibraryExportRequestSchema.parse(request.body),
+        });
+      },
+    );
+  }
+
+  if (dependencies?.submitAuthoringExport) {
+    app.post(
+      "/api/authoring/projects/:projectId/exports",
+      async (request, reply) => {
+        const { projectId } = LocalProjectParamsSchema.parse(request.params);
+        const authorization = request.headers.authorization;
+        if (!authorization) {
+          throw new LocalAuthenticationError(
+            "Authentication is required to submit an authoring export.",
+          );
+        }
+        const submitted = await dependencies.submitAuthoringExport!({
+          projectId,
+          authorization,
+          request: SubmitClipLibraryExportRequestSchema.parse(request.body),
+        });
+        return reply.status(201).send(submitted);
+      },
+    );
+  }
+
   if (
     dependencies?.resolveArtifactVersion &&
     dependencies.verifyArtifactVersion
@@ -467,6 +528,39 @@ export function createLocalAgent(
           authorization,
           requirements: command.requirements,
         });
+      },
+    );
+  }
+
+  if (dependencies?.createAuthoringArtifactDescriptor) {
+    app.post(
+      "/api/authoring/projects/:projectId/clips/:clipId/artifact-descriptor",
+      async (request) => {
+        const { projectId, clipId } = LocalClipParamsSchema.parse(
+          request.params,
+        );
+        const authorization = request.headers.authorization;
+        if (!authorization) {
+          throw new LocalAuthenticationError(
+            "Authentication is required for authoring artifact handoff.",
+          );
+        }
+        const command = AuthoringArtifactDescriptorRequestSchema.parse(
+          request.body,
+        );
+        if (command.requirements.clipId !== clipId) {
+          throw new LocalArtifactRequestError(
+            "Authoring compatibility evidence differs from the route clip.",
+          );
+        }
+        return LocalAuthoringArtifactDescriptorSchema.parse(
+          await dependencies.createAuthoringArtifactDescriptor!({
+            projectId,
+            clipId,
+            authorization,
+            request: command,
+          }),
+        );
       },
     );
   }

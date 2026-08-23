@@ -7,6 +7,7 @@ import {
   ArtifactVersionHistoryResponseSchema,
   ArtifactVersionHistoryQuerySchema,
   ArtifactVersionSummarySchema,
+  ArtifactCompatibilityResolutionSchema,
   AcceptLoggedExportDeliveryRequestSchema,
   CancelLoggedExportRequestSchema,
   CancelLoggedExportResponseSchema,
@@ -76,6 +77,8 @@ import {
   type ArtifactVersionHistoryQuery,
   type ArtifactVersionHistoryResponse,
   type ArtifactVersionSummary,
+  type ArtifactCompatibilityRequirements,
+  type ArtifactCompatibilityResolution,
   type AcceptLoggedExportDeliveryRequest,
   type CancelLoggedExportRequest,
   type CancelLoggedExportResponse,
@@ -160,6 +163,7 @@ import {
 } from "@research-video/contracts";
 import {
   canonicalJson,
+  artifactVersionMatchesRequirements,
   exportWorkerAdvertisementFingerprint,
   isRegisterableExportWorkerCapability,
   resolveExportSettings,
@@ -3799,6 +3803,26 @@ export class SharedProjectCatalog {
       throw new CatalogNotFoundError("Artifact version not found.");
     }
     return mapArtifactVersionSummary(result.rows[0]);
+  }
+
+  async resolveArtifactVersionCompatibility(
+    actor: AuthenticatedActor,
+    projectId: string,
+    clipId: string,
+    artifactVersionId: string,
+    requirements: ArtifactCompatibilityRequirements,
+  ): Promise<ArtifactCompatibilityResolution> {
+    const version = await this.getArtifactVersion(
+      actor,
+      projectId,
+      clipId,
+      artifactVersionId,
+    );
+    return ArtifactCompatibilityResolutionSchema.parse(
+      artifactVersionMatchesRequirements(version, requirements)
+        ? { state: "candidate", version }
+        : { state: "incompatible", artifactVersionId },
+    );
   }
 
   async getLoggedExportRequest(

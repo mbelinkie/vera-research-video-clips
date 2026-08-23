@@ -4,6 +4,8 @@ import { PGlite } from "@electric-sql/pglite";
 import { afterEach, describe, expect, it } from "vitest";
 
 import type {
+  ArtifactCompatibilityRequirements,
+  ArtifactVersionSummary,
   AuthenticatedActor,
   ExportRequest,
   LoggedExportFailureResult,
@@ -1220,19 +1222,49 @@ describe("logged export delivery", () => {
       ],
     });
     expect(secondPage.nextCursor).toBeUndefined();
-    expect(
-      await fixture.catalog.getArtifactVersion(
-        fixture.owner,
-        secondRequest.projectId!,
-        secondRequest.clipId!,
-        second.id,
-      ),
-    ).toMatchObject({
+    const exactVersion = await fixture.catalog.getArtifactVersion(
+      fixture.owner,
+      secondRequest.projectId!,
+      secondRequest.clipId!,
+      second.id,
+    );
+    expect(exactVersion).toMatchObject({
       artifactVersionId: second.id,
       preset: secondRequest.preset,
       resolvedExportBounds: second.result.resolvedExportBounds,
       renderedMediaProvenance: second.result.renderedMediaProvenance,
       thumbnailProvenance: second.result.thumbnailProvenance,
+    });
+    const requirements = compatibilityRequirementsForVersion(exactVersion);
+    await expect(
+      fixture.catalog.resolveArtifactVersionCompatibility(
+        fixture.owner,
+        secondRequest.projectId!,
+        secondRequest.clipId!,
+        second.id,
+        requirements,
+      ),
+    ).resolves.toMatchObject({
+      state: "candidate",
+      version: { artifactVersionId: second.id },
+    });
+    await expect(
+      fixture.catalog.resolveArtifactVersionCompatibility(
+        fixture.owner,
+        secondRequest.projectId!,
+        secondRequest.clipId!,
+        second.id,
+        {
+          ...requirements,
+          resolvedBounds: {
+            ...requirements.resolvedBounds,
+            endMs: requirements.resolvedBounds.endMs + 1,
+          },
+        },
+      ),
+    ).resolves.toEqual({
+      state: "incompatible",
+      artifactVersionId: second.id,
     });
     expect(
       JSON.stringify([...firstPage.versions, ...secondPage.versions]),
@@ -1254,6 +1286,15 @@ describe("logged export delivery", () => {
         secondRequest.projectId!,
         secondRequest.clipId!,
         second.id,
+      ),
+    ).rejects.toMatchObject({ statusCode: 403 });
+    await expect(
+      fixture.catalog.resolveArtifactVersionCompatibility(
+        outsider,
+        secondRequest.projectId!,
+        secondRequest.clipId!,
+        second.id,
+        requirements,
       ),
     ).rejects.toMatchObject({ statusCode: 403 });
   });
@@ -1317,6 +1358,15 @@ describe("logged export delivery", () => {
         clipId,
         completed.id,
         command,
+      ),
+    ).resolves.toEqual(reexported);
+    await expect(
+      fixture.catalog.reexportArtifactVersion(
+        fixture.owner,
+        projectId,
+        clipId,
+        completed.id,
+        { ...command, requestOrigin: "authoring_build" },
       ),
     ).resolves.toEqual(reexported);
     expect(
@@ -3706,5 +3756,38 @@ function loggedExportSuccessFixture(
             artifact("video_mp4", "6"),
           ],
         }),
+  };
+}
+
+function compatibilityRequirementsForVersion(
+  summary: ArtifactVersionSummary,
+): ArtifactCompatibilityRequirements {
+  const { text: _text, ...selection } = summary.selection;
+  return {
+    clipId: summary.clipId,
+    selection,
+    resolvedBounds: {
+      startMs: summary.resolvedExportBounds.startMs,
+      endMs: summary.resolvedExportBounds.endMs,
+    },
+    sourceLanguageClass: summary.sourceLanguageClass,
+    ...(summary.subtitleTracks
+      ? { subtitleTracks: summary.subtitleTracks }
+      : {}),
+    subtitlePolicy: summary.subtitleOmissionProvenance
+      ? {
+          requiredSidecars: [],
+          omittedReason: summary.subtitleOmissionProvenance.policy,
+        }
+      : summary.sourceLanguageClass === "confirmed_english"
+        ? { requiredSidecars: ["english"] }
+        : { requiredSidecars: ["original", "english"] },
+    requiredArtifactRoles: summary.artifacts.map((artifact) => artifact.role),
+    acceptedManifestSchemas: [1, 2],
+    settings: {
+      mode: "exact_fingerprint",
+      resolutionFingerprint:
+        summary.resolvedSettingsSnapshot.resolutionFingerprint!,
+    },
   };
 }

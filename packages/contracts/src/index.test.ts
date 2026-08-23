@@ -7,6 +7,8 @@ import {
   ArtifactVersionSummarySchema,
   ArtifactLocatorSummarySchema,
   ArtifactCompatibilityRequirementsSchema,
+  ArtifactCompatibilityResolutionSchema,
+  AuthoringArtifactDescriptorRequestSchema,
   ArtifactLocatorActionRequestSchema,
   ArtifactResolutionResultSchema,
   RelinkArtifactLocatorRequestSchema,
@@ -43,6 +45,7 @@ import {
   LoggedExportSuccessResultSchema,
   LoggedExportSuccessSchema,
   LocalClipLibraryPageSchema,
+  LocalAuthoringArtifactDescriptorSchema,
   PrepareClipLibraryExportRequestSchema,
   SubmitClipLibraryExportRequestSchema,
   UpdateLocalClipLibrarySelectionSchema,
@@ -298,6 +301,102 @@ describe("shared contracts", () => {
       ArtifactVersionSummarySchema.safeParse({
         ...summary,
         localPath: "/private/export.mov",
+      }).success,
+    ).toBe(false);
+
+    const { text: _text, ...selection } = summary.selection;
+    const requirements = ArtifactCompatibilityRequirementsSchema.parse({
+      clipId: summary.clipId,
+      selection,
+      resolvedBounds: {
+        startMs: summary.resolvedExportBounds.startMs,
+        endMs: summary.resolvedExportBounds.endMs,
+      },
+      sourceLanguageClass: summary.sourceLanguageClass,
+      subtitlePolicy: {
+        requiredSidecars: [],
+        omittedReason: "confirmed_english_user_setting",
+      },
+      requiredArtifactRoles: summary.artifacts.map((artifact) => artifact.role),
+      acceptedManifestSchemas: [2],
+      settings: {
+        mode: "exact_fingerprint",
+        resolutionFingerprint:
+          summary.resolvedSettingsSnapshot.resolutionFingerprint,
+      },
+    });
+    const locatorId = "019fbb95-cd76-7920-93fa-e23ba755ee63";
+    expect(
+      AuthoringArtifactDescriptorRequestSchema.parse({
+        artifactVersionId: summary.artifactVersionId,
+        locatorId,
+        requirements,
+      }),
+    ).toBeTruthy();
+    expect(
+      ArtifactCompatibilityResolutionSchema.parse({
+        state: "candidate",
+        version: summary,
+      }),
+    ).toBeTruthy();
+    const packagePath = `/private/exports/${summary.packageIdentity}`;
+    const descriptor = {
+      schemaVersion: 1 as const,
+      projectId: summary.projectId,
+      clipId: summary.clipId,
+      artifactVersionId: summary.artifactVersionId,
+      requestId: summary.requestId,
+      locatorId,
+      packageIdentity: summary.packageIdentity,
+      resultFingerprint: summary.resultFingerprint,
+      manifest: {
+        schemaVersion: 2 as const,
+        contentSha256: manifest.contentSha256,
+      },
+      packagePath,
+      artifacts: summary.artifacts.map((artifact) => ({
+        role: artifact.role,
+        absolutePath: `${packagePath}/${artifact.role}`,
+        byteSize: artifact.byteSize,
+        contentSha256: artifact.contentSha256,
+      })),
+    };
+    expect(LocalAuthoringArtifactDescriptorSchema.parse(descriptor)).toEqual(
+      descriptor,
+    );
+    expect(
+      LocalAuthoringArtifactDescriptorSchema.safeParse({
+        ...descriptor,
+        packagePath: "relative/package",
+      }).success,
+    ).toBe(false);
+    expect(
+      LocalAuthoringArtifactDescriptorSchema.safeParse({
+        ...descriptor,
+        artifacts: descriptor.artifacts.map((artifact, index) =>
+          index === 0
+            ? {
+                ...artifact,
+                absolutePath: `${packagePath}/../outside.mp4`,
+              }
+            : artifact,
+        ),
+      }).success,
+    ).toBe(false);
+    expect(
+      LocalAuthoringArtifactDescriptorSchema.safeParse({
+        ...descriptor,
+        artifacts: descriptor.artifacts.map((artifact, index) =>
+          index === 0
+            ? { ...artifact, absolutePath: "/private/outside.mp4" }
+            : artifact,
+        ),
+      }).success,
+    ).toBe(false);
+    expect(
+      ArtifactCompatibilityResolutionSchema.safeParse({
+        state: "candidate",
+        version: { ...summary, packagePath },
       }).success,
     ).toBe(false);
   });
@@ -585,7 +684,7 @@ describe("shared contracts", () => {
     ).toBe(false);
   });
 
-  it("fixes explicit artifact re-export provenance to the Clip Library", () => {
+  it("bounds explicit artifact re-export provenance to project export clients", () => {
     const command = {
       idempotencyKey: "reexport-v1",
       sourceLanguageClass: "confirmed_english" as const,
@@ -602,6 +701,12 @@ describe("shared contracts", () => {
       ReexportArtifactVersionRequestSchema.safeParse({
         ...command,
         requestOrigin: "authoring_build",
+      }).success,
+    ).toBe(true);
+    expect(
+      ReexportArtifactVersionRequestSchema.safeParse({
+        ...command,
+        requestOrigin: "selection_action",
       }).success,
     ).toBe(false);
   });

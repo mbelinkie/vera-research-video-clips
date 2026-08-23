@@ -912,7 +912,9 @@ export const CreateClipExportRequestSchema =
   );
 export const ReexportArtifactVersionRequestSchema =
   CreateClipExportRequestSchema.safeExtend({
-    requestOrigin: z.literal("clip_library").default("clip_library"),
+    requestOrigin: z
+      .enum(["clip_library", "authoring_build"])
+      .default("clip_library"),
   });
 export const CreateLoggedExportBatchRequestSchema = z
   .object({
@@ -2735,6 +2737,27 @@ export const ArtifactCompatibilityRequirementsSchema = z
     }
   });
 
+export const ResolveArtifactCompatibilityRequestSchema = z
+  .object({ requirements: ArtifactCompatibilityRequirementsSchema })
+  .strict();
+export const ArtifactCompatibilityResolutionSchema = z.discriminatedUnion(
+  "state",
+  [
+    z
+      .object({
+        state: z.literal("candidate"),
+        version: ArtifactVersionSummarySchema,
+      })
+      .strict(),
+    z
+      .object({
+        state: z.literal("incompatible"),
+        artifactVersionId: IdSchema,
+      })
+      .strict(),
+  ],
+);
+
 export const ArtifactResolutionFreshnessSchema = z.enum(["fresh", "stale"]);
 const ArtifactResolutionLocatorSchema = ArtifactLocatorSummarySchema;
 export const ArtifactResolutionResultSchema = z.discriminatedUnion("state", [
@@ -2799,6 +2822,136 @@ export const ArtifactLocatorActionResultSchema = z
     freshness: ArtifactResolutionFreshnessSchema,
   })
   .strict();
+
+// Local-agent-only. Absolute paths from this descriptor must never be sent to
+// the cloud catalog, events, telemetry, diagnostics, or browser Clip Library.
+const LocalAbsoluteArtifactPathSchema = z
+  .string()
+  .min(1)
+  .max(4096)
+  .refine(
+    (value) =>
+      !value.includes("\0") &&
+      value === value.normalize("NFC") &&
+      canonicalLocalAbsolutePath(value) !== undefined,
+    "Authoring artifact paths must be absolute local paths.",
+  );
+export const AuthoringArtifactDescriptorRequestSchema = z
+  .object({
+    artifactVersionId: IdSchema,
+    locatorId: IdSchema,
+    requirements: ArtifactCompatibilityRequirementsSchema,
+  })
+  .strict();
+export const LocalAuthoringArtifactDescriptorSchema = z
+  .object({
+    schemaVersion: z.literal(1),
+    projectId: IdSchema,
+    clipId: IdSchema,
+    artifactVersionId: IdSchema,
+    requestId: IdSchema,
+    locatorId: IdSchema,
+    packageIdentity: z.string().regex(/^clip-[a-f0-9-]{36}$/),
+    resultFingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+    manifest: z
+      .object({
+        schemaVersion: z.union([z.literal(1), z.literal(2)]),
+        contentSha256: z.string().regex(/^[a-f0-9]{64}$/),
+      })
+      .strict(),
+    packagePath: LocalAbsoluteArtifactPathSchema,
+    artifacts: z
+      .array(
+        z
+          .object({
+            role: FinalArtifactRoleSchema,
+            absolutePath: LocalAbsoluteArtifactPathSchema,
+            byteSize: z.number().int().nonnegative(),
+            contentSha256: z.string().regex(/^[a-f0-9]{64}$/),
+          })
+          .strict(),
+      )
+      .min(4)
+      .max(6),
+  })
+  .strict()
+  .superRefine((descriptor, context) => {
+    if (descriptor.packageIdentity !== `clip-${descriptor.requestId}`) {
+      context.addIssue({
+        code: "custom",
+        path: ["packageIdentity"],
+        message: "Authoring package identity must name its export request.",
+      });
+    }
+    const roles = descriptor.artifacts.map((artifact) => artifact.role);
+    if (new Set(roles).size !== roles.length) {
+      context.addIssue({
+        code: "custom",
+        path: ["artifacts"],
+        message: "Authoring descriptor artifact roles must be unique.",
+      });
+    }
+    const canonicalPackagePath = canonicalLocalAbsolutePath(
+      descriptor.packagePath,
+    )!;
+    if (
+      descriptor.artifacts.some((artifact) => {
+        const canonicalArtifactPath = canonicalLocalAbsolutePath(
+          artifact.absolutePath,
+        );
+        return (
+          !canonicalArtifactPath ||
+          !canonicalArtifactPath.startsWith(`${canonicalPackagePath}/`)
+        );
+      })
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["artifacts"],
+        message: "Authoring artifact paths must stay inside the package.",
+      });
+    }
+    const manifest = descriptor.artifacts.find(
+      (artifact) => artifact.role === "manifest_json",
+    );
+    if (
+      !manifest ||
+      manifest.contentSha256 !== descriptor.manifest.contentSha256
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["manifest", "contentSha256"],
+        message: "Authoring descriptor manifest identity must match its role.",
+      });
+    }
+  });
+
+function canonicalLocalAbsolutePath(value: string): string | undefined {
+  const windows = /^([A-Za-z]):[\\/]/u.exec(value);
+  if (windows) {
+    const segments = value.slice(3).split(/[\\/]/u);
+    if (
+      segments.length === 0 ||
+      segments.some(
+        (segment) => !segment || segment === "." || segment === "..",
+      )
+    ) {
+      return undefined;
+    }
+    return `${windows[1]!.toLocaleLowerCase("en-US")}:/${segments
+      .map((segment) => segment.toLocaleLowerCase("en-US"))
+      .join("/")}`;
+  }
+  if (!value.startsWith("/") || value.startsWith("//")) return undefined;
+  const segments = value.slice(1).split("/");
+  if (
+    segments.length === 0 ||
+    segments.some((segment) => !segment || segment === "." || segment === "..")
+  ) {
+    return undefined;
+  }
+  return `/${segments.join("/")}`;
+}
 
 export const ClipLibraryQuerySchema = z
   .object({
@@ -3681,6 +3834,12 @@ export type ArtifactCompatibilitySelection = z.infer<
 export type ArtifactCompatibilityRequirements = z.infer<
   typeof ArtifactCompatibilityRequirementsSchema
 >;
+export type ResolveArtifactCompatibilityRequest = z.infer<
+  typeof ResolveArtifactCompatibilityRequestSchema
+>;
+export type ArtifactCompatibilityResolution = z.infer<
+  typeof ArtifactCompatibilityResolutionSchema
+>;
 export type ArtifactResolutionFreshness = z.infer<
   typeof ArtifactResolutionFreshnessSchema
 >;
@@ -3698,6 +3857,12 @@ export type RelinkArtifactLocatorRequest = z.infer<
 >;
 export type ArtifactLocatorActionResult = z.infer<
   typeof ArtifactLocatorActionResultSchema
+>;
+export type AuthoringArtifactDescriptorRequest = z.infer<
+  typeof AuthoringArtifactDescriptorRequestSchema
+>;
+export type LocalAuthoringArtifactDescriptor = z.infer<
+  typeof LocalAuthoringArtifactDescriptorSchema
 >;
 export type ClipLibraryQuery = z.infer<typeof ClipLibraryQuerySchema>;
 export type ClipLibraryExportLeaf = z.infer<typeof ClipLibraryExportLeafSchema>;

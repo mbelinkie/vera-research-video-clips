@@ -57,6 +57,7 @@ import {
   LocalArtifactActionError,
   LocalArtifactLocatorService,
   resolveArtifactActionEvidence,
+  resolveAuthoringArtifactEvidence,
 } from "./artifact-locators.ts";
 import { PlatformArtifactLauncher } from "./artifact-launcher.ts";
 import { LocalClipLibraryService } from "./clip-library.ts";
@@ -209,6 +210,36 @@ const app = createLocalAgent({
       throw error;
     }
   },
+  prepareAuthoringExport: async (input) => {
+    try {
+      return await clipLibraryExports.prepare({
+        ...input,
+        requestOrigin: "authoring_build",
+      });
+    } catch (error) {
+      clipLibrary.purgeRevokedAuthorization({
+        projectId: input.projectId,
+        authorization: input.authorization,
+        statusCode: (error as { statusCode?: number }).statusCode,
+      });
+      throw error;
+    }
+  },
+  submitAuthoringExport: async (input) => {
+    try {
+      return await clipLibraryExports.submit({
+        ...input,
+        requestOrigin: "authoring_build",
+      });
+    } catch (error) {
+      clipLibrary.purgeRevokedAuthorization({
+        projectId: input.projectId,
+        authorization: input.authorization,
+        statusCode: (error as { statusCode?: number }).statusCode,
+      });
+      throw error;
+    }
+  },
   resolveArtifactVersion: async ({
     projectId,
     clipId,
@@ -247,6 +278,43 @@ const app = createLocalAgent({
       });
       throw error;
     }
+  },
+  createAuthoringArtifactDescriptor: async ({
+    projectId,
+    clipId,
+    authorization,
+    request,
+  }) => {
+    const identity = artifactLocators.getLocatorCloudIdentity(
+      request.locatorId,
+    );
+    if (
+      identity.projectId !== projectId ||
+      identity.clipId !== clipId ||
+      identity.artifactVersionId !== request.artifactVersionId
+    ) {
+      throw new LocalArtifactActionError("not_found", 404);
+    }
+    const summary = await resolveAuthoringArtifactEvidence({
+      fetchCloud: () =>
+        callCloudArtifactVersion(
+          projectId,
+          clipId,
+          request.artifactVersionId,
+          authorization,
+        ),
+      onAuthorizationDenied: (statusCode) =>
+        clipLibrary.purgeRevokedAuthorization({
+          projectId,
+          authorization,
+          statusCode,
+        }),
+    });
+    return artifactLocators.createAuthoringDescriptor(
+      request.locatorId,
+      summary,
+      request.requirements,
+    );
   },
   actOnArtifactLocator: async ({ locatorId, authorization, action }) => {
     const identity = artifactLocators.getLocatorCloudIdentity(locatorId);

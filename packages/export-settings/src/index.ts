@@ -6,6 +6,8 @@ import {
   InstalledExportWorkerCapabilitySummarySchema,
   ResolvedExportSettingsSnapshotSchema,
   type ExportCapabilityIssue,
+  type ArtifactCompatibilityRequirements,
+  type ArtifactVersionSummary,
   type ExportPresetScope,
   type ExportPresetSnapshot,
   type ExportRendererCapabilityId,
@@ -607,4 +609,54 @@ export function resolvedPresetForCompatibility(
     name: `${base?.name ?? "Editing"}${snapshot.overrideFields.length ? " + overrides" : ""}`,
     settings: snapshot.settings,
   };
+}
+
+export function artifactVersionMatchesRequirements(
+  summary: ArtifactVersionSummary,
+  requirements: ArtifactCompatibilityRequirements,
+): boolean {
+  const { text: _text, ...selection } = summary.selection;
+  const subtitlePolicy = summary.subtitleOmissionProvenance
+    ? {
+        requiredSidecars: [] as string[],
+        omittedReason: summary.subtitleOmissionProvenance.policy,
+      }
+    : summary.sourceLanguageClass === "confirmed_english"
+      ? { requiredSidecars: ["english"] }
+      : { requiredSidecars: ["original", "english"] };
+  if (
+    summary.clipId !== requirements.clipId ||
+    canonicalJson(selection) !== canonicalJson(requirements.selection) ||
+    canonicalJson({
+      startMs: summary.resolvedExportBounds.startMs,
+      endMs: summary.resolvedExportBounds.endMs,
+    }) !== canonicalJson(requirements.resolvedBounds) ||
+    summary.sourceLanguageClass !== requirements.sourceLanguageClass ||
+    canonicalJson(summary.subtitleTracks) !==
+      canonicalJson(requirements.subtitleTracks) ||
+    canonicalJson(subtitlePolicy) !==
+      canonicalJson(requirements.subtitlePolicy) ||
+    (summary.manifest.schemaVersion !== "unknown" &&
+      !requirements.acceptedManifestSchemas.includes(
+        summary.manifest.schemaVersion,
+      )) ||
+    requirements.requiredArtifactRoles.some(
+      (role) => !summary.artifacts.some((artifact) => artifact.role === role),
+    )
+  ) {
+    return false;
+  }
+  if (requirements.settings.mode === "exact_fingerprint") {
+    return (
+      summary.resolvedSettingsSnapshot.resolutionFingerprint ===
+      requirements.settings.resolutionFingerprint
+    );
+  }
+  const renderer = rendererCapabilityForSettings(
+    summary.resolvedSettingsSnapshot.settings,
+  );
+  return Boolean(
+    renderer &&
+    requirements.settings.rendererCapabilityIds.includes(renderer.id),
+  );
 }

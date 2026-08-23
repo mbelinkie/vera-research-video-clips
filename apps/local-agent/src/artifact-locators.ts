@@ -13,6 +13,7 @@ import {
   ArtifactVersionSummarySchema,
   ExportClipManifestSchema,
   ExportClipMetadataSchema,
+  LocalAuthoringArtifactDescriptorSchema,
   LoggedExportSuccessResultSchema,
   type ArtifactLocatorSummary,
   type ArtifactCompatibilityRequirements,
@@ -23,10 +24,12 @@ import {
   type ArtifactStoragePlatform,
   type ArtifactVerificationFailureClass,
   type ArtifactVersionSummary,
+  type LocalAuthoringArtifactDescriptor,
   type ConfigureLocalArtifactRootRequest,
 } from "@research-video/contracts";
 import {
   canonicalJson,
+  artifactVersionMatchesRequirements,
   rendererCapabilityForSettings,
   resolvedPresetForCompatibility,
   sha256Fingerprint,
@@ -78,6 +81,22 @@ export async function resolveArtifactActionEvidence(input: {
       summary: ArtifactVersionSummarySchema.parse(cached),
       freshness: "stale",
     };
+  }
+}
+
+export async function resolveAuthoringArtifactEvidence(input: {
+  fetchCloud(): Promise<ArtifactVersionSummary>;
+  onAuthorizationDenied(statusCode: 401 | 403): void;
+}): Promise<ArtifactVersionSummary> {
+  try {
+    return ArtifactVersionSummarySchema.parse(await input.fetchCloud());
+  } catch (error) {
+    const statusCode = (error as { statusCode?: number }).statusCode;
+    if (statusCode === 401 || statusCode === 403) {
+      input.onAuthorizationDenied(statusCode);
+      throw new LocalArtifactActionError("not_found", 404);
+    }
+    throw error;
   }
 }
 
@@ -263,6 +282,79 @@ export class LocalArtifactLocatorService {
     freshness: ArtifactResolutionFreshness,
   ): Promise<ArtifactLocatorActionResult> {
     return this.launchLocator(locatorId, input, freshness, "open");
+  }
+
+  async createAuthoringDescriptor(
+    locatorId: string,
+    input: ArtifactVersionSummary,
+    requirements: ArtifactCompatibilityRequirements,
+  ): Promise<LocalAuthoringArtifactDescriptor> {
+    const summary = ArtifactVersionSummarySchema.parse(input);
+    if (!artifactVersionMatchesRequirements(summary, requirements)) {
+      throw new LocalArtifactActionError("incompatible", 409);
+    }
+    const stored = this.requireMatchingLocator(locatorId, summary);
+    let verified: VerifiedArtifactPaths;
+    try {
+      verified = await verifyPackage(this.requireRoot(stored.rootId), summary);
+    } catch (error) {
+      const failure = asVerificationError(error);
+      this.repository.recordUnavailable({
+        rootId: stored.rootId,
+        artifactVersionId: stored.artifactVersionId,
+        availability:
+          failure.failureClass === "package_missing" ||
+          failure.failureClass === "root_unavailable"
+            ? "missing"
+            : "invalid",
+        failureClass: failure.failureClass,
+      });
+      throw failure;
+    }
+    const locator = this.repository.recordVerified({
+      artifactVersionId: summary.artifactVersionId,
+      rootId: stored.rootId,
+      relativePackagePath: summary.packageIdentity,
+      platform: verified.platform,
+      projectId: summary.projectId,
+      clipId: summary.clipId,
+      requestId: summary.requestId,
+      packageIdentity: summary.packageIdentity,
+      manifestSha256: summary.manifest.contentSha256,
+      manifestSchemaVersion: verified.manifestSchemaVersion,
+      resultFingerprint: summary.resultFingerprint,
+    });
+    if (
+      !requirements.acceptedManifestSchemas.includes(
+        verified.manifestSchemaVersion,
+      )
+    ) {
+      throw new LocalArtifactActionError("incompatible", 409);
+    }
+    return LocalAuthoringArtifactDescriptorSchema.parse({
+      schemaVersion: 1,
+      projectId: summary.projectId,
+      clipId: summary.clipId,
+      artifactVersionId: summary.artifactVersionId,
+      requestId: summary.requestId,
+      locatorId: locator.id,
+      packageIdentity: summary.packageIdentity,
+      resultFingerprint: summary.resultFingerprint,
+      manifest: {
+        schemaVersion: verified.manifestSchemaVersion,
+        contentSha256: summary.manifest.contentSha256,
+      },
+      packagePath: verified.packagePath,
+      artifacts: summary.artifacts.map((artifact) => ({
+        role: artifact.role,
+        absolutePath: resolve(
+          verified.packagePath,
+          expectedFilename(artifact.role, summary.requestId),
+        ),
+        byteSize: artifact.byteSize,
+        contentSha256: artifact.contentSha256,
+      })),
+    });
   }
 
   async verifyArtifactVersion(
@@ -875,70 +967,6 @@ function expectedFilename(role: string, requestId: string): string {
   return filename;
 }
 
-export function artifactVersionMatchesRequirements(
-  summary: ArtifactVersionSummary,
-  requirements: ArtifactCompatibilityRequirements,
-): boolean {
-  const selection = summary.selection;
-  const sanitizedSelection = {
-    trackId: selection.trackId,
-    transcriptVersion: selection.transcriptVersion,
-    firstSegmentId: selection.firstSegmentId,
-    lastSegmentId: selection.lastSegmentId,
-    ...(selection.firstTokenId ? { firstTokenId: selection.firstTokenId } : {}),
-    ...(selection.lastTokenId ? { lastTokenId: selection.lastTokenId } : {}),
-    transcriptStartMs: selection.transcriptStartMs,
-    transcriptEndMs: selection.transcriptEndMs,
-    exportStartMs: selection.exportStartMs,
-    exportEndMs: selection.exportEndMs,
-    timingPrecision: selection.timingPrecision,
-  };
-  const subtitlePolicy = summary.subtitleOmissionProvenance
-    ? {
-        requiredSidecars: [] as string[],
-        omittedReason: summary.subtitleOmissionProvenance.policy,
-      }
-    : summary.sourceLanguageClass === "confirmed_english"
-      ? { requiredSidecars: ["english"] }
-      : { requiredSidecars: ["original", "english"] };
-  if (
-    summary.clipId !== requirements.clipId ||
-    canonicalJson(sanitizedSelection) !==
-      canonicalJson(requirements.selection) ||
-    canonicalJson({
-      startMs: summary.resolvedExportBounds.startMs,
-      endMs: summary.resolvedExportBounds.endMs,
-    }) !== canonicalJson(requirements.resolvedBounds) ||
-    summary.sourceLanguageClass !== requirements.sourceLanguageClass ||
-    canonicalJson(summary.subtitleTracks) !==
-      canonicalJson(requirements.subtitleTracks) ||
-    canonicalJson(subtitlePolicy) !==
-      canonicalJson(requirements.subtitlePolicy) ||
-    (summary.manifest.schemaVersion !== "unknown" &&
-      !requirements.acceptedManifestSchemas.includes(
-        summary.manifest.schemaVersion,
-      )) ||
-    requirements.requiredArtifactRoles.some(
-      (role) => !summary.artifacts.some((artifact) => artifact.role === role),
-    )
-  ) {
-    return false;
-  }
-  if (requirements.settings.mode === "exact_fingerprint") {
-    return (
-      summary.resolvedSettingsSnapshot.resolutionFingerprint ===
-      requirements.settings.resolutionFingerprint
-    );
-  }
-  const renderer = rendererCapabilityForSettings(
-    summary.resolvedSettingsSnapshot.settings,
-  );
-  return Boolean(
-    renderer &&
-    requirements.settings.rendererCapabilityIds.includes(renderer.id),
-  );
-}
-
 async function inspectRoot(path: string) {
   const info = await lstat(path, { bigint: true });
   if (!info.isDirectory() || info.isSymbolicLink()) {
@@ -1051,7 +1079,11 @@ export class LocalArtifactActionError extends Error {
 
   constructor(
     actionClass:
-      "not_found" | "identity_mismatch" | "unsupported" | "launch_failed",
+      | "not_found"
+      | "identity_mismatch"
+      | "incompatible"
+      | "unsupported"
+      | "launch_failed",
     readonly statusCode = 422,
   ) {
     super("Local artifact action failed.");

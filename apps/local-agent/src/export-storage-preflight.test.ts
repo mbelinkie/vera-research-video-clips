@@ -176,7 +176,7 @@ describe("Clip Library export storage preflight", () => {
     expect(createIndividual).not.toHaveBeenCalled();
   });
 
-  it("replays one deterministic batch command with clip_library origin", async () => {
+  it("replays one deterministic batch command across diagnostic origins", async () => {
     const projectId = randomUUID();
     const clips = [
       clip(projectId, "source-a", 1),
@@ -227,7 +227,19 @@ describe("Clip Library export storage preflight", () => {
       kind: "batch",
       batch: { id: batchId },
     });
-    expect(createBatch).toHaveBeenCalledTimes(2);
+    await expect(
+      service.submit({
+        projectId,
+        authorization: "Bearer test",
+        requestOrigin: "authoring_build",
+        request: {
+          ...request,
+          expectedPreflightFingerprint: preflight.preflightFingerprint,
+          confirmUnknownSourceSizes: true,
+        },
+      }),
+    ).resolves.toMatchObject({ kind: "batch", batch: { id: batchId } });
+    expect(createBatch).toHaveBeenCalledTimes(3);
     const first = createBatch.mock.calls[0]![0].command;
     const second = createBatch.mock.calls[1]![0].command;
     expect(second).toEqual(first);
@@ -237,6 +249,13 @@ describe("Clip Library export storage preflight", () => {
     expect(first.idempotencyKey).toBe(
       `clip-library:${preflight.preflightFingerprint}`,
     );
+    const authoring = createBatch.mock.calls[2]![0].command;
+    expect(authoring.idempotencyKey).toBe(first.idempotencyKey);
+    expect(
+      authoring.items.every(
+        (item) => item.export.requestOrigin === "authoring_build",
+      ),
+    ).toBe(true);
   });
 
   it("preflights an explicit completed-version re-export and keeps its identity in replay", async () => {

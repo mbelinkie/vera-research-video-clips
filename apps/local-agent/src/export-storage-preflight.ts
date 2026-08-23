@@ -20,6 +20,7 @@ import {
   type ExportSourceLanguageClass,
   type ExportStoragePreflight,
   type ExportRequest,
+  type ExportRequestOrigin,
   type LoggedExportBatch,
   type PrepareClipLibraryExportRequest,
   type SubmitClipLibraryExportRequest,
@@ -110,14 +111,27 @@ export class ClipLibraryExportOperationService {
     projectId: string;
     authorization: string;
     request: PrepareClipLibraryExportRequest;
+    requestOrigin?: Extract<
+      ExportRequestOrigin,
+      "clip_library" | "authoring_build"
+    >;
   }): Promise<ExportStoragePreflight> {
-    return (await this.build(input, true)).preflight;
+    return (
+      await this.build(
+        { ...input, requestOrigin: input.requestOrigin ?? "clip_library" },
+        true,
+      )
+    ).preflight;
   }
 
   async submit(input: {
     projectId: string;
     authorization: string;
     request: SubmitClipLibraryExportRequest;
+    requestOrigin?: Extract<
+      ExportRequestOrigin,
+      "clip_library" | "authoring_build"
+    >;
   }): Promise<ClipLibraryExportSubmission> {
     const request = SubmitClipLibraryExportRequestSchema.parse(input.request);
     const prepared = await this.build(
@@ -133,6 +147,7 @@ export class ClipLibraryExportOperationService {
               }
             : {}),
         },
+        requestOrigin: input.requestOrigin ?? "clip_library",
       },
       false,
     );
@@ -220,6 +235,10 @@ export class ClipLibraryExportOperationService {
       projectId: string;
       authorization: string;
       request: PrepareClipLibraryExportRequest;
+      requestOrigin: Extract<
+        ExportRequestOrigin,
+        "clip_library" | "authoring_build"
+      >;
     },
     requireEligible: boolean,
   ): Promise<PreparedOperation> {
@@ -301,7 +320,7 @@ export class ClipLibraryExportOperationService {
           preview,
           command: {
             idempotencyKey: "pending-preflight",
-            requestOrigin: "clip_library",
+            requestOrigin: input.requestOrigin,
             sourceLanguageClass,
             ...(sourceLanguageClass === "confirmed_english"
               ? {}
