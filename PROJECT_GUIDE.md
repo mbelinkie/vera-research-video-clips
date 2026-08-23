@@ -2,8 +2,8 @@
 
 ## Project guide and implementation plan
 
-Status: Milestones 1–5 and M6-01–M6-04 complete; M6-02 local locator verification remains macOS-verified with a declared real-Windows physical-containment release gate; Milestone 6 continues through bounded slices M6-05–M6-07
-Last updated: 2026-08-22
+Status: Milestones 1–5 and M6-01–M6-05 complete; M6-02 local locator verification remains macOS-verified with a declared real-Windows physical-containment release gate; Milestone 6 continues through bounded slices M6-06–M6-07
+Last updated: 2026-08-23
 
 This document is the source of truth for product scope, architecture, sequencing, and acceptance criteria. Update it when a deliberate product or architectural decision changes. Use `outline.md` as the shorter execution checklist.
 

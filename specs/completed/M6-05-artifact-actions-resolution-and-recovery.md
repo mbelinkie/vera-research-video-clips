@@ -1,6 +1,6 @@
 # M6-05 — Artifact actions, resolution, and recovery
 
-- Status: active
+- Status: complete
 - Task/thread: M6-05 only
 - Dependencies: M6-01 immutable artifact history, M6-02 local roots/locators and
   full package verifier, M6-03 restart-safe Clip Library, and M6-04 durable Clip
@@ -153,3 +153,30 @@ typecheck, scoped formatting, web build, both migration validators, the full
 network-free suite, Playwright, clean detached `npm run check`, and
 `git diff --check`. The existing real-Windows junction gate remains declared and
 must not be weakened or claimed from macOS.
+
+## Completion evidence
+
+- Implemented strict path-free compatibility, resolution, action, relink, and
+  re-export contracts. `remote_only` remains representable but is never emitted
+  without a configured remote provider.
+- Reused the M6-02 full verifier for every adoption and immediately before
+  Reveal/Open. The platform launcher receives only an internally derived,
+  freshly verified package or media path through argument-array process APIs.
+- Added opaque locator-ID lookup, configured-root relink with immutable prior
+  locator preservation, authorization-scoped offline evidence, denial purge,
+  and nonenumerating denied action behavior without a new migration.
+- Added a dedicated current-authorized re-export command with a separate durable
+  idempotency namespace and `clip_library` origin. Concurrent replay adopts one
+  new request; a later reconciled success produces a second artifact version
+  while the original remains unchanged and ordered behind it.
+- Browser coverage distinguishes immutable completion from workstation
+  availability and exercises Resolve, Verify, Reveal, Open, configured-root
+  relink, and the ordinary storage-gated re-export preflight.
+- Focused compatibility, containment, offline scope, catalog/API, storage, and
+  browser tests passed. The final clean-tree aggregate check passed with 309
+  tests and 2
+  skips; both migration validators passed (27 local, 20 cloud); typecheck, web
+  build, Playwright (4 tests), scoped formatting, and `git diff --check` passed.
+- Independent Sol review found no remaining P0/P1 or acceptance blocker. The
+  M6-02 real-Windows junction/reparse physical-containment proof remains the
+  declared release gate and was not claimed from macOS.
