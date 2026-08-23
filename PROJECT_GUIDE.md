@@ -2,7 +2,7 @@
 
 ## Project guide and implementation plan
 
-Status: Milestones 1–6 and M7-02 complete; M7-01 real AWS acceptance remains blocked
+Status: Milestones 1–6 and M7-03 complete; M7-01 real AWS acceptance remains blocked
 Last updated: 2026-08-23
 
 This document is the source of truth for product scope, architecture, sequencing, and acceptance criteria. Update it when a deliberate product or architectural decision changes. Use `outline.md` as the shorter execution checklist.
@@ -1885,6 +1885,18 @@ Execute six bounded slices:
    checksum. Expose `ComponentHealth` and `ReadinessReport` for API/database,
    worker, provider, network, permission, storage, tool, and model state without
    blocking unrelated lightweight work.
+
+   Completed 2026-08-23 in implementation commit `7295b73`. The packaged app
+   now owns project/setup guidance, typed native selection, canonical root and
+   executable validation, exact tool capability probes, path-free persisted
+   component references, checksum-pinned staged model installation, supervised
+   worker reconciliation, and closed operation-specific readiness. Transcript
+   scratch is confined to the selected cache filesystem; export scratch,
+   capacity checks, promotion, cancellation, and recovery share the selected
+   output filesystem. The 10 GiB threshold remains advisory while measured need
+   plus 2 GiB is the hard heavy-operation floor. No production model URL, size,
+   or SHA-256 was invented, so real model installation remains fail-closed until
+   that approved pin is supplied; real sign-in still depends on M7-01.
 4. **Complete transcript workflow integration:** replace fixture-only research
    hydration with the verified local/shared transcript resolver for every
    supported loaded project video. Automatically supervise caption discovery,

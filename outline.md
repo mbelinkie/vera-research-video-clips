@@ -413,7 +413,7 @@ conflict behavior are proven.
       harden the renderer/preload boundary, protect OAuth with Keychain-backed
       `safeStorage`, retain the authenticated loopback agent, and supervise the
       local agent plus transcription/export workers.
-- [ ] M7-03 terminal-free first run/readiness: guide login, projects, roots,
+- [x] M7-03 terminal-free first run/readiness: guide login, projects, roots,
       rights/privacy, providers, and translation consent; detect or Finder-select
       installed FFmpeg/FFprobe, yt-dlp, and whisper-cli; download or select and
       checksum-verify the pinned model; expose `ComponentHealth` and
@@ -607,7 +607,7 @@ infra/aws        storage, API, database, queues, identity, monitoring
 
 ## Next action
 
-Milestones 1–6 and M7-02 are complete. M7-01's real AWS change-set and Cognito
+Milestones 1–6 and M7-03 are complete. M7-01's real AWS change-set and Cognito
 acceptance remain an explicit external prerequisite. The next unstarted local
-implementation slice is M7-03 terminal-free first run/readiness, and it must
+implementation slice is M7-04 complete transcript integration, and it must
 begin with its own bounded active specification.
