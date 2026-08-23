@@ -1473,6 +1473,138 @@ describe("logged export delivery import", () => {
     reopened.close();
   });
 
+  it("derives restart-safe quiescence evidence without exposing durable identities", () => {
+    const directory = mkdtempSync(join(tmpdir(), "research-video-runtime-"));
+    temporaryDirectories.add(directory);
+    const filename = join(directory, "runtime.sqlite");
+    const database = openLocalDatabase(filename);
+    runLocalMigrations(database);
+    const queue = new LocalExportQueue(database);
+    const delivery = fixtureLoggedDelivery();
+    queue.importLoggedDeliveryPending(delivery);
+    expect(queue.getRuntimeQuiescenceEvidence()).toEqual({
+      pendingAcceptance: 1,
+      accepted: 0,
+      executing: 0,
+      complete: 0,
+      failed: 0,
+      canceled: 0,
+      needsAttention: 0,
+      recoveryRequired: 0,
+      activeSourceLifecycleCount: 0,
+    });
+    queue.activateLoggedDelivery({
+      ...delivery,
+      status: "accepted",
+      acceptedAt: "2026-08-20T12:00:05.000Z",
+    });
+    expect(queue.getRuntimeQuiescenceEvidence()).toMatchObject({
+      pendingAcceptance: 0,
+      accepted: 1,
+      executing: 0,
+    });
+    activateFixtureExecution(queue, delivery);
+    expect(queue.getRuntimeQuiescenceEvidence()).toMatchObject({
+      accepted: 0,
+      executing: 1,
+      recoveryRequired: 0,
+    });
+    const source = queue.beginSourceAcquisition(delivery.request.id, {
+      requireLoggedExecution: true,
+    });
+    const groupId = randomUUID();
+    database
+      .prepare(
+        `INSERT INTO logged_export_source_groups
+           (id, compatibility_key, project_id, batch_id, youtube_video_id,
+            acquisition_profile_fingerprint, worker_id, worker_epoch,
+            lifecycle_state, cleanup_error_code, cleanup_error_message,
+            created_at, expires_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 1, 'cleanup_failed',
+                 'source_cleanup_failed', 'bounded fixture', ?, ?, ?)`,
+      )
+      .run(
+        groupId,
+        "c".repeat(64),
+        randomUUID(),
+        randomUUID(),
+        "M7lc1UVf-VE",
+        "d".repeat(64),
+        randomUUID(),
+        "2026-08-20T12:00:00.000Z",
+        "2026-08-23T12:00:00.000Z",
+        "2026-08-20T12:00:00.000Z",
+      );
+    expect(queue.getRuntimeQuiescenceEvidence()).toMatchObject({
+      executing: 1,
+      recoveryRequired: 1,
+      activeSourceLifecycleCount: 2,
+    });
+    queue.recordSourceCleanupStarted(source.request.jobId, source.attempt);
+    queue.recordSourceCleanupSucceeded(source.request.jobId, source.attempt);
+    database
+      .prepare(
+        `UPDATE logged_export_source_groups
+         SET lifecycle_state = 'deleted', deleted_at = ?, updated_at = ?
+         WHERE id = ?`,
+      )
+      .run("2026-08-20T12:00:10.000Z", "2026-08-20T12:00:10.000Z", groupId);
+    database
+      .prepare("UPDATE jobs SET state = 'failed' WHERE id = ?")
+      .run(source.request.jobId);
+    for (const state of [
+      "complete",
+      "canceled",
+      "needs_user_action",
+    ] as const) {
+      const terminalDelivery = {
+        ...fixtureLoggedDelivery(),
+        deliveryId: randomUUID(),
+        reservationToken: randomUUID(),
+        request: {
+          ...fixtureLoggedDelivery().request,
+          id: randomUUID(),
+          jobId: randomUUID(),
+        },
+      };
+      queue.importLoggedDeliveryPending(terminalDelivery);
+      queue.activateLoggedDelivery({
+        ...terminalDelivery,
+        status: "accepted",
+        acceptedAt: "2026-08-20T12:00:05.000Z",
+      });
+      database
+        .prepare("UPDATE jobs SET state = ? WHERE id = ?")
+        .run(state, terminalDelivery.request.jobId);
+    }
+    expect(queue.getRuntimeQuiescenceEvidence()).toMatchObject({
+      executing: 0,
+      complete: 1,
+      failed: 1,
+      canceled: 1,
+      needsAttention: 1,
+      recoveryRequired: 0,
+      activeSourceLifecycleCount: 0,
+    });
+    database.close();
+
+    const reopened = openLocalDatabase(filename);
+    expect(
+      new LocalExportQueue(reopened).getRuntimeQuiescenceEvidence(),
+    ).toEqual({
+      pendingAcceptance: 0,
+      accepted: 0,
+      executing: 0,
+      complete: 1,
+      failed: 1,
+      canceled: 1,
+      needsAttention: 1,
+      recoveryRequired: 0,
+      activeSourceLifecycleCount: 0,
+    });
+    reopened.close();
+  });
+
   it("projects only sanitized not-started or verified-deleted logged failures", () => {
     const directory = mkdtempSync(join(tmpdir(), "research-video-failure-"));
     temporaryDirectories.add(directory);

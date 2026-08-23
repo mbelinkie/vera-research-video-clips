@@ -147,6 +147,11 @@ export function createCloudApi(
   if (!dependencies) return app;
   const { catalog, authenticate } = dependencies;
 
+  app.get("/api/session", async (request, reply) => {
+    await authenticate(request);
+    return reply.status(204).send();
+  });
+
   app.post("/api/session/register", async (request) => {
     const actor = await authenticate(request);
     const body = z

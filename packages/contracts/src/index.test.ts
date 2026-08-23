@@ -46,6 +46,9 @@ import {
   LoggedExportSuccessSchema,
   LocalClipLibraryPageSchema,
   LocalAuthoringArtifactDescriptorSchema,
+  LocalOperationFailureSchema,
+  LocalRuntimeDrainResultSchema,
+  LocalRuntimeQuiescenceSchema,
   PrepareClipLibraryExportRequestSchema,
   SubmitClipLibraryExportRequestSchema,
   UpdateLocalClipLibrarySelectionSchema,
@@ -73,6 +76,78 @@ const now = "2026-08-01T12:00:00.000Z";
 const id = "019fbb95-cd76-7920-93fa-e23ba755ee3f";
 
 describe("shared contracts", () => {
+  it("keeps runtime quiescence and operation diagnostics closed and content-free", () => {
+    const correlationId = "019fbb95-cd76-7920-93fa-e23ba755ee3e";
+    const quiescence = {
+      schemaVersion: 1 as const,
+      draining: true,
+      safeToStop: true,
+      activeOperationCount: 0,
+      activeOperations: {
+        clipLibrary: 0,
+        artifact: 0,
+        authoring: 0,
+        export: 0,
+        runtime: 0,
+      },
+      activeChildProcessCount: 0,
+      activeSourceLifecycleCount: 0,
+      durableWork: {
+        pendingAcceptance: 0,
+        accepted: 2,
+        executing: 0,
+        complete: 3,
+        failed: 1,
+        canceled: 1,
+        needsAttention: 0,
+        recoveryRequired: 0,
+      },
+      checkedAt: now,
+    };
+    expect(LocalRuntimeQuiescenceSchema.parse(quiescence)).toEqual(quiescence);
+    expect(
+      LocalRuntimeDrainResultSchema.parse({
+        operation: { operation: "runtime", correlationId },
+        quiescence,
+      }).operation.correlationId,
+    ).toBe(correlationId);
+    expect(
+      LocalOperationFailureSchema.parse({
+        operation: "export",
+        failureClass: "runtime_draining",
+        retryable: false,
+        correlationId,
+      }),
+    ).not.toHaveProperty("message");
+    for (const prohibited of [
+      "path",
+      "url",
+      "token",
+      "header",
+      "command",
+      "output",
+      "transcript",
+      "notes",
+    ]) {
+      expect(
+        LocalOperationFailureSchema.safeParse({
+          operation: "export",
+          failureClass: "runtime_draining",
+          retryable: false,
+          correlationId,
+          [prohibited]: "/private/fixture secret fixture text",
+        }).success,
+      ).toBe(false);
+    }
+    expect(
+      LocalRuntimeQuiescenceSchema.safeParse({
+        ...quiescence,
+        safeToStop: true,
+        activeChildProcessCount: 1,
+      }).success,
+    ).toBe(false);
+  });
+
   it("requires exact worker epoch plus delivery generation and token for logged handoff", () => {
     const claim = {
       workerId: id,

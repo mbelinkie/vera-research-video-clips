@@ -50,6 +50,26 @@ describe("cloud API", () => {
     );
   });
 
+  it("validates a runtime caller without exposing session identity", async () => {
+    const authenticate = vi.fn(async () => ({
+      userId: randomUUID(),
+      externalSubject: "fixture:runtime",
+    }));
+    const app = createCloudApi({
+      catalog: {} as SharedProjectCatalog,
+      authenticate,
+    });
+    apps.add(app);
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/session",
+      headers: { authorization: "Bearer validated" },
+    });
+    expect(response.statusCode).toBe(204);
+    expect(response.body).toBe("");
+    expect(authenticate).toHaveBeenCalledTimes(1);
+  });
+
   it("routes strict Clip Library re-export commands to the exact artifact version", async () => {
     const projectId = randomUUID();
     const clipId = randomUUID();

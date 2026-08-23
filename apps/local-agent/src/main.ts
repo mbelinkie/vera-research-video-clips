@@ -72,6 +72,7 @@ import {
   runLocalExportOnce,
 } from "./export-run-once.ts";
 import { LocalLoggedExportSourceGroupCoordinator } from "./shared-source-group.ts";
+import { LocalRuntimeCoordinator } from "./local-runtime.ts";
 
 const config = loadConfig();
 await mkdir(config.dataDir, { recursive: true });
@@ -80,6 +81,10 @@ await mkdir(managedExportRoot, { recursive: true });
 const database = openLocalDatabase(join(config.dataDir, "local.sqlite"));
 runLocalMigrations(database);
 const exportQueue = new LocalExportQueue(database);
+const runtime = new LocalRuntimeCoordinator(() =>
+  exportQueue.getRuntimeQuiescenceEvidence(),
+);
+const mediaRunner = runtime.createTrackingMediaCommandRunner();
 const artifactLocatorRepository = new LocalArtifactLocatorRepository(database);
 const artifactLocators = new LocalArtifactLocatorService(
   artifactLocatorRepository,
@@ -99,15 +104,26 @@ await runLocalSourceScratchSweep(
   { queue: exportQueue, dataRoot: config.dataDir },
 );
 const workerIdentity = new LocalExportWorkerIdentityRepository(database);
-const capabilityProvider = new FfmpegCapabilityDiscoveryProvider();
-const sourceProvider = createExportSourceAcquisitionProvider({
-  mode: config.exportSourceProvider,
-  ytDlpPath: config.ytDlpPath,
+const capabilityProvider = new FfmpegCapabilityDiscoveryProvider({
+  runner: mediaRunner,
 });
-const sourceInspector = new FfprobeMediaInspector();
-const rangeRenderer = new FfmpegCapabilityRangeRenderer();
-const thumbnailExtractor = new FfmpegJpegThumbnailExtractor();
-const thumbnailInspector = new FfprobeJpegThumbnailInspector();
+const sourceProvider = createExportSourceAcquisitionProvider(
+  {
+    mode: config.exportSourceProvider,
+    ytDlpPath: config.ytDlpPath,
+  },
+  mediaRunner,
+);
+const sourceInspector = new FfprobeMediaInspector({ runner: mediaRunner });
+const rangeRenderer = new FfmpegCapabilityRangeRenderer({
+  runner: mediaRunner,
+});
+const thumbnailExtractor = new FfmpegJpegThumbnailExtractor({
+  runner: mediaRunner,
+});
+const thumbnailInspector = new FfprobeJpegThumbnailInspector({
+  runner: mediaRunner,
+});
 const sharedSourceCoordinator = sourceProvider
   ? new LocalLoggedExportSourceGroupCoordinator(
       exportQueue,
@@ -170,6 +186,9 @@ const clipLibraryExports = new ClipLibraryExportOperationService({
   capacity: exportStorageCapacity,
 });
 const app = createLocalAgent({
+  runtime,
+  authorizeRuntime: (authorization) =>
+    callCloudRuntimeAuthorization(authorization),
   resolveClipLibrary: ({ projectId, authorization, query }) =>
     clipLibrary.resolvePage({
       projectId,
@@ -510,6 +529,27 @@ await app.listen({ host: config.localAgentHost, port: config.localAgentPort });
 app.log.info(
   `Local agent listening on http://${config.localAgentHost}:${config.localAgentPort}`,
 );
+
+async function callCloudRuntimeAuthorization(
+  authorization: string,
+): Promise<void> {
+  const response = await fetch(`${cloudApiUrl}/api/session`, {
+    headers: { authorization },
+  });
+  if (response.ok) return;
+  throw Object.assign(
+    new Error("Runtime authorization could not be validated."),
+    {
+      statusCode: response.status,
+      code:
+        response.status === 401
+          ? "authentication_required"
+          : response.status === 403
+            ? "authorization_denied"
+            : "runtime_authorization_unavailable",
+    },
+  );
+}
 
 async function callCloudExportWorker(
   method: "PUT" | "POST",

@@ -1,4 +1,5 @@
-import Fastify, { type FastifyInstance } from "fastify";
+import Fastify, { type FastifyInstance, type FastifyRequest } from "fastify";
+import { randomUUID } from "node:crypto";
 import { z, ZodError } from "zod";
 
 import {
@@ -60,6 +61,9 @@ import {
   type ExportSettingsPreviewRequest,
   type ResolvedExportSettingsSnapshot,
   HealthResponseSchema,
+  LocalOperationFailureSchema,
+  LocalRuntimeDrainResultSchema,
+  LocalRuntimeQuiescenceSchema,
 } from "@research-video/contracts";
 import {
   currentExportWorkerAdvertisement,
@@ -74,8 +78,14 @@ import type {
 import type { WorkspaceTranscriptResolution } from "@research-video/sync";
 
 import type { LocalExportOnceResult } from "./export-run-once.ts";
+import type { LocalRuntimeCoordinator } from "./local-runtime.ts";
 
 export interface LocalAgentDependencies {
+  runtime?: Pick<
+    LocalRuntimeCoordinator,
+    "beginDrain" | "getQuiescence" | "beginOperation" | "isDraining"
+  >;
+  authorizeRuntime?(authorization: string): Promise<void>;
   resolveClipLibrary?(input: {
     projectId: string;
     authorization: string;
@@ -307,8 +317,56 @@ export function createLocalAgent(
   dependencies?: LocalAgentDependencies,
 ): FastifyInstance {
   const app = Fastify({ logger: false });
+  const requestCorrelations = new WeakMap<object, string>();
+  const requestRuntimeOperations = new WeakMap<object, () => void>();
 
-  app.setErrorHandler((error, _request, reply) => {
+  app.addHook("onRequest", (request, reply, done) => {
+    const correlationId = randomUUID();
+    requestCorrelations.set(request, correlationId);
+    reply.header("x-correlation-id", correlationId);
+    done();
+  });
+  const finishRuntimeOperation = (request: FastifyRequest) => {
+    requestRuntimeOperations.get(request)?.();
+    requestRuntimeOperations.delete(request);
+  };
+  app.addHook("onSend", (request, _reply, payload, done) => {
+    finishRuntimeOperation(request);
+    done(null, payload);
+  });
+  app.addHook("onError", (request, _reply, _error, done) => {
+    finishRuntimeOperation(request);
+    done();
+  });
+  app.addHook("preHandler", async (request) => {
+    if (
+      !dependencies?.runtime ||
+      !tracksRuntimeOperation(request.method, request.url)
+    ) {
+      return;
+    }
+    if (dependencies.runtime.isDraining()) {
+      const authorization = requireRuntimeAuthorization(
+        request.headers.authorization,
+      );
+      if (!dependencies.authorizeRuntime) {
+        throw new LocalAuthenticationError(
+          "Authentication is required to start local work while draining.",
+        );
+      }
+      await dependencies.authorizeRuntime(authorization);
+    }
+    const operation = dependencies.runtime.beginOperation(
+      localOperationClass(request.url),
+    );
+    registerRuntimeOperation(
+      request,
+      operation.finish,
+      requestRuntimeOperations,
+    );
+  });
+
+  app.setErrorHandler((error, request, reply) => {
     const candidate = error as Error & {
       statusCode?: number;
       code?: string;
@@ -316,17 +374,23 @@ export function createLocalAgent(
     };
     const statusCode =
       error instanceof ZodError ? 400 : (candidate.statusCode ?? 500);
+    const operation = localOperationClass(request.url);
+    const operationFailure = LocalOperationFailureSchema.parse({
+      operation,
+      correlationId: requestCorrelations.get(request) ?? randomUUID(),
+      failureClass: localFailureClass(
+        error instanceof ZodError ? "invalid_request" : candidate.code,
+        statusCode,
+      ),
+      retryable: statusCode >= 500,
+    });
     return reply.status(statusCode).send({
       error: {
-        code:
-          error instanceof ZodError
-            ? "invalid_request"
-            : (candidate.code ?? "internal_error"),
-        message:
-          statusCode === 500 ? "Internal server error." : candidate.message,
+        code: localFailureCode(candidate.code, operationFailure.failureClass),
+        message: localFailureMessage(operationFailure.failureClass),
         retryable: statusCode >= 500,
-        ...(candidate.issues ? { issues: candidate.issues } : {}),
       },
+      operationFailure,
     });
   });
 
@@ -338,6 +402,27 @@ export function createLocalAgent(
       timestamp: new Date().toISOString(),
     }),
   );
+
+  if (dependencies?.runtime && dependencies.authorizeRuntime) {
+    app.post("/api/runtime/drain", async (request) => {
+      const authorization = requireRuntimeAuthorization(
+        request.headers.authorization,
+      );
+      await dependencies.authorizeRuntime!(authorization);
+      return LocalRuntimeDrainResultSchema.parse(
+        dependencies.runtime!.beginDrain(),
+      );
+    });
+    app.get("/api/runtime/quiescence", async (request) => {
+      const authorization = requireRuntimeAuthorization(
+        request.headers.authorization,
+      );
+      await dependencies.authorizeRuntime!(authorization);
+      return LocalRuntimeQuiescenceSchema.parse(
+        dependencies.runtime!.getQuiescence(),
+      );
+    });
+  }
 
   if (dependencies?.resolveClipLibrary) {
     app.get("/api/projects/:projectId/clip-library", async (request) => {
@@ -803,6 +888,13 @@ export function createLocalAgent(
       }
       const pending = dependencies.getPendingLoggedDelivery!();
       if (pending) {
+        const pendingOperation = dependencies.runtime?.beginOperation(
+          "export",
+          {
+            allowDuringDrain: true,
+            exclusiveKey: "logged-export-pending-acceptance",
+          },
+        );
         try {
           const accepted = await dependencies.acceptLoggedExportDelivery!({
             authorization,
@@ -822,53 +914,70 @@ export function createLocalAgent(
           if ((error as { statusCode?: number }).statusCode !== 409)
             throw error;
           dependencies.rejectPendingLoggedDelivery!(pending);
+        } finally {
+          pendingOperation?.finish();
         }
       }
-      const claimed = ClaimLoggedExportDeliveryResponseSchema.parse(
-        await dependencies.claimLoggedExportDelivery!({
-          authorization,
-          request: {
-            workerId: identity.workerId,
-            workerEpoch: identity.epoch,
-          },
-        }),
-      );
-      if (!claimed.delivery) return claimed;
-      if (
-        claimed.delivery.workerId !== identity.workerId ||
-        claimed.delivery.workerEpoch !== identity.epoch
-      ) {
-        throw new LocalExportSettingsError(
-          "Cloud delivery ownership does not match this registered local worker.",
-          "export_delivery_ownership_mismatch",
-          409,
-        );
-      }
-
-      dependencies.importLoggedDeliveryPending!(claimed.delivery);
-      let accepted: LoggedExportDelivery;
-      try {
-        accepted = await dependencies.acceptLoggedExportDelivery!({
-          authorization,
-          request: {
-            workerId: identity.workerId,
-            workerEpoch: identity.epoch,
-            deliveryId: claimed.delivery.deliveryId,
-            generation: claimed.delivery.generation,
-            reservationToken: claimed.delivery.reservationToken,
-          },
-        });
-      } catch (error) {
-        const statusCode = (error as { statusCode?: number }).statusCode;
-        if (statusCode === 409) {
-          dependencies.rejectPendingLoggedDelivery!(claimed.delivery);
+      if (dependencies.runtime?.isDraining()) {
+        if (!dependencies.authorizeRuntime) {
+          throw new LocalAuthenticationError(
+            "Authentication is required to claim local work while draining.",
+          );
         }
-        throw error;
+        await dependencies.authorizeRuntime(authorization);
       }
-      dependencies.activateLoggedDelivery!(accepted);
-      return ClaimLoggedExportDeliveryResponseSchema.parse({
-        delivery: accepted,
+      const claimOperation = dependencies.runtime?.beginOperation("export", {
+        exclusiveKey: "logged-export-claim",
       });
+      try {
+        const claimed = ClaimLoggedExportDeliveryResponseSchema.parse(
+          await dependencies.claimLoggedExportDelivery!({
+            authorization,
+            request: {
+              workerId: identity.workerId,
+              workerEpoch: identity.epoch,
+            },
+          }),
+        );
+        if (!claimed.delivery) return claimed;
+        if (
+          claimed.delivery.workerId !== identity.workerId ||
+          claimed.delivery.workerEpoch !== identity.epoch
+        ) {
+          throw new LocalExportSettingsError(
+            "Cloud delivery ownership does not match this registered local worker.",
+            "export_delivery_ownership_mismatch",
+            409,
+          );
+        }
+
+        dependencies.importLoggedDeliveryPending!(claimed.delivery);
+        let accepted: LoggedExportDelivery;
+        try {
+          accepted = await dependencies.acceptLoggedExportDelivery!({
+            authorization,
+            request: {
+              workerId: identity.workerId,
+              workerEpoch: identity.epoch,
+              deliveryId: claimed.delivery.deliveryId,
+              generation: claimed.delivery.generation,
+              reservationToken: claimed.delivery.reservationToken,
+            },
+          });
+        } catch (error) {
+          const statusCode = (error as { statusCode?: number }).statusCode;
+          if (statusCode === 409) {
+            dependencies.rejectPendingLoggedDelivery!(claimed.delivery);
+          }
+          throw error;
+        }
+        dependencies.activateLoggedDelivery!(accepted);
+        return ClaimLoggedExportDeliveryResponseSchema.parse({
+          delivery: accepted,
+        });
+      } finally {
+        claimOperation?.finish();
+      }
     });
   }
 
@@ -914,7 +1023,24 @@ export function createLocalAgent(
           409,
         );
       }
-
+      if (dependencies.runtime?.isDraining()) {
+        if (!dependencies.authorizeRuntime) {
+          throw new LocalAuthenticationError(
+            "Authentication is required to process local work while draining.",
+          );
+        }
+        await dependencies.authorizeRuntime(authorization);
+      }
+      const processOperation = dependencies.runtime?.beginOperation("export", {
+        exclusiveKey: `logged-export-process:${command.requestId}`,
+      });
+      if (processOperation) {
+        registerRuntimeOperation(
+          request,
+          processOperation.finish,
+          requestRuntimeOperations,
+        );
+      }
       if (
         dependencies.buildLoggedExportCanceledResult &&
         dependencies.reconcileLoggedExportCanceled
@@ -1346,6 +1472,136 @@ export function createLocalAgent(
   }
 
   return app;
+}
+
+function requireRuntimeAuthorization(
+  authorization: string | undefined,
+): string {
+  if (!authorization) {
+    throw new LocalAuthenticationError(
+      "Authentication is required to inspect or drain the local runtime.",
+    );
+  }
+  return authorization;
+}
+
+function tracksRuntimeOperation(method: string, url: string): boolean {
+  return (
+    !["GET", "HEAD", "OPTIONS"].includes(method) &&
+    url.startsWith("/api/") &&
+    !url.startsWith("/api/runtime/") &&
+    url !== "/api/export-deliveries/claim" &&
+    url !== "/api/export-deliveries/process"
+  );
+}
+
+function registerRuntimeOperation(
+  request: FastifyRequest,
+  finish: () => void,
+  operations: WeakMap<object, () => void>,
+): void {
+  operations.set(request, finish);
+}
+
+function localOperationClass(url: string) {
+  if (url.includes("/runtime/")) return "runtime" as const;
+  if (url.includes("/authoring/")) return "authoring" as const;
+  if (url.includes("artifact")) return "artifact" as const;
+  if (url.includes("clip-library")) return "clip_library" as const;
+  return "export" as const;
+}
+
+function localFailureClass(code: string | undefined, statusCode: number) {
+  if (statusCode === 401) return "authentication_required" as const;
+  if (statusCode === 403 || code === "not_found")
+    return "authorization_denied" as const;
+  if (statusCode === 400) return "invalid_request" as const;
+  if (code === "runtime_draining") return "runtime_draining" as const;
+  if (code?.includes("storage")) return "storage_insufficient" as const;
+  if (code?.includes("verification") || code?.includes("artifact"))
+    return "verification_failed" as const;
+  if (code?.includes("cleanup")) return "cleanup_required" as const;
+  if (code?.includes("lease") || code?.includes("execution"))
+    return "execution_lost" as const;
+  if (statusCode === 409) return "conflict" as const;
+  if (statusCode >= 500) return "provider_unavailable" as const;
+  return "internal" as const;
+}
+
+function localFailureMessage(
+  failureClass: ReturnType<typeof localFailureClass>,
+): string {
+  switch (failureClass) {
+    case "authentication_required":
+      return "Authentication is required.";
+    case "authorization_denied":
+      return "This operation is not available.";
+    case "invalid_request":
+      return "The request is invalid.";
+    case "conflict":
+      return "The operation conflicts with current durable state.";
+    case "runtime_draining":
+      return "The local export runtime is draining.";
+    case "storage_insufficient":
+      return "Local storage is insufficient for this operation.";
+    case "verification_failed":
+      return "Local artifact verification failed.";
+    case "provider_unavailable":
+      return "A required local or cloud provider is unavailable.";
+    case "execution_lost":
+      return "Durable export execution ownership is unavailable.";
+    case "cleanup_required":
+      return "Local source cleanup requires attention.";
+    case "internal":
+      return "Internal server error.";
+  }
+}
+
+const SafeLocalErrorCodes = new Set([
+  "artifact_identity_mismatch",
+  "artifact_reexport_unavailable",
+  "authentication_required",
+  "authorization_denied",
+  "clip_library_export_clip_ineligible",
+  "clip_library_export_duration_invalid",
+  "clip_library_export_language_evidence_incomplete",
+  "clip_library_export_scope_mismatch",
+  "clip_library_export_settings_unsupported",
+  "export_delivery_ownership_mismatch",
+  "export_settings_stale",
+  "export_settings_unsupported",
+  "export_source_provider_unconfigured",
+  "export_storage_capacity_unavailable",
+  "export_storage_estimate_invalid",
+  "export_storage_estimate_overflow",
+  "export_storage_insufficient",
+  "export_storage_insufficient_after_acquisition",
+  "export_storage_preflight_stale",
+  "export_storage_reserve_unavailable",
+  "export_storage_settings_missing",
+  "export_storage_unknown_confirmation_required",
+  "identity_mismatch",
+  "incompatible",
+  "invalid_request",
+  "launch_failed",
+  "logged_export_delivery_not_accepted",
+  "logged_export_execution_ownership_mismatch",
+  "logged_export_failure_cleanup_incomplete",
+  "not_found",
+  "runtime_draining",
+  "runtime_operation_conflict",
+  "unsupported",
+  "worker_registration_required",
+]);
+
+function localFailureCode(
+  candidateCode: string | undefined,
+  failureClass: ReturnType<typeof localFailureClass>,
+): string {
+  if (candidateCode && SafeLocalErrorCodes.has(candidateCode)) {
+    return candidateCode;
+  }
+  return failureClass === "internal" ? "internal_error" : failureClass;
 }
 
 function startExecutionHeartbeatLoop(input: {

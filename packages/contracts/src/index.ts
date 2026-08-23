@@ -3509,6 +3509,110 @@ export const ProcessAcceptedLoggedExportResponseSchema = z.union([
     .strict(),
 ]);
 
+export const LocalOperationClassSchema = z.enum([
+  "clip_library",
+  "artifact",
+  "authoring",
+  "export",
+  "runtime",
+]);
+
+export const LocalOperationFailureClassSchema = z.enum([
+  "authentication_required",
+  "authorization_denied",
+  "invalid_request",
+  "conflict",
+  "runtime_draining",
+  "storage_insufficient",
+  "verification_failed",
+  "provider_unavailable",
+  "execution_lost",
+  "cleanup_required",
+  "internal",
+]);
+
+export const LocalOperationCorrelationSchema = z
+  .object({
+    operation: LocalOperationClassSchema,
+    correlationId: IdSchema,
+  })
+  .strict();
+
+export const LocalOperationFailureSchema =
+  LocalOperationCorrelationSchema.extend({
+    failureClass: LocalOperationFailureClassSchema,
+    retryable: z.boolean(),
+  }).strict();
+
+const LocalRuntimeCountSchema = z.number().int().nonnegative().max(1_000_000);
+
+export const LocalRuntimeDurableWorkSchema = z
+  .object({
+    pendingAcceptance: LocalRuntimeCountSchema,
+    accepted: LocalRuntimeCountSchema,
+    executing: LocalRuntimeCountSchema,
+    complete: LocalRuntimeCountSchema,
+    failed: LocalRuntimeCountSchema,
+    canceled: LocalRuntimeCountSchema,
+    needsAttention: LocalRuntimeCountSchema,
+    recoveryRequired: LocalRuntimeCountSchema,
+  })
+  .strict();
+
+export const LocalRuntimeQuiescenceSchema = z
+  .object({
+    schemaVersion: z.literal(1),
+    draining: z.boolean(),
+    safeToStop: z.boolean(),
+    activeOperationCount: LocalRuntimeCountSchema,
+    activeOperations: z
+      .object({
+        clipLibrary: LocalRuntimeCountSchema,
+        artifact: LocalRuntimeCountSchema,
+        authoring: LocalRuntimeCountSchema,
+        export: LocalRuntimeCountSchema,
+        runtime: LocalRuntimeCountSchema,
+      })
+      .strict(),
+    activeChildProcessCount: LocalRuntimeCountSchema,
+    activeSourceLifecycleCount: LocalRuntimeCountSchema,
+    durableWork: LocalRuntimeDurableWorkSchema,
+    checkedAt: UtcTimestampSchema,
+  })
+  .strict()
+  .superRefine((value, context) => {
+    const operationCount = Object.values(value.activeOperations).reduce(
+      (sum, count) => sum + count,
+      0,
+    );
+    if (operationCount !== value.activeOperationCount) {
+      context.addIssue({
+        code: "custom",
+        path: ["activeOperationCount"],
+        message: "Active operation totals must match their bounded classes.",
+      });
+    }
+    const derivedSafe =
+      value.draining &&
+      value.activeOperationCount === 0 &&
+      value.activeChildProcessCount === 0 &&
+      value.activeSourceLifecycleCount === 0;
+    if (value.safeToStop !== derivedSafe) {
+      context.addIssue({
+        code: "custom",
+        path: ["safeToStop"],
+        message: "safeToStop must be derived from the complete runtime state.",
+      });
+    }
+  });
+
+export const LocalRuntimeDrainResultSchema = z
+  .object({
+    operation: LocalOperationCorrelationSchema,
+    quiescence: LocalRuntimeQuiescenceSchema,
+  })
+  .strict();
+
 export const JobSchema = z.object({
   id: IdSchema,
   kind: JobKindSchema,
@@ -3912,6 +4016,23 @@ export type ProcessAcceptedLoggedExportRequest = z.infer<
 >;
 export type ProcessAcceptedLoggedExportResponse = z.infer<
   typeof ProcessAcceptedLoggedExportResponseSchema
+>;
+export type LocalOperationClass = z.infer<typeof LocalOperationClassSchema>;
+export type LocalOperationFailureClass = z.infer<
+  typeof LocalOperationFailureClassSchema
+>;
+export type LocalOperationCorrelation = z.infer<
+  typeof LocalOperationCorrelationSchema
+>;
+export type LocalOperationFailure = z.infer<typeof LocalOperationFailureSchema>;
+export type LocalRuntimeDurableWork = z.infer<
+  typeof LocalRuntimeDurableWorkSchema
+>;
+export type LocalRuntimeQuiescence = z.infer<
+  typeof LocalRuntimeQuiescenceSchema
+>;
+export type LocalRuntimeDrainResult = z.infer<
+  typeof LocalRuntimeDrainResultSchema
 >;
 export type TranscriptArtifact = z.infer<typeof TranscriptArtifactSchema>;
 export type TranscriptManifest = z.infer<typeof TranscriptManifestSchema>;

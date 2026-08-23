@@ -1268,6 +1268,57 @@ export class LocalExportQueue {
     ).map((row) => this.mapRequest(row));
   }
 
+  getRuntimeQuiescenceEvidence(): LocalRuntimeQuiescenceEvidence {
+    const durable = this.database
+      .prepare(
+        `SELECT
+           COALESCE(SUM(CASE WHEN er.cloud_delivery_state = 'pending_acceptance'
+             THEN 1 ELSE 0 END), 0) AS pending_acceptance,
+           COALESCE(SUM(CASE WHEN er.cloud_delivery_state = 'accepted'
+             AND er.cloud_execution_id IS NULL
+             AND j.state = 'queued'
+             THEN 1 ELSE 0 END), 0) AS accepted,
+           COALESCE(SUM(CASE WHEN er.cloud_execution_id IS NOT NULL
+             AND j.state IN ('queued', 'processing')
+             THEN 1 ELSE 0 END), 0) AS executing,
+           COALESCE(SUM(CASE WHEN er.cloud_delivery_id IS NOT NULL
+             AND j.state = 'complete' THEN 1 ELSE 0 END), 0) AS complete,
+           COALESCE(SUM(CASE WHEN er.cloud_delivery_id IS NOT NULL
+             AND j.state = 'failed' THEN 1 ELSE 0 END), 0) AS failed,
+           COALESCE(SUM(CASE WHEN er.cloud_delivery_id IS NOT NULL
+             AND j.state = 'canceled' THEN 1 ELSE 0 END), 0) AS canceled,
+           COALESCE(SUM(CASE WHEN er.cloud_delivery_id IS NOT NULL
+             AND j.state = 'needs_user_action' THEN 1 ELSE 0 END), 0)
+             AS needs_attention,
+           COALESCE(SUM(CASE WHEN er.cloud_delivery_id IS NOT NULL
+             AND j.state = 'processing' THEN 1 ELSE 0 END), 0)
+             AS recovery_required
+         FROM export_requests er
+         JOIN jobs j ON j.id = er.job_id`,
+      )
+      .get() as Record<string, number>;
+    const scratch = this.database
+      .prepare(
+        `SELECT
+           (SELECT COUNT(*) FROM source_scratch_assets
+              WHERE lifecycle_state != 'deleted') +
+           (SELECT COUNT(*) FROM logged_export_source_groups
+              WHERE lifecycle_state != 'deleted') AS active_source_lifecycles`,
+      )
+      .get() as { active_source_lifecycles: number };
+    return {
+      pendingAcceptance: Number(durable.pending_acceptance),
+      accepted: Number(durable.accepted),
+      executing: Number(durable.executing),
+      complete: Number(durable.complete),
+      failed: Number(durable.failed),
+      canceled: Number(durable.canceled),
+      needsAttention: Number(durable.needs_attention),
+      recoveryRequired: Number(durable.recovery_required),
+      activeSourceLifecycleCount: Number(scratch.active_source_lifecycles),
+    };
+  }
+
   getVerifiedEnglishTranscript(input: {
     trackId: string;
     trackVersion: number;
@@ -3288,6 +3339,18 @@ export class LocalExportQueue {
 export type LocalExportSourceAttempt = {
   request: ExportRequest;
   attempt: number;
+};
+
+export type LocalRuntimeQuiescenceEvidence = {
+  pendingAcceptance: number;
+  accepted: number;
+  executing: number;
+  complete: number;
+  failed: number;
+  canceled: number;
+  needsAttention: number;
+  recoveryRequired: number;
+  activeSourceLifecycleCount: number;
 };
 
 export type LocalLoggedExportSourceGroup = {

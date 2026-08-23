@@ -16,6 +16,7 @@ import { normalizeTranscriptFixture } from "@research-video/transcript";
 import transcriptFixture from "../../../tests/fixtures/transcripts/english-word.json" with { type: "json" };
 
 import { createLocalAgent } from "./app.ts";
+import { LocalRuntimeCoordinator } from "./local-runtime.ts";
 
 const apps = new Set<ReturnType<typeof createLocalAgent>>();
 
@@ -790,6 +791,155 @@ describe("local agent", () => {
     expect(activate).toHaveBeenCalledWith(accepted);
   });
 
+  it("authenticates drain and rejects a later claim before cloud with bounded diagnostics", async () => {
+    const delivery = loggedDeliveryFixture();
+    const evidence = {
+      pendingAcceptance: 0,
+      accepted: 1,
+      executing: 0,
+      complete: 0,
+      failed: 0,
+      canceled: 0,
+      needsAttention: 0,
+      recoveryRequired: 0,
+      activeSourceLifecycleCount: 0,
+    };
+    const runtime = new LocalRuntimeCoordinator(() => evidence);
+    const claim = vi.fn(async () => ({ delivery: undefined }));
+    const authorizeRuntime = vi.fn(async (authorization: string) => {
+      if (authorization === "Bearer nonsense") {
+        throw Object.assign(new Error("denied"), {
+          statusCode: 401,
+          code: "authentication_required",
+        });
+      }
+    });
+    const app = createLocalAgent({
+      runtime,
+      authorizeRuntime,
+      workerIdentity: {
+        get: () => ({
+          workerId: delivery.workerId,
+          epoch: delivery.workerEpoch,
+          advertisementFingerprint: "a".repeat(64),
+          createdAt: delivery.reservedAt,
+          updatedAt: delivery.reservedAt,
+        }),
+        prepareRegistration: () => {
+          throw new Error("not used");
+        },
+      },
+      getPendingLoggedDelivery: () => undefined,
+      claimLoggedExportDelivery: claim,
+      importLoggedDeliveryPending: vi.fn(() => ({}) as never),
+      acceptLoggedExportDelivery: vi.fn(),
+      activateLoggedDelivery: vi.fn(() => ({}) as never),
+      rejectPendingLoggedDelivery: vi.fn(),
+    });
+    apps.add(app);
+    const denied = await app.inject({
+      method: "POST",
+      url: "/api/runtime/drain",
+    });
+    expect(denied.statusCode).toBe(401);
+    expect(denied.json()).toMatchObject({
+      operationFailure: {
+        operation: "runtime",
+        failureClass: "authentication_required",
+        retryable: false,
+      },
+    });
+    expect(authorizeRuntime).not.toHaveBeenCalled();
+    const invalid = await app.inject({
+      method: "POST",
+      url: "/api/runtime/drain",
+      headers: { authorization: "Bearer nonsense" },
+    });
+    expect(invalid.statusCode).toBe(401);
+    expect(runtime.getQuiescence().draining).toBe(false);
+    const drained = await app.inject({
+      method: "POST",
+      url: "/api/runtime/drain",
+      headers: { authorization: "Bearer fixture-secret" },
+    });
+    expect(drained.statusCode).toBe(200);
+    expect(authorizeRuntime).toHaveBeenLastCalledWith("Bearer fixture-secret");
+    expect(drained.json()).toMatchObject({
+      quiescence: { draining: true, safeToStop: true },
+    });
+    expect(drained.headers["x-correlation-id"]).toMatch(/^[0-9a-f-]{36}$/u);
+    const blocked = await app.inject({
+      method: "POST",
+      url: "/api/export-deliveries/claim",
+      headers: { authorization: "Bearer fixture-secret" },
+    });
+    expect(blocked.statusCode).toBe(409);
+    expect(blocked.json()).toMatchObject({
+      operationFailure: {
+        operation: "export",
+        failureClass: "runtime_draining",
+        retryable: false,
+      },
+    });
+    expect(JSON.stringify(blocked.json())).not.toContain("fixture-secret");
+    expect(claim).not.toHaveBeenCalled();
+  });
+
+  it("finishes a pending acceptance handoff during drain without claiming fresh work", async () => {
+    const pending = loggedDeliveryFixture();
+    const accepted = {
+      ...pending,
+      status: "accepted" as const,
+      acceptedAt: "2026-08-20T12:00:05.000Z",
+    };
+    const runtime = new LocalRuntimeCoordinator(() => ({
+      pendingAcceptance: 1,
+      accepted: 0,
+      executing: 0,
+      complete: 0,
+      failed: 0,
+      canceled: 0,
+      needsAttention: 0,
+      recoveryRequired: 0,
+      activeSourceLifecycleCount: 0,
+    }));
+    runtime.beginDrain();
+    const claim = vi.fn(async () => ({ delivery: undefined }));
+    const app = createLocalAgent({
+      runtime,
+      authorizeRuntime: async () => {},
+      workerIdentity: {
+        get: () => ({
+          workerId: pending.workerId,
+          epoch: pending.workerEpoch,
+          advertisementFingerprint: "a".repeat(64),
+          createdAt: pending.reservedAt,
+          updatedAt: pending.reservedAt,
+        }),
+        prepareRegistration: () => {
+          throw new Error("not used");
+        },
+      },
+      getPendingLoggedDelivery: () => pending,
+      claimLoggedExportDelivery: claim,
+      importLoggedDeliveryPending: vi.fn(() => ({}) as never),
+      acceptLoggedExportDelivery: vi.fn(async () => accepted),
+      activateLoggedDelivery: vi.fn(() => ({}) as never),
+      rejectPendingLoggedDelivery: vi.fn(),
+    });
+    apps.add(app);
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: "/api/export-deliveries/claim",
+          headers: { authorization: "Bearer fixture" },
+        })
+      ).json(),
+    ).toMatchObject({ delivery: { status: "accepted" } });
+    expect(claim).not.toHaveBeenCalled();
+  });
+
   it("recovers a lost acceptance response from local pending provenance before claiming new work", async () => {
     const pending = loggedDeliveryFixture();
     const accepted = {
@@ -957,6 +1107,213 @@ describe("local agent", () => {
       ).statusCode,
     ).toBe(409);
     expect(run).not.toHaveBeenCalled();
+  });
+
+  it("drains around one active processor and rejects a duplicate without a second start", async () => {
+    const delivery = acceptedLoggedDeliveryFixture();
+    const result = localSuccessResultFixture(delivery);
+    let signalStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      signalStarted = resolve;
+    });
+    let finish!: () => void;
+    const run = vi.fn(
+      () =>
+        new Promise<{
+          requestId: string;
+          status: "complete";
+          state: "complete";
+        }>((resolve) => {
+          signalStarted();
+          finish = () =>
+            resolve({
+              requestId: delivery.request.id,
+              status: "complete",
+              state: "complete",
+            });
+        }),
+    );
+    const runtime = new LocalRuntimeCoordinator(() => ({
+      pendingAcceptance: 0,
+      accepted: 0,
+      executing: 0,
+      complete: 0,
+      failed: 0,
+      canceled: 0,
+      needsAttention: 0,
+      recoveryRequired: 0,
+      activeSourceLifecycleCount: 0,
+    }));
+    const reconciled = {
+      id: "019fbb95-cd76-7920-93fa-e23ba755ee81",
+      deliveryId: delivery.deliveryId,
+      generation: delivery.generation,
+      workerId: delivery.workerId,
+      workerEpoch: delivery.workerEpoch,
+      result,
+      resultFingerprint: "f".repeat(64),
+      reconciledAt: "2026-08-20T12:00:20.000Z",
+    };
+    const app = createLocalAgent({
+      runtime,
+      authorizeRuntime: async () => {},
+      workerIdentity: {
+        get: () => ({
+          workerId: delivery.workerId,
+          epoch: delivery.workerEpoch,
+          advertisementFingerprint: "a".repeat(64),
+          createdAt: delivery.reservedAt,
+          updatedAt: delivery.reservedAt,
+        }),
+        prepareRegistration: () => {
+          throw new Error("not used");
+        },
+      },
+      getAcceptedLoggedDelivery: () => delivery,
+      buildLoggedExportSuccessResult: () => result,
+      runLoggedExportOnce: run,
+      reconcileLoggedExportSuccess: vi.fn(async () => reconciled),
+    });
+    apps.add(app);
+    const command = {
+      method: "POST" as const,
+      url: "/api/export-deliveries/process",
+      headers: { authorization: "Bearer fixture" },
+      payload: {
+        requestId: delivery.request.id,
+        authorizationConfirmed: true,
+      },
+    };
+    const first = app.inject(command);
+    await started;
+    expect(runtime.beginDrain().quiescence).toMatchObject({
+      safeToStop: false,
+      activeOperations: { export: 1 },
+    });
+    const duplicate = await app.inject(command);
+    expect(duplicate.statusCode).toBe(409);
+    expect(duplicate.json()).toMatchObject({
+      operationFailure: { failureClass: "runtime_draining" },
+    });
+    expect(run).toHaveBeenCalledTimes(1);
+    finish();
+    expect((await first).statusCode).toBe(200);
+    expect(runtime.getQuiescence().safeToStop).toBe(true);
+  });
+
+  it("tracks a pre-drain media-capable action and blocks later actions after safe", async () => {
+    const projectId = "019fbb95-cd76-7920-93fa-e23ba755ee65";
+    const clipId = "019fbb95-cd76-7920-93fa-e23ba755ee66";
+    const runtime = new LocalRuntimeCoordinator(() => ({
+      pendingAcceptance: 0,
+      accepted: 0,
+      executing: 0,
+      complete: 0,
+      failed: 0,
+      canceled: 0,
+      needsAttention: 0,
+      recoveryRequired: 0,
+      activeSourceLifecycleCount: 0,
+    }));
+    let signalStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      signalStarted = resolve;
+    });
+    let finish!: () => void;
+    const prepare = vi.fn(
+      () =>
+        new Promise<never>((resolve) => {
+          signalStarted();
+          finish = () => resolve({} as never);
+        }),
+    );
+    const app = createLocalAgent({
+      runtime,
+      authorizeRuntime: async () => {},
+      prepareClipLibraryExport: prepare,
+    });
+    apps.add(app);
+    const command = {
+      method: "POST" as const,
+      url: `/api/projects/${projectId}/clip-library/export-preflight`,
+      headers: { authorization: "Bearer fixture" },
+      payload: {
+        clipIds: [clipId],
+        settingsSelection: { base: "application_default", overrides: {} },
+      },
+    };
+    const first = app.inject(command);
+    await started;
+    expect(runtime.beginDrain().quiescence).toMatchObject({
+      safeToStop: false,
+      activeOperations: { clipLibrary: 1 },
+    });
+    const blocked = await app.inject(command);
+    expect(blocked.statusCode).toBe(409);
+    expect(blocked.json()).toMatchObject({
+      operationFailure: { failureClass: "runtime_draining" },
+    });
+    expect(prepare).toHaveBeenCalledTimes(1);
+    finish();
+    await first;
+    expect(runtime.getQuiescence().safeToStop).toBe(true);
+  });
+
+  it("never reflects caught provider text into local diagnostics", async () => {
+    const delivery = loggedDeliveryFixture();
+    const providerFailure = Object.assign(
+      new Error(
+        "Authorization: Bearer secret /private/source.mp4 transcript fixture",
+      ),
+      {
+        statusCode: 409,
+        code: "provider_conflict_transcript_secret",
+        issues: [{ message: "notes-secret /private/issue" }],
+      },
+    );
+    const app = createLocalAgent({
+      workerIdentity: {
+        get: () => ({
+          workerId: delivery.workerId,
+          epoch: delivery.workerEpoch,
+          advertisementFingerprint: "a".repeat(64),
+          createdAt: delivery.reservedAt,
+          updatedAt: delivery.reservedAt,
+        }),
+        prepareRegistration: () => {
+          throw new Error("not used");
+        },
+      },
+      getPendingLoggedDelivery: () => undefined,
+      claimLoggedExportDelivery: vi.fn(async () => {
+        throw providerFailure;
+      }),
+      importLoggedDeliveryPending: vi.fn(() => ({}) as never),
+      acceptLoggedExportDelivery: vi.fn(),
+      activateLoggedDelivery: vi.fn(() => ({}) as never),
+      rejectPendingLoggedDelivery: vi.fn(),
+    });
+    apps.add(app);
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/export-deliveries/claim",
+      headers: { authorization: "Bearer request-secret" },
+    });
+    expect(response.statusCode).toBe(409);
+    expect(response.json()).toMatchObject({
+      operationFailure: { operation: "export", failureClass: "conflict" },
+    });
+    for (const sentinel of [
+      "secret",
+      "private",
+      "source.mp4",
+      "transcript fixture",
+      "transcript_secret",
+      "notes-secret",
+      "private/issue",
+    ]) {
+      expect(JSON.stringify(response.json())).not.toContain(sentinel);
+    }
   });
 
   it("retries both cloud crash windows from the same locally completed result without rerendering", async () => {
