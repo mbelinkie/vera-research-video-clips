@@ -23,6 +23,8 @@ import {
   ExportPresetDefaultSchema,
   ExportPresetSnapshotSchema,
   ExportSettingsSchema,
+  ExportStoragePreflightSchema,
+  ExportStorageSafetyReserveBytes,
   InstalledExportWorkerCapabilitySummarySchema,
   ClaimLoggedExportDeliveryRequestSchema,
   LoggedExportDeliverySchema,
@@ -37,6 +39,8 @@ import {
   LoggedExportSuccessResultSchema,
   LoggedExportSuccessSchema,
   LocalClipLibraryPageSchema,
+  PrepareClipLibraryExportRequestSchema,
+  SubmitClipLibraryExportRequestSchema,
   UpdateLocalClipLibrarySelectionSchema,
   ProcessAcceptedLoggedExportRequestSchema,
   ProcessAcceptedLoggedExportResponseSchema,
@@ -377,6 +381,72 @@ describe("shared contracts", () => {
       LocalClipLibraryPageSchema.safeParse({
         ...localPage,
         absoluteRootPath: "/private/exports",
+      }).success,
+    ).toBe(false);
+  });
+
+  it("keeps Clip Library storage evidence strict, internally consistent, and path-free", () => {
+    const request = deliveryContractFixture().request;
+    const clipId = request.clipId!;
+    const outputEstimatedBytes = 300_000_000;
+    const activeCheckpointReserveBytes = 25_000_000;
+    const knownRequiredBytes =
+      outputEstimatedBytes +
+      outputEstimatedBytes +
+      activeCheckpointReserveBytes +
+      ExportStorageSafetyReserveBytes;
+    const command = {
+      clipIds: [clipId],
+      settingsSelection: {
+        base: "application_default" as const,
+        overrides: {},
+      },
+    };
+    expect(PrepareClipLibraryExportRequestSchema.parse(command)).toEqual(
+      command,
+    );
+    expect(
+      SubmitClipLibraryExportRequestSchema.parse({
+        ...command,
+        expectedPreflightFingerprint: "a".repeat(64),
+      }),
+    ).toMatchObject({ confirmUnknownSourceSizes: false });
+    const preflight = {
+      schemaVersion: 1 as const,
+      projectId: request.projectId!,
+      preflightFingerprint: "a".repeat(64),
+      checkedAt: now,
+      availableBytes: knownRequiredBytes,
+      uniqueSourceCount: 1,
+      sourceSharingAssurance: "same_worker_profile_only" as const,
+      knownSourceBytes: 0,
+      unknownSourceCount: 1,
+      outputEstimatedBytes,
+      promotionReserveBytes: outputEstimatedBytes,
+      activeCheckpointReserveBytes,
+      safetyReserveBytes: ExportStorageSafetyReserveBytes,
+      knownRequiredBytes,
+      decision: "confirmation_required" as const,
+      items: [
+        {
+          clipId,
+          sourceLanguageClass: request.sourceLanguageClass,
+          resolvedSettingsSnapshot: request.resolvedSettingsSnapshot!,
+          outputEstimatedBytes,
+        },
+      ],
+    };
+    expect(ExportStoragePreflightSchema.parse(preflight)).toEqual(preflight);
+    expect(
+      ExportStoragePreflightSchema.safeParse({
+        ...preflight,
+        knownRequiredBytes: knownRequiredBytes - 1,
+      }).success,
+    ).toBe(false);
+    expect(
+      ExportStoragePreflightSchema.safeParse({
+        ...preflight,
+        localPath: "/private/exports",
       }).success,
     ).toBe(false);
   });

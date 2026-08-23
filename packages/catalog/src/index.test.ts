@@ -1151,10 +1151,10 @@ describe("logged export delivery", () => {
       fixture.owner,
       fixture.accepted.request.projectId!,
       fixture.accepted.request.clipId!,
-      "clip-library-reexport",
+      "selection-action-reexport",
       "h264",
       "confirmed_english",
-      "clip_library",
+      "selection_action",
     );
     const reserved = (
       await fixture.catalog.claimLoggedExportDelivery(fixture.owner, {
@@ -1199,7 +1199,7 @@ describe("logged export delivery", () => {
         {
           artifactVersionId: second.id,
           requestId: secondRequest.id,
-          requestOrigin: "clip_library",
+          requestOrigin: "selection_action",
           manifest: { schemaVersion: "unknown" },
         },
       ],
@@ -2815,6 +2815,60 @@ describe("logged export delivery", () => {
       [fixture.accepted.request.id],
     );
     expect(executions.rows[0]!.count).toBe("1");
+  });
+});
+
+describe("Clip Library export creation", () => {
+  it("adopts an exact lost-response replay but rejects a second independent request", async () => {
+    const database = new PGlite();
+    databases.add(database);
+    await runCloudMigrations(database);
+    const catalog = new SharedProjectCatalog(
+      database,
+      new MemoryTranscriptObjectStore(),
+      () => new Date("2026-08-22T12:00:00.000Z"),
+    );
+    const owner = fixtureActor("clip-library-export-owner");
+    await catalog.registerUser(owner, "Clip Library export owner");
+    const project = await catalog.createProject(owner, {
+      name: "Clip Library export project",
+    });
+    const [clip] = await createBatchClips(catalog, owner, project.id, 1);
+    const create = () =>
+      createLoggedExportFromClip(
+        catalog,
+        owner,
+        project.id,
+        clip!.id,
+        "clip-library-lost-response",
+        "h264",
+        "confirmed_english",
+        "clip_library",
+      );
+    const [first, concurrentReplay] = await Promise.all([create(), create()]);
+    expect(concurrentReplay).toEqual(first);
+
+    expect(await create()).toEqual(first);
+    await expect(
+      createLoggedExportFromClip(
+        catalog,
+        owner,
+        project.id,
+        clip!.id,
+        "clip-library-second-request",
+        "h264",
+        "confirmed_english",
+        "clip_library",
+      ),
+    ).rejects.toMatchObject({ statusCode: 409 });
+    expect(
+      (
+        await database.query<{ count: string }>(
+          "SELECT COUNT(*)::text AS count FROM export_requests WHERE clip_id = $1",
+          [clip!.id],
+        )
+      ).rows[0]!.count,
+    ).toBe("1");
   });
 });
 

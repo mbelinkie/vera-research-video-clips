@@ -502,11 +502,9 @@ describe("cloud API", () => {
         preset: { ...exportPayload.preset, name: "Changed retry" },
       },
     });
-    expect(exportRetry.json<{ id: string }>().id).toBe(
-      exported.json<{ id: string }>().id,
-    );
+    expect(exportRetry.statusCode).toBe(409);
     expect(exportRetry.json()).toMatchObject({
-      preset: { name: "Editing MP4" },
+      error: { code: "idempotency_conflict" },
     });
     const queuedJobs = await database.query<{ count: string }>(
       "SELECT count(*)::text AS count FROM jobs WHERE project_id = $1 AND kind = 'export' AND state = 'queued'",
@@ -593,13 +591,10 @@ describe("cloud API", () => {
         expectedResolutionFingerprint: "f".repeat(64),
       },
     });
-    expect(catalogReplay.statusCode).toBe(201);
-    expect(catalogReplay.json<{ id: string }>().id).toBe(
-      catalogExport.json<{ id: string }>().id,
-    );
-    expect(catalogReplay.json().resolvedSettingsSnapshot).toEqual(
-      catalogExport.json().resolvedSettingsSnapshot,
-    );
+    expect(catalogReplay.statusCode).toBe(409);
+    expect(catalogReplay.json()).toMatchObject({
+      error: { code: "idempotency_conflict" },
+    });
     expect(
       (
         await app.inject({

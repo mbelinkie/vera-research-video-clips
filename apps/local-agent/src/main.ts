@@ -4,6 +4,9 @@ import { join } from "node:path";
 import { loadConfig } from "@research-video/config";
 import {
   ExportSettingsPreviewSchema,
+  ExportRequestSchema,
+  LoggedExportBatchSchema,
+  ClipCandidateSchema,
   ArtifactVersionSummarySchema,
   ClipLibraryPageSchema,
   ClipLibraryQuerySchema,
@@ -16,6 +19,10 @@ import {
   LoggedExportSuccessSchema,
   RegisteredExportWorkerSchema,
   type ClipLibraryQuery,
+  type CreateClipExportRequest,
+  type CreateLoggedExportBatchRequest,
+  type ExportSourceLanguageClass,
+  type ExportSettingsSelection,
 } from "@research-video/contracts";
 import {
   LocalExportQueue,
@@ -42,10 +49,16 @@ import {
   FfprobeJpegThumbnailInspector,
   FfprobeMediaInspector,
 } from "@research-video/media";
+import { withInstalledExportWorkerAvailability } from "@research-video/export-settings";
 
 import { createLocalAgent } from "./app.ts";
 import { LocalArtifactLocatorService } from "./artifact-locators.ts";
 import { LocalClipLibraryService } from "./clip-library.ts";
+import {
+  ClipLibraryExportOperationService,
+  createFileSystemStorageCapacityProvider,
+  createPostAcquisitionExportStorageGuard,
+} from "./export-storage-preflight.ts";
 import { runLocalSourceScratchSweep } from "./export-scratch-sweeper.ts";
 import {
   discardCompletedLoggedExportForCancellation,
@@ -104,6 +117,36 @@ const reader = new CachedTranscriptDocumentReader(
   new LocalTranscriptIndex(database),
 );
 const cloudApiUrl = `http://${config.cloudApiHost}:${config.cloudApiPort}`;
+const exportStorageCapacity = createFileSystemStorageCapacityProvider(
+  config.dataDir,
+);
+const exportStorageGuard = createPostAcquisitionExportStorageGuard(
+  exportStorageCapacity,
+);
+const clipLibraryExports = new ClipLibraryExportOperationService({
+  getClip: ({ projectId, clipId, authorization }) =>
+    callCloudClipCandidate(projectId, clipId, authorization),
+  previewSettings: async ({
+    projectId,
+    authorization,
+    sourceLanguageClass,
+    selection,
+  }) =>
+    withInstalledExportWorkerAvailability(
+      await callCloudProjectExportSettings(
+        projectId,
+        sourceLanguageClass,
+        selection,
+        authorization,
+      ),
+      await capabilityProvider.discover(),
+    ),
+  createIndividual: ({ projectId, clipId, authorization, command }) =>
+    callCloudClipExport(projectId, clipId, command, authorization),
+  createBatch: ({ projectId, authorization, command }) =>
+    callCloudExportBatch(projectId, command, authorization),
+  capacity: exportStorageCapacity,
+});
 const app = createLocalAgent({
   resolveClipLibrary: ({ projectId, authorization, query }) =>
     clipLibrary.resolvePage({
@@ -121,6 +164,30 @@ const app = createLocalAgent({
     }),
   updateClipLibrarySelection: ({ projectId, authorization, command }) =>
     clipLibrary.updateSelection({ projectId, authorization, command }),
+  prepareClipLibraryExport: async (input) => {
+    try {
+      return await clipLibraryExports.prepare(input);
+    } catch (error) {
+      clipLibrary.purgeRevokedAuthorization({
+        projectId: input.projectId,
+        authorization: input.authorization,
+        statusCode: (error as { statusCode?: number }).statusCode,
+      });
+      throw error;
+    }
+  },
+  submitClipLibraryExport: async (input) => {
+    try {
+      return await clipLibraryExports.submit(input);
+    } catch (error) {
+      clipLibrary.purgeRevokedAuthorization({
+        projectId: input.projectId,
+        authorization: input.authorization,
+        statusCode: (error as { statusCode?: number }).statusCode,
+      });
+      throw error;
+    }
+  },
   resolveArtifactVersion: async ({
     projectId,
     clipId,
@@ -213,6 +280,7 @@ const app = createLocalAgent({
       thumbnailInspector,
       capabilityProvider,
       ...(sharedSourceCoordinator ? { sharedSourceCoordinator } : {}),
+      storageGuard: exportStorageGuard,
       dataRoot: config.dataDir,
     }),
   discardCompletedLoggedExportForCancellation: (requestId, reason) =>
@@ -371,6 +439,105 @@ async function callCloudClipLibrary(
     );
   }
   return ClipLibraryPageSchema.parse(payload);
+}
+
+async function callCloudClipCandidate(
+  projectId: string,
+  clipId: string,
+  authorization: string,
+) {
+  return ClipCandidateSchema.parse(
+    await callCloudProjectExport(
+      "GET",
+      `/api/projects/${projectId}/clips/${clipId}`,
+      undefined,
+      authorization,
+    ),
+  );
+}
+
+async function callCloudProjectExportSettings(
+  projectId: string,
+  sourceLanguageClass: ExportSourceLanguageClass,
+  selection: ExportSettingsSelection,
+  authorization: string,
+) {
+  return ExportSettingsPreviewSchema.parse(
+    await callCloudProjectExport(
+      "POST",
+      `/api/projects/${projectId}/export-settings/preview`,
+      { sourceLanguageClass, selection },
+      authorization,
+    ),
+  );
+}
+
+async function callCloudClipExport(
+  projectId: string,
+  clipId: string,
+  command: CreateClipExportRequest,
+  authorization: string,
+) {
+  return ExportRequestSchema.parse(
+    await callCloudProjectExport(
+      "POST",
+      `/api/projects/${projectId}/clips/${clipId}/exports`,
+      command,
+      authorization,
+    ),
+  );
+}
+
+async function callCloudExportBatch(
+  projectId: string,
+  command: CreateLoggedExportBatchRequest,
+  authorization: string,
+) {
+  return LoggedExportBatchSchema.parse(
+    await callCloudProjectExport(
+      "POST",
+      `/api/projects/${projectId}/export-batches`,
+      command,
+      authorization,
+    ),
+  );
+}
+
+async function callCloudProjectExport(
+  method: "GET" | "POST",
+  path: string,
+  body: unknown,
+  authorization: string,
+) {
+  let response: Response;
+  try {
+    response = await fetch(`${cloudApiUrl}${path}`, {
+      method,
+      headers: {
+        authorization,
+        ...(body === undefined ? {} : { "content-type": "application/json" }),
+      },
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+    });
+  } catch {
+    throw Object.assign(new Error("Cloud export service is unreachable."), {
+      code: "cloud_unreachable",
+      statusCode: 503,
+    });
+  }
+  const payload = await response.json().catch(() => undefined);
+  if (!response.ok) {
+    const remote = payload as
+      { error?: { code?: string; message?: string } } | undefined;
+    throw Object.assign(
+      new Error(remote?.error?.message ?? "Cloud export request failed."),
+      {
+        statusCode: response.status,
+        code: remote?.error?.code ?? "clip_library_export_cloud_failed",
+      },
+    );
+  }
+  return payload;
 }
 
 async function callCloudLoggedExportDeliveryClaim(

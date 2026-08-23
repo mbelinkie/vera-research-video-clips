@@ -4,6 +4,8 @@ import { z, ZodError } from "zod";
 import {
   CreateExportOnlyRequestSchema,
   ClipLibraryQuerySchema,
+  PrepareClipLibraryExportRequestSchema,
+  SubmitClipLibraryExportRequestSchema,
   VerifyLocalArtifactVersionRequestSchema,
   UpdateLocalClipLibrarySelectionSchema,
   ClaimLoggedExportDeliveryResponseSchema,
@@ -14,7 +16,11 @@ import {
   type ArtifactLocatorSummary,
   type ArtifactVersionSummary,
   type ClipLibraryQuery,
+  type ClipLibraryExportSubmission,
+  type ExportStoragePreflight,
   type LocalClipLibraryPage,
+  type PrepareClipLibraryExportRequest,
+  type SubmitClipLibraryExportRequest,
   type UpdateLocalClipLibrarySelection,
   type AcceptLoggedExportDeliveryRequest,
   type ClaimLoggedExportDeliveryRequest,
@@ -73,6 +79,16 @@ export interface LocalAgentDependencies {
     authorization: string;
     command: UpdateLocalClipLibrarySelection;
   }): string[];
+  prepareClipLibraryExport?(input: {
+    projectId: string;
+    authorization: string;
+    request: PrepareClipLibraryExportRequest;
+  }): Promise<ExportStoragePreflight>;
+  submitClipLibraryExport?(input: {
+    projectId: string;
+    authorization: string;
+    request: SubmitClipLibraryExportRequest;
+  }): Promise<ClipLibraryExportSubmission>;
   resolveArtifactVersion?(input: {
     projectId: string;
     clipId: string;
@@ -320,6 +336,47 @@ export function createLocalAgent(
             command: UpdateLocalClipLibrarySelectionSchema.parse(request.body),
           }),
         };
+      },
+    );
+  }
+
+  if (dependencies?.prepareClipLibraryExport) {
+    app.post(
+      "/api/projects/:projectId/clip-library/export-preflight",
+      async (request) => {
+        const { projectId } = LocalProjectParamsSchema.parse(request.params);
+        const authorization = request.headers.authorization;
+        if (!authorization) {
+          throw new LocalAuthenticationError(
+            "Authentication is required to preflight a Clip Library export.",
+          );
+        }
+        return dependencies.prepareClipLibraryExport!({
+          projectId,
+          authorization,
+          request: PrepareClipLibraryExportRequestSchema.parse(request.body),
+        });
+      },
+    );
+  }
+
+  if (dependencies?.submitClipLibraryExport) {
+    app.post(
+      "/api/projects/:projectId/clip-library/exports",
+      async (request, reply) => {
+        const { projectId } = LocalProjectParamsSchema.parse(request.params);
+        const authorization = request.headers.authorization;
+        if (!authorization) {
+          throw new LocalAuthenticationError(
+            "Authentication is required to submit a Clip Library export.",
+          );
+        }
+        const submitted = await dependencies.submitClipLibraryExport!({
+          projectId,
+          authorization,
+          request: SubmitClipLibraryExportRequestSchema.parse(request.body),
+        });
+        return reply.status(201).send(submitted);
       },
     );
   }

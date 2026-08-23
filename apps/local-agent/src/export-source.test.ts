@@ -26,6 +26,7 @@ import {
 import { normalizeTranscriptFixture } from "@research-video/transcript";
 
 import { LocalExportSourceProcessor } from "./export-source.ts";
+import { ClipLibraryExportOperationError } from "./export-storage-preflight.ts";
 
 const directories = new Set<string>();
 
@@ -1104,6 +1105,51 @@ describe("LocalExportSourceProcessor", () => {
     ).rejects.toMatchObject({ code: "export_bounds_empty" });
     expect(queue.get(request.id)).toMatchObject({ state: "needs_user_action" });
     expect(queue.get(request.id)?.resolvedExportBounds).toBeUndefined();
+    expect(queue.getSourceAttempt(request.jobId, 1)).toMatchObject({
+      lifecycleState: "deleted",
+    });
+    database.close();
+  });
+
+  it("rechecks measured storage after acquisition and cleans scratch before renderer entry", async () => {
+    const { root, database, queue, request } = fixtureQueue();
+    const render = vi.fn(async ({ outputPath }: { outputPath: string }) => {
+      await writeFile(outputPath, "fixture render");
+    });
+    const assertCanRender = vi.fn(async () => {
+      throw new ClipLibraryExportOperationError(
+        "Available storage fell below this export's render requirement.",
+        "export_storage_insufficient_after_acquisition",
+        409,
+      );
+    });
+    const processor = new LocalExportSourceProcessor(
+      queue,
+      fixtureSourceProvider(),
+      fixtureInspector(),
+      { render },
+      root,
+      fixtureThumbnailExtractor(),
+      fixtureThumbnailInspector(),
+      undefined,
+      undefined,
+      { assertCanRender },
+    );
+
+    await expect(
+      processor.process({
+        requestId: request.id,
+        authorizationConfirmed: true,
+      }),
+    ).rejects.toMatchObject({
+      code: "export_storage_insufficient_after_acquisition",
+    });
+    expect(assertCanRender).toHaveBeenCalledWith(
+      expect.objectContaining({ id: request.id }),
+      14,
+    );
+    expect(render).not.toHaveBeenCalled();
+    expect(queue.get(request.id)).toMatchObject({ state: "needs_user_action" });
     expect(queue.getSourceAttempt(request.jobId, 1)).toMatchObject({
       lifecycleState: "deleted",
     });

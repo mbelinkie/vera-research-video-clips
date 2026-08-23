@@ -117,6 +117,97 @@ describe("local agent", () => {
     });
   });
 
+  it("keeps Clip Library preflight and submission behind current authorization", async () => {
+    const projectId = "019fbb95-cd76-7920-93fa-e23ba755ee65";
+    const clipId = "019fbb95-cd76-7920-93fa-e23ba755ee66";
+    const settingsSelection = {
+      base: "application_default" as const,
+      overrides: {},
+    };
+    const request = { clipIds: [clipId], settingsSelection };
+    const preflight = {
+      schemaVersion: 1 as const,
+      projectId,
+      preflightFingerprint: "a".repeat(64),
+      checkedAt: "2026-08-22T12:00:00.000Z",
+      availableBytes: 5_000_000_000,
+      uniqueSourceCount: 1,
+      sourceSharingAssurance: "same_worker_profile_only" as const,
+      knownSourceBytes: 0,
+      unknownSourceCount: 1,
+      outputEstimatedBytes: 100_000_000,
+      promotionReserveBytes: 100_000_000,
+      activeCheckpointReserveBytes: 0,
+      safetyReserveBytes: 2_147_483_648 as const,
+      knownRequiredBytes: 2_347_483_648,
+      decision: "confirmation_required" as const,
+      items: [],
+    } as never;
+    const prepareClipLibraryExport = vi.fn(async () => preflight);
+    const submitClipLibraryExport = vi.fn(async () => ({
+      kind: "individual" as const,
+      request: { id: clipId },
+    })) as never;
+    const app = createLocalAgent({
+      prepareClipLibraryExport,
+      submitClipLibraryExport,
+    });
+    apps.add(app);
+    const preflightUrl = `/api/projects/${projectId}/clip-library/export-preflight`;
+    const submitUrl = `/api/projects/${projectId}/clip-library/exports`;
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: preflightUrl,
+          payload: request,
+        })
+      ).statusCode,
+    ).toBe(401);
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: submitUrl,
+          payload: {
+            ...request,
+            expectedPreflightFingerprint: "a".repeat(64),
+            confirmUnknownSourceSizes: true,
+          },
+        })
+      ).statusCode,
+    ).toBe(401);
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: preflightUrl,
+          headers: { authorization: "Bearer project-session" },
+          payload: request,
+        })
+      ).statusCode,
+    ).toBe(200);
+    expect(prepareClipLibraryExport).toHaveBeenCalledWith({
+      projectId,
+      authorization: "Bearer project-session",
+      request,
+    });
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: submitUrl,
+          headers: { authorization: "Bearer project-session" },
+          payload: {
+            ...request,
+            expectedPreflightFingerprint: "a".repeat(64),
+            confirmUnknownSourceSizes: true,
+          },
+        })
+      ).statusCode,
+    ).toBe(201);
+  });
+
   it("keeps root paths local and resolves verification evidence through authorization", async () => {
     const rootId = "019fbb95-cd76-7920-93fa-e23ba755ee71";
     const artifactVersionId = "019fbb95-cd76-7920-93fa-e23ba755ee72";

@@ -284,6 +284,7 @@ test("maps transcript text selection to stable source and export bounds", async 
   let exportOnlyPostCount = 0;
   let batchExportPostCount = 0;
   let batchFixtureEnabled = false;
+  const clipLibrarySelected = new Set<string>();
   let loggedClip: Record<string, unknown> | undefined;
   let lastClipBody: Record<string, any> | undefined;
   let lastLoggedExportBody: Record<string, any> | undefined;
@@ -600,24 +601,92 @@ test("maps transcript text selection to stable source and export bounds", async 
       const path = new URL(request.url()).pathname;
       const projectId = path.split("/")[4]!;
       if (path.endsWith("/selection")) {
+        const body = request.postDataJSON();
+        for (const clipId of body.pageClipIds as string[]) {
+          if ((body.selectedClipIds as string[]).includes(clipId))
+            clipLibrarySelected.add(clipId);
+          else clipLibrarySelected.delete(clipId);
+        }
         return route.fulfill({
           json: {
-            selectedClipIds: request.postDataJSON().selectedClipIds,
+            selectedClipIds: [...clipLibrarySelected],
           },
         });
       }
-      const entries =
+      if (path.endsWith("/export-preflight")) {
+        const body = request.postDataJSON();
+        const outputEstimatedBytes = 150_000_000 * body.clipIds.length;
+        const preview = settingsPreview(
+          {
+            sourceLanguageClass: "foreign",
+            selection: body.settingsSelection,
+          },
+          "logged",
+          createdProjectPresetId,
+        );
+        return route.fulfill({
+          json: {
+            schemaVersion: 1,
+            projectId,
+            preflightFingerprint: "a".repeat(64),
+            checkedAt: now,
+            availableBytes: 8_000_000_000,
+            uniqueSourceCount: 1,
+            sourceSharingAssurance: "same_worker_profile_only",
+            knownSourceBytes: 0,
+            unknownSourceCount: 1,
+            outputEstimatedBytes,
+            promotionReserveBytes: outputEstimatedBytes,
+            activeCheckpointReserveBytes: 0,
+            safetyReserveBytes: 2_147_483_648,
+            knownRequiredBytes: outputEstimatedBytes * 2 + 2_147_483_648,
+            decision: "confirmation_required",
+            items: body.clipIds.map((clipId: string) => ({
+              clipId,
+              sourceLanguageClass: "foreign",
+              resolvedSettingsSnapshot: preview.snapshot,
+              outputEstimatedBytes: 150_000_000,
+            })),
+          },
+        });
+      }
+      if (path.endsWith("/exports") && request.method() === "POST") {
+        batchExportPostCount += 1;
+        const body = request.postDataJSON();
+        return route.fulfill({
+          status: 201,
+          json: {
+            kind: "batch",
+            batch: batchResponse({
+              items: body.clipIds.map((clipId: string) => ({ clipId })),
+            }),
+          },
+        });
+      }
+      const pageClips =
         projectId === createdProjectId && loggedClip
-          ? [
-              {
-                clip: loggedClip,
-                currentLeaves: [],
-                hasMoreLeaves: false,
-                completedVersionCount: 0,
-                recentArtifactVersions: [],
-              },
-            ]
+          ? batchFixtureEnabled
+            ? [
+                loggedClip,
+                {
+                  ...loggedClip,
+                  id: "019fbb95-cd76-7920-93fa-e23ba755eeb2",
+                  catalogVideoId: "019fbb95-cd76-7920-93fa-e23ba755eeb3",
+                  video: {
+                    ...(loggedClip.video as Record<string, unknown>),
+                    title: "Second batch sibling",
+                  },
+                },
+              ]
+            : [loggedClip]
           : [];
+      const entries = pageClips.map((clip) => ({
+        clip,
+        currentLeaves: [],
+        hasMoreLeaves: false,
+        completedVersionCount: 0,
+        recentArtifactVersions: [],
+      }));
       return route.fulfill({
         json: {
           projectId,
@@ -634,7 +703,9 @@ test("maps transcript text selection to stable source and export bounds", async 
           freshness: "fresh",
           cachedAt: now,
           cacheCoverage: "cached_subset",
-          selectedClipIds: [],
+          selectedClipIds: pageClips
+            .map((clip) => String(clip.id))
+            .filter((clipId) => clipLibrarySelected.has(clipId)),
           localAvailability: [],
         },
       });
@@ -949,21 +1020,22 @@ test("maps transcript text selection to stable source and export bounds", async 
     lastClipBody?.languageEvidence.preferred.trackId,
   );
   batchFixtureEnabled = true;
-  const batchPanel = page.getByTestId("export-batch-panel");
-  await batchPanel
-    .getByRole("button", { name: "Refresh eligible clips" })
-    .click();
-  await expect(batchPanel.locator('input[type="checkbox"]')).toHaveCount(2);
-  for (const checkbox of await batchPanel
-    .locator('input[type="checkbox"]')
-    .all()) {
+  await clipQueue.getByRole("button", { name: "Refresh" }).click();
+  const clipSelectors = clipQueue.locator(
+    '.clip-library-select input[type="checkbox"]',
+  );
+  await expect(clipSelectors).toHaveCount(2);
+  for (const checkbox of await clipSelectors.all()) {
     await checkbox.check();
   }
-  await batchPanel
-    .getByRole("button", { name: "Export 2 selected clips" })
-    .click();
-  await expect(batchPanel.getByTestId("export-batch-summary")).toContainText(
-    "2 active",
+  await clipQueue.getByRole("button", { name: "Preflight 2 clips" }).click();
+  await expect(clipQueue).toContainText(
+    "Source sizes are unavailable until acquisition",
+  );
+  await clipQueue.getByLabel(/Continue with unknown source sizes/u).check();
+  await clipQueue.getByRole("button", { name: "Submit durable batch" }).click();
+  await expect(clipQueue).toContainText(
+    "Queued 2 independent export requests.",
   );
   expect(batchExportPostCount).toBe(1);
   await clipQueue.getByLabel("Filter tag").selectOption("");

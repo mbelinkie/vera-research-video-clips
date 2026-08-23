@@ -48,6 +48,7 @@ import {
   StartLoggedExportExecutionRequestSchema,
   StartLoggedExportExecutionResponseSchema,
   ExportSettingsSchema,
+  ResolvedExportSettingsSnapshotSchema,
   ExportWorkerCompatibilityRequestSchema,
   HeartbeatExportWorkerRequestSchema,
   RegisterExportWorkerRequestSchema,
@@ -2754,6 +2755,15 @@ export class SharedProjectCatalog {
                 ...(leaf.batch_item_id
                   ? { batchItemId: leaf.batch_item_id }
                   : {}),
+                ...(leaf.batch_id ? { batchId: leaf.batch_id } : {}),
+                ...(leaf.resolved_settings_snapshot
+                  ? {
+                      resolvedSettingsSnapshot:
+                        ResolvedExportSettingsSnapshotSchema.parse(
+                          leaf.resolved_settings_snapshot,
+                        ),
+                    }
+                  : {}),
                 ...(leaf.execution_id
                   ? {
                       progress: mapLoggedExportProgress({
@@ -2980,16 +2990,66 @@ export class SharedProjectCatalog {
     await this.authorize(actor, projectId, "write");
     const clip = await this.getClipCandidate(actor, projectId, clipId);
     const idempotencyKey = `clip-export:${clipId}:${input.idempotencyKey}`;
+    const adoptCompatibleReplay = (row: DbRow) => {
+      const persisted = mapLoggedExportRequest(row);
+      const persistedFingerprint =
+        persisted.resolvedSettingsSnapshot?.resolutionFingerprint;
+      const divergent =
+        persisted.clipId !== clipId ||
+        persisted.sourceLanguageClass !== input.sourceLanguageClass ||
+        sha256Fingerprint(persisted.subtitleTracks ?? null) !==
+          sha256Fingerprint(input.subtitleTracks ?? null) ||
+        (input.expectedResolutionFingerprint !== undefined &&
+          persistedFingerprint !== input.expectedResolutionFingerprint) ||
+        (input.preset !== undefined &&
+          sha256Fingerprint(persisted.preset) !==
+            sha256Fingerprint(input.preset));
+      if (divergent) {
+        throw new CatalogIdempotencyConflictError(
+          "This clip export command identity already belongs to different source, subtitle, or settings evidence.",
+        );
+      }
+      return persisted;
+    };
     const existing = await this.database.query<DbRow>(
       `${loggedExportRequestSelect}
        WHERE j.idempotency_key = $1 AND er.project_id = $2`,
       [idempotencyKey, projectId],
     );
-    if (existing.rows[0]) return mapLoggedExportRequest(existing.rows[0]);
+    if (existing.rows[0]) {
+      return adoptCompatibleReplay(existing.rows[0]);
+    }
     const requestId = randomUUID();
+    let resolvedRequestId: string = requestId;
     const jobId = randomUUID();
     const now = this.now().toISOString();
     await this.transaction(async () => {
+      const lockedClip = await this.database.query<{ export_status: string }>(
+        `SELECT export_status FROM clip_candidates
+         WHERE id = $1 AND project_id = $2
+         FOR UPDATE`,
+        [clipId, projectId],
+      );
+      if (!lockedClip.rows[0]) {
+        throw new CatalogNotFoundError("Clip candidate not found.");
+      }
+      const racedReplay = await this.database.query<DbRow>(
+        `${loggedExportRequestSelect}
+         WHERE j.idempotency_key = $1 AND er.project_id = $2`,
+        [idempotencyKey, projectId],
+      );
+      if (racedReplay.rows[0]) {
+        resolvedRequestId = adoptCompatibleReplay(racedReplay.rows[0]).id;
+        return;
+      }
+      if (
+        input.requestOrigin === "clip_library" &&
+        lockedClip.rows[0].export_status !== "not_requested"
+      ) {
+        throw new CatalogConflictError(
+          "A new Clip Library export requires a not-requested clip; recover the existing request instead.",
+        );
+      }
       const batchMembership = await this.database.query(
         `SELECT 1 FROM export_requests
          WHERE project_id = $1 AND clip_id = $2
@@ -3105,7 +3165,7 @@ export class SharedProjectCatalog {
         ],
       );
     });
-    return this.getLoggedExportRequest(actor, projectId, requestId);
+    return this.getLoggedExportRequest(actor, projectId, resolvedRequestId);
   }
 
   async createLoggedExportBatch(
@@ -5848,12 +5908,14 @@ export class SharedProjectCatalog {
 
   private loadClipLibraryLeaves(projectId: string, clipId: string) {
     return this.database.query<DbRow>(
-      `SELECT request.*, job.state,
+      `SELECT request.*, job.state, batch_item.batch_id,
               progress.execution_id, progress.export_request_id,
               progress.attempt, progress.sequence, progress.stage,
               progress.basis_points, progress.updated_at AS progress_updated_at
        FROM export_requests request
        JOIN jobs job ON job.id = request.job_id
+       LEFT JOIN logged_export_batch_items batch_item
+         ON batch_item.id = request.batch_item_id
        LEFT JOIN logged_export_execution_progress progress
          ON progress.export_request_id = request.id
        WHERE request.project_id = $1 AND request.clip_id = $2

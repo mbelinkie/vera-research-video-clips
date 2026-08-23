@@ -1,12 +1,18 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import {
+  ApiErrorSchema,
+  ClipLibraryExportSubmissionSchema,
   ClipCandidateSchema,
   ClipTagNameSchema,
+  ExportStoragePreflightSchema,
   LocalClipLibrarySelectionSchema,
   LocalClipLibraryPageSchema,
+  ProjectExportPresetCatalogSchema,
   type ClipCandidate,
   type ClipLibraryEntry,
+  type ExportSettingsSelection,
+  type ExportStoragePreflight,
   type LocalClipLibraryPage,
 } from "@research-video/contracts";
 
@@ -43,6 +49,17 @@ export function ClipQueue({
   const [tagsText, setTagsText] = useState("");
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("Loading project Clip Library…");
+  const [settingsSelection, setSettingsSelection] =
+    useState<ExportSettingsSelection>({
+      base: "context_default",
+      overrides: {},
+    });
+  const [presetOptions, setPresetOptions] = useState<
+    Array<{ key: string; label: string; selection: ExportSettingsSelection }>
+  >([]);
+  const [presetKey, setPresetKey] = useState("context_default");
+  const [preflight, setPreflight] = useState<ExportStoragePreflight>();
+  const [confirmUnknownSources, setConfirmUnknownSources] = useState(false);
   const requestGeneration = useRef(0);
 
   function pagePath(
@@ -144,6 +161,50 @@ export function ClipQueue({
             }
           })
           .catch(() => undefined);
+        void request(`/api/projects/${projectId}/export-presets`)
+          .then((payload) => {
+            if (generation !== requestGeneration.current) return;
+            const catalog = ProjectExportPresetCatalogSchema.parse(payload);
+            setPresetOptions([
+              {
+                key: "context_default",
+                label: "Project default",
+                selection: { base: "context_default", overrides: {} },
+              },
+              {
+                key: "application_default",
+                label: "Editing MP4",
+                selection: { base: "application_default", overrides: {} },
+              },
+              ...catalog.projectPresets.map((preset) => ({
+                key: `project:${preset.id}:${preset.currentVersion}`,
+                label: `${preset.current.name} (project v${preset.currentVersion})`,
+                selection: {
+                  base: "context_default" as const,
+                  selectedPreset: {
+                    scope: "project" as const,
+                    presetId: preset.id,
+                    presetVersion: preset.currentVersion,
+                  },
+                  overrides: {},
+                },
+              })),
+              ...catalog.personalPresets.map((preset) => ({
+                key: `personal:${preset.id}:${preset.currentVersion}`,
+                label: `${preset.current.name} (personal v${preset.currentVersion})`,
+                selection: {
+                  base: "context_default" as const,
+                  selectedPreset: {
+                    scope: "personal" as const,
+                    presetId: preset.id,
+                    presetVersion: preset.currentVersion,
+                  },
+                  overrides: {},
+                },
+              })),
+            ]);
+          })
+          .catch(() => undefined);
       }
     } catch (error) {
       if (generation === requestGeneration.current) {
@@ -169,6 +230,10 @@ export function ClipQueue({
     setStatusFilter("all");
     setCompletedFilter("any");
     setAvailabilityFilter("all");
+    setPreflight(undefined);
+    setConfirmUnknownSources(false);
+    setPresetKey("context_default");
+    setSettingsSelection({ base: "context_default", overrides: {} });
     void reload(undefined, true, true);
     // Reads use the current in-memory credential and restart through the local
     // authorization-fingerprint cache only after the same credential returns.
@@ -266,6 +331,8 @@ export function ClipQueue({
     if (checked) next.add(clipId);
     else next.delete(clipId);
     setSelected(next);
+    setPreflight(undefined);
+    setConfirmUnknownSources(false);
     try {
       const response = await fetch(
         `/local-agent/api/projects/${projectId}/clip-library/selection`,
@@ -294,6 +361,150 @@ export function ClipQueue({
           error instanceof Error ? error.message : "Unable to save selection.",
         );
       }
+    }
+  }
+
+  async function prepareExport() {
+    if (page?.freshness !== "fresh" || !selected.size) return;
+    const generation = requestGeneration.current;
+    setBusy(true);
+    setPreflight(undefined);
+    setConfirmUnknownSources(false);
+    setMessage("Resolving immutable settings and measuring storage…");
+    try {
+      const response = await fetch(
+        `/local-agent/api/projects/${projectId}/clip-library/export-preflight`,
+        {
+          method: "POST",
+          headers: {
+            accept: "application/json",
+            authorization,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({
+            clipIds: [...selected].toSorted(),
+            settingsSelection,
+          }),
+        },
+      );
+      const payload: unknown = await response.json().catch(() => undefined);
+      if (!response.ok) throw apiError(payload, "Unable to preflight export.");
+      const prepared = ExportStoragePreflightSchema.parse(payload);
+      if (generation !== requestGeneration.current) return;
+      setPreflight(prepared);
+      setMessage(
+        prepared.decision === "insufficient"
+          ? "The known export requirement does not fit. No request was created."
+          : prepared.decision === "confirmation_required"
+            ? "Source sizes are unavailable until acquisition. Review and confirm before submitting."
+            : "Storage preflight passed. Review the immutable settings before submitting.",
+      );
+    } catch (error) {
+      if (generation === requestGeneration.current) {
+        setMessage(
+          error instanceof Error
+            ? error.message
+            : "Unable to preflight export.",
+        );
+      }
+    } finally {
+      if (generation === requestGeneration.current) setBusy(false);
+    }
+  }
+
+  async function submitExport() {
+    if (!preflight || page?.freshness !== "fresh") return;
+    const generation = requestGeneration.current;
+    setBusy(true);
+    setMessage("Submitting the durable export command…");
+    try {
+      const response = await fetch(
+        `/local-agent/api/projects/${projectId}/clip-library/exports`,
+        {
+          method: "POST",
+          headers: {
+            accept: "application/json",
+            authorization,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({
+            clipIds: [...selected].toSorted(),
+            settingsSelection,
+            expectedPreflightFingerprint: preflight.preflightFingerprint,
+            confirmUnknownSourceSizes: confirmUnknownSources,
+          }),
+        },
+      );
+      const payload: unknown = await response.json().catch(() => undefined);
+      if (!response.ok) throw apiError(payload, "Unable to submit export.");
+      const submitted = ClipLibraryExportSubmissionSchema.parse(payload);
+      if (generation !== requestGeneration.current) return;
+      const submittedMessage =
+        submitted.kind === "batch"
+          ? `Queued ${submitted.batch.summary.total} independent export requests.`
+          : "Queued one durable export request.";
+      setPreflight(undefined);
+      const reloadPromise = reload();
+      const reloadGeneration = requestGeneration.current;
+      await reloadPromise;
+      if (reloadGeneration === requestGeneration.current)
+        setMessage(submittedMessage);
+    } catch (error) {
+      if (generation === requestGeneration.current) {
+        const failureMessage =
+          error instanceof Error
+            ? `${error.message} The Clip Library was refreshed to recover any request committed before the response was lost.`
+            : "Unable to submit export.";
+        const reloadPromise = reload();
+        const reloadGeneration = requestGeneration.current;
+        await reloadPromise;
+        if (reloadGeneration === requestGeneration.current)
+          setMessage(failureMessage);
+      }
+    } finally {
+      if (generation === requestGeneration.current) setBusy(false);
+    }
+  }
+
+  async function mutateLeaf(requestId: string, action: "retry" | "cancel") {
+    if (page?.freshness !== "fresh") return;
+    const generation = requestGeneration.current;
+    setBusy(true);
+    try {
+      const response = await fetch(
+        `/cloud-api/api/projects/${projectId}/export-requests/${requestId}/${action}`,
+        {
+          method: "POST",
+          headers: {
+            accept: "application/json",
+            authorization,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({
+            idempotencyKey: `clip-library-${action}:${requestId}`,
+          }),
+        },
+      );
+      const payload: unknown = await response.json().catch(() => undefined);
+      if (!response.ok)
+        throw apiError(payload, `Unable to ${action} this export.`);
+      if (generation !== requestGeneration.current) return;
+      setMessage(
+        action === "retry"
+          ? "Created or recovered the immutable retry child."
+          : "Cancellation was requested without changing sibling exports.",
+      );
+      void reload();
+    } catch (error) {
+      if (generation === requestGeneration.current) {
+        setMessage(
+          error instanceof Error
+            ? error.message
+            : `Unable to ${action} export.`,
+        );
+      }
+    } finally {
+      if (generation === requestGeneration.current) setBusy(false);
     }
   }
 
@@ -427,6 +638,125 @@ export function ClipQueue({
           Apply cloud filters
         </button>
       </div>
+      <section className="clip-library-export" aria-label="Clip export">
+        <div className="section-heading">
+          <div>
+            <p className="eyebrow">Durable export</p>
+            <h4>Export selected clips</h4>
+          </div>
+        </div>
+        <label>
+          Conversion preset
+          <select
+            value={presetKey}
+            disabled={busy || page?.freshness !== "fresh"}
+            onChange={(event) => {
+              const option = presetOptions.find(
+                (candidate) => candidate.key === event.target.value,
+              );
+              if (!option) return;
+              setPresetKey(option.key);
+              setSettingsSelection(option.selection);
+              setPreflight(undefined);
+              setConfirmUnknownSources(false);
+            }}
+          >
+            {(presetOptions.length
+              ? presetOptions
+              : [
+                  {
+                    key: "context_default",
+                    label: "Project default",
+                    selection: settingsSelection,
+                  },
+                ]
+            ).map((option) => (
+              <option key={option.key} value={option.key}>
+                {option.label}
+              </option>
+            ))}
+          </select>
+        </label>
+        <div className="action-row">
+          <button
+            type="button"
+            disabled={
+              busy ||
+              page?.freshness !== "fresh" ||
+              selected.size < 1 ||
+              selected.size > 25
+            }
+            onClick={() => void prepareExport()}
+          >
+            Preflight {selected.size || "selected"} clip
+            {selected.size === 1 ? "" : "s"}
+          </button>
+        </div>
+        {preflight ? (
+          <div className="clip-library-preflight">
+            <p>
+              {formatBytes(preflight.availableBytes)} available ·{" "}
+              {formatBytes(preflight.outputEstimatedBytes)} estimated outputs ·{" "}
+              {formatBytes(preflight.promotionReserveBytes)} promotion copy ·{" "}
+              {formatBytes(preflight.activeCheckpointReserveBytes)} active
+              update/checkpoint reserve ·{" "}
+              {formatBytes(preflight.safetyReserveBytes)} safety margin
+            </p>
+            <p>
+              {preflight.uniqueSourceCount} compatible source
+              {preflight.uniqueSourceCount === 1 ? "" : "s"} on this workstation
+              · {preflight.unknownSourceCount} unknown before acquisition
+            </p>
+            <ul>
+              {preflight.items.map((item) => {
+                const clip = entries.find(
+                  (entry) => entry.clip.id === item.clipId,
+                )?.clip;
+                const settings = item.resolvedSettingsSnapshot.settings;
+                return (
+                  <li key={item.clipId}>
+                    {clip?.video.title ?? "Selected clip"}:{" "}
+                    {settings.videoCodec.toUpperCase()} /{" "}
+                    {settings.audioCodec.toUpperCase()} /{" "}
+                    {settings.container.toUpperCase()} ·{" "}
+                    {formatBytes(item.outputEstimatedBytes)} estimated ·
+                    fingerprint{" "}
+                    {item.resolvedSettingsSnapshot.resolutionFingerprint?.slice(
+                      0,
+                      12,
+                    )}
+                  </li>
+                );
+              })}
+            </ul>
+            {preflight.decision === "confirmation_required" ? (
+              <label className="export-checkbox">
+                <input
+                  type="checkbox"
+                  checked={confirmUnknownSources}
+                  onChange={(event) =>
+                    setConfirmUnknownSources(event.target.checked)
+                  }
+                />
+                Continue with unknown source sizes and recheck measured space
+                before rendering
+              </label>
+            ) : null}
+            <button
+              type="button"
+              disabled={
+                busy ||
+                preflight.decision === "insufficient" ||
+                (preflight.decision === "confirmation_required" &&
+                  !confirmUnknownSources)
+              }
+              onClick={() => void submitExport()}
+            >
+              Submit durable {preflight.items.length === 1 ? "export" : "batch"}
+            </button>
+          </div>
+        ) : null}
+      </section>
       <p className="form-message" role="status">
         {message ||
           `${visibleEntries.length} cached result${visibleEntries.length === 1 ? "" : "s"}; ${selected.size} selected.`}
@@ -473,6 +803,30 @@ export function ClipQueue({
                         {leaf.progress
                           ? ` · ${leaf.progress.stage.replaceAll("_", " ")} ${Math.floor(leaf.progress.basisPoints / 100)}%`
                           : ""}
+                        {leaf.state === "failed" ? (
+                          <button
+                            type="button"
+                            disabled={busy || page?.freshness !== "fresh"}
+                            onClick={() =>
+                              void mutateLeaf(leaf.requestId, "retry")
+                            }
+                          >
+                            Retry
+                          </button>
+                        ) : null}
+                        {["queued", "claimed", "processing"].includes(
+                          leaf.state,
+                        ) ? (
+                          <button
+                            type="button"
+                            disabled={busy || page?.freshness !== "fresh"}
+                            onClick={() =>
+                              void mutateLeaf(leaf.requestId, "cancel")
+                            }
+                          >
+                            Cancel
+                          </button>
+                        ) : null}
                       </span>
                     ))}
                     {entry.hasMoreLeaves ? (
@@ -614,4 +968,15 @@ function formatTime(milliseconds: number) {
   const minutes = Math.floor(totalSeconds / 60);
   const seconds = totalSeconds % 60;
   return `${minutes}:${String(seconds).padStart(2, "0")}`;
+}
+
+function formatBytes(bytes: number) {
+  if (bytes >= 1024 ** 3) return `${(bytes / 1024 ** 3).toFixed(1)} GiB`;
+  if (bytes >= 1024 ** 2) return `${(bytes / 1024 ** 2).toFixed(1)} MiB`;
+  return `${bytes.toLocaleString()} bytes`;
+}
+
+function apiError(payload: unknown, fallback: string) {
+  const parsed = ApiErrorSchema.safeParse(payload);
+  return new Error(parsed.success ? parsed.data.error.message : fallback);
 }

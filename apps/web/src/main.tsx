@@ -42,7 +42,6 @@ import multilingualFixture from "../../../tests/fixtures/transcripts/romanian-mu
 
 import "./styles.css";
 import { BatchWorkspace } from "./batch-workspace.tsx";
-import { ExportBatchPanel } from "./export-batch-panel.tsx";
 import { YouTubePlayer, type YouTubePlayerHandle } from "./youtube-player.tsx";
 import { VirtualTranscript } from "./virtual-transcript.tsx";
 
@@ -2123,7 +2122,6 @@ function App() {
         projectId={projectId}
         projects={projects}
       />
-      <ExportBatchPanel authorization={authorization} projectId={projectId} />
     </main>
   );
 }

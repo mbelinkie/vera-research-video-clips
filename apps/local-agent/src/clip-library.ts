@@ -136,6 +136,21 @@ export class LocalClipLibraryService {
     });
   }
 
+  purgeRevokedAuthorization(input: {
+    projectId: string;
+    authorization: string;
+    statusCode: number | undefined;
+  }): void {
+    const authorizationScopeSha256 = clipLibraryAuthorizationScope(
+      input.authorization,
+    );
+    if (input.statusCode === 401) {
+      this.cache.purgeAuthorizationScope(authorizationScopeSha256);
+    } else if (input.statusCode === 403) {
+      this.cache.purgeScope(input.projectId, authorizationScopeSha256);
+    }
+  }
+
   private decorate(
     query: ClipLibraryQuery,
     page: ClipLibraryPage,

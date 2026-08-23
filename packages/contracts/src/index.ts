@@ -2643,7 +2643,9 @@ export const ClipLibraryExportLeafSchema = z
     requestOrigin: ExportRequestOriginSchema.nullable(),
     retryOfRequestId: IdSchema.optional(),
     retryOrdinal: z.number().int().positive().optional(),
+    batchId: IdSchema.optional(),
     batchItemId: IdSchema.optional(),
+    resolvedSettingsSnapshot: ResolvedExportSettingsSnapshotSchema.optional(),
     progress: LoggedExportProgressSnapshotSchema.optional(),
     updatedAt: UtcTimestampSchema,
   })
@@ -2779,6 +2781,153 @@ export const UpdateLocalClipLibrarySelectionSchema = z
       });
     }
   });
+
+const StorageByteCountSchema = z
+  .number()
+  .int()
+  .nonnegative()
+  .max(Number.MAX_SAFE_INTEGER);
+export const ExportStorageSafetyReserveBytes = 2 * 1024 * 1024 * 1024;
+
+export const PrepareClipLibraryExportRequestSchema = z
+  .object({
+    clipIds: z.array(IdSchema).min(1).max(25),
+    settingsSelection: ExportSettingsSelectionSchema,
+  })
+  .strict()
+  .superRefine((request, context) => {
+    if (new Set(request.clipIds).size !== request.clipIds.length) {
+      context.addIssue({
+        code: "custom",
+        path: ["clipIds"],
+        message: "A Clip Library export can include each clip only once.",
+      });
+    }
+  });
+
+export const ExportStoragePreflightItemSchema = z
+  .object({
+    clipId: IdSchema,
+    sourceLanguageClass: ExportSourceLanguageClassSchema,
+    resolvedSettingsSnapshot: ResolvedExportSettingsSnapshotSchema,
+    outputEstimatedBytes: StorageByteCountSchema,
+  })
+  .strict();
+
+export const ExportStoragePreflightSchema = z
+  .object({
+    schemaVersion: z.literal(1),
+    projectId: IdSchema,
+    preflightFingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+    checkedAt: UtcTimestampSchema,
+    availableBytes: StorageByteCountSchema,
+    uniqueSourceCount: z.number().int().min(1).max(25),
+    sourceSharingAssurance: z.literal("same_worker_profile_only"),
+    knownSourceBytes: StorageByteCountSchema,
+    unknownSourceCount: z.number().int().nonnegative().max(25),
+    outputEstimatedBytes: StorageByteCountSchema,
+    promotionReserveBytes: StorageByteCountSchema,
+    activeCheckpointReserveBytes: StorageByteCountSchema,
+    safetyReserveBytes: z.literal(ExportStorageSafetyReserveBytes),
+    knownRequiredBytes: StorageByteCountSchema,
+    decision: z.enum(["ready", "confirmation_required", "insufficient"]),
+    items: z.array(ExportStoragePreflightItemSchema).min(1).max(25),
+  })
+  .strict()
+  .superRefine((preflight, context) => {
+    const outputTotal = preflight.items.reduce(
+      (sum, item) => sum + item.outputEstimatedBytes,
+      0,
+    );
+    const requiredTotal =
+      preflight.knownSourceBytes +
+      preflight.outputEstimatedBytes +
+      preflight.promotionReserveBytes +
+      preflight.activeCheckpointReserveBytes +
+      preflight.safetyReserveBytes;
+    if (
+      !Number.isSafeInteger(outputTotal) ||
+      !Number.isSafeInteger(requiredTotal)
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["knownRequiredBytes"],
+        message: "Storage component totals must remain safe integers.",
+      });
+    }
+    if (
+      preflight.unknownSourceCount > preflight.uniqueSourceCount ||
+      preflight.uniqueSourceCount > preflight.items.length
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["unknownSourceCount"],
+        message: "Source counts must fit the selected export items.",
+      });
+    }
+    if (
+      new Set(preflight.items.map((item) => item.clipId)).size !==
+      preflight.items.length
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["items"],
+        message: "Storage evidence can include each clip only once.",
+      });
+    }
+    if (outputTotal !== preflight.outputEstimatedBytes) {
+      context.addIssue({
+        code: "custom",
+        path: ["outputEstimatedBytes"],
+        message: "Output storage must equal the sum of per-clip estimates.",
+      });
+    }
+    if (preflight.promotionReserveBytes !== preflight.outputEstimatedBytes) {
+      context.addIssue({
+        code: "custom",
+        path: ["promotionReserveBytes"],
+        message:
+          "Promotion storage must reserve a second copy of every estimated output package.",
+      });
+    }
+    if (requiredTotal !== preflight.knownRequiredBytes) {
+      context.addIssue({
+        code: "custom",
+        path: ["knownRequiredBytes"],
+        message:
+          "Known storage must include sources, staged outputs, promotion copies, active reserve, and safety reserve.",
+      });
+    }
+    const expectedDecision =
+      preflight.availableBytes < preflight.knownRequiredBytes
+        ? "insufficient"
+        : preflight.unknownSourceCount > 0
+          ? "confirmation_required"
+          : "ready";
+    if (preflight.decision !== expectedDecision) {
+      context.addIssue({
+        code: "custom",
+        path: ["decision"],
+        message:
+          "Storage decision does not match the available and required byte evidence.",
+      });
+    }
+  });
+
+export const SubmitClipLibraryExportRequestSchema =
+  PrepareClipLibraryExportRequestSchema.safeExtend({
+    expectedPreflightFingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+    confirmUnknownSourceSizes: z.boolean().default(false),
+  });
+
+export const ClipLibraryExportSubmissionSchema = z.discriminatedUnion("kind", [
+  z
+    .object({ kind: z.literal("individual"), request: ExportRequestSchema })
+    .strict(),
+  z
+    .object({ kind: z.literal("batch"), batch: LoggedExportBatchSchema })
+    .strict(),
+]);
 
 export function sanitizeLoggedExportFailureCode(value: string): string {
   const sanitized = value
@@ -3348,6 +3497,21 @@ export type LocalClipLibrarySelection = z.infer<
 >;
 export type UpdateLocalClipLibrarySelection = z.infer<
   typeof UpdateLocalClipLibrarySelectionSchema
+>;
+export type PrepareClipLibraryExportRequest = z.infer<
+  typeof PrepareClipLibraryExportRequestSchema
+>;
+export type ExportStoragePreflightItem = z.infer<
+  typeof ExportStoragePreflightItemSchema
+>;
+export type ExportStoragePreflight = z.infer<
+  typeof ExportStoragePreflightSchema
+>;
+export type SubmitClipLibraryExportRequest = z.infer<
+  typeof SubmitClipLibraryExportRequestSchema
+>;
+export type ClipLibraryExportSubmission = z.infer<
+  typeof ClipLibraryExportSubmissionSchema
 >;
 export type LoggedExportFailureResult = z.infer<
   typeof LoggedExportFailureResultSchema
