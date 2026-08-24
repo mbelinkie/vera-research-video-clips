@@ -45,12 +45,13 @@ export async function pumpJobQueueOnce(
 ): Promise<void> {
   const jobs = await catalog.listUndispatchedTranscriptionJobs();
   for (const job of jobs) {
+    const reserved = await catalog.markTranscriptionJobDispatched(job.jobId);
+    if (!reserved) continue;
     await queue.publish({
       schemaVersion: 1,
       jobId: job.jobId,
       executionLocation: job.executionLocation,
     });
-    await catalog.markTranscriptionJobDispatched(job.jobId);
   }
   const delivery = await queue.receive(30);
   if (!delivery) return;

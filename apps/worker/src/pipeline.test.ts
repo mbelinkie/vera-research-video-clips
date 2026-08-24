@@ -28,6 +28,7 @@ import {
   type ClaimedTranslationClient,
   type TranscriptPublicationClient,
 } from "./pipeline.ts";
+import type { TranscriptionExecutionContext } from "./worker.ts";
 
 const temporaryDirectories = new Set<string>();
 
@@ -189,6 +190,25 @@ function publicationFixture() {
   return { client, uploaded, finalize };
 }
 
+function executionContext(
+  overrides: Partial<TranscriptionExecutionContext> = {},
+): TranscriptionExecutionContext {
+  return {
+    signal: new AbortController().signal,
+    setStage: async () => undefined,
+    recordSourcePlan: async () => undefined,
+    observeLanguageEvidence: async (request) => ({
+      evidence: request.evidence,
+      gate: {
+        state: "ready",
+        status: "confirmed",
+        remediationReason: "none",
+      },
+    }),
+    ...overrides,
+  };
+}
+
 describe("transcript pipeline", () => {
   it("uploads and pins original evidence before requesting claimed cloud translation", async () => {
     const scratchRoot = await mkdtemp(join(tmpdir(), "pipeline-"));
@@ -276,11 +296,7 @@ describe("transcript pipeline", () => {
       claimedTranslation: { translate },
     });
 
-    await executor(claimed, {
-      signal: new AbortController().signal,
-      setStage: async () => undefined,
-      recordSourcePlan: async () => undefined,
-    });
+    await executor(claimed, executionContext());
 
     expect(translate).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -344,14 +360,26 @@ describe("transcript pipeline", () => {
       },
     });
     const claimed = claimedJob();
+    const unverifiedDecision = {
+      ...languageDecision("es", 6),
+      status: "unverified" as const,
+      basis: "creator_metadata" as const,
+    };
+    claimed.job.payload = {
+      ...claimed.job.payload,
+      creatorReportedLanguage: "es",
+      languageDecision: unverifiedDecision,
+    };
     const plans: unknown[] = [];
     const stages: string[] = [];
 
-    await executor(claimed, {
-      signal: new AbortController().signal,
-      setStage: async (stage) => void stages.push(stage),
-      recordSourcePlan: async (plan) => void plans.push(plan),
-    });
+    await executor(
+      claimed,
+      executionContext({
+        setStage: async (stage) => void stages.push(stage),
+        recordSourcePlan: async (plan) => void plans.push(plan),
+      }),
+    );
 
     expect(media.acquireAuthorizedSource).not.toHaveBeenCalled();
     expect(speechToText.transcribe).not.toHaveBeenCalled();
@@ -376,6 +404,10 @@ describe("transcript pipeline", () => {
     ).toContain("00:00:00,500 --> 00:00:02,500\nThis is a short example.");
     expect(await readdir(scratchRoot)).toEqual([]);
     expect(publication.finalize).toHaveBeenCalledOnce();
+    expect(
+      JSON.parse(new TextDecoder().decode(publication.uploaded.get("manifest")))
+        .languageDecision,
+    ).toEqual(unverifiedDecision);
   });
 
   it("falls back from failed caption acquisition to ASR and cleans scratch", async () => {
@@ -422,17 +454,34 @@ describe("transcript pipeline", () => {
           };
         },
       },
-      speechToText: { transcribe: speechToText },
+      speechToText: {
+        checkLanguageSupport: () => ({
+          state: "supported",
+          provider: "fixture-asr",
+          operation: "speech_to_text",
+          sourceLanguage: "en",
+          version: "fixture-v1",
+        }),
+        transcribe: speechToText,
+      },
     });
     const plans: Array<{ reason?: string }> = [];
+    const claimed = claimedJob();
+    claimed.job.payload = {
+      ...claimed.job.payload,
+      languageDecision: languageDecision("en", 1),
+    };
 
-    await executor(claimedJob(), {
-      signal: new AbortController().signal,
-      setStage: async () => undefined,
-      recordSourcePlan: async (plan) => void plans.push(plan),
-    });
+    await executor(
+      claimed,
+      executionContext({
+        recordSourcePlan: async (plan) => void plans.push(plan),
+      }),
+    );
 
-    expect(plans).toMatchObject([{ reason: "caption-acquisition-failed" }]);
+    expect(plans).toContainEqual(
+      expect.objectContaining({ reason: "caption-acquisition-failed" }),
+    );
     expect(speechToText).toHaveBeenCalledOnce();
     expect([...publication.uploaded.keys()].sort()).toEqual([
       "english-normalized",
@@ -441,4 +490,311 @@ describe("transcript pipeline", () => {
     ]);
     expect(await readdir(scratchRoot)).toEqual([]);
   });
+
+  it("observes conflicting Korean automatic caption evidence before any provider work", async () => {
+    const scratchRoot = await mkdtemp(join(tmpdir(), "pipeline-"));
+    temporaryDirectories.add(scratchRoot);
+    const publication = publicationFixture();
+    const acquire = vi.fn();
+    const media = { acquireAuthorizedSource: vi.fn() };
+    const transcribe = vi.fn();
+    const translate = vi.fn();
+    const claimed = claimedJob();
+    claimed.job.payload = {
+      ...claimed.job.payload,
+      languageDecision: languageDecision("dz", 1),
+    };
+    const observeLanguageEvidence = vi.fn(async (request) => ({
+      evidence: request.evidence,
+      gate: {
+        state: "needs_language_confirmation" as const,
+        status: "conflict" as const,
+        providerEvidence: request.evidence,
+        remediationReason: "resolve_conflict" as const,
+      },
+    }));
+    const executor = createTranscriptPipelineExecutor({
+      scratchRoot,
+      publication: publication.client,
+      captions: {
+        discover: vi.fn(async () => [automaticCaption("ko")]),
+        acquire,
+      },
+      media,
+      speechToText: { transcribe },
+      translation: { translate },
+    });
+
+    await expect(
+      executor(claimed, executionContext({ observeLanguageEvidence })),
+    ).rejects.toMatchObject({ code: "language_gate_actionable" });
+
+    expect(observeLanguageEvidence).toHaveBeenCalledOnce();
+    expect(observeLanguageEvidence).toHaveBeenCalledWith(
+      expect.objectContaining({
+        attempt: claimed.lease.attempt,
+        evidence: expect.objectContaining({
+          source: "caption",
+          provider: "caption-discovery",
+          reportedLanguage: "ko",
+          captionKind: "automatic",
+          trackFingerprint: expect.stringMatching(/^[a-f0-9]{64}$/),
+        }),
+      }),
+    );
+    expect(acquire).not.toHaveBeenCalled();
+    expect(media.acquireAuthorizedSource).not.toHaveBeenCalled();
+    expect(transcribe).not.toHaveBeenCalled();
+    expect(translate).not.toHaveBeenCalled();
+    expect(publication.finalize).not.toHaveBeenCalled();
+    expect(publication.uploaded).toEqual(new Map());
+  });
+
+  it("blocks unsupported confirmed speech before media acquisition", async () => {
+    const scratchRoot = await mkdtemp(join(tmpdir(), "pipeline-"));
+    temporaryDirectories.add(scratchRoot);
+    const publication = publicationFixture();
+    const media = { acquireAuthorizedSource: vi.fn() };
+    const transcribe = vi.fn();
+    const claimed = claimedJob();
+    claimed.job.payload = {
+      ...claimed.job.payload,
+      sourcePolicy: "force-generate",
+      languageDecision: languageDecision("dz", 2),
+    };
+    const observeLanguageEvidence = vi.fn(async (request) => ({
+      evidence: request.evidence,
+      gate: {
+        state: "needs_transcript" as const,
+        status: "confirmed" as const,
+        speechCapability: request.speechCapability,
+        remediationReason: "select_supported_provider" as const,
+      },
+    }));
+    const executor = createTranscriptPipelineExecutor({
+      scratchRoot,
+      publication: publication.client,
+      media,
+      speechToText: {
+        checkLanguageSupport: () => ({
+          state: "unsupported",
+          provider: "fixture-speech",
+          operation: "speech_to_text",
+          sourceLanguage: "dz",
+          reason: "language_not_supported",
+        }),
+        transcribe,
+      },
+    });
+
+    await expect(
+      executor(claimed, executionContext({ observeLanguageEvidence })),
+    ).rejects.toMatchObject({ code: "language_gate_actionable" });
+
+    expect(observeLanguageEvidence).toHaveBeenCalledWith(
+      expect.objectContaining({
+        speechCapability: expect.objectContaining({ state: "unsupported" }),
+      }),
+    );
+    expect(media.acquireAuthorizedSource).not.toHaveBeenCalled();
+    expect(transcribe).not.toHaveBeenCalled();
+    expect(publication.finalize).not.toHaveBeenCalled();
+  });
+
+  it("blocks speech acquisition when no language decision is snapshotted", async () => {
+    const scratchRoot = await mkdtemp(join(tmpdir(), "pipeline-"));
+    temporaryDirectories.add(scratchRoot);
+    const publication = publicationFixture();
+    const media = { acquireAuthorizedSource: vi.fn() };
+    const transcribe = vi.fn();
+    const claimed = claimedJob();
+    claimed.job.payload = {
+      ...claimed.job.payload,
+      sourcePolicy: "force-generate",
+    };
+    const observeLanguageEvidence = vi.fn(async (request) => ({
+      evidence: request.evidence,
+      gate: {
+        state: "needs_language_confirmation" as const,
+        status: "unknown" as const,
+        remediationReason: "confirm_language" as const,
+      },
+    }));
+    const executor = createTranscriptPipelineExecutor({
+      scratchRoot,
+      publication: publication.client,
+      media,
+      speechToText: { transcribe },
+    });
+
+    await expect(
+      executor(claimed, executionContext({ observeLanguageEvidence })),
+    ).rejects.toMatchObject({ code: "language_gate_actionable" });
+
+    expect(observeLanguageEvidence).toHaveBeenCalledWith(
+      expect.objectContaining({
+        evidence: expect.objectContaining({
+          source: "speech_detection",
+          provider: "speech-to-text",
+        }),
+      }),
+    );
+    expect(media.acquireAuthorizedSource).not.toHaveBeenCalled();
+    expect(transcribe).not.toHaveBeenCalled();
+    expect(publication.finalize).not.toHaveBeenCalled();
+  });
+
+  it("blocks unsupported confirmed translation before caption acquisition", async () => {
+    const scratchRoot = await mkdtemp(join(tmpdir(), "pipeline-"));
+    temporaryDirectories.add(scratchRoot);
+    const publication = publicationFixture();
+    const acquire = vi.fn();
+    const claimed = claimedJob();
+    claimed.job.payload = {
+      ...claimed.job.payload,
+      languageDecision: languageDecision("dz", 3),
+    };
+    const observeLanguageEvidence = vi.fn(async (request) => ({
+      evidence: request.evidence,
+      gate: {
+        state: "needs_translation" as const,
+        status: "confirmed" as const,
+        translationCapability: request.translationCapability,
+        remediationReason: "select_supported_provider" as const,
+      },
+    }));
+    const executor = createTranscriptPipelineExecutor({
+      scratchRoot,
+      publication: publication.client,
+      captions: { discover: async () => [automaticCaption("dz")], acquire },
+      media: { acquireAuthorizedSource: vi.fn() },
+      speechToText: { transcribe: vi.fn() },
+      translation: {
+        checkLanguagePair: () => ({
+          state: "unsupported",
+          provider: "fixture-translation",
+          operation: "translation",
+          sourceLanguage: "dz",
+          targetLanguage: "en",
+          reason: "language_not_supported",
+        }),
+        translate: vi.fn(),
+      },
+    });
+
+    await expect(
+      executor(claimed, executionContext({ observeLanguageEvidence })),
+    ).rejects.toMatchObject({ code: "language_gate_actionable" });
+    expect(observeLanguageEvidence).toHaveBeenCalledWith(
+      expect.objectContaining({
+        translationCapability: expect.objectContaining({
+          state: "unsupported",
+          sourceLanguage: "dz",
+          targetLanguage: "en",
+        }),
+      }),
+    );
+    expect(acquire).not.toHaveBeenCalled();
+    expect(publication.finalize).not.toHaveBeenCalled();
+  });
+
+  it("passes a supported confirmed hint and persists the exact claimed decision", async () => {
+    const scratchRoot = await mkdtemp(join(tmpdir(), "pipeline-"));
+    temporaryDirectories.add(scratchRoot);
+    const publication = publicationFixture();
+    const claimed = claimedJob();
+    const snapshot = languageDecision("ko", 4);
+    claimed.job.payload = {
+      ...claimed.job.payload,
+      sourcePolicy: "force-generate",
+      languageDecision: snapshot,
+    };
+    const transcribe = vi.fn(async () =>
+      normalizeGeneratedTranscript({
+        videoId: "M7lc1UVf-VE",
+        language: "ko",
+        provider: "fixture-speech",
+        model: "fixture-model",
+        segments: [{ startMs: 0, endMs: 1_000, text: "한국어" }],
+      }),
+    );
+    const executor = createTranscriptPipelineExecutor({
+      scratchRoot,
+      publication: publication.client,
+      media: {
+        acquireAuthorizedSource: async (videoId, scratch) => {
+          const scratchPath = join(scratch, "audio.flac");
+          await writeFile(scratchPath, "fixture audio");
+          return {
+            videoId,
+            scratchPath,
+            byteSize: 13,
+            format: "flac",
+            provider: "fixture",
+            contentSha256: "0".repeat(64),
+          };
+        },
+      },
+      speechToText: {
+        checkLanguageSupport: () => ({
+          state: "supported",
+          provider: "fixture-speech",
+          operation: "speech_to_text",
+          sourceLanguage: "ko",
+          version: "fixture-v1",
+        }),
+        transcribe,
+      },
+      translation: {
+        checkLanguagePair: () => ({
+          state: "supported",
+          provider: "fixture-translation",
+          operation: "translation",
+          sourceLanguage: "ko",
+          targetLanguage: "en",
+          version: "fixture-v1",
+        }),
+        translate: async (input) => ({
+          provider: "fixture-translation",
+          segments: input.segments.map((segment) => ({
+            sourceSegmentId: segment.id,
+            text: "Korean example.",
+          })),
+        }),
+      },
+    });
+
+    await executor(claimed, executionContext());
+
+    expect(transcribe).toHaveBeenCalledWith(
+      expect.objectContaining({ language: "ko" }),
+    );
+    const manifest = JSON.parse(
+      new TextDecoder().decode(publication.uploaded.get("manifest")),
+    );
+    expect(manifest.languageDecision).toEqual(snapshot);
+    const laterDecision = languageDecision("en", 5);
+    expect(manifest.languageDecision).not.toEqual(laterDecision);
+  });
 });
+
+function automaticCaption(language: string) {
+  return {
+    id: `fixture:auto:${language}`,
+    language,
+    kind: "automatic" as const,
+    translatable: false,
+    downloadAccess: "available" as const,
+  };
+}
+
+function languageDecision(language: string, decisionVersion: number) {
+  return {
+    schemaVersion: 1 as const,
+    decisionId: `00000000-0000-4000-8000-${String(decisionVersion).padStart(12, "0")}`,
+    decisionVersion,
+    status: "confirmed" as const,
+    basis: "user_confirmation" as const,
+    resolvedLanguage: language,
+  };
+}

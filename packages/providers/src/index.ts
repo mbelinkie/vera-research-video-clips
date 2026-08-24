@@ -1,7 +1,11 @@
 import {
   TranscriptSourcePlanSchema,
+  languagesEquivalent,
+  normalizeLanguageTag,
   type BatchSourcePolicy,
   type CaptionTrackCandidate,
+  type LanguageCapabilityResult,
+  type LanguageDecisionSnapshot,
   type NormalizedTranscript,
   type TranscriptSourcePlan,
 } from "@research-video/contracts";
@@ -211,6 +215,11 @@ function generatedPlan(
 }
 
 export interface SpeechToTextProvider {
+  /**
+   * Answers only from the adapter's pinned capability metadata.  Implementations
+   * must not acquire media or start a recognition command for this preflight.
+   */
+  checkLanguageSupport?(language: string): LanguageCapabilityResult;
   transcribe(input: {
     videoId: string;
     inputPath: string;
@@ -233,7 +242,93 @@ export type TranslationResult = {
 };
 
 export interface TranslationProvider {
+  /**
+   * Answers only from the adapter's pinned capability metadata.  Implementations
+   * must not send transcript text to a remote translation provider here.
+   */
+  checkLanguagePair?(
+    sourceLanguage: string,
+    targetLanguage: string,
+  ): LanguageCapabilityResult;
   translate(input: TranslationRequest): Promise<TranslationResult>;
+}
+
+/**
+ * Provider-reported caption language is evidence, not a label callers may
+ * overwrite. This pure gate preserves the selected candidate exactly when it
+ * is usable and rejects conflicting evidence before caption acquisition.
+ */
+export type CaptionLanguageGateInput = {
+  track: CaptionTrackCandidate;
+  creatorLanguage?: string;
+  confirmedDecision?: LanguageDecisionSnapshot;
+};
+
+export type CaptionLanguageGateResult =
+  | {
+      state: "accepted";
+      track: CaptionTrackCandidate;
+      providerLanguage: string;
+      resolvedLanguage: string;
+    }
+  | {
+      state: "conflict";
+      track: CaptionTrackCandidate;
+      providerLanguage: string;
+      creatorLanguage?: string;
+      confirmedLanguage?: string;
+      reason:
+        | "provider_creator_language_conflict"
+        | "provider_confirmed_language_conflict";
+    };
+
+export function gateCaptionLanguage(
+  input: CaptionLanguageGateInput,
+): CaptionLanguageGateResult {
+  const providerLanguage = normalizeLanguageTag(input.track.language);
+  const creatorLanguage = input.creatorLanguage
+    ? normalizeLanguageTag(input.creatorLanguage)
+    : undefined;
+  const confirmedLanguage =
+    input.confirmedDecision?.status === "confirmed" &&
+    input.confirmedDecision.resolvedLanguage
+      ? normalizeLanguageTag(input.confirmedDecision.resolvedLanguage)
+      : undefined;
+
+  if (
+    confirmedLanguage &&
+    !languagesEquivalent(providerLanguage, confirmedLanguage)
+  ) {
+    return {
+      state: "conflict",
+      track: input.track,
+      providerLanguage,
+      ...(creatorLanguage ? { creatorLanguage } : {}),
+      confirmedLanguage,
+      reason: "provider_confirmed_language_conflict",
+    };
+  }
+  if (
+    !confirmedLanguage &&
+    creatorLanguage &&
+    !languagesEquivalent(providerLanguage, creatorLanguage)
+  ) {
+    return {
+      state: "conflict",
+      track: input.track,
+      providerLanguage,
+      creatorLanguage,
+      ...(confirmedLanguage ? { confirmedLanguage } : {}),
+      reason: "provider_creator_language_conflict",
+    };
+  }
+
+  return {
+    state: "accepted",
+    track: input.track,
+    providerLanguage,
+    resolvedLanguage: confirmedLanguage ?? creatorLanguage ?? providerLanguage,
+  };
 }
 
 export async function translateCanonicalTranscript(

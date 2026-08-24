@@ -607,13 +607,82 @@ infra/aws        storage, API, database, queues, identity, monitoring
 
 ## Next action
 
-Milestones 1–6 and M7-04 are complete. M7-01's real AWS change-set and Cognito
-acceptance remain an explicit external prerequisite. The next unstarted local
-implementation slice is M7-05 complete export integration, and it must begin
-with its own bounded active specification. After M7-05 and its deterministic
-packaged-app regression establish a known-good baseline, follow the priority and
-dependency waves in `specs/future/PILOT-punch-list.md`; do not wait for externally
-gated M7-06 live dogfood before beginning bounded PUNCH-001 through PUNCH-008
-work. M7-06 remains the final M7 validation stream when its required external
+Milestones 1–6, M7-04, and the deterministic M7-05 export baseline are complete.
+M7-01's real AWS change-set and Cognito acceptance remain an explicit external
+prerequisite. PUNCH-001 completed on 2026-08-24: versioned language decisions,
+conflict/capability gates, strict immutable timed bilingual import, bounded
+side-by-side review, explicit activation, two-workstation verified-cache reuse,
+and corrected clip/export provenance are implemented and verified. PUNCH-006
+slice 1 also completed on 2026-08-24: the workspace now has bounded typed
+shell/ingest, transcript, player, selection, command, batch/worklist, and Clip
+Library seams behind unchanged browser behavior. PUNCH-003 slice 1 completed on
+2026-08-24: stable normalized handles, explicit project kind/visibility,
+Owner/Administrator/Researcher authority, safe Editor/Viewer migration,
+membership-bounded summaries, concurrent collision/replay behavior, and the
+correct one-Owner migration constraint are implemented and verified. PUNCH-004
+slice 1 completed on 2026-08-24: direct and bulk ingest now converge on one
+canonical project-video row with independent durable member flags, safe replay
+and restore, bounded authorized flagger/processing/transcript/clip aggregates,
+optimistic own-flag commands, migration backfill, and a real Workbench read
+surface independent of transcription batch-item identity. PUNCH-004 slice 2
+also completed on 2026-08-24: renewable soft claims, explicit audited takeover,
+independent priority and Administrator-only completion policy, append-only
+review cycles, transcript/no-transcript completion basis, reasoned reopen,
+transactional role checks, exact replay, and concurrent completion now flow
+through the real canonical Workbench routes without changing processing or
+flags. PUNCH-004 slice 3 completed on 2026-08-24: optimistic individual/bulk
+dismissal and restore preserve every research record, Queue/Reviewed/Dismissed
+reads stay independent, queued/active transcription cancellation is
+dependency-aware and heartbeat-rechecked, and safe per-user review/triage
+receipts drive `New for you`, bounded activity, and idempotent mark-seen in the
+real Workbench. Migration 0030 backfills Active without fabricated history and
+current reads hide removed-member identities while retaining durable audit.
+PUNCH-004 slice 4 completed on 2026-08-24: hosted batches persist an independent
+Pending/Approved/Revoked axis, current Owners/Administrators approve or revoke
+with optimistic exact replay, and catalog queue reservation/delivery plus worker
+claim all enforce the current decision without replacing the existing job.
+Migration 0031 leaves local work automatic, pauses historical active hosted
+batches as Pending, preserves canceled state, and fabricates no authority.
+PUNCH-004 slice 5 completed on 2026-08-24: project-local Automatic/Paused policy,
+optimistic exact replay, automatic direct caption-first composition, bounded
+50-video resume catch-up, membership-bounded workload estimates, and policy
+checks at dispatch reservation/delivery plus worker claim now flow through the
+real Workbench. Migration 0032 safely defaults historical projects to Automatic
+and historical batches to Manual without fabricated policy actors.
+PUNCH-005 slice 1 completed on 2026-08-24: project-scoped approved positive
+literal keywords and exact-language aliases, Researcher suggestions,
+Owner/Administrator decisions, normalized deduplication, optimistic/exact
+replay, migration 0033, and the real Workbench governance path are verified.
+PUNCH-005 slice 2 completed on 2026-08-24: deterministic exact-language
+Unicode matching, linked-track time-overlap dedupe, exact lease-bound input,
+private immutable checksummed evidence, current/stale summaries, a real scan
+worker, replay/reclaim authorization, active-transcript replacement, and
+second-client pinned reuse are verified through migration 0034 and the
+aggregate repository gate. PUNCH-005 slice 3 completed on 2026-08-24: stable
+Promising/No matches/Processing/Action needed groups, exact filters and sorts,
+summary-level per-keyword counts, lazy checksum/size/schema/input-verified
+bounded context, honest click-to-seek/highlight, current/prior evidence,
+scan-completed activity receipts, and confirmed all-or-nothing bulk priority
+are implemented through migration 0035. The complete 11-flow browser file and
+606-test aggregate network-free gate pass. PUNCH-005 is complete. Direct
+keyword maintenance/withdrawal, explicit hosted project-budget accounting,
+idle/overnight OS scheduling, and broader notification policy remain separate
+later work.
+PUNCH-002 and all PUNCH-006 slices completed on 2026-08-24:
+VERA — Research Video Clips now has authoritative grouped project summaries,
+membership-revalidated account-scoped recency, role-aware project destinations,
+an unread badge, separated account preferences, readable full BCP-47 labels, a
+real Bulk add handoff, bounded persisted Workbench dimensions, a separate Clip
+Library destination, and deterministic 1440×900/narrow browser geometry. Clip
+opening now resolves compatible immutable artifacts and freshly verifies bytes
+before local open, otherwise opens and loops the exact authorized source range.
+Visible Back/recent navigation restores playhead, language view, query/match,
+and exact safe selections from bounded account/project-private state while
+discarding removed identities and stale transcript selections. The 15-flow
+workspace browser file, 606-test aggregate suite, desktop build, and both
+migration gates pass. PUNCH-006 is complete.
+Continue the priority and dependency waves in
+`specs/future/PILOT-punch-list.md`; do not wait for externally gated M7-06 live
+dogfood. M7-06 remains the final M7 validation stream when its required external
 inputs are available, and the expanded workflow must be dogfooded again before
 signed-pilot distribution.

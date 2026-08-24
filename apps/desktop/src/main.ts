@@ -18,6 +18,9 @@ import { CognitoOAuthClient } from "@research-video/auth";
 import {
   DesktopApiRequestSchema,
   DesktopApiResponseSchema,
+  DesktopTimedTranscriptUploadRequestSchema,
+  CreateManualTimedTranscriptImportRequestSchema,
+  ManualTimedTranscriptImportUploadGrantSchema,
   DesktopAuthStatusSchema,
   DesktopServiceStatusSchema,
   DesktopStatusSchema,
@@ -64,6 +67,10 @@ import {
   shouldRunTranscriptionWorker,
 } from "./desktop-setup-policy.ts";
 import { LocalAgentEndpointRegistry } from "./local-agent-endpoint.ts";
+import {
+  TimedTranscriptUploadGrantRegistry,
+  uploadTimedTranscript,
+} from "./timed-transcript-upload.ts";
 import {
   ModelDownloadCanceledError,
   downloadPinnedModel,
@@ -278,7 +285,7 @@ if (!app.requestSingleInstanceLock()) {
 
 function createMainWindow(): BrowserWindow {
   const window = new BrowserWindow({
-    title: "Research Video Clips",
+    title: "VERA — Research Video Clips",
     width: 1_440,
     height: 960,
     minWidth: 960,
@@ -372,6 +379,7 @@ function installIpcHandlers(options: {
   sessionSecret: string;
   nativeActionSecret: string;
 }) {
+  const timedTranscriptUploadGrants = new TimedTranscriptUploadGrantRegistry();
   let activeModelDownload:
     | {
         controller: AbortController;
@@ -742,6 +750,14 @@ function installIpcHandlers(options: {
       }),
     );
   });
+  ipcMain.handle(
+    desktopIpcChannels.timedTranscriptUpload,
+    async (event, rawInput) => {
+      requireTrustedRenderer(event);
+      const input = DesktopTimedTranscriptUploadRequestSchema.parse(rawInput);
+      return uploadTimedTranscript(input, fetch, timedTranscriptUploadGrants);
+    },
+  );
   ipcMain.handle(desktopIpcChannels.request, async (event, rawInput) => {
     requireTrustedRenderer(event);
     const input = DesktopApiRequestSchema.parse(rawInput);
@@ -846,14 +862,54 @@ function installIpcHandlers(options: {
       ...(input.body !== undefined ? { body: input.body } : {}),
       redirect: "error",
     });
+    const body = await response.text();
+    if (isTimedTranscriptCreateRequest(input) && response.ok) {
+      try {
+        timedTranscriptUploadGrants.register(
+          ManualTimedTranscriptImportUploadGrantSchema.parse(JSON.parse(body)),
+          CreateManualTimedTranscriptImportRequestSchema.parse(
+            JSON.parse(input.body ?? ""),
+          ),
+        );
+      } catch {
+        return DesktopApiResponseSchema.parse({
+          status: 502,
+          body: JSON.stringify({
+            error: {
+              code: "invalid_upload_grant",
+              message: "Timed transcript upload grant could not be verified.",
+            },
+          }),
+          contentType: "application/json",
+        });
+      }
+    }
     return DesktopApiResponseSchema.parse({
       status: response.status,
-      body: await response.text(),
+      body,
       ...(response.headers.get("content-type")
         ? { contentType: response.headers.get("content-type")! }
         : {}),
     });
   });
+}
+
+function isTimedTranscriptCreateRequest(input: {
+  target: "cloud" | "local";
+  method: string;
+  path: string;
+  contentType?: string | undefined;
+  body?: string | undefined;
+}) {
+  return (
+    input.target === "cloud" &&
+    input.method === "POST" &&
+    input.contentType === "application/json" &&
+    input.body !== undefined &&
+    /^\/api\/projects\/[0-9a-f-]+\/videos\/[0-9a-f-]+\/timed-transcript-imports$/iu.test(
+      input.path,
+    )
+  );
 }
 
 function localModelPin(pin: {

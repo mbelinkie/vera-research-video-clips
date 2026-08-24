@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 
 import {
+  gateCaptionLanguage,
   InvalidYouTubeUrlError,
   TranscriptSourceAcquirer,
   TranscriptSourceResolver,
@@ -18,6 +19,72 @@ import {
   normalizeAcquiredCaption,
   type CommandRunner,
 } from "./captions-local.ts";
+
+describe("caption language gate", () => {
+  const automaticKorean = {
+    id: "fixture:auto:ko",
+    language: "ko",
+    kind: "automatic" as const,
+    translatable: false,
+    downloadAccess: "available" as const,
+  };
+
+  it("rejects a conflicting automatic provider claim without relabeling its candidate", () => {
+    const result = gateCaptionLanguage({
+      track: automaticKorean,
+      confirmedDecision: {
+        schemaVersion: 1,
+        decisionId: "11111111-1111-4111-8111-111111111111",
+        decisionVersion: 2,
+        status: "confirmed",
+        basis: "user_confirmation",
+        resolvedLanguage: "dz",
+      },
+    });
+
+    expect(result).toMatchObject({
+      state: "conflict",
+      providerLanguage: "ko",
+      confirmedLanguage: "dz",
+      reason: "provider_confirmed_language_conflict",
+    });
+    expect(result.track).toBe(automaticKorean);
+    expect(automaticKorean).toMatchObject({
+      id: "fixture:auto:ko",
+      language: "ko",
+    });
+  });
+
+  it("also surfaces creator metadata conflict and preserves an exact matching decision", () => {
+    expect(
+      gateCaptionLanguage({ track: automaticKorean, creatorLanguage: "dz" }),
+    ).toMatchObject({
+      state: "conflict",
+      reason: "provider_creator_language_conflict",
+      providerLanguage: "ko",
+      creatorLanguage: "dz",
+    });
+
+    const accepted = gateCaptionLanguage({
+      track: automaticKorean,
+      creatorLanguage: "dz",
+      confirmedDecision: {
+        schemaVersion: 1,
+        decisionId: "22222222-2222-4222-8222-222222222222",
+        decisionVersion: 3,
+        status: "confirmed",
+        basis: "user_confirmation",
+        resolvedLanguage: "ko-KR",
+      },
+    });
+    expect(accepted).toMatchObject({
+      state: "accepted",
+      providerLanguage: "ko",
+      resolvedLanguage: "ko-KR",
+    });
+    expect(accepted.track).toBe(automaticKorean);
+  });
+});
 
 describe("normalizeYouTubeUrl", () => {
   it.each([

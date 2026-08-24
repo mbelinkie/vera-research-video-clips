@@ -11,6 +11,7 @@ export const desktopIpcChannels = {
   startModelDownload: "desktop:start-model-download",
   cancelModelDownload: "desktop:cancel-model-download",
   modelDownloadProgress: "desktop:model-download-progress",
+  timedTranscriptUpload: "desktop:timed-transcript-upload",
   request: "desktop:request",
 } as const;
 

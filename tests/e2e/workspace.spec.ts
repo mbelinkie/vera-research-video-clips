@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import { expect, test, type Page } from "@playwright/test";
 import {
   CURRENT_EXPORT_WORKER_CAPABILITY,
@@ -27,6 +29,39 @@ function projectVideoFixture(
   now: string,
 ) {
   return { ...video, version: 1, createdAt: now, updatedAt: now };
+}
+
+function defaultLocalProcessingStatus(path: string) {
+  const projectId = path.match(
+    /(?:\/cloud-api)?\/api\/projects\/([^/]+)\/local-processing$/,
+  )?.[1];
+  if (!projectId) return undefined;
+  return {
+    projectId,
+    policy: { state: "automatic", version: 1 },
+    workload: {
+      queuedJobs: 0,
+      activeJobs: 0,
+      queuedKnownDurationMs: 0,
+      activeKnownDurationMs: 0,
+      queuedUnknownDurationCount: 0,
+      activeUnknownDurationCount: 0,
+      unprocessedActiveVideoCount: 0,
+    },
+  };
+}
+
+function defaultProjectKeywordCatalog(path: string) {
+  const projectId = path.match(
+    /(?:\/cloud-api)?\/api\/projects\/([^/]+)\/keywords$/,
+  )?.[1];
+  if (!projectId) return undefined;
+  return {
+    projectId,
+    keywordSetVersion: 1,
+    keywords: [],
+    suggestions: [],
+  };
 }
 
 function transcriptWithSegmentTrackIds(transcript: {
@@ -138,6 +173,24 @@ async function selectFirstTwoTranscriptRows(page: Page) {
 }
 
 test.beforeEach(async ({ page }) => {
+  await page.route("**/cloud-api/api/projects/*/worklist?*", async (route) =>
+    route.fulfill({ json: { items: [], total: 0 } }),
+  );
+  await page.route(
+    "**/cloud-api/api/projects/*/local-processing",
+    async (route) => {
+      const status = defaultLocalProcessingStatus(
+        new URL(route.request().url()).pathname,
+      );
+      await route.fulfill({ json: status });
+    },
+  );
+  await page.route("**/cloud-api/api/projects/*/keywords", async (route) => {
+    const catalog = defaultProjectKeywordCatalog(
+      new URL(route.request().url()).pathname,
+    );
+    await route.fulfill({ json: catalog });
+  });
   await page.route(
     "https://www.youtube-nocookie.com/embed/**",
     async (route) => {
@@ -166,9 +219,7 @@ test("does not hydrate fixture text for an arbitrary projectless URL", async ({
 }) => {
   await page.goto("/");
 
-  await expect(
-    page.getByRole("heading", { name: "Navigate video by transcript" }),
-  ).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Workbench" })).toBeVisible();
   await page
     .getByLabel("YouTube URL or video ID")
     .fill(directVideo.canonicalUrl);
@@ -216,6 +267,7 @@ async function mockAuthenticatedWorkspace(
         json: {
           id: "019fbb95-cd76-7920-93fa-e23ba755ee36",
           externalSubject: "fixture:e2e-user",
+          handle: "e2e_user",
           displayName: "E2E User",
           preferredLanguage: input.preferredLanguage,
           createdAt: now,
@@ -230,6 +282,10 @@ async function mockAuthenticatedWorkspace(
             id: input.projectId,
             name: "Workspace fixture project",
             description: "",
+            kind: "shared",
+            visibility: "invitation_only",
+            currentUserRole: "owner",
+            memberCount: 1,
             version: 1,
             createdAt: now,
             updatedAt: now,
@@ -240,6 +296,13 @@ async function mockAuthenticatedWorkspace(
     if (path === `/api/projects/${input.projectId}/videos`) {
       return route.fulfill({ json: [projectVideoFixture(romanianVideo, now)] });
     }
+    if (path.includes("/worklist")) {
+      return route.fulfill({ json: { items: [], total: 0 } });
+    }
+    const localProcessing = defaultLocalProcessingStatus(path);
+    if (localProcessing) return route.fulfill({ json: localProcessing });
+    const keywordCatalog = defaultProjectKeywordCatalog(path);
+    if (keywordCatalog) return route.fulfill({ json: keywordCatalog });
     return route.fulfill({ status: 404, json: { error: "not found" } });
   });
   await page.route(
@@ -247,6 +310,848 @@ async function mockAuthenticatedWorkspace(
     async (route) => route.fulfill({ json: input.workspace }),
   );
 }
+
+const shellUserId = "019fbb95-cd76-7920-93fa-e23ba755ee70";
+const shellPersonalProjectId = "019fbb95-cd76-7920-93fa-e23ba755ee71";
+const shellAdminProjectId = "019fbb95-cd76-7920-93fa-e23ba755ee72";
+const shellResearcherProjectId = "019fbb95-cd76-7920-93fa-e23ba755ee73";
+const removedShellProjectId = "019fbb95-cd76-7920-93fa-e23ba755ee74";
+
+function shellProject(
+  id: string,
+  name: string,
+  kind: "personal" | "shared",
+  currentUserRole: "owner" | "administrator" | "researcher",
+  memberCount: number,
+) {
+  const now = "2026-08-01T12:00:00.000Z";
+  return {
+    id,
+    name,
+    description: "",
+    kind,
+    visibility: kind === "personal" ? "private" : "invitation_only",
+    currentUserRole,
+    memberCount,
+    version: 1,
+    createdAt: now,
+    updatedAt: now,
+  };
+}
+
+async function mockShellWorkspace(page: Page, unreadCount = 3) {
+  const now = "2026-08-01T12:00:00.000Z";
+  const projects = [
+    shellProject(
+      shellPersonalProjectId,
+      "Personal notebook",
+      "personal",
+      "owner",
+      1,
+    ),
+    shellProject(
+      shellAdminProjectId,
+      "Shared administration",
+      "shared",
+      "administrator",
+      4,
+    ),
+    shellProject(
+      shellResearcherProjectId,
+      "Shared research",
+      "shared",
+      "researcher",
+      7,
+    ),
+  ];
+  const requestedProjectIds: string[] = [];
+  await page.route("**/cloud-api/**", async (route) => {
+    const path = new URL(route.request().url()).pathname.replace(
+      "/cloud-api",
+      "",
+    );
+    if (path === "/api/session/profile") {
+      return route.fulfill({
+        json: {
+          id: shellUserId,
+          externalSubject: "fixture:shell-user",
+          handle: "shell_user",
+          displayName: "Shell User",
+          preferredLanguage: "zh-Hant-TW",
+          createdAt: now,
+          updatedAt: now,
+        },
+      });
+    }
+    if (path === "/api/projects") return route.fulfill({ json: projects });
+    const projectMatch = path.match(/^\/api\/projects\/([^/]+)/u);
+    if (projectMatch?.[1]) requestedProjectIds.push(projectMatch[1]);
+    if (path.endsWith("/videos"))
+      return route.fulfill({ json: [projectVideoFixture(directVideo, now)] });
+    if (path.endsWith("/transcription-batches"))
+      return route.fulfill({ json: { batches: [] } });
+    if (path.endsWith("/review-inbox"))
+      return route.fulfill({ json: { items: [] } });
+    if (path.includes("/worklist"))
+      return route.fulfill({ json: { items: [], total: 0 } });
+    if (path.endsWith("/local-processing"))
+      return route.fulfill({ json: defaultLocalProcessingStatus(path) });
+    if (path.endsWith("/keywords"))
+      return route.fulfill({ json: defaultProjectKeywordCatalog(path) });
+    if (path.endsWith("/activity"))
+      return route.fulfill({ json: { items: [], unreadCount } });
+    return route.fulfill({ status: 404, json: { error: "not found" } });
+  });
+  await page.route(
+    "**/local-agent/api/projects/*/videos/*/transcript?*",
+    async (route) => {
+      const projectId = new URL(route.request().url()).pathname.split("/")[4]!;
+      return route.fulfill({
+        json: workspaceFixture({
+          projectId,
+          video: directVideo,
+          preferredLanguage: "zh-Hant-TW",
+        }),
+      });
+    },
+  );
+  return { requestedProjectIds };
+}
+
+async function connectShellWorkspace(page: Page) {
+  await page
+    .getByLabel("Development session credential")
+    .fill(`Bearer ${shellUserId}|fixture:web`);
+  await page.getByRole("button", { name: "Connect" }).click();
+}
+
+const navigationUserId = "019fbb95-cd76-7920-93fa-e23ba755ee80";
+const navigationProjectId = "019fbb95-cd76-7920-93fa-e23ba755ee81";
+const navigationOtherProjectId = "019fbb95-cd76-7920-93fa-e23ba755ee82";
+const navigationDirectClipId = "019fbb95-cd76-7920-93fa-e23ba755ee83";
+const navigationRomanianClipId = "019fbb95-cd76-7920-93fa-e23ba755ee84";
+const navigationDirectArtifactId = "019fbb95-cd76-7920-93fa-e23ba755ee85";
+const navigationRomanianArtifactId = "019fbb95-cd76-7920-93fa-e23ba755ee86";
+const navigationDirectLocatorId = "019fbb95-cd76-7920-93fa-e23ba755ee87";
+const navigationRomanianLocatorId = "019fbb95-cd76-7920-93fa-e23ba755ee88";
+const navigationRootId = "019fbb95-cd76-7920-93fa-e23ba755ee89";
+
+const navigationDirectSelection = {
+  trackId: "019fbb95-cd76-7920-93fa-e23ba755e301",
+  transcriptVersion: 1,
+  firstSegmentId: "019fbb95-cd76-7920-93fa-e23ba755e311",
+  lastSegmentId: "019fbb95-cd76-7920-93fa-e23ba755e312",
+  firstTokenId: "019fbb95-cd76-7920-93fa-e23ba755e322",
+  lastTokenId: "019fbb95-cd76-7920-93fa-e23ba755e326",
+  transcriptStartMs: 300,
+  transcriptEndMs: 2_900,
+  exportStartMs: 200,
+  exportEndMs: 3_200,
+  text: "fixture has accurate word timing. Click any word",
+  timingPrecision: "word",
+} as const;
+
+const navigationRomanianSelection = {
+  trackId: "019fbb95-cd76-7920-93fa-e23ba755e502",
+  transcriptVersion: 1,
+  firstSegmentId: "019fbb95-cd76-7920-93fa-e23ba755e521",
+  lastSegmentId: "019fbb95-cd76-7920-93fa-e23ba755e522",
+  transcriptStartMs: 0,
+  transcriptEndMs: 4_000,
+  exportStartMs: 0,
+  exportEndMs: 4_000,
+  text: "This is a Romanian example. The selection stays linked by time.",
+  timingPrecision: "cue",
+} as const;
+
+function navigationClip(
+  video: typeof directVideo | typeof romanianVideo,
+  id: string,
+  selection:
+    typeof navigationDirectSelection | typeof navigationRomanianSelection,
+) {
+  const now = "2026-08-01T12:00:00.000Z";
+  const native =
+    video.youtubeVideoId === directVideo.youtubeVideoId
+      ? {
+          role: "native",
+          language: "en",
+          text: selection.text,
+          trackId: englishWordFixture.track.id,
+          trackVersion: 1,
+          timingPrecision: "word",
+        }
+      : {
+          role: "native",
+          language: "ro",
+          text: "Acesta este un exemplu românesc. Selecția rămâne legată de timp.",
+          trackId: multilingualFixture.original.track.id,
+          trackVersion: 1,
+          timingPrecision: "cue",
+        };
+  const english =
+    video.youtubeVideoId === directVideo.youtubeVideoId
+      ? {
+          role: "english",
+          language: "en",
+          text: selection.text,
+          trackId: englishWordFixture.track.id,
+          trackVersion: 1,
+          timingPrecision: "word",
+        }
+      : {
+          role: "english",
+          language: "en",
+          text: selection.text,
+          trackId: multilingualFixture.english.track.id,
+          trackVersion: 1,
+          sourceTrackId: multilingualFixture.original.track.id,
+          timingPrecision: "cue",
+        };
+  return {
+    id,
+    projectId: navigationProjectId,
+    catalogVideoId: video.id,
+    video: {
+      youtubeVideoId: video.youtubeVideoId,
+      canonicalUrl: video.canonicalUrl,
+      title: video.title,
+      channel: video.channel,
+    },
+    selection,
+    languageEvidence: { schemaVersion: 2, native, english },
+    englishText: selection.text,
+    ...(video.youtubeVideoId === romanianVideo.youtubeVideoId
+      ? { originalText: native.text }
+      : {}),
+    notes: "Navigation fixture",
+    tags: ["Navigation"],
+    researchStatus: "candidate",
+    exportStatus: "not_requested",
+    createdBy: navigationUserId,
+    version: 1,
+    createdAt: now,
+    updatedAt: now,
+  };
+}
+
+async function mockNavigationWorkspace(
+  page: Page,
+  input: {
+    authorizedVideos?: Array<typeof directVideo | typeof romanianVideo>;
+  } = {},
+) {
+  const now = "2026-08-01T12:00:00.000Z";
+  let authorizedVideos = input.authorizedVideos ?? [directVideo, romanianVideo];
+  const transcriptVersions = new Map<string, string>();
+  const transcriptRequests: string[] = [];
+  const artifactResolutionRequests: string[] = [];
+  const artifactOpenRequests: string[] = [];
+  const directClip = navigationClip(
+    directVideo,
+    navigationDirectClipId,
+    navigationDirectSelection,
+  );
+  const romanianClip = navigationClip(
+    romanianVideo,
+    navigationRomanianClipId,
+    navigationRomanianSelection,
+  );
+  const versions = new Map([
+    [
+      navigationDirectClipId,
+      artifactVersionFixture(directClip, navigationDirectArtifactId, now),
+    ],
+    [
+      navigationRomanianClipId,
+      artifactVersionFixture(romanianClip, navigationRomanianArtifactId, now),
+    ],
+  ]);
+  const locators = new Map([
+    [
+      navigationDirectClipId,
+      artifactLocatorFixture(
+        navigationDirectLocatorId,
+        navigationDirectArtifactId,
+        navigationRootId,
+        now,
+      ),
+    ],
+    [
+      navigationRomanianClipId,
+      artifactLocatorFixture(
+        navigationRomanianLocatorId,
+        navigationRomanianArtifactId,
+        navigationRootId,
+        now,
+      ),
+    ],
+  ]);
+
+  await page.route("**/cloud-api/**", async (route) => {
+    const path = new URL(route.request().url()).pathname.replace(
+      "/cloud-api",
+      "",
+    );
+    if (path === "/api/session/profile") {
+      return route.fulfill({
+        json: {
+          id: navigationUserId,
+          externalSubject: "fixture:navigation-user",
+          handle: "navigation_user",
+          displayName: "Navigation User",
+          preferredLanguage: "en",
+          createdAt: now,
+          updatedAt: now,
+        },
+      });
+    }
+    if (path === "/api/projects") {
+      return route.fulfill({
+        json: [
+          shellProject(
+            navigationProjectId,
+            "Navigation project",
+            "shared",
+            "owner",
+            2,
+          ),
+          shellProject(
+            navigationOtherProjectId,
+            "Other project",
+            "shared",
+            "owner",
+            1,
+          ),
+        ],
+      });
+    }
+    if (path === `/api/projects/${navigationProjectId}/videos`) {
+      return route.fulfill({
+        json: authorizedVideos.map((video) => projectVideoFixture(video, now)),
+      });
+    }
+    if (path === `/api/projects/${navigationOtherProjectId}/videos`) {
+      return route.fulfill({ json: [projectVideoFixture(directVideo, now)] });
+    }
+    if (path.endsWith("/transcription-batches"))
+      return route.fulfill({ json: { batches: [] } });
+    if (path.endsWith("/review-inbox"))
+      return route.fulfill({ json: { items: [] } });
+    if (path.includes("/worklist"))
+      return route.fulfill({ json: { items: [], total: 0 } });
+    if (path.endsWith("/local-processing"))
+      return route.fulfill({ json: defaultLocalProcessingStatus(path) });
+    if (path.endsWith("/keywords"))
+      return route.fulfill({ json: defaultProjectKeywordCatalog(path) });
+    if (path.endsWith("/activity"))
+      return route.fulfill({ json: { items: [], unreadCount: 0 } });
+    return route.fulfill({ status: 404, json: { error: "not found" } });
+  });
+  await page.route(
+    "**/local-agent/api/projects/*/videos/*/transcript?*",
+    async (route) => {
+      const parts = new URL(route.request().url()).pathname.split("/");
+      const projectId = parts[4]!;
+      const catalogVideoId = parts[6]!;
+      transcriptRequests.push(catalogVideoId);
+      const video =
+        catalogVideoId === romanianVideo.id ? romanianVideo : directVideo;
+      const fixture = workspaceFixture({
+        projectId,
+        video,
+        preferredLanguage: "en",
+      });
+      return route.fulfill({
+        json: {
+          ...fixture,
+          transcriptVersionId:
+            transcriptVersions.get(catalogVideoId) ??
+            fixture.transcriptVersionId,
+        },
+      });
+    },
+  );
+  await page.route("**/local-agent/api/artifact-roots", async (route) =>
+    route.fulfill({
+      json: {
+        roots: [
+          {
+            id: navigationRootId,
+            label: "Navigation exports",
+            platform: "posix",
+            enabled: true,
+            createdAt: now,
+            updatedAt: now,
+          },
+        ],
+      },
+    }),
+  );
+  await page.route(
+    "**/local-agent/api/projects/*/clips/*/artifact-resolution",
+    async (route) => {
+      const clipId = new URL(route.request().url()).pathname.split("/")[6]!;
+      artifactResolutionRequests.push(clipId);
+      const version = versions.get(clipId)!;
+      return route.fulfill({
+        json: {
+          state: "reusable_local",
+          artifactVersionId: version.artifactVersionId,
+          locator: locators.get(clipId),
+          freshness: "fresh",
+        },
+      });
+    },
+  );
+  await page.route("**/local-agent/api/artifact-locators/**", async (route) => {
+    const parts = new URL(route.request().url()).pathname.split("/");
+    const locatorId = parts.at(-2)!;
+    const action = parts.at(-1)!;
+    if (action === "open") artifactOpenRequests.push(locatorId);
+    if (locatorId === navigationRomanianLocatorId && action === "open") {
+      return route.fulfill({
+        status: 409,
+        json: {
+          error: {
+            code: "artifact_invalid",
+            message: "Fresh bytes no longer match the verified package.",
+            retryable: false,
+          },
+        },
+      });
+    }
+    const clipId =
+      locatorId === navigationDirectLocatorId
+        ? navigationDirectClipId
+        : navigationRomanianClipId;
+    return route.fulfill({
+      json: { locator: locators.get(clipId), freshness: "fresh" },
+    });
+  });
+  await page.route(
+    "**/local-agent/api/projects/*/clip-library**",
+    async (route) => {
+      const projectId = new URL(route.request().url()).pathname.split("/")[4]!;
+      const clips =
+        projectId === navigationProjectId ? [directClip, romanianClip] : [];
+      return route.fulfill({
+        json: {
+          projectId,
+          entries: clips.map((clip) => ({
+            clip,
+            currentLeaves: [],
+            hasMoreLeaves: false,
+            completedVersionCount: 1,
+            recentArtifactVersions: [versions.get(clip.id)],
+          })),
+          syncCursor: "1",
+          fetchedAt: now,
+          query: { limit: 25, completed: "any" },
+          freshness: "fresh",
+          cachedAt: now,
+          cacheCoverage: "cached_subset",
+          selectedClipIds: [],
+          localAvailability: clips.map((clip) => ({
+            artifactVersionId: versions.get(clip.id)!.artifactVersionId,
+            locators: [locators.get(clip.id)],
+          })),
+        },
+      });
+    },
+  );
+
+  return {
+    transcriptRequests,
+    artifactResolutionRequests,
+    artifactOpenRequests,
+    setAuthorizedVideos(
+      videos: Array<typeof directVideo | typeof romanianVideo>,
+    ) {
+      authorizedVideos = videos;
+    },
+    setTranscriptVersion(catalogVideoId: string, transcriptVersionId: string) {
+      transcriptVersions.set(catalogVideoId, transcriptVersionId);
+    },
+  };
+}
+
+test("renders the role-aware VERA shell and persists bounded layout controls", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.addInitScript(
+    ({ userId, projectId, otherUserId, otherProjectId }) => {
+      localStorage.setItem(`vera:recent-project:${userId}`, projectId);
+      localStorage.setItem(
+        `vera:recent-project:${otherUserId}`,
+        otherProjectId,
+      );
+    },
+    {
+      userId: shellUserId,
+      projectId: shellAdminProjectId,
+      otherUserId: "019fbb95-cd76-7920-93fa-e23ba755ee79",
+      otherProjectId: shellResearcherProjectId,
+    },
+  );
+  await mockShellWorkspace(page);
+  await page.goto("/");
+  await connectShellWorkspace(page);
+
+  await expect(page.getByLabel("Active project")).toHaveValue(
+    shellAdminProjectId,
+  );
+  await expect(
+    page
+      .getByLabel("Active project")
+      .locator('optgroup[label="Personal projects"] option'),
+  ).toHaveCount(1);
+  await expect(
+    page
+      .getByLabel("Active project")
+      .locator('optgroup[label="Shared projects"] option'),
+  ).toHaveCount(2);
+  await expect(page.getByLabel("3 unread")).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "Project Settings" }),
+  ).toBeVisible();
+
+  await page.locator("details.account-menu > summary").click();
+  await expect(page.getByLabel("Account settings")).toContainText(
+    "Chinese (Traditional) (Taiwan) (zh-Hant-TW)",
+  );
+  await expect(page.locator(".account-menu-panel")).not.toContainText(
+    "Project keywords",
+  );
+  await page.locator("details.account-menu > summary").click();
+
+  await page.getByRole("button", { name: "Bulk add" }).click();
+  await expect(
+    page.getByLabel("YouTube URLs or video IDs, one per line"),
+  ).toBeFocused();
+
+  const shellGeometry = await page.evaluate(() => ({
+    documentHeight: document.documentElement.scrollHeight,
+    viewportHeight: document.documentElement.clientHeight,
+    shelfHeight: Math.round(
+      document
+        .querySelector(".workbench-worklist-slot")!
+        .getBoundingClientRect().height,
+    ),
+    researchHeight: Math.round(
+      document.querySelector(".workbench-research")!.getBoundingClientRect()
+        .height,
+    ),
+  }));
+  expect(shellGeometry.documentHeight).toBeLessThanOrEqual(
+    shellGeometry.viewportHeight,
+  );
+  expect(shellGeometry.shelfHeight).toBe(260);
+  expect(shellGeometry.researchHeight).toBeGreaterThan(100);
+
+  await page.getByText("Layout", { exact: true }).click();
+  await page.getByLabel("Worklist shelf height").fill("340");
+  await page.getByLabel("Transcript width").fill("54");
+  await expect(page.getByLabel("Worklist shelf height")).toHaveValue("340");
+  await page.reload();
+  await page.getByText("Layout", { exact: true }).click();
+  await expect(page.getByLabel("Worklist shelf height")).toHaveValue("340");
+  await expect(page.getByLabel("Transcript width")).toHaveValue("54");
+  await page.getByRole("button", { name: "Reset layout" }).click();
+  await expect(page.getByLabel("Worklist shelf height")).toHaveValue("260");
+  await expect(page.getByLabel("Transcript width")).toHaveValue("42");
+});
+
+test("fails closed for removed recency and gates settings for researchers", async ({
+  page,
+}) => {
+  await page.addInitScript(
+    ({ userId, projectId }) =>
+      localStorage.setItem(`vera:recent-project:${userId}`, projectId),
+    { userId: shellUserId, projectId: removedShellProjectId },
+  );
+  const fixture = await mockShellWorkspace(page, 0);
+  await page.goto("/");
+  await connectShellWorkspace(page);
+
+  await expect(page.getByLabel("Active project")).toHaveValue("");
+  await expect
+    .poll(() =>
+      page.evaluate(
+        (userId) => localStorage.getItem(`vera:recent-project:${userId}`),
+        shellUserId,
+      ),
+    )
+    .toBeNull();
+  expect(fixture.requestedProjectIds).not.toContain(removedShellProjectId);
+
+  await page
+    .getByLabel("Active project")
+    .selectOption(shellResearcherProjectId);
+  await expect(
+    page.getByRole("button", { name: "Project Settings" }),
+  ).toHaveCount(0);
+  await expect(page.getByText("Shared research · Researcher")).toBeVisible();
+
+  await page.setViewportSize({ width: 700, height: 900 });
+  const panelOrder = await page.evaluate(() => {
+    const player = document
+      .querySelector(".video-panel")!
+      .getBoundingClientRect();
+    const transcript = document
+      .querySelector(".transcript-panel")!
+      .getBoundingClientRect();
+    return { playerTop: player.top, transcriptTop: transcript.top };
+  });
+  expect(panelOrder.playerTop).toBeLessThan(panelOrder.transcriptTop);
+});
+
+test("opens verified artifacts first and restores bounded source navigation", async ({
+  page,
+}) => {
+  const fixture = await mockNavigationWorkspace(page);
+  await page.goto("/");
+  await page
+    .getByLabel("Development session credential")
+    .fill(`Bearer ${navigationUserId}|fixture:web`);
+  await page.getByRole("button", { name: "Connect" }).click();
+  await expect(page.getByLabel("Active project")).toHaveValue(
+    navigationProjectId,
+  );
+
+  await page
+    .getByLabel("YouTube URL or video ID")
+    .fill(directVideo.canonicalUrl);
+  await page.getByRole("button", { name: "Load video" }).click();
+  await expect(page.getByText("word timing", { exact: true })).toBeVisible();
+  await page.getByLabel("Language view").selectOption("english");
+  await page.getByLabel("Search transcript").fill("i");
+  await expect(page.getByText("1 of 2", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Next match" }).click();
+  await expect(page.getByText("2 of 2", { exact: true })).toBeVisible();
+  await selectDirectFixturePassage(page);
+
+  const directFrame = page
+    .frames()
+    .find((frame) =>
+      frame.url().includes(`/embed/${directVideo.youtubeVideoId}`),
+    );
+  if (!directFrame) throw new Error("Expected the direct-video player frame.");
+  await directFrame.evaluate(
+    (targetOrigin) =>
+      window.parent.postMessage(
+        JSON.stringify({ info: { currentTime: 1.25 } }),
+        targetOrigin,
+      ),
+    new URL(page.url()).origin,
+  );
+  await expect(page.locator(".video-details strong")).toHaveText("0:01");
+
+  await page.getByRole("button", { name: "Clips", exact: true }).click();
+  const directCard = page.locator(".clip-card").filter({
+    hasText: directVideo.title,
+  });
+  const romanianCard = page.locator(".clip-card").filter({
+    hasText: romanianVideo.title,
+  });
+  await expect(directCard).toBeVisible();
+  await directCard.getByRole("button", { name: "Open clip" }).click();
+  await expect
+    .poll(() => fixture.artifactResolutionRequests)
+    .toContain(navigationDirectClipId);
+  await expect
+    .poll(() => fixture.artifactOpenRequests)
+    .toContain(navigationDirectLocatorId);
+  await expect(
+    page.getByRole("button", { name: "Clips", exact: true }),
+  ).toHaveAttribute("aria-current", "page");
+
+  await romanianCard.getByRole("button", { name: "Open clip" }).click();
+  await expect
+    .poll(() => fixture.artifactOpenRequests)
+    .toContain(navigationRomanianLocatorId);
+  await expect(page.getByRole("button", { name: "Workbench" })).toHaveAttribute(
+    "aria-current",
+    "page",
+  );
+  await expect(
+    page.getByText(/compatible local artifact could not be freshly verified/u),
+  ).toBeVisible();
+  await expect(page.getByText("Looping logged clip 0:00–0:04")).toBeVisible();
+  await expect(page.getByLabel("Clip selection")).toContainText(
+    navigationRomanianSelection.text,
+  );
+
+  const romanianFrame = page
+    .frames()
+    .find((frame) =>
+      frame.url().includes(`/embed/${romanianVideo.youtubeVideoId}`),
+    );
+  if (!romanianFrame)
+    throw new Error("Expected the Romanian-video player frame.");
+  await expect
+    .poll(() =>
+      romanianFrame.evaluate(
+        () =>
+          (
+            window as typeof window & {
+              __receivedPlayerCommands?: Array<{ func?: string }>;
+            }
+          ).__receivedPlayerCommands?.map((command) => command.func) ?? [],
+      ),
+    )
+    .toEqual(expect.arrayContaining(["seekTo", "playVideo"]));
+  const seekCountBeforeLoop = await romanianFrame.evaluate(
+    () =>
+      (
+        window as typeof window & {
+          __receivedPlayerCommands?: Array<{ func?: string }>;
+        }
+      ).__receivedPlayerCommands?.filter((command) => command.func === "seekTo")
+        .length ?? 0,
+  );
+  await romanianFrame.evaluate(
+    (targetOrigin) =>
+      window.parent.postMessage(
+        JSON.stringify({ info: { currentTime: 4.2 } }),
+        targetOrigin,
+      ),
+    new URL(page.url()).origin,
+  );
+  await expect
+    .poll(() =>
+      romanianFrame.evaluate(
+        () =>
+          (
+            window as typeof window & {
+              __receivedPlayerCommands?: Array<{ func?: string }>;
+            }
+          ).__receivedPlayerCommands?.filter(
+            (command) => command.func === "seekTo",
+          ).length ?? 0,
+      ),
+    )
+    .toBeGreaterThan(seekCountBeforeLoop);
+
+  await expect
+    .poll(() =>
+      page.evaluate(
+        ({ userId, projectId }) => {
+          const raw = localStorage.getItem(
+            `vera:navigation:v1:${userId}:${projectId}`,
+          );
+          if (!raw) return undefined;
+          const record = JSON.parse(raw) as {
+            backStack?: Array<{ matchIndex?: number }>;
+          };
+          return record.backStack?.at(-1)?.matchIndex;
+        },
+        { userId: navigationUserId, projectId: navigationProjectId },
+      ),
+    )
+    .toBe(1);
+
+  await page.getByRole("button", { name: "Back" }).click();
+  await expect(page.getByLabel("Current source")).toContainText(
+    directVideo.title,
+  );
+  await expect(page.getByLabel("Search transcript")).toHaveValue("i");
+  await expect(page.getByText("2 of 2", { exact: true })).toBeVisible();
+  await expect(page.getByLabel("Language view")).toHaveValue("english");
+  await expect(page.getByLabel("Clip selection")).toContainText(
+    navigationDirectSelection.text,
+  );
+  await expect(page.locator(".video-details strong")).toHaveText("0:01");
+
+  await page.waitForTimeout(350);
+  fixture.setTranscriptVersion(
+    directVideo.id,
+    "019fbb95-cd76-7920-93fa-e23ba755ee90",
+  );
+  await page.reload();
+  await page
+    .getByLabel("Development session credential")
+    .fill(`Bearer ${navigationUserId}|fixture:web`);
+  await page.getByRole("button", { name: "Connect" }).click();
+  await expect(
+    page.getByText(
+      /discarded its selection because the active transcript version changed/u,
+    ),
+  ).toBeVisible();
+  await expect(page.getByLabel("Search transcript")).toHaveValue("i");
+  await expect(page.getByLabel("Language view")).toHaveValue("english");
+  await expect(page.locator(".video-details strong")).toHaveText("0:01");
+  await expect(page.getByLabel("Clip selection")).toHaveCount(0);
+
+  await page.getByRole("button", { name: "Clips", exact: true }).click();
+  await page
+    .locator(".clip-card")
+    .filter({ hasText: romanianVideo.title })
+    .getByRole("button", { name: "Open clip" })
+    .click();
+  await expect(page.getByRole("button", { name: "Back" })).toBeEnabled();
+  await page
+    .getByLabel("Active project")
+    .selectOption(navigationOtherProjectId);
+  await expect(page.getByRole("button", { name: "Back" })).toBeDisabled();
+});
+
+test("discards removed private navigation identities without requesting them", async ({
+  page,
+}) => {
+  await page.addInitScript(
+    ({ userId, projectId, snapshot }) => {
+      localStorage.setItem(`vera:recent-project:${userId}`, projectId);
+      localStorage.setItem(
+        `vera:navigation:v1:${userId}:${projectId}`,
+        JSON.stringify({ schemaVersion: 1, current: snapshot, backStack: [] }),
+      );
+    },
+    {
+      userId: navigationUserId,
+      projectId: navigationProjectId,
+      snapshot: {
+        schemaVersion: 1,
+        projectId: navigationProjectId,
+        catalogVideoId: romanianVideo.id,
+        youtubeVideoId: romanianVideo.youtubeVideoId,
+        canonicalUrl: romanianVideo.canonicalUrl,
+        title: romanianVideo.title,
+        transcriptVersionId: "019fbb95-cd76-7920-93fa-e23ba755ee54",
+        currentMs: 2_000,
+        transcriptView: "english",
+        query: "Romanian",
+        matchIndex: 0,
+        selection: navigationRomanianSelection,
+      },
+    },
+  );
+  const fixture = await mockNavigationWorkspace(page, {
+    authorizedVideos: [directVideo],
+  });
+  await page.goto("/");
+  await page
+    .getByLabel("Development session credential")
+    .fill(`Bearer ${navigationUserId}|fixture:web`);
+  await page.getByRole("button", { name: "Connect" }).click();
+  await expect(page.getByLabel("Active project")).toHaveValue(
+    navigationProjectId,
+  );
+  await expect(page.getByRole("button", { name: "Back" })).toBeDisabled();
+  await expect
+    .poll(() => fixture.transcriptRequests.includes(romanianVideo.id))
+    .toBe(false);
+  await expect
+    .poll(() =>
+      page.evaluate(
+        ({ userId, projectId }) =>
+          localStorage.getItem(`vera:navigation:v1:${userId}:${projectId}`),
+        { userId: navigationUserId, projectId: navigationProjectId },
+      ),
+    )
+    .toBeNull();
+});
 
 test("keeps verified offline cache review readable but blocks logged work", async ({
   page,
@@ -270,7 +1175,7 @@ test("keeps verified offline cache review readable but blocks logged work", asyn
     .getByLabel("Development session credential")
     .fill("Bearer 019fbb95-cd76-7920-93fa-e23ba755ee36|fixture:web");
   await page.getByRole("button", { name: "Connect" }).click();
-  await expect(page.getByLabel("Target project")).toHaveValue(projectId);
+  await expect(page.getByLabel("Active project")).toHaveValue(projectId);
   await page
     .getByLabel("YouTube URL or video ID")
     .fill(romanianVideo.canonicalUrl);
@@ -336,7 +1241,7 @@ test("keeps English explicit when preferred translation is unavailable", async (
   ).toHaveAttribute("disabled", "");
   await expect(
     page.getByText(
-      "Preferred translation unavailable for es-MX. Original and English remain available; logging waits for the required preferred evidence.",
+      "Preferred translation unavailable for Spanish (Mexico) (es-MX). Original and English remain available; logging waits for the required preferred evidence.",
     ),
   ).toBeVisible();
   await page.getByLabel("Language view").selectOption("original");
@@ -576,6 +1481,7 @@ test("maps transcript text selection to stable source and export bounds", async 
       json: {
         id: "019fbb95-cd76-7920-93fa-e23ba755ee36",
         externalSubject: "fixture:e2e-user",
+        handle: "e2e_user",
         displayName: "E2E User",
         preferredLanguage: body.preferredLanguage ?? "en",
         createdAt: now,
@@ -608,6 +1514,10 @@ test("maps transcript text selection to stable source and export bounds", async 
                 id: createdProjectId,
                 name: "New essay",
                 description: "Created without losing the selection",
+                kind: "shared",
+                visibility: "invitation_only",
+                currentUserRole: "owner",
+                memberCount: 1,
                 version: 1,
                 createdAt: now,
                 updatedAt: now,
@@ -617,6 +1527,10 @@ test("maps transcript text selection to stable source and export bounds", async 
                   id: existingProjectId,
                   name: "Existing essay",
                   description: "",
+                  kind: "shared",
+                  visibility: "invitation_only",
+                  currentUserRole: "owner",
+                  memberCount: 1,
                   version: 1,
                   createdAt: now,
                   updatedAt: now,
@@ -882,6 +1796,13 @@ test("maps transcript text selection to stable source and export bounds", async 
     if (path.endsWith("/review-inbox")) {
       return route.fulfill({ json: { items: [] } });
     }
+    if (path.includes("/worklist")) {
+      return route.fulfill({ json: { items: [], total: 0 } });
+    }
+    const localProcessing = defaultLocalProcessingStatus(path);
+    if (localProcessing) return route.fulfill({ json: localProcessing });
+    const keywordCatalog = defaultProjectKeywordCatalog(path);
+    if (keywordCatalog) return route.fulfill({ json: keywordCatalog });
     return route.fulfill({ status: 404, json: { error: "not found" } });
   });
   await page.route("**/local-agent/api/artifact-roots", async (route) => {
@@ -1145,7 +2066,7 @@ test("maps transcript text selection to stable source and export bounds", async 
     .getByLabel("Development session credential")
     .fill("Bearer 019fbb95-cd76-7920-93fa-e23ba755ee36|fixture:web");
   await page.getByRole("button", { name: "Connect" }).click();
-  await expect(page.getByLabel("Target project")).toHaveValue(
+  await expect(page.getByLabel("Active project")).toHaveValue(
     existingProjectId,
   );
   await page
@@ -1248,7 +2169,7 @@ test("maps transcript text selection to stable source and export bounds", async 
     .getByLabel("Description (optional)")
     .fill("Created without losing the selection");
   await page.getByRole("button", { name: "Create and select project" }).click();
-  await expect(page.getByLabel("Target project")).toHaveValue(createdProjectId);
+  await expect(page.getByLabel("Active project")).toHaveValue(createdProjectId);
   await page
     .getByLabel("YouTube URL or video ID")
     .fill(directVideo.canonicalUrl);
@@ -1303,6 +2224,7 @@ test("maps transcript text selection to stable source and export bounds", async 
   await expect(page.getByRole("button", { name: "Logged" })).toBeDisabled();
   expect(clipPostCount).toBe(1);
 
+  await page.getByRole("button", { name: "Clips" }).click();
   const clipQueue = page.getByRole("article", { name: /clip library/i });
   await clipQueue.getByRole("button", { name: "Refresh" }).click();
   await expect(clipQueue).toContainText(directVideo.title);
@@ -1328,6 +2250,7 @@ test("maps transcript text selection to stable source and export bounds", async 
   await expect(clipQueue).toContainText(
     "Downloaded the project clip log as CSV.",
   );
+  await page.getByRole("button", { name: "Workbench" }).click();
 
   await page.getByText("Per-export overrides").click();
   await expect(
@@ -1430,14 +2353,16 @@ test("maps transcript text selection to stable source and export bounds", async 
     disclosureVersion: 1,
   });
 
+  await page.locator("details.account-menu > summary").click();
   await page.getByLabel("Preferred transcript language").fill("es-MX");
   await page.getByRole("button", { name: "Save preference" }).click();
   await expect(page.getByLabel("Account settings")).toContainText(
     "Saved es-MX. Existing logged clips are unchanged.",
   );
+  await page.locator("details.account-menu > summary").click();
   await page.getByLabel("YouTube URL or video ID").fill("Romanian001");
   await page.getByRole("button", { name: "Load video" }).click();
-  await expect(page.getByText("es transcript")).toBeVisible();
+  await expect(page.getByText("Spanish (es) transcript")).toBeVisible();
   await expect(
     page.getByText("Loaded the exact verified local transcript cache."),
   ).toBeVisible();
@@ -1486,6 +2411,7 @@ test("maps transcript text selection to stable source and export bounds", async 
     lastClipBody?.languageEvidence.preferred.trackId,
   );
   batchFixtureEnabled = true;
+  await page.getByRole("button", { name: "Clips" }).click();
   await clipQueue.getByRole("button", { name: "Refresh" }).click();
   const clipSelectors = clipQueue.locator(
     '.clip-library-select input[type="checkbox"]',
@@ -1530,15 +2456,19 @@ test("maps transcript text selection to stable source and export bounds", async 
   await clipQueue.getByLabel("Filter tag").selectOption("");
   await clipQueue.getByLabel("Search clips").fill("");
   await clipQueue.getByRole("button", { name: "Refresh" }).click();
-  await expect(clipQueue).toContainText("Native (ro)");
+  await expect(clipQueue).toContainText("Native — Romanian (ro)");
   await expect(clipQueue).toContainText("English");
-  await expect(clipQueue).toContainText("Preferred (es)");
+  await expect(clipQueue).toContainText("Preferred — Spanish (es)");
   await clipQueue.getByText("Recent immutable artifact history").click();
   await clipQueue.getByRole("button", { name: "Resolve" }).click();
   await expect(clipQueue).toContainText("workstation reusable local");
   await clipQueue.getByRole("button", { name: "Verify" }).click();
   await clipQueue.getByRole("button", { name: "Reveal" }).click();
-  await clipQueue.getByRole("button", { name: "Open clip" }).click();
+  await clipQueue
+    .locator(".clip-card")
+    .filter({ hasText: romanianVideo.title })
+    .getByRole("button", { name: "Open clip" })
+    .click();
   await clipQueue
     .getByRole("button", { name: "Relink to Recovery exports" })
     .click();
@@ -1560,10 +2490,11 @@ test("maps transcript text selection to stable source and export bounds", async 
       "I confirm I am authorized to process every exact YouTube source listed above for this export.",
     ),
   ).not.toBeChecked();
+  await page.locator("details.account-menu > summary").click();
   await page.getByLabel("Preferred transcript language").fill("en");
   await page.getByRole("button", { name: "Save preference" }).click();
   await clipQueue.getByRole("button", { name: "Refresh" }).click();
-  await expect(clipQueue).toContainText("Preferred (es)");
+  await expect(clipQueue).toContainText("Preferred — Spanish (es)");
 });
 
 test("connects an explicit project, controls a batch, and updates review state", async ({
@@ -1574,8 +2505,40 @@ test("connects an explicit project, controls a batch, and updates review state",
   const batchId = "019fbb95-cd76-7920-93fa-e23ba755ee31";
   let batchVersion = 1;
   let dispatchStatus = "active";
+  let hostedApprovalState: "pending" | "approved" | "revoked" = "pending";
+  let hostedApprovalVersion = 1;
+  const hostedApprovalCommands: Array<Record<string, unknown>> = [];
+  let localProcessingState: "automatic" | "paused" = "automatic";
+  let localProcessingVersion = 1;
+  let localQueuedJobs = 2;
+  let localUnprocessedVideoCount = 3;
+  const localProcessingCommands: Array<Record<string, unknown>> = [];
+  let keywordSetVersion = 1;
+  const projectKeywords: Array<Record<string, any>> = [];
+  const keywordSuggestions: Array<Record<string, any>> = [];
+  const keywordSuggestionCommands: Array<Record<string, any>> = [];
+  const keywordReviewCommands: Array<Record<string, any>> = [];
+  const bulkPriorityCommands: Array<Record<string, any>> = [];
+  let tamperKeywordArtifact = true;
   let reviewVersion = 1;
   let reviewStatus = "unreviewed";
+  let ownFlagActive = true;
+  let ownFlagVersion = 1;
+  let projectVideoVersion = 1;
+  let worklistPriority = "normal";
+  let completionPolicy = "researcher_or_administrator";
+  let canonicalReviewStatus = "open";
+  let canonicalReviewVersion = 1;
+  let canonicalReviewCycle = 1;
+  let canonicalReviewReason: string | undefined;
+  let triageState = "active";
+  let triageVersion = 1;
+  let triageReason: string | undefined;
+  let activityState = "unread";
+  let activityVersion = 1;
+  let claimVersion = 0;
+  let claimGeneration = 0;
+  let claimActive = false;
   let workspaceRequestPath: string | undefined;
   let workspaceRequests = 0;
   const progress = {
@@ -1599,8 +2562,22 @@ test("connects an explicit project, controls a batch, and updates review state",
     targetLanguage: "en",
     transcriptionProfile: "default",
     sourcePolicy: "prefer-existing",
-    executionLocation: "local",
+    executionLocation: "hosted",
     priority: "normal",
+    hostedApproval: {
+      state: hostedApprovalState,
+      version: hostedApprovalVersion,
+      ...(hostedApprovalState === "pending"
+        ? {}
+        : {
+            decidedBy: {
+              userId: "019fbb95-cd76-7920-93fa-e23ba755ee36",
+              handle: "e2e_user",
+              displayName: "E2E User",
+            },
+            decidedAt: now,
+          }),
+    },
     dispatchStatus,
     createdBy: "019fbb95-cd76-7920-93fa-e23ba755ee36",
     version: batchVersion,
@@ -1640,10 +2617,257 @@ test("connects an explicit project, controls a batch, and updates review state",
     },
     progress,
   });
+  const keywordArtifact = () => {
+    const keyword = projectKeywords[0];
+    const evidenceAlias = keyword?.aliases?.[1];
+    return {
+      schemaVersion: 1,
+      projectId,
+      projectVideoId: directVideo.id,
+      transcriptVersionId: "019fbb95-cd76-7920-93fa-e23ba755ee34",
+      keywordSetVersion,
+      scannerSchemaVersion: 1,
+      occurrences:
+        keyword && evidenceAlias
+          ? [
+              {
+                id: "019fbb95-cd76-7920-93fa-e23ba755eeba",
+                keywordId: keyword.id,
+                startMs: 1_000,
+                endMs: 1_800,
+                timingPrecision: "word",
+                evidence: [
+                  {
+                    keywordId: keyword.id,
+                    aliasId: evidenceAlias.id,
+                    trackId: englishWordFixture.track.id,
+                    language: "en",
+                    segmentIds: [englishWordFixture.segments[0]!.id],
+                    startMs: 1_000,
+                    endMs: 1_800,
+                    timingPrecision: "word",
+                    context: "A durable workflow keeps research accurate.",
+                  },
+                ],
+              },
+            ]
+          : [],
+    };
+  };
+  const keywordArtifactBytes = () =>
+    Buffer.from(JSON.stringify(keywordArtifact()));
+  const keywordArtifactDescriptor = () => {
+    const bytes = keywordArtifactBytes();
+    return {
+      objectKey: `keyword-scans/${projectId}/${directVideo.id}/019fbb95-cd76-7920-93fa-e23ba755eeb8/matches.json`,
+      objectVersionId: "keyword-artifact-v1",
+      sha256: createHash("sha256").update(bytes).digest("hex"),
+      sizeBytes: bytes.byteLength,
+      schemaVersion: 1,
+    };
+  };
+  const worklistResponse = (view = "all") => {
+    const visible =
+      view === "dismissed"
+        ? triageState === "dismissed"
+        : view === "reviewed"
+          ? triageState === "active" && canonicalReviewStatus === "completed"
+          : view === "queue"
+            ? triageState === "active" && canonicalReviewStatus === "open"
+            : true;
+    return {
+      items: visible
+        ? [
+            {
+              projectId,
+              video: projectVideoFixture(directVideo, now),
+              projectVideoVersion,
+              priority: worklistPriority,
+              completionPolicy,
+              triage:
+                triageState === "dismissed"
+                  ? {
+                      state: "dismissed",
+                      version: triageVersion,
+                      dismissedAt: now,
+                      dismissedBy: {
+                        userId: "019fbb95-cd76-7920-93fa-e23ba755ee36",
+                        handle: "e2e_user",
+                        displayName: "E2E User",
+                      },
+                      reason: triageReason,
+                    }
+                  : { state: "active", version: triageVersion },
+              unreadActivityCount: activityState === "unread" ? 1 : 0,
+              ...(claimVersion
+                ? {
+                    claim: {
+                      claimant: {
+                        userId: "019fbb95-cd76-7920-93fa-e23ba755ee36",
+                        handle: "e2e_user",
+                        displayName: "E2E User",
+                      },
+                      isCurrentUser: true,
+                      active: claimActive,
+                      generation: claimGeneration,
+                      version: claimVersion,
+                      claimedAt: now,
+                      heartbeatAt: now,
+                      expiresAt: "2026-08-24T12:05:00.000Z",
+                    },
+                  }
+                : {}),
+              review: {
+                id:
+                  canonicalReviewCycle === 1
+                    ? "019fbb95-cd76-7920-93fa-e23ba755ee37"
+                    : "019fbb95-cd76-7920-93fa-e23ba755ee38",
+                cycleNumber: canonicalReviewCycle,
+                status: canonicalReviewStatus,
+                version: canonicalReviewVersion,
+                openedAt: now,
+                ...(canonicalReviewReason
+                  ? { reopenReason: canonicalReviewReason }
+                  : {}),
+                ...(canonicalReviewStatus === "completed"
+                  ? {
+                      completionPolicy,
+                      completedAt: now,
+                      completedBy: {
+                        userId: "019fbb95-cd76-7920-93fa-e23ba755ee36",
+                        handle: "e2e_user",
+                        displayName: "E2E User",
+                      },
+                      completionBasis: "ready_transcript",
+                      transcriptVersionId:
+                        "019fbb95-cd76-7920-93fa-e23ba755ee34",
+                    }
+                  : {}),
+              },
+              activeTranscriptVersionId: "019fbb95-cd76-7920-93fa-e23ba755ee34",
+              activeFlagCount: ownFlagActive ? 1 : 0,
+              flaggers: ownFlagActive
+                ? [
+                    {
+                      userId: "019fbb95-cd76-7920-93fa-e23ba755ee36",
+                      handle: "e2e_user",
+                      displayName: "E2E User",
+                      flaggedAt: now,
+                    },
+                  ]
+                : [],
+              flaggersTruncated: false,
+              ownFlag: {
+                active: ownFlagActive,
+                version: ownFlagVersion,
+                createdAt: now,
+                updatedAt: now,
+                ...(!ownFlagActive ? { deactivatedAt: now } : {}),
+              },
+              processing: {
+                state: "ready",
+                batchId,
+                batchItemId: item().id,
+                attempt: 0,
+                updatedAt: now,
+              },
+              keywordScan: {
+                projectId,
+                projectVideoId: directVideo.id,
+                scanId: "019fbb95-cd76-7920-93fa-e23ba755eeb8",
+                status: "current",
+                transcriptVersionId: "019fbb95-cd76-7920-93fa-e23ba755ee34",
+                keywordSetVersion,
+                scannerSchemaVersion: 1,
+                occurrenceCount: projectKeywords.length ? 1 : 0,
+                matchedKeywordCount: projectKeywords.length ? 1 : 0,
+                keywordCounts: projectKeywords.length
+                  ? [
+                      {
+                        keywordId: projectKeywords[0]!.id,
+                        occurrenceCount: 1,
+                      },
+                    ]
+                  : [],
+                approvedKeywordCount: projectKeywords.length,
+                matchesPerMinute: projectKeywords.length ? 1 : 0,
+                durationMs: 60_000,
+                artifact: keywordArtifactDescriptor(),
+                completedAt: now,
+              },
+              clipCount: 2,
+              createdAt: now,
+              updatedAt: now,
+            },
+          ]
+        : [],
+      total: visible ? 1 : 0,
+    };
+  };
+  const activityResponse = () => ({
+    items: [
+      {
+        eventId: "019fbb95-cd76-7920-93fa-e23ba755ee39",
+        projectId,
+        videoId: directVideo.id,
+        videoTitle: "Fixture review video",
+        eventType: "video_restored",
+        actor: {
+          userId: "019fbb95-cd76-7920-93fa-e23ba755ee35",
+          handle: "fixture_admin",
+          displayName: "Fixture Admin",
+        },
+        reason: "Returned to the research queue.",
+        state: activityState,
+        version: activityVersion,
+        createdAt: now,
+        ...(activityState === "seen" ? { seenAt: now } : {}),
+      },
+    ],
+    unreadCount: activityState === "unread" ? 1 : 0,
+  });
+  const keywordActor = {
+    userId: "019fbb95-cd76-7920-93fa-e23ba755ee36",
+    handle: "e2e_user",
+    displayName: "E2E User",
+  };
+  const keywordCatalogResponse = () => ({
+    projectId,
+    keywordSetVersion,
+    keywords: projectKeywords,
+    suggestions: keywordSuggestions,
+  });
+  const localProcessingResponse = () => ({
+    projectId,
+    policy: {
+      state: localProcessingState,
+      version: localProcessingVersion,
+      ...(localProcessingVersion === 1
+        ? {}
+        : {
+            updatedBy: {
+              userId: "019fbb95-cd76-7920-93fa-e23ba755ee36",
+              handle: "e2e_user",
+              displayName: "E2E User",
+            },
+            updatedAt: now,
+          }),
+    },
+    workload: {
+      queuedJobs: localQueuedJobs,
+      activeJobs: 1,
+      queuedKnownDurationMs: 120_000,
+      activeKnownDurationMs: 60_000,
+      queuedUnknownDurationCount: 1,
+      activeUnknownDurationCount: 0,
+      unprocessedActiveVideoCount: localUnprocessedVideoCount,
+    },
+  });
 
   await page.route("**/cloud-api/**", async (route) => {
     const request = route.request();
-    const path = new URL(request.url()).pathname.replace("/cloud-api", "");
+    const url = new URL(request.url());
+    const path = url.pathname.replace("/cloud-api", "");
     if (path === "/api/projects") {
       return route.fulfill({
         json: [
@@ -1651,6 +2875,10 @@ test("connects an explicit project, controls a batch, and updates review state",
             id: projectId,
             name: "Essay project",
             description: "",
+            kind: "shared",
+            visibility: "invitation_only",
+            currentUserRole: "owner",
+            memberCount: 1,
             version: 1,
             createdAt: now,
             updatedAt: now,
@@ -1671,6 +2899,308 @@ test("connects an explicit project, controls a batch, and updates review state",
     if (path === `/api/projects/${projectId}/videos`) {
       return route.fulfill({ json: [projectVideoFixture(directVideo, now)] });
     }
+    if (path === `/api/projects/${projectId}/worklist`) {
+      return route.fulfill({
+        json: worklistResponse(url.searchParams.get("view") ?? "all"),
+      });
+    }
+    if (
+      path ===
+      `/api/projects/${projectId}/keyword-scans/019fbb95-cd76-7920-93fa-e23ba755eeb8/artifact-download`
+    ) {
+      return route.fulfill({
+        json: {
+          scanId: "019fbb95-cd76-7920-93fa-e23ba755eeb8",
+          artifact: keywordArtifactDescriptor(),
+          downloadUrl:
+            "http://127.0.0.1:43112/keyword-artifact-fixture/matches.json",
+          expiresAt: "2026-08-24T12:05:00.000Z",
+        },
+      });
+    }
+    if (path === `/api/projects/${projectId}/activity`) {
+      return route.fulfill({ json: activityResponse() });
+    }
+    if (path === `/api/projects/${projectId}/keywords`) {
+      return route.fulfill({ json: keywordCatalogResponse() });
+    }
+    if (
+      path === `/api/projects/${projectId}/keyword-suggestions` &&
+      request.method() === "POST"
+    ) {
+      const body = request.postDataJSON() as Record<string, any>;
+      keywordSuggestionCommands.push(body);
+      expect(body.idempotencyKey).toMatch(
+        /^workbench-keyword-suggestion:[a-f0-9]{64}$/,
+      );
+      const suggestion = {
+        id:
+          keywordSuggestions.length === 0
+            ? "019fbb95-cd76-7920-93fa-e23ba755eeb4"
+            : "019fbb95-cd76-7920-93fa-e23ba755eeb7",
+        projectId,
+        ...(body.keywordId ? { keywordId: body.keywordId } : {}),
+        ...(body.proposedLabel ? { proposedLabel: body.proposedLabel } : {}),
+        ...(body.proposedDescription
+          ? { proposedDescription: body.proposedDescription }
+          : {}),
+        language: body.language,
+        phrase: body.phrase,
+        normalizedPhrase: String(body.phrase).toLocaleLowerCase("en-US"),
+        ...(body.rationale ? { rationale: body.rationale } : {}),
+        state: "pending",
+        version: 1,
+        proposedBy: keywordActor,
+        createdAt: now,
+        updatedAt: now,
+      };
+      keywordSuggestions.push(suggestion);
+      return route.fulfill({
+        json: { resolution: "created", suggestion },
+      });
+    }
+    const keywordReviewMatch = path.match(
+      new RegExp(
+        `^/api/projects/${projectId}/keyword-suggestions/([^/]+)/review$`,
+      ),
+    );
+    if (keywordReviewMatch && request.method() === "POST") {
+      const body = request.postDataJSON() as Record<string, any>;
+      keywordReviewCommands.push(body);
+      expect(body.idempotencyKey).toMatch(
+        /^workbench-keyword-review:[a-f0-9]{64}$/,
+      );
+      const suggestion = keywordSuggestions.find(
+        (entry) => entry.id === keywordReviewMatch[1],
+      )!;
+      expect(body.expectedSuggestionVersion).toBe(suggestion.version);
+      expect(body.expectedKeywordSetVersion).toBe(keywordSetVersion);
+      suggestion.state = body.action === "approve" ? "approved" : "rejected";
+      suggestion.version += 1;
+      suggestion.reviewedBy = keywordActor;
+      suggestion.reviewedAt = now;
+      suggestion.updatedAt = now;
+      if (body.reason) suggestion.reviewReason = body.reason;
+      if (body.action === "approve") {
+        const keywordId = "019fbb95-cd76-7920-93fa-e23ba755eeb5";
+        const alias = {
+          id: "019fbb95-cd76-7920-93fa-e23ba755eeb6",
+          projectId,
+          keywordId,
+          language: suggestion.language,
+          phrase: suggestion.phrase,
+          normalizedPhrase: suggestion.normalizedPhrase,
+          enabled: true,
+          version: 1,
+          createdBy: keywordActor,
+          createdAt: now,
+          updatedAt: now,
+        };
+        const evidenceAlias = {
+          ...alias,
+          id: "019fbb95-cd76-7920-93fa-e23ba755eeb9",
+          phrase: "accurate",
+          normalizedPhrase: "accurate",
+        };
+        const keyword = {
+          id: keywordId,
+          projectId,
+          label: suggestion.proposedLabel,
+          ...(suggestion.proposedDescription
+            ? { description: suggestion.proposedDescription }
+            : {}),
+          enabled: true,
+          version: 1,
+          createdBy: keywordActor,
+          createdAt: now,
+          updatedAt: now,
+          aliases: [alias, evidenceAlias],
+        };
+        suggestion.keywordId = keywordId;
+        projectKeywords.push(keyword);
+        keywordSetVersion += 1;
+        return route.fulfill({
+          json: {
+            projectId,
+            keywordSetVersion,
+            suggestion,
+            keyword,
+            alias,
+          },
+        });
+      }
+      return route.fulfill({
+        json: { projectId, keywordSetVersion, suggestion },
+      });
+    }
+    if (path === `/api/projects/${projectId}/local-processing`) {
+      if (request.method() === "GET") {
+        return route.fulfill({ json: localProcessingResponse() });
+      }
+      const body = request.postDataJSON() as Record<string, unknown>;
+      localProcessingCommands.push(body);
+      expect(body.expectedVersion).toBe(localProcessingVersion);
+      expect(body.idempotencyKey).toMatch(
+        /^workbench-local-processing:[a-f0-9]{64}$/,
+      );
+      localProcessingState = body.state as "automatic" | "paused";
+      localProcessingVersion += 1;
+      const enqueuedCount =
+        localProcessingState === "automatic"
+          ? Math.min(localUnprocessedVideoCount, 50)
+          : 0;
+      localQueuedJobs += enqueuedCount;
+      localUnprocessedVideoCount -= enqueuedCount;
+      return route.fulfill({
+        json: {
+          ...localProcessingResponse(),
+          enqueuedCount,
+          remainingUnprocessedCount: localUnprocessedVideoCount,
+        },
+      });
+    }
+    if (
+      path === `/api/projects/${projectId}/activity/seen` &&
+      request.method() === "PATCH"
+    ) {
+      activityState = "seen";
+      activityVersion += 1;
+      return route.fulfill({
+        json: { projectId, items: activityResponse().items },
+      });
+    }
+    if (
+      path === `/api/projects/${projectId}/worklist/triage` &&
+      request.method() === "PATCH"
+    ) {
+      const body = request.postDataJSON();
+      triageState = body.action === "dismiss" ? "dismissed" : "active";
+      triageReason =
+        body.action === "dismiss" ? String(body.reason) : undefined;
+      triageVersion += 1;
+      projectVideoVersion += 1;
+      return route.fulfill({
+        json: {
+          projectId,
+          items: worklistResponse("all").items.map((entry) => ({
+            videoId: entry.video.id,
+            projectVideoVersion: entry.projectVideoVersion,
+            triage: entry.triage,
+          })),
+          cancellation: {
+            queuedJobsCanceled: body.action === "dismiss" ? 1 : 0,
+            activeJobsRequested: 0,
+            requestsRevoked: 0,
+          },
+        },
+      });
+    }
+    if (
+      path === `/api/projects/${projectId}/worklist/priority` &&
+      request.method() === "PATCH"
+    ) {
+      const body = request.postDataJSON() as Record<string, any>;
+      bulkPriorityCommands.push(body);
+      worklistPriority = String(body.priority);
+      projectVideoVersion += 1;
+      return route.fulfill({
+        json: {
+          projectId,
+          priority: worklistPriority,
+          items: [
+            {
+              projectId,
+              videoId: directVideo.id,
+              priority: worklistPriority,
+              completionPolicy,
+              projectVideoVersion,
+              updatedAt: now,
+            },
+          ],
+        },
+      });
+    }
+    if (
+      path === `/api/projects/${projectId}/worklist/${directVideo.id}/claim` &&
+      request.method() === "POST"
+    ) {
+      const body = request.postDataJSON();
+      if (body.action === "release") {
+        claimVersion = 0;
+        claimActive = false;
+        return route.fulfill({ json: { projectId, videoId: directVideo.id } });
+      }
+      if (body.action === "renew") claimVersion += 1;
+      else {
+        claimVersion += 1;
+        claimGeneration += 1;
+      }
+      claimActive = true;
+      return route.fulfill({
+        json: {
+          projectId,
+          videoId: directVideo.id,
+          claim: worklistResponse().items[0]!.claim,
+        },
+      });
+    }
+    if (
+      path ===
+        `/api/projects/${projectId}/worklist/${directVideo.id}/governance` &&
+      request.method() === "PATCH"
+    ) {
+      const body = request.postDataJSON();
+      if (body.priority) worklistPriority = String(body.priority);
+      if (body.completionPolicy)
+        completionPolicy = String(body.completionPolicy);
+      projectVideoVersion += 1;
+      return route.fulfill({
+        json: {
+          projectId,
+          videoId: directVideo.id,
+          priority: worklistPriority,
+          completionPolicy,
+          projectVideoVersion,
+          updatedAt: now,
+        },
+      });
+    }
+    if (
+      path === `/api/projects/${projectId}/worklist/${directVideo.id}/review` &&
+      request.method() === "POST"
+    ) {
+      const body = request.postDataJSON();
+      if (body.action === "complete") {
+        canonicalReviewStatus = "completed";
+        canonicalReviewVersion += 1;
+      } else {
+        canonicalReviewStatus = "open";
+        canonicalReviewVersion = 1;
+        canonicalReviewCycle += 1;
+        canonicalReviewReason = String(body.reason);
+      }
+      return route.fulfill({
+        json: {
+          projectId,
+          videoId: directVideo.id,
+          review: worklistResponse().items[0]!.review,
+        },
+      });
+    }
+    if (
+      path === `/api/projects/${projectId}/worklist/${directVideo.id}/flag` &&
+      request.method() === "PATCH"
+    ) {
+      ownFlagActive = Boolean(request.postDataJSON().active);
+      ownFlagVersion += 1;
+      return route.fulfill({
+        json: {
+          projectId,
+          videoId: directVideo.id,
+          flag: worklistResponse().items[0]!.ownFlag,
+        },
+      });
+    }
     if (
       path === `/api/projects/${projectId}/transcription-batches/${batchId}` &&
       request.method() === "GET"
@@ -1682,6 +3212,26 @@ test("connects an explicit project, controls a batch, and updates review state",
       batchVersion += 1;
       return route.fulfill({ json: batchResponse() });
     }
+    if (
+      path.endsWith(`/transcription-batches/${batchId}/hosted-approval`) &&
+      request.method() === "POST"
+    ) {
+      const body = request.postDataJSON() as Record<string, unknown>;
+      hostedApprovalCommands.push(body);
+      expect(body.expectedVersion).toBe(hostedApprovalVersion);
+      expect(body.idempotencyKey).toMatch(
+        /^workbench-hosted-approval:[a-f0-9]{64}$/,
+      );
+      hostedApprovalState = body.action === "approve" ? "approved" : "revoked";
+      hostedApprovalVersion += 1;
+      return route.fulfill({
+        json: {
+          projectId,
+          batchId,
+          approval: batch().hostedApproval,
+        },
+      });
+    }
     if (path.includes("/review-inbox/") && request.method() === "PATCH") {
       reviewStatus = String(request.postDataJSON().reviewStatus);
       reviewVersion += 1;
@@ -1691,7 +3241,27 @@ test("connects an explicit project, controls a batch, and updates review state",
         json: { ...item(), batchName: "Interview research" },
       });
     }
+    if (path.includes("/worklist")) {
+      return route.fulfill({ json: { items: [], total: 0 } });
+    }
+    const localProcessing = defaultLocalProcessingStatus(path);
+    if (localProcessing) return route.fulfill({ json: localProcessing });
+    const keywordCatalog = defaultProjectKeywordCatalog(path);
+    if (keywordCatalog) return route.fulfill({ json: keywordCatalog });
     return route.fulfill({ status: 404, json: { error: "not found" } });
+  });
+  await page.route("**/keyword-artifact-fixture/**", async (route) => {
+    const bytes = keywordArtifactBytes();
+    return route.fulfill({
+      status: 200,
+      headers: {
+        "access-control-allow-origin": "*",
+        "content-type": "application/json",
+      },
+      body: tamperKeywordArtifact
+        ? Buffer.concat([bytes, Buffer.from(" ")])
+        : bytes,
+    });
   });
   await page.route(
     "**/local-agent/api/projects/*/videos/*/transcript?*",
@@ -1727,7 +3297,7 @@ test("connects an explicit project, controls a batch, and updates review state",
     .fill("Bearer 019fbb95-cd76-7920-93fa-e23ba755ee36|fixture:web");
   await page.getByRole("button", { name: "Connect" }).click();
 
-  await expect(page.getByLabel("Target project")).toHaveValue(projectId);
+  await expect(page.getByLabel("Active project")).toHaveValue(projectId);
   await page.getByLabel("Import CSV").setInputFiles({
     name: "research.csv",
     mimeType: "text/csv",
@@ -1743,6 +3313,94 @@ test("connects an explicit project, controls a batch, and updates review state",
   await expect(
     page.getByText("Interview research", { exact: true }),
   ).toBeVisible();
+  const canonicalWorklist = page.getByLabel("Project video worklist");
+  await expect(canonicalWorklist).toContainText("Fixture review video");
+  await expect(canonicalWorklist).toContainText("Flagged by @e2e_user");
+  await expect(canonicalWorklist).toContainText("transcript ready · 2 clips");
+  await expect(canonicalWorklist).toContainText("New for you · 1");
+  const noMatchesGroup = canonicalWorklist.getByLabel(
+    "No matches keyword results",
+  );
+  const promisingGroup = canonicalWorklist.getByLabel(
+    "Promising keyword results",
+  );
+  await expect(noMatchesGroup.getByRole("heading")).toHaveText("No matches 1");
+  await expect(noMatchesGroup).toContainText(
+    "Current scan · genuine zero matches · no triage change",
+  );
+  await expect(promisingGroup.getByRole("heading")).toHaveText("Promising 0");
+  await canonicalWorklist
+    .getByLabel("Keyword scan state")
+    .selectOption("stale");
+  await expect(noMatchesGroup).not.toContainText("Fixture review video");
+  await canonicalWorklist
+    .getByLabel("Keyword scan state")
+    .selectOption("current");
+  await expect(noMatchesGroup).toContainText("Fixture review video");
+  await canonicalWorklist.getByLabel("Keyword scan state").selectOption("all");
+  const activityInbox = page.locator(".activity-inbox-card");
+  await expect(activityInbox).toContainText("video restored by @fixture_admin");
+  await activityInbox.getByRole("button", { name: "Mark seen" }).click();
+  await expect(activityInbox).toContainText("seen");
+  await expect(canonicalWorklist).not.toContainText("New for you");
+  await canonicalWorklist.getByRole("button", { name: "Claim review" }).click();
+  await expect(canonicalWorklist).toContainText("Claimed by you");
+  await canonicalWorklist.getByRole("button", { name: "Renew claim" }).click();
+  await canonicalWorklist
+    .getByLabel("Priority for Fixture review video")
+    .selectOption("high");
+  await expect(canonicalWorklist).toContainText("Priority high");
+  await canonicalWorklist
+    .getByLabel("Review completion policy for Fixture review video")
+    .selectOption("administrator_only");
+  await canonicalWorklist
+    .getByRole("button", { name: "Complete review" })
+    .click();
+  await expect(canonicalWorklist).not.toContainText("Fixture review video");
+  await canonicalWorklist
+    .getByRole("button", { name: "Reviewed", exact: true })
+    .click();
+  await expect(canonicalWorklist).toContainText("review cycle 1 completed");
+  page.once("dialog", (dialog) => dialog.accept("New evidence arrived."));
+  await canonicalWorklist
+    .getByRole("button", { name: "Reopen review" })
+    .click();
+  await expect(canonicalWorklist).not.toContainText("Fixture review video");
+  await canonicalWorklist
+    .getByRole("button", { name: "Queue", exact: true })
+    .click();
+  await expect(canonicalWorklist).toContainText(
+    "review cycle 2 open · reopened: New evidence arrived.",
+  );
+  await canonicalWorklist
+    .getByRole("button", { name: "Remove my flag" })
+    .click();
+  await expect(canonicalWorklist).toContainText("No active flags");
+  await canonicalWorklist
+    .getByRole("button", { name: "Restore my flag" })
+    .click();
+  await expect(canonicalWorklist).toContainText("Flagged by @e2e_user");
+  await canonicalWorklist.getByLabel("Select Fixture review video").check();
+  page.once("dialog", (dialog) => dialog.accept("Not useful for this cut."));
+  await canonicalWorklist
+    .getByRole("button", { name: "Dismiss selected (1)" })
+    .click();
+  await expect(canonicalWorklist).not.toContainText("Fixture review video");
+  await canonicalWorklist
+    .getByRole("button", { name: "Dismissed", exact: true })
+    .click();
+  await expect(canonicalWorklist).toContainText(
+    "Dismissed by @e2e_user · Not useful for this cut.",
+  );
+  await canonicalWorklist.getByLabel("Select Fixture review video").check();
+  await canonicalWorklist
+    .getByRole("button", { name: "Restore selected (1)" })
+    .click();
+  await expect(canonicalWorklist).not.toContainText("Fixture review video");
+  await canonicalWorklist
+    .getByRole("button", { name: "Queue", exact: true })
+    .click();
+  await expect(canonicalWorklist).toContainText("Active in worklist");
   await expect(
     page.locator(".review-card").getByText("Fixture review video", {
       exact: true,
@@ -1773,8 +3431,1623 @@ test("connects an explicit project, controls a batch, and updates review state",
     page.getByLabel("Review status for Fixture review video"),
   ).toHaveValue("reviewing");
 
+  await page.getByRole("button", { name: "Project Settings" }).click();
+  const localProcessing = page.getByLabel("Local processing policy");
+  await expect(localProcessing).toContainText(
+    "Policy: automatic · safe historical default",
+  );
+  await expect(localProcessing).toContainText(
+    "Queued 2 · known load 2m · 1 unknown duration",
+  );
+  await expect(localProcessing).toContainText("Active 1 · known load 1m");
+  await expect(localProcessing).toContainText("3 active videos not yet queued");
+  await localProcessing
+    .getByRole("button", { name: "Pause new local starts" })
+    .click();
+  await expect(localProcessing).toContainText(
+    "Policy: paused · last changed by @e2e_user",
+  );
+  await localProcessing
+    .getByRole("button", { name: "Resume and queue up to 50" })
+    .click();
+  await expect(localProcessing).toContainText(
+    "Policy: automatic · last changed by @e2e_user",
+  );
+  await expect(localProcessing).toContainText(
+    "Queued 5 · known load 2m · 1 unknown duration",
+  );
+  await expect(localProcessing).not.toContainText("not yet queued");
+  expect(localProcessingCommands).toHaveLength(2);
+  expect(localProcessingCommands.map((command) => command.state)).toEqual([
+    "paused",
+    "automatic",
+  ]);
+  expect(
+    localProcessingCommands.map((command) => command.expectedVersion),
+  ).toEqual([1, 2]);
+  expect(localProcessingCommands[0]!.idempotencyKey).not.toBe(
+    localProcessingCommands[1]!.idempotencyKey,
+  );
+
+  const projectKeywordCard = page.getByLabel("Project keywords");
+  await expect(projectKeywordCard).toContainText("These are not clip tags");
+  await expect(projectKeywordCard).toContainText(
+    "No approved project keywords yet.",
+  );
+  await projectKeywordCard
+    .getByLabel("New keyword label")
+    .fill("Climate change");
+  await projectKeywordCard
+    .getByLabel("Keyword description")
+    .fill("Positive literal research phrase");
+  await projectKeywordCard.getByLabel("Keyword alias language").fill("en");
+  await projectKeywordCard
+    .getByLabel("Literal keyword phrase")
+    .fill("Climate change");
+  await projectKeywordCard
+    .getByLabel("Keyword suggestion rationale")
+    .fill("Core research vocabulary");
+  await projectKeywordCard
+    .getByRole("button", { name: "Suggest project keyword" })
+    .click();
+  await expect(projectKeywordCard).toContainText("Pending suggestions 1");
+  await expect(projectKeywordCard).toContainText(
+    "English (en): Climate change",
+  );
+  await expect(projectKeywordCard).toContainText(
+    "No approved project keywords yet.",
+  );
+  await projectKeywordCard
+    .getByRole("button", { name: "Approve Climate change" })
+    .click();
+  await expect(projectKeywordCard).toContainText("Approved vocabulary");
+  await expect(projectKeywordCard).toContainText("Climate change");
+  await expect(
+    projectKeywordCard.getByLabel("Aliases for Climate change"),
+  ).toContainText("English (en): Climate change");
+  await expect(projectKeywordCard).toContainText("Pending suggestions 0");
+  await expect(projectKeywordCard).toContainText("v2");
+
+  await page.getByRole("button", { name: "Workbench" }).click();
+  await expect(promisingGroup.getByRole("heading")).toHaveText("Promising 1");
+  await expect(promisingGroup).toContainText("Current keyword evidence");
+  await expect(promisingGroup).toContainText(
+    "Coverage 1/1 · 1 occurrence · 1.00 per minute",
+  );
+  await expect(noMatchesGroup.getByRole("heading")).toHaveText("No matches 0");
+  await canonicalWorklist
+    .getByLabel("Approved keyword filter")
+    .selectOption("019fbb95-cd76-7920-93fa-e23ba755eeb5");
+  await expect(promisingGroup).toContainText("Fixture review video");
+
+  await promisingGroup
+    .getByRole("button", { name: "Show verified keyword evidence" })
+    .click();
+  await expect(promisingGroup.getByRole("alert")).toContainText(
+    "Keyword evidence size verification failed.",
+  );
+  await expect(promisingGroup.locator(".keyword-context-row")).toHaveCount(0);
+  tamperKeywordArtifact = false;
+  await promisingGroup
+    .getByRole("button", { name: "Retry evidence verification" })
+    .click();
+  const verifiedEvidence = promisingGroup.getByRole("button", {
+    name: /0:01\.000 · accurate · English \(en\) · word · A durable workflow keeps research accurate\./,
+  });
+  await expect(verifiedEvidence).toBeVisible();
+  await verifiedEvidence.click();
+  await expect(page.getByLabel("Search transcript")).toHaveValue("accurate");
+  await expect(
+    page.getByText("Opened verified keyword evidence at 1s with word timing."),
+  ).toBeVisible();
+
+  await canonicalWorklist.getByLabel("Select Fixture review video").check();
+  page.once("dialog", (dialog) => dialog.accept());
+  await canonicalWorklist
+    .getByRole("button", { name: "Set high priority" })
+    .click();
+  await expect(canonicalWorklist).toContainText("Priority high");
+  expect(bulkPriorityCommands).toHaveLength(1);
+  expect(bulkPriorityCommands[0]).toMatchObject({
+    priority: "high",
+    items: [
+      {
+        videoId: directVideo.id,
+        expectedProjectVideoVersion: projectVideoVersion - 1,
+      },
+    ],
+  });
+  expect(bulkPriorityCommands[0]!.idempotencyKey).toMatch(
+    /^workbench-bulk-priority:[a-f0-9]{64}$/,
+  );
+  await canonicalWorklist
+    .getByLabel("Approved keyword filter")
+    .selectOption("");
+
+  await page.getByRole("button", { name: "Project Settings" }).click();
+  await projectKeywordCard
+    .getByLabel("Keyword suggestion target")
+    .selectOption("019fbb95-cd76-7920-93fa-e23ba755eeb5");
+  await expect(
+    projectKeywordCard.getByLabel("New keyword label"),
+  ).toBeDisabled();
+  await projectKeywordCard.getByLabel("Keyword alias language").fill("es");
+  await projectKeywordCard
+    .getByLabel("Literal keyword phrase")
+    .fill("Cambio climático");
+  await projectKeywordCard
+    .getByRole("button", { name: "Suggest project keyword" })
+    .click();
+  await expect(projectKeywordCard).toContainText(
+    "Spanish (es): Cambio climático",
+  );
+  page.once("dialog", (dialog) => dialog.accept("Use a more specific phrase."));
+  await projectKeywordCard
+    .getByRole("button", { name: "Reject Cambio climático" })
+    .click();
+  await expect(projectKeywordCard).toContainText("Pending suggestions 0");
+  await expect(projectKeywordCard).toContainText(
+    "2 reviewed suggestion records retained.",
+  );
+  await expect(projectKeywordCard).toContainText("v2");
+  expect(keywordSuggestionCommands).toHaveLength(2);
+  expect(keywordReviewCommands).toHaveLength(2);
+  expect(keywordReviewCommands.map((command) => command.action)).toEqual([
+    "approve",
+    "reject",
+  ]);
+  expect(
+    keywordReviewCommands.map((command) => command.expectedSuggestionVersion),
+  ).toEqual([1, 1]);
+  expect(
+    keywordReviewCommands.map((command) => command.expectedKeywordSetVersion),
+  ).toEqual([1, 2]);
+  expect(keywordReviewCommands[1]!.reason).toBe("Use a more specific phrase.");
+
+  await page.getByRole("button", { name: "Workbench" }).click();
+
+  await expect(page.getByText("Hosted processing: Pending")).toBeVisible();
+  await page.getByRole("button", { name: "Approve hosted processing" }).click();
+  await expect(page.getByText("Hosted processing: Approved")).toBeVisible();
+  await page.getByRole("button", { name: "Revoke hosted approval" }).click();
+  await expect(page.getByText("Hosted processing: Revoked")).toBeVisible();
+  expect(hostedApprovalCommands).toHaveLength(2);
+  expect(hostedApprovalCommands.map((command) => command.action)).toEqual([
+    "approve",
+    "revoke",
+  ]);
+  expect(
+    hostedApprovalCommands.map((command) => command.expectedVersion),
+  ).toEqual([1, 2]);
+  expect(hostedApprovalCommands[0]!.idempotencyKey).not.toBe(
+    hostedApprovalCommands[1]!.idempotencyKey,
+  );
+
   await page.getByRole("button", { name: "Pause pending" }).click();
   await expect(page.getByText(/paused · 1 ready/)).toBeVisible();
+});
+
+test("confirms a language-gated batch item through the catalog worklist", async ({
+  page,
+  context,
+}) => {
+  const now = "2026-08-23T12:00:00.000Z";
+  const projectId = "019fbb95-cd76-7920-93fa-e23ba755ee70";
+  const batchId = "019fbb95-cd76-7920-93fa-e23ba755ee71";
+  const itemId = "019fbb95-cd76-7920-93fa-e23ba755ee72";
+  const videoId = "019fbb95-cd76-7920-93fa-e23ba755ee73";
+  let decisionVersion = 1;
+  let postCount = 0;
+  let gateState: "needs_language_confirmation" | "needs_translation" | "ready" =
+    "needs_language_confirmation";
+  let lastBody: Record<string, unknown> | undefined;
+  const decisionBodies: Record<string, unknown>[] = [];
+  const languageGate = () =>
+    gateState === "ready"
+      ? {
+          state: "ready" as const,
+          status: "confirmed" as const,
+          creatorReportedLanguage: "dz",
+          providerEvidence: {
+            id: "019fbb95-cd76-7920-93fa-e23ba755ee74",
+            projectId,
+            videoId,
+            source: "caption" as const,
+            provider: "fixture-captions",
+            reportedLanguage: "ko",
+            trackFingerprint: "a".repeat(64),
+            captionKind: "automatic" as const,
+            createdAt: now,
+          },
+          decision: {
+            id: "019fbb95-cd76-7920-93fa-e23ba755ee75",
+            projectId,
+            videoId,
+            decisionVersion,
+            status: "confirmed" as const,
+            basis: "user_confirmation" as const,
+            resolvedLanguage: "dz",
+            evidenceId: "019fbb95-cd76-7920-93fa-e23ba755ee74",
+            actorId: "019fbb95-cd76-7920-93fa-e23ba755ee36",
+            createdAt: now,
+          },
+          remediationReason: "none" as const,
+        }
+      : {
+          state: gateState,
+          status: "conflict" as const,
+          creatorReportedLanguage: "dz",
+          providerEvidence: {
+            id: "019fbb95-cd76-7920-93fa-e23ba755ee74",
+            projectId,
+            videoId,
+            source: "caption" as const,
+            provider: "fixture-captions",
+            reportedLanguage: "ko",
+            trackFingerprint: "a".repeat(64),
+            captionKind: "automatic" as const,
+            createdAt: now,
+          },
+          decision: {
+            id: "019fbb95-cd76-7920-93fa-e23ba755ee75",
+            projectId,
+            videoId,
+            decisionVersion,
+            status: "conflict" as const,
+            basis: "creator_metadata" as const,
+            resolvedLanguage: "dz",
+            evidenceId: "019fbb95-cd76-7920-93fa-e23ba755ee74",
+            actorId: "019fbb95-cd76-7920-93fa-e23ba755ee36",
+            createdAt: now,
+          },
+          ...(gateState === "needs_translation"
+            ? {
+                translationCapability: {
+                  provider: "fixture-translate",
+                  operation: "translation" as const,
+                  sourceLanguage: "dz",
+                  targetLanguage: "en",
+                  state: "unsupported" as const,
+                  reason: "language_not_supported" as const,
+                },
+                remediationReason: "select_supported_provider" as const,
+              }
+            : { remediationReason: "resolve_conflict" as const }),
+        };
+  const item = () => ({
+    id: itemId,
+    batchId,
+    inputIndex: 0,
+    input: "GatedFixture001",
+    status: "ready",
+    processingNeed: "transcription",
+    youtubeVideoId: "GatedFixture001",
+    title: "Language-gated fixture",
+    catalogVideoId: videoId,
+    state: gateState === "ready" ? "queued" : "needs_language_confirmation",
+    reviewStatus: "unreviewed",
+    attempt: 0,
+    version: 3,
+    languageGate: languageGate(),
+    createdAt: now,
+    updatedAt: now,
+  });
+  const batch = () => ({
+    id: batchId,
+    projectId,
+    name: "Language gate batch",
+    targetLanguage: "en",
+    transcriptionProfile: "default",
+    sourcePolicy: "prefer-existing",
+    executionLocation: "local",
+    priority: "normal",
+    dispatchStatus: "active",
+    createdBy: "019fbb95-cd76-7920-93fa-e23ba755ee36",
+    version: 1,
+    createdAt: now,
+    updatedAt: now,
+  });
+  const batchResponse = () => ({
+    batch: batch(),
+    items: [item()],
+    summary: {
+      total: 1,
+      ready: 1,
+      existingTranscripts: 0,
+      duplicates: 0,
+      unsupported: 0,
+      metadataFailed: 0,
+    },
+    progress: {
+      total: 1,
+      queued: gateState === "ready" ? 1 : 0,
+      active: 0,
+      readyForReview: 0,
+      blocked: gateState === "ready" ? 0 : 1,
+      failed: 0,
+      retryableFailed: 0,
+      canceled: 0,
+      unreviewed: 1,
+      reviewing: 0,
+      reviewed: 0,
+      skipped: 0,
+    },
+  });
+  await page.route("**/cloud-api/**", async (route) => {
+    const request = route.request();
+    const path = new URL(request.url()).pathname.replace("/cloud-api", "");
+    if (path === "/api/projects") {
+      return route.fulfill({
+        json: [
+          {
+            id: projectId,
+            name: "Language fixture project",
+            description: "",
+            kind: "shared",
+            visibility: "invitation_only",
+            currentUserRole: "owner",
+            memberCount: 1,
+            version: 1,
+            createdAt: now,
+            updatedAt: now,
+          },
+        ],
+      });
+    }
+    if (path === `/api/projects/${projectId}/transcription-batches`) {
+      return route.fulfill({
+        json: {
+          batches: [{ batch: batch(), progress: batchResponse().progress }],
+        },
+      });
+    }
+    if (path === `/api/projects/${projectId}/review-inbox`) {
+      return route.fulfill({ json: { items: [] } });
+    }
+    if (
+      path === `/api/projects/${projectId}/transcription-batches/${batchId}`
+    ) {
+      return route.fulfill({ json: batchResponse() });
+    }
+    if (
+      path === `/api/projects/${projectId}/videos/${videoId}/language-decisions`
+    ) {
+      lastBody = request.postDataJSON();
+      decisionBodies.push(lastBody!);
+      postCount += 1;
+      if (postCount === 1) {
+        decisionVersion = 2;
+        return route.fulfill({
+          status: 409,
+          json: {
+            error: {
+              code: "stale_version",
+              message: "Decision changed.",
+              retryable: true,
+            },
+          },
+        });
+      }
+      if (postCount === 2) {
+        gateState = "needs_translation";
+        return route.fulfill({
+          json: { decision: languageGate().decision, gate: languageGate() },
+        });
+      }
+      gateState = "ready";
+      return route.fulfill({
+        json: { decision: languageGate().decision, gate: languageGate() },
+      });
+    }
+    const localProcessing = defaultLocalProcessingStatus(path);
+    if (localProcessing) return route.fulfill({ json: localProcessing });
+    const keywordCatalog = defaultProjectKeywordCatalog(path);
+    if (keywordCatalog) return route.fulfill({ json: keywordCatalog });
+    if (path.includes("/worklist")) {
+      return route.fulfill({ json: { items: [], total: 0 } });
+    }
+    return route.fulfill({ status: 404, json: { error: "not found" } });
+  });
+
+  await page.goto("/");
+  await page
+    .getByLabel("Development session credential")
+    .fill("Bearer 019fbb95-cd76-7920-93fa-e23ba755ee36|fixture:web");
+  await page.getByRole("button", { name: "Connect" }).click();
+  const fieldset = page.getByRole("group", {
+    name: "Language confirmation required",
+  });
+  await expect(fieldset).toContainText("Provider-reported language: ko");
+  await expect(fieldset).toContainText("Creator-reported language: dz");
+  await expect(fieldset).toContainText("Current resolved language: dz");
+  await expect(fieldset).toContainText(
+    "Status: conflict. Basis: creator_metadata.",
+  );
+  await expect(
+    fieldset
+      .getByLabel("Confirmed spoken language for Language-gated fixture")
+      .locator("option"),
+  ).toHaveText(["dz", "ko"]);
+  await expect(page.getByRole("button", { name: "Open video" })).toHaveCount(0);
+
+  await fieldset
+    .getByRole("button", { name: "Confirm language and retry" })
+    .click();
+  await expect(fieldset).toContainText("Decision changed.");
+  expect(lastBody).toMatchObject({
+    expectedDecisionVersion: 1,
+    resolvedLanguage: "dz",
+    basis: "user_confirmation",
+    evidenceId: "019fbb95-cd76-7920-93fa-e23ba755ee74",
+    batchItemId: itemId,
+    expectedBatchItemVersion: 3,
+  });
+  expect(JSON.stringify(lastBody)).not.toMatch(
+    /fixture-captions|GatedFixture001|https?:|path/i,
+  );
+
+  await fieldset
+    .getByRole("button", { name: "Confirm language and retry" })
+    .click();
+  await expect(fieldset).toContainText(
+    "Translation is unsupported (language not supported).",
+  );
+  await expect(
+    fieldset.getByRole("button", {
+      name: "Choose a supported language to retry",
+    }),
+  ).toBeDisabled();
+  expect(decisionBodies[1]?.idempotencyKey).toBe(
+    decisionBodies[0]?.idempotencyKey,
+  );
+  await fieldset
+    .getByLabel("Confirmed spoken language for Language-gated fixture")
+    .selectOption("ko");
+
+  await fieldset
+    .getByRole("button", { name: "Confirm language and retry" })
+    .click();
+  await expect(fieldset).toHaveCount(0);
+  expect(decisionBodies[2]?.idempotencyKey).not.toBe(
+    decisionBodies[1]?.idempotencyKey,
+  );
+  await page.reload();
+  await expect(
+    page.getByRole("group", { name: "Language confirmation required" }),
+  ).toHaveCount(0);
+
+  const secondClient = await context.newPage();
+  await secondClient.goto("/");
+  await secondClient
+    .getByLabel("Development session credential")
+    .fill("Bearer 019fbb95-cd76-7920-93fa-e23ba755ee36|fixture:web");
+  await secondClient.getByRole("button", { name: "Connect" }).click();
+  await expect(
+    secondClient.getByRole("group", { name: "Language confirmation required" }),
+  ).toHaveCount(0);
+  await secondClient.close();
+});
+
+test("does not leak a delayed language gate after changing projects", async ({
+  page,
+}) => {
+  const now = "2026-08-23T12:00:00.000Z";
+  const projectA = "019fbb95-cd76-7920-93fa-e23ba755ee80";
+  const projectB = "019fbb95-cd76-7920-93fa-e23ba755ee81";
+  const batchA = "019fbb95-cd76-7920-93fa-e23ba755ee82";
+  const batchB = "019fbb95-cd76-7920-93fa-e23ba755ee83";
+  let resolveDelayedBatchA: (() => void) | undefined;
+  const delayedBatchA = new Promise<void>((resolve) => {
+    resolveDelayedBatchA = resolve;
+  });
+  let batchARequested = false;
+  const batch = (id: string, projectId: string, name: string) => ({
+    id,
+    projectId,
+    name,
+    targetLanguage: "en",
+    transcriptionProfile: "default",
+    sourcePolicy: "prefer-existing",
+    executionLocation: "local",
+    priority: "normal",
+    dispatchStatus: "active",
+    createdBy: "019fbb95-cd76-7920-93fa-e23ba755ee36",
+    version: 1,
+    createdAt: now,
+    updatedAt: now,
+  });
+  const progress = {
+    total: 1,
+    queued: 0,
+    active: 0,
+    readyForReview: 0,
+    blocked: 1,
+    failed: 0,
+    retryableFailed: 0,
+    canceled: 0,
+    unreviewed: 1,
+    reviewing: 0,
+    reviewed: 0,
+    skipped: 0,
+  };
+  const gateItem = {
+    id: "019fbb95-cd76-7920-93fa-e23ba755ee84",
+    batchId: batchA,
+    inputIndex: 0,
+    input: "DelayedGateFixture001",
+    status: "ready",
+    processingNeed: "transcription",
+    youtubeVideoId: "DelayedGateFixture001",
+    title: "Delayed language gate",
+    catalogVideoId: "019fbb95-cd76-7920-93fa-e23ba755ee85",
+    state: "needs_language_confirmation",
+    reviewStatus: "unreviewed",
+    attempt: 0,
+    version: 1,
+    languageGate: {
+      state: "needs_language_confirmation",
+      status: "conflict",
+      creatorReportedLanguage: "dz",
+      remediationReason: "resolve_conflict",
+    },
+    createdAt: now,
+    updatedAt: now,
+  };
+  await page.route("**/cloud-api/**", async (route) => {
+    const path = new URL(route.request().url()).pathname.replace(
+      "/cloud-api",
+      "",
+    );
+    if (path === "/api/projects") {
+      return route.fulfill({
+        json: [
+          {
+            id: projectA,
+            name: "Project A",
+            description: "",
+            kind: "shared",
+            visibility: "invitation_only",
+            currentUserRole: "owner",
+            memberCount: 1,
+            version: 1,
+            createdAt: now,
+            updatedAt: now,
+          },
+          {
+            id: projectB,
+            name: "Project B",
+            description: "",
+            kind: "shared",
+            visibility: "invitation_only",
+            currentUserRole: "owner",
+            memberCount: 1,
+            version: 1,
+            createdAt: now,
+            updatedAt: now,
+          },
+        ],
+      });
+    }
+    const projectId = path.match(/^\/api\/projects\/([^/]+)/)?.[1];
+    if (projectId && path.endsWith("/transcription-batches")) {
+      const selected =
+        projectId === projectA
+          ? batch(batchA, projectA, "A batch")
+          : batch(batchB, projectB, "B batch");
+      return route.fulfill({
+        json: { batches: [{ batch: selected, progress }] },
+      });
+    }
+    if (projectId && path.endsWith("/review-inbox"))
+      return route.fulfill({ json: { items: [] } });
+    if (path.endsWith(`/transcription-batches/${batchA}`)) {
+      batchARequested = true;
+      await delayedBatchA;
+      return route.fulfill({
+        json: {
+          batch: batch(batchA, projectA, "A batch"),
+          items: [gateItem],
+          summary: {
+            total: 1,
+            ready: 1,
+            existingTranscripts: 0,
+            duplicates: 0,
+            unsupported: 0,
+            metadataFailed: 0,
+          },
+          progress,
+        },
+      });
+    }
+    if (path.endsWith(`/transcription-batches/${batchB}`)) {
+      return route.fulfill({
+        json: {
+          batch: batch(batchB, projectB, "B batch"),
+          items: [],
+          summary: {
+            total: 0,
+            ready: 0,
+            existingTranscripts: 0,
+            duplicates: 0,
+            unsupported: 0,
+            metadataFailed: 0,
+          },
+          progress: { ...progress, total: 0, blocked: 0, unreviewed: 0 },
+        },
+      });
+    }
+    if (path === `/api/projects/${projectA}/keywords`) {
+      return route.fulfill({
+        json: {
+          projectId: projectA,
+          keywordSetVersion: 2,
+          keywords: [
+            {
+              id: "019fbb95-cd76-7920-93fa-e23ba755ee86",
+              projectId: projectA,
+              label: "Project A only keyword",
+              enabled: true,
+              version: 1,
+              createdBy: {
+                userId: "019fbb95-cd76-7920-93fa-e23ba755ee36",
+                handle: "e2e_user",
+                displayName: "E2E User",
+              },
+              createdAt: now,
+              updatedAt: now,
+              aliases: [
+                {
+                  id: "019fbb95-cd76-7920-93fa-e23ba755ee87",
+                  projectId: projectA,
+                  keywordId: "019fbb95-cd76-7920-93fa-e23ba755ee86",
+                  language: "en",
+                  phrase: "Project A only keyword",
+                  normalizedPhrase: "project a only keyword",
+                  enabled: true,
+                  version: 1,
+                  createdBy: {
+                    userId: "019fbb95-cd76-7920-93fa-e23ba755ee36",
+                    handle: "e2e_user",
+                    displayName: "E2E User",
+                  },
+                  createdAt: now,
+                  updatedAt: now,
+                },
+              ],
+            },
+          ],
+          suggestions: [],
+        },
+      });
+    }
+    const localProcessing = defaultLocalProcessingStatus(path);
+    if (localProcessing) return route.fulfill({ json: localProcessing });
+    const keywordCatalog = defaultProjectKeywordCatalog(path);
+    if (keywordCatalog) return route.fulfill({ json: keywordCatalog });
+    if (path.includes("/worklist")) {
+      return route.fulfill({ json: { items: [], total: 0 } });
+    }
+    return route.fulfill({ status: 404, json: { error: "not found" } });
+  });
+  await page.goto("/");
+  await page
+    .getByLabel("Development session credential")
+    .fill("Bearer 019fbb95-cd76-7920-93fa-e23ba755ee36|fixture:web");
+  await page.getByRole("button", { name: "Connect" }).click();
+  await expect.poll(() => batchARequested).toBe(true);
+  await page.getByRole("button", { name: "Project Settings" }).click();
+  await expect(page.getByLabel("Project keywords")).toContainText(
+    "Project A only keyword",
+  );
+  await page.getByRole("button", { name: "Workbench" }).click();
+  await page.getByLabel("Keyword result group").selectOption("action_needed");
+  await page.getByLabel("Keyword scan state").selectOption("failed");
+  await page
+    .getByLabel("Approved keyword filter")
+    .selectOption("019fbb95-cd76-7920-93fa-e23ba755ee86");
+  await page.getByLabel("Keyword result sort").selectOption("recency");
+  await page.getByLabel("Active project").selectOption(projectB);
+  await expect(page.getByText("B batch", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Project Settings" }).click();
+  await expect(page.getByLabel("Project keywords")).not.toContainText(
+    "Project A only keyword",
+  );
+  await page.getByRole("button", { name: "Workbench" }).click();
+  await expect(page.getByLabel("Keyword result group")).toHaveValue("all");
+  await expect(page.getByLabel("Keyword scan state")).toHaveValue("all");
+  await expect(page.getByLabel("Approved keyword filter")).toHaveValue("");
+  await expect(page.getByLabel("Keyword result sort")).toHaveValue("coverage");
+  await expect(
+    page
+      .getByLabel("Approved keyword filter")
+      .locator('option[value="019fbb95-cd76-7920-93fa-e23ba755ee86"]'),
+  ).toHaveCount(0);
+  resolveDelayedBatchA?.();
+  await expect(
+    page.getByText("Delayed language gate", { exact: true }),
+  ).toHaveCount(0);
+  await expect(
+    page.getByRole("group", { name: "Language confirmation required" }),
+  ).toHaveCount(0);
+});
+
+test("does not render an older delayed batch selection in the same project", async ({
+  page,
+}) => {
+  const now = "2026-08-24T00:00:00.000Z";
+  const projectId = "019fbb95-cd76-7920-93fa-e23ba755ee90";
+  const batchAId = "019fbb95-cd76-7920-93fa-e23ba755ee91";
+  const batchBId = "019fbb95-cd76-7920-93fa-e23ba755ee92";
+  let releaseBatchA: (() => void) | undefined;
+  let batchARequested = false;
+  const delayedBatchA = new Promise<void>((resolve) => {
+    releaseBatchA = resolve;
+  });
+  const batch = (id: string, name: string) => ({
+    id,
+    projectId,
+    name,
+    targetLanguage: "en",
+    transcriptionProfile: "default",
+    sourcePolicy: "prefer-existing",
+    executionLocation: "local",
+    priority: "normal",
+    dispatchStatus: "active",
+    createdBy: "019fbb95-cd76-7920-93fa-e23ba755ee36",
+    version: 1,
+    createdAt: now,
+    updatedAt: now,
+  });
+  const progress = {
+    total: 0,
+    queued: 0,
+    active: 0,
+    readyForReview: 0,
+    blocked: 0,
+    failed: 0,
+    retryableFailed: 0,
+    canceled: 0,
+    unreviewed: 0,
+    reviewing: 0,
+    reviewed: 0,
+    skipped: 0,
+  };
+  const response = (id: string, name: string, items: unknown[] = []) => ({
+    batch: batch(id, name),
+    items,
+    summary: {
+      total: items.length,
+      ready: items.length,
+      existingTranscripts: 0,
+      duplicates: 0,
+      unsupported: 0,
+      metadataFailed: 0,
+    },
+    progress: {
+      ...progress,
+      total: items.length,
+      blocked: items.length,
+      unreviewed: items.length,
+    },
+  });
+  const delayedGateItem = {
+    id: "019fbb95-cd76-7920-93fa-e23ba755ee93",
+    batchId: batchAId,
+    inputIndex: 0,
+    input: "DelayedSameProject001",
+    status: "ready",
+    processingNeed: "transcription",
+    youtubeVideoId: "DelayedSameProject001",
+    title: "Older delayed language gate",
+    catalogVideoId: "019fbb95-cd76-7920-93fa-e23ba755ee94",
+    state: "needs_language_confirmation",
+    reviewStatus: "unreviewed",
+    attempt: 0,
+    version: 1,
+    languageGate: {
+      state: "needs_language_confirmation",
+      status: "conflict",
+      creatorReportedLanguage: "dz",
+      remediationReason: "resolve_conflict",
+    },
+    createdAt: now,
+    updatedAt: now,
+  };
+  await page.route("**/cloud-api/**", async (route) => {
+    const path = new URL(route.request().url()).pathname.replace(
+      "/cloud-api",
+      "",
+    );
+    if (path === "/api/projects") {
+      return route.fulfill({
+        json: [
+          {
+            id: projectId,
+            name: "Same-project fixture",
+            description: "",
+            kind: "shared",
+            visibility: "invitation_only",
+            currentUserRole: "owner",
+            memberCount: 1,
+            version: 1,
+            createdAt: now,
+            updatedAt: now,
+          },
+        ],
+      });
+    }
+    if (path === `/api/projects/${projectId}/transcription-batches`) {
+      return route.fulfill({
+        json: {
+          batches: [
+            { batch: batch(batchAId, "Batch A delayed"), progress },
+            { batch: batch(batchBId, "Batch B current"), progress },
+          ],
+        },
+      });
+    }
+    if (path === `/api/projects/${projectId}/review-inbox`)
+      return route.fulfill({ json: { items: [] } });
+    if (path.endsWith(`/transcription-batches/${batchAId}`)) {
+      batchARequested = true;
+      await delayedBatchA;
+      return route.fulfill({
+        json: response(batchAId, "Batch A delayed", [delayedGateItem]),
+      });
+    }
+    if (path.endsWith(`/transcription-batches/${batchBId}`)) {
+      return route.fulfill({
+        json: response(batchBId, "Batch B current"),
+      });
+    }
+    const localProcessing = defaultLocalProcessingStatus(path);
+    if (localProcessing) return route.fulfill({ json: localProcessing });
+    const keywordCatalog = defaultProjectKeywordCatalog(path);
+    if (keywordCatalog) return route.fulfill({ json: keywordCatalog });
+    if (path.includes("/worklist")) {
+      return route.fulfill({ json: { items: [], total: 0 } });
+    }
+    return route.fulfill({ status: 404, json: { error: "not found" } });
+  });
+
+  await page.goto("/");
+  await page
+    .getByLabel("Development session credential")
+    .fill("Bearer 019fbb95-cd76-7920-93fa-e23ba755ee36|fixture:web");
+  await page.getByRole("button", { name: "Connect" }).click();
+  await expect.poll(() => batchARequested).toBe(true);
+  const batchBButton = page.getByRole("button", { name: /Batch B current/ });
+  await batchBButton.click();
+  await expect(batchBButton).toHaveClass(/selected/);
+  releaseBatchA?.();
+  await expect(
+    page.getByRole("group", { name: "Language confirmation required" }),
+  ).toHaveCount(0);
+  await expect(page.getByText("Older delayed language gate")).toHaveCount(0);
+  await expect(batchBButton).toHaveClass(/selected/);
+});
+
+test("keeps a newer batch selected when an older language confirmation completes", async ({
+  page,
+}) => {
+  const now = "2026-08-24T00:05:00.000Z";
+  const projectId = "019fbb95-cd76-7920-93fa-e23ba755ee95";
+  const batchAId = "019fbb95-cd76-7920-93fa-e23ba755ee96";
+  const batchBId = "019fbb95-cd76-7920-93fa-e23ba755ee97";
+  const itemId = "019fbb95-cd76-7920-93fa-e23ba755ee98";
+  const videoId = "019fbb95-cd76-7920-93fa-e23ba755ee99";
+  let releaseConfirmation: (() => void) | undefined;
+  let confirmationStarted = false;
+  let confirmationCompleted = false;
+  const delayedConfirmation = new Promise<void>((resolve) => {
+    releaseConfirmation = resolve;
+  });
+  const batch = (id: string, name: string) => ({
+    id,
+    projectId,
+    name,
+    targetLanguage: "en",
+    transcriptionProfile: "default",
+    sourcePolicy: "prefer-existing",
+    executionLocation: "local",
+    priority: "normal",
+    dispatchStatus: "active",
+    createdBy: "019fbb95-cd76-7920-93fa-e23ba755ee36",
+    version: 1,
+    createdAt: now,
+    updatedAt: now,
+  });
+  const progress = {
+    total: 0,
+    queued: 0,
+    active: 0,
+    readyForReview: 0,
+    blocked: 0,
+    failed: 0,
+    retryableFailed: 0,
+    canceled: 0,
+    unreviewed: 0,
+    reviewing: 0,
+    reviewed: 0,
+    skipped: 0,
+  };
+  const languageGate = {
+    state: "needs_language_confirmation" as const,
+    status: "conflict" as const,
+    creatorReportedLanguage: "dz",
+    providerEvidence: {
+      id: "019fbb95-cd76-7920-93fa-e23ba755ee9a",
+      projectId,
+      videoId,
+      source: "caption" as const,
+      provider: "fixture-captions",
+      reportedLanguage: "ko",
+      captionKind: "automatic" as const,
+      createdAt: now,
+    },
+    remediationReason: "resolve_conflict" as const,
+  };
+  const gatedItem = {
+    id: itemId,
+    batchId: batchAId,
+    inputIndex: 0,
+    input: "ConfirmRace001",
+    status: "ready",
+    processingNeed: "transcription",
+    youtubeVideoId: "ConfirmRace001",
+    title: "Confirmation race gate",
+    catalogVideoId: videoId,
+    state: "needs_language_confirmation",
+    reviewStatus: "unreviewed",
+    attempt: 0,
+    version: 1,
+    languageGate,
+    createdAt: now,
+    updatedAt: now,
+  };
+  const batchResponse = (id: string, name: string, items: unknown[]) => ({
+    batch: batch(id, name),
+    items,
+    summary: {
+      total: items.length,
+      ready: items.length,
+      existingTranscripts: 0,
+      duplicates: 0,
+      unsupported: 0,
+      metadataFailed: 0,
+    },
+    progress: {
+      ...progress,
+      total: items.length,
+      blocked: items.length,
+      unreviewed: items.length,
+    },
+  });
+  await page.route("**/cloud-api/**", async (route) => {
+    const path = new URL(route.request().url()).pathname.replace(
+      "/cloud-api",
+      "",
+    );
+    if (path === "/api/projects") {
+      return route.fulfill({
+        json: [
+          {
+            id: projectId,
+            name: "Confirmation race project",
+            description: "",
+            kind: "shared",
+            visibility: "invitation_only",
+            currentUserRole: "owner",
+            memberCount: 1,
+            version: 1,
+            createdAt: now,
+            updatedAt: now,
+          },
+        ],
+      });
+    }
+    if (path === `/api/projects/${projectId}/transcription-batches`) {
+      return route.fulfill({
+        json: {
+          batches: [
+            { batch: batch(batchAId, "Batch A confirmation"), progress },
+            { batch: batch(batchBId, "Batch B selected"), progress },
+          ],
+        },
+      });
+    }
+    if (path === `/api/projects/${projectId}/review-inbox`)
+      return route.fulfill({ json: { items: [] } });
+    if (path.endsWith(`/transcription-batches/${batchAId}`)) {
+      return route.fulfill({
+        json: batchResponse(batchAId, "Batch A confirmation", [gatedItem]),
+      });
+    }
+    if (path.endsWith(`/transcription-batches/${batchBId}`)) {
+      return route.fulfill({
+        json: batchResponse(batchBId, "Batch B selected", []),
+      });
+    }
+    if (
+      path === `/api/projects/${projectId}/videos/${videoId}/language-decisions`
+    ) {
+      confirmationStarted = true;
+      await delayedConfirmation;
+      confirmationCompleted = true;
+      return route.fulfill({
+        json: {
+          decision: {
+            id: "019fbb95-cd76-7920-93fa-e23ba755ee9b",
+            projectId,
+            videoId,
+            decisionVersion: 1,
+            status: "confirmed",
+            basis: "user_confirmation",
+            resolvedLanguage: "dz",
+            actorId: "019fbb95-cd76-7920-93fa-e23ba755ee36",
+            createdAt: now,
+          },
+          gate: {
+            state: "ready",
+            status: "confirmed",
+            remediationReason: "none",
+          },
+        },
+      });
+    }
+    const localProcessing = defaultLocalProcessingStatus(path);
+    if (localProcessing) return route.fulfill({ json: localProcessing });
+    const keywordCatalog = defaultProjectKeywordCatalog(path);
+    if (keywordCatalog) return route.fulfill({ json: keywordCatalog });
+    if (path.includes("/worklist")) {
+      return route.fulfill({ json: { items: [], total: 0 } });
+    }
+    return route.fulfill({ status: 404, json: { error: "not found" } });
+  });
+
+  await page.goto("/");
+  await page
+    .getByLabel("Development session credential")
+    .fill("Bearer 019fbb95-cd76-7920-93fa-e23ba755ee36|fixture:web");
+  await page.getByRole("button", { name: "Connect" }).click();
+  await page
+    .getByRole("group", { name: "Language confirmation required" })
+    .getByRole("button", { name: "Confirm language and retry" })
+    .click();
+  await expect.poll(() => confirmationStarted).toBe(true);
+  const batchBButton = page.getByRole("button", { name: /Batch B selected/ });
+  await batchBButton.click();
+  await expect(batchBButton).toHaveClass(/selected/);
+  releaseConfirmation?.();
+  await expect.poll(() => confirmationCompleted).toBe(true);
+  await expect(
+    page.getByRole("group", { name: "Language confirmation required" }),
+  ).toHaveCount(0);
+  await expect(batchBButton).toHaveClass(/selected/);
+});
+
+test("imports two timed tracks and takes over a delayed finalizer without re-uploading", async ({
+  page,
+  context,
+}) => {
+  const now = "2026-08-24T01:00:00.000Z";
+  const projectId = "019fbb95-cd76-7920-93fa-e23ba755eaa1";
+  const batchId = "019fbb95-cd76-7920-93fa-e23ba755eaa2";
+  const itemId = "019fbb95-cd76-7920-93fa-e23ba755eaa3";
+  const videoId = "019fbb95-cd76-7920-93fa-e23ba755eaa4";
+  const importId = "019fbb95-cd76-7920-93fa-e23ba755eaa5";
+  const decisionId = "019fbb95-cd76-7920-93fa-e23ba755eaa6";
+  const candidateId = "019fbb95-cd76-7920-93fa-e23ba755eaa7";
+  const transcriptVersionId = "019fbb95-cd76-7920-93fa-e23ba755eaa8";
+  const originalTrackId = "019fbb95-cd76-7920-93fa-e23ba755eaa9";
+  const englishTrackId = "019fbb95-cd76-7920-93fa-e23ba755eaaa";
+  const projectB = "019fbb95-cd76-7920-93fa-e23ba755eab1";
+  const batchB = "019fbb95-cd76-7920-93fa-e23ba755eab2";
+  let finalized = false;
+  let finalizationInProgress = false;
+  let finalizeAttempts = 0;
+  let delayUploads = false;
+  let reviewAttempts = 0;
+  let activated = false;
+  let releaseFirstReview: (() => void) | undefined;
+  const delayedFirstReview = new Promise<void>(
+    (resolve) => (releaseFirstReview = resolve),
+  );
+  let releaseUploads: (() => void) | undefined;
+  const delayedUploads = new Promise<void>(
+    (resolve) => (releaseUploads = resolve),
+  );
+  const putBodies: Buffer[] = [];
+  const batch = () => ({
+    id: batchId,
+    projectId,
+    name: "Timed import",
+    targetLanguage: "en",
+    transcriptionProfile: "default",
+    sourcePolicy: "prefer-existing",
+    executionLocation: "local",
+    priority: "normal",
+    dispatchStatus: "active",
+    createdBy: "019fbb95-cd76-7920-93fa-e23ba755ee36",
+    version: 1,
+    createdAt: now,
+    updatedAt: now,
+  });
+  const item = () => ({
+    id: itemId,
+    batchId,
+    inputIndex: 0,
+    input: "TimedImport001",
+    status: "ready",
+    processingNeed: "transcription",
+    youtubeVideoId: "TimedImport001",
+    title: "Timed import fixture",
+    catalogVideoId: videoId,
+    state: "needs_language_confirmation",
+    reviewStatus: "unreviewed",
+    attempt: 0,
+    version: 1,
+    createdAt: now,
+    updatedAt: now,
+    languageGate: {
+      state: "needs_translation",
+      status: "confirmed",
+      creatorReportedLanguage: "dz",
+      decision: {
+        id: decisionId,
+        projectId,
+        videoId,
+        decisionVersion: 1,
+        status: "confirmed",
+        basis: "user_confirmation",
+        resolvedLanguage: "dz",
+        actorId: "019fbb95-cd76-7920-93fa-e23ba755ee36",
+        createdAt: now,
+      },
+      translationCapability: {
+        provider: "fixture-translate",
+        operation: "translation",
+        sourceLanguage: "dz",
+        targetLanguage: "en",
+        state: "unsupported",
+        reason: "language_not_supported",
+      },
+      remediationReason: "select_supported_provider",
+    },
+  });
+  const response = () => ({
+    batch: batch(),
+    items: [item()],
+    summary: {
+      total: 1,
+      ready: 1,
+      existingTranscripts: 0,
+      duplicates: 0,
+      unsupported: 0,
+      metadataFailed: 0,
+    },
+    progress: {
+      total: 1,
+      queued: 0,
+      active: 0,
+      readyForReview: finalized ? 1 : 0,
+      blocked: finalized ? 0 : 1,
+      failed: 0,
+      retryableFailed: 0,
+      canceled: 0,
+      unreviewed: 1,
+      reviewing: 0,
+      reviewed: 0,
+      skipped: 0,
+    },
+  });
+  await context.route("**/timed-upload/**", async (route) => {
+    if (route.request().method() === "OPTIONS") {
+      return route.fulfill({
+        status: 204,
+        headers: {
+          "access-control-allow-origin": "*",
+          "access-control-allow-methods": "PUT",
+          "access-control-allow-headers": "content-type",
+        },
+      });
+    }
+    putBodies.push(Buffer.from(route.request().postDataBuffer() ?? []));
+    if (delayUploads) await delayedUploads;
+    await route.fulfill({
+      status: 200,
+      headers: {
+        "access-control-allow-origin": "*",
+        "x-amz-version-id": `version-${putBodies.length}`,
+      },
+    });
+  });
+  await context.route("**/cloud-api/**", async (route) => {
+    const request = route.request();
+    const url = new URL(request.url());
+    const path = url.pathname.replace("/cloud-api", "");
+    if (path === "/api/projects")
+      return route.fulfill({
+        json: [
+          {
+            id: projectId,
+            name: "Timed import project",
+            description: "",
+            kind: "shared",
+            visibility: "invitation_only",
+            currentUserRole: "owner",
+            memberCount: 1,
+            version: 1,
+            createdAt: now,
+            updatedAt: now,
+          },
+          {
+            id: projectB,
+            name: "Other project",
+            description: "",
+            kind: "shared",
+            visibility: "invitation_only",
+            currentUserRole: "owner",
+            memberCount: 1,
+            version: 1,
+            createdAt: now,
+            updatedAt: now,
+          },
+        ],
+      });
+    if (path === `/api/projects/${projectB}/transcription-batches`)
+      return route.fulfill({
+        json: {
+          batches: [
+            {
+              batch: {
+                ...batch(),
+                id: batchB,
+                projectId: projectB,
+                name: "Other batch",
+              },
+              progress: { ...response().progress, total: 0, blocked: 0 },
+            },
+          ],
+        },
+      });
+    if (path === `/api/projects/${projectB}/review-inbox`)
+      return route.fulfill({ json: { items: [] } });
+    if (path === `/api/projects/${projectB}/transcription-batches/${batchB}`)
+      return route.fulfill({
+        json: {
+          batch: {
+            ...batch(),
+            id: batchB,
+            projectId: projectB,
+            name: "Other batch",
+          },
+          items: [],
+          summary: {
+            total: 0,
+            ready: 0,
+            existingTranscripts: 0,
+            duplicates: 0,
+            unsupported: 0,
+            metadataFailed: 0,
+          },
+          progress: { ...response().progress, total: 0, blocked: 0 },
+        },
+      });
+    if (path === `/api/projects/${projectId}/transcription-batches`)
+      return route.fulfill({
+        json: { batches: [{ batch: batch(), progress: response().progress }] },
+      });
+    if (path === `/api/projects/${projectId}/review-inbox`)
+      return route.fulfill({ json: { items: [] } });
+    if (path === `/api/projects/${projectId}/transcription-batches/${batchId}`)
+      return route.fulfill({ json: response() });
+    const base = `/api/projects/${projectId}/videos/${videoId}/timed-transcript-imports`;
+    if (path === base && url.searchParams.get("batchItemId") === itemId)
+      return finalized
+        ? route.fulfill({
+            json: {
+              importId,
+              projectId,
+              catalogVideoId: videoId,
+              batchItemId: itemId,
+              state: "finalized",
+              version: 1,
+              sourceLanguage: "dz",
+              targetLanguage: "en",
+              languageDecisionId: "019fbb95-cd76-7920-93fa-e23ba755eaa6",
+              languageDecisionVersion: 1,
+              createdAt: now,
+              expiresAt: now,
+              candidate: {
+                candidateId: "019fbb95-cd76-7920-93fa-e23ba755eaa7",
+                transcriptVersionId: "019fbb95-cd76-7920-93fa-e23ba755eaa8",
+                timingPrecision: "cue",
+                finalizedAt: now,
+              },
+            },
+          })
+        : finalizationInProgress
+          ? route.fulfill({
+              json: {
+                importId,
+                projectId,
+                catalogVideoId: videoId,
+                batchItemId: itemId,
+                state: "finalizing",
+                version: 1,
+                sourceLanguage: "dz",
+                targetLanguage: "en",
+                languageDecisionId: "019fbb95-cd76-7920-93fa-e23ba755eaa6",
+                languageDecisionVersion: 1,
+                createdAt: now,
+                expiresAt: now,
+              },
+            })
+          : route.fulfill({
+              status: 404,
+              json: {
+                error: {
+                  code: "not_found",
+                  message: "Not found",
+                  retryable: false,
+                },
+              },
+            });
+    if (path === base && request.method() === "POST")
+      return route.fulfill({
+        json: {
+          importId,
+          projectId,
+          catalogVideoId: videoId,
+          batchItemId: itemId,
+          sourceLanguage: "dz",
+          languageDecisionId: "019fbb95-cd76-7920-93fa-e23ba755eaa6",
+          languageDecisionVersion: 1,
+          expiresAt: now,
+          targets: [
+            {
+              role: "original",
+              format: "srt",
+              objectKey: "private",
+              uploadUrl: "/timed-upload/original",
+            },
+            {
+              role: "english",
+              format: "vtt",
+              objectKey: "private",
+              uploadUrl: "/timed-upload/english",
+            },
+          ],
+        },
+      });
+    if (path === `${base}/${importId}/finalize`) {
+      finalizeAttempts += 1;
+      if (finalizeAttempts === 1) {
+        return route.fulfill({
+          status: 422,
+          json: {
+            error: {
+              code: "cue_out_of_bounds",
+              message: "Timed cue is outside the video duration.",
+              retryable: false,
+            },
+          },
+        });
+      }
+      if (finalizeAttempts === 2) {
+        finalizationInProgress = true;
+        return route.fulfill({
+          json: {
+            importId,
+            projectId,
+            catalogVideoId: videoId,
+            batchItemId: itemId,
+            state: "finalizing",
+            version: 1,
+            sourceLanguage: "dz",
+            targetLanguage: "en",
+            languageDecisionId: "019fbb95-cd76-7920-93fa-e23ba755eaa6",
+            languageDecisionVersion: 1,
+            createdAt: now,
+            expiresAt: now,
+          },
+        });
+      }
+      finalized = true;
+      finalizationInProgress = false;
+      return route.fulfill({
+        json: {
+          importId,
+          projectId,
+          catalogVideoId: videoId,
+          batchItemId: itemId,
+          state: "finalized",
+          version: 1,
+          sourceLanguage: "dz",
+          targetLanguage: "en",
+          languageDecisionId: "019fbb95-cd76-7920-93fa-e23ba755eaa6",
+          languageDecisionVersion: 1,
+          createdAt: now,
+          expiresAt: now,
+          candidate: {
+            candidateId: "019fbb95-cd76-7920-93fa-e23ba755eaa7",
+            transcriptVersionId: "019fbb95-cd76-7920-93fa-e23ba755eaa8",
+            timingPrecision: "cue",
+            finalizedAt: now,
+          },
+        },
+      });
+    }
+    const candidateBase = `/api/projects/${projectId}/videos/${videoId}/timed-transcript-candidates/${candidateId}`;
+    if (path === `${candidateBase}/review`) {
+      reviewAttempts += 1;
+      if (reviewAttempts === 1) await delayedFirstReview;
+      return route.fulfill({
+        json: {
+          candidateId,
+          importId,
+          transcriptVersionId,
+          projectId,
+          catalogVideoId: videoId,
+          projectVideoVersion: 3,
+          languageDecisionId: decisionId,
+          languageDecisionVersion: 1,
+          finalizedAt: now,
+          offset: 0,
+          limit: 25,
+          hasMore: false,
+          original: {
+            trackId: originalTrackId,
+            trackVersion: 1,
+            language: "dz",
+            kind: "original",
+            source: "manual-import",
+            provider: "researcher-timed-import",
+            timingPrecision: "cue",
+            contentSha256: "a".repeat(64),
+            totalCues: 1,
+            cues: [
+              {
+                id: "019fbb95-cd76-7920-93fa-e23ba755eaab",
+                ordinal: 0,
+                startMs: 0,
+                endMs: 1_000,
+                text: "ཀ",
+              },
+            ],
+          },
+          english: {
+            trackId: englishTrackId,
+            trackVersion: 1,
+            language: "en",
+            kind: "english",
+            source: "manual-import",
+            provider: "researcher-timed-import",
+            sourceTrackId: originalTrackId,
+            timingPrecision: "cue",
+            contentSha256: "b".repeat(64),
+            totalCues: 1,
+            cues: [
+              {
+                id: "019fbb95-cd76-7920-93fa-e23ba755eaac",
+                ordinal: 0,
+                startMs: 0,
+                endMs: 1_000,
+                text: "English",
+              },
+            ],
+          },
+        },
+      });
+    }
+    if (path === `${candidateBase}/activate`) {
+      activated = true;
+      return route.fulfill({
+        json: {
+          activationId: "019fbb95-cd76-7920-93fa-e23ba755eaad",
+          state: "activated",
+          projectId,
+          catalogVideoId: videoId,
+          importId,
+          candidateId,
+          transcriptVersionId,
+          languageDecisionId: decisionId,
+          languageDecisionVersion: 1,
+          projectVideoVersion: 4,
+          activatedAt: now,
+        },
+      });
+    }
+    const localProcessing = defaultLocalProcessingStatus(path);
+    if (localProcessing) return route.fulfill({ json: localProcessing });
+    const keywordCatalog = defaultProjectKeywordCatalog(path);
+    if (keywordCatalog) return route.fulfill({ json: keywordCatalog });
+    if (path.includes("/worklist")) {
+      return route.fulfill({ json: { items: [], total: 0 } });
+    }
+    return route.fulfill({ status: 404, json: { error: "not found" } });
+  });
+  await page.goto("/");
+  await page
+    .getByLabel("Development session credential")
+    .fill("Bearer 019fbb95-cd76-7920-93fa-e23ba755ee36|fixture:web");
+  await page.getByRole("button", { name: "Connect" }).click();
+  await page.getByLabel("Timed original transcript").setInputFiles({
+    name: "original.srt",
+    mimeType: "application/x-subrip",
+    buffer: Buffer.from("1\n00:00:00,000 --> 00:00:01,000\nཀ\n"),
+  });
+  await page.getByLabel("Timed English transcript").setInputFiles({
+    name: "english.vtt",
+    mimeType: "text/vtt",
+    buffer: Buffer.from("WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nEnglish\n"),
+  });
+  delayUploads = true;
+  await page.getByRole("button", { name: "Import timed transcripts" }).click();
+  await expect.poll(() => putBodies.length).toBeGreaterThan(0);
+  await page.getByLabel("Active project").selectOption(projectB);
+  await expect(page.getByText("Other batch", { exact: true })).toBeVisible();
+  releaseUploads?.();
+  await expect(
+    page.getByText("Timed bilingual candidate finalized for review."),
+  ).toHaveCount(0);
+  expect(finalizeAttempts).toBe(0);
+  delayUploads = false;
+  await page.getByLabel("Active project").selectOption(projectId);
+  await page.getByLabel("Timed original transcript").setInputFiles({
+    name: "original.srt",
+    mimeType: "application/x-subrip",
+    buffer: Buffer.from("1\n00:00:00,000 --> 00:00:01,000\nཀ\n"),
+  });
+  await page.getByLabel("Timed English transcript").setInputFiles({
+    name: "english.vtt",
+    mimeType: "text/vtt",
+    buffer: Buffer.from("WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nEnglish\n"),
+  });
+  await page.getByRole("button", { name: "Import timed transcripts" }).click();
+  await expect(
+    page.getByText("Timed cue is outside the video duration."),
+  ).toBeVisible();
+  await expect(
+    page.getByText("Timed bilingual candidate finalized for review."),
+  ).toHaveCount(0);
+  await page.getByRole("button", { name: "Import timed transcripts" }).click();
+  await expect(
+    page.getByText(
+      "Finalization is still in progress. Retrying confirmation shortly.",
+    ),
+  ).toBeVisible();
+  await expect(
+    page.getByText("Timed bilingual candidate finalized for review."),
+  ).toHaveCount(0);
+  await expect.poll(() => reviewAttempts).toBe(1);
+  await page.getByLabel("Active project").selectOption(projectB);
+  releaseFirstReview?.();
+  await expect(
+    page.getByRole("heading", {
+      name: "Review corrected bilingual transcript",
+    }),
+  ).toHaveCount(0);
+  await page.getByLabel("Active project").selectOption(projectId);
+  await expect(
+    page.getByRole("heading", {
+      name: "Review corrected bilingual transcript",
+    }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("paragraph").filter({ hasText: /^English$/u }),
+  ).toBeVisible();
+  await expect(page.getByText("ཀ", { exact: true })).toBeVisible();
+  await page
+    .getByRole("button", { name: "Activate this exact version" })
+    .click();
+  await expect.poll(() => activated).toBe(true);
+  await expect(
+    page.getByRole("button", { name: "Corrected version active" }),
+  ).toBeDisabled();
+  // The retry reuses the durable in-memory receipts and only repeats finalize.
+  expect(putBodies).toHaveLength(4);
 });
 
 function artifactLocatorFixture(

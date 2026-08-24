@@ -3,6 +3,8 @@ import {
   DesktopApiResponseSchema,
   type DesktopApiRequest,
   type DesktopApiResponse,
+  type DesktopTimedTranscriptUploadRequest,
+  type DesktopTimedTranscriptUploadResponse,
   type DesktopStatus,
   type ModelDownloadProgress,
   type ReadinessReport,
@@ -27,6 +29,9 @@ export type DesktopBridge = Readonly<{
     listener: (progress: ModelDownloadProgress) => void,
   ): () => void;
   request(request: DesktopApiRequest): Promise<DesktopApiResponse>;
+  uploadTimedTranscript(
+    request: DesktopTimedTranscriptUploadRequest,
+  ): Promise<DesktopTimedTranscriptUploadResponse>;
 }>;
 
 export function desktopBridge(): DesktopBridge | undefined {

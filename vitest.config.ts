@@ -9,6 +9,10 @@ export default defineConfig({
       "tests/infra/**/*.test.ts",
       "tests/integration/**/*.test.ts",
     ],
+    // Several suites create and migrate independent PGlite catalogs. Bounding
+    // file workers prevents migration/FFmpeg contention from turning the
+    // existing per-test timeout into a machine-load race as the schema grows.
+    maxWorkers: 4,
     testTimeout: 15_000,
   },
 });

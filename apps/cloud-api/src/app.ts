@@ -2,7 +2,10 @@ import Fastify, { type FastifyInstance, type FastifyRequest } from "fastify";
 import { z, ZodError } from "zod";
 
 import { AuthenticationError } from "@research-video/auth";
-import type { SharedProjectCatalog } from "@research-video/catalog";
+import {
+  CatalogConflictError,
+  type SharedProjectCatalog,
+} from "@research-video/catalog";
 import {
   AddProjectMemberRequestSchema,
   AcceptLoggedExportDeliveryRequestSchema,
@@ -21,18 +24,43 @@ import {
   ExportSettingsPreviewRequestSchema,
   CreateTranscriptionBatchRequestSchema,
   CreateProjectRequestSchema,
+  CreateProjectVideoLanguageDecisionRequestSchema,
   ClaimLoggedExportDeliveryRequestSchema,
   ClipLibraryQuerySchema,
   PublishDerivedTranslationRequestSchema,
+  ProjectVideoWorklistQuerySchema,
+  UpdateProjectLocalProcessingRequestSchema,
+  SuggestProjectKeywordRequestSchema,
+  ReviewProjectKeywordSuggestionRequestSchema,
+  ClaimProjectKeywordScanRequestSchema,
+  HeartbeatProjectKeywordScanRequestSchema,
+  GetProjectKeywordScanInputRequestSchema,
+  FinalizeProjectKeywordScanRequestSchema,
+  FailProjectKeywordScanRequestSchema,
+  CreateProjectKeywordScanArtifactUploadRequestSchema,
   LookupDerivedTranslationSchema,
   RequestDerivedTranslationSchema,
   TranscriptionBatchControlRequestSchema,
+  UpdateHostedTranscriptionApprovalRequestSchema,
   UpdateReviewStatusRequestSchema,
+  UpdateOwnProjectVideoFlagRequestSchema,
+  UpdateProjectVideoClaimRequestSchema,
+  UpdateProjectVideoGovernanceRequestSchema,
+  BulkUpdateProjectVideoPriorityRequestSchema,
+  UpdateProjectVideoReviewRequestSchema,
+  UpdateProjectVideoTriageRequestSchema,
+  ProjectVideoActivityQuerySchema,
+  MarkProjectVideoActivitySeenRequestSchema,
   UpdateClipCandidateRequestSchema,
   ReviseExportPresetRequestSchema,
   SetExportPresetDefaultRequestSchema,
   UpdatePreferredLanguageRequestSchema,
   FinalizeTranscriptRequestSchema,
+  CreateManualTimedTranscriptImportRequestSchema,
+  FinalizeManualTimedTranscriptImportRequestSchema,
+  ManualTimedTranscriptImportStatusQuerySchema,
+  ActivateManualTimedTranscriptCandidateRequestSchema,
+  ManualTimedTranscriptCandidateReviewQuerySchema,
   HealthResponseSchema,
   WorkerClaimRequestSchema,
   WorkerFailureRequestSchema,
@@ -40,11 +68,13 @@ import {
   WorkerFinalizeTranscriptRequestSchema,
   WorkerHeartbeatRequestSchema,
   WorkerSourcePlanRequestSchema,
+  WorkerObserveLanguageEvidenceRequestSchema,
   WorkerTranslateTranscriptRequestSchema,
   WorkerTranslateTranscriptResponseSchema,
   ExportWorkerCompatibilityRequestSchema,
   HeartbeatExportWorkerRequestSchema,
   RegisterExportWorkerRequestSchema,
+  RegisterUserRequestSchema,
   ReconcileLoggedExportFailureRequestSchema,
   ReconcileLoggedExportCanceledRequestSchema,
   ReconcileLoggedExportSuccessRequestSchema,
@@ -75,6 +105,12 @@ export interface CloudApiDependencies {
 
 const IdParamsSchema = z.object({ projectId: z.uuid() });
 const ProjectVideoParamsSchema = IdParamsSchema.extend({ videoId: z.uuid() });
+const ProjectVideoImportParamsSchema = ProjectVideoParamsSchema.extend({
+  importId: z.uuid(),
+});
+const ProjectVideoCandidateParamsSchema = ProjectVideoParamsSchema.extend({
+  candidateId: z.uuid(),
+});
 const ProjectClipParamsSchema = IdParamsSchema.extend({ clipId: z.uuid() });
 const ProjectExportRequestParamsSchema = IdParamsSchema.extend({
   requestId: z.uuid(),
@@ -85,6 +121,12 @@ const ProjectExportBatchParamsSchema = IdParamsSchema.extend({
 const ProjectBatchParamsSchema = IdParamsSchema.extend({ batchId: z.uuid() });
 const ProjectReviewItemParamsSchema = IdParamsSchema.extend({
   itemId: z.uuid(),
+});
+const ProjectKeywordSuggestionParamsSchema = IdParamsSchema.extend({
+  suggestionId: z.uuid(),
+});
+const ProjectKeywordScanParamsSchema = IdParamsSchema.extend({
+  scanId: z.uuid(),
 });
 const JobParamsSchema = z.object({ jobId: z.uuid() });
 const CreateUploadSchema = z.object({
@@ -162,10 +204,8 @@ export function createCloudApi(
 
   app.post("/api/session/register", async (request) => {
     const actor = await authenticate(request);
-    const body = z
-      .object({ displayName: z.string().trim().min(1).max(160) })
-      .parse(request.body);
-    return catalog.registerUser(actor, body.displayName);
+    const body = RegisterUserRequestSchema.parse(request.body);
+    return catalog.registerUser(actor, body.displayName, body.handle);
   });
 
   app.put("/api/export-workers/self", async (request) =>
@@ -260,6 +300,33 @@ export function createCloudApi(
       );
     },
   );
+
+  app.patch("/api/projects/:projectId/worklist/triage", async (request) => {
+    const { projectId } = IdParamsSchema.parse(request.params);
+    return catalog.updateProjectVideoTriage(
+      await authenticate(request),
+      projectId,
+      UpdateProjectVideoTriageRequestSchema.parse(request.body),
+    );
+  });
+
+  app.get("/api/projects/:projectId/activity", async (request) => {
+    const { projectId } = IdParamsSchema.parse(request.params);
+    return catalog.listProjectVideoActivity(
+      await authenticate(request),
+      projectId,
+      ProjectVideoActivityQuerySchema.parse(request.query),
+    );
+  });
+
+  app.patch("/api/projects/:projectId/activity/seen", async (request) => {
+    const { projectId } = IdParamsSchema.parse(request.params);
+    return catalog.markProjectVideoActivitySeen(
+      await authenticate(request),
+      projectId,
+      MarkProjectVideoActivitySeenRequestSchema.parse(request.body),
+    );
+  });
 
   app.post("/api/export-deliveries/reconcile-success", async (request) =>
     catalog.reconcileLoggedExportSuccess(
@@ -491,6 +558,7 @@ export function createCloudApi(
           ? {}
           : { sourceLanguage: body.sourceLanguage }),
       },
+      { automaticLocalProcessing: true },
     );
     return reply.status(201).send(video);
   });
@@ -499,6 +567,297 @@ export function createCloudApi(
     const { projectId } = IdParamsSchema.parse(request.params);
     return catalog.listVideos(await authenticate(request), projectId);
   });
+
+  app.get("/api/projects/:projectId/worklist", async (request) => {
+    const { projectId } = IdParamsSchema.parse(request.params);
+    return catalog.listProjectVideoWorklist(
+      await authenticate(request),
+      projectId,
+      ProjectVideoWorklistQuerySchema.parse(request.query),
+    );
+  });
+
+  app.get("/api/projects/:projectId/local-processing", async (request) => {
+    const { projectId } = IdParamsSchema.parse(request.params);
+    return catalog.getProjectLocalProcessingStatus(
+      await authenticate(request),
+      projectId,
+    );
+  });
+
+  app.patch("/api/projects/:projectId/local-processing", async (request) => {
+    const { projectId } = IdParamsSchema.parse(request.params);
+    return catalog.updateProjectLocalProcessing(
+      await authenticate(request),
+      projectId,
+      UpdateProjectLocalProcessingRequestSchema.parse(request.body),
+    );
+  });
+
+  app.get("/api/projects/:projectId/keywords", async (request) => {
+    const { projectId } = IdParamsSchema.parse(request.params);
+    return catalog.listProjectKeywords(await authenticate(request), projectId);
+  });
+
+  app.post("/api/projects/:projectId/keyword-suggestions", async (request) => {
+    const { projectId } = IdParamsSchema.parse(request.params);
+    return catalog.suggestProjectKeyword(
+      await authenticate(request),
+      projectId,
+      SuggestProjectKeywordRequestSchema.parse(request.body),
+    );
+  });
+
+  app.post(
+    "/api/projects/:projectId/keyword-suggestions/:suggestionId/review",
+    async (request) => {
+      const { projectId, suggestionId } =
+        ProjectKeywordSuggestionParamsSchema.parse(request.params);
+      return catalog.reviewProjectKeywordSuggestion(
+        await authenticate(request),
+        projectId,
+        suggestionId,
+        ReviewProjectKeywordSuggestionRequestSchema.parse(request.body),
+      );
+    },
+  );
+
+  app.get(
+    "/api/projects/:projectId/worklist/:videoId/keyword-scan",
+    async (request) => {
+      const { projectId, videoId } = ProjectVideoParamsSchema.parse(
+        request.params,
+      );
+      return catalog.getProjectKeywordScanSummary(
+        await authenticate(request),
+        projectId,
+        videoId,
+      );
+    },
+  );
+
+  app.post(
+    "/api/projects/:projectId/worklist/:videoId/keyword-scan",
+    async (request) => {
+      const { projectId, videoId } = ProjectVideoParamsSchema.parse(
+        request.params,
+      );
+      return catalog.scheduleProjectKeywordScan(
+        await authenticate(request),
+        projectId,
+        videoId,
+      );
+    },
+  );
+
+  app.post(
+    "/api/projects/:projectId/keyword-scans/claim",
+    async (request, reply) => {
+      const { projectId } = IdParamsSchema.parse(request.params);
+      const claim = await catalog.claimProjectKeywordScan(
+        await authenticate(request),
+        projectId,
+        ClaimProjectKeywordScanRequestSchema.parse(request.body),
+      );
+      return claim === undefined ? reply.status(204).send() : claim;
+    },
+  );
+
+  app.post("/api/keyword-scans/claim", async (request, reply) => {
+    const claim = await catalog.claimProjectKeywordScan(
+      await authenticate(request),
+      undefined,
+      ClaimProjectKeywordScanRequestSchema.parse(request.body),
+    );
+    return claim === undefined ? reply.status(204).send() : claim;
+  });
+
+  app.post(
+    "/api/projects/:projectId/keyword-scans/:scanId/input",
+    async (request) => {
+      const { projectId, scanId } = ProjectKeywordScanParamsSchema.parse(
+        request.params,
+      );
+      return catalog.getProjectKeywordScanInput(
+        await authenticate(request),
+        projectId,
+        scanId,
+        GetProjectKeywordScanInputRequestSchema.parse(request.body),
+      );
+    },
+  );
+
+  app.post(
+    "/api/projects/:projectId/keyword-scans/:scanId/heartbeat",
+    async (request) => {
+      const { projectId, scanId } = ProjectKeywordScanParamsSchema.parse(
+        request.params,
+      );
+      return catalog.heartbeatProjectKeywordScan(
+        await authenticate(request),
+        projectId,
+        scanId,
+        HeartbeatProjectKeywordScanRequestSchema.parse(request.body),
+      );
+    },
+  );
+
+  app.post(
+    "/api/projects/:projectId/keyword-scans/:scanId/finalize",
+    async (request) => {
+      const { projectId, scanId } = ProjectKeywordScanParamsSchema.parse(
+        request.params,
+      );
+      return catalog.finalizeProjectKeywordScan(
+        await authenticate(request),
+        projectId,
+        scanId,
+        FinalizeProjectKeywordScanRequestSchema.parse(request.body),
+      );
+    },
+  );
+
+  app.post(
+    "/api/projects/:projectId/keyword-scans/:scanId/artifact-upload",
+    async (request) => {
+      const { projectId, scanId } = ProjectKeywordScanParamsSchema.parse(
+        request.params,
+      );
+      return catalog.createProjectKeywordScanArtifactUpload(
+        await authenticate(request),
+        projectId,
+        scanId,
+        CreateProjectKeywordScanArtifactUploadRequestSchema.parse(request.body),
+      );
+    },
+  );
+
+  app.get(
+    "/api/projects/:projectId/keyword-scans/:scanId/artifact-download",
+    async (request) => {
+      const { projectId, scanId } = ProjectKeywordScanParamsSchema.parse(
+        request.params,
+      );
+      return catalog.getProjectKeywordScanArtifactDownload(
+        await authenticate(request),
+        projectId,
+        scanId,
+      );
+    },
+  );
+
+  app.post(
+    "/api/projects/:projectId/keyword-scans/:scanId/fail",
+    async (request) => {
+      const { projectId, scanId } = ProjectKeywordScanParamsSchema.parse(
+        request.params,
+      );
+      return catalog.failProjectKeywordScan(
+        await authenticate(request),
+        projectId,
+        scanId,
+        FailProjectKeywordScanRequestSchema.parse(request.body),
+      );
+    },
+  );
+
+  app.patch(
+    "/api/projects/:projectId/worklist/:videoId/flag",
+    async (request) => {
+      const { projectId, videoId } = ProjectVideoParamsSchema.parse(
+        request.params,
+      );
+      return catalog.updateOwnProjectVideoFlag(
+        await authenticate(request),
+        projectId,
+        videoId,
+        UpdateOwnProjectVideoFlagRequestSchema.parse(request.body),
+      );
+    },
+  );
+
+  app.post(
+    "/api/projects/:projectId/worklist/:videoId/claim",
+    async (request) => {
+      const { projectId, videoId } = ProjectVideoParamsSchema.parse(
+        request.params,
+      );
+      return catalog.updateProjectVideoClaim(
+        await authenticate(request),
+        projectId,
+        videoId,
+        UpdateProjectVideoClaimRequestSchema.parse(request.body),
+      );
+    },
+  );
+
+  app.patch("/api/projects/:projectId/worklist/priority", async (request) => {
+    const { projectId } = IdParamsSchema.parse(request.params);
+    return catalog.bulkUpdateProjectVideoPriority(
+      await authenticate(request),
+      projectId,
+      BulkUpdateProjectVideoPriorityRequestSchema.parse(request.body),
+    );
+  });
+
+  app.patch(
+    "/api/projects/:projectId/worklist/:videoId/governance",
+    async (request) => {
+      const { projectId, videoId } = ProjectVideoParamsSchema.parse(
+        request.params,
+      );
+      return catalog.updateProjectVideoGovernance(
+        await authenticate(request),
+        projectId,
+        videoId,
+        UpdateProjectVideoGovernanceRequestSchema.parse(request.body),
+      );
+    },
+  );
+
+  app.post(
+    "/api/projects/:projectId/worklist/:videoId/review",
+    async (request) => {
+      const { projectId, videoId } = ProjectVideoParamsSchema.parse(
+        request.params,
+      );
+      return catalog.updateProjectVideoReview(
+        await authenticate(request),
+        projectId,
+        videoId,
+        UpdateProjectVideoReviewRequestSchema.parse(request.body),
+      );
+    },
+  );
+
+  app.get(
+    "/api/projects/:projectId/videos/:videoId/language-gate",
+    async (request) => {
+      const { projectId, videoId } = ProjectVideoParamsSchema.parse(
+        request.params,
+      );
+      return catalog.getProjectVideoLanguageGate(
+        await authenticate(request),
+        projectId,
+        videoId,
+      );
+    },
+  );
+
+  app.post(
+    "/api/projects/:projectId/videos/:videoId/language-decisions",
+    async (request) => {
+      const { projectId, videoId } = ProjectVideoParamsSchema.parse(
+        request.params,
+      );
+      return catalog.confirmProjectVideoLanguageDecision(
+        await authenticate(request),
+        projectId,
+        videoId,
+        CreateProjectVideoLanguageDecisionRequestSchema.parse(request.body),
+      );
+    },
+  );
 
   app.post(
     "/api/projects/:projectId/videos/:videoId/derived-translations/lookup",
@@ -781,6 +1140,7 @@ export function createCloudApi(
               ? { sourceLanguage: metadata.sourceLanguage }
               : {}),
           },
+          { automaticLocalProcessing: true },
         );
         return reply.status(201).send(video);
       },
@@ -882,6 +1242,21 @@ export function createCloudApi(
     },
   );
 
+  app.post(
+    "/api/projects/:projectId/transcription-batches/:batchId/hosted-approval",
+    async (request) => {
+      const { projectId, batchId } = ProjectBatchParamsSchema.parse(
+        request.params,
+      );
+      return catalog.updateHostedTranscriptionApproval(
+        await authenticate(request),
+        projectId,
+        batchId,
+        UpdateHostedTranscriptionApprovalRequestSchema.parse(request.body),
+      );
+    },
+  );
+
   app.post("/api/transcription-jobs/claim", async (request, reply) => {
     const body = WorkerClaimRequestSchema.parse(request.body);
     const actor = await authenticate(request);
@@ -900,14 +1275,14 @@ export function createCloudApi(
     const { jobId } = JobParamsSchema.parse(request.params);
     const body = WorkerHeartbeatRequestSchema.parse(request.body);
     const actor = await authenticate(request);
-    const lease = await catalog.heartbeatTranscriptionJob(
+    const heartbeat = await catalog.heartbeatTranscriptionJob(
       actor,
       jobId,
       body.attempt,
       body.leaseSeconds,
       body.stage,
     );
-    return lease;
+    return heartbeat;
   });
 
   app.post(
@@ -922,6 +1297,18 @@ export function createCloudApi(
         body.plan,
       );
       return reply.status(204).send();
+    },
+  );
+
+  app.post(
+    "/api/transcription-jobs/:jobId/language-evidence",
+    async (request) => {
+      const { jobId } = JobParamsSchema.parse(request.params);
+      return catalog.observeWorkerLanguageEvidence(
+        await authenticate(request),
+        jobId,
+        WorkerObserveLanguageEvidenceRequestSchema.parse(request.body),
+      );
     },
   );
 
@@ -1033,6 +1420,91 @@ export function createCloudApi(
         },
       );
       return reply.status(201).send(grant);
+    },
+  );
+
+  app.post(
+    "/api/projects/:projectId/videos/:videoId/timed-transcript-imports",
+    async (request, reply) => {
+      const { projectId, videoId } = ProjectVideoParamsSchema.parse(
+        request.params,
+      );
+      const grant = await catalog.createManualTimedTranscriptImport(
+        await authenticate(request),
+        projectId,
+        videoId,
+        CreateManualTimedTranscriptImportRequestSchema.parse(request.body),
+      );
+      return reply.status(201).send(grant);
+    },
+  );
+
+  app.post(
+    "/api/projects/:projectId/videos/:videoId/timed-transcript-imports/:importId/finalize",
+    async (request) => {
+      const { projectId, videoId, importId } =
+        ProjectVideoImportParamsSchema.parse(request.params);
+      return catalog.finalizeManualTimedTranscriptImport(
+        await authenticate(request),
+        projectId,
+        videoId,
+        importId,
+        FinalizeManualTimedTranscriptImportRequestSchema.parse(request.body),
+      );
+    },
+  );
+
+  app.get(
+    "/api/projects/:projectId/videos/:videoId/timed-transcript-imports",
+    async (request) => {
+      const { projectId, videoId } = ProjectVideoParamsSchema.parse(
+        request.params,
+      );
+      const { batchItemId } =
+        ManualTimedTranscriptImportStatusQuerySchema.parse(request.query);
+      return catalog.getManualTimedTranscriptImportForBatchItem(
+        await authenticate(request),
+        projectId,
+        videoId,
+        batchItemId,
+      );
+    },
+  );
+
+  app.get(
+    "/api/projects/:projectId/videos/:videoId/timed-transcript-candidates/:candidateId/review",
+    async (request) => {
+      const { projectId, videoId, candidateId } =
+        ProjectVideoCandidateParamsSchema.parse(request.params);
+      return catalog.reviewManualTimedTranscriptCandidate(
+        await authenticate(request),
+        projectId,
+        videoId,
+        candidateId,
+        ManualTimedTranscriptCandidateReviewQuerySchema.parse(request.query),
+      );
+    },
+  );
+
+  app.post(
+    "/api/projects/:projectId/videos/:videoId/timed-transcript-candidates/:candidateId/activate",
+    async (request) => {
+      const { projectId, videoId, candidateId } =
+        ProjectVideoCandidateParamsSchema.parse(request.params);
+      const body = ActivateManualTimedTranscriptCandidateRequestSchema.parse(
+        request.body,
+      );
+      if (body.candidateId !== candidateId) {
+        throw new CatalogConflictError(
+          "Corrected transcript candidate identity does not match the route.",
+        );
+      }
+      return catalog.activateManualTimedTranscriptCandidate(
+        await authenticate(request),
+        projectId,
+        videoId,
+        body,
+      );
     },
   );
 

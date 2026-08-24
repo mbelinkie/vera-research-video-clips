@@ -1,6 +1,10 @@
 import { createHash, randomUUID } from "node:crypto";
 
-import { AuthorizationError, requirePermission } from "@research-video/auth";
+import {
+  AuthorizationError,
+  requirePermission,
+  requireProjectRoleAssignment,
+} from "@research-video/auth";
 import {
   asCloudDatabase,
   type CloudDatabase,
@@ -8,6 +12,7 @@ import {
 } from "@research-video/db-cloud";
 import {
   ActiveTranscriptBundleSchema,
+  ActivateManualTimedTranscriptCandidateRequestSchema,
   ArtifactVersionHistoryResponseSchema,
   ArtifactVersionHistoryQuerySchema,
   ArtifactVersionSummarySchema,
@@ -18,9 +23,18 @@ import {
   BatchPreflightSummarySchema,
   ClaimedTranscriptionJobSchema,
   ClipCandidateSchema,
+  ClipCommentListQuerySchema,
+  ClipCommentPageSchema,
+  ClipCommentSchema,
   ClipLibraryPageSchema,
   ClipLibraryQuerySchema,
   ClipLanguageEvidenceV2Schema,
+  CreateClipCandidateRequestSchema,
+  CreateClipCandidateResponseSchema,
+  CreateClipCommentRequestSchema,
+  DeleteClipCommentRequestSchema,
+  ModerateClipCommentRequestSchema,
+  UpdateClipCommentRequestSchema,
   DerivedTranslationJobSchema,
   DerivedTranslationIdentitySchema,
   DerivedTranslationManifestSchema,
@@ -58,16 +72,65 @@ import {
   ResolvedExportSettingsSnapshotSchema,
   ExportWorkerCompatibilityRequestSchema,
   HeartbeatExportWorkerRequestSchema,
+  HostedTranscriptionApprovalResponseSchema,
   RegisterExportWorkerRequestSchema,
   RegisteredExportWorkerSchema,
   RevokeExportWorkerRequestSchema,
   ExportWorkerAvailabilityResponseSchema,
+  CreateProjectVideoLanguageDecisionRequestSchema,
+  LanguageDecisionSnapshotSchema,
+  LanguageGateSchema,
+  LanguageTagSchema,
+  ProjectVideoLanguageDecisionResponseSchema,
+  ProjectVideoLanguageDecisionSchema,
+  ProviderLanguageEvidenceSchema,
   ExportPresetCatalogEntrySchema,
   ExportPresetDefaultSchema,
   PersonalExportPresetCatalogSchema,
   ProjectExportPresetCatalogSchema,
   JobSchema,
   ProjectSchema,
+  ProjectSummarySchema,
+  ProjectVideoOwnFlagResponseSchema,
+  ProjectVideoClaimResponseSchema,
+  ProjectVideoGovernanceResponseSchema,
+  BulkUpdateProjectVideoPriorityRequestSchema,
+  BulkUpdateProjectVideoPriorityResponseSchema,
+  ProjectVideoReviewResponseSchema,
+  ProjectVideoTriageResponseSchema,
+  ProjectVideoActivityPageSchema,
+  ProjectVideoActivityQuerySchema,
+  ProjectLocalProcessingStatusSchema,
+  ProjectKeywordCatalogSchema,
+  SuggestProjectKeywordRequestSchema,
+  SuggestProjectKeywordResponseSchema,
+  ReviewProjectKeywordSuggestionRequestSchema,
+  ReviewProjectKeywordSuggestionResponseSchema,
+  ClaimProjectKeywordScanRequestSchema,
+  ProjectKeywordScanClaimSchema,
+  ProjectKeywordScanJobSchema,
+  ProjectKeywordScanSummarySchema,
+  ProjectKeywordMatchArtifactSchema,
+  ProjectKeywordScannerSchemaVersion,
+  HeartbeatProjectKeywordScanRequestSchema,
+  GetProjectKeywordScanInputRequestSchema,
+  ProjectKeywordScanInputSnapshotSchema,
+  FinalizeProjectKeywordScanRequestSchema,
+  FailProjectKeywordScanRequestSchema,
+  CreateProjectKeywordScanArtifactUploadRequestSchema,
+  ProjectKeywordScanArtifactUploadGrantSchema,
+  ProjectKeywordScanArtifactDownloadTargetSchema,
+  UpdateProjectLocalProcessingRequestSchema,
+  UpdateProjectLocalProcessingResponseSchema,
+  MarkProjectVideoActivitySeenResponseSchema,
+  MarkProjectVideoActivitySeenRequestSchema,
+  ProjectVideoWorklistPageSchema,
+  ProjectVideoWorklistQuerySchema,
+  UpdateProjectVideoClaimRequestSchema,
+  UpdateProjectVideoGovernanceRequestSchema,
+  UpdateProjectVideoReviewRequestSchema,
+  UpdateProjectVideoTriageRequestSchema,
+  UpdateHostedTranscriptionApprovalRequestSchema,
   ReviewInboxItemSchema,
   ReviewInboxResponseSchema,
   TranscriptManifestSchema,
@@ -79,10 +142,24 @@ import {
   UserSchema,
   VideoSchema,
   WorkerLeaseSchema,
+  WorkerHeartbeatResponseSchema,
+  WorkerObserveLanguageEvidenceRequestSchema,
+  WorkerObserveLanguageEvidenceResponseSchema,
   WorkerTranslateTranscriptResponseSchema,
+  CreateManualTimedTranscriptImportRequestSchema,
+  FinalizeManualTimedTranscriptImportRequestSchema,
+  ManualTimedTranscriptImportStatusSchema,
+  ManualTimedTranscriptImportUploadGrantSchema,
+  ManualTimedTranscriptFormatSchema,
+  ManualTimedTranscriptActivationStatusSchema,
+  ManualTimedTranscriptCandidateReviewPageSchema,
+  ManualTimedTranscriptCandidateReviewQuerySchema,
   languagesEquivalent,
+  normalizeUserHandle,
+  normalizeProjectKeywordPhrase,
   primaryLanguage,
   type ActiveTranscriptBundle,
+  type ActivateManualTimedTranscriptCandidateRequest,
   type ArtifactVersionHistoryQuery,
   type ArtifactVersionHistoryResponse,
   type ArtifactVersionSummary,
@@ -97,16 +174,25 @@ import {
   type ClaimedTranscriptionJob,
   type CloudTranslationConsent,
   type ClipCandidate,
+  type ClipComment,
+  type ClipCommentListQuery,
+  type ClipCommentPage,
   type ClipLibraryPage,
   type ClipLibraryQuery,
   type ClipLanguageEvidence,
   type CreateClipCandidateRequest,
+  type CreateClipCandidateResponse,
+  type CreateClipCommentRequest,
+  type UpdateClipCommentRequest,
+  type DeleteClipCommentRequest,
+  type ModerateClipCommentRequest,
   type ClaimLoggedExportDeliveryRequest,
   type ClaimLoggedExportDeliveryResponse,
   type CreateClipExportRequest,
   type ReexportArtifactVersionRequest,
   type CreateTranscriptionBatchResponse,
   type CreateLoggedExportBatchRequest,
+  type CreateProjectVideoLanguageDecisionRequest,
   type DerivedTranslation,
   type DerivedTranslationIdentity,
   type DerivedTranslationJob,
@@ -121,6 +207,7 @@ import {
   type ExportSettingsPreview,
   type ExportWorkerCompatibilityRequest,
   type HeartbeatExportWorkerRequest,
+  type HostedTranscriptionApprovalResponse,
   type RegisterExportWorkerRequest,
   type RegisteredExportWorker,
   type LoggedExportDelivery,
@@ -153,7 +240,44 @@ import {
   type ReviseExportPresetRequest,
   type SetExportPresetDefaultRequest,
   type Project,
+  type ProjectKind,
   type ProjectRole,
+  type ProjectSummary,
+  type ProjectLocalProcessingStatus,
+  type ProjectKeyword,
+  type ProjectKeywordCatalog,
+  type ProjectKeywordSuggestion,
+  type SuggestProjectKeywordRequest,
+  type SuggestProjectKeywordResponse,
+  type ReviewProjectKeywordSuggestionRequest,
+  type ReviewProjectKeywordSuggestionResponse,
+  type ClaimProjectKeywordScanRequest,
+  type ProjectKeywordScanClaim,
+  type ProjectKeywordScanJob,
+  type ProjectKeywordScanSummary,
+  type HeartbeatProjectKeywordScanRequest,
+  type GetProjectKeywordScanInputRequest,
+  type ProjectKeywordScanInputSnapshot,
+  type FinalizeProjectKeywordScanRequest,
+  type FailProjectKeywordScanRequest,
+  type CreateProjectKeywordScanArtifactUploadRequest,
+  type ProjectKeywordScanArtifactUploadGrant,
+  type ProjectKeywordScanArtifactDownloadTarget,
+  type ProjectVideoOwnFlagResponse,
+  type ProjectVideoClaimResponse,
+  type ProjectVideoGovernanceResponse,
+  type BulkUpdateProjectVideoPriorityRequest,
+  type BulkUpdateProjectVideoPriorityResponse,
+  type ProjectVideoReviewResponse,
+  type ProjectVideoTriageResponse,
+  type ProjectVideoActivityPage,
+  type ProjectVideoActivityQuery,
+  type MarkProjectVideoActivitySeenRequest,
+  type MarkProjectVideoActivitySeenResponse,
+  type ProjectVideoWorklistPage,
+  type ProjectVideoWorklistProcessingState,
+  type ProjectVideoWorklistQuery,
+  type ProjectVisibility,
   type PublishDerivedTranslationRequest,
   type RequestDerivedTranslation,
   type TranscriptArtifact,
@@ -164,15 +288,37 @@ import {
   type ReviewInboxItem,
   type ReviewInboxResponse,
   type UpdateReviewStatusRequest,
+  type UpdateOwnProjectVideoFlagRequest,
+  type UpdateProjectVideoClaimRequest,
+  type UpdateProjectVideoGovernanceRequest,
+  type UpdateProjectVideoReviewRequest,
+  type UpdateProjectVideoTriageRequest,
+  type UpdateHostedTranscriptionApprovalRequest,
+  type UpdateProjectLocalProcessingRequest,
+  type UpdateProjectLocalProcessingResponse,
   type UpdateClipCandidateRequest,
   type UpdatePreferredLanguageRequest,
   type TranscriptSourcePlan,
+  type LanguageDecisionSnapshot,
+  type LanguageGate,
+  type ProjectVideoLanguageDecisionResponse,
+  type ProviderLanguageEvidence,
   type User,
   type Video,
   type WorkerLease,
+  type WorkerHeartbeatResponse,
+  type WorkerObserveLanguageEvidenceRequest,
+  type WorkerObserveLanguageEvidenceResponse,
   type WorkerTranslateTranscriptResponse,
   type WorkerFailureRequest,
   type WorkerProgressStage,
+  type CreateManualTimedTranscriptImportRequest,
+  type FinalizeManualTimedTranscriptImportRequest,
+  type ManualTimedTranscriptImportStatus,
+  type ManualTimedTranscriptImportUploadGrant,
+  type ManualTimedTranscriptActivationStatus,
+  type ManualTimedTranscriptCandidateReviewPage,
+  type ManualTimedTranscriptCandidateReviewQuery,
 } from "@research-video/contracts";
 import {
   canonicalJson,
@@ -188,6 +334,7 @@ import {
   type StagedUploadUrlIssuer,
   type TranscriptObjectStore,
 } from "@research-video/storage";
+import { normalizeManualTimedBilingualImport } from "@research-video/transcript";
 
 export class CatalogNotFoundError extends Error {
   readonly statusCode = 404;
@@ -212,6 +359,16 @@ export class TranscriptIntegrityError extends Error {
 export class CatalogValidationError extends Error {
   readonly statusCode = 422;
   readonly code = "invalid_language_evidence";
+}
+
+class ManualTimedTranscriptImportError extends Error {
+  readonly statusCode = 422;
+  constructor(
+    readonly code: string,
+    message = "Timed transcript import is invalid.",
+  ) {
+    super(message);
+  }
 }
 
 export class CatalogIdempotencyConflictError extends Error {
@@ -290,6 +447,17 @@ const jsonRecord = (value: unknown): Record<string, unknown> | undefined => {
     : undefined;
 };
 
+const jsonArray = (value: unknown): unknown[] | undefined => {
+  if (typeof value === "string") {
+    try {
+      return jsonArray(JSON.parse(value));
+    } catch {
+      return undefined;
+    }
+  }
+  return Array.isArray(value) ? value : undefined;
+};
+
 const sha256 = (bytes: Uint8Array) =>
   createHash("sha256").update(bytes).digest("hex");
 
@@ -347,6 +515,119 @@ function parseClipLibraryCursor(value: string): ClipLibraryCursor {
   }
 }
 
+type ClipCommentCursor = {
+  projectId: string;
+  clipId: string;
+  commentId: string;
+  createdAt: string;
+};
+
+function makeClipCommentCursor(cursor: ClipCommentCursor) {
+  return Buffer.from(canonicalJson(cursor)).toString("base64url");
+}
+
+function parseClipCommentCursor(value: string): ClipCommentCursor {
+  try {
+    const parsed = JSON.parse(Buffer.from(value, "base64url").toString("utf8"));
+    if (
+      canonicalJson(Object.keys(parsed).sort()) !==
+        canonicalJson(["clipId", "commentId", "createdAt", "projectId"]) ||
+      typeof parsed.projectId !== "string" ||
+      typeof parsed.clipId !== "string" ||
+      typeof parsed.commentId !== "string" ||
+      typeof parsed.createdAt !== "string" ||
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(
+        parsed.projectId,
+      ) ||
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(
+        parsed.clipId,
+      ) ||
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(
+        parsed.commentId,
+      ) ||
+      !Number.isFinite(Date.parse(parsed.createdAt))
+    ) {
+      throw new Error("invalid cursor");
+    }
+    return parsed as ClipCommentCursor;
+  } catch {
+    throw new CatalogInvalidRequestError("Clip comment cursor is invalid.");
+  }
+}
+
+type ProjectVideoWorklistCursor = {
+  projectId: string;
+  videoId: string;
+  createdAt: string;
+  view: NonNullable<ProjectVideoWorklistQuery["view"]>;
+};
+
+function makeProjectVideoWorklistCursor(cursor: ProjectVideoWorklistCursor) {
+  return Buffer.from(canonicalJson(cursor)).toString("base64url");
+}
+
+function parseProjectVideoWorklistCursor(
+  value: string,
+): ProjectVideoWorklistCursor {
+  try {
+    const parsed = JSON.parse(Buffer.from(value, "base64url").toString("utf8"));
+    const keys = Object.keys(parsed).sort();
+    if (
+      canonicalJson(keys) !==
+        canonicalJson(["createdAt", "projectId", "videoId", "view"]) ||
+      typeof parsed.projectId !== "string" ||
+      typeof parsed.videoId !== "string" ||
+      typeof parsed.createdAt !== "string" ||
+      !["all", "queue", "reviewed", "dismissed"].includes(parsed.view) ||
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(
+        parsed.projectId,
+      ) ||
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(
+        parsed.videoId,
+      ) ||
+      !Number.isFinite(Date.parse(parsed.createdAt))
+    ) {
+      throw new Error("invalid cursor");
+    }
+    return parsed as ProjectVideoWorklistCursor;
+  } catch {
+    throw new CatalogInvalidRequestError("Project worklist cursor is invalid.");
+  }
+}
+
+type ProjectVideoActivityCursor = {
+  projectId: string;
+  eventId: string;
+  createdAt: string;
+  state: ProjectVideoActivityQuery["state"];
+};
+
+function makeProjectVideoActivityCursor(cursor: ProjectVideoActivityCursor) {
+  return Buffer.from(canonicalJson(cursor)).toString("base64url");
+}
+
+function parseProjectVideoActivityCursor(
+  value: string,
+): ProjectVideoActivityCursor {
+  try {
+    const parsed = JSON.parse(Buffer.from(value, "base64url").toString("utf8"));
+    if (
+      canonicalJson(Object.keys(parsed).sort()) !==
+        canonicalJson(["createdAt", "eventId", "projectId", "state"]) ||
+      typeof parsed.projectId !== "string" ||
+      typeof parsed.eventId !== "string" ||
+      typeof parsed.createdAt !== "string" ||
+      !["all", "unread", "seen"].includes(parsed.state) ||
+      !Number.isFinite(Date.parse(parsed.createdAt))
+    ) {
+      throw new Error("invalid cursor");
+    }
+    return parsed as ProjectVideoActivityCursor;
+  } catch {
+    throw new CatalogInvalidRequestError("Project activity cursor is invalid.");
+  }
+}
+
 const LoggedExportProgressStageRank: Record<LoggedExportProgressStage, number> =
   {
     preparing: 1,
@@ -399,24 +680,48 @@ export class SharedProjectCatalog {
   async registerUser(
     actor: AuthenticatedActor,
     displayName: string,
+    requestedHandle?: string,
   ): Promise<User> {
     const now = this.now().toISOString();
-    const result = await this.database.query<DbRow>(
-      `INSERT INTO users (id, external_subject, display_name, created_at, updated_at)
-       VALUES ($1, $2, $3, $4, $4)
-       ON CONFLICT (external_subject) DO UPDATE
-       SET display_name = EXCLUDED.display_name, updated_at = EXCLUDED.updated_at
-       RETURNING id, external_subject, display_name, preferred_language,
-                 created_at, updated_at`,
-      [actor.userId, actor.externalSubject, displayName.trim(), now],
+    const existing = await this.database.query<DbRow>(
+      `SELECT handle FROM users WHERE id = $1 AND external_subject = $2`,
+      [actor.userId, actor.externalSubject],
     );
-    return mapUser(result.rows[0]);
+    const handle = normalizeUserHandle(
+      requestedHandle ??
+        String(
+          existing.rows[0]?.handle ??
+            `user_${actor.userId.replaceAll("-", "").slice(0, 20)}`,
+        ),
+    );
+    try {
+      const result = await this.database.query<DbRow>(
+        `INSERT INTO users
+           (id, external_subject, handle, normalized_handle, display_name,
+            created_at, updated_at)
+         VALUES ($1, $2, $3, $3, $4, $5, $5)
+         ON CONFLICT (external_subject) DO UPDATE
+         SET handle = EXCLUDED.handle,
+             normalized_handle = EXCLUDED.normalized_handle,
+             display_name = EXCLUDED.display_name,
+             updated_at = EXCLUDED.updated_at
+         RETURNING id, external_subject, handle, display_name,
+                   preferred_language, created_at, updated_at`,
+        [actor.userId, actor.externalSubject, handle, displayName.trim(), now],
+      );
+      return mapUser(result.rows[0]);
+    } catch (error) {
+      if (isUniqueViolation(error)) {
+        throw new CatalogConflictError("That handle is already in use.");
+      }
+      throw error;
+    }
   }
 
   async getCurrentUser(actor: AuthenticatedActor): Promise<User> {
     await this.requireRegistered(actor);
     const result = await this.database.query<DbRow>(
-      `SELECT id, external_subject, display_name, preferred_language,
+      `SELECT id, external_subject, handle, display_name, preferred_language,
               created_at, updated_at
        FROM users WHERE id = $1 AND external_subject = $2`,
       [actor.userId, actor.externalSubject],
@@ -1965,7 +2270,7 @@ export class SharedProjectCatalog {
       `UPDATE users
        SET preferred_language = $1, updated_at = $2
        WHERE id = $3 AND external_subject = $4
-       RETURNING id, external_subject, display_name, preferred_language,
+       RETURNING id, external_subject, handle, display_name, preferred_language,
                  created_at, updated_at`,
       [input.preferredLanguage, now, actor.userId, actor.externalSubject],
     );
@@ -2103,20 +2408,39 @@ export class SharedProjectCatalog {
 
   async createProject(
     actor: AuthenticatedActor,
-    input: { name: string; description?: string },
+    input: {
+      name: string;
+      description?: string;
+      kind?: ProjectKind;
+      visibility?: ProjectVisibility;
+    },
   ): Promise<Project> {
     await this.requireRegistered(actor);
     const id = randomUUID();
     const now = this.now().toISOString();
+    const kind = input.kind ?? "shared";
+    const visibility =
+      input.visibility ?? (kind === "personal" ? "private" : "invitation_only");
+    if (
+      (kind === "personal" && visibility !== "private") ||
+      (kind === "shared" && visibility === "private")
+    ) {
+      throw new CatalogValidationError(
+        "Project kind and visibility are incompatible.",
+      );
+    }
     await this.transaction(async () => {
       await this.database.query(
         `INSERT INTO projects
-           (id, name, description, version, created_by, created_at, updated_at)
-         VALUES ($1, $2, $3, 1, $4, $5, $5)`,
+           (id, name, description, kind, visibility, version, created_by,
+            created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, 1, $6, $7, $7)`,
         [
           id,
           input.name.trim(),
           input.description?.trim() ?? "",
+          kind,
+          visibility,
           actor.userId,
           now,
         ],
@@ -2131,17 +2455,20 @@ export class SharedProjectCatalog {
     return this.getProject(actor, id);
   }
 
-  async listProjects(actor: AuthenticatedActor): Promise<Project[]> {
+  async listProjects(actor: AuthenticatedActor): Promise<ProjectSummary[]> {
     await this.requireRegistered(actor);
     const result = await this.database.query<DbRow>(
-      `SELECT p.id, p.name, p.description, p.version, p.created_at, p.updated_at
+      `SELECT p.id, p.name, p.description, p.kind, p.visibility, p.version,
+              p.created_at, p.updated_at, pm.role AS current_user_role,
+              (SELECT count(*)::integer FROM project_members members
+               WHERE members.project_id = p.id) AS member_count
        FROM projects p
        JOIN project_members pm ON pm.project_id = p.id
        WHERE pm.user_id = $1
        ORDER BY p.updated_at DESC`,
       [actor.userId],
     );
-    return result.rows.map(mapProject);
+    return result.rows.map(mapProjectSummary);
   }
 
   async requestDerivedTranslation(
@@ -2471,13 +2798,24 @@ export class SharedProjectCatalog {
     actor: AuthenticatedActor,
     projectId: string,
     input: CreateClipCandidateRequest,
-  ): Promise<ClipCandidate> {
+  ): Promise<CreateClipCandidateResponse> {
     await this.authorize(actor, projectId, "write");
+    input = CreateClipCandidateRequestSchema.parse(input);
     const user = await this.getCurrentUser(actor);
     const candidateId = randomUUID();
     const now = this.now().toISOString();
     let persistedCandidateId: string = candidateId;
+    const requestFingerprint = sha256Fingerprint(input);
     const evidence = input.languageEvidence;
+    if (
+      input.firstComment?.sourceTimeMs !== undefined &&
+      (input.firstComment.sourceTimeMs < input.selection.exportStartMs ||
+        input.firstComment.sourceTimeMs > input.selection.exportEndMs)
+    ) {
+      throw new CatalogInvalidRequestError(
+        "Comment source time must be inside the immutable clip export range.",
+      );
+    }
     const preferredIsDistinct =
       !languagesEquivalent(user.preferredLanguage, "en") &&
       !languagesEquivalent(user.preferredLanguage, evidence.native.language);
@@ -2541,12 +2879,21 @@ export class SharedProjectCatalog {
          ON CONFLICT (project_id, video_id) DO NOTHING`,
         [projectId, catalogVideoId, now],
       );
+      await this.database.query(
+        `INSERT INTO project_video_review_cycles
+           (id, project_id, video_id, cycle_number, status, version,
+            opened_by, opened_at, updated_at)
+         VALUES ($1, $2, $3, 1, 'open', 1, $4, $5, $5)
+         ON CONFLICT (project_id, video_id, cycle_number) DO NOTHING`,
+        [randomUUID(), projectId, catalogVideoId, actor.userId, now],
+      );
 
       const selection = input.selection;
       const inserted = await this.database.query<DbRow>(
         `INSERT INTO clip_candidates
            (id, project_id, video_id, youtube_video_id, canonical_url,
             video_title, video_channel, source_language, idempotency_key,
+            request_sha256,
             transcript_track_id, transcript_version, first_segment_id,
             last_segment_id, first_token_id, last_token_id,
             transcript_start_ms, transcript_end_ms, export_start_ms,
@@ -2555,8 +2902,8 @@ export class SharedProjectCatalog {
             research_status, export_status, created_by, version, created_at,
             updated_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
-                 $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, 2, $24,
-                 'candidate', 'not_requested', $25, 1, $26, $26)
+                 $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, 2,
+                 $25, 'candidate', 'not_requested', $26, 1, $27, $27)
          ON CONFLICT (project_id, idempotency_key) DO NOTHING
          RETURNING id`,
         [
@@ -2569,6 +2916,7 @@ export class SharedProjectCatalog {
           input.video.channel ?? null,
           input.video.sourceLanguage ?? null,
           input.idempotencyKey,
+          requestFingerprint,
           selection.trackId,
           selection.transcriptVersion,
           selection.firstSegmentId,
@@ -2593,11 +2941,26 @@ export class SharedProjectCatalog {
       const created = Boolean(inserted.rows[0]);
       if (!created) {
         const existing = await this.database.query<DbRow>(
-          `SELECT id FROM clip_candidates
+          `SELECT id, request_sha256 FROM clip_candidates
            WHERE project_id = $1 AND idempotency_key = $2`,
           [projectId, input.idempotencyKey],
         );
-        persistedCandidateId = String(existing.rows[0]!.id);
+        const row = existing.rows[0];
+        if (!row) {
+          throw new CatalogConflictError(
+            "The clip could not be resolved after idempotent creation.",
+          );
+        }
+        if (
+          (row.request_sha256 &&
+            String(row.request_sha256) !== requestFingerprint) ||
+          (!row.request_sha256 && input.firstComment)
+        ) {
+          throw new CatalogIdempotencyConflictError(
+            "This clip command identity already belongs to different clip or first-comment evidence.",
+          );
+        }
+        persistedCandidateId = String(row.id);
         return;
       }
 
@@ -2640,6 +3003,27 @@ export class SharedProjectCatalog {
           [candidateId, tagResult.rows[0]!.id],
         );
       }
+      const firstCommentId = input.firstComment ? randomUUID() : undefined;
+      if (input.firstComment && firstCommentId) {
+        await this.database.query(
+          `INSERT INTO clip_comments
+             (id, project_id, clip_id, author_id, author_handle,
+              author_display_name, body, source_time_ms, initial_comment,
+              version, created_at, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true, 1, $9, $9)`,
+          [
+            firstCommentId,
+            projectId,
+            candidateId,
+            user.id,
+            user.handle,
+            user.displayName,
+            input.firstComment.body,
+            input.firstComment.sourceTimeMs ?? null,
+            now,
+          ],
+        );
+      }
       await this.database.query(
         `INSERT INTO sync_events
            (project_id, event_type, entity_id, server_version, payload, created_at)
@@ -2655,9 +3039,42 @@ export class SharedProjectCatalog {
           now,
         ],
       );
+      if (firstCommentId) {
+        await this.database.query(
+          `INSERT INTO sync_events
+             (project_id, event_type, entity_id, server_version, payload,
+              created_at)
+           VALUES ($1, 'clip_comment.created', $2, 1, $3, $4)`,
+          [
+            projectId,
+            firstCommentId,
+            JSON.stringify({
+              clipId: candidateId,
+              commentId: firstCommentId,
+              authorId: user.id,
+              initialComment: true,
+              sourceTimeMs: input.firstComment?.sourceTimeMs ?? null,
+            }),
+            now,
+          ],
+        );
+      }
     });
 
-    return this.getClipCandidate(actor, projectId, persistedCandidateId);
+    const [clip, initialComment] = await Promise.all([
+      this.getClipCandidate(actor, projectId, persistedCandidateId),
+      this.database.query<DbRow>(
+        `SELECT * FROM clip_comments
+         WHERE project_id = $1 AND clip_id = $2 AND initial_comment`,
+        [projectId, persistedCandidateId],
+      ),
+    ]);
+    return CreateClipCandidateResponseSchema.parse({
+      ...clip,
+      ...(initialComment.rows[0]
+        ? { firstComment: mapClipComment(initialComment.rows[0]) }
+        : {}),
+    });
   }
 
   async listClipCandidates(
@@ -3911,7 +4328,8 @@ export class SharedProjectCatalog {
   ): Promise<Project> {
     await this.authorize(actor, projectId, "read");
     const result = await this.database.query<DbRow>(
-      `SELECT id, name, description, version, created_at, updated_at
+      `SELECT id, name, description, kind, visibility, version,
+              created_at, updated_at
        FROM projects WHERE id = $1`,
       [projectId],
     );
@@ -3923,23 +4341,51 @@ export class SharedProjectCatalog {
     actor: AuthenticatedActor,
     projectId: string,
     userId: string,
-    role: Exclude<ProjectRole, "owner">,
+    role: "administrator" | "researcher" | "viewer",
   ): Promise<void> {
-    await this.authorize(actor, projectId, "manage_members");
+    await this.requireRegistered(actor);
+    const [membership, project] = await Promise.all([
+      this.database.query<{ role: ProjectRole }>(
+        "SELECT role FROM project_members WHERE project_id = $1 AND user_id = $2",
+        [projectId, actor.userId],
+      ),
+      this.database.query<DbRow>("SELECT kind FROM projects WHERE id = $1", [
+        projectId,
+      ]),
+    ]);
+    if (role === "viewer") {
+      // Compatibility-only catalog setup path. The public command contract
+      // deliberately cannot assign Viewer.
+      requirePermission(membership.rows[0]?.role, "manage_administrators");
+    } else {
+      requireProjectRoleAssignment(membership.rows[0]?.role, role);
+    }
+    if (!project.rows[0]) throw new CatalogNotFoundError("Project not found.");
+    if (project.rows[0].kind === "personal") {
+      throw new CatalogConflictError(
+        "Personal projects cannot have additional members.",
+      );
+    }
     const target = await this.database.query(
       "SELECT id FROM users WHERE id = $1",
       [userId],
     );
     if (!target.rows[0]) throw new CatalogNotFoundError("User not found.");
     const now = this.now().toISOString();
+    const existing = await this.database.query<{ role: ProjectRole }>(
+      "SELECT role FROM project_members WHERE project_id = $1 AND user_id = $2",
+      [projectId, userId],
+    );
+    if (existing.rows[0]?.role === role) return;
+    if (existing.rows[0]) {
+      throw new CatalogConflictError(
+        "This member already has a different project role.",
+      );
+    }
     await this.database.query(
       `INSERT INTO project_members
          (project_id, user_id, role, version, created_at, updated_at)
-       VALUES ($1, $2, $3, 1, $4, $4)
-       ON CONFLICT (project_id, user_id) DO UPDATE
-       SET role = EXCLUDED.role,
-           version = project_members.version + 1,
-           updated_at = EXCLUDED.updated_at`,
+       VALUES ($1, $2, $3, 1, $4, $4)`,
       [projectId, userId, role, now],
     );
   }
@@ -3955,45 +4401,35 @@ export class SharedProjectCatalog {
       durationMs?: number;
       sourceLanguage?: string;
     },
+    options: { automaticLocalProcessing?: boolean } = {},
   ): Promise<Video> {
     await this.authorize(actor, projectId, "write");
-    const existing = await this.database.query<DbRow>(
-      "SELECT id FROM videos WHERE youtube_video_id = $1",
-      [input.youtubeVideoId],
-    );
-    const id = String(existing.rows[0]?.id ?? randomUUID());
     const now = this.now().toISOString();
-    await this.transaction(async () => {
-      await this.database.query(
-        `INSERT INTO videos
-           (id, youtube_video_id, canonical_url, title, channel, duration_ms,
-            source_language, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8)
-         ON CONFLICT (youtube_video_id) DO UPDATE
-         SET canonical_url = EXCLUDED.canonical_url,
-             title = EXCLUDED.title,
-             channel = EXCLUDED.channel,
-             duration_ms = EXCLUDED.duration_ms,
-             source_language = EXCLUDED.source_language,
-             updated_at = EXCLUDED.updated_at`,
-        [
-          id,
-          input.youtubeVideoId,
-          input.canonicalUrl,
-          input.title.trim(),
-          input.channel?.trim() ?? null,
-          input.durationMs ?? null,
-          input.sourceLanguage ?? null,
+    const id = await this.transaction(async () => {
+      const catalogVideoId = await this.upsertProjectVideo(
+        actor.userId,
+        projectId,
+        input,
+        now,
+      );
+      const project = await this.database.query<DbRow>(
+        `SELECT local_processing_state FROM projects
+         WHERE id = $1 FOR UPDATE`,
+        [projectId],
+      );
+      if (
+        options.automaticLocalProcessing &&
+        project.rows[0]?.local_processing_state === "automatic"
+      ) {
+        await this.enqueueMissingProjectLocalVideos(
+          actor,
+          projectId,
           now,
-        ],
-      );
-      await this.database.query(
-        `INSERT INTO project_videos
-           (project_id, video_id, version, created_at, updated_at)
-         VALUES ($1, $2, 1, $3, $3)
-         ON CONFLICT (project_id, video_id) DO NOTHING`,
-        [projectId, id, now],
-      );
+          1,
+          catalogVideoId,
+        );
+      }
+      return catalogVideoId;
     });
     const result = await this.database.query<DbRow>(
       `SELECT id, youtube_video_id, canonical_url, title, channel, duration_ms,
@@ -4019,6 +4455,2751 @@ export class SharedProjectCatalog {
       [projectId],
     );
     return result.rows.map(mapVideo);
+  }
+
+  async getProjectLocalProcessingStatus(
+    actor: AuthenticatedActor,
+    projectId: string,
+  ): Promise<ProjectLocalProcessingStatus> {
+    await this.authorize(actor, projectId, "read");
+    return this.loadProjectLocalProcessingStatus(projectId);
+  }
+
+  async updateProjectLocalProcessing(
+    actor: AuthenticatedActor,
+    projectId: string,
+    input: UpdateProjectLocalProcessingRequest,
+  ): Promise<UpdateProjectLocalProcessingResponse> {
+    await this.requireRegistered(actor);
+    const command = UpdateProjectLocalProcessingRequestSchema.parse(input);
+    const requestSha256 = createHash("sha256")
+      .update(canonicalJson(command))
+      .digest("hex");
+    const now = this.now().toISOString();
+
+    return this.transaction(async () => {
+      const membership = await this.database.query<{ role: ProjectRole }>(
+        `SELECT role FROM project_members
+         WHERE project_id = $1 AND user_id = $2
+         FOR SHARE`,
+        [projectId, actor.userId],
+      );
+      requirePermission(membership.rows[0]?.role, "manage_project");
+      const selected = await this.database.query<DbRow>(
+        `SELECT local_processing_version FROM projects
+         WHERE id = $1 FOR UPDATE`,
+        [projectId],
+      );
+      if (!selected.rows[0]) {
+        throw new CatalogNotFoundError("Project not found.");
+      }
+      const replay = await this.database.query<DbRow>(
+        `SELECT request_sha256, response_json
+         FROM project_local_processing_commands
+         WHERE project_id = $1 AND actor_id = $2 AND idempotency_key = $3`,
+        [projectId, actor.userId, command.idempotencyKey],
+      );
+      if (replay.rows[0]) {
+        if (String(replay.rows[0].request_sha256) !== requestSha256) {
+          throw new CatalogIdempotencyConflictError(
+            "This local-processing command key was already used for another request.",
+          );
+        }
+        return UpdateProjectLocalProcessingResponseSchema.parse(
+          jsonRecord(replay.rows[0].response_json),
+        );
+      }
+      if (
+        Number(selected.rows[0].local_processing_version) !==
+        command.expectedVersion
+      ) {
+        throw new CatalogConflictError(
+          "The local-processing policy changed; reload before trying again.",
+        );
+      }
+      await this.database.query(
+        `UPDATE projects
+         SET local_processing_state = $1,
+             local_processing_version = local_processing_version + 1,
+             local_processing_updated_by = $2,
+             local_processing_updated_at = $3,
+             updated_at = $3
+         WHERE id = $4`,
+        [command.state, actor.userId, now, projectId],
+      );
+      const enqueuedCount =
+        command.state === "automatic"
+          ? await this.enqueueMissingProjectLocalVideos(
+              actor,
+              projectId,
+              now,
+              50,
+            )
+          : 0;
+      const status = await this.loadProjectLocalProcessingStatus(projectId);
+      const response = UpdateProjectLocalProcessingResponseSchema.parse({
+        ...status,
+        enqueuedCount,
+        remainingUnprocessedCount: status.workload.unprocessedActiveVideoCount,
+      });
+      await this.database.query(
+        `INSERT INTO project_local_processing_commands
+           (id, project_id, actor_id, requested_state, idempotency_key,
+            request_sha256, response_json, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+        [
+          randomUUID(),
+          projectId,
+          actor.userId,
+          command.state,
+          command.idempotencyKey,
+          requestSha256,
+          JSON.stringify(response),
+          now,
+        ],
+      );
+      return response;
+    });
+  }
+
+  async listProjectKeywords(
+    actor: AuthenticatedActor,
+    projectId: string,
+  ): Promise<ProjectKeywordCatalog> {
+    await this.authorize(actor, projectId, "read");
+    return this.loadProjectKeywordCatalog(projectId);
+  }
+
+  async getProjectKeywordScanSummary(
+    actor: AuthenticatedActor,
+    projectId: string,
+    projectVideoId: string,
+  ): Promise<ProjectKeywordScanSummary> {
+    await this.authorize(actor, projectId, "read");
+    return this.loadProjectKeywordScanSummary(projectId, projectVideoId);
+  }
+
+  async scheduleProjectKeywordScan(
+    actor: AuthenticatedActor,
+    projectId: string,
+    projectVideoId: string,
+  ): Promise<ProjectKeywordScanSummary> {
+    await this.requireRegistered(actor);
+    const now = this.now().toISOString();
+    return this.transaction(async () => {
+      const membership = await this.database.query<{ role: ProjectRole }>(
+        `SELECT role FROM project_members
+         WHERE project_id = $1 AND user_id = $2 FOR SHARE`,
+        [projectId, actor.userId],
+      );
+      requirePermission(membership.rows[0]?.role, "write");
+      const current = await this.database.query<DbRow>(
+        `SELECT pv.active_transcript_version_id, p.keyword_set_version,
+                (SELECT count(*)::integer FROM project_keywords k
+                 WHERE k.project_id = p.id AND k.enabled) AS approved_keyword_count
+         FROM project_videos pv
+         JOIN projects p ON p.id = pv.project_id
+         WHERE pv.project_id = $1 AND pv.video_id = $2
+         FOR UPDATE OF pv, p`,
+        [projectId, projectVideoId],
+      );
+      const row = current.rows[0];
+      if (!row) throw new CatalogNotFoundError("Project video not found.");
+      if (!row.active_transcript_version_id) {
+        return this.loadProjectKeywordScanSummary(projectId, projectVideoId);
+      }
+      const existing = await this.database.query<DbRow>(
+        `SELECT id, state FROM project_keyword_scans
+         WHERE project_id = $1 AND video_id = $2
+           AND transcript_version_id = $3 AND keyword_set_version = $4
+           AND scanner_schema_version = $5
+         FOR UPDATE`,
+        [
+          projectId,
+          projectVideoId,
+          row.active_transcript_version_id,
+          row.keyword_set_version,
+          ProjectKeywordScannerSchemaVersion,
+        ],
+      );
+      if (!existing.rows[0]) {
+        await this.database.query(
+          `INSERT INTO project_keyword_scans
+             (id, project_id, video_id, transcript_version_id,
+              keyword_set_version, scanner_schema_version, state, attempt,
+              approved_keyword_count, created_at, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6, 'queued', 0, $7, $8, $8)`,
+          [
+            randomUUID(),
+            projectId,
+            projectVideoId,
+            row.active_transcript_version_id,
+            row.keyword_set_version,
+            ProjectKeywordScannerSchemaVersion,
+            Number(row.approved_keyword_count),
+            now,
+          ],
+        );
+      } else if (existing.rows[0].state === "failed") {
+        await this.database.query(
+          `UPDATE project_keyword_scans
+           SET state = 'queued', error_code = NULL, error_message = NULL,
+               terminal_actor_id = NULL, completed_at = NULL, updated_at = $1
+           WHERE id = $2`,
+          [now, existing.rows[0].id],
+        );
+      }
+      return this.loadProjectKeywordScanSummary(projectId, projectVideoId);
+    });
+  }
+
+  async claimProjectKeywordScan(
+    actor: AuthenticatedActor,
+    projectId: string | undefined,
+    input: ClaimProjectKeywordScanRequest,
+  ): Promise<ProjectKeywordScanClaim | undefined> {
+    await this.requireRegistered(actor);
+    const command = ClaimProjectKeywordScanRequestSchema.parse(input);
+    const claimedAt = this.now();
+    const expiresAt = new Date(
+      claimedAt.getTime() + command.leaseSeconds * 1_000,
+    );
+    return this.transaction(async () => {
+      const candidate = await this.database.query<DbRow>(
+        `SELECT s.*
+         FROM project_keyword_scans s
+         JOIN project_members pm
+           ON pm.project_id = s.project_id AND pm.user_id = $1
+         JOIN projects p ON p.id = s.project_id
+         JOIN project_videos pv
+           ON pv.project_id = s.project_id AND pv.video_id = s.video_id
+         WHERE ($2::uuid IS NULL OR s.project_id = $2)
+           AND pm.role IN ('owner', 'administrator', 'researcher')
+           AND pv.active_transcript_version_id = s.transcript_version_id
+           AND p.keyword_set_version = s.keyword_set_version
+           AND s.scanner_schema_version = $3
+           AND (s.state = 'queued'
+                OR (s.state = 'scanning' AND s.expires_at <= $4))
+         ORDER BY s.created_at, s.id
+         LIMIT 1 FOR UPDATE OF s SKIP LOCKED`,
+        [
+          actor.userId,
+          projectId ?? null,
+          ProjectKeywordScannerSchemaVersion,
+          claimedAt.toISOString(),
+        ],
+      );
+      const row = candidate.rows[0];
+      if (!row) return undefined;
+      const attempt = Number(row.attempt) + 1;
+      await this.database.query(
+        `UPDATE project_keyword_scans
+         SET state = 'scanning', attempt = $1, worker_id = $2,
+             claimed_at = $3, heartbeat_at = $3, expires_at = $4,
+             terminal_actor_id = NULL, completed_at = NULL, updated_at = $3
+         WHERE id = $5`,
+        [
+          attempt,
+          actor.userId,
+          claimedAt.toISOString(),
+          expiresAt.toISOString(),
+          row.id,
+        ],
+      );
+      return ProjectKeywordScanClaimSchema.parse({
+        job: mapProjectKeywordScanJob({
+          ...row,
+          state: "scanning",
+          attempt,
+          updated_at: claimedAt.toISOString(),
+        }),
+        workerId: actor.userId,
+        attempt,
+        claimedAt: claimedAt.toISOString(),
+        heartbeatAt: claimedAt.toISOString(),
+        expiresAt: expiresAt.toISOString(),
+      });
+    });
+  }
+
+  async getProjectKeywordScanInput(
+    actor: AuthenticatedActor,
+    projectId: string,
+    scanId: string,
+    input: GetProjectKeywordScanInputRequest,
+  ): Promise<ProjectKeywordScanInputSnapshot> {
+    await this.requireRegistered(actor);
+    const command = GetProjectKeywordScanInputRequestSchema.parse(input);
+    const now = this.now().toISOString();
+    const snapshot = await this.transaction(
+      async () => {
+        const selected = await this.database.query<DbRow>(
+          `SELECT s.*, v.duration_ms
+           FROM project_keyword_scans s
+           JOIN project_members pm
+             ON pm.project_id = s.project_id AND pm.user_id = $1
+           JOIN projects p ON p.id = s.project_id
+           JOIN project_videos pv
+             ON pv.project_id = s.project_id AND pv.video_id = s.video_id
+           JOIN videos v ON v.id = s.video_id
+           WHERE s.id = $2 AND s.project_id = $3 AND s.state = 'scanning'
+             AND s.worker_id = $1 AND s.attempt = $4 AND s.expires_at > $5
+             AND pm.role IN ('owner', 'administrator', 'researcher')
+             AND p.keyword_set_version = s.keyword_set_version
+             AND pv.active_transcript_version_id = s.transcript_version_id`,
+          [actor.userId, scanId, projectId, command.attempt, now],
+        );
+        const row = selected.rows[0];
+        if (!row) {
+          throw new AuthorizationError(
+            "The keyword scan input is stale, expired, removed, or not owned by this worker.",
+          );
+        }
+        const aliases = await this.database.query<DbRow>(
+          `SELECT a.id, a.keyword_id, a.language, a.phrase
+           FROM project_keyword_aliases a
+           JOIN project_keywords k
+             ON k.project_id = a.project_id AND k.id = a.keyword_id
+           WHERE a.project_id = $1 AND a.enabled AND k.enabled
+           ORDER BY a.keyword_id, a.id
+           LIMIT 20000`,
+          [projectId],
+        );
+        return {
+          row,
+          aliases: aliases.rows.map((alias) => ({
+            keywordId: String(alias.keyword_id),
+            aliasId: String(alias.id),
+            language: String(alias.language),
+            phrase: String(alias.phrase),
+          })),
+        };
+      },
+      { repeatableRead: true },
+    );
+    const transcript = await this.loadTranscriptBundleByVersion(
+      projectId,
+      String(snapshot.row.video_id),
+      String(snapshot.row.transcript_version_id),
+    );
+    return ProjectKeywordScanInputSnapshotSchema.parse({
+      job: mapProjectKeywordScanJob(snapshot.row),
+      attempt: command.attempt,
+      aliases: snapshot.aliases,
+      transcript,
+      ...(snapshot.row.duration_ms === null ||
+      snapshot.row.duration_ms === undefined
+        ? {}
+        : { durationMs: Number(snapshot.row.duration_ms) }),
+    });
+  }
+
+  async heartbeatProjectKeywordScan(
+    actor: AuthenticatedActor,
+    projectId: string,
+    scanId: string,
+    input: HeartbeatProjectKeywordScanRequest,
+  ): Promise<ProjectKeywordScanClaim> {
+    await this.authorize(actor, projectId, "write");
+    const command = HeartbeatProjectKeywordScanRequestSchema.parse(input);
+    const heartbeatAt = this.now();
+    const expiresAt = new Date(
+      heartbeatAt.getTime() + command.leaseSeconds * 1_000,
+    );
+    const updated = await this.database.query<DbRow>(
+      `UPDATE project_keyword_scans
+       SET heartbeat_at = $1, expires_at = $2, updated_at = $1
+       WHERE id = $3 AND project_id = $4 AND state = 'scanning'
+         AND worker_id = $5 AND attempt = $6 AND expires_at > $1
+       RETURNING *`,
+      [
+        heartbeatAt.toISOString(),
+        expiresAt.toISOString(),
+        scanId,
+        projectId,
+        actor.userId,
+        command.attempt,
+      ],
+    );
+    const row = updated.rows[0];
+    if (!row) {
+      throw new AuthorizationError(
+        "The keyword scan lease is stale, expired, or not owned by this worker.",
+      );
+    }
+    return ProjectKeywordScanClaimSchema.parse({
+      job: mapProjectKeywordScanJob(row),
+      workerId: actor.userId,
+      attempt: command.attempt,
+      claimedAt: iso(row.claimed_at),
+      heartbeatAt: heartbeatAt.toISOString(),
+      expiresAt: expiresAt.toISOString(),
+    });
+  }
+
+  async createProjectKeywordScanArtifactUpload(
+    actor: AuthenticatedActor,
+    projectId: string,
+    scanId: string,
+    input: CreateProjectKeywordScanArtifactUploadRequest,
+  ): Promise<ProjectKeywordScanArtifactUploadGrant> {
+    const command =
+      CreateProjectKeywordScanArtifactUploadRequestSchema.parse(input);
+    const now = this.now();
+    const selected = await this.database.query<DbRow>(
+      `SELECT s.video_id, s.expires_at
+       FROM project_keyword_scans s
+       JOIN project_members pm
+         ON pm.project_id = s.project_id AND pm.user_id = $1
+       WHERE s.id = $2 AND s.project_id = $3 AND s.state = 'scanning'
+         AND s.worker_id = $1 AND s.attempt = $4 AND s.expires_at > $5
+         AND pm.role IN ('owner', 'administrator', 'researcher')`,
+      [actor.userId, scanId, projectId, command.attempt, now.toISOString()],
+    );
+    const row = selected.rows[0];
+    if (!row) {
+      throw new AuthorizationError(
+        "The keyword scan lease is stale, expired, removed, or not owned by this worker.",
+      );
+    }
+    const expiresAt = new Date(
+      Math.min(now.getTime() + 15 * 60_000, Date.parse(iso(row.expires_at))),
+    );
+    const expiresInSeconds = Math.max(
+      1,
+      Math.floor((expiresAt.getTime() - now.getTime()) / 1_000),
+    );
+    const objectKey = `keyword-scans/${projectId}/${row.video_id}/${scanId}/matches.json`;
+    return ProjectKeywordScanArtifactUploadGrantSchema.parse({
+      scanId,
+      objectKey,
+      uploadUrl: await this.uploadUrlIssuer.issuePutUrl({
+        objectKey,
+        expiresInSeconds,
+      }),
+      expiresAt: expiresAt.toISOString(),
+    });
+  }
+
+  async getProjectKeywordScanArtifactDownload(
+    actor: AuthenticatedActor,
+    projectId: string,
+    scanId: string,
+  ): Promise<ProjectKeywordScanArtifactDownloadTarget> {
+    await this.authorize(actor, projectId, "read");
+    const selected = await this.database.query<DbRow>(
+      `SELECT * FROM project_keyword_scans
+       WHERE id = $1 AND project_id = $2 AND state = 'completed'`,
+      [scanId, projectId],
+    );
+    const row = selected.rows[0];
+    if (!row)
+      throw new CatalogNotFoundError("Completed keyword scan not found.");
+    const expiresInSeconds = 300;
+    const expiresAt = new Date(
+      this.now().getTime() + expiresInSeconds * 1_000,
+    ).toISOString();
+    const artifact = {
+      objectKey: row.artifact_object_key,
+      objectVersionId: row.artifact_object_version_id,
+      sha256: row.artifact_sha256,
+      sizeBytes: Number(row.artifact_size_bytes),
+      schemaVersion: Number(row.artifact_schema_version),
+    };
+    return ProjectKeywordScanArtifactDownloadTargetSchema.parse({
+      scanId,
+      artifact,
+      downloadUrl: await this.uploadUrlIssuer.issueGetUrl({
+        objectKey: String(row.artifact_object_key),
+        objectVersionId: String(row.artifact_object_version_id),
+        expiresInSeconds,
+      }),
+      expiresAt,
+    });
+  }
+
+  async finalizeProjectKeywordScan(
+    actor: AuthenticatedActor,
+    projectId: string,
+    scanId: string,
+    input: FinalizeProjectKeywordScanRequest,
+  ): Promise<ProjectKeywordScanSummary> {
+    await this.authorize(actor, projectId, "write");
+    const command = FinalizeProjectKeywordScanRequestSchema.parse(input);
+    const now = this.now().toISOString();
+    return this.transaction(async () => {
+      const selected = await this.database.query<DbRow>(
+        `SELECT * FROM project_keyword_scans
+         WHERE id = $1 AND project_id = $2 FOR UPDATE`,
+        [scanId, projectId],
+      );
+      const row = selected.rows[0];
+      if (!row) throw new CatalogNotFoundError("Keyword scan not found.");
+      const exactTerminal =
+        row.state === "completed" &&
+        String(row.terminal_actor_id) === actor.userId &&
+        Number(row.attempt) === command.attempt &&
+        String(row.artifact_object_key) === command.artifact.objectKey &&
+        String(row.artifact_object_version_id) ===
+          command.artifact.objectVersionId &&
+        String(row.artifact_sha256) === command.artifact.sha256 &&
+        Number(row.artifact_size_bytes) === command.artifact.sizeBytes &&
+        Number(row.occurrence_count) === command.occurrenceCount &&
+        Number(row.matched_keyword_count) === command.matchedKeywordCount &&
+        canonicalJson(jsonArray(row.keyword_counts) ?? []) ===
+          canonicalJson(command.keywordCounts) &&
+        (row.duration_ms === null
+          ? command.durationMs === undefined
+          : Number(row.duration_ms) === command.durationMs);
+      if (exactTerminal) {
+        return this.loadProjectKeywordScanSummary(
+          projectId,
+          String(row.video_id),
+        );
+      }
+      if (
+        row.state !== "scanning" ||
+        String(row.worker_id) !== actor.userId ||
+        Number(row.attempt) !== command.attempt ||
+        Date.parse(iso(row.expires_at)) <= Date.parse(now)
+      ) {
+        throw new CatalogConflictError(
+          "The keyword scan lease changed or a divergent result already finalized.",
+        );
+      }
+      const expectedObjectKey = `keyword-scans/${projectId}/${row.video_id}/${scanId}/matches.json`;
+      if (command.artifact.objectKey !== expectedObjectKey) {
+        throw new CatalogValidationError(
+          "The keyword scan artifact key does not match this exact job.",
+        );
+      }
+      if (
+        command.matchedKeywordCount > Number(row.approved_keyword_count) ||
+        command.artifact.schemaVersion !== Number(row.scanner_schema_version)
+      ) {
+        throw new CatalogValidationError(
+          "The keyword scan aggregate or artifact schema exceeds its exact input snapshot.",
+        );
+      }
+      const stored = await this.store.getBounded(
+        command.artifact.objectKey,
+        command.artifact.objectVersionId,
+        50_000_000,
+      );
+      const actualSha256 = stored
+        ? createHash("sha256").update(stored.bytes).digest("hex")
+        : undefined;
+      if (
+        !stored ||
+        stored.bytes.byteLength !== command.artifact.sizeBytes ||
+        actualSha256 !== command.artifact.sha256
+      ) {
+        throw new TranscriptIntegrityError(
+          "The private keyword scan artifact is missing or failed checksum verification.",
+        );
+      }
+      let artifact;
+      try {
+        artifact = ProjectKeywordMatchArtifactSchema.parse(
+          JSON.parse(new TextDecoder().decode(stored.bytes)),
+        );
+      } catch {
+        throw new TranscriptIntegrityError(
+          "The private keyword scan artifact is not valid scanner evidence.",
+        );
+      }
+      const artifactMatchedKeywordCount = new Set(
+        artifact.occurrences.map((occurrence) => occurrence.keywordId),
+      ).size;
+      const artifactKeywordCountMap = new Map<string, number>();
+      for (const occurrence of artifact.occurrences) {
+        artifactKeywordCountMap.set(
+          occurrence.keywordId,
+          (artifactKeywordCountMap.get(occurrence.keywordId) ?? 0) + 1,
+        );
+      }
+      const artifactKeywordCounts = [...artifactKeywordCountMap]
+        .map(([keywordId, occurrenceCount]) => ({
+          keywordId,
+          occurrenceCount,
+        }))
+        .sort((left, right) => left.keywordId.localeCompare(right.keywordId));
+      if (
+        artifact.projectId !== projectId ||
+        artifact.projectVideoId !== String(row.video_id) ||
+        artifact.transcriptVersionId !== String(row.transcript_version_id) ||
+        artifact.keywordSetVersion !== Number(row.keyword_set_version) ||
+        artifact.scannerSchemaVersion !== Number(row.scanner_schema_version) ||
+        artifact.occurrences.length !== command.occurrenceCount ||
+        artifactMatchedKeywordCount !== command.matchedKeywordCount ||
+        canonicalJson(artifactKeywordCounts) !==
+          canonicalJson(
+            [...command.keywordCounts].sort((left, right) =>
+              left.keywordId.localeCompare(right.keywordId),
+            ),
+          )
+      ) {
+        throw new TranscriptIntegrityError(
+          "The private keyword scan artifact does not match this exact scan input and aggregate.",
+        );
+      }
+      await this.database.query(
+        `UPDATE project_keyword_scans
+         SET state = 'completed', worker_id = NULL, claimed_at = NULL,
+             heartbeat_at = NULL, expires_at = NULL,
+             artifact_object_key = $1, artifact_sha256 = $2,
+             artifact_object_version_id = $3,
+             artifact_size_bytes = $4, artifact_schema_version = $5,
+             occurrence_count = $6, matched_keyword_count = $7,
+             keyword_counts = $8::jsonb, duration_ms = $9,
+             terminal_actor_id = $10,
+             completed_at = $11, updated_at = $11
+         WHERE id = $12`,
+        [
+          command.artifact.objectKey,
+          command.artifact.sha256,
+          command.artifact.objectVersionId,
+          command.artifact.sizeBytes,
+          command.artifact.schemaVersion,
+          command.occurrenceCount,
+          command.matchedKeywordCount,
+          JSON.stringify(artifactKeywordCounts),
+          command.durationMs ?? null,
+          actor.userId,
+          now,
+          scanId,
+        ],
+      );
+      const recipients = await this.database.query<{ user_id: string }>(
+        `SELECT user_id FROM project_members WHERE project_id = $1`,
+        [projectId],
+      );
+      await this.createProjectVideoActivity(
+        projectId,
+        String(row.video_id),
+        actor.userId,
+        "keyword_scan_completed",
+        `keyword-scan:${scanId}`,
+        undefined,
+        recipients.rows.map((member) => String(member.user_id)),
+        now,
+      );
+      return this.loadProjectKeywordScanSummary(
+        projectId,
+        String(row.video_id),
+      );
+    });
+  }
+
+  async failProjectKeywordScan(
+    actor: AuthenticatedActor,
+    projectId: string,
+    scanId: string,
+    input: FailProjectKeywordScanRequest,
+  ): Promise<ProjectKeywordScanSummary> {
+    await this.authorize(actor, projectId, "write");
+    const command = FailProjectKeywordScanRequestSchema.parse(input);
+    const now = this.now().toISOString();
+    return this.transaction(async () => {
+      const selected = await this.database.query<DbRow>(
+        `SELECT * FROM project_keyword_scans
+         WHERE id = $1 AND project_id = $2 FOR UPDATE`,
+        [scanId, projectId],
+      );
+      const row = selected.rows[0];
+      if (!row) throw new CatalogNotFoundError("Keyword scan not found.");
+      const exactTerminal =
+        row.state === "failed" &&
+        String(row.terminal_actor_id) === actor.userId &&
+        Number(row.attempt) === command.attempt &&
+        String(row.error_code) === command.error.code &&
+        String(row.error_message) === command.error.message;
+      if (exactTerminal) {
+        return this.loadProjectKeywordScanSummary(
+          projectId,
+          String(row.video_id),
+        );
+      }
+      if (
+        row.state !== "scanning" ||
+        String(row.worker_id) !== actor.userId ||
+        Number(row.attempt) !== command.attempt ||
+        Date.parse(iso(row.expires_at)) <= Date.parse(now)
+      ) {
+        throw new CatalogConflictError(
+          "The keyword scan lease changed or a divergent failure already finalized.",
+        );
+      }
+      await this.database.query(
+        `UPDATE project_keyword_scans
+         SET state = 'failed', worker_id = NULL, claimed_at = NULL,
+             heartbeat_at = NULL, expires_at = NULL,
+             error_code = $1, error_message = $2, terminal_actor_id = $3,
+             completed_at = $4, updated_at = $4
+         WHERE id = $5`,
+        [command.error.code, command.error.message, actor.userId, now, scanId],
+      );
+      return this.loadProjectKeywordScanSummary(
+        projectId,
+        String(row.video_id),
+      );
+    });
+  }
+
+  private async enqueueCurrentProjectKeywordScans(
+    projectId: string,
+    now: string,
+  ): Promise<void> {
+    const videos = await this.database.query<DbRow>(
+      `SELECT pv.video_id, pv.active_transcript_version_id
+       FROM project_videos pv
+       WHERE pv.project_id = $1 AND pv.active_transcript_version_id IS NOT NULL
+       ORDER BY pv.video_id
+       LIMIT 500`,
+      [projectId],
+    );
+    for (const video of videos.rows) {
+      await this.enqueueProjectVideoKeywordScan(
+        projectId,
+        String(video.video_id),
+        String(video.active_transcript_version_id),
+        now,
+      );
+    }
+  }
+
+  private async enqueueProjectVideoKeywordScan(
+    projectId: string,
+    projectVideoId: string,
+    transcriptVersionId: string,
+    now: string,
+  ): Promise<void> {
+    const project = await this.database.query<DbRow>(
+      `SELECT p.keyword_set_version,
+              (SELECT count(*)::integer FROM project_keywords k
+               WHERE k.project_id = p.id AND k.enabled) AS approved_keyword_count
+       FROM projects p WHERE p.id = $1`,
+      [projectId],
+    );
+    const row = project.rows[0];
+    if (!row) throw new CatalogNotFoundError("Project not found.");
+    await this.database.query(
+      `INSERT INTO project_keyword_scans
+         (id, project_id, video_id, transcript_version_id,
+          keyword_set_version, scanner_schema_version, state, attempt,
+          approved_keyword_count, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, 'queued', 0, $7, $8, $8)
+       ON CONFLICT
+         (project_id, video_id, transcript_version_id,
+          keyword_set_version, scanner_schema_version)
+       DO NOTHING`,
+      [
+        randomUUID(),
+        projectId,
+        projectVideoId,
+        transcriptVersionId,
+        row.keyword_set_version,
+        ProjectKeywordScannerSchemaVersion,
+        Number(row.approved_keyword_count),
+        now,
+      ],
+    );
+  }
+
+  private async loadProjectKeywordScanSummary(
+    projectId: string,
+    projectVideoId: string,
+  ): Promise<ProjectKeywordScanSummary> {
+    const current = await this.database.query<DbRow>(
+      `SELECT pv.active_transcript_version_id, p.keyword_set_version,
+              (SELECT count(*)::integer FROM project_keywords k
+               WHERE k.project_id = p.id AND k.enabled) AS approved_keyword_count
+       FROM project_videos pv
+       JOIN projects p ON p.id = pv.project_id
+       WHERE pv.project_id = $1 AND pv.video_id = $2`,
+      [projectId, projectVideoId],
+    );
+    const identity = current.rows[0];
+    if (!identity) throw new CatalogNotFoundError("Project video not found.");
+    const base = {
+      projectId,
+      projectVideoId,
+      keywordSetVersion: Number(identity.keyword_set_version),
+      scannerSchemaVersion: ProjectKeywordScannerSchemaVersion,
+      approvedKeywordCount: Number(identity.approved_keyword_count),
+    };
+    if (!identity.active_transcript_version_id) {
+      return ProjectKeywordScanSummarySchema.parse({
+        ...base,
+        status: "waiting_for_transcript",
+      });
+    }
+    const exact = await this.database.query<DbRow>(
+      `SELECT * FROM project_keyword_scans
+       WHERE project_id = $1 AND video_id = $2
+         AND transcript_version_id = $3 AND keyword_set_version = $4
+         AND scanner_schema_version = $5
+       ORDER BY created_at DESC, id DESC LIMIT 1`,
+      [
+        projectId,
+        projectVideoId,
+        identity.active_transcript_version_id,
+        identity.keyword_set_version,
+        ProjectKeywordScannerSchemaVersion,
+      ],
+    );
+    let row = exact.rows[0];
+    let status: ProjectKeywordScanSummary["status"];
+    if (row) {
+      status =
+        row.state === "completed"
+          ? "current"
+          : row.state === "scanning" &&
+              Date.parse(iso(row.expires_at)) <= this.now().getTime()
+            ? "queued"
+            : row.state === "scanning"
+              ? "scanning"
+              : row.state === "failed"
+                ? "failed"
+                : "queued";
+    } else {
+      const prior = await this.database.query<DbRow>(
+        `SELECT * FROM project_keyword_scans
+         WHERE project_id = $1 AND video_id = $2 AND state = 'completed'
+         ORDER BY completed_at DESC, id DESC LIMIT 1`,
+        [projectId, projectVideoId],
+      );
+      row = prior.rows[0];
+      status = row ? "stale" : "not_scanned";
+    }
+    if (!row) {
+      return ProjectKeywordScanSummarySchema.parse({
+        ...base,
+        status,
+        transcriptVersionId: identity.active_transcript_version_id,
+      });
+    }
+    const terminal = status === "current" || status === "stale";
+    const prior = terminal
+      ? undefined
+      : (
+          await this.database.query<DbRow>(
+            `SELECT * FROM project_keyword_scans
+             WHERE project_id = $1 AND video_id = $2 AND state = 'completed'
+               AND id <> $3
+             ORDER BY completed_at DESC, id DESC LIMIT 1`,
+            [projectId, projectVideoId, row.id],
+          )
+        ).rows[0];
+    const completedResult = (completed: DbRow) => ({
+      scanId: completed.id,
+      transcriptVersionId: completed.transcript_version_id,
+      keywordSetVersion: Number(completed.keyword_set_version),
+      scannerSchemaVersion: Number(completed.scanner_schema_version),
+      occurrenceCount: Number(completed.occurrence_count),
+      matchedKeywordCount: Number(completed.matched_keyword_count),
+      ...(jsonArray(completed.keyword_counts)
+        ? { keywordCounts: jsonArray(completed.keyword_counts) }
+        : {}),
+      approvedKeywordCount: Number(completed.approved_keyword_count),
+      ...(completed.duration_ms === null || completed.duration_ms === undefined
+        ? {}
+        : {
+            durationMs: Number(completed.duration_ms),
+            matchesPerMinute:
+              (Number(completed.occurrence_count) * 60_000) /
+              Number(completed.duration_ms),
+          }),
+      artifact: {
+        objectKey: completed.artifact_object_key,
+        objectVersionId: completed.artifact_object_version_id,
+        sha256: completed.artifact_sha256,
+        sizeBytes: Number(completed.artifact_size_bytes),
+        schemaVersion: Number(completed.artifact_schema_version),
+      },
+      completedAt: iso(completed.completed_at),
+    });
+    return ProjectKeywordScanSummarySchema.parse({
+      ...base,
+      scanId: row.id,
+      status,
+      transcriptVersionId: row.transcript_version_id,
+      keywordSetVersion: Number(row.keyword_set_version),
+      approvedKeywordCount: Number(row.approved_keyword_count),
+      ...(terminal
+        ? {
+            occurrenceCount: Number(row.occurrence_count),
+            matchedKeywordCount: Number(row.matched_keyword_count),
+            ...(jsonArray(row.keyword_counts)
+              ? { keywordCounts: jsonArray(row.keyword_counts) }
+              : {}),
+            artifact: {
+              objectKey: row.artifact_object_key,
+              objectVersionId: row.artifact_object_version_id,
+              sha256: row.artifact_sha256,
+              sizeBytes: Number(row.artifact_size_bytes),
+              schemaVersion: Number(row.artifact_schema_version),
+            },
+            completedAt: iso(row.completed_at),
+          }
+        : {}),
+      ...(row.duration_ms === null || row.duration_ms === undefined
+        ? {}
+        : {
+            durationMs: Number(row.duration_ms),
+            ...(terminal
+              ? {
+                  matchesPerMinute:
+                    (Number(row.occurrence_count) * 60_000) /
+                    Number(row.duration_ms),
+                }
+              : {}),
+          }),
+      ...(status === "failed"
+        ? {
+            error: {
+              code: String(row.error_code),
+              message: String(row.error_message),
+            },
+          }
+        : {}),
+      ...(prior ? { priorResult: completedResult(prior) } : {}),
+    });
+  }
+
+  async suggestProjectKeyword(
+    actor: AuthenticatedActor,
+    projectId: string,
+    input: SuggestProjectKeywordRequest,
+  ): Promise<SuggestProjectKeywordResponse> {
+    await this.requireRegistered(actor);
+    const command = SuggestProjectKeywordRequestSchema.parse(input);
+    const normalizedPhrase = normalizeProjectKeywordPhrase(command.phrase);
+    const requestSha256 = createHash("sha256")
+      .update(canonicalJson(command))
+      .digest("hex");
+    const now = this.now().toISOString();
+    return this.transaction(async () => {
+      const membership = await this.database.query<{ role: ProjectRole }>(
+        `SELECT role FROM project_members
+         WHERE project_id = $1 AND user_id = $2 FOR SHARE`,
+        [projectId, actor.userId],
+      );
+      requirePermission(membership.rows[0]?.role, "write");
+      const project = await this.database.query(
+        "SELECT id FROM projects WHERE id = $1 FOR UPDATE",
+        [projectId],
+      );
+      if (!project.rows[0])
+        throw new CatalogNotFoundError("Project not found.");
+      const replay = await this.loadProjectKeywordCommandReplay(
+        projectId,
+        actor.userId,
+        command.idempotencyKey,
+        requestSha256,
+      );
+      if (replay) return SuggestProjectKeywordResponseSchema.parse(replay);
+      if (command.keywordId) {
+        const target = await this.database.query(
+          `SELECT id FROM project_keywords
+           WHERE project_id = $1 AND id = $2`,
+          [projectId, command.keywordId],
+        );
+        if (!target.rows[0]) {
+          throw new CatalogNotFoundError("Project keyword not found.");
+        }
+      }
+      const approved = await this.database.query<DbRow>(
+        `SELECT a.id, a.keyword_id
+         FROM project_keyword_aliases a
+         WHERE a.project_id = $1 AND a.language = $2
+           AND a.normalized_phrase = $3`,
+        [projectId, command.language, normalizedPhrase],
+      );
+      let response: SuggestProjectKeywordResponse;
+      if (approved.rows[0]) {
+        const catalog = await this.loadProjectKeywordCatalog(projectId);
+        const keyword = catalog.keywords.find(
+          (entry) => entry.id === String(approved.rows[0]!.keyword_id),
+        )!;
+        response = SuggestProjectKeywordResponseSchema.parse({
+          resolution: "already_approved",
+          keyword,
+          alias: keyword.aliases.find(
+            (alias) => alias.id === String(approved.rows[0]!.id),
+          ),
+        });
+      } else {
+        const pending = await this.database.query<DbRow>(
+          `SELECT id FROM project_keyword_suggestions
+           WHERE project_id = $1 AND language = $2
+             AND normalized_phrase = $3 AND state = 'pending'`,
+          [projectId, command.language, normalizedPhrase],
+        );
+        const suggestionId = pending.rows[0]?.id
+          ? String(pending.rows[0].id)
+          : randomUUID();
+        if (!pending.rows[0]) {
+          await this.database.query(
+            `INSERT INTO project_keyword_suggestions
+               (id, project_id, keyword_id, proposed_label,
+                proposed_description, language, phrase, normalized_phrase,
+                rationale, state, version, proposed_by, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9,
+                     'pending', 1, $10, $11, $11)`,
+            [
+              suggestionId,
+              projectId,
+              command.keywordId ?? null,
+              command.proposedLabel ?? null,
+              command.proposedDescription ?? null,
+              command.language,
+              command.phrase,
+              normalizedPhrase,
+              command.rationale ?? null,
+              actor.userId,
+              now,
+            ],
+          );
+        }
+        const catalog = await this.loadProjectKeywordCatalog(projectId);
+        response = SuggestProjectKeywordResponseSchema.parse({
+          resolution: pending.rows[0] ? "existing_pending" : "created",
+          suggestion: catalog.suggestions.find(
+            (entry) => entry.id === suggestionId,
+          ),
+        });
+      }
+      await this.recordProjectKeywordCommand(
+        projectId,
+        actor.userId,
+        "suggest",
+        command.idempotencyKey,
+        requestSha256,
+        response,
+        now,
+      );
+      return response;
+    });
+  }
+
+  async reviewProjectKeywordSuggestion(
+    actor: AuthenticatedActor,
+    projectId: string,
+    suggestionId: string,
+    input: ReviewProjectKeywordSuggestionRequest,
+  ): Promise<ReviewProjectKeywordSuggestionResponse> {
+    await this.requireRegistered(actor);
+    const command = ReviewProjectKeywordSuggestionRequestSchema.parse(input);
+    const requestSha256 = createHash("sha256")
+      .update(canonicalJson({ suggestionId, ...command }))
+      .digest("hex");
+    const now = this.now().toISOString();
+    return this.transaction(async () => {
+      const membership = await this.database.query<{ role: ProjectRole }>(
+        `SELECT role FROM project_members
+         WHERE project_id = $1 AND user_id = $2 FOR SHARE`,
+        [projectId, actor.userId],
+      );
+      requirePermission(membership.rows[0]?.role, "manage_project");
+      const project = await this.database.query<DbRow>(
+        `SELECT keyword_set_version FROM projects
+         WHERE id = $1 FOR UPDATE`,
+        [projectId],
+      );
+      if (!project.rows[0])
+        throw new CatalogNotFoundError("Project not found.");
+      const replay = await this.loadProjectKeywordCommandReplay(
+        projectId,
+        actor.userId,
+        command.idempotencyKey,
+        requestSha256,
+      );
+      if (replay) {
+        return ReviewProjectKeywordSuggestionResponseSchema.parse(replay);
+      }
+      const selected = await this.database.query<DbRow>(
+        `SELECT * FROM project_keyword_suggestions
+         WHERE id = $1 AND project_id = $2 FOR UPDATE`,
+        [suggestionId, projectId],
+      );
+      const suggestion = selected.rows[0];
+      if (!suggestion) {
+        throw new CatalogNotFoundError("Keyword suggestion not found.");
+      }
+      if (Number(suggestion.version) !== command.expectedSuggestionVersion) {
+        throw new CatalogConflictError(
+          "The keyword suggestion changed; reload before reviewing it.",
+        );
+      }
+      if (suggestion.state !== "pending") {
+        throw new CatalogConflictError(
+          "This keyword suggestion was already reviewed.",
+        );
+      }
+      let keywordId = suggestion.keyword_id
+        ? String(suggestion.keyword_id)
+        : undefined;
+      let keywordSetVersion = Number(project.rows[0].keyword_set_version);
+      if (command.action === "approve") {
+        if (keywordSetVersion !== command.expectedKeywordSetVersion) {
+          throw new CatalogConflictError(
+            "The project keyword set changed; reload before approving.",
+          );
+        }
+        if (!keywordId) {
+          const label = String(suggestion.proposed_label);
+          const normalizedLabel = normalizeProjectKeywordPhrase(label);
+          if (normalizedLabel.length > 120) {
+            throw new CatalogValidationError(
+              "The normalized keyword label exceeds 120 characters.",
+            );
+          }
+          const duplicateLabel = await this.database.query(
+            `SELECT id FROM project_keywords
+             WHERE project_id = $1 AND normalized_label = $2`,
+            [projectId, normalizedLabel],
+          );
+          if (duplicateLabel.rows[0]) {
+            throw new CatalogConflictError(
+              "A project keyword with that display label already exists; suggest this phrase as an alias for it.",
+            );
+          }
+          keywordId = randomUUID();
+          await this.database.query(
+            `INSERT INTO project_keywords
+               (id, project_id, label, normalized_label, description,
+                enabled, version, created_by, updated_by, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, true, 1, $6, $6, $7, $7)`,
+            [
+              keywordId,
+              projectId,
+              label,
+              normalizedLabel,
+              suggestion.proposed_description,
+              actor.userId,
+              now,
+            ],
+          );
+        } else {
+          const target = await this.database.query(
+            `SELECT id FROM project_keywords
+             WHERE id = $1 AND project_id = $2 FOR UPDATE`,
+            [keywordId, projectId],
+          );
+          if (!target.rows[0]) {
+            throw new CatalogConflictError(
+              "The target keyword no longer exists.",
+            );
+          }
+        }
+        const aliasCount = await this.database.query<{ count: number }>(
+          `SELECT count(*)::integer AS count
+           FROM project_keyword_aliases
+           WHERE project_id = $1 AND keyword_id = $2`,
+          [projectId, keywordId],
+        );
+        if (Number(aliasCount.rows[0]?.count ?? 0) >= 100) {
+          throw new CatalogConflictError(
+            "This project keyword already has the maximum 100 aliases.",
+          );
+        }
+        const duplicateAlias = await this.database.query(
+          `SELECT id FROM project_keyword_aliases
+           WHERE project_id = $1 AND language = $2
+             AND normalized_phrase = $3`,
+          [projectId, suggestion.language, suggestion.normalized_phrase],
+        );
+        if (duplicateAlias.rows[0]) {
+          throw new CatalogConflictError(
+            "That language-specific project keyword alias is already approved.",
+          );
+        }
+        await this.database.query(
+          `INSERT INTO project_keyword_aliases
+             (id, project_id, keyword_id, language, phrase,
+              normalized_phrase, enabled, version, created_by, updated_by,
+              created_at, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6, true, 1, $7, $7, $8, $8)`,
+          [
+            randomUUID(),
+            projectId,
+            keywordId,
+            suggestion.language,
+            suggestion.phrase,
+            suggestion.normalized_phrase,
+            actor.userId,
+            now,
+          ],
+        );
+        keywordSetVersion += 1;
+        await this.database.query(
+          `UPDATE projects
+           SET keyword_set_version = $1, updated_at = $2 WHERE id = $3`,
+          [keywordSetVersion, now, projectId],
+        );
+        await this.enqueueCurrentProjectKeywordScans(projectId, now);
+      }
+      await this.database.query(
+        `UPDATE project_keyword_suggestions
+         SET keyword_id = $1, state = $2, version = version + 1,
+             reviewed_by = $3, reviewed_at = $4, review_reason = $5,
+             updated_at = $4
+         WHERE id = $6`,
+        [
+          keywordId ?? null,
+          command.action === "approve" ? "approved" : "rejected",
+          actor.userId,
+          now,
+          command.reason ?? null,
+          suggestionId,
+        ],
+      );
+      const catalog = await this.loadProjectKeywordCatalog(projectId);
+      const reviewed = catalog.suggestions.find(
+        (entry) => entry.id === suggestionId,
+      )!;
+      const keyword = keywordId
+        ? catalog.keywords.find((entry) => entry.id === keywordId)
+        : undefined;
+      const response = ReviewProjectKeywordSuggestionResponseSchema.parse({
+        projectId,
+        keywordSetVersion,
+        suggestion: reviewed,
+        ...(command.action === "approve" && keyword
+          ? {
+              keyword,
+              alias: keyword.aliases.find(
+                (entry) =>
+                  entry.language === reviewed.language &&
+                  entry.normalizedPhrase === reviewed.normalizedPhrase,
+              ),
+            }
+          : {}),
+      });
+      await this.recordProjectKeywordCommand(
+        projectId,
+        actor.userId,
+        "review",
+        command.idempotencyKey,
+        requestSha256,
+        response,
+        now,
+      );
+      return response;
+    });
+  }
+
+  async listProjectVideoWorklist(
+    actor: AuthenticatedActor,
+    projectId: string,
+    input: ProjectVideoWorklistQuery,
+  ): Promise<ProjectVideoWorklistPage> {
+    await this.authorize(actor, projectId, "read");
+    const query = ProjectVideoWorklistQuerySchema.parse(input);
+    const view = query.view ?? "all";
+    const cursor = query.cursor
+      ? parseProjectVideoWorklistCursor(query.cursor)
+      : undefined;
+    if (cursor && cursor.projectId !== projectId) {
+      throw new CatalogInvalidRequestError(
+        "Project worklist cursor belongs to another project.",
+      );
+    }
+    if (cursor && cursor.view !== view) {
+      throw new CatalogInvalidRequestError(
+        "Project worklist cursor belongs to another view.",
+      );
+    }
+
+    return this.transaction(
+      async () => {
+        const parameters: unknown[] = [projectId, actor.userId];
+        const viewClause =
+          view === "dismissed"
+            ? "AND pv.triage_state = 'dismissed'"
+            : view === "reviewed"
+              ? `AND pv.triage_state = 'active'
+                 AND EXISTS (
+                   SELECT 1 FROM project_video_review_cycles view_cycle
+                   WHERE view_cycle.project_id = pv.project_id
+                     AND view_cycle.video_id = pv.video_id
+                     AND view_cycle.status = 'completed'
+                     AND NOT EXISTS (
+                       SELECT 1 FROM project_video_review_cycles later_cycle
+                       WHERE later_cycle.project_id = view_cycle.project_id
+                         AND later_cycle.video_id = view_cycle.video_id
+                         AND later_cycle.cycle_number > view_cycle.cycle_number
+                     )
+                 )`
+              : view === "queue"
+                ? `AND pv.triage_state = 'active'
+                   AND EXISTS (
+                     SELECT 1 FROM project_video_review_cycles view_cycle
+                     WHERE view_cycle.project_id = pv.project_id
+                       AND view_cycle.video_id = pv.video_id
+                       AND view_cycle.status = 'open'
+                   )`
+                : "";
+        let cursorClause = "";
+        if (cursor) {
+          parameters.push(cursor.createdAt, cursor.videoId);
+          cursorClause = `
+            AND (
+              pv.created_at < $3::timestamptz
+              OR (pv.created_at = $3::timestamptz AND pv.video_id < $4)
+            )`;
+        }
+        parameters.push(query.limit + 1);
+        const limitParameter = parameters.length;
+        const rows = await this.database.query<DbRow>(
+          `SELECT pv.project_id, pv.video_id, pv.active_transcript_version_id,
+                  pv.version AS project_video_version,
+                  pv.worklist_priority, pv.review_completion_policy,
+                  pv.triage_state, pv.triage_version, pv.dismissed_at,
+                  pv.dismissal_reason, pv.dismissed_by,
+                  dismissed.handle AS dismissed_handle,
+                  dismissed.display_name AS dismissed_display_name,
+                  pv.created_at AS project_video_created_at,
+                  pv.updated_at AS project_video_updated_at,
+                  v.id, v.youtube_video_id, v.canonical_url, v.title,
+                  v.channel, v.duration_ms, v.source_language,
+                  v.created_at, v.updated_at,
+                  own.active AS own_flag_active,
+                  own.version AS own_flag_version,
+                  own.created_at AS own_flag_created_at,
+                  own.updated_at AS own_flag_updated_at,
+                  own.deactivated_at AS own_flag_deactivated_at
+           FROM project_videos pv
+           JOIN videos v ON v.id = pv.video_id
+           LEFT JOIN project_members dismissed_member
+             ON dismissed_member.project_id = pv.project_id
+            AND dismissed_member.user_id = pv.dismissed_by
+           LEFT JOIN users dismissed
+             ON dismissed.id = dismissed_member.user_id
+           LEFT JOIN project_video_flags own
+             ON own.project_id = pv.project_id
+            AND own.video_id = pv.video_id
+            AND own.user_id = $2
+           WHERE pv.project_id = $1 ${viewClause}${cursorClause}
+           ORDER BY pv.created_at DESC, pv.video_id DESC
+           LIMIT $${limitParameter}`,
+          parameters,
+        );
+        const pageRows = rows.rows.slice(0, query.limit);
+        const videoIds = pageRows.map((row) => String(row.video_id));
+        const total = Number(
+          (
+            await this.database.query<DbRow>(
+              `SELECT count(*)::integer AS total
+               FROM project_videos pv
+               WHERE pv.project_id = $1 ${viewClause}`,
+              [projectId],
+            )
+          ).rows[0]?.total ?? 0,
+        );
+        if (videoIds.length === 0) {
+          return ProjectVideoWorklistPageSchema.parse({ items: [], total });
+        }
+        const readNow = this.now();
+
+        const [
+          flagRows,
+          processingRows,
+          clipRows,
+          claimRows,
+          reviewRows,
+          unreadRows,
+          keywordScanRows,
+        ] = await Promise.all([
+          this.database.query<DbRow>(
+            `SELECT * FROM (
+               SELECT f.video_id, f.user_id, f.updated_at, u.handle,
+                      u.display_name,
+                      row_number() OVER (
+                        PARTITION BY f.video_id
+                        ORDER BY f.updated_at DESC, f.user_id
+                      ) AS flag_rank,
+                      count(*) OVER (PARTITION BY f.video_id) AS flag_count
+               FROM project_video_flags f
+               JOIN project_members pm
+                 ON pm.project_id = f.project_id AND pm.user_id = f.user_id
+               JOIN users u ON u.id = f.user_id
+               WHERE f.project_id = $1 AND f.active
+                 AND f.video_id = ANY($2::uuid[])
+             ) ranked
+             WHERE flag_rank <= 25
+             ORDER BY video_id, flag_rank`,
+            [projectId, videoIds],
+          ),
+          this.database.query<DbRow>(
+            `SELECT * FROM (
+               SELECT bi.catalog_video_id AS video_id, bi.batch_id,
+                      bi.id AS batch_item_id, bi.job_id, bi.state, bi.attempt,
+                      bi.error_code, bi.error_message, bi.error_retryable,
+                      bi.updated_at,
+                      row_number() OVER (
+                        PARTITION BY bi.catalog_video_id
+                        ORDER BY bi.updated_at DESC, bi.id DESC
+                      ) AS processing_rank
+               FROM transcription_batch_items bi
+               JOIN transcription_batches b ON b.id = bi.batch_id
+               WHERE b.project_id = $1
+                 AND bi.catalog_video_id = ANY($2::uuid[])
+             ) ranked
+             WHERE processing_rank = 1`,
+            [projectId, videoIds],
+          ),
+          this.database.query<DbRow>(
+            `SELECT video_id, count(*)::integer AS clip_count
+             FROM clip_candidates
+             WHERE project_id = $1 AND video_id = ANY($2::uuid[])
+             GROUP BY video_id`,
+            [projectId, videoIds],
+          ),
+          this.database.query<DbRow>(
+            `SELECT c.*, u.handle, u.display_name
+             FROM project_video_claims c
+             JOIN project_members pm
+               ON pm.project_id = c.project_id
+              AND pm.user_id = c.claimant_user_id
+             JOIN users u ON u.id = c.claimant_user_id
+             WHERE c.project_id = $1 AND c.video_id = ANY($2::uuid[])`,
+            [projectId, videoIds],
+          ),
+          this.database.query<DbRow>(
+            `SELECT DISTINCT ON (c.video_id)
+                    c.*,
+                    opened.handle AS opened_handle,
+                    opened.display_name AS opened_display_name,
+                    completed.handle AS completed_handle,
+                    completed.display_name AS completed_display_name
+             FROM project_video_review_cycles c
+             LEFT JOIN project_members opened_member
+               ON opened_member.project_id = c.project_id
+              AND opened_member.user_id = c.opened_by
+             LEFT JOIN users opened ON opened.id = opened_member.user_id
+             LEFT JOIN project_members completed_member
+               ON completed_member.project_id = c.project_id
+              AND completed_member.user_id = c.completed_by
+             LEFT JOIN users completed
+               ON completed.id = completed_member.user_id
+             WHERE c.project_id = $1 AND c.video_id = ANY($2::uuid[])
+             ORDER BY c.video_id, c.cycle_number DESC`,
+            [projectId, videoIds],
+          ),
+          this.database.query<DbRow>(
+            `SELECT event.video_id, count(*)::integer AS unread_count
+               FROM project_video_activity_receipts receipt
+               JOIN project_video_activity_events event
+                 ON event.id = receipt.event_id
+               JOIN project_members actor_member
+                 ON actor_member.project_id = event.project_id
+                AND actor_member.user_id = event.actor_id
+               WHERE event.project_id = $1 AND receipt.user_id = $2
+                 AND receipt.state = 'unread'
+                 AND event.video_id = ANY($3::uuid[])
+               GROUP BY event.video_id`,
+            [projectId, actor.userId, videoIds],
+          ),
+          Promise.all(
+            videoIds.map((videoId) =>
+              this.loadProjectKeywordScanSummary(projectId, videoId),
+            ),
+          ),
+        ]);
+        const flagsByVideo = new Map<string, DbRow[]>();
+        for (const row of flagRows.rows) {
+          const key = String(row.video_id);
+          flagsByVideo.set(key, [...(flagsByVideo.get(key) ?? []), row]);
+        }
+        const processingByVideo = new Map(
+          processingRows.rows.map((row) => [String(row.video_id), row]),
+        );
+        const clipsByVideo = new Map(
+          clipRows.rows.map((row) => [
+            String(row.video_id),
+            Number(row.clip_count),
+          ]),
+        );
+        const claimsByVideo = new Map(
+          claimRows.rows.map((row) => [String(row.video_id), row]),
+        );
+        const reviewsByVideo = new Map(
+          reviewRows.rows.map((row) => [String(row.video_id), row]),
+        );
+        const unreadByVideo = new Map(
+          unreadRows.rows.map((row) => [
+            String(row.video_id),
+            Number(row.unread_count),
+          ]),
+        );
+        const keywordScansByVideo = new Map(
+          keywordScanRows.map((summary) => [summary.projectVideoId, summary]),
+        );
+        const items = pageRows.map((row) => {
+          const videoId = String(row.video_id);
+          const flaggers = flagsByVideo.get(videoId) ?? [];
+          const processing = processingByVideo.get(videoId);
+          const claim = claimsByVideo.get(videoId);
+          const review = reviewsByVideo.get(videoId);
+          if (!review) {
+            throw new CatalogConflictError(
+              "The canonical project video has no review cycle.",
+            );
+          }
+          const processingState = processing
+            ? mapProjectVideoWorklistProcessingState(String(processing.state))
+            : "not_requested";
+          return {
+            projectId,
+            video: mapVideo(row),
+            projectVideoVersion: Number(row.project_video_version),
+            priority: row.worklist_priority,
+            completionPolicy: row.review_completion_policy,
+            triage: mapProjectVideoTriage(row),
+            unreadActivityCount: unreadByVideo.get(videoId) ?? 0,
+            ...(claim
+              ? {
+                  claim: mapProjectVideoClaim(claim, actor.userId, readNow),
+                }
+              : {}),
+            review: mapProjectVideoReviewCycle(review),
+            ...(row.active_transcript_version_id === null
+              ? {}
+              : {
+                  activeTranscriptVersionId: String(
+                    row.active_transcript_version_id,
+                  ),
+                }),
+            activeFlagCount: Number(flaggers[0]?.flag_count ?? 0),
+            flaggers: flaggers.map((flagger) => ({
+              userId: flagger.user_id,
+              handle: flagger.handle,
+              displayName: flagger.display_name,
+              flaggedAt: iso(flagger.updated_at),
+            })),
+            flaggersTruncated: Number(flaggers[0]?.flag_count ?? 0) > 25,
+            ...(row.own_flag_version === null
+              ? {}
+              : { ownFlag: mapProjectVideoOwnFlag(row) }),
+            processing: {
+              state: processingState,
+              ...(processing?.batch_id
+                ? { batchId: String(processing.batch_id) }
+                : {}),
+              ...(processing?.batch_item_id
+                ? { batchItemId: String(processing.batch_item_id) }
+                : {}),
+              ...(processing?.job_id
+                ? { jobId: String(processing.job_id) }
+                : {}),
+              attempt: Number(processing?.attempt ?? 0),
+              updatedAt: iso(
+                processing?.updated_at ?? row.project_video_updated_at,
+              ),
+              ...(processing?.error_code && processing?.error_message
+                ? {
+                    error: {
+                      code: String(processing.error_code),
+                      message: String(processing.error_message),
+                      ...(processing.error_retryable === null ||
+                      processing.error_retryable === undefined
+                        ? {}
+                        : {
+                            retryable: Boolean(processing.error_retryable),
+                          }),
+                    },
+                  }
+                : {}),
+            },
+            keywordScan: keywordScansByVideo.get(videoId),
+            clipCount: clipsByVideo.get(videoId) ?? 0,
+            createdAt: iso(row.project_video_created_at),
+            updatedAt: iso(row.project_video_updated_at),
+          };
+        });
+        const last = pageRows.at(-1);
+        return ProjectVideoWorklistPageSchema.parse({
+          items,
+          total,
+          ...(rows.rows.length > query.limit && last
+            ? {
+                nextCursor: makeProjectVideoWorklistCursor({
+                  projectId,
+                  videoId: String(last.video_id),
+                  createdAt: iso(last.project_video_created_at),
+                  view,
+                }),
+              }
+            : {}),
+        });
+      },
+      { repeatableRead: true },
+    );
+  }
+
+  async updateOwnProjectVideoFlag(
+    actor: AuthenticatedActor,
+    projectId: string,
+    videoId: string,
+    input: UpdateOwnProjectVideoFlagRequest,
+  ): Promise<ProjectVideoOwnFlagResponse> {
+    await this.authorize(actor, projectId, "write");
+    const now = this.now().toISOString();
+    return this.transaction(async () => {
+      await this.requireProjectVideo(projectId, videoId);
+      const existing = await this.database.query<DbRow>(
+        `SELECT active, version, created_at, updated_at, deactivated_at
+         FROM project_video_flags
+         WHERE project_id = $1 AND video_id = $2 AND user_id = $3
+         FOR UPDATE`,
+        [projectId, videoId, actor.userId],
+      );
+      const row = existing.rows[0];
+      if (!row) {
+        if (!input.active || input.expectedVersion !== 0) {
+          throw new CatalogConflictError(
+            "The project-video flag version is stale.",
+          );
+        }
+        const inserted = await this.database.query<DbRow>(
+          `INSERT INTO project_video_flags
+             (project_id, video_id, user_id, active, version, created_at,
+              updated_at)
+           VALUES ($1, $2, $3, true, 1, $4, $4)
+           RETURNING active, version, created_at, updated_at, deactivated_at`,
+          [projectId, videoId, actor.userId, now],
+        );
+        await this.database.query(
+          `UPDATE project_videos
+           SET version = version + 1, updated_at = $1
+           WHERE project_id = $2 AND video_id = $3`,
+          [now, projectId, videoId],
+        );
+        return ProjectVideoOwnFlagResponseSchema.parse({
+          projectId,
+          videoId,
+          flag: mapProjectVideoOwnFlag(inserted.rows[0]!),
+        });
+      }
+      if (Number(row.version) !== input.expectedVersion) {
+        throw new CatalogConflictError(
+          "The project-video flag version is stale.",
+        );
+      }
+      if (Boolean(row.active) === input.active) {
+        return ProjectVideoOwnFlagResponseSchema.parse({
+          projectId,
+          videoId,
+          flag: mapProjectVideoOwnFlag(row),
+        });
+      }
+      const updated = await this.database.query<DbRow>(
+        `UPDATE project_video_flags
+         SET active = $1, version = version + 1, updated_at = $2,
+             deactivated_at = CASE WHEN $1 THEN NULL ELSE $2::timestamptz END
+         WHERE project_id = $3 AND video_id = $4 AND user_id = $5
+         RETURNING active, version, created_at, updated_at, deactivated_at`,
+        [input.active, now, projectId, videoId, actor.userId],
+      );
+      await this.database.query(
+        `UPDATE project_videos
+         SET version = version + 1, updated_at = $1
+         WHERE project_id = $2 AND video_id = $3`,
+        [now, projectId, videoId],
+      );
+      return ProjectVideoOwnFlagResponseSchema.parse({
+        projectId,
+        videoId,
+        flag: mapProjectVideoOwnFlag(updated.rows[0]!),
+      });
+    });
+  }
+
+  async updateProjectVideoClaim(
+    actor: AuthenticatedActor,
+    projectId: string,
+    videoId: string,
+    input: UpdateProjectVideoClaimRequest,
+  ): Promise<ProjectVideoClaimResponse> {
+    await this.requireRegistered(actor);
+    const command = UpdateProjectVideoClaimRequestSchema.parse(input);
+    const requestSha256 = createHash("sha256")
+      .update(canonicalJson(command))
+      .digest("hex");
+    const now = this.now();
+    const nowIso = now.toISOString();
+
+    return this.transaction(async () => {
+      const membership = await this.database.query<{ role: ProjectRole }>(
+        `SELECT role FROM project_members
+         WHERE project_id = $1 AND user_id = $2
+         FOR SHARE`,
+        [projectId, actor.userId],
+      );
+      if (
+        !membership.rows[0] ||
+        !new Set<ProjectRole>(["owner", "administrator", "researcher"]).has(
+          membership.rows[0].role,
+        )
+      ) {
+        throw new AuthorizationError(
+          "Your project role cannot coordinate review claims.",
+        );
+      }
+      const projectVideo = await this.database.query(
+        `SELECT 1 FROM project_videos
+         WHERE project_id = $1 AND video_id = $2
+         FOR UPDATE`,
+        [projectId, videoId],
+      );
+      if (!projectVideo.rows[0]) {
+        throw new CatalogNotFoundError("Project video not found.");
+      }
+      const receipt = await this.database.query<DbRow>(
+        `SELECT request_sha256, response_json
+         FROM project_video_claim_events
+         WHERE project_id = $1 AND video_id = $2 AND actor_id = $3
+           AND idempotency_key = $4`,
+        [projectId, videoId, actor.userId, command.idempotencyKey],
+      );
+      if (receipt.rows[0]) {
+        if (receipt.rows[0].request_sha256 !== requestSha256) {
+          throw new CatalogIdempotencyConflictError(
+            "This claim command key was already used for another request.",
+          );
+        }
+        return ProjectVideoClaimResponseSchema.parse(
+          jsonRecord(receipt.rows[0].response_json),
+        );
+      }
+
+      const currentResult = await this.database.query<DbRow>(
+        `SELECT c.*, u.handle, u.display_name
+         FROM project_video_claims c
+         JOIN users u ON u.id = c.claimant_user_id
+         WHERE c.project_id = $1 AND c.video_id = $2
+         FOR UPDATE OF c`,
+        [projectId, videoId],
+      );
+      const current = currentResult.rows[0];
+      const latestEvent = current
+        ? undefined
+        : (
+            await this.database.query<DbRow>(
+              `SELECT MAX(claim_generation) AS claim_generation,
+                      MAX(claim_version) AS claim_version
+               FROM project_video_claim_events
+               WHERE project_id = $1 AND video_id = $2`,
+              [projectId, videoId],
+            )
+          ).rows[0];
+      const active = current
+        ? Date.parse(iso(current.expires_at)) > now.getTime()
+        : false;
+      let eventType: "claimed" | "renewed" | "taken_over" | "released";
+      let response: ProjectVideoClaimResponse;
+      let claimGeneration = Number(
+        current?.generation ?? latestEvent?.claim_generation ?? 1,
+      );
+      let claimVersion = Number(
+        current?.version ?? latestEvent?.claim_version ?? 1,
+      );
+      const previousClaimant = current
+        ? String(current.claimant_user_id)
+        : undefined;
+
+      if (command.action === "release") {
+        if (
+          !current ||
+          !active ||
+          current.claimant_user_id !== actor.userId ||
+          Number(current.version) !== command.expectedClaimVersion
+        ) {
+          throw new CatalogConflictError(
+            "The active project-video claim changed before release.",
+          );
+        }
+        await this.database.query(
+          `DELETE FROM project_video_claims
+           WHERE project_id = $1 AND video_id = $2`,
+          [projectId, videoId],
+        );
+        eventType = "released";
+        response = ProjectVideoClaimResponseSchema.parse({
+          projectId,
+          videoId,
+        });
+      } else if (command.action === "renew") {
+        if (command.leaseSeconds === undefined) {
+          throw new CatalogValidationError(
+            "A renewable project-video claim requires a bounded lease.",
+          );
+        }
+        if (
+          !current ||
+          !active ||
+          current.claimant_user_id !== actor.userId ||
+          Number(current.version) !== command.expectedClaimVersion
+        ) {
+          throw new CatalogConflictError(
+            "Only the current claimant can renew this claim version.",
+          );
+        }
+        const expiresAt = new Date(
+          now.getTime() + command.leaseSeconds * 1_000,
+        ).toISOString();
+        const renewed = await this.database.query<DbRow>(
+          `UPDATE project_video_claims
+           SET version = version + 1, heartbeat_at = $1, expires_at = $2
+           WHERE project_id = $3 AND video_id = $4
+           RETURNING *`,
+          [nowIso, expiresAt, projectId, videoId],
+        );
+        claimVersion = Number(renewed.rows[0]!.version);
+        eventType = "renewed";
+        response = ProjectVideoClaimResponseSchema.parse({
+          projectId,
+          videoId,
+          claim: mapProjectVideoClaim(
+            {
+              ...renewed.rows[0]!,
+              handle: current.handle,
+              display_name: current.display_name,
+            },
+            actor.userId,
+            now,
+          ),
+        });
+      } else {
+        if (command.leaseSeconds === undefined) {
+          throw new CatalogValidationError(
+            "A project-video claim requires a bounded lease.",
+          );
+        }
+        if (
+          current &&
+          Number(current.version) !== command.expectedClaimVersion &&
+          (active || command.expectedClaimVersion !== 0)
+        ) {
+          throw new CatalogConflictError(
+            "The project-video claim version is stale.",
+          );
+        }
+        if (!current && command.expectedClaimVersion !== 0) {
+          throw new CatalogConflictError(
+            "The project-video claim version is stale.",
+          );
+        }
+        if (current && current.claimant_user_id !== actor.userId) {
+          if (!command.takeoverConfirmed) {
+            throw new CatalogConflictError(
+              "Another member has or had this claim. Confirm takeover to continue.",
+            );
+          }
+          eventType = "taken_over";
+        } else {
+          eventType = "claimed";
+        }
+        if (active && current!.claimant_user_id === actor.userId) {
+          response = ProjectVideoClaimResponseSchema.parse({
+            projectId,
+            videoId,
+            claim: mapProjectVideoClaim(current!, actor.userId, now),
+          });
+        } else {
+          claimGeneration = current
+            ? Number(current.generation) + 1
+            : latestEvent
+              ? Number(latestEvent.claim_generation) + 1
+              : 1;
+          claimVersion = current
+            ? Number(current.version) + 1
+            : latestEvent
+              ? Number(latestEvent.claim_version) + 1
+              : 1;
+          const expiresAt = new Date(
+            now.getTime() + command.leaseSeconds * 1_000,
+          ).toISOString();
+          const claimed = await this.database.query<DbRow>(
+            `INSERT INTO project_video_claims
+               (project_id, video_id, claimant_user_id, generation, version,
+                claimed_at, heartbeat_at, expires_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $6, $7)
+             ON CONFLICT (project_id, video_id) DO UPDATE
+             SET claimant_user_id = EXCLUDED.claimant_user_id,
+                 generation = EXCLUDED.generation,
+                 version = EXCLUDED.version,
+                 claimed_at = EXCLUDED.claimed_at,
+                 heartbeat_at = EXCLUDED.heartbeat_at,
+                 expires_at = EXCLUDED.expires_at
+             RETURNING *`,
+            [
+              projectId,
+              videoId,
+              actor.userId,
+              claimGeneration,
+              claimVersion,
+              nowIso,
+              expiresAt,
+            ],
+          );
+          const user = await this.database.query<DbRow>(
+            "SELECT handle, display_name FROM users WHERE id = $1",
+            [actor.userId],
+          );
+          response = ProjectVideoClaimResponseSchema.parse({
+            projectId,
+            videoId,
+            claim: mapProjectVideoClaim(
+              {
+                ...claimed.rows[0]!,
+                ...user.rows[0]!,
+              },
+              actor.userId,
+              now,
+            ),
+          });
+        }
+      }
+
+      await this.database.query(
+        `INSERT INTO project_video_claim_events
+           (id, project_id, video_id, event_type, actor_id,
+            previous_claimant_user_id, claim_generation, claim_version,
+            idempotency_key, request_sha256, response_json, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+        [
+          randomUUID(),
+          projectId,
+          videoId,
+          eventType,
+          actor.userId,
+          eventType === "taken_over" ? previousClaimant : null,
+          claimGeneration,
+          claimVersion,
+          command.idempotencyKey,
+          requestSha256,
+          JSON.stringify(response),
+          nowIso,
+        ],
+      );
+      return response;
+    });
+  }
+
+  async updateProjectVideoGovernance(
+    actor: AuthenticatedActor,
+    projectId: string,
+    videoId: string,
+    input: UpdateProjectVideoGovernanceRequest,
+  ): Promise<ProjectVideoGovernanceResponse> {
+    await this.requireRegistered(actor);
+    const command = UpdateProjectVideoGovernanceRequestSchema.parse(input);
+    const requestSha256 = createHash("sha256")
+      .update(canonicalJson(command))
+      .digest("hex");
+    const now = this.now().toISOString();
+    return this.transaction(async () => {
+      const role = await this.database.query<{ role: ProjectRole }>(
+        `SELECT role FROM project_members
+         WHERE project_id = $1 AND user_id = $2
+         FOR SHARE`,
+        [projectId, actor.userId],
+      );
+      requirePermission(role.rows[0]?.role, "manage_project");
+      const projectVideo = await this.database.query<DbRow>(
+        `SELECT * FROM project_videos
+         WHERE project_id = $1 AND video_id = $2
+         FOR UPDATE`,
+        [projectId, videoId],
+      );
+      if (!projectVideo.rows[0]) {
+        throw new CatalogNotFoundError("Project video not found.");
+      }
+      const receipt = await this.database.query<DbRow>(
+        `SELECT request_sha256, response_json
+         FROM project_video_governance_events
+         WHERE project_id = $1 AND video_id = $2 AND actor_id = $3
+           AND idempotency_key = $4`,
+        [projectId, videoId, actor.userId, command.idempotencyKey],
+      );
+      if (receipt.rows[0]) {
+        if (receipt.rows[0].request_sha256 !== requestSha256) {
+          throw new CatalogIdempotencyConflictError(
+            "This governance command key was already used for another request.",
+          );
+        }
+        return ProjectVideoGovernanceResponseSchema.parse(
+          jsonRecord(receipt.rows[0].response_json),
+        );
+      }
+      if (
+        Number(projectVideo.rows[0].version) !==
+        command.expectedProjectVideoVersion
+      ) {
+        throw new CatalogConflictError(
+          "The project-video governance version is stale.",
+        );
+      }
+      const result = await this.database.query<DbRow>(
+        `UPDATE project_videos
+         SET worklist_priority = COALESCE($1, worklist_priority),
+             review_completion_policy = COALESCE(
+               $2, review_completion_policy
+             ),
+             version = version + 1, updated_at = $3
+         WHERE project_id = $4 AND video_id = $5
+         RETURNING worklist_priority, review_completion_policy, version,
+                   updated_at`,
+        [
+          command.priority ?? null,
+          command.completionPolicy ?? null,
+          now,
+          projectId,
+          videoId,
+        ],
+      );
+      const response = ProjectVideoGovernanceResponseSchema.parse({
+        projectId,
+        videoId,
+        priority: result.rows[0]!.worklist_priority,
+        completionPolicy: result.rows[0]!.review_completion_policy,
+        projectVideoVersion: Number(result.rows[0]!.version),
+        updatedAt: iso(result.rows[0]!.updated_at),
+      });
+      await this.database.query(
+        `INSERT INTO project_video_governance_events
+           (id, project_id, video_id, actor_id, priority,
+            review_completion_policy, project_video_version, idempotency_key,
+            request_sha256, response_json, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+        [
+          randomUUID(),
+          projectId,
+          videoId,
+          actor.userId,
+          command.priority ?? null,
+          command.completionPolicy ?? null,
+          response.projectVideoVersion,
+          command.idempotencyKey,
+          requestSha256,
+          JSON.stringify(response),
+          now,
+        ],
+      );
+      return response;
+    });
+  }
+
+  async bulkUpdateProjectVideoPriority(
+    actor: AuthenticatedActor,
+    projectId: string,
+    input: BulkUpdateProjectVideoPriorityRequest,
+  ): Promise<BulkUpdateProjectVideoPriorityResponse> {
+    await this.requireRegistered(actor);
+    const command = BulkUpdateProjectVideoPriorityRequestSchema.parse(input);
+    const requestSha256 = createHash("sha256")
+      .update(canonicalJson(command))
+      .digest("hex");
+    const now = this.now().toISOString();
+    return this.transaction(async () => {
+      const membership = await this.database.query<{ role: ProjectRole }>(
+        `SELECT role FROM project_members
+         WHERE project_id = $1 AND user_id = $2 FOR SHARE`,
+        [projectId, actor.userId],
+      );
+      requirePermission(membership.rows[0]?.role, "manage_project");
+      const replay = await this.database.query<DbRow>(
+        `SELECT request_sha256, response_json
+         FROM project_video_priority_commands
+         WHERE project_id = $1 AND actor_id = $2 AND idempotency_key = $3`,
+        [projectId, actor.userId, command.idempotencyKey],
+      );
+      if (replay.rows[0]) {
+        if (String(replay.rows[0].request_sha256) !== requestSha256) {
+          throw new CatalogIdempotencyConflictError(
+            "This bulk priority command key was already used for another request.",
+          );
+        }
+        return BulkUpdateProjectVideoPriorityResponseSchema.parse(
+          jsonRecord(replay.rows[0].response_json),
+        );
+      }
+      const expected = new Map(
+        command.items.map((item) => [
+          item.videoId,
+          item.expectedProjectVideoVersion,
+        ]),
+      );
+      const selected = await this.database.query<DbRow>(
+        `SELECT * FROM project_videos
+         WHERE project_id = $1 AND video_id = ANY($2::uuid[])
+         ORDER BY video_id FOR UPDATE`,
+        [projectId, [...expected.keys()]],
+      );
+      if (
+        selected.rows.length !== expected.size ||
+        selected.rows.some(
+          (row) => Number(row.version) !== expected.get(String(row.video_id)),
+        )
+      ) {
+        throw new CatalogConflictError(
+          "A selected project video changed; no priorities were updated.",
+        );
+      }
+      const items: ProjectVideoGovernanceResponse[] = [];
+      for (const row of selected.rows) {
+        const updated = await this.database.query<DbRow>(
+          `UPDATE project_videos
+           SET worklist_priority = $1, version = version + 1, updated_at = $2
+           WHERE project_id = $3 AND video_id = $4
+           RETURNING worklist_priority, review_completion_policy, version,
+                     updated_at`,
+          [command.priority, now, projectId, row.video_id],
+        );
+        items.push(
+          ProjectVideoGovernanceResponseSchema.parse({
+            projectId,
+            videoId: row.video_id,
+            priority: updated.rows[0]!.worklist_priority,
+            completionPolicy: updated.rows[0]!.review_completion_policy,
+            projectVideoVersion: Number(updated.rows[0]!.version),
+            updatedAt: iso(updated.rows[0]!.updated_at),
+          }),
+        );
+      }
+      const response = BulkUpdateProjectVideoPriorityResponseSchema.parse({
+        projectId,
+        priority: command.priority,
+        items,
+      });
+      await this.database.query(
+        `INSERT INTO project_video_priority_commands
+           (id, project_id, actor_id, requested_priority, idempotency_key,
+            request_sha256, response_json, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+        [
+          randomUUID(),
+          projectId,
+          actor.userId,
+          command.priority,
+          command.idempotencyKey,
+          requestSha256,
+          JSON.stringify(response),
+          now,
+        ],
+      );
+      return response;
+    });
+  }
+
+  async updateProjectVideoReview(
+    actor: AuthenticatedActor,
+    projectId: string,
+    videoId: string,
+    input: UpdateProjectVideoReviewRequest,
+  ): Promise<ProjectVideoReviewResponse> {
+    await this.requireRegistered(actor);
+    const command = UpdateProjectVideoReviewRequestSchema.parse(input);
+    const requestSha256 = createHash("sha256")
+      .update(canonicalJson(command))
+      .digest("hex");
+    const now = this.now().toISOString();
+
+    return this.transaction(async () => {
+      const [projectVideo, membership] = await Promise.all([
+        this.database.query<DbRow>(
+          `SELECT * FROM project_videos
+           WHERE project_id = $1 AND video_id = $2
+           FOR UPDATE`,
+          [projectId, videoId],
+        ),
+        this.database.query<{ role: ProjectRole }>(
+          `SELECT role FROM project_members
+           WHERE project_id = $1 AND user_id = $2
+           FOR SHARE`,
+          [projectId, actor.userId],
+        ),
+      ]);
+      const projectVideoRow = projectVideo.rows[0];
+      if (!projectVideoRow) {
+        throw new CatalogNotFoundError("Project video not found.");
+      }
+      const receipt = await this.database.query<DbRow>(
+        `SELECT request_sha256, response_json
+         FROM project_video_review_events
+         WHERE project_id = $1 AND video_id = $2 AND actor_id = $3
+           AND idempotency_key = $4`,
+        [projectId, videoId, actor.userId, command.idempotencyKey],
+      );
+      if (receipt.rows[0]) {
+        if (receipt.rows[0].request_sha256 !== requestSha256) {
+          throw new CatalogIdempotencyConflictError(
+            "This review command key was already used for another request.",
+          );
+        }
+        return ProjectVideoReviewResponseSchema.parse(
+          jsonRecord(receipt.rows[0].response_json),
+        );
+      }
+
+      const current = await this.loadCurrentProjectVideoReviewCycle(
+        projectId,
+        videoId,
+        true,
+      );
+      if (
+        String(current.id) !== command.expectedCycleId ||
+        Number(current.version) !== command.expectedCycleVersion
+      ) {
+        throw new CatalogConflictError(
+          "The project-video review cycle changed before this command.",
+        );
+      }
+      const roleValue = membership.rows[0]?.role;
+      let eventType: "completed" | "reopened";
+      let previousCycleId: string | undefined;
+
+      if (command.action === "complete") {
+        if (current.status !== "open") {
+          throw new CatalogConflictError(
+            "This review cycle is already closed.",
+          );
+        }
+        const policy = String(projectVideoRow.review_completion_policy);
+        const allowedRoles =
+          policy === "administrator_only"
+            ? new Set<ProjectRole>(["owner", "administrator"])
+            : new Set<ProjectRole>(["owner", "administrator", "researcher"]);
+        if (!roleValue || !allowedRoles.has(roleValue)) {
+          throw new AuthorizationError(
+            "Your project role cannot complete this review cycle.",
+          );
+        }
+        const transcriptVersionId = projectVideoRow.active_transcript_version_id
+          ? String(projectVideoRow.active_transcript_version_id)
+          : undefined;
+        if (
+          !transcriptVersionId &&
+          command.acknowledgeTranscriptUnavailable !== true
+        ) {
+          throw new CatalogConflictError(
+            "Confirm that this review is being completed without a ready transcript.",
+          );
+        }
+        await this.database.query(
+          `UPDATE project_video_review_cycles
+           SET status = 'completed', version = version + 1,
+               completion_policy = $1, completed_by = $2, completed_at = $3,
+               completion_basis = $4, transcript_version_id = $5,
+               updated_at = $3
+           WHERE id = $6`,
+          [
+            policy,
+            actor.userId,
+            now,
+            transcriptVersionId
+              ? "ready_transcript"
+              : "without_ready_transcript_acknowledged",
+            transcriptVersionId ?? null,
+            current.id,
+          ],
+        );
+        eventType = "completed";
+      } else {
+        if (current.status !== "completed") {
+          throw new CatalogConflictError(
+            "Only a completed review cycle can be reopened.",
+          );
+        }
+        if (
+          !roleValue ||
+          !new Set<ProjectRole>(["owner", "administrator", "researcher"]).has(
+            roleValue,
+          )
+        ) {
+          throw new AuthorizationError(
+            "Your project role cannot reopen this review cycle.",
+          );
+        }
+        previousCycleId = String(current.id);
+        await this.database.query(
+          `INSERT INTO project_video_review_cycles
+             (id, project_id, video_id, cycle_number, status, version,
+              opened_by, opened_at, reopen_reason, updated_at)
+           VALUES ($1, $2, $3, $4, 'open', 1, $5, $6, $7, $6)`,
+          [
+            randomUUID(),
+            projectId,
+            videoId,
+            Number(current.cycle_number) + 1,
+            actor.userId,
+            now,
+            command.reason,
+          ],
+        );
+        eventType = "reopened";
+      }
+
+      const resulting = await this.loadCurrentProjectVideoReviewCycle(
+        projectId,
+        videoId,
+      );
+      const response = ProjectVideoReviewResponseSchema.parse({
+        projectId,
+        videoId,
+        review: mapProjectVideoReviewCycle(resulting),
+      });
+      await this.database.query(
+        `INSERT INTO project_video_review_events
+           (id, project_id, video_id, cycle_id, previous_cycle_id, event_type,
+            actor_id, cycle_version, idempotency_key, request_sha256,
+            response_json, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+        [
+          randomUUID(),
+          projectId,
+          videoId,
+          response.review.id,
+          previousCycleId ?? null,
+          eventType,
+          actor.userId,
+          response.review.version,
+          command.idempotencyKey,
+          requestSha256,
+          JSON.stringify(response),
+          now,
+        ],
+      );
+      await this.createProjectVideoActivity(
+        projectId,
+        videoId,
+        actor.userId,
+        eventType === "completed" ? "review_completed" : "review_reopened",
+        `review:${response.review.id}:${eventType}:${response.review.version}`,
+        eventType === "reopened" ? command.reason : undefined,
+        eventType === "reopened" && current.completed_by
+          ? [String(current.completed_by)]
+          : [],
+        now,
+      );
+      return response;
+    });
+  }
+
+  async updateProjectVideoTriage(
+    actor: AuthenticatedActor,
+    projectId: string,
+    input: UpdateProjectVideoTriageRequest,
+  ): Promise<ProjectVideoTriageResponse> {
+    await this.requireRegistered(actor);
+    const command = UpdateProjectVideoTriageRequestSchema.parse(input);
+    const requestSha256 = createHash("sha256")
+      .update(canonicalJson(command))
+      .digest("hex");
+    const now = this.now().toISOString();
+
+    return this.transaction(async () => {
+      const role = await this.database.query<{ role: ProjectRole }>(
+        `SELECT role FROM project_members
+         WHERE project_id = $1 AND user_id = $2
+         FOR SHARE`,
+        [projectId, actor.userId],
+      );
+      requirePermission(role.rows[0]?.role, "manage_project");
+      const replay = await this.database.query<DbRow>(
+        `SELECT request_sha256, response_json
+         FROM project_video_triage_commands
+         WHERE project_id = $1 AND actor_id = $2 AND idempotency_key = $3`,
+        [projectId, actor.userId, command.idempotencyKey],
+      );
+      if (replay.rows[0]) {
+        if (String(replay.rows[0].request_sha256) !== requestSha256) {
+          throw new CatalogIdempotencyConflictError(
+            "This triage command key was already used for another request.",
+          );
+        }
+        return ProjectVideoTriageResponseSchema.parse(
+          jsonRecord(replay.rows[0].response_json),
+        );
+      }
+
+      const videoIds = command.items.map((item) => item.videoId).sort();
+      const current = await this.database.query<DbRow>(
+        `SELECT pv.*, dismissed.handle AS dismissed_handle,
+                dismissed.display_name AS dismissed_display_name
+         FROM project_videos pv
+         LEFT JOIN users dismissed ON dismissed.id = pv.dismissed_by
+         WHERE pv.project_id = $1 AND pv.video_id = ANY($2::uuid[])
+         ORDER BY pv.video_id
+         FOR UPDATE OF pv`,
+        [projectId, videoIds],
+      );
+      if (current.rows.length !== videoIds.length) {
+        throw new CatalogNotFoundError("A project video was not found.");
+      }
+      const expectedByVideo = new Map(
+        command.items.map((item) => [
+          item.videoId,
+          item.expectedProjectVideoVersion,
+        ]),
+      );
+      for (const row of current.rows) {
+        if (Number(row.version) !== expectedByVideo.get(String(row.video_id))) {
+          throw new CatalogConflictError(
+            "A project-video triage version changed before this command.",
+          );
+        }
+        const expectedState =
+          command.action === "dismiss" ? "active" : "dismissed";
+        if (String(row.triage_state) !== expectedState) {
+          throw new CatalogConflictError(
+            `A project video is already ${command.action === "dismiss" ? "dismissed" : "active"}.`,
+          );
+        }
+      }
+
+      const updatedRows: DbRow[] = [];
+      const actorSummary = (
+        await this.database.query<DbRow>(
+          "SELECT handle, display_name FROM users WHERE id = $1",
+          [actor.userId],
+        )
+      ).rows[0]!;
+      for (const row of current.rows) {
+        const updated = await this.database.query<DbRow>(
+          command.action === "dismiss"
+            ? `UPDATE project_videos
+               SET triage_state = 'dismissed', triage_version = triage_version + 1,
+                   dismissed_by = $1, dismissed_at = $2,
+                   dismissal_reason = $3, version = version + 1,
+                   updated_at = $2
+               WHERE project_id = $4 AND video_id = $5
+               RETURNING *`
+            : `UPDATE project_videos
+               SET triage_state = 'active', triage_version = triage_version + 1,
+                   dismissed_by = NULL, dismissed_at = NULL,
+                   dismissal_reason = NULL, version = version + 1,
+                   updated_at = $1
+               WHERE project_id = $2 AND video_id = $3
+               RETURNING *`,
+          command.action === "dismiss"
+            ? [
+                actor.userId,
+                now,
+                command.reason ?? null,
+                projectId,
+                row.video_id,
+              ]
+            : [now, projectId, row.video_id],
+        );
+        updatedRows.push({
+          ...updated.rows[0]!,
+          ...(command.action === "dismiss"
+            ? {
+                dismissed_handle: actorSummary.handle,
+                dismissed_display_name: actorSummary.display_name,
+              }
+            : {}),
+        });
+      }
+
+      let queuedJobsCanceled = 0;
+      let activeJobsRequested = 0;
+      let requestsRevoked = 0;
+      const jobs = await this.database.query<DbRow>(
+        `SELECT j.id, j.state
+         FROM jobs j
+         WHERE j.kind = 'transcription'
+           AND j.id IN (
+             SELECT item.job_id
+             FROM transcription_batch_items item
+             JOIN transcription_batches batch ON batch.id = item.batch_id
+             WHERE batch.project_id = $1
+               AND item.catalog_video_id = ANY($2::uuid[])
+               AND item.job_id IS NOT NULL
+           )
+         ORDER BY j.id
+         FOR UPDATE OF j`,
+        [projectId, videoIds],
+      );
+      for (const job of jobs.rows) {
+        const activeDependency = Boolean(
+          (
+            await this.database.query(
+              `SELECT 1
+               FROM transcription_batch_items dependency
+               JOIN transcription_batches dependency_batch
+                 ON dependency_batch.id = dependency.batch_id
+               JOIN project_videos dependency_video
+                 ON dependency_video.project_id = dependency_batch.project_id
+                AND dependency_video.video_id = dependency.catalog_video_id
+               WHERE dependency.job_id = $1
+                 AND dependency_video.triage_state = 'active'
+               LIMIT 1`,
+              [job.id],
+            )
+          ).rows[0],
+        );
+        if (command.action === "dismiss" && !activeDependency) {
+          if (job.state === "queued") {
+            await this.database.query(
+              `UPDATE jobs SET state = 'canceled', updated_at = $1
+               WHERE id = $2 AND state = 'queued'`,
+              [now, job.id],
+            );
+            await this.database.query(
+              `UPDATE transcription_batch_items
+               SET state = 'canceled', version = version + 1, updated_at = $1
+               WHERE job_id = $2 AND state = 'queued'`,
+              [now, job.id],
+            );
+            queuedJobsCanceled += 1;
+          } else if (["claimed", "processing"].includes(String(job.state))) {
+            const requested = await this.database.query(
+              `INSERT INTO transcription_job_cancel_requests
+                 (job_id, project_id, requested_by, requested_at)
+               VALUES ($1, $2, $3, $4)
+               ON CONFLICT (job_id) DO UPDATE
+               SET requested_by = EXCLUDED.requested_by,
+                   requested_at = EXCLUDED.requested_at,
+                   revoked_at = NULL, completed_at = NULL
+               WHERE transcription_job_cancel_requests.revoked_at IS NOT NULL
+               RETURNING job_id`,
+              [job.id, projectId, actor.userId, now],
+            );
+            if (requested.rows[0]) activeJobsRequested += 1;
+          }
+        } else if (command.action === "restore" && activeDependency) {
+          const revoked = await this.database.query(
+            `UPDATE transcription_job_cancel_requests
+             SET revoked_at = $1
+             WHERE job_id = $2 AND revoked_at IS NULL AND completed_at IS NULL
+             RETURNING job_id`,
+            [now, job.id],
+          );
+          if (revoked.rows[0]) requestsRevoked += 1;
+        }
+      }
+
+      const response = ProjectVideoTriageResponseSchema.parse({
+        projectId,
+        items: updatedRows.map((row) => ({
+          videoId: String(row.video_id),
+          projectVideoVersion: Number(row.version),
+          triage: mapProjectVideoTriage(row),
+        })),
+        cancellation: {
+          queuedJobsCanceled,
+          activeJobsRequested,
+          requestsRevoked,
+        },
+      });
+      const commandId = randomUUID();
+      await this.database.query(
+        `INSERT INTO project_video_triage_commands
+           (id, project_id, actor_id, action, idempotency_key,
+            request_sha256, response_json, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+        [
+          commandId,
+          projectId,
+          actor.userId,
+          command.action,
+          command.idempotencyKey,
+          requestSha256,
+          JSON.stringify(response),
+          now,
+        ],
+      );
+      for (const result of response.items) {
+        const eventId = randomUUID();
+        await this.database.query(
+          `INSERT INTO project_video_triage_events
+             (id, command_id, project_id, video_id, event_type, actor_id,
+              previous_state, triage_version, reason, created_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+          [
+            eventId,
+            commandId,
+            projectId,
+            result.videoId,
+            command.action === "dismiss" ? "dismissed" : "restored",
+            actor.userId,
+            command.action === "dismiss" ? "active" : "dismissed",
+            result.triage.version,
+            command.reason ?? null,
+            now,
+          ],
+        );
+        await this.createProjectVideoActivity(
+          projectId,
+          result.videoId,
+          actor.userId,
+          command.action === "dismiss" ? "video_dismissed" : "video_restored",
+          `triage:${eventId}`,
+          command.reason,
+          [],
+          now,
+        );
+      }
+      return response;
+    });
+  }
+
+  async listProjectVideoActivity(
+    actor: AuthenticatedActor,
+    projectId: string,
+    input: ProjectVideoActivityQuery,
+  ): Promise<ProjectVideoActivityPage> {
+    await this.authorize(actor, projectId, "read");
+    const query = ProjectVideoActivityQuerySchema.parse(input);
+    const cursor = query.cursor
+      ? parseProjectVideoActivityCursor(query.cursor)
+      : undefined;
+    if (cursor && cursor.projectId !== projectId) {
+      throw new CatalogInvalidRequestError(
+        "Project activity cursor belongs to another project.",
+      );
+    }
+    if (cursor && cursor.state !== query.state) {
+      throw new CatalogInvalidRequestError(
+        "Project activity cursor belongs to another state filter.",
+      );
+    }
+    const parameters: unknown[] = [projectId, actor.userId];
+    const stateClause = query.state === "all" ? "" : `AND receipt.state = $3`;
+    if (query.state !== "all") parameters.push(query.state);
+    let cursorClause = "";
+    if (cursor) {
+      parameters.push(cursor.createdAt, cursor.eventId);
+      const createdParameter = parameters.length - 1;
+      const eventParameter = parameters.length;
+      cursorClause = `AND (
+        event.created_at < $${createdParameter}::timestamptz OR
+        (event.created_at = $${createdParameter}::timestamptz
+         AND event.id < $${eventParameter})
+      )`;
+    }
+    parameters.push(query.limit + 1);
+    const rows = await this.database.query<DbRow>(
+      `SELECT receipt.*, event.project_id, event.video_id, event.event_type,
+              event.actor_id, event.reason, event.created_at AS event_created_at,
+              actor.handle AS actor_handle,
+              actor.display_name AS actor_display_name, video.title AS video_title
+       FROM project_video_activity_receipts receipt
+       JOIN project_video_activity_events event ON event.id = receipt.event_id
+       JOIN project_members member
+         ON member.project_id = event.project_id AND member.user_id = receipt.user_id
+       JOIN users actor ON actor.id = event.actor_id
+       JOIN project_members actor_member
+         ON actor_member.project_id = event.project_id
+        AND actor_member.user_id = event.actor_id
+       JOIN videos video ON video.id = event.video_id
+       WHERE event.project_id = $1 AND receipt.user_id = $2
+         ${stateClause} ${cursorClause}
+       ORDER BY event.created_at DESC, event.id DESC
+       LIMIT $${parameters.length}`,
+      parameters,
+    );
+    const unreadCount = Number(
+      (
+        await this.database.query<DbRow>(
+          `SELECT count(*)::integer AS count
+           FROM project_video_activity_receipts receipt
+           JOIN project_video_activity_events event ON event.id = receipt.event_id
+           JOIN project_members member
+             ON member.project_id = event.project_id AND member.user_id = receipt.user_id
+           JOIN project_members actor_member
+             ON actor_member.project_id = event.project_id
+            AND actor_member.user_id = event.actor_id
+           WHERE event.project_id = $1 AND receipt.user_id = $2
+             AND receipt.state = 'unread'`,
+          [projectId, actor.userId],
+        )
+      ).rows[0]?.count ?? 0,
+    );
+    const pageRows = rows.rows.slice(0, query.limit);
+    const last = pageRows.at(-1);
+    return ProjectVideoActivityPageSchema.parse({
+      items: pageRows.map(mapProjectVideoActivityReceipt),
+      unreadCount,
+      ...(rows.rows.length > query.limit && last
+        ? {
+            nextCursor: makeProjectVideoActivityCursor({
+              projectId,
+              eventId: String(last.event_id),
+              createdAt: iso(last.event_created_at),
+              state: query.state,
+            }),
+          }
+        : {}),
+    });
+  }
+
+  async markProjectVideoActivitySeen(
+    actor: AuthenticatedActor,
+    projectId: string,
+    input: MarkProjectVideoActivitySeenRequest,
+  ): Promise<MarkProjectVideoActivitySeenResponse> {
+    await this.authorize(actor, projectId, "read");
+    const command = MarkProjectVideoActivitySeenRequestSchema.parse(input);
+    const now = this.now().toISOString();
+    return this.transaction(async () => {
+      const rows: DbRow[] = [];
+      for (const item of command.items) {
+        const current = await this.database.query<DbRow>(
+          `SELECT receipt.*, event.project_id, event.video_id, event.event_type,
+                  event.actor_id, event.reason,
+                  event.created_at AS event_created_at,
+                  actor.handle AS actor_handle,
+                  actor.display_name AS actor_display_name,
+                  video.title AS video_title
+           FROM project_video_activity_receipts receipt
+           JOIN project_video_activity_events event ON event.id = receipt.event_id
+           JOIN users actor ON actor.id = event.actor_id
+           JOIN project_members actor_member
+             ON actor_member.project_id = event.project_id
+            AND actor_member.user_id = event.actor_id
+           JOIN videos video ON video.id = event.video_id
+           WHERE receipt.event_id = $1 AND receipt.user_id = $2
+             AND event.project_id = $3
+           FOR UPDATE OF receipt`,
+          [item.eventId, actor.userId, projectId],
+        );
+        if (!current.rows[0]) {
+          throw new CatalogNotFoundError("Project activity receipt not found.");
+        }
+        if (current.rows[0].state === "seen") {
+          rows.push(current.rows[0]);
+          continue;
+        }
+        if (Number(current.rows[0].version) !== item.expectedVersion) {
+          throw new CatalogConflictError(
+            "A project activity receipt changed before it was marked seen.",
+          );
+        }
+        await this.database.query(
+          `UPDATE project_video_activity_receipts
+           SET state = 'seen', version = version + 1, seen_at = $1,
+               updated_at = $1
+           WHERE event_id = $2 AND user_id = $3`,
+          [now, item.eventId, actor.userId],
+        );
+        rows.push({
+          ...current.rows[0],
+          state: "seen",
+          version: Number(current.rows[0].version) + 1,
+          seen_at: now,
+        });
+      }
+      return MarkProjectVideoActivitySeenResponseSchema.parse({
+        projectId,
+        items: rows.map(mapProjectVideoActivityReceipt),
+      });
+    });
   }
 
   async findProjectVideoTranscriptStates(
@@ -4063,6 +7244,344 @@ export class SharedProjectCatalog {
     return states;
   }
 
+  async getProjectVideoLanguageGate(
+    actor: AuthenticatedActor,
+    projectId: string,
+    videoId: string,
+  ): Promise<LanguageGate> {
+    await this.authorize(actor, projectId, "read");
+    return this.loadProjectVideoLanguageGate(projectId, videoId);
+  }
+
+  async confirmProjectVideoLanguageDecision(
+    actor: AuthenticatedActor,
+    projectId: string,
+    videoId: string,
+    input: CreateProjectVideoLanguageDecisionRequest,
+  ): Promise<ProjectVideoLanguageDecisionResponse> {
+    await this.authorize(actor, projectId, "write");
+    const command =
+      CreateProjectVideoLanguageDecisionRequestSchema.parse(input);
+    const requestSha256 = createHash("sha256")
+      .update(canonicalJson(command))
+      .digest("hex");
+    const now = this.now().toISOString();
+
+    return this.transaction(async () => {
+      const replay = await this.database.query<DbRow>(
+        `SELECT * FROM project_video_language_decisions
+         WHERE project_id = $1 AND video_id = $2 AND actor_id = $3
+           AND idempotency_key = $4`,
+        [projectId, videoId, actor.userId, command.idempotencyKey],
+      );
+      if (replay.rows[0]) {
+        if (String(replay.rows[0].request_sha256) !== requestSha256) {
+          throw new CatalogIdempotencyConflictError(
+            "That language-decision idempotency key was already used for different input.",
+          );
+        }
+        return ProjectVideoLanguageDecisionResponseSchema.parse({
+          decision: mapProjectVideoLanguageDecision(replay.rows[0]),
+          gate: await this.loadProjectVideoLanguageGate(projectId, videoId),
+        });
+      }
+
+      const projectVideo = await this.database.query<DbRow>(
+        `SELECT * FROM project_videos
+         WHERE project_id = $1 AND video_id = $2 FOR UPDATE`,
+        [projectId, videoId],
+      );
+      const current = projectVideo.rows[0];
+      if (!current) throw new CatalogNotFoundError("Project video not found.");
+      const currentDecisionVersion = await this.database.query<DbRow>(
+        `SELECT COALESCE(MAX(decision_version), 0) AS decision_version
+         FROM project_video_language_decisions
+         WHERE project_id = $1 AND video_id = $2`,
+        [projectId, videoId],
+      );
+      if (
+        Number(currentDecisionVersion.rows[0]?.decision_version ?? 0) !==
+        command.expectedDecisionVersion
+      ) {
+        throw new CatalogConflictError(
+          "The language decision changed; reload it before confirming.",
+        );
+      }
+      if (command.evidenceId) {
+        const evidence = await this.database.query(
+          `SELECT 1 FROM project_video_language_evidence
+           WHERE id = $1 AND project_id = $2 AND video_id = $3`,
+          [command.evidenceId, projectId, videoId],
+        );
+        if (!evidence.rows[0]) {
+          throw new CatalogConflictError(
+            "The selected language evidence does not belong to this project video.",
+          );
+        }
+      }
+
+      const decision = {
+        id: randomUUID(),
+        projectId,
+        videoId,
+        decisionVersion: command.expectedDecisionVersion + 1,
+        status: "confirmed" as const,
+        basis: command.basis,
+        resolvedLanguage: command.resolvedLanguage,
+        ...(command.evidenceId ? { evidenceId: command.evidenceId } : {}),
+        actorId: actor.userId,
+        createdAt: now,
+      };
+      await this.database.query(
+        `INSERT INTO project_video_language_decisions
+           (id, project_id, video_id, decision_version, status, basis,
+            resolved_language, evidence_id, actor_id, idempotency_key,
+            request_sha256, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+        [
+          decision.id,
+          projectId,
+          videoId,
+          decision.decisionVersion,
+          decision.status,
+          decision.basis,
+          decision.resolvedLanguage,
+          command.evidenceId ?? null,
+          actor.userId,
+          command.idempotencyKey,
+          requestSha256,
+          now,
+        ],
+      );
+      await this.database.query(
+        `UPDATE project_videos
+         SET current_language_decision_id = $1, language_gate_status = 'confirmed',
+             version = version + 1, updated_at = $2
+         WHERE project_id = $3 AND video_id = $4`,
+        [decision.id, now, projectId, videoId],
+      );
+
+      if (command.batchItemId) {
+        await this.requeueLanguageConfirmedBatchItem({
+          actor,
+          projectId,
+          videoId,
+          batchItemId: command.batchItemId,
+          expectedBatchItemVersion: command.expectedBatchItemVersion!,
+          decision: LanguageDecisionSnapshotSchema.parse({
+            schemaVersion: 1,
+            decisionId: decision.id,
+            decisionVersion: decision.decisionVersion,
+            status: decision.status,
+            basis: decision.basis,
+            resolvedLanguage: decision.resolvedLanguage,
+            ...(command.evidenceId ? { evidenceId: command.evidenceId } : {}),
+          }),
+          now,
+        });
+      }
+      return ProjectVideoLanguageDecisionResponseSchema.parse({
+        decision,
+        gate: await this.loadProjectVideoLanguageGate(projectId, videoId),
+      });
+    });
+  }
+
+  async observeWorkerLanguageEvidence(
+    actor: AuthenticatedActor,
+    jobId: string,
+    input: WorkerObserveLanguageEvidenceRequest,
+  ): Promise<WorkerObserveLanguageEvidenceResponse> {
+    const request = WorkerObserveLanguageEvidenceRequestSchema.parse(input);
+    await this.requireActiveWorkerLease(actor, jobId, request.attempt);
+    const now = this.now().toISOString();
+    return this.transaction(async () => {
+      const jobResult = await this.database.query<DbRow>(
+        `SELECT * FROM jobs WHERE id = $1 AND kind = 'transcription' FOR UPDATE`,
+        [jobId],
+      );
+      const job = jobResult.rows[0];
+      if (!job) throw new CatalogNotFoundError("Transcription job not found.");
+      if (!["claimed", "processing"].includes(String(job.state))) {
+        throw new AuthorizationError("The worker lease is no longer active.");
+      }
+      await this.requireActiveWorkerLease(actor, jobId, request.attempt);
+      const payload = TranscriptionJobPayloadSchema.parse(
+        typeof job.payload === "string" ? JSON.parse(job.payload) : job.payload,
+      );
+      const evidence = ProviderLanguageEvidenceSchema.parse(request.evidence);
+      if (
+        evidence.jobId !== jobId ||
+        evidence.attempt !== request.attempt ||
+        evidence.projectId !== job.project_id ||
+        evidence.videoId !== payload.catalogVideoId
+      ) {
+        throw new CatalogConflictError(
+          "Observed language evidence does not belong to this worker attempt.",
+        );
+      }
+      const existing = await this.database.query<DbRow>(
+        "SELECT * FROM project_video_language_evidence WHERE id = $1",
+        [evidence.id],
+      );
+      if (existing.rows[0]) {
+        if (
+          canonicalJson(mapProviderLanguageEvidence(existing.rows[0])) !==
+          canonicalJson(evidence)
+        ) {
+          throw new CatalogIdempotencyConflictError(
+            "Language evidence ID was already used for different evidence.",
+          );
+        }
+      } else {
+        await this.database.query(
+          `INSERT INTO project_video_language_evidence
+             (id, project_id, video_id, source, provider, reported_language,
+              track_fingerprint, caption_kind, job_id, attempt, created_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+          [
+            evidence.id,
+            evidence.projectId,
+            evidence.videoId,
+            evidence.source,
+            evidence.provider,
+            evidence.reportedLanguage ?? null,
+            evidence.trackFingerprint ?? null,
+            evidence.captionKind ?? null,
+            evidence.jobId,
+            evidence.attempt,
+            evidence.createdAt,
+          ],
+        );
+      }
+
+      const projectVideo = await this.database.query<DbRow>(
+        `SELECT current_language_decision_id
+         FROM project_videos
+         WHERE project_id = $1 AND video_id = $2
+         FOR UPDATE`,
+        [job.project_id, payload.catalogVideoId],
+      );
+      if (!projectVideo.rows[0]) {
+        throw new CatalogNotFoundError("Project video not found.");
+      }
+      const currentGate = await this.loadProjectVideoLanguageGate(
+        String(job.project_id),
+        payload.catalogVideoId,
+      );
+      const currentDecisionId = projectVideo.rows[0]
+        .current_language_decision_id
+        ? String(projectVideo.rows[0].current_language_decision_id)
+        : undefined;
+      const observesCurrentDecision = currentDecisionId
+        ? payload.languageDecision?.decisionId === currentDecisionId
+        : payload.languageDecision === undefined;
+      const conflictsCreator =
+        payload.languageDecision?.status !== "confirmed" &&
+        evidence.reportedLanguage !== undefined &&
+        payload.creatorReportedLanguage !== undefined &&
+        !languagesEquivalent(
+          evidence.reportedLanguage,
+          payload.creatorReportedLanguage,
+        );
+      const conflictsDecision =
+        evidence.reportedLanguage !== undefined &&
+        payload.languageDecision?.status === "confirmed" &&
+        payload.languageDecision.resolvedLanguage !== undefined &&
+        !languagesEquivalent(
+          evidence.reportedLanguage,
+          payload.languageDecision.resolvedLanguage,
+        );
+      const status =
+        conflictsCreator || conflictsDecision
+          ? "conflict"
+          : (payload.languageDecision?.status ?? currentGate.status);
+      const hasConfirmedDecision =
+        payload.languageDecision?.status === "confirmed" &&
+        payload.languageDecision.resolvedLanguage !== undefined;
+      const gateState =
+        status === "conflict"
+          ? "needs_language_confirmation"
+          : !hasConfirmedDecision && evidence.reportedLanguage === undefined
+            ? "needs_language_confirmation"
+            : request.speechCapability !== undefined &&
+                request.speechCapability.state !== "supported"
+              ? "needs_transcript"
+              : request.translationCapability !== undefined &&
+                  request.translationCapability.state !== "supported"
+                ? "needs_translation"
+                : "ready";
+      const gate = LanguageGateSchema.parse({
+        state: gateState,
+        status,
+        ...(payload.creatorReportedLanguage
+          ? { creatorReportedLanguage: payload.creatorReportedLanguage }
+          : {}),
+        providerEvidence: evidence,
+        ...(observesCurrentDecision && currentGate.decision
+          ? { decision: currentGate.decision }
+          : {}),
+        ...(request.speechCapability
+          ? { speechCapability: request.speechCapability }
+          : {}),
+        ...(request.translationCapability
+          ? { translationCapability: request.translationCapability }
+          : {}),
+        remediationReason:
+          gateState === "ready"
+            ? "none"
+            : gateState === "needs_language_confirmation"
+              ? status === "conflict"
+                ? "resolve_conflict"
+                : "confirm_language"
+              : "select_supported_provider",
+      });
+      if (observesCurrentDecision) {
+        await this.database.query(
+          `UPDATE project_videos
+           SET current_language_evidence_id = $1, language_gate_status = $2,
+               version = version + 1, updated_at = $3
+           WHERE project_id = $4 AND video_id = $5`,
+          [evidence.id, status, now, job.project_id, payload.catalogVideoId],
+        );
+      }
+      if (gateState !== "ready") {
+        await this.database.query(
+          `UPDATE jobs SET state = 'needs_user_action', updated_at = $1
+           WHERE id = $2`,
+          [now, jobId],
+        );
+        await this.database.query(
+          `UPDATE transcription_batch_items
+           SET state = $1, language_gate = $2::jsonb,
+               language_decision_id = $3, language_decision_video_id = $4,
+               version = version + 1, updated_at = $5
+           WHERE job_id = $6 AND attempt = $7 AND state <> 'canceled'`,
+          [
+            gateState === "needs_language_confirmation"
+              ? "needs_language_confirmation"
+              : "blocked",
+            JSON.stringify(gate),
+            payload.languageDecision?.decisionId ?? null,
+            payload.languageDecision ? payload.catalogVideoId : null,
+            now,
+            jobId,
+            request.attempt,
+          ],
+        );
+        await this.database.query(
+          `DELETE FROM worker_leases
+           WHERE job_id = $1 AND worker_id = $2 AND attempt = $3`,
+          [jobId, actor.userId, request.attempt],
+        );
+      }
+      return WorkerObserveLanguageEvidenceResponseSchema.parse({
+        evidence,
+        gate,
+      });
+    });
+  }
+
   async createTranscriptionBatch(
     actor: AuthenticatedActor,
     input: CreateTranscriptionBatchInput,
@@ -4071,172 +7590,24 @@ export class SharedProjectCatalog {
     const batchId = randomUUID();
     const createdAt = this.now().toISOString();
     await this.transaction(async () => {
-      await this.database.query(
-        `INSERT INTO transcription_batches
-           (id, project_id, name, target_language, execution_location,
-            transcription_profile, source_policy, priority, created_by,
-            translation_provider, translation_disclosure_version,
-            translation_consent_accepted_at, version, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-                 1, $13, $13)`,
-        [
-          batchId,
-          input.projectId,
-          input.name.trim(),
-          input.options.targetLanguage,
-          input.options.executionLocation,
-          input.options.transcriptionProfile,
-          input.options.sourcePolicy,
-          input.options.priority,
-          actor.userId,
-          input.options.translationConsent?.provider ?? null,
-          input.options.translationConsent?.disclosureVersion ?? null,
-          input.options.translationConsent ? createdAt : null,
-          createdAt,
-        ],
+      await this.insertTranscriptionBatch(
+        batchId,
+        actor.userId,
+        input.projectId,
+        input.name,
+        input.options,
+        createdAt,
+        "manual",
       );
-
       for (const item of input.items) {
-        let catalogVideoId = item.catalogVideoId;
-        if (
-          item.youtubeVideoId &&
-          item.canonicalUrl &&
-          item.title &&
-          ["ready", "existing-transcript"].includes(item.status)
-        ) {
-          catalogVideoId = await this.upsertProjectVideo(
-            input.projectId,
-            item,
-            createdAt,
-          );
-        }
-
-        let persistedItem = item;
-        if (
-          item.status === "ready" &&
-          catalogVideoId &&
-          input.options.sourcePolicy !== "force-generate"
-        ) {
-          const active = await this.database.query<DbRow>(
-            `SELECT active_transcript_version_id
-             FROM project_videos
-             WHERE project_id = $1 AND video_id = $2`,
-            [input.projectId, catalogVideoId],
-          );
-          const activeTranscriptVersionId =
-            active.rows[0]?.active_transcript_version_id;
-          if (activeTranscriptVersionId) {
-            persistedItem = {
-              ...item,
-              status: "existing-transcript",
-              processingNeed: "reuse-shared",
-              catalogVideoId,
-              activeTranscriptVersionId: String(activeTranscriptVersionId),
-            };
-          }
-        }
-
-        let jobId: string | undefined;
-        let idempotencyKey: string | undefined;
-        let state: "queued" | "ready_for_review" | "blocked" | "canceled";
-        if (persistedItem.status === "ready" && catalogVideoId) {
-          idempotencyKey = [
-            "transcription",
-            input.projectId,
-            catalogVideoId,
-            input.options.transcriptionProfile,
-            input.options.targetLanguage,
-            input.options.sourcePolicy,
-            input.options.translationConsent
-              ? `translate-${input.options.translationConsent.provider}-v${input.options.translationConsent.disclosureVersion}`
-              : "translate-disabled",
-            "schema-1",
-          ].join(":");
-          const candidateJobId = randomUUID();
-          const insertedJob = await this.database.query<DbRow>(
-            `INSERT INTO jobs
-                 (id, project_id, kind, state, idempotency_key, attempt,
-                  payload, created_at, updated_at)
-               VALUES ($1, $2, 'transcription', 'queued', $3, 0, $4, $5, $5)
-               ON CONFLICT (idempotency_key) DO NOTHING
-               RETURNING id`,
-            [
-              candidateJobId,
-              input.projectId,
-              idempotencyKey,
-              JSON.stringify({
-                batchId,
-                catalogVideoId,
-                youtubeVideoId: persistedItem.youtubeVideoId,
-                targetLanguage: input.options.targetLanguage,
-                transcriptionProfile: input.options.transcriptionProfile,
-                sourcePolicy: input.options.sourcePolicy,
-                executionLocation: input.options.executionLocation,
-                priority: input.options.priority,
-                ...(input.options.translationConsent
-                  ? { translationConsent: input.options.translationConsent }
-                  : {}),
-              }),
-              createdAt,
-            ],
-          );
-          if (insertedJob.rows[0]) {
-            jobId = String(insertedJob.rows[0].id);
-          } else {
-            const existingJob = await this.database.query<DbRow>(
-              "SELECT id FROM jobs WHERE idempotency_key = $1",
-              [idempotencyKey],
-            );
-            if (!existingJob.rows[0]) {
-              throw new CatalogConflictError(
-                "The transcription job could not be resolved after deduplication.",
-              );
-            }
-            jobId = String(existingJob.rows[0].id);
-          }
-          state = "queued";
-        } else if (persistedItem.status === "existing-transcript") {
-          state = "ready_for_review";
-        } else if (persistedItem.status === "duplicate") {
-          state = "canceled";
-        } else {
-          state = "blocked";
-        }
-
-        await this.database.query(
-          `INSERT INTO transcription_batch_items
-             (id, batch_id, input_index, raw_input, youtube_video_id,
-              canonical_url, catalog_video_id, active_transcript_version_id,
-              title, channel, duration_ms, source_language, preflight_status,
-              processing_need, duplicate_of_input_index, state, review_status,
-              job_id, idempotency_key, error_code, error_message, attempt,
-              version, created_at, updated_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-                   $13, $14, $15, $16, 'unreviewed', $17, $18, $19, $20,
-                   0, 1, $21, $21)`,
-          [
-            randomUUID(),
-            batchId,
-            persistedItem.inputIndex,
-            persistedItem.input,
-            persistedItem.youtubeVideoId ?? null,
-            persistedItem.canonicalUrl ?? null,
-            catalogVideoId ?? null,
-            persistedItem.activeTranscriptVersionId ?? null,
-            persistedItem.title ?? null,
-            persistedItem.channel ?? null,
-            persistedItem.durationMs ?? null,
-            persistedItem.sourceLanguage ?? null,
-            persistedItem.status,
-            persistedItem.processingNeed,
-            persistedItem.duplicateOfInputIndex ?? null,
-            state,
-            jobId ?? null,
-            idempotencyKey ?? null,
-            persistedItem.error?.code ?? null,
-            persistedItem.error?.message ?? null,
-            createdAt,
-          ],
+        await this.insertTranscriptionBatchItem(
+          actor,
+          input.projectId,
+          batchId,
+          input.options,
+          item,
+          createdAt,
+          true,
         );
       }
     });
@@ -4250,7 +7621,15 @@ export class SharedProjectCatalog {
   ): Promise<CreateTranscriptionBatchResponse> {
     await this.authorize(actor, projectId, "read");
     const batchResult = await this.database.query<DbRow>(
-      "SELECT * FROM transcription_batches WHERE id = $1 AND project_id = $2",
+      `SELECT b.*, decision_user.handle AS decision_handle,
+              decision_user.display_name AS decision_display_name
+       FROM transcription_batches b
+       LEFT JOIN project_members decision_member
+         ON decision_member.project_id = b.project_id
+        AND decision_member.user_id = b.hosted_approval_by
+       LEFT JOIN users decision_user
+         ON decision_user.id = decision_member.user_id
+       WHERE b.id = $1 AND b.project_id = $2`,
       [batchId, projectId],
     );
     const batch = batchResult.rows[0];
@@ -4272,6 +7651,30 @@ export class SharedProjectCatalog {
         sourcePolicy: batch.source_policy,
         executionLocation: batch.execution_location,
         priority: batch.priority,
+        ...(batch.execution_location === "hosted"
+          ? {
+              hostedApproval: {
+                state: batch.hosted_approval_state,
+                version: Number(batch.hosted_approval_version),
+                ...(batch.hosted_approval_state === "pending"
+                  ? {}
+                  : {
+                      decidedBy: {
+                        userId: String(batch.hosted_approval_by),
+                        handle:
+                          batch.decision_handle === null
+                            ? "former_member"
+                            : String(batch.decision_handle),
+                        displayName:
+                          batch.decision_display_name === null
+                            ? "Former project member"
+                            : String(batch.decision_display_name),
+                      },
+                      decidedAt: iso(batch.hosted_approval_at),
+                    }),
+              },
+            }
+          : {}),
         ...(batch.translation_provider === null
           ? {}
           : {
@@ -4301,7 +7704,7 @@ export class SharedProjectCatalog {
     const result = await this.database.query<DbRow>(
       `SELECT id
        FROM transcription_batches
-       WHERE project_id = $1
+       WHERE project_id = $1 AND processing_origin = 'manual'
        ORDER BY updated_at DESC, id DESC
        LIMIT 200`,
       [projectId],
@@ -4328,7 +7731,8 @@ export class SharedProjectCatalog {
       `SELECT bi.*, b.name AS batch_name
        FROM transcription_batch_items bi
        JOIN transcription_batches b ON b.id = bi.batch_id
-       WHERE b.project_id = $1 AND bi.state = 'ready_for_review'
+       WHERE b.project_id = $1 AND b.processing_origin = 'manual'
+         AND bi.state = 'ready_for_review'
        ORDER BY
          CASE bi.review_status
            WHEN 'unreviewed' THEN 0
@@ -4398,7 +7802,7 @@ export class SharedProjectCatalog {
     const updatedAt = this.now().toISOString();
     await this.transaction(async () => {
       const result = await this.database.query<DbRow>(
-        `SELECT id, dispatch_status, version
+        `SELECT id, dispatch_status, processing_origin, version
          FROM transcription_batches
          WHERE id = $1 AND project_id = $2
          FOR UPDATE`,
@@ -4407,6 +7811,11 @@ export class SharedProjectCatalog {
       const batch = result.rows[0];
       if (!batch) {
         throw new CatalogNotFoundError("Transcription batch not found.");
+      }
+      if (batch.processing_origin === "project_local") {
+        throw new CatalogConflictError(
+          "Automatic local work is controlled by the project local-processing policy.",
+        );
       }
       if (Number(batch.version) !== command.expectedVersion) {
         throw new CatalogConflictError(
@@ -4504,6 +7913,132 @@ export class SharedProjectCatalog {
     return this.getTranscriptionBatch(actor, projectId, batchId);
   }
 
+  async updateHostedTranscriptionApproval(
+    actor: AuthenticatedActor,
+    projectId: string,
+    batchId: string,
+    input: UpdateHostedTranscriptionApprovalRequest,
+  ): Promise<HostedTranscriptionApprovalResponse> {
+    await this.requireRegistered(actor);
+    const command = UpdateHostedTranscriptionApprovalRequestSchema.parse(input);
+    const requestSha256 = createHash("sha256")
+      .update(canonicalJson(command))
+      .digest("hex");
+    const now = this.now().toISOString();
+
+    return this.transaction(async () => {
+      const membership = await this.database.query<{ role: ProjectRole }>(
+        `SELECT role FROM project_members
+         WHERE project_id = $1 AND user_id = $2
+         FOR SHARE`,
+        [projectId, actor.userId],
+      );
+      requirePermission(membership.rows[0]?.role, "manage_project");
+
+      const selected = await this.database.query<DbRow>(
+        `SELECT * FROM transcription_batches
+         WHERE id = $1 AND project_id = $2
+         FOR UPDATE`,
+        [batchId, projectId],
+      );
+      const batch = selected.rows[0];
+      if (!batch) {
+        throw new CatalogNotFoundError("Transcription batch not found.");
+      }
+      if (batch.execution_location !== "hosted") {
+        throw new CatalogConflictError(
+          "Local transcription batches do not require hosted approval.",
+        );
+      }
+
+      const replay = await this.database.query<DbRow>(
+        `SELECT request_sha256, response_json
+         FROM hosted_transcription_approval_commands
+         WHERE project_id = $1 AND batch_id = $2 AND actor_id = $3
+           AND idempotency_key = $4`,
+        [projectId, batchId, actor.userId, command.idempotencyKey],
+      );
+      if (replay.rows[0]) {
+        if (String(replay.rows[0].request_sha256) !== requestSha256) {
+          throw new CatalogIdempotencyConflictError(
+            "This hosted-approval command key was already used for another request.",
+          );
+        }
+        return HostedTranscriptionApprovalResponseSchema.parse(
+          jsonRecord(replay.rows[0].response_json),
+        );
+      }
+
+      if (Number(batch.hosted_approval_version) !== command.expectedVersion) {
+        throw new CatalogConflictError(
+          "The hosted approval changed; reload the batch before trying again.",
+        );
+      }
+      const currentState = String(batch.hosted_approval_state);
+      if (
+        (command.action === "approve" &&
+          !["pending", "revoked"].includes(currentState)) ||
+        (command.action === "revoke" && currentState !== "approved")
+      ) {
+        throw new CatalogConflictError(
+          command.action === "approve"
+            ? "This hosted batch is already approved."
+            : "Only an approved hosted batch can be revoked.",
+        );
+      }
+
+      const nextState = command.action === "approve" ? "approved" : "revoked";
+      const updated = await this.database.query<DbRow>(
+        `UPDATE transcription_batches
+         SET hosted_approval_state = $1,
+             hosted_approval_version = hosted_approval_version + 1,
+             hosted_approval_by = $2, hosted_approval_at = $3,
+             updated_at = $3
+         WHERE id = $4 AND project_id = $5
+         RETURNING hosted_approval_version`,
+        [nextState, actor.userId, now, batchId, projectId],
+      );
+      const actorSummary = (
+        await this.database.query<DbRow>(
+          "SELECT handle, display_name FROM users WHERE id = $1",
+          [actor.userId],
+        )
+      ).rows[0]!;
+      const response = HostedTranscriptionApprovalResponseSchema.parse({
+        projectId,
+        batchId,
+        approval: {
+          state: nextState,
+          version: Number(updated.rows[0]!.hosted_approval_version),
+          decidedBy: {
+            userId: actor.userId,
+            handle: String(actorSummary.handle),
+            displayName: String(actorSummary.display_name),
+          },
+          decidedAt: now,
+        },
+      });
+      await this.database.query(
+        `INSERT INTO hosted_transcription_approval_commands
+           (id, project_id, batch_id, actor_id, action, idempotency_key,
+            request_sha256, response_json, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+        [
+          randomUUID(),
+          projectId,
+          batchId,
+          actor.userId,
+          command.action,
+          command.idempotencyKey,
+          requestSha256,
+          JSON.stringify(response),
+          now,
+        ],
+      );
+      return response;
+    });
+  }
+
   async listUndispatchedTranscriptionJobs(
     limit = 25,
   ): Promise<Array<{ jobId: string; executionLocation: "local" | "hosted" }>> {
@@ -4512,6 +8047,7 @@ export class SharedProjectCatalog {
        FROM jobs j
        JOIN transcription_batch_items bi ON bi.job_id = j.id
        JOIN transcription_batches b ON b.id = bi.batch_id
+       JOIN projects p ON p.id = b.project_id
        WHERE j.kind = 'transcription' AND j.state = 'queued'
          AND j.payload->>'queueDeliveredAt' IS NULL
          AND (
@@ -4519,6 +8055,11 @@ export class SharedProjectCatalog {
            OR (j.payload->>'queueDispatchedAt')::timestamptz <= $2::timestamptz
          )
          AND b.dispatch_status = 'active' AND bi.state = 'queued'
+         AND (
+           (j.payload->>'executionLocation' = 'local'
+             AND p.local_processing_state = 'automatic')
+           OR b.hosted_approval_state = 'approved'
+         )
        ORDER BY j.id
        LIMIT $1::integer`,
       [
@@ -4533,17 +8074,32 @@ export class SharedProjectCatalog {
     }));
   }
 
-  async markTranscriptionJobDispatched(jobId: string): Promise<void> {
-    await this.database.query(
+  async markTranscriptionJobDispatched(jobId: string): Promise<boolean> {
+    const result = await this.database.query<DbRow>(
       `UPDATE jobs
        SET payload = payload || jsonb_build_object(
              'queueDispatchedAt', $1::text
            ),
            updated_at = $1::timestamptz
        WHERE id = $2 AND kind = 'transcription' AND state = 'queued'
-         AND payload->>'queueDeliveredAt' IS NULL`,
+         AND payload->>'queueDeliveredAt' IS NULL
+         AND EXISTS (
+           SELECT 1
+           FROM transcription_batch_items bi
+           JOIN transcription_batches b ON b.id = bi.batch_id
+           JOIN projects p ON p.id = b.project_id
+           WHERE bi.job_id = jobs.id
+             AND b.dispatch_status = 'active' AND bi.state = 'queued'
+             AND (
+               (jobs.payload->>'executionLocation' = 'local'
+                 AND p.local_processing_state = 'automatic')
+               OR b.hosted_approval_state = 'approved'
+             )
+         )
+       RETURNING id`,
       [this.now().toISOString(), jobId],
     );
+    return Boolean(result.rows[0]);
   }
 
   async markTranscriptionJobQueueDelivered(
@@ -4559,6 +8115,16 @@ export class SharedProjectCatalog {
            updated_at = $1::timestamptz
        WHERE id = $2 AND kind = 'transcription' AND state = 'queued'
          AND payload->>'executionLocation' = $3
+         AND EXISTS (
+           SELECT 1
+           FROM transcription_batch_items bi
+           JOIN transcription_batches b ON b.id = bi.batch_id
+           JOIN projects p ON p.id = b.project_id
+           WHERE bi.job_id = jobs.id
+             AND b.dispatch_status = 'active' AND bi.state = 'queued'
+             AND (($3 = 'local' AND p.local_processing_state = 'automatic')
+               OR b.hosted_approval_state = 'approved')
+         )
        RETURNING id`,
       [deliveredAt, jobId, executionLocation],
     );
@@ -4580,16 +8146,19 @@ export class SharedProjectCatalog {
          FROM jobs j
          JOIN project_members pm
            ON pm.project_id = j.project_id AND pm.user_id = $1
+         JOIN projects p ON p.id = j.project_id
          LEFT JOIN worker_leases wl ON wl.job_id = j.id
          WHERE j.kind = 'transcription'
-           AND pm.role IN ('owner', 'editor', 'researcher')
+           AND pm.role IN ('owner', 'administrator', 'researcher')
            AND j.payload->>'executionLocation' = $2
+           AND ($2 = 'hosted' OR p.local_processing_state = 'automatic')
            ${requireQueueDelivery ? "AND j.payload->>'queueDeliveredAt' IS NOT NULL" : ""}
            AND EXISTS (
              SELECT 1
              FROM transcription_batch_items bi
              JOIN transcription_batches b ON b.id = bi.batch_id
              WHERE bi.job_id = j.id
+               AND ($2 = 'local' OR b.hosted_approval_state = 'approved')
                AND (
                  (b.dispatch_status = 'active' AND bi.state = 'queued')
                  OR bi.state IN (
@@ -4671,15 +8240,85 @@ export class SharedProjectCatalog {
     attempt: number,
     leaseSeconds: number,
     stage: WorkerProgressStage,
-  ): Promise<WorkerLease> {
-    const lease = await this.requireActiveWorkerLease(actor, jobId, attempt);
+  ): Promise<WorkerHeartbeatResponse> {
     const heartbeatAt = this.now();
     const expiresAt = new Date(heartbeatAt.getTime() + leaseSeconds * 1_000);
-    await this.transaction(async () => {
-      await this.database.query(
+    return this.transaction(async () => {
+      const job = await this.database.query<DbRow>(
+        "SELECT state FROM jobs WHERE id = $1 FOR UPDATE",
+        [jobId],
+      );
+      if (
+        !job.rows[0] ||
+        !["claimed", "processing"].includes(String(job.rows[0].state))
+      ) {
+        throw new AuthorizationError("The worker lease is no longer active.");
+      }
+      const lease = await this.requireActiveWorkerLease(actor, jobId, attempt);
+      const cancellation = await this.database.query<DbRow>(
+        `SELECT requested_at
+         FROM transcription_job_cancel_requests
+         WHERE job_id = $1 AND revoked_at IS NULL AND completed_at IS NULL
+         FOR UPDATE`,
+        [jobId],
+      );
+      if (cancellation.rows[0]) {
+        const activeDependency = Boolean(
+          (
+            await this.database.query(
+              `SELECT 1
+               FROM transcription_batch_items dependency
+               JOIN transcription_batches dependency_batch
+                 ON dependency_batch.id = dependency.batch_id
+               JOIN project_videos dependency_video
+                 ON dependency_video.project_id = dependency_batch.project_id
+                AND dependency_video.video_id = dependency.catalog_video_id
+               WHERE dependency.job_id = $1
+                 AND dependency_video.triage_state = 'active'
+               LIMIT 1`,
+              [jobId],
+            )
+          ).rows[0],
+        );
+        if (!activeDependency) {
+          await this.database.query(
+            `UPDATE jobs SET state = 'canceled', updated_at = $1
+             WHERE id = $2 AND state IN ('claimed', 'processing')`,
+            [heartbeatAt.toISOString(), jobId],
+          );
+          await this.database.query(
+            `UPDATE transcription_batch_items
+             SET state = 'canceled', version = version + 1, updated_at = $1
+             WHERE job_id = $2 AND attempt = $3
+               AND state NOT IN ('ready_for_review', 'canceled')`,
+            [heartbeatAt.toISOString(), jobId, attempt],
+          );
+          await this.database.query(
+            `UPDATE transcription_job_cancel_requests SET completed_at = $1
+             WHERE job_id = $2`,
+            [heartbeatAt.toISOString(), jobId],
+          );
+          await this.database.query(
+            `DELETE FROM worker_leases
+             WHERE job_id = $1 AND worker_id = $2 AND attempt = $3`,
+            [jobId, actor.userId, attempt],
+          );
+          return WorkerHeartbeatResponseSchema.parse({
+            status: "cancellation_requested",
+            requestedAt: iso(cancellation.rows[0].requested_at),
+          });
+        }
+        await this.database.query(
+          `UPDATE transcription_job_cancel_requests SET revoked_at = $1
+           WHERE job_id = $2`,
+          [heartbeatAt.toISOString(), jobId],
+        );
+      }
+      const renewed = await this.database.query(
         `UPDATE worker_leases
          SET heartbeat_at = $1, expires_at = $2
-         WHERE job_id = $3 AND worker_id = $4 AND attempt = $5`,
+         WHERE job_id = $3 AND worker_id = $4 AND attempt = $5
+         RETURNING job_id`,
         [
           heartbeatAt.toISOString(),
           expiresAt.toISOString(),
@@ -4688,8 +8327,12 @@ export class SharedProjectCatalog {
           attempt,
         ],
       );
+      if (!renewed.rows[0]) {
+        throw new AuthorizationError("The worker lease is no longer active.");
+      }
       await this.database.query(
-        "UPDATE jobs SET state = 'processing', updated_at = $1 WHERE id = $2",
+        `UPDATE jobs SET state = 'processing', updated_at = $1
+         WHERE id = $2 AND state IN ('claimed', 'processing')`,
         [heartbeatAt.toISOString(), jobId],
       );
       await this.database.query(
@@ -4698,14 +8341,17 @@ export class SharedProjectCatalog {
          WHERE job_id = $3 AND attempt = $4`,
         [stage, heartbeatAt.toISOString(), jobId, attempt],
       );
-    });
-    return WorkerLeaseSchema.parse({
-      jobId,
-      workerId: actor.userId,
-      attempt,
-      claimedAt: iso(lease.claimed_at),
-      heartbeatAt: heartbeatAt.toISOString(),
-      expiresAt: expiresAt.toISOString(),
+      return WorkerHeartbeatResponseSchema.parse({
+        status: "active",
+        lease: {
+          jobId,
+          workerId: actor.userId,
+          attempt,
+          claimedAt: iso(lease.claimed_at),
+          heartbeatAt: heartbeatAt.toISOString(),
+          expiresAt: expiresAt.toISOString(),
+        },
+      });
     });
   }
 
@@ -4866,6 +8512,876 @@ export class SharedProjectCatalog {
       expiresAt: expiresAt.toISOString(),
       targets,
     });
+  }
+
+  async createManualTimedTranscriptImport(
+    actor: AuthenticatedActor,
+    projectId: string,
+    videoId: string,
+    input: CreateManualTimedTranscriptImportRequest,
+  ): Promise<ManualTimedTranscriptImportUploadGrant> {
+    await this.authorize(actor, projectId, "write");
+    const command = CreateManualTimedTranscriptImportRequestSchema.parse(input);
+    const requestSha256 = sha256(
+      new TextEncoder().encode(canonicalJson(command)),
+    );
+    const now = this.now();
+    const expiresAt = new Date(now.getTime() + 15 * 60 * 1_000);
+    let importId: string = randomUUID();
+    let sourceLanguage = "";
+
+    await this.transaction(async () => {
+      const replay = await this.database.query<DbRow>(
+        `SELECT * FROM manual_timed_transcript_imports
+         WHERE project_id = $1 AND video_id = $2 AND created_by = $3
+           AND idempotency_key = $4`,
+        [projectId, videoId, actor.userId, command.idempotencyKey],
+      );
+      if (replay.rows[0]) {
+        if (String(replay.rows[0].request_sha256) !== requestSha256) {
+          throw new CatalogIdempotencyConflictError(
+            "That timed transcript import idempotency key was already used for different input.",
+          );
+        }
+        sourceLanguage = await this.loadManualImportSourceLanguage(
+          replay.rows[0],
+        );
+        importId = String(replay.rows[0].id);
+        return;
+      }
+
+      const video = await this.database.query<DbRow>(
+        `SELECT pv.version AS project_video_version, v.duration_ms,
+                v.updated_at AS video_updated_at,
+                d.id AS decision_id, d.decision_version, d.status,
+                d.resolved_language
+         FROM project_videos pv
+         JOIN videos v ON v.id = pv.video_id
+         LEFT JOIN project_video_language_decisions d
+           ON d.id = pv.current_language_decision_id
+         WHERE pv.project_id = $1 AND pv.video_id = $2
+         FOR UPDATE OF pv`,
+        [projectId, videoId],
+      );
+      const projectVideo = video.rows[0];
+      if (!projectVideo)
+        throw new CatalogNotFoundError("Project video not found.");
+      // The project-video lock serializes same-key creators. Recheck after
+      // acquiring it so a concurrent exact create returns its original grant.
+      const replayAfterLock = await this.database.query<DbRow>(
+        `SELECT * FROM manual_timed_transcript_imports
+         WHERE project_id = $1 AND video_id = $2 AND created_by = $3
+           AND idempotency_key = $4`,
+        [projectId, videoId, actor.userId, command.idempotencyKey],
+      );
+      if (replayAfterLock.rows[0]) {
+        if (String(replayAfterLock.rows[0].request_sha256) !== requestSha256) {
+          throw new CatalogIdempotencyConflictError(
+            "That timed transcript import idempotency key was already used for different input.",
+          );
+        }
+        sourceLanguage = await this.loadManualImportSourceLanguage(
+          replayAfterLock.rows[0],
+        );
+        importId = String(replayAfterLock.rows[0].id);
+        return;
+      }
+      if (
+        String(projectVideo.decision_id ?? "") !== command.languageDecisionId ||
+        Number(projectVideo.decision_version ?? 0) !==
+          command.expectedDecisionVersion ||
+        projectVideo.status !== "confirmed" ||
+        !isImportableSourceLanguage(projectVideo.resolved_language)
+      ) {
+        throw new CatalogConflictError(
+          "The confirmed source-language decision changed; reload before importing.",
+        );
+      }
+      if (
+        !Number.isSafeInteger(Number(projectVideo.duration_ms)) ||
+        Number(projectVideo.duration_ms) <= 0
+      ) {
+        throw new CatalogConflictError(
+          "A known video duration is required for timed transcript import.",
+        );
+      }
+      const batchItem = await this.database.query<DbRow>(
+        `SELECT bi.id, bi.batch_id, bi.version, bi.state
+         FROM transcription_batch_items bi
+         JOIN transcription_batches b ON b.id = bi.batch_id
+         WHERE bi.id = $1 AND b.project_id = $2 AND bi.catalog_video_id = $3
+         FOR UPDATE OF bi`,
+        [command.batchItemId, projectId, videoId],
+      );
+      const item = batchItem.rows[0];
+      if (
+        !item ||
+        Number(item.version) !== command.expectedBatchItemVersion ||
+        !["needs_language_confirmation", "blocked"].includes(String(item.state))
+      ) {
+        throw new CatalogConflictError(
+          "The selected batch item is no longer actionable for timed import.",
+        );
+      }
+      sourceLanguage = String(projectVideo.resolved_language);
+      await this.database.query(
+        `INSERT INTO manual_timed_transcript_imports
+           (id, project_id, video_id, language_decision_id,
+            language_decision_version, project_video_version, video_duration_ms,
+            video_updated_at, batch_item_id, batch_id, batch_item_version, original_format,
+            english_format, original_byte_size, english_byte_size, original_sha256,
+            english_sha256, state, idempotency_key, request_sha256, expires_at,
+            created_by, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                 $13, $14, $15, $16, $17, 'staged', $18, $19, $20, $21, $22)`,
+        [
+          importId,
+          projectId,
+          videoId,
+          command.languageDecisionId,
+          command.expectedDecisionVersion,
+          Number(projectVideo.project_video_version),
+          Number(projectVideo.duration_ms),
+          iso(projectVideo.video_updated_at),
+          command.batchItemId,
+          item.batch_id,
+          command.expectedBatchItemVersion,
+          command.original.format,
+          command.english.format,
+          command.original.byteSize,
+          command.english.byteSize,
+          command.original.sha256,
+          command.english.sha256,
+          command.idempotencyKey,
+          requestSha256,
+          expiresAt.toISOString(),
+          actor.userId,
+          now.toISOString(),
+        ],
+      );
+      for (const target of [
+        { role: "original", format: command.original.format },
+        { role: "english", format: command.english.format },
+      ] as const) {
+        await this.database.query(
+          `INSERT INTO manual_timed_transcript_import_targets
+             (import_id, role, object_key) VALUES ($1, $2, $3)`,
+          [
+            importId,
+            target.role,
+            `staging/manual-imports/projects/${projectId}/videos/${videoId}/${importId}/${target.role}.${target.format}`,
+          ],
+        );
+      }
+    });
+
+    const persisted = await this.loadManualTimedTranscriptImport(importId);
+    return this.issueManualTimedTranscriptImportGrant(
+      persisted,
+      sourceLanguage,
+    );
+  }
+
+  async finalizeManualTimedTranscriptImport(
+    actor: AuthenticatedActor,
+    projectId: string,
+    videoId: string,
+    importId: string,
+    input: FinalizeManualTimedTranscriptImportRequest,
+  ): Promise<ManualTimedTranscriptImportStatus> {
+    await this.authorize(actor, projectId, "write");
+    const command =
+      FinalizeManualTimedTranscriptImportRequestSchema.parse(input);
+    const requestSha256 = sha256(
+      new TextEncoder().encode(canonicalJson(command)),
+    );
+    let importRow = await this.loadManualTimedTranscriptImport(importId);
+    if (
+      String(importRow.project_id) !== projectId ||
+      String(importRow.video_id) !== videoId
+    ) {
+      throw new CatalogNotFoundError("Timed transcript import not found.");
+    }
+    if (String(importRow.state) === "finalized") {
+      if (
+        String(importRow.finalize_idempotency_key) !== command.idempotencyKey ||
+        String(importRow.finalize_request_sha256) !== requestSha256
+      ) {
+        throw new CatalogIdempotencyConflictError(
+          "Timed transcript import was already finalized with different input.",
+        );
+      }
+      return this.loadManualTimedTranscriptImportStatus(importId);
+    }
+    let finalizationToken: string | undefined;
+    let resuming = false;
+    if (String(importRow.state) === "finalizing") {
+      if (
+        String(importRow.finalize_idempotency_key) !== command.idempotencyKey ||
+        String(importRow.finalize_request_sha256) !== requestSha256
+      ) {
+        throw new CatalogIdempotencyConflictError(
+          "Timed transcript import finalization is already in progress.",
+        );
+      }
+      const startedAt = new Date(
+        iso(importRow.finalization_started_at),
+      ).getTime();
+      if (startedAt > this.now().getTime() - 5 * 60 * 1_000) {
+        return this.loadManualTimedTranscriptImportStatus(importId);
+      }
+      const takeoverToken = randomUUID();
+      const resumed = await this.database.query<DbRow>(
+        `UPDATE manual_timed_transcript_imports
+         SET finalization_token = $1, finalization_started_at = $2,
+             version = version + 1
+         WHERE id = $3 AND state = 'finalizing' AND finalization_token = $4
+         RETURNING *`,
+        [
+          takeoverToken,
+          this.now().toISOString(),
+          importId,
+          importRow.finalization_token,
+        ],
+      );
+      if (!resumed.rows[0]) {
+        return this.loadManualTimedTranscriptImportStatus(importId);
+      }
+      importRow = resumed.rows[0];
+      finalizationToken = takeoverToken;
+      resuming = true;
+    }
+    if (new Date(iso(importRow.expires_at)).getTime() <= this.now().getTime()) {
+      await this.expireManualTimedTranscriptImport(importRow);
+      throw new CatalogConflictError(
+        "Timed transcript import grant has expired.",
+      );
+    }
+    const targets = await this.loadManualTimedTranscriptImportTargets(importId);
+    const originalReceipt = resuming
+      ? this.manualTimedImportStoredReceipt(importRow, "original")
+      : command.original;
+    const englishReceipt = resuming
+      ? this.manualTimedImportStoredReceipt(importRow, "english")
+      : command.english;
+    const original = await this.loadManualTimedTranscriptImportObject(
+      targets.get("original"),
+      originalReceipt,
+      importRow.original_byte_size,
+      importRow.original_sha256,
+    );
+    const english = await this.loadManualTimedTranscriptImportObject(
+      targets.get("english"),
+      englishReceipt,
+      importRow.english_byte_size,
+      importRow.english_sha256,
+    );
+    const sourceLanguage = await this.loadManualImportSourceLanguage(importRow);
+    let normalized: Awaited<
+      ReturnType<typeof normalizeManualTimedBilingualImport>
+    >;
+    try {
+      normalized = await normalizeManualTimedBilingualImport({
+        importId,
+        videoId: await this.loadYoutubeVideoId(videoId),
+        sourceLanguage,
+        durationMs: Number(importRow.video_duration_ms),
+        original: {
+          format: ManualTimedTranscriptFormatSchema.parse(
+            importRow.original_format,
+          ),
+          bytes: original.bytes,
+        },
+        english: {
+          format: ManualTimedTranscriptFormatSchema.parse(
+            importRow.english_format,
+          ),
+          bytes: english.bytes,
+        },
+      });
+    } catch (error) {
+      const code =
+        error && typeof error === "object" && "code" in error
+          ? String(error.code)
+          : "manual_import_invalid_format";
+      throw new ManualTimedTranscriptImportError(code);
+    }
+    const claimToken = finalizationToken ?? randomUUID();
+    let reserved = resuming;
+    if (!resuming)
+      await this.transaction(async () => {
+        const locked = await this.database.query<DbRow>(
+          `SELECT state, expires_at, finalize_idempotency_key,
+                  finalize_request_sha256
+         FROM manual_timed_transcript_imports WHERE id = $1 FOR UPDATE`,
+          [importId],
+        );
+        const current = locked.rows[0];
+        if (!current) {
+          throw new CatalogNotFoundError("Timed transcript import not found.");
+        }
+        if (String(current.state) === "finalized") {
+          if (
+            String(current.finalize_idempotency_key) !==
+              command.idempotencyKey ||
+            String(current.finalize_request_sha256) !== requestSha256
+          ) {
+            throw new CatalogIdempotencyConflictError(
+              "Timed transcript import was already finalized with different input.",
+            );
+          }
+          return;
+        }
+        if (String(current.state) === "finalizing") {
+          if (
+            String(current.finalize_idempotency_key) !==
+              command.idempotencyKey ||
+            String(current.finalize_request_sha256) !== requestSha256
+          ) {
+            throw new CatalogIdempotencyConflictError(
+              "Timed transcript import finalization is already in progress.",
+            );
+          }
+          return;
+        }
+        if (
+          String(current.state) !== "staged" ||
+          new Date(iso(current.expires_at)).getTime() <= this.now().getTime()
+        ) {
+          return;
+        }
+        const reservation = await this.database.query<DbRow>(
+          `UPDATE manual_timed_transcript_imports
+         SET state = 'finalizing', finalize_idempotency_key = $1,
+             finalize_request_sha256 = $2, finalization_token = $3,
+             finalization_started_at = $4,
+             original_object_version_id = $5, english_object_version_id = $6,
+             version = version + 1
+         WHERE id = $7 AND state = 'staged' AND expires_at > $4
+         RETURNING id`,
+          [
+            command.idempotencyKey,
+            requestSha256,
+            claimToken,
+            this.now().toISOString(),
+            originalReceipt.objectVersionId,
+            englishReceipt.objectVersionId,
+            importId,
+          ],
+        );
+        reserved = reservation.rows.length === 1;
+      });
+    if (!reserved) return this.loadManualTimedTranscriptImportStatus(importId);
+    const finalizedAt = this.now().toISOString();
+    const transcriptVersionId = randomUUID();
+    const candidateId = randomUUID();
+    const prefix = `projects/${projectId}/videos/${videoId}/manual-imports/${importId}/candidate`;
+    const candidateObjects: Array<{
+      objectKey: string;
+      objectVersionId: string;
+    }> = [];
+    try {
+      const artifacts = await this.storeManualTimedTranscriptCandidateArtifacts(
+        prefix,
+        normalized,
+        (artifact) => candidateObjects.push(artifact),
+      );
+      const manifest = TranscriptManifestSchema.parse({
+        schemaVersion: 1,
+        id: transcriptVersionId,
+        projectId,
+        catalogVideoId: videoId,
+        videoId: await this.loadYoutubeVideoId(videoId),
+        lineageId: importId,
+        version: 1,
+        sourceLanguage,
+        targetLanguage: "en",
+        timingPrecision: "cue",
+        provider: normalized.original.track.provider,
+        normalizationSchemaVersion: normalized.original.track.schemaVersion,
+        manualImportId: importId,
+        createdBy: actor.userId,
+        createdAt: finalizedAt,
+        languageDecision: {
+          schemaVersion: 1,
+          decisionId: importRow.language_decision_id,
+          decisionVersion: Number(importRow.language_decision_version),
+          status: "confirmed",
+          basis: await this.loadManualImportDecisionBasis(importRow),
+          resolvedLanguage: sourceLanguage,
+        },
+        artifacts,
+      });
+      const manifestBytes = new TextEncoder().encode(JSON.stringify(manifest));
+      const manifestObject = await this.store.put({
+        key: `${prefix}/manifest.json`,
+        bytes: manifestBytes,
+        contentType: "application/json",
+        sha256: sha256(manifestBytes),
+      });
+      candidateObjects.push({
+        objectKey: manifestObject.key,
+        objectVersionId: manifestObject.versionId,
+      });
+
+      await this.transaction(async () => {
+        const locked = await this.database.query<DbRow>(
+          `SELECT mi.*, pv.version AS current_project_video_version,
+                v.duration_ms AS current_duration_ms,
+                v.updated_at AS current_video_updated_at,
+                pv.current_language_decision_id,
+                d.decision_version, d.status, d.basis, d.resolved_language
+         FROM manual_timed_transcript_imports mi
+         JOIN project_videos pv ON pv.project_id = mi.project_id AND pv.video_id = mi.video_id
+         JOIN videos v ON v.id = mi.video_id
+         LEFT JOIN project_video_language_decisions d ON d.id = pv.current_language_decision_id
+         WHERE mi.id = $1 FOR UPDATE OF mi, pv`,
+          [importId],
+        );
+        const current = locked.rows[0];
+        if (!current)
+          throw new CatalogNotFoundError("Timed transcript import not found.");
+        if (
+          String(current.state) !== "finalizing" ||
+          String(current.finalization_token ?? "") !== claimToken
+        ) {
+          throw new CatalogConflictError(
+            "Timed transcript import finalization reservation was lost.",
+          );
+        }
+        if (
+          Number(current.current_project_video_version) !==
+            Number(current.project_video_version) ||
+          Number(current.current_duration_ms) !==
+            Number(current.video_duration_ms) ||
+          iso(current.current_video_updated_at) !==
+            iso(current.video_updated_at) ||
+          String(current.current_language_decision_id ?? "") !==
+            String(current.language_decision_id) ||
+          Number(current.decision_version ?? 0) !==
+            Number(current.language_decision_version) ||
+          current.status !== "confirmed" ||
+          new Date(iso(current.expires_at)).getTime() <= this.now().getTime() ||
+          !languagesEquivalent(
+            String(current.resolved_language ?? ""),
+            sourceLanguage,
+          )
+        ) {
+          throw new CatalogConflictError(
+            "The project video or confirmed language decision changed; restart the import.",
+          );
+        }
+        const batchItem = await this.database.query<DbRow>(
+          `SELECT bi.id, bi.version, bi.state
+         FROM transcription_batch_items bi
+         WHERE bi.id = $1 AND bi.catalog_video_id = $2 FOR UPDATE`,
+          [current.batch_item_id, videoId],
+        );
+        if (
+          !batchItem.rows[0] ||
+          Number(batchItem.rows[0].version) !==
+            Number(current.batch_item_version) ||
+          !["needs_language_confirmation", "blocked"].includes(
+            String(batchItem.rows[0].state),
+          )
+        ) {
+          throw new CatalogConflictError(
+            "The selected batch item changed; restart the timed import.",
+          );
+        }
+        await this.database.query(
+          `INSERT INTO transcript_versions
+           (id, project_id, video_id, lineage_id, version, schema_version,
+            source_language, target_language, timing_precision,
+            manifest_object_key, manifest_object_version_id, manifest_sha256,
+            idempotency_key, finalized_at, created_at)
+         VALUES ($1, $2, $3, $4, 1, $5, $6, 'en', 'cue', $7, $8, $9,
+                 $10, $11, $11)`,
+          [
+            transcriptVersionId,
+            projectId,
+            videoId,
+            importId,
+            normalized.original.track.schemaVersion,
+            sourceLanguage,
+            manifestObject.key,
+            manifestObject.versionId,
+            manifestObject.sha256,
+            `manual-import:${importId}`,
+            finalizedAt,
+          ],
+        );
+        for (const artifact of [
+          {
+            type: "manifest" as const,
+            objectKey: manifestObject.key,
+            objectVersionId: manifestObject.versionId,
+            byteSize: manifestObject.bytes.byteLength,
+            sha256: manifestObject.sha256,
+          },
+          ...artifacts,
+        ]) {
+          await this.database.query(
+            `INSERT INTO transcript_artifacts
+             (transcript_version_id, artifact_type, object_key, object_version_id,
+              byte_size, sha256) VALUES ($1, $2, $3, $4, $5, $6)`,
+            [
+              transcriptVersionId,
+              artifact.type,
+              artifact.objectKey,
+              artifact.objectVersionId,
+              artifact.byteSize,
+              artifact.sha256,
+            ],
+          );
+        }
+        await this.database.query(
+          `INSERT INTO manual_timed_transcript_candidates
+           (id, import_id, project_id, video_id, transcript_version_id,
+            language_decision_id, language_decision_version, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+          [
+            candidateId,
+            importId,
+            projectId,
+            videoId,
+            transcriptVersionId,
+            current.language_decision_id,
+            current.language_decision_version,
+            finalizedAt,
+          ],
+        );
+        await this.database.query(
+          `UPDATE manual_timed_transcript_imports
+         SET state = 'finalized', finalization_token = NULL,
+             finalization_started_at = NULL, finalized_at = $1,
+             version = version + 1
+         WHERE id = $2`,
+          [finalizedAt, importId],
+        );
+        await this.database.query(
+          `UPDATE transcription_batch_items
+         SET state = 'ready_for_review', manual_timed_transcript_candidate_id = $1,
+             error_code = NULL, error_message = NULL, error_retryable = NULL,
+             version = version + 1, updated_at = $2
+         WHERE id = $3`,
+          [candidateId, finalizedAt, current.batch_item_id],
+        );
+        await this.database.query(
+          `INSERT INTO sync_events
+           (project_id, event_type, entity_id, server_version, payload)
+         VALUES ($1, 'transcript.candidate_finalized', $2, 1, $3)`,
+          [projectId, candidateId, JSON.stringify({ videoId })],
+        );
+      });
+    } catch (error) {
+      await this.database.query(
+        `UPDATE manual_timed_transcript_imports
+         SET state = 'staged', finalize_idempotency_key = NULL,
+             finalize_request_sha256 = NULL, finalization_token = NULL,
+             finalization_started_at = NULL, version = version + 1
+         WHERE id = $1 AND state = 'finalizing' AND finalization_token = $2`,
+        [importId, claimToken],
+      );
+      await Promise.allSettled(
+        candidateObjects.map((object) =>
+          this.store.deleteVersion(object.objectKey, object.objectVersionId),
+        ),
+      );
+      const current = await this.loadManualTimedTranscriptImport(importId);
+      if (
+        ["staged", "finalizing"].includes(String(current.state)) &&
+        new Date(iso(current.expires_at)).getTime() <= this.now().getTime()
+      ) {
+        await this.expireManualTimedTranscriptImport(current);
+      }
+      throw error;
+    }
+    return this.loadManualTimedTranscriptImportStatus(importId);
+  }
+
+  async getManualTimedTranscriptImportForBatchItem(
+    actor: AuthenticatedActor,
+    projectId: string,
+    videoId: string,
+    batchItemId: string,
+  ): Promise<ManualTimedTranscriptImportStatus> {
+    await this.authorize(actor, projectId, "write");
+    const result = await this.database.query<DbRow>(
+      `SELECT mi.id
+       FROM manual_timed_transcript_imports mi
+       LEFT JOIN manual_timed_transcript_candidates candidate
+         ON candidate.import_id = mi.id
+       WHERE mi.project_id = $1 AND mi.video_id = $2 AND mi.batch_item_id = $3
+       ORDER BY (candidate.id IS NOT NULL) DESC, mi.created_at DESC, mi.id DESC
+       LIMIT 1`,
+      [projectId, videoId, batchItemId],
+    );
+    if (!result.rows[0]) {
+      throw new CatalogNotFoundError("Timed transcript import not found.");
+    }
+    return this.loadManualTimedTranscriptImportStatus(
+      String(result.rows[0].id),
+    );
+  }
+
+  async reviewManualTimedTranscriptCandidate(
+    actor: AuthenticatedActor,
+    projectId: string,
+    videoId: string,
+    candidateId: string,
+    input: ManualTimedTranscriptCandidateReviewQuery,
+  ): Promise<ManualTimedTranscriptCandidateReviewPage> {
+    // Corrected candidate text is remediation evidence, not a general project
+    // transcript read. Compatibility viewers cannot approve the candidate and
+    // therefore do not receive this pre-activation review surface.
+    await this.authorize(actor, projectId, "write");
+    const query = ManualTimedTranscriptCandidateReviewQuerySchema.parse(input);
+    const verified = await this.loadVerifiedManualTimedTranscriptCandidate(
+      projectId,
+      videoId,
+      candidateId,
+    );
+    const cuePage = (transcript: NormalizedTranscript) =>
+      transcript.segments
+        .slice(query.offset, query.offset + query.limit)
+        .map(({ trackId: _trackId, ...cue }) => cue);
+    const trackPage = (transcript: NormalizedTranscript) => ({
+      trackId: transcript.track.id,
+      trackVersion: transcript.track.version,
+      language: transcript.track.language,
+      kind: transcript.track.kind,
+      source: transcript.track.source,
+      provider: transcript.track.provider,
+      ...(transcript.track.sourceTrackId
+        ? { sourceTrackId: transcript.track.sourceTrackId }
+        : {}),
+      timingPrecision: transcript.track.timingPrecision,
+      contentSha256: transcript.track.contentSha256,
+      totalCues: transcript.segments.length,
+      cues: cuePage(transcript),
+    });
+    return ManualTimedTranscriptCandidateReviewPageSchema.parse({
+      candidateId: verified.row.candidate_id,
+      importId: verified.row.import_id,
+      transcriptVersionId: verified.row.transcript_version_id,
+      projectId,
+      catalogVideoId: videoId,
+      projectVideoVersion: Number(verified.row.project_video_version),
+      languageDecisionId: verified.row.language_decision_id,
+      languageDecisionVersion: Number(verified.row.language_decision_version),
+      finalizedAt: iso(verified.row.finalized_at),
+      offset: query.offset,
+      limit: query.limit,
+      hasMore:
+        verified.original.segments.length > query.offset + query.limit ||
+        verified.english.segments.length > query.offset + query.limit,
+      original: trackPage(verified.original),
+      english: trackPage(verified.english),
+    });
+  }
+
+  async activateManualTimedTranscriptCandidate(
+    actor: AuthenticatedActor,
+    projectId: string,
+    videoId: string,
+    input: ActivateManualTimedTranscriptCandidateRequest,
+  ): Promise<ManualTimedTranscriptActivationStatus> {
+    await this.authorize(actor, projectId, "write");
+    const command =
+      ActivateManualTimedTranscriptCandidateRequestSchema.parse(input);
+    const requestSha256 = sha256(
+      new TextEncoder().encode(canonicalJson(command)),
+    );
+    const replay = await this.loadManualTimedTranscriptActivationReplay(
+      actor,
+      projectId,
+      videoId,
+      command.idempotencyKey,
+      requestSha256,
+    );
+    if (replay) return replay;
+
+    // Verify every immutable object before entering the pointer transaction.
+    // The subsequent row locks revalidate all mutable optimistic snapshots.
+    const verified = await this.loadVerifiedManualTimedTranscriptCandidate(
+      projectId,
+      videoId,
+      command.candidateId,
+    );
+    if (
+      String(verified.row.import_id) !== command.importId ||
+      String(verified.row.transcript_version_id) !==
+        command.transcriptVersionId ||
+      String(verified.row.language_decision_id) !==
+        command.languageDecisionId ||
+      Number(verified.row.language_decision_version) !==
+        command.expectedLanguageDecisionVersion
+    ) {
+      throw new CatalogConflictError(
+        "The corrected transcript candidate identity changed; reload before activation.",
+      );
+    }
+
+    const activationId = randomUUID();
+    const activatedAt = this.now().toISOString();
+    let status: ManualTimedTranscriptActivationStatus | undefined;
+    await this.transaction(async () => {
+      const projectVideo = await this.database.query<DbRow>(
+        `SELECT pv.version, pv.active_transcript_version_id,
+                pv.current_language_decision_id,
+                d.decision_version, d.status
+         FROM project_videos pv
+         LEFT JOIN project_video_language_decisions d
+           ON d.id = pv.current_language_decision_id
+         WHERE pv.project_id = $1 AND pv.video_id = $2
+         FOR UPDATE OF pv`,
+        [projectId, videoId],
+      );
+      const current = projectVideo.rows[0];
+      if (!current) throw new CatalogNotFoundError("Project video not found.");
+
+      const replayAfterLock =
+        await this.loadManualTimedTranscriptActivationReplay(
+          actor,
+          projectId,
+          videoId,
+          command.idempotencyKey,
+          requestSha256,
+        );
+      if (replayAfterLock) {
+        status = replayAfterLock;
+        return;
+      }
+      if (
+        Number(current.version) !== command.expectedProjectVideoVersion ||
+        String(current.current_language_decision_id ?? "") !==
+          command.languageDecisionId ||
+        Number(current.decision_version ?? 0) !==
+          command.expectedLanguageDecisionVersion ||
+        current.status !== "confirmed"
+      ) {
+        throw new CatalogConflictError(
+          "The project video or confirmed language decision changed; reload before activation.",
+        );
+      }
+      const candidate = await this.database.query<DbRow>(
+        `SELECT candidate.id
+         FROM manual_timed_transcript_candidates candidate
+         JOIN manual_timed_transcript_imports mi
+           ON mi.id = candidate.import_id
+         WHERE candidate.id = $1 AND candidate.project_id = $2
+           AND candidate.video_id = $3 AND candidate.import_id = $4
+           AND candidate.transcript_version_id = $5
+           AND candidate.language_decision_id = $6
+           AND candidate.language_decision_version = $7
+           AND mi.state = 'finalized'
+         FOR UPDATE OF candidate`,
+        [
+          command.candidateId,
+          projectId,
+          videoId,
+          command.importId,
+          command.transcriptVersionId,
+          command.languageDecisionId,
+          command.expectedLanguageDecisionVersion,
+        ],
+      );
+      if (!candidate.rows[0]) {
+        throw new CatalogConflictError(
+          "The corrected transcript candidate changed; reload before activation.",
+        );
+      }
+      const priorActivation = await this.database.query<DbRow>(
+        `SELECT id FROM manual_timed_transcript_activations
+         WHERE candidate_id = $1`,
+        [command.candidateId],
+      );
+      if (priorActivation.rows[0]) {
+        throw new CatalogIdempotencyConflictError(
+          "That corrected transcript candidate was already activated by another command.",
+        );
+      }
+      const resultingProjectVideoVersion = Number(current.version) + 1;
+      await this.database.query(
+        `UPDATE project_videos
+         SET active_transcript_version_id = $1, version = $2, updated_at = $3
+         WHERE project_id = $4 AND video_id = $5`,
+        [
+          command.transcriptVersionId,
+          resultingProjectVideoVersion,
+          activatedAt,
+          projectId,
+          videoId,
+        ],
+      );
+      await this.enqueueProjectVideoKeywordScan(
+        projectId,
+        videoId,
+        command.transcriptVersionId,
+        activatedAt,
+      );
+      await this.database.query(
+        `INSERT INTO manual_timed_transcript_activations
+           (id, project_id, video_id, import_id, candidate_id,
+            transcript_version_id, language_decision_id,
+            language_decision_version, expected_project_video_version,
+            resulting_project_video_version, previous_transcript_version_id,
+            actor_id, idempotency_key, request_sha256, activated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                 $13, $14, $15)`,
+        [
+          activationId,
+          projectId,
+          videoId,
+          command.importId,
+          command.candidateId,
+          command.transcriptVersionId,
+          command.languageDecisionId,
+          command.expectedLanguageDecisionVersion,
+          command.expectedProjectVideoVersion,
+          resultingProjectVideoVersion,
+          current.active_transcript_version_id,
+          actor.userId,
+          command.idempotencyKey,
+          requestSha256,
+          activatedAt,
+        ],
+      );
+      await this.database.query(
+        `INSERT INTO sync_events
+           (project_id, event_type, entity_id, server_version, payload)
+         VALUES ($1, 'transcript.activated', $2, 1, $3)`,
+        [
+          projectId,
+          command.transcriptVersionId,
+          JSON.stringify({
+            videoId,
+            candidateId: command.candidateId,
+            activationId,
+          }),
+        ],
+      );
+      status = ManualTimedTranscriptActivationStatusSchema.parse({
+        activationId,
+        state: "activated",
+        projectId,
+        catalogVideoId: videoId,
+        importId: command.importId,
+        candidateId: command.candidateId,
+        transcriptVersionId: command.transcriptVersionId,
+        languageDecisionId: command.languageDecisionId,
+        languageDecisionVersion: command.expectedLanguageDecisionVersion,
+        projectVideoVersion: resultingProjectVideoVersion,
+        activatedAt,
+      });
+    });
+    if (!status) {
+      throw new CatalogConflictError(
+        "Corrected transcript activation could not be resolved.",
+      );
+    }
+    return status;
   }
 
   async createClaimedTranscriptUpload(
@@ -5349,6 +9865,31 @@ export class SharedProjectCatalog {
         [claim.jobId],
       );
       const jobPayload = jsonRecord(jobResult.rows[0]?.payload);
+      const parsedJobPayload =
+        TranscriptionJobPayloadSchema.safeParse(jobPayload);
+      if (
+        parsedJobPayload.success &&
+        (parsedJobPayload.data.languageDecision || manifest.languageDecision) &&
+        canonicalJson(parsedJobPayload.data.languageDecision ?? null) !==
+          canonicalJson(manifest.languageDecision ?? null)
+      ) {
+        throw new TranscriptIntegrityError(
+          "Transcript manifest language decision does not match the claimed job.",
+        );
+      }
+      if (
+        parsedJobPayload.success &&
+        parsedJobPayload.data.languageDecision?.status === "confirmed" &&
+        parsedJobPayload.data.languageDecision.resolvedLanguage !== undefined &&
+        !languagesEquivalent(
+          manifest.sourceLanguage,
+          parsedJobPayload.data.languageDecision.resolvedLanguage,
+        )
+      ) {
+        throw new TranscriptIntegrityError(
+          "Transcript source language does not match the confirmed job decision.",
+        );
+      }
       if (
         jobPayload?.translationConsent &&
         !languagesEquivalent(manifest.sourceLanguage, manifest.targetLanguage)
@@ -5538,6 +10079,12 @@ export class SharedProjectCatalog {
           manifest.catalogVideoId,
         ],
       );
+      await this.enqueueProjectVideoKeywordScan(
+        manifest.projectId,
+        manifest.catalogVideoId,
+        manifest.id,
+        this.now().toISOString(),
+      );
       await this.database.query(
         "UPDATE transcript_uploads SET state = 'finalized' WHERE id = $1",
         [request.uploadId],
@@ -5587,17 +10134,38 @@ export class SharedProjectCatalog {
   ): Promise<ActiveTranscriptBundle> {
     await this.authorize(actor, projectId, "read");
     const result = await this.database.query<DbRow>(
-      `SELECT tv.id, tv.manifest_object_key, tv.manifest_object_version_id,
-              tv.manifest_sha256, ta.byte_size
-       FROM project_videos pv
-       JOIN transcript_versions tv ON tv.id = pv.active_transcript_version_id
-       JOIN transcript_artifacts ta
-         ON ta.transcript_version_id = tv.id AND ta.artifact_type = 'manifest'
-       WHERE pv.project_id = $1 AND pv.video_id = $2`,
+      `SELECT active_transcript_version_id
+       FROM project_videos
+       WHERE project_id = $1 AND video_id = $2`,
       [projectId, catalogVideoId],
     );
     const row = result.rows[0];
-    if (!row) throw new CatalogNotFoundError("No active transcript found.");
+    if (!row?.active_transcript_version_id) {
+      throw new CatalogNotFoundError("No active transcript found.");
+    }
+    return this.loadTranscriptBundleByVersion(
+      projectId,
+      catalogVideoId,
+      String(row.active_transcript_version_id),
+    );
+  }
+
+  private async loadTranscriptBundleByVersion(
+    projectId: string,
+    catalogVideoId: string,
+    transcriptVersionId: string,
+  ): Promise<ActiveTranscriptBundle> {
+    const result = await this.database.query<DbRow>(
+      `SELECT tv.id, tv.manifest_object_key, tv.manifest_object_version_id,
+              tv.manifest_sha256, ta.byte_size
+       FROM transcript_versions tv
+       JOIN transcript_artifacts ta
+         ON ta.transcript_version_id = tv.id AND ta.artifact_type = 'manifest'
+       WHERE tv.project_id = $1 AND tv.video_id = $2 AND tv.id = $3`,
+      [projectId, catalogVideoId, transcriptVersionId],
+    );
+    const row = result.rows[0];
+    if (!row) throw new CatalogNotFoundError("Transcript version not found.");
     const manifestObject = {
       type: "manifest" as const,
       objectKey: String(row.manifest_object_key),
@@ -5609,6 +10177,15 @@ export class SharedProjectCatalog {
     const manifest = TranscriptManifestSchema.parse(
       JSON.parse(new TextDecoder().decode(bytes)),
     );
+    if (
+      manifest.id !== transcriptVersionId ||
+      manifest.projectId !== projectId ||
+      manifest.catalogVideoId !== catalogVideoId
+    ) {
+      throw new TranscriptIntegrityError(
+        "Transcript manifest identity does not match its catalog version.",
+      );
+    }
     const descriptors = [manifestObject, ...manifest.artifacts].map(
       (artifact) => {
         if (!artifact.objectVersionId) {
@@ -5630,7 +10207,7 @@ export class SharedProjectCatalog {
       })),
     );
     return ActiveTranscriptBundleSchema.parse({
-      transcriptVersionId: String(row.id),
+      transcriptVersionId,
       manifest,
       manifestObject,
       downloads,
@@ -5654,6 +10231,44 @@ export class SharedProjectCatalog {
     ) {
       throw new TranscriptIntegrityError(
         `Object verification failed for ${descriptor.objectKey}.`,
+      );
+    }
+    return object.bytes;
+  }
+
+  private async verifyObjectBounded(
+    descriptor: {
+      objectKey: string;
+      objectVersionId: string;
+      byteSize: number;
+      sha256: string;
+    },
+    maxBytes: number,
+  ): Promise<Uint8Array> {
+    if (descriptor.byteSize > maxBytes) {
+      throw new TranscriptIntegrityError(
+        "Corrected transcript candidate exceeds its review limit.",
+      );
+    }
+    let object;
+    try {
+      object = await this.store.getBounded(
+        descriptor.objectKey,
+        descriptor.objectVersionId,
+        maxBytes,
+      );
+    } catch {
+      throw new TranscriptIntegrityError(
+        "Corrected transcript candidate object verification failed.",
+      );
+    }
+    if (
+      !object ||
+      object.bytes.byteLength !== descriptor.byteSize ||
+      sha256(object.bytes) !== descriptor.sha256
+    ) {
+      throw new TranscriptIntegrityError(
+        "Corrected transcript candidate object verification failed.",
       );
     }
     return object.bytes;
@@ -5699,6 +10314,867 @@ export class SharedProjectCatalog {
     );
   }
 
+  private async loadManualTimedTranscriptImport(
+    importId: string,
+  ): Promise<DbRow> {
+    const result = await this.database.query<DbRow>(
+      "SELECT * FROM manual_timed_transcript_imports WHERE id = $1",
+      [importId],
+    );
+    if (!result.rows[0]) {
+      throw new CatalogNotFoundError("Timed transcript import not found.");
+    }
+    return result.rows[0];
+  }
+
+  private async loadManualTimedTranscriptActivationReplay(
+    actor: AuthenticatedActor,
+    projectId: string,
+    videoId: string,
+    idempotencyKey: string,
+    requestSha256: string,
+  ): Promise<ManualTimedTranscriptActivationStatus | undefined> {
+    const result = await this.database.query<DbRow>(
+      `SELECT activation.*, pv.active_transcript_version_id
+       FROM manual_timed_transcript_activations activation
+       JOIN project_videos pv
+         ON pv.project_id = activation.project_id
+        AND pv.video_id = activation.video_id
+       WHERE activation.project_id = $1 AND activation.video_id = $2
+         AND activation.actor_id = $3 AND activation.idempotency_key = $4`,
+      [projectId, videoId, actor.userId, idempotencyKey],
+    );
+    const row = result.rows[0];
+    if (!row) return undefined;
+    if (String(row.request_sha256) !== requestSha256) {
+      throw new CatalogIdempotencyConflictError(
+        "That corrected transcript activation key was already used for different input.",
+      );
+    }
+    return ManualTimedTranscriptActivationStatusSchema.parse({
+      activationId: row.id,
+      state:
+        String(row.active_transcript_version_id ?? "") ===
+        String(row.transcript_version_id)
+          ? "activated"
+          : "superseded",
+      projectId: row.project_id,
+      catalogVideoId: row.video_id,
+      importId: row.import_id,
+      candidateId: row.candidate_id,
+      transcriptVersionId: row.transcript_version_id,
+      languageDecisionId: row.language_decision_id,
+      languageDecisionVersion: Number(row.language_decision_version),
+      projectVideoVersion: Number(row.resulting_project_video_version),
+      activatedAt: iso(row.activated_at),
+    });
+  }
+
+  private async loadVerifiedManualTimedTranscriptCandidate(
+    projectId: string,
+    videoId: string,
+    candidateId: string,
+  ): Promise<{
+    row: DbRow;
+    manifest: ReturnType<typeof TranscriptManifestSchema.parse>;
+    original: NormalizedTranscript;
+    english: NormalizedTranscript;
+  }> {
+    const result = await this.database.query<DbRow>(
+      `SELECT candidate.id AS candidate_id, candidate.import_id,
+              candidate.transcript_version_id,
+              candidate.language_decision_id,
+              candidate.language_decision_version,
+              candidate.created_at AS finalized_at,
+              mi.state AS import_state,
+              pv.version AS project_video_version,
+              pv.current_language_decision_id,
+              decision.decision_version AS current_decision_version,
+              decision.status AS current_decision_status,
+              tv.manifest_object_key, tv.manifest_object_version_id,
+              tv.manifest_sha256,
+              manifest_artifact.byte_size AS manifest_byte_size,
+              original_artifact.object_key AS original_object_key,
+              original_artifact.object_version_id AS original_object_version_id,
+              original_artifact.byte_size AS original_byte_size,
+              original_artifact.sha256 AS original_sha256,
+              english_artifact.object_key AS english_object_key,
+              english_artifact.object_version_id AS english_object_version_id,
+              english_artifact.byte_size AS english_byte_size,
+              english_artifact.sha256 AS english_sha256
+       FROM manual_timed_transcript_candidates candidate
+       JOIN manual_timed_transcript_imports mi ON mi.id = candidate.import_id
+       JOIN project_videos pv
+         ON pv.project_id = candidate.project_id AND pv.video_id = candidate.video_id
+       LEFT JOIN project_video_language_decisions decision
+         ON decision.id = pv.current_language_decision_id
+       JOIN transcript_versions tv ON tv.id = candidate.transcript_version_id
+       JOIN transcript_artifacts manifest_artifact
+         ON manifest_artifact.transcript_version_id = tv.id
+        AND manifest_artifact.artifact_type = 'manifest'
+       JOIN transcript_artifacts original_artifact
+         ON original_artifact.transcript_version_id = tv.id
+        AND original_artifact.artifact_type = 'original-normalized'
+       JOIN transcript_artifacts english_artifact
+         ON english_artifact.transcript_version_id = tv.id
+        AND english_artifact.artifact_type = 'english-normalized'
+       WHERE candidate.id = $1 AND candidate.project_id = $2
+         AND candidate.video_id = $3`,
+      [candidateId, projectId, videoId],
+    );
+    const row = result.rows[0];
+    if (!row) {
+      throw new CatalogNotFoundError(
+        "Corrected transcript candidate not found.",
+      );
+    }
+    if (
+      row.import_state !== "finalized" ||
+      String(row.current_language_decision_id ?? "") !==
+        String(row.language_decision_id) ||
+      Number(row.current_decision_version ?? 0) !==
+        Number(row.language_decision_version) ||
+      row.current_decision_status !== "confirmed"
+    ) {
+      throw new CatalogConflictError(
+        "The corrected transcript candidate no longer matches the confirmed language decision.",
+      );
+    }
+    const manifestDescriptor = FinalizedObjectSchema.parse({
+      type: "manifest",
+      objectKey: row.manifest_object_key,
+      objectVersionId: row.manifest_object_version_id,
+      byteSize: Number(row.manifest_byte_size),
+      sha256: row.manifest_sha256,
+    });
+    const originalDescriptor = FinalizedObjectSchema.parse({
+      type: "original-normalized",
+      objectKey: row.original_object_key,
+      objectVersionId: row.original_object_version_id,
+      byteSize: Number(row.original_byte_size),
+      sha256: row.original_sha256,
+    });
+    const englishDescriptor = FinalizedObjectSchema.parse({
+      type: "english-normalized",
+      objectKey: row.english_object_key,
+      objectVersionId: row.english_object_version_id,
+      byteSize: Number(row.english_byte_size),
+      sha256: row.english_sha256,
+    });
+    const [manifestBytes, originalBytes, englishBytes] = await Promise.all([
+      this.verifyObjectBounded(manifestDescriptor, 2 * 1024 * 1024),
+      this.verifyObjectBounded(originalDescriptor, 20 * 1024 * 1024),
+      this.verifyObjectBounded(englishDescriptor, 20 * 1024 * 1024),
+    ]);
+    let manifest: ReturnType<typeof TranscriptManifestSchema.parse>;
+    let original: NormalizedTranscript;
+    let english: NormalizedTranscript;
+    try {
+      manifest = TranscriptManifestSchema.parse(
+        JSON.parse(
+          new TextDecoder("utf-8", { fatal: true }).decode(manifestBytes),
+        ),
+      );
+      original = NormalizedTranscriptSchema.parse(
+        JSON.parse(
+          new TextDecoder("utf-8", { fatal: true }).decode(originalBytes),
+        ),
+      );
+      english = NormalizedTranscriptSchema.parse(
+        JSON.parse(
+          new TextDecoder("utf-8", { fatal: true }).decode(englishBytes),
+        ),
+      );
+    } catch {
+      throw new TranscriptIntegrityError(
+        "Corrected transcript candidate content is invalid.",
+      );
+    }
+    const manifestOriginal = manifest.artifacts.find(
+      (artifact) => artifact.type === "original-normalized",
+    );
+    const manifestEnglish = manifest.artifacts.find(
+      (artifact) => artifact.type === "english-normalized",
+    );
+    if (
+      manifest.id !== String(row.transcript_version_id) ||
+      manifest.projectId !== projectId ||
+      manifest.catalogVideoId !== videoId ||
+      manifest.manualImportId !== String(row.import_id) ||
+      manifest.languageDecision?.decisionId !==
+        String(row.language_decision_id) ||
+      manifest.languageDecision?.decisionVersion !==
+        Number(row.language_decision_version) ||
+      manifest.languageDecision?.status !== "confirmed" ||
+      !manifestOriginal ||
+      !manifestEnglish ||
+      !sameFinalizedObject(originalDescriptor, manifestOriginal) ||
+      !sameFinalizedObject(englishDescriptor, manifestEnglish) ||
+      original.track.kind !== "original" ||
+      original.track.source !== "manual-import" ||
+      original.track.timingPrecision !== "cue" ||
+      english.track.kind !== "english" ||
+      english.track.source !== "manual-import" ||
+      english.track.language !== "en" ||
+      english.track.timingPrecision !== "cue" ||
+      english.track.sourceTrackId !== original.track.id ||
+      original.segments.some(
+        (segment, index) =>
+          segment.trackId !== original.track.id || segment.ordinal !== index,
+      ) ||
+      english.segments.some(
+        (segment, index) =>
+          segment.trackId !== english.track.id || segment.ordinal !== index,
+      )
+    ) {
+      throw new TranscriptIntegrityError(
+        "Corrected transcript candidate identity is inconsistent.",
+      );
+    }
+    return { row, manifest, original, english };
+  }
+
+  private async loadManualTimedTranscriptImportTargets(
+    importId: string,
+  ): Promise<Map<string, string>> {
+    const result = await this.database.query<DbRow>(
+      `SELECT role, object_key FROM manual_timed_transcript_import_targets
+       WHERE import_id = $1`,
+      [importId],
+    );
+    const targets = new Map(
+      result.rows.map((row) => [String(row.role), String(row.object_key)]),
+    );
+    if (
+      !targets.has("original") ||
+      !targets.has("english") ||
+      targets.size !== 2
+    ) {
+      throw new ManualTimedTranscriptImportError(
+        "manual_import_target_invalid",
+      );
+    }
+    return targets;
+  }
+
+  private async loadManualImportSourceLanguage(
+    importRow: DbRow,
+  ): Promise<string> {
+    const result = await this.database.query<DbRow>(
+      `SELECT resolved_language, status, decision_version
+       FROM project_video_language_decisions
+       WHERE id = $1 AND project_id = $2 AND video_id = $3`,
+      [
+        importRow.language_decision_id,
+        importRow.project_id,
+        importRow.video_id,
+      ],
+    );
+    const decision = result.rows[0];
+    if (
+      !decision ||
+      decision.status !== "confirmed" ||
+      Number(decision.decision_version) !==
+        Number(importRow.language_decision_version) ||
+      !isImportableSourceLanguage(decision.resolved_language)
+    ) {
+      throw new CatalogConflictError(
+        "The confirmed source-language decision is no longer valid for this import.",
+      );
+    }
+    return String(decision.resolved_language);
+  }
+
+  private async loadManualImportDecisionBasis(importRow: DbRow) {
+    const result = await this.database.query<DbRow>(
+      `SELECT basis, status, resolved_language, decision_version
+       FROM project_video_language_decisions
+       WHERE id = $1 AND project_id = $2 AND video_id = $3`,
+      [
+        importRow.language_decision_id,
+        importRow.project_id,
+        importRow.video_id,
+      ],
+    );
+    const decision = result.rows[0];
+    if (
+      !decision ||
+      decision.status !== "confirmed" ||
+      Number(decision.decision_version) !==
+        Number(importRow.language_decision_version) ||
+      !isImportableSourceLanguage(decision.resolved_language)
+    ) {
+      throw new CatalogConflictError(
+        "The confirmed source-language decision is no longer valid for this import.",
+      );
+    }
+    return decision.basis;
+  }
+
+  private async issueManualTimedTranscriptImportGrant(
+    importRow: DbRow,
+    sourceLanguage: string,
+  ): Promise<ManualTimedTranscriptImportUploadGrant> {
+    if (String(importRow.state) !== "staged") {
+      throw new CatalogConflictError(
+        "Timed transcript import is already finalized.",
+      );
+    }
+    if (new Date(iso(importRow.expires_at)).getTime() <= this.now().getTime()) {
+      throw new CatalogConflictError(
+        "Timed transcript import grant has expired.",
+      );
+    }
+    const targets = await this.loadManualTimedTranscriptImportTargets(
+      String(importRow.id),
+    );
+    return ManualTimedTranscriptImportUploadGrantSchema.parse({
+      importId: importRow.id,
+      projectId: importRow.project_id,
+      catalogVideoId: importRow.video_id,
+      batchItemId: importRow.batch_item_id,
+      sourceLanguage,
+      languageDecisionId: importRow.language_decision_id,
+      languageDecisionVersion: Number(importRow.language_decision_version),
+      expiresAt: iso(importRow.expires_at),
+      targets: await Promise.all(
+        (["original", "english"] as const).map(async (role) => ({
+          role,
+          format:
+            role === "original"
+              ? importRow.original_format
+              : importRow.english_format,
+          objectKey: targets.get(role)!,
+          uploadUrl: await this.uploadUrlIssuer.issuePutUrl({
+            objectKey: targets.get(role)!,
+            expiresInSeconds: 15 * 60,
+          }),
+        })),
+      ),
+    });
+  }
+
+  private async loadManualTimedTranscriptImportObject(
+    objectKey: string | undefined,
+    receipt: { objectVersionId: string; byteSize: number; sha256: string },
+    expectedByteSize: unknown,
+    expectedSha256: unknown,
+  ) {
+    if (
+      !objectKey ||
+      receipt.byteSize !== Number(expectedByteSize) ||
+      receipt.sha256 !== String(expectedSha256)
+    ) {
+      throw new ManualTimedTranscriptImportError(
+        "manual_import_object_invalid",
+      );
+    }
+    let object;
+    try {
+      object = await this.store.getBounded(
+        objectKey,
+        receipt.objectVersionId,
+        receipt.byteSize,
+      );
+    } catch {
+      throw new ManualTimedTranscriptImportError(
+        "manual_import_object_invalid",
+      );
+    }
+    if (
+      !object ||
+      object.versionId !== receipt.objectVersionId ||
+      object.bytes.byteLength !== receipt.byteSize ||
+      sha256(object.bytes) !== receipt.sha256
+    ) {
+      throw new ManualTimedTranscriptImportError(
+        "manual_import_object_invalid",
+      );
+    }
+    return object;
+  }
+
+  private manualTimedImportStoredReceipt(
+    importRow: DbRow,
+    role: "original" | "english",
+  ) {
+    const objectVersionId = String(
+      role === "original"
+        ? (importRow.original_object_version_id ?? "")
+        : (importRow.english_object_version_id ?? ""),
+    );
+    if (!objectVersionId) {
+      throw new ManualTimedTranscriptImportError(
+        "manual_import_object_invalid",
+      );
+    }
+    return {
+      objectVersionId,
+      byteSize: Number(
+        role === "original"
+          ? importRow.original_byte_size
+          : importRow.english_byte_size,
+      ),
+      sha256: String(
+        role === "original"
+          ? importRow.original_sha256
+          : importRow.english_sha256,
+      ),
+    };
+  }
+
+  private async expireManualTimedTranscriptImport(importRow: DbRow) {
+    const expired = await this.database.query<DbRow>(
+      `UPDATE manual_timed_transcript_imports
+       SET state = 'expired', finalization_token = NULL,
+           finalization_started_at = NULL, version = version + 1
+       WHERE id = $1 AND state IN ('staged', 'finalizing')
+         AND version = $2 AND expires_at <= $3
+       RETURNING original_object_version_id, english_object_version_id`,
+      [importRow.id, importRow.version, this.now().toISOString()],
+    );
+    const row = expired.rows[0];
+    if (!row) return;
+    const targets = await this.loadManualTimedTranscriptImportTargets(
+      String(importRow.id),
+    );
+    await Promise.all(
+      (["original", "english"] as const).map(async (role) => {
+        const versionId =
+          role === "original"
+            ? row.original_object_version_id
+            : row.english_object_version_id;
+        const objectKey = targets.get(role);
+        if (objectKey && versionId) {
+          await this.store.deleteVersion(objectKey, String(versionId));
+        }
+      }),
+    );
+  }
+
+  private async loadYoutubeVideoId(catalogVideoId: string): Promise<string> {
+    const result = await this.database.query<DbRow>(
+      "SELECT youtube_video_id FROM videos WHERE id = $1",
+      [catalogVideoId],
+    );
+    if (!result.rows[0])
+      throw new CatalogNotFoundError("Project video not found.");
+    return String(result.rows[0].youtube_video_id);
+  }
+
+  private async storeManualTimedTranscriptCandidateArtifacts(
+    prefix: string,
+    normalized: Awaited<ReturnType<typeof normalizeManualTimedBilingualImport>>,
+    onStored: (artifact: {
+      objectKey: string;
+      objectVersionId: string;
+    }) => void,
+  ) {
+    const values = [
+      {
+        type: "original-normalized" as const,
+        suffix: "original.normalized.json",
+        bytes: new TextEncoder().encode(JSON.stringify(normalized.original)),
+        contentType: "application/json",
+      },
+      {
+        type: "english-normalized" as const,
+        suffix: "english.normalized.json",
+        bytes: new TextEncoder().encode(JSON.stringify(normalized.english)),
+        contentType: "application/json",
+      },
+      {
+        type: "original-srt" as const,
+        suffix: "original.srt",
+        bytes: new TextEncoder().encode(normalized.originalSrt),
+        contentType: "application/x-subrip",
+      },
+      {
+        type: "english-srt" as const,
+        suffix: "english.srt",
+        bytes: new TextEncoder().encode(normalized.englishSrt),
+        contentType: "application/x-subrip",
+      },
+    ];
+    const artifacts: Array<{
+      type: (typeof values)[number]["type"];
+      objectKey: string;
+      objectVersionId: string;
+      byteSize: number;
+      sha256: string;
+    }> = [];
+    for (const value of values) {
+      const object = await this.store.put({
+        key: `${prefix}/${value.suffix}`,
+        bytes: value.bytes,
+        contentType: value.contentType,
+        sha256: sha256(value.bytes),
+      });
+      const artifact = {
+        type: value.type,
+        objectKey: object.key,
+        objectVersionId: object.versionId,
+        byteSize: object.bytes.byteLength,
+        sha256: object.sha256,
+      };
+      onStored(artifact);
+      artifacts.push(artifact);
+    }
+    return artifacts;
+  }
+
+  private async loadManualTimedTranscriptImportStatus(
+    importId: string,
+  ): Promise<ManualTimedTranscriptImportStatus> {
+    const importRow = await this.loadManualTimedTranscriptImport(importId);
+    if (
+      ["staged", "finalizing"].includes(String(importRow.state)) &&
+      new Date(iso(importRow.expires_at)).getTime() <= this.now().getTime()
+    ) {
+      await this.expireManualTimedTranscriptImport(importRow);
+    }
+    const result = await this.database.query<DbRow>(
+      `SELECT mi.*, d.resolved_language,
+              candidate.id AS candidate_id,
+              candidate.transcript_version_id,
+              candidate.created_at AS candidate_created_at
+       FROM manual_timed_transcript_imports mi
+       JOIN project_video_language_decisions d
+         ON d.id = mi.language_decision_id
+        AND d.project_id = mi.project_id AND d.video_id = mi.video_id
+       LEFT JOIN manual_timed_transcript_candidates candidate
+         ON candidate.import_id = mi.id
+       WHERE mi.id = $1`,
+      [importId],
+    );
+    const row = result.rows[0];
+    if (!row)
+      throw new CatalogNotFoundError("Timed transcript import not found.");
+    return ManualTimedTranscriptImportStatusSchema.parse({
+      importId: row.id,
+      projectId: row.project_id,
+      catalogVideoId: row.video_id,
+      batchItemId: row.batch_item_id,
+      state: row.state,
+      version: Number(row.version),
+      sourceLanguage: row.resolved_language,
+      targetLanguage: "en",
+      languageDecisionId: row.language_decision_id,
+      languageDecisionVersion: Number(row.language_decision_version),
+      createdAt: iso(row.created_at),
+      expiresAt: iso(row.expires_at),
+      ...(row.candidate_id
+        ? {
+            candidate: {
+              candidateId: row.candidate_id,
+              transcriptVersionId: row.transcript_version_id,
+              timingPrecision: "cue",
+              finalizedAt: iso(row.candidate_created_at),
+            },
+          }
+        : {}),
+    });
+  }
+
+  private async loadProjectVideoLanguageGate(
+    projectId: string,
+    videoId: string,
+  ): Promise<LanguageGate> {
+    const result = await this.database.query<DbRow>(
+      `SELECT pv.language_gate_status, v.source_language AS creator_reported_language,
+              e.id AS evidence_id, e.project_id AS evidence_project_id,
+              e.video_id AS evidence_video_id, e.source AS evidence_source,
+              e.provider AS evidence_provider,
+              e.reported_language AS evidence_reported_language,
+              e.track_fingerprint AS evidence_track_fingerprint,
+              e.caption_kind AS evidence_caption_kind, e.job_id AS evidence_job_id,
+              e.attempt AS evidence_attempt, e.created_at AS evidence_created_at,
+              d.id AS decision_id, d.project_id AS decision_project_id,
+              d.video_id AS decision_video_id,
+              d.decision_version AS decision_version, d.status AS decision_status,
+              d.basis AS decision_basis, d.resolved_language AS decision_resolved_language,
+              d.evidence_id AS decision_evidence_id, d.actor_id AS decision_actor_id,
+              d.created_at AS decision_created_at
+       FROM project_videos pv
+       JOIN videos v ON v.id = pv.video_id
+       LEFT JOIN project_video_language_evidence e
+         ON e.id = pv.current_language_evidence_id
+       LEFT JOIN project_video_language_decisions d
+         ON d.id = pv.current_language_decision_id
+       WHERE pv.project_id = $1 AND pv.video_id = $2`,
+      [projectId, videoId],
+    );
+    const row = result.rows[0];
+    if (!row) throw new CatalogNotFoundError("Project video not found.");
+    const status = String(row.language_gate_status ?? "unverified");
+    const creatorReportedLanguage = LanguageTagSchema.safeParse(
+      row.creator_reported_language,
+    );
+    const evidence = row.evidence_id
+      ? mapProviderLanguageEvidence({
+          id: row.evidence_id,
+          project_id: row.evidence_project_id,
+          video_id: row.evidence_video_id,
+          source: row.evidence_source,
+          provider: row.evidence_provider,
+          reported_language: row.evidence_reported_language,
+          track_fingerprint: row.evidence_track_fingerprint,
+          caption_kind: row.evidence_caption_kind,
+          job_id: row.evidence_job_id,
+          attempt: row.evidence_attempt,
+          created_at: row.evidence_created_at,
+        })
+      : undefined;
+    const decision = row.decision_id
+      ? mapProjectVideoLanguageDecision({
+          id: row.decision_id,
+          project_id: row.decision_project_id,
+          video_id: row.decision_video_id,
+          decision_version: row.decision_version,
+          status: row.decision_status,
+          basis: row.decision_basis,
+          resolved_language: row.decision_resolved_language,
+          evidence_id: row.decision_evidence_id,
+          actor_id: row.decision_actor_id,
+          created_at: row.decision_created_at,
+        })
+      : undefined;
+    const hasKnownLanguage =
+      creatorReportedLanguage.success ||
+      evidence?.reportedLanguage !== undefined ||
+      (decision?.status === "confirmed" &&
+        decision.resolvedLanguage !== undefined);
+    const state =
+      status === "conflict" || !hasKnownLanguage
+        ? "needs_language_confirmation"
+        : "ready";
+    return LanguageGateSchema.parse({
+      state,
+      status,
+      ...(creatorReportedLanguage.success
+        ? { creatorReportedLanguage: creatorReportedLanguage.data }
+        : {}),
+      ...(evidence ? { providerEvidence: evidence } : {}),
+      ...(decision ? { decision } : {}),
+      remediationReason:
+        state === "ready"
+          ? "none"
+          : status === "conflict"
+            ? "resolve_conflict"
+            : "confirm_language",
+    });
+  }
+
+  private async ensureCreatorMetadataLanguageDecision(
+    actor: AuthenticatedActor,
+    projectId: string,
+    videoId: string,
+    language: string,
+    now: string,
+  ): Promise<void> {
+    const resolvedLanguage = LanguageTagSchema.parse(language);
+    const projectVideo = await this.database.query<DbRow>(
+      `SELECT current_language_decision_id
+       FROM project_videos
+       WHERE project_id = $1 AND video_id = $2
+       FOR UPDATE`,
+      [projectId, videoId],
+    );
+    if (!projectVideo.rows[0]) {
+      throw new CatalogNotFoundError("Project video not found.");
+    }
+    const currentDecisionId = projectVideo.rows[0].current_language_decision_id;
+    if (currentDecisionId) {
+      const current = await this.database.query<DbRow>(
+        "SELECT * FROM project_video_language_decisions WHERE id = $1",
+        [currentDecisionId],
+      );
+      const decision = current.rows[0]
+        ? mapProjectVideoLanguageDecision(current.rows[0])
+        : undefined;
+      if (
+        decision?.status === "confirmed" ||
+        (decision?.status === "unverified" &&
+          decision.basis === "creator_metadata" &&
+          decision.resolvedLanguage !== undefined &&
+          languagesEquivalent(decision.resolvedLanguage, resolvedLanguage))
+      ) {
+        return;
+      }
+    }
+    const versionResult = await this.database.query<DbRow>(
+      `SELECT COALESCE(MAX(decision_version), 0) AS decision_version
+       FROM project_video_language_decisions
+       WHERE project_id = $1 AND video_id = $2`,
+      [projectId, videoId],
+    );
+    const decisionVersion =
+      Number(versionResult.rows[0]?.decision_version ?? 0) + 1;
+    const id = randomUUID();
+    const idempotencyKey = `creator-metadata:${resolvedLanguage}:v${decisionVersion}`;
+    const requestSha256 = createHash("sha256")
+      .update(
+        canonicalJson({
+          projectId,
+          videoId,
+          decisionVersion,
+          status: "unverified",
+          basis: "creator_metadata",
+          resolvedLanguage,
+        }),
+      )
+      .digest("hex");
+    await this.database.query(
+      `INSERT INTO project_video_language_decisions
+         (id, project_id, video_id, decision_version, status, basis,
+          resolved_language, actor_id, idempotency_key, request_sha256,
+          created_at)
+       VALUES ($1, $2, $3, $4, 'unverified', 'creator_metadata', $5, $6,
+               $7, $8, $9)`,
+      [
+        id,
+        projectId,
+        videoId,
+        decisionVersion,
+        resolvedLanguage,
+        actor.userId,
+        idempotencyKey,
+        requestSha256,
+        now,
+      ],
+    );
+    await this.database.query(
+      `UPDATE project_videos
+       SET current_language_decision_id = $1, language_gate_status = 'unverified',
+           version = version + 1, updated_at = $2
+       WHERE project_id = $3 AND video_id = $4`,
+      [id, now, projectId, videoId],
+    );
+  }
+
+  private async requeueLanguageConfirmedBatchItem(input: {
+    actor: AuthenticatedActor;
+    projectId: string;
+    videoId: string;
+    batchItemId: string;
+    expectedBatchItemVersion: number;
+    decision: LanguageDecisionSnapshot;
+    now: string;
+  }): Promise<void> {
+    const result = await this.database.query<DbRow>(
+      `SELECT bi.*, b.target_language, b.transcription_profile, b.source_policy,
+              b.execution_location, b.priority, b.translation_provider,
+              b.translation_disclosure_version
+       FROM transcription_batch_items bi
+       JOIN transcription_batches b ON b.id = bi.batch_id
+       WHERE bi.id = $1 AND b.project_id = $2 FOR UPDATE OF bi`,
+      [input.batchItemId, input.projectId],
+    );
+    const item = result.rows[0];
+    if (!item || String(item.catalog_video_id) !== input.videoId) {
+      throw new CatalogNotFoundError(
+        "Language-confirmation batch item not found.",
+      );
+    }
+    if (Number(item.version) !== input.expectedBatchItemVersion) {
+      throw new CatalogConflictError(
+        "The language-confirmation item changed; reload it before retrying.",
+      );
+    }
+    if (item.state !== "needs_language_confirmation") {
+      throw new CatalogConflictError(
+        "Only language-confirmation items can be explicitly requeued.",
+      );
+    }
+    const creatorReportedLanguage = LanguageTagSchema.safeParse(
+      item.source_language,
+    );
+    const payload = TranscriptionJobPayloadSchema.parse({
+      batchId: item.batch_id,
+      catalogVideoId: item.catalog_video_id,
+      youtubeVideoId: item.youtube_video_id,
+      targetLanguage: item.target_language,
+      transcriptionProfile: item.transcription_profile,
+      sourcePolicy: item.source_policy,
+      executionLocation: item.execution_location,
+      priority: item.priority,
+      ...(item.translation_provider
+        ? {
+            translationConsent: {
+              provider: item.translation_provider,
+              disclosureVersion: Number(item.translation_disclosure_version),
+              transcriptTextTransferAccepted: true,
+            },
+          }
+        : {}),
+      ...(creatorReportedLanguage.success
+        ? { creatorReportedLanguage: creatorReportedLanguage.data }
+        : {}),
+      languageDecision: input.decision,
+    });
+    const idempotencyKey = transcriptionJobIdempotencyKey(
+      input.projectId,
+      input.videoId,
+      payload,
+    );
+    const candidateJobId = randomUUID();
+    const inserted = await this.database.query<DbRow>(
+      `INSERT INTO jobs
+         (id, project_id, kind, state, idempotency_key, attempt, payload,
+          created_at, updated_at)
+       VALUES ($1, $2, 'transcription', 'queued', $3, 0, $4, $5, $5)
+       ON CONFLICT (idempotency_key) DO NOTHING RETURNING id`,
+      [
+        candidateJobId,
+        input.projectId,
+        idempotencyKey,
+        JSON.stringify(payload),
+        input.now,
+      ],
+    );
+    const jobId = inserted.rows[0]?.id
+      ? String(inserted.rows[0].id)
+      : String(
+          (
+            await this.database.query<DbRow>(
+              "SELECT id FROM jobs WHERE idempotency_key = $1",
+              [idempotencyKey],
+            )
+          ).rows[0]?.id ?? "",
+        );
+    if (!jobId) {
+      throw new CatalogConflictError(
+        "The confirmed transcription job could not be resolved.",
+      );
+    }
+    const gate = LanguageGateSchema.parse({
+      state: "ready",
+      status: "confirmed",
+      ...(creatorReportedLanguage.success
+        ? { creatorReportedLanguage: creatorReportedLanguage.data }
+        : {}),
+      remediationReason: "none",
+    });
+    await this.database.query(
+      `UPDATE transcription_batch_items
+       SET state = 'queued', job_id = $1, idempotency_key = $2,
+           language_gate = $3::jsonb, language_decision_id = $4,
+           language_decision_video_id = $5,
+           error_code = NULL, error_message = NULL, error_retryable = NULL,
+           version = version + 1, updated_at = $6
+       WHERE id = $7`,
+      [
+        jobId,
+        idempotencyKey,
+        JSON.stringify(gate),
+        input.decision.decisionId,
+        input.videoId,
+        input.now,
+        input.batchItemId,
+      ],
+    );
+  }
+
   private async requireProjectVideo(projectId: string, videoId: string) {
     const result = await this.database.query(
       "SELECT 1 FROM project_videos WHERE project_id = $1 AND video_id = $2",
@@ -5708,17 +11184,771 @@ export class SharedProjectCatalog {
       throw new CatalogNotFoundError("Project video not found.");
   }
 
-  private async upsertProjectVideo(
+  private async createProjectVideoActivity(
     projectId: string,
+    videoId: string,
+    actorId: string,
+    eventType:
+      | "review_completed"
+      | "review_reopened"
+      | "video_dismissed"
+      | "video_restored"
+      | "keyword_scan_completed",
+    sourceKey: string,
+    reason: string | undefined,
+    additionalRecipientIds: string[],
+    createdAt: string,
+  ): Promise<void> {
+    const eventId = randomUUID();
+    const inserted = await this.database.query<DbRow>(
+      `INSERT INTO project_video_activity_events
+         (id, project_id, video_id, event_type, actor_id, source_key, reason,
+          created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       ON CONFLICT (project_id, event_type, source_key) DO NOTHING
+       RETURNING id`,
+      [
+        eventId,
+        projectId,
+        videoId,
+        eventType,
+        actorId,
+        sourceKey,
+        reason ?? null,
+        createdAt,
+      ],
+    );
+    if (!inserted.rows[0]) return;
+    await this.database.query(
+      `INSERT INTO project_video_activity_receipts
+         (event_id, user_id, state, version, created_at, updated_at)
+       SELECT $1, recipients.user_id, 'unread', 1, $2, $2
+       FROM (
+         SELECT flag.user_id
+         FROM project_video_flags flag
+         JOIN project_members member
+           ON member.project_id = flag.project_id
+          AND member.user_id = flag.user_id
+         WHERE flag.project_id = $3 AND flag.video_id = $4 AND flag.active
+         UNION
+         SELECT member.user_id
+         FROM project_members member
+         WHERE member.project_id = $3
+           AND member.user_id = ANY($5::uuid[])
+       ) recipients
+       WHERE recipients.user_id <> $6
+       ON CONFLICT (event_id, user_id) DO NOTHING`,
+      [eventId, createdAt, projectId, videoId, additionalRecipientIds, actorId],
+    );
+  }
+
+  private async loadCurrentProjectVideoReviewCycle(
+    projectId: string,
+    videoId: string,
+    lock = false,
+  ): Promise<DbRow> {
+    const result = await this.database.query<DbRow>(
+      `SELECT c.*,
+              opened.handle AS opened_handle,
+              opened.display_name AS opened_display_name,
+              completed.handle AS completed_handle,
+              completed.display_name AS completed_display_name
+       FROM project_video_review_cycles c
+       LEFT JOIN project_members opened_member
+         ON opened_member.project_id = c.project_id
+        AND opened_member.user_id = c.opened_by
+       LEFT JOIN users opened ON opened.id = opened_member.user_id
+       LEFT JOIN project_members completed_member
+         ON completed_member.project_id = c.project_id
+        AND completed_member.user_id = c.completed_by
+       LEFT JOIN users completed ON completed.id = completed_member.user_id
+       WHERE c.project_id = $1 AND c.video_id = $2
+       ORDER BY c.cycle_number DESC
+       LIMIT 1${lock ? " FOR UPDATE OF c" : ""}`,
+      [projectId, videoId],
+    );
+    if (!result.rows[0]) {
+      throw new CatalogConflictError(
+        "The project video has no review cycle evidence.",
+      );
+    }
+    return result.rows[0];
+  }
+
+  private async loadProjectKeywordCatalog(
+    projectId: string,
+  ): Promise<ProjectKeywordCatalog> {
+    const project = await this.database.query<DbRow>(
+      "SELECT keyword_set_version FROM projects WHERE id = $1",
+      [projectId],
+    );
+    if (!project.rows[0]) throw new CatalogNotFoundError("Project not found.");
+    const keywords = await this.database.query<DbRow>(
+      `SELECT k.*, creator.handle AS creator_handle,
+              creator.display_name AS creator_display_name
+       FROM project_keywords k
+       LEFT JOIN project_members creator_member
+         ON creator_member.project_id = k.project_id
+        AND creator_member.user_id = k.created_by
+       LEFT JOIN users creator ON creator.id = creator_member.user_id
+       WHERE k.project_id = $1
+       ORDER BY k.normalized_label, k.id
+       LIMIT 200`,
+      [projectId],
+    );
+    const aliases = await this.database.query<DbRow>(
+      `SELECT a.*, creator.handle AS creator_handle,
+              creator.display_name AS creator_display_name
+       FROM project_keyword_aliases a
+       LEFT JOIN project_members creator_member
+         ON creator_member.project_id = a.project_id
+        AND creator_member.user_id = a.created_by
+       LEFT JOIN users creator ON creator.id = creator_member.user_id
+       WHERE a.project_id = $1
+       ORDER BY a.keyword_id, a.language, a.normalized_phrase, a.id
+       LIMIT 20000`,
+      [projectId],
+    );
+    const suggestions = await this.database.query<DbRow>(
+      `SELECT s.*, proposer.handle AS proposer_handle,
+              proposer.display_name AS proposer_display_name,
+              reviewer.handle AS reviewer_handle,
+              reviewer.display_name AS reviewer_display_name
+       FROM project_keyword_suggestions s
+       LEFT JOIN project_members proposer_member
+         ON proposer_member.project_id = s.project_id
+        AND proposer_member.user_id = s.proposed_by
+       LEFT JOIN users proposer ON proposer.id = proposer_member.user_id
+       LEFT JOIN project_members reviewer_member
+         ON reviewer_member.project_id = s.project_id
+        AND reviewer_member.user_id = s.reviewed_by
+       LEFT JOIN users reviewer ON reviewer.id = reviewer_member.user_id
+       WHERE s.project_id = $1
+       ORDER BY CASE s.state WHEN 'pending' THEN 0 ELSE 1 END,
+                s.created_at DESC, s.id DESC
+       LIMIT 200`,
+      [projectId],
+    );
+    const actor = (userId: unknown, handle: unknown, displayName: unknown) => ({
+      userId: String(userId),
+      handle: handle === null ? "former_member" : String(handle),
+      displayName:
+        displayName === null ? "Former project member" : String(displayName),
+    });
+    const mappedAliases = aliases.rows.map((row) => ({
+      id: String(row.id),
+      projectId: String(row.project_id),
+      keywordId: String(row.keyword_id),
+      language: String(row.language),
+      phrase: String(row.phrase),
+      normalizedPhrase: String(row.normalized_phrase),
+      enabled: Boolean(row.enabled),
+      version: Number(row.version),
+      createdBy: actor(
+        row.created_by,
+        row.creator_handle,
+        row.creator_display_name,
+      ),
+      createdAt: iso(row.created_at),
+      updatedAt: iso(row.updated_at),
+    }));
+    return ProjectKeywordCatalogSchema.parse({
+      projectId,
+      keywordSetVersion: Number(project.rows[0].keyword_set_version),
+      keywords: keywords.rows.map((row) => ({
+        id: String(row.id),
+        projectId: String(row.project_id),
+        label: String(row.label),
+        ...(row.description === null
+          ? {}
+          : { description: String(row.description) }),
+        enabled: Boolean(row.enabled),
+        version: Number(row.version),
+        createdBy: actor(
+          row.created_by,
+          row.creator_handle,
+          row.creator_display_name,
+        ),
+        createdAt: iso(row.created_at),
+        updatedAt: iso(row.updated_at),
+        aliases: mappedAliases.filter(
+          (entry) => entry.keywordId === String(row.id),
+        ),
+      })),
+      suggestions: suggestions.rows.map((row) => ({
+        id: String(row.id),
+        projectId: String(row.project_id),
+        ...(row.keyword_id === null
+          ? {}
+          : { keywordId: String(row.keyword_id) }),
+        ...(row.proposed_label === null
+          ? {}
+          : { proposedLabel: String(row.proposed_label) }),
+        ...(row.proposed_description === null
+          ? {}
+          : { proposedDescription: String(row.proposed_description) }),
+        language: String(row.language),
+        phrase: String(row.phrase),
+        normalizedPhrase: String(row.normalized_phrase),
+        ...(row.rationale === null ? {} : { rationale: String(row.rationale) }),
+        state: String(row.state),
+        version: Number(row.version),
+        proposedBy: actor(
+          row.proposed_by,
+          row.proposer_handle,
+          row.proposer_display_name,
+        ),
+        ...(row.reviewed_by === null
+          ? {}
+          : {
+              reviewedBy: actor(
+                row.reviewed_by,
+                row.reviewer_handle,
+                row.reviewer_display_name,
+              ),
+              reviewedAt: iso(row.reviewed_at),
+            }),
+        ...(row.review_reason === null
+          ? {}
+          : { reviewReason: String(row.review_reason) }),
+        createdAt: iso(row.created_at),
+        updatedAt: iso(row.updated_at),
+      })),
+    });
+  }
+
+  private async loadProjectKeywordCommandReplay(
+    projectId: string,
+    actorId: string,
+    idempotencyKey: string,
+    requestSha256: string,
+  ): Promise<Record<string, unknown> | undefined> {
+    const replay = await this.database.query<DbRow>(
+      `SELECT request_sha256, response_json FROM project_keyword_commands
+       WHERE project_id = $1 AND actor_id = $2 AND idempotency_key = $3`,
+      [projectId, actorId, idempotencyKey],
+    );
+    if (!replay.rows[0]) return undefined;
+    if (String(replay.rows[0].request_sha256) !== requestSha256) {
+      throw new CatalogIdempotencyConflictError(
+        "This project-keyword command key was already used for another request.",
+      );
+    }
+    return jsonRecord(replay.rows[0].response_json);
+  }
+
+  private async recordProjectKeywordCommand(
+    projectId: string,
+    actorId: string,
+    commandKind: "suggest" | "review",
+    idempotencyKey: string,
+    requestSha256: string,
+    response: unknown,
+    createdAt: string,
+  ): Promise<void> {
+    await this.database.query(
+      `INSERT INTO project_keyword_commands
+         (id, project_id, actor_id, command_kind, idempotency_key,
+          request_sha256, response_json, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+      [
+        randomUUID(),
+        projectId,
+        actorId,
+        commandKind,
+        idempotencyKey,
+        requestSha256,
+        JSON.stringify(response),
+        createdAt,
+      ],
+    );
+  }
+
+  private async loadProjectLocalProcessingStatus(
+    projectId: string,
+  ): Promise<ProjectLocalProcessingStatus> {
+    const project = await this.database.query<DbRow>(
+      `SELECT p.local_processing_state, p.local_processing_version,
+              p.local_processing_updated_by, p.local_processing_updated_at,
+              updater.handle AS updater_handle,
+              updater.display_name AS updater_display_name
+       FROM projects p
+       LEFT JOIN project_members updater_member
+         ON updater_member.project_id = p.id
+        AND updater_member.user_id = p.local_processing_updated_by
+       LEFT JOIN users updater ON updater.id = updater_member.user_id
+       WHERE p.id = $1`,
+      [projectId],
+    );
+    const row = project.rows[0];
+    if (!row) throw new CatalogNotFoundError("Project not found.");
+    const jobs = await this.database.query<DbRow>(
+      `SELECT j.id, j.state, max(v.duration_ms)::bigint AS duration_ms
+       FROM jobs j
+       JOIN transcription_batch_items bi ON bi.job_id = j.id
+       JOIN transcription_batches b ON b.id = bi.batch_id
+       JOIN videos v ON v.id = bi.catalog_video_id
+       WHERE b.project_id = $1 AND b.execution_location = 'local'
+         AND j.kind = 'transcription'
+         AND j.state IN ('queued', 'claimed', 'processing')
+         AND bi.state NOT IN ('ready_for_review', 'failed', 'canceled')
+       GROUP BY j.id, j.state`,
+      [projectId],
+    );
+    const unprocessed = await this.database.query<DbRow>(
+      `SELECT count(*)::integer AS total
+       FROM project_videos pv
+       WHERE pv.project_id = $1 AND pv.triage_state = 'active'
+         AND pv.active_transcript_version_id IS NULL
+         AND NOT EXISTS (
+           SELECT 1
+           FROM transcription_batch_items bi
+           JOIN transcription_batches b ON b.id = bi.batch_id
+           WHERE b.project_id = pv.project_id
+             AND b.execution_location = 'local'
+             AND bi.catalog_video_id = pv.video_id
+         )`,
+      [projectId],
+    );
+    const queued = jobs.rows.filter((job) => job.state === "queued");
+    const active = jobs.rows.filter((job) => job.state !== "queued");
+    const knownDuration = (rows: DbRow[]) =>
+      rows.reduce(
+        (total, job) =>
+          total + (job.duration_ms === null ? 0 : Number(job.duration_ms)),
+        0,
+      );
+    const unknownDuration = (rows: DbRow[]) =>
+      rows.filter((job) => job.duration_ms === null).length;
+    return ProjectLocalProcessingStatusSchema.parse({
+      projectId,
+      policy: {
+        state: row.local_processing_state,
+        version: Number(row.local_processing_version),
+        ...(row.local_processing_updated_by === null
+          ? {}
+          : {
+              updatedBy: {
+                userId: String(row.local_processing_updated_by),
+                handle:
+                  row.updater_handle === null
+                    ? "former_member"
+                    : String(row.updater_handle),
+                displayName:
+                  row.updater_display_name === null
+                    ? "Former project member"
+                    : String(row.updater_display_name),
+              },
+              updatedAt: iso(row.local_processing_updated_at),
+            }),
+      },
+      workload: {
+        queuedJobs: queued.length,
+        activeJobs: active.length,
+        queuedKnownDurationMs: knownDuration(queued),
+        activeKnownDurationMs: knownDuration(active),
+        queuedUnknownDurationCount: unknownDuration(queued),
+        activeUnknownDurationCount: unknownDuration(active),
+        unprocessedActiveVideoCount: Number(unprocessed.rows[0]?.total ?? 0),
+      },
+    });
+  }
+
+  private async enqueueMissingProjectLocalVideos(
+    actor: AuthenticatedActor,
+    projectId: string,
+    createdAt: string,
+    limit: number,
+    catalogVideoId?: string,
+  ): Promise<number> {
+    const candidates = await this.database.query<DbRow>(
+      `SELECT v.id, v.youtube_video_id, v.canonical_url, v.title, v.channel,
+              v.duration_ms, v.source_language
+       FROM project_videos pv
+       JOIN videos v ON v.id = pv.video_id
+       WHERE pv.project_id = $1 AND pv.triage_state = 'active'
+         AND pv.active_transcript_version_id IS NULL
+         AND ($2::uuid IS NULL OR pv.video_id = $2::uuid)
+         AND NOT EXISTS (
+           SELECT 1
+           FROM transcription_batch_items bi
+           JOIN transcription_batches b ON b.id = bi.batch_id
+           WHERE b.project_id = pv.project_id
+             AND b.execution_location = 'local'
+             AND bi.catalog_video_id = pv.video_id
+         )
+       ORDER BY pv.created_at, pv.video_id
+       LIMIT $3::integer`,
+      [projectId, catalogVideoId ?? null, Math.max(1, Math.min(50, limit))],
+    );
+    if (candidates.rows.length === 0) return 0;
+    const automaticBatch = await this.database.query<DbRow>(
+      `SELECT id FROM transcription_batches
+       WHERE project_id = $1 AND processing_origin = 'project_local'`,
+      [projectId],
+    );
+    const batchId = automaticBatch.rows[0]?.id
+      ? String(automaticBatch.rows[0].id)
+      : randomUUID();
+    const options: BatchOptions = {
+      targetLanguage: "en",
+      transcriptionProfile: "default",
+      sourcePolicy: "captions-then-generate",
+      executionLocation: "local",
+      priority: "normal",
+    };
+    if (!automaticBatch.rows[0]) {
+      await this.insertTranscriptionBatch(
+        batchId,
+        actor.userId,
+        projectId,
+        "Automatic local processing",
+        options,
+        createdAt,
+        "project_local",
+      );
+    }
+    const nextIndex = await this.database.query<DbRow>(
+      `SELECT coalesce(max(input_index), -1)::integer + 1 AS next_index
+       FROM transcription_batch_items WHERE batch_id = $1`,
+      [batchId],
+    );
+    let inputIndex = Number(nextIndex.rows[0]?.next_index ?? 0);
+    for (const candidate of candidates.rows) {
+      await this.insertTranscriptionBatchItem(
+        actor,
+        projectId,
+        batchId,
+        options,
+        {
+          inputIndex,
+          input: String(candidate.canonical_url),
+          status: "ready",
+          processingNeed: "transcription",
+          catalogVideoId: String(candidate.id),
+          youtubeVideoId: String(candidate.youtube_video_id),
+          canonicalUrl: String(candidate.canonical_url),
+          title: String(candidate.title),
+          ...(candidate.channel === null
+            ? {}
+            : { channel: String(candidate.channel) }),
+          ...(candidate.duration_ms === null
+            ? {}
+            : { durationMs: Number(candidate.duration_ms) }),
+          ...(candidate.source_language === null
+            ? {}
+            : { sourceLanguage: String(candidate.source_language) }),
+        },
+        createdAt,
+        false,
+      );
+      inputIndex += 1;
+    }
+    return candidates.rows.length;
+  }
+
+  private async insertTranscriptionBatch(
+    batchId: string,
+    actorId: string,
+    projectId: string,
+    name: string,
+    options: BatchOptions,
+    createdAt: string,
+    processingOrigin: "manual" | "project_local",
+  ): Promise<void> {
+    await this.database.query(
+      `INSERT INTO transcription_batches
+         (id, project_id, name, target_language, execution_location,
+          transcription_profile, source_policy, priority, created_by,
+          translation_provider, translation_disclosure_version,
+          translation_consent_accepted_at, hosted_approval_state,
+          hosted_approval_version, processing_origin, version, created_at,
+          updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+               $13, 1, $14, 1, $15, $15)`,
+      [
+        batchId,
+        projectId,
+        name.trim(),
+        options.targetLanguage,
+        options.executionLocation,
+        options.transcriptionProfile,
+        options.sourcePolicy,
+        options.priority,
+        actorId,
+        options.translationConsent?.provider ?? null,
+        options.translationConsent?.disclosureVersion ?? null,
+        options.translationConsent ? createdAt : null,
+        options.executionLocation === "hosted" ? "pending" : "not_required",
+        processingOrigin,
+        createdAt,
+      ],
+    );
+  }
+
+  private async insertTranscriptionBatchItem(
+    actor: AuthenticatedActor,
+    projectId: string,
+    batchId: string,
+    options: BatchOptions,
     item: BatchPreflightItem,
+    createdAt: string,
+    upsertVideo: boolean,
+  ): Promise<void> {
+    let catalogVideoId = item.catalogVideoId;
+    if (
+      upsertVideo &&
+      item.youtubeVideoId &&
+      item.canonicalUrl &&
+      item.title &&
+      ["ready", "existing-transcript"].includes(item.status)
+    ) {
+      catalogVideoId = await this.upsertProjectVideo(
+        actor.userId,
+        projectId,
+        item,
+        createdAt,
+      );
+    }
+
+    let persistedItem = item;
+    if (
+      item.status === "ready" &&
+      catalogVideoId &&
+      options.sourcePolicy !== "force-generate"
+    ) {
+      const active = await this.database.query<DbRow>(
+        `SELECT active_transcript_version_id
+         FROM project_videos
+         WHERE project_id = $1 AND video_id = $2`,
+        [projectId, catalogVideoId],
+      );
+      const activeTranscriptVersionId =
+        active.rows[0]?.active_transcript_version_id;
+      if (activeTranscriptVersionId) {
+        persistedItem = {
+          ...item,
+          status: "existing-transcript",
+          processingNeed: "reuse-shared",
+          catalogVideoId,
+          activeTranscriptVersionId: String(activeTranscriptVersionId),
+        };
+      }
+    }
+
+    let jobId: string | undefined;
+    let idempotencyKey: string | undefined;
+    let languageGate: LanguageGate | undefined;
+    let languageDecision: LanguageDecisionSnapshot | undefined;
+    let creatorReportedLanguage: string | undefined;
+    if (catalogVideoId) {
+      languageGate = await this.loadProjectVideoLanguageGate(
+        projectId,
+        catalogVideoId,
+      );
+      creatorReportedLanguage = languageGate.creatorReportedLanguage;
+      if (
+        creatorReportedLanguage &&
+        languageGate.decision?.status !== "confirmed"
+      ) {
+        await this.ensureCreatorMetadataLanguageDecision(
+          actor,
+          projectId,
+          catalogVideoId,
+          creatorReportedLanguage,
+          createdAt,
+        );
+        languageGate = await this.loadProjectVideoLanguageGate(
+          projectId,
+          catalogVideoId,
+        );
+      }
+      if (languageGate.decision) {
+        languageDecision = LanguageDecisionSnapshotSchema.parse({
+          schemaVersion: 1,
+          decisionId: languageGate.decision.id,
+          decisionVersion: languageGate.decision.decisionVersion,
+          status: languageGate.decision.status,
+          basis: languageGate.decision.basis,
+          ...(languageGate.decision.resolvedLanguage
+            ? { resolvedLanguage: languageGate.decision.resolvedLanguage }
+            : {}),
+          ...(languageGate.decision.evidenceId
+            ? { evidenceId: languageGate.decision.evidenceId }
+            : {}),
+        });
+      }
+    }
+    let state:
+      | "queued"
+      | "ready_for_review"
+      | "blocked"
+      | "canceled"
+      | "needs_language_confirmation";
+    if (persistedItem.status === "ready" && catalogVideoId) {
+      if (languageGate?.state === "needs_language_confirmation") {
+        state = "needs_language_confirmation";
+      } else {
+        const payload = TranscriptionJobPayloadSchema.parse({
+          batchId,
+          catalogVideoId,
+          youtubeVideoId: persistedItem.youtubeVideoId,
+          targetLanguage: options.targetLanguage,
+          transcriptionProfile: options.transcriptionProfile,
+          sourcePolicy: options.sourcePolicy,
+          executionLocation: options.executionLocation,
+          priority: options.priority,
+          ...(options.translationConsent
+            ? { translationConsent: options.translationConsent }
+            : {}),
+          ...(creatorReportedLanguage ? { creatorReportedLanguage } : {}),
+          ...(languageDecision ? { languageDecision } : {}),
+        });
+        const equivalent = await this.database.query<DbRow>(
+          `SELECT id, idempotency_key
+           FROM jobs
+           WHERE project_id = $1 AND kind = 'transcription'
+             AND state IN ('queued', 'claimed', 'processing', 'needs_user_action')
+             AND payload->>'catalogVideoId' = $2
+             AND payload->>'targetLanguage' = $3
+             AND payload->>'transcriptionProfile' = $4
+             AND payload->>'executionLocation' = $5
+             AND (
+               payload->>'sourcePolicy' = $6
+               OR (
+                 payload->>'sourcePolicy' <> 'force-generate'
+                 AND $6 <> 'force-generate'
+               )
+             )
+             AND coalesce(payload->'translationConsent', 'null'::jsonb)
+                 = $7::jsonb
+             AND coalesce(payload->>'creatorReportedLanguage', '') = $8
+             AND coalesce(payload->'languageDecision', 'null'::jsonb)
+                 = $9::jsonb
+           ORDER BY created_at, id
+           LIMIT 1`,
+          [
+            projectId,
+            catalogVideoId,
+            payload.targetLanguage,
+            payload.transcriptionProfile,
+            payload.executionLocation,
+            payload.sourcePolicy,
+            JSON.stringify(payload.translationConsent ?? null),
+            payload.creatorReportedLanguage ?? "",
+            JSON.stringify(payload.languageDecision ?? null),
+          ],
+        );
+        if (equivalent.rows[0]) {
+          jobId = String(equivalent.rows[0].id);
+          idempotencyKey = String(equivalent.rows[0].idempotency_key);
+        } else {
+          idempotencyKey = transcriptionJobIdempotencyKey(
+            projectId,
+            catalogVideoId,
+            payload,
+          );
+          const candidateJobId = randomUUID();
+          const insertedJob = await this.database.query<DbRow>(
+            `INSERT INTO jobs
+             (id, project_id, kind, state, idempotency_key, attempt,
+              payload, created_at, updated_at)
+             VALUES ($1, $2, 'transcription', 'queued', $3, 0, $4, $5, $5)
+             ON CONFLICT (idempotency_key) DO NOTHING
+             RETURNING id`,
+            [
+              candidateJobId,
+              projectId,
+              idempotencyKey,
+              JSON.stringify(payload),
+              createdAt,
+            ],
+          );
+          if (insertedJob.rows[0]) {
+            jobId = String(insertedJob.rows[0].id);
+          } else {
+            const existingJob = await this.database.query<DbRow>(
+              "SELECT id FROM jobs WHERE idempotency_key = $1",
+              [idempotencyKey],
+            );
+            if (!existingJob.rows[0]) {
+              throw new CatalogConflictError(
+                "The transcription job could not be resolved after deduplication.",
+              );
+            }
+            jobId = String(existingJob.rows[0].id);
+          }
+        }
+        state = "queued";
+      }
+    } else if (persistedItem.status === "existing-transcript") {
+      state = "ready_for_review";
+    } else if (persistedItem.status === "duplicate") {
+      state = "canceled";
+    } else {
+      state = "blocked";
+    }
+
+    await this.database.query(
+      `INSERT INTO transcription_batch_items
+         (id, batch_id, input_index, raw_input, youtube_video_id,
+          canonical_url, catalog_video_id, active_transcript_version_id,
+          title, channel, duration_ms, source_language, preflight_status,
+          processing_need, duplicate_of_input_index, state, review_status,
+          job_id, idempotency_key, error_code, error_message, attempt,
+          language_gate, language_decision_id, language_decision_video_id,
+          version, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+               $13, $14, $15, $16, 'unreviewed', $17, $18, $19, $20,
+               0, $21, $22, $23, 1, $24, $24)`,
+      [
+        randomUUID(),
+        batchId,
+        persistedItem.inputIndex,
+        persistedItem.input,
+        persistedItem.youtubeVideoId ?? null,
+        persistedItem.canonicalUrl ?? null,
+        catalogVideoId ?? null,
+        persistedItem.activeTranscriptVersionId ?? null,
+        persistedItem.title ?? null,
+        persistedItem.channel ?? null,
+        persistedItem.durationMs ?? null,
+        persistedItem.sourceLanguage ?? null,
+        persistedItem.status,
+        persistedItem.processingNeed,
+        persistedItem.duplicateOfInputIndex ?? null,
+        state,
+        jobId ?? null,
+        idempotencyKey ?? null,
+        persistedItem.error?.code ?? null,
+        persistedItem.error?.message ?? null,
+        languageGate ? JSON.stringify(languageGate) : null,
+        languageDecision?.decisionId ?? null,
+        languageDecision ? catalogVideoId : null,
+        createdAt,
+      ],
+    );
+  }
+
+  private async upsertProjectVideo(
+    actorId: string,
+    projectId: string,
+    item: {
+      youtubeVideoId?: string | undefined;
+      canonicalUrl?: string | undefined;
+      title?: string | undefined;
+      channel?: string | undefined;
+      durationMs?: number | undefined;
+      sourceLanguage?: string | undefined;
+    },
     now: string,
   ): Promise<string> {
-    const existing = await this.database.query<DbRow>(
-      "SELECT id FROM videos WHERE youtube_video_id = $1",
-      [item.youtubeVideoId],
-    );
-    const id = String(existing.rows[0]?.id ?? randomUUID());
-    await this.database.query(
+    if (!item.youtubeVideoId || !item.canonicalUrl || !item.title) {
+      throw new CatalogInvalidRequestError(
+        "A canonical video identity and title are required.",
+      );
+    }
+    const insertedVideo = await this.database.query<DbRow>(
       `INSERT INTO videos
          (id, youtube_video_id, canonical_url, title, channel, duration_ms,
           source_language, created_at, updated_at)
@@ -5729,18 +11959,20 @@ export class SharedProjectCatalog {
            channel = EXCLUDED.channel,
            duration_ms = EXCLUDED.duration_ms,
            source_language = EXCLUDED.source_language,
-           updated_at = EXCLUDED.updated_at`,
+           updated_at = EXCLUDED.updated_at
+       RETURNING id`,
       [
-        id,
+        randomUUID(),
         item.youtubeVideoId,
         item.canonicalUrl,
-        item.title,
+        item.title.trim(),
         item.channel ?? null,
         item.durationMs ?? null,
         item.sourceLanguage ?? null,
         now,
       ],
     );
+    const id = String(insertedVideo.rows[0]!.id);
     await this.database.query(
       `INSERT INTO project_videos
          (project_id, video_id, version, created_at, updated_at)
@@ -5748,6 +11980,42 @@ export class SharedProjectCatalog {
        ON CONFLICT (project_id, video_id) DO NOTHING`,
       [projectId, id, now],
     );
+    await this.database.query(
+      `INSERT INTO project_video_review_cycles
+         (id, project_id, video_id, cycle_number, status, version, opened_by,
+          opened_at, updated_at)
+       VALUES ($1, $2, $3, 1, 'open', 1, $4, $5, $5)
+       ON CONFLICT (project_id, video_id, cycle_number) DO NOTHING`,
+      [randomUUID(), projectId, id, actorId, now],
+    );
+    const insertedFlag = await this.database.query<DbRow>(
+      `INSERT INTO project_video_flags
+         (project_id, video_id, user_id, active, version, created_at,
+          updated_at)
+       VALUES ($1, $2, $3, true, 1, $4, $4)
+       ON CONFLICT (project_id, video_id, user_id) DO NOTHING
+       RETURNING version`,
+      [projectId, id, actorId, now],
+    );
+    if (!insertedFlag.rows[0]) {
+      const restored = await this.database.query<DbRow>(
+        `UPDATE project_video_flags
+         SET active = true, version = version + 1, updated_at = $1,
+             deactivated_at = NULL
+         WHERE project_id = $2 AND video_id = $3 AND user_id = $4
+           AND NOT active
+         RETURNING version`,
+        [now, projectId, id, actorId],
+      );
+      if (restored.rows[0]) {
+        await this.database.query(
+          `UPDATE project_videos
+           SET version = version + 1, updated_at = $1
+           WHERE project_id = $2 AND video_id = $3`,
+          [now, projectId, id],
+        );
+      }
+    }
     return id;
   }
 
@@ -6705,6 +12973,7 @@ function mapUser(row: DbRow | undefined): User {
   return UserSchema.parse({
     id: row.id,
     externalSubject: row.external_subject,
+    handle: row.handle,
     displayName: row.display_name,
     preferredLanguage: row.preferred_language ?? "en",
     createdAt: iso(row.created_at),
@@ -7142,10 +13411,29 @@ function mapProject(row: DbRow): Project {
     id: row.id,
     name: row.name,
     description: row.description,
+    kind: row.kind,
+    visibility: row.visibility,
     version: row.version,
     createdAt: iso(row.created_at),
     updatedAt: iso(row.updated_at),
   });
+}
+
+function mapProjectSummary(row: DbRow): ProjectSummary {
+  return ProjectSummarySchema.parse({
+    ...mapProject(row),
+    currentUserRole: row.current_user_role,
+    memberCount: Number(row.member_count),
+  });
+}
+
+function isUniqueViolation(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    (error as { code?: unknown }).code === "23505"
+  );
 }
 
 function mapDerivedTranslationJob(
@@ -7469,6 +13757,242 @@ function mapVideo(row: DbRow | undefined): Video {
   });
 }
 
+function mapProjectVideoOwnFlag(row: DbRow) {
+  return {
+    active: Boolean(row.own_flag_active ?? row.active),
+    version: Number(row.own_flag_version ?? row.version),
+    createdAt: iso(row.own_flag_created_at ?? row.created_at),
+    updatedAt: iso(row.own_flag_updated_at ?? row.updated_at),
+    ...((row.own_flag_deactivated_at ?? row.deactivated_at) === null ||
+    (row.own_flag_deactivated_at ?? row.deactivated_at) === undefined
+      ? {}
+      : {
+          deactivatedAt: iso(row.own_flag_deactivated_at ?? row.deactivated_at),
+        }),
+  };
+}
+
+function mapProjectVideoClaim(row: DbRow, currentUserId: string, now: Date) {
+  return {
+    claimant: {
+      userId: String(row.claimant_user_id),
+      handle: String(row.handle),
+      displayName: String(row.display_name),
+    },
+    isCurrentUser: String(row.claimant_user_id) === currentUserId,
+    active: Date.parse(iso(row.expires_at)) > now.getTime(),
+    generation: Number(row.generation),
+    version: Number(row.version),
+    claimedAt: iso(row.claimed_at),
+    heartbeatAt: iso(row.heartbeat_at),
+    expiresAt: iso(row.expires_at),
+  };
+}
+
+function mapProjectVideoReviewCycle(row: DbRow) {
+  return {
+    id: String(row.id),
+    cycleNumber: Number(row.cycle_number),
+    status: String(row.status),
+    version: Number(row.version),
+    openedAt: iso(row.opened_at),
+    ...(row.opened_by
+      ? {
+          openedBy: mapCurrentOrFormerProjectActor(
+            row.opened_by,
+            row.opened_handle,
+            row.opened_display_name,
+          ),
+        }
+      : {}),
+    ...(row.reopen_reason ? { reopenReason: String(row.reopen_reason) } : {}),
+    ...(row.completion_policy
+      ? { completionPolicy: String(row.completion_policy) }
+      : {}),
+    ...(row.completed_at ? { completedAt: iso(row.completed_at) } : {}),
+    ...(row.completed_by
+      ? {
+          completedBy: mapCurrentOrFormerProjectActor(
+            row.completed_by,
+            row.completed_handle,
+            row.completed_display_name,
+          ),
+        }
+      : {}),
+    ...(row.completion_basis
+      ? { completionBasis: String(row.completion_basis) }
+      : {}),
+    ...(row.transcript_version_id
+      ? { transcriptVersionId: String(row.transcript_version_id) }
+      : {}),
+  };
+}
+
+function mapProjectVideoTriage(row: DbRow) {
+  return {
+    state: String(row.triage_state),
+    version: Number(row.triage_version),
+    ...(row.dismissed_at ? { dismissedAt: iso(row.dismissed_at) } : {}),
+    ...(row.dismissed_by
+      ? {
+          dismissedBy: mapCurrentOrFormerProjectActor(
+            row.dismissed_by,
+            row.dismissed_handle,
+            row.dismissed_display_name,
+          ),
+        }
+      : {}),
+    ...(row.dismissal_reason ? { reason: String(row.dismissal_reason) } : {}),
+  };
+}
+
+function mapCurrentOrFormerProjectActor(
+  userId: unknown,
+  handle: unknown,
+  displayName: unknown,
+) {
+  return {
+    userId: String(userId),
+    handle: handle ? String(handle) : "former_member",
+    displayName: displayName ? String(displayName) : "Former project member",
+  };
+}
+
+function mapProjectVideoActivityReceipt(row: DbRow) {
+  return {
+    eventId: String(row.event_id),
+    projectId: String(row.project_id),
+    videoId: String(row.video_id),
+    videoTitle: String(row.video_title),
+    eventType: String(row.event_type),
+    actor: {
+      userId: String(row.actor_id),
+      handle: String(row.actor_handle),
+      displayName: String(row.actor_display_name),
+    },
+    ...(row.reason ? { reason: String(row.reason) } : {}),
+    state: String(row.state),
+    version: Number(row.version),
+    createdAt: iso(row.event_created_at),
+    ...(row.seen_at ? { seenAt: iso(row.seen_at) } : {}),
+  };
+}
+
+function mapProjectKeywordScanJob(row: DbRow): ProjectKeywordScanJob {
+  return ProjectKeywordScanJobSchema.parse({
+    id: row.id,
+    projectId: row.project_id,
+    projectVideoId: row.video_id,
+    transcriptVersionId: row.transcript_version_id,
+    keywordSetVersion: Number(row.keyword_set_version),
+    scannerSchemaVersion: Number(row.scanner_schema_version),
+    state: row.state,
+    attempt: Number(row.attempt),
+    approvedKeywordCount: Number(row.approved_keyword_count),
+    createdAt: iso(row.created_at),
+    updatedAt: iso(row.updated_at),
+  });
+}
+
+function mapProjectVideoWorklistProcessingState(
+  state: string,
+): ProjectVideoWorklistProcessingState {
+  if (state === "ready_for_review") return "ready";
+  if (
+    [
+      "queued",
+      "resolving",
+      "acquiring",
+      "transcribing",
+      "translating",
+      "aligning",
+      "uploading",
+      "needs_language_confirmation",
+      "blocked",
+      "failed",
+      "canceled",
+    ].includes(state)
+  ) {
+    return state as ProjectVideoWorklistProcessingState;
+  }
+  return "not_requested";
+}
+
+function mapProviderLanguageEvidence(row: DbRow): ProviderLanguageEvidence {
+  return ProviderLanguageEvidenceSchema.parse({
+    id: row.id,
+    projectId: row.project_id,
+    videoId: row.video_id,
+    source: row.source,
+    provider: row.provider,
+    ...(row.reported_language === null || row.reported_language === undefined
+      ? {}
+      : { reportedLanguage: row.reported_language }),
+    ...(row.track_fingerprint === null || row.track_fingerprint === undefined
+      ? {}
+      : { trackFingerprint: row.track_fingerprint }),
+    ...(row.caption_kind === null || row.caption_kind === undefined
+      ? {}
+      : { captionKind: row.caption_kind }),
+    ...(row.job_id === null || row.job_id === undefined
+      ? {}
+      : { jobId: row.job_id }),
+    ...(row.attempt === null || row.attempt === undefined
+      ? {}
+      : { attempt: Number(row.attempt) }),
+    createdAt: iso(row.created_at),
+  });
+}
+
+function mapProjectVideoLanguageDecision(row: DbRow) {
+  return ProjectVideoLanguageDecisionSchema.parse({
+    id: row.id,
+    projectId: row.project_id,
+    videoId: row.video_id,
+    decisionVersion: Number(row.decision_version),
+    status: row.status,
+    basis: row.basis,
+    ...(row.resolved_language === null || row.resolved_language === undefined
+      ? {}
+      : { resolvedLanguage: row.resolved_language }),
+    ...(row.evidence_id === null || row.evidence_id === undefined
+      ? {}
+      : { evidenceId: row.evidence_id }),
+    actorId: row.actor_id,
+    createdAt: iso(row.created_at),
+  });
+}
+
+function isImportableSourceLanguage(value: unknown): boolean {
+  const parsed = LanguageTagSchema.safeParse(value);
+  if (!parsed.success) return false;
+  const language = primaryLanguage(parsed.data);
+  return language !== "en" && language !== "und" && language !== "mul";
+}
+
+function transcriptionJobIdempotencyKey(
+  projectId: string,
+  catalogVideoId: string,
+  payload: ReturnType<typeof TranscriptionJobPayloadSchema.parse>,
+) {
+  return [
+    "transcription",
+    projectId,
+    catalogVideoId,
+    payload.transcriptionProfile,
+    payload.targetLanguage,
+    payload.sourcePolicy,
+    payload.translationConsent
+      ? `translate-${payload.translationConsent.provider}-v${payload.translationConsent.disclosureVersion}`
+      : "translate-disabled",
+    payload.creatorReportedLanguage ?? "creator-unknown",
+    payload.languageDecision
+      ? `decision-${payload.languageDecision.decisionId}-v${payload.languageDecision.decisionVersion}-${payload.languageDecision.status}-${payload.languageDecision.resolvedLanguage ?? "unresolved"}`
+      : "decision-none",
+    "schema-2",
+  ].join(":");
+}
+
 function mapBatchItem(row: DbRow): TranscriptionBatchItem {
   return TranscriptionBatchItemSchema.parse({
     id: row.id,
@@ -7515,6 +14039,15 @@ function mapBatchItem(row: DbRow): TranscriptionBatchItem {
     ...(row.idempotency_key === null
       ? {}
       : { idempotencyKey: row.idempotency_key }),
+    ...(row.language_gate === null || row.language_gate === undefined
+      ? {}
+      : {
+          languageGate: LanguageGateSchema.parse(
+            typeof row.language_gate === "string"
+              ? JSON.parse(row.language_gate)
+              : row.language_gate,
+          ),
+        }),
     ...(row.source_plan === null ? {} : { sourcePlan: row.source_plan }),
     ...(row.source_resolved_at === null
       ? {}

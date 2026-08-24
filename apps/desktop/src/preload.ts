@@ -3,6 +3,8 @@ import { contextBridge, ipcRenderer } from "electron";
 import {
   DesktopApiRequestSchema,
   DesktopApiResponseSchema,
+  DesktopTimedTranscriptUploadRequestSchema,
+  DesktopTimedTranscriptUploadResponseSchema,
   DesktopAuthStatusSchema,
   DesktopStatusSchema,
   ModelDownloadProgressSchema,
@@ -74,6 +76,13 @@ contextBridge.exposeInMainWorld("researchVideoDesktop", {
       await ipcRenderer.invoke(
         desktopIpcChannels.request,
         DesktopApiRequestSchema.parse(input),
+      ),
+    ),
+  uploadTimedTranscript: async (input: unknown) =>
+    DesktopTimedTranscriptUploadResponseSchema.parse(
+      await ipcRenderer.invoke(
+        desktopIpcChannels.timedTranscriptUpload,
+        DesktopTimedTranscriptUploadRequestSchema.parse(input),
       ),
     ),
 });

@@ -5,7 +5,13 @@ import type {
   ProjectRole,
 } from "@research-video/contracts";
 
-export type ProjectPermission = "read" | "write" | "manage_members";
+export type ProjectPermission =
+  | "read"
+  | "write"
+  | "manage_members"
+  | "manage_researchers"
+  | "manage_administrators"
+  | "manage_project";
 
 export interface SessionProvider<Request = unknown> {
   authenticate(request: Request): Promise<AuthenticatedActor>;
@@ -22,7 +28,20 @@ export class AuthorizationError extends Error {
 }
 
 const permissions: Record<ProjectRole, ReadonlySet<ProjectPermission>> = {
-  owner: new Set(["read", "write", "manage_members"]),
+  owner: new Set([
+    "read",
+    "write",
+    "manage_members",
+    "manage_researchers",
+    "manage_administrators",
+    "manage_project",
+  ]),
+  administrator: new Set([
+    "read",
+    "write",
+    "manage_researchers",
+    "manage_project",
+  ]),
   editor: new Set(["read", "write"]),
   researcher: new Set(["read", "write"]),
   viewer: new Set(["read"]),
@@ -35,6 +54,18 @@ export function requirePermission(
   if (!role || !permissions[role].has(permission)) {
     throw new AuthorizationError("You do not have access to this project.");
   }
+}
+
+export function requireProjectRoleAssignment(
+  actorRole: ProjectRole | undefined,
+  targetRole: "administrator" | "researcher",
+): void {
+  requirePermission(
+    actorRole,
+    targetRole === "administrator"
+      ? "manage_administrators"
+      : "manage_researchers",
+  );
 }
 
 /** The claims this package needs from a verified Cognito access token. */

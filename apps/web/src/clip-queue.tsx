@@ -10,6 +10,7 @@ import {
   ClipCandidateSchema,
   ClipTagNameSchema,
   ExportStoragePreflightSchema,
+  formatLanguageLabel,
   LocalClipLibrarySelectionSchema,
   LocalClipLibraryPageSchema,
   ProjectExportPresetCatalogSchema,
@@ -29,14 +30,14 @@ type ClipQueueProps = {
   authorization: string;
   projectId: string;
   request: CloudRequest;
-  onOpenVideo(canonicalUrl: string): void;
+  onOpenSourceClip(clip: ClipCandidate, fallbackNotice?: string): void;
 };
 
 export function ClipQueue({
   authorization,
   projectId,
   request,
-  onOpenVideo,
+  onOpenSourceClip,
 }: ClipQueueProps) {
   const [entries, setEntries] = useState<ClipLibraryEntry[]>([]);
   const [page, setPage] = useState<LocalClipLibraryPage>();
@@ -558,7 +559,8 @@ export function ClipQueue({
   async function resolveArtifact(
     clip: ClipCandidate,
     version: ClipLibraryEntry["recentArtifactVersions"][number],
-  ) {
+    options: { announce?: boolean; refresh?: boolean } = {},
+  ): Promise<ArtifactResolutionResult | undefined> {
     const generation = requestGeneration.current;
     const { text: _text, ...selection } = version.selection;
     const rendererCapabilityId =
@@ -619,14 +621,16 @@ export function ClipQueue({
       const payload: unknown = await response.json().catch(() => undefined);
       if (!response.ok) throw apiError(payload, "Unable to resolve artifact.");
       const resolution = ArtifactResolutionResultSchema.parse(payload);
-      if (generation !== requestGeneration.current) return;
+      if (generation !== requestGeneration.current) return undefined;
       setResolutions((current) =>
         new Map(current).set(version.artifactVersionId, resolution),
       );
-      setMessage(
-        `Artifact resolution: ${resolution.state.replaceAll("_", " ")}.`,
-      );
-      void reload();
+      if (options.announce !== false)
+        setMessage(
+          `Artifact resolution: ${resolution.state.replaceAll("_", " ")}.`,
+        );
+      if (options.refresh !== false) void reload();
+      return resolution;
     } catch (error) {
       if (generation === requestGeneration.current) {
         setMessage(
@@ -635,6 +639,7 @@ export function ClipQueue({
             : "Unable to resolve artifact.",
         );
       }
+      return undefined;
     } finally {
       if (generation === requestGeneration.current) setBusy(false);
     }
@@ -644,10 +649,10 @@ export function ClipQueue({
     locatorId: string,
     action: "verify" | "reveal" | "open" | "relink",
     targetRootId?: string,
-  ) {
+  ): Promise<boolean> {
     if (action === "relink" && page?.freshness !== "fresh") {
       setMessage("Reconnect before relinking a project artifact.");
-      return;
+      return false;
     }
     const generation = requestGeneration.current;
     setBusy(true);
@@ -671,7 +676,7 @@ export function ClipQueue({
         action !== "relink"
           ? ArtifactLocatorActionResultSchema.parse(payload)
           : undefined;
-      if (generation !== requestGeneration.current) return;
+      if (generation !== requestGeneration.current) return false;
       if (actionResult) {
         setMessage(
           actionResult.freshness === "stale"
@@ -683,6 +688,7 @@ export function ClipQueue({
         setMessage("Local artifact relink completed after full verification.");
       }
       void reload();
+      return true;
     } catch (error) {
       if (generation === requestGeneration.current) {
         setMessage(
@@ -691,9 +697,36 @@ export function ClipQueue({
             : `Unable to ${action} local artifact.`,
         );
       }
+      return false;
     } finally {
       if (generation === requestGeneration.current) setBusy(false);
     }
+  }
+
+  async function openClip(entry: ClipLibraryEntry) {
+    let artifactFailure = false;
+    for (const version of entry.recentArtifactVersions) {
+      const cachedResolution = resolutions.get(version.artifactVersionId);
+      const resolution =
+        cachedResolution ??
+        (await resolveArtifact(entry.clip, version, {
+          announce: false,
+          refresh: false,
+        }));
+      if (!resolution) {
+        artifactFailure = true;
+        continue;
+      }
+      if (resolution.state !== "reusable_local") continue;
+      const opened = await actOnArtifact(resolution.locator.id, "open");
+      if (opened) return;
+      artifactFailure = true;
+    }
+    const fallbackNotice = artifactFailure
+      ? "A compatible local artifact could not be freshly verified, so VERA opened the authorized source range instead."
+      : undefined;
+    if (fallbackNotice) setMessage(fallbackNotice);
+    onOpenSourceClip(entry.clip, fallbackNotice);
   }
 
   async function downloadCsv() {
@@ -1039,9 +1072,10 @@ export function ClipQueue({
                   <div className="clip-card-actions">
                     <button
                       type="button"
-                      onClick={() => onOpenVideo(clip.video.canonicalUrl)}
+                      disabled={busy}
+                      onClick={() => void openClip(entry)}
                     >
-                      Open video
+                      Open clip
                     </button>
                     <button
                       type="button"
@@ -1056,7 +1090,10 @@ export function ClipQueue({
                   <div className="clip-language-evidence">
                     <blockquote>
                       <strong>
-                        Native ({clip.languageEvidence.native.language})
+                        Native —{" "}
+                        {formatLanguageLabel(
+                          clip.languageEvidence.native.language,
+                        )}
                       </strong>
                       {clip.languageEvidence.native.text}
                     </blockquote>
@@ -1067,7 +1104,10 @@ export function ClipQueue({
                     {clip.languageEvidence.preferred ? (
                       <blockquote>
                         <strong>
-                          Preferred ({clip.languageEvidence.preferred.language})
+                          Preferred —{" "}
+                          {formatLanguageLabel(
+                            clip.languageEvidence.preferred.language,
+                          )}
                         </strong>
                         {clip.languageEvidence.preferred.text}
                       </blockquote>
@@ -1143,7 +1183,7 @@ export function ClipQueue({
                                       void actOnArtifact(locator.id, "open")
                                     }
                                   >
-                                    Open clip
+                                    Open artifact
                                   </button>
                                   {artifactRoots
                                     .filter(

@@ -10,6 +10,8 @@ import {
   createCognitoAccessTokenVerifier,
   createCognitoSessionProvider,
   requirePermission,
+  requireProjectRoleAssignment,
+  type ProjectPermission,
   type CognitoAccessTokenVerifier,
   type OAuthCrypto,
 } from "./index.ts";
@@ -19,17 +21,66 @@ const clientId = "public-client-id";
 const subject = "b5602ca3-98b9-4e82-bd22-e896fe7cab40";
 
 describe("project authorization", () => {
-  it("allows researchers to publish but not manage members", () => {
-    expect(() => requirePermission("researcher", "write")).not.toThrow();
-    expect(() => requirePermission("researcher", "manage_members")).toThrow(
-      AuthorizationError,
-    );
+  it("enforces the complete closed permission matrix", () => {
+    const permissions: ProjectPermission[] = [
+      "read",
+      "write",
+      "manage_members",
+      "manage_researchers",
+      "manage_administrators",
+      "manage_project",
+    ];
+    const allowed = {
+      owner: permissions,
+      administrator: ["read", "write", "manage_researchers", "manage_project"],
+      researcher: ["read", "write"],
+      editor: ["read", "write"],
+      viewer: ["read"],
+    } satisfies Record<string, ProjectPermission[]>;
+
+    for (const [role, rolePermissions] of Object.entries(allowed)) {
+      for (const permission of permissions) {
+        const assertion = expect(() =>
+          requirePermission(role as keyof typeof allowed, permission),
+        );
+        if ((rolePermissions as ProjectPermission[]).includes(permission))
+          assertion.not.toThrow();
+        else assertion.toThrow(AuthorizationError);
+      }
+    }
   });
 
   it("denies users without membership", () => {
     expect(() => requirePermission(undefined, "read")).toThrow(
       AuthorizationError,
     );
+  });
+
+  it("allows only the exact target-role assignment matrix", () => {
+    const expectations = {
+      owner: { administrator: true, researcher: true },
+      administrator: { administrator: false, researcher: true },
+      researcher: { administrator: false, researcher: false },
+      editor: { administrator: false, researcher: false },
+      viewer: { administrator: false, researcher: false },
+    } as const;
+    for (const [actorRole, targets] of Object.entries(expectations)) {
+      for (const [targetRole, permitted] of Object.entries(targets)) {
+        const assertion = expect(() =>
+          requireProjectRoleAssignment(
+            actorRole as keyof typeof expectations,
+            targetRole as "administrator" | "researcher",
+          ),
+        );
+        if (permitted) assertion.not.toThrow();
+        else assertion.toThrow(AuthorizationError);
+      }
+    }
+    for (const targetRole of ["administrator", "researcher"] as const) {
+      expect(() => requireProjectRoleAssignment(undefined, targetRole)).toThrow(
+        AuthorizationError,
+      );
+    }
   });
 });
 

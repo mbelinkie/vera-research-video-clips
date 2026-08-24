@@ -4,11 +4,12 @@ import {
   ApiErrorSchema,
   ModelDownloadProgressSchema,
   ProjectSchema,
+  ProjectSummarySchema,
   ReadinessReportSchema,
   SetupSnapshotSchema,
   type DesktopAuthStatus,
   type ModelDownloadProgress,
-  type Project,
+  type ProjectSummary,
   type ReadinessOperation,
   type SetupAction,
   type SetupSelectionTarget,
@@ -20,9 +21,9 @@ import { apiFetch, desktopBridge } from "./api-client.ts";
 type DesktopSetupProps = {
   authorization: string;
   authStatus?: DesktopAuthStatus;
-  projects: readonly Project[];
+  projects: readonly ProjectSummary[];
   projectId: string;
-  onProjectsChange(projects: Project[]): void;
+  onProjectsChange(projects: ProjectSummary[]): void;
   onProjectChange(projectId: string): void;
   onSignIn(): Promise<void>;
   onSignOut(): Promise<void>;
@@ -66,6 +67,9 @@ export function DesktopSetup({
   const [message, setMessage] = useState("Checking this workstation’s setup…");
   const [busy, setBusy] = useState(false);
   const [newProjectName, setNewProjectName] = useState("");
+  const [newProjectKind, setNewProjectKind] = useState<"personal" | "shared">(
+    "shared",
+  );
 
   const refresh = useCallback(async () => {
     if (!bridge) return;
@@ -164,10 +168,10 @@ export function DesktopSetup({
       );
       const payload = await response.json().catch(() => undefined);
       if (!response.ok) throw apiError(payload, "Unable to load projects.");
-      const loaded = ProjectSchema.array().parse(payload);
+      const loaded = ProjectSummarySchema.array().parse(payload);
       onProjectsChange(loaded);
       if (!loaded.some((project) => project.id === projectId)) {
-        onProjectChange(loaded[0]?.id ?? "");
+        onProjectChange("");
       }
     }, "Project access refreshed.");
   }
@@ -179,18 +183,27 @@ export function DesktopSetup({
       const response = await apiFetch(
         "cloud",
         "/api/projects",
-        { method: "POST", body: JSON.stringify({ name, description: "" }) },
+        {
+          method: "POST",
+          body: JSON.stringify({ name, description: "", kind: newProjectKind }),
+        },
         authorization,
       );
       const payload = await response.json().catch(() => undefined);
       if (!response.ok) throw apiError(payload, "Unable to create project.");
       const project = ProjectSchema.parse(payload);
+      const projectSummary = ProjectSummarySchema.parse({
+        ...project,
+        currentUserRole: "owner",
+        memberCount: 1,
+      });
       onProjectsChange([
         ...projects.filter((candidate) => candidate.id !== project.id),
-        project,
+        projectSummary,
       ]);
       onProjectChange(project.id);
       setNewProjectName("");
+      setNewProjectKind("shared");
     }, "Project created and selected.");
   }
 
@@ -261,6 +274,16 @@ export function DesktopSetup({
             </select>
           </label>
           <div className="setup-inline-form">
+            <select
+              aria-label="Desktop new project kind"
+              value={newProjectKind}
+              onChange={(event) =>
+                setNewProjectKind(event.target.value as "personal" | "shared")
+              }
+            >
+              <option value="personal">Personal</option>
+              <option value="shared">Shared</option>
+            </select>
             <input
               aria-label="New project name"
               value={newProjectName}

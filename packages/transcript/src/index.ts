@@ -1,12 +1,18 @@
 import {
   ClipLanguageEvidenceV2Schema,
   NormalizedTranscriptSchema,
+  ProjectKeywordMatchArtifactSchema,
+  ProjectKeywordScanAliasInputSchema,
+  ProjectKeywordScannerSchemaVersion,
   TranscriptSelectionSchema,
   languagesEquivalent,
   normalizeLanguageTag,
   type ClipLanguageEvidenceV2,
   type NormalizedTranscript,
   type PreferredTranscriptResolution,
+  type ProjectKeywordMatchArtifact,
+  type ProjectKeywordMatchEvidence,
+  type ProjectKeywordScanAliasInput,
   type TranscriptSegment,
   type TranscriptSelection,
   type TranscriptToken,
@@ -14,6 +20,257 @@ import {
 } from "@research-video/contracts";
 
 export type { TranscriptSegment, TranscriptToken, TranscriptTrack };
+
+export type DeterministicKeywordScanInput = {
+  projectId: string;
+  projectVideoId: string;
+  transcriptVersionId: string;
+  keywordSetVersion: number;
+  tracks: readonly NormalizedTranscript[];
+  aliases: readonly ProjectKeywordScanAliasInput[];
+};
+
+export type DeterministicKeywordScanResult = {
+  artifact: ProjectKeywordMatchArtifact;
+  bytes: Uint8Array;
+  sha256: string;
+  occurrenceCount: number;
+  matchedKeywordCount: number;
+};
+
+/**
+ * Produces byte-stable private scan evidence from already verified transcript
+ * tracks. It deliberately performs exact-language literal matching only.
+ */
+export async function scanProjectKeywords(
+  input: DeterministicKeywordScanInput,
+): Promise<DeterministicKeywordScanResult> {
+  const aliases = input.aliases
+    .map((alias) => ProjectKeywordScanAliasInputSchema.parse(alias))
+    .sort((left, right) =>
+      [left.keywordId, left.aliasId]
+        .join(":")
+        .localeCompare([right.keywordId, right.aliasId].join(":")),
+    );
+  const tracks = input.tracks
+    .map((track) => NormalizedTranscriptSchema.parse(track))
+    .sort((left, right) => left.track.id.localeCompare(right.track.id));
+  const evidence: ProjectKeywordMatchEvidence[] = [];
+
+  for (const track of tracks) {
+    const trackLanguage = normalizeLanguageTag(track.track.language);
+    const trackAliases = aliases.filter(
+      (alias) => normalizeLanguageTag(alias.language) === trackLanguage,
+    );
+    if (trackAliases.length === 0) continue;
+    const searchable = buildKeywordSearchTrack(track);
+    for (const alias of trackAliases) {
+      const terms = keywordTerms(alias.phrase);
+      if (terms.length === 0) continue;
+      for (
+        let index = 0;
+        index <= searchable.terms.length - terms.length;
+        index += 1
+      ) {
+        if (
+          !terms.every(
+            (term, offset) => searchable.terms[index + offset]?.term === term,
+          )
+        ) {
+          continue;
+        }
+        const matched = searchable.terms.slice(index, index + terms.length);
+        const segmentIndexes = [
+          ...new Set(matched.map((term) => term.segmentIndex)),
+        ];
+        if (segmentIndexes.length > 20) continue;
+        const segments = segmentIndexes.map(
+          (segmentIndex) => track.segments[segmentIndex]!,
+        );
+        const timedTokens = matched.map((term) => term.token).filter(Boolean);
+        const hasExactWordBounds =
+          timedTokens.length === matched.length &&
+          timedTokens.every(
+            (token) =>
+              token?.startMs !== undefined && token.endMs !== undefined,
+          );
+        const startMs = hasExactWordBounds
+          ? timedTokens[0]!.startMs!
+          : Math.min(...segments.map((segment) => segment.startMs));
+        const endMs = hasExactWordBounds
+          ? timedTokens.at(-1)!.endMs!
+          : Math.max(...segments.map((segment) => segment.endMs));
+        evidence.push({
+          keywordId: alias.keywordId,
+          aliasId: alias.aliasId,
+          trackId: track.track.id,
+          language: trackLanguage,
+          segmentIds: segments.map((segment) => segment.id),
+          startMs,
+          endMs,
+          timingPrecision: hasExactWordBounds
+            ? "word"
+            : track.track.timingPrecision === "estimated"
+              ? "estimated"
+              : "cue",
+          context: boundedKeywordContext(segments),
+        });
+      }
+    }
+  }
+
+  const occurrences = [];
+  const keywordIds = [
+    ...new Set(evidence.map((match) => match.keywordId)),
+  ].sort();
+  for (const keywordId of keywordIds) {
+    const remaining = evidence
+      .filter((match) => match.keywordId === keywordId)
+      .sort(compareKeywordEvidence);
+    while (remaining.length > 0) {
+      const component = [remaining.shift()!];
+      let expanded = true;
+      while (expanded) {
+        expanded = false;
+        for (let index = remaining.length - 1; index >= 0; index -= 1) {
+          const candidate = remaining[index]!;
+          const repeatsSameTrackAlias = component.some(
+            (match) =>
+              match.trackId === candidate.trackId &&
+              match.aliasId === candidate.aliasId,
+          );
+          if (
+            !repeatsSameTrackAlias &&
+            component.some((match) => intervalsOverlap(match, candidate))
+          ) {
+            component.push(candidate);
+            remaining.splice(index, 1);
+            expanded = true;
+          }
+        }
+      }
+      component.sort(compareKeywordEvidence);
+      const startMs = Math.min(...component.map((match) => match.startMs));
+      const endMs = Math.max(...component.map((match) => match.endMs));
+      occurrences.push({
+        id: await stableUuid(
+          `keyword-occurrence:${input.projectId}:${input.projectVideoId}:${input.transcriptVersionId}:${input.keywordSetVersion}:${keywordId}:${startMs}:${endMs}:${component.map((match) => `${match.trackId}:${match.aliasId}:${match.startMs}:${match.endMs}`).join("|")}`,
+        ),
+        keywordId,
+        startMs,
+        endMs,
+        timingPrecision: leastPrecise(
+          component.map((match) => match.timingPrecision),
+        ),
+        evidence: component,
+      });
+    }
+  }
+  occurrences.sort(
+    (left, right) =>
+      left.startMs - right.startMs ||
+      left.endMs - right.endMs ||
+      left.keywordId.localeCompare(right.keywordId),
+  );
+  const artifact = ProjectKeywordMatchArtifactSchema.parse({
+    schemaVersion: ProjectKeywordScannerSchemaVersion,
+    projectId: input.projectId,
+    projectVideoId: input.projectVideoId,
+    transcriptVersionId: input.transcriptVersionId,
+    keywordSetVersion: input.keywordSetVersion,
+    scannerSchemaVersion: ProjectKeywordScannerSchemaVersion,
+    occurrences,
+  });
+  const bytes = new TextEncoder().encode(JSON.stringify(artifact));
+  return {
+    artifact,
+    bytes,
+    sha256: await sha256Hex(bytes),
+    occurrenceCount: artifact.occurrences.length,
+    matchedKeywordCount: new Set(
+      artifact.occurrences.map((occurrence) => occurrence.keywordId),
+    ).size,
+  };
+}
+
+type KeywordSearchTerm = {
+  term: string;
+  segmentIndex: number;
+  token?: TranscriptToken;
+};
+
+function buildKeywordSearchTrack(track: NormalizedTranscript): {
+  terms: KeywordSearchTerm[];
+} {
+  const tokensBySegment = new Map<string, TranscriptToken[]>();
+  for (const token of track.tokens) {
+    const tokens = tokensBySegment.get(token.segmentId) ?? [];
+    tokens.push(token);
+    tokensBySegment.set(token.segmentId, tokens);
+  }
+  const terms: KeywordSearchTerm[] = [];
+  track.segments.forEach((segment, segmentIndex) => {
+    const segmentTerms = keywordTerms(segment.text);
+    const tokens = (tokensBySegment.get(segment.id) ?? []).sort(
+      (left, right) => left.ordinal - right.ordinal,
+    );
+    const tokenTerms = tokens.flatMap((token) =>
+      keywordTerms(token.text).map((term) => ({ term, token })),
+    );
+    const exactTokenMap =
+      tokenTerms.length === segmentTerms.length &&
+      tokenTerms.every((entry, index) => entry.term === segmentTerms[index]);
+    segmentTerms.forEach((term, index) => {
+      terms.push({
+        term,
+        segmentIndex,
+        ...(exactTokenMap ? { token: tokenTerms[index]!.token } : {}),
+      });
+    });
+  });
+  return { terms };
+}
+
+function keywordTerms(value: string): string[] {
+  return (
+    value
+      .normalize("NFKC")
+      .toLocaleLowerCase("en-US")
+      .match(/[\p{L}\p{N}\p{M}]+/gu) ?? []
+  );
+}
+
+function boundedKeywordContext(segments: readonly TranscriptSegment[]): string {
+  const text = segments.map((segment) => segment.text.trim()).join(" ");
+  return text.length <= 500 ? text : `${text.slice(0, 499).trimEnd()}…`;
+}
+
+function intervalsOverlap(
+  left: { startMs: number; endMs: number },
+  right: { startMs: number; endMs: number },
+): boolean {
+  return left.startMs < right.endMs && right.startMs < left.endMs;
+}
+
+function compareKeywordEvidence(
+  left: ProjectKeywordMatchEvidence,
+  right: ProjectKeywordMatchEvidence,
+): number {
+  return (
+    left.startMs - right.startMs ||
+    left.endMs - right.endMs ||
+    left.trackId.localeCompare(right.trackId) ||
+    left.aliasId.localeCompare(right.aliasId)
+  );
+}
+
+function leastPrecise(
+  values: readonly ("word" | "cue" | "estimated")[],
+): "word" | "cue" | "estimated" {
+  if (values.includes("estimated")) return "estimated";
+  if (values.includes("cue")) return "cue";
+  return "word";
+}
 
 export class TranslationNormalizationError extends Error {
   readonly code = "invalid_translation";
@@ -30,6 +287,113 @@ export type GeneratedTranscriptSegment = {
   endMs: number;
   text: string;
 };
+
+export type ManualTimedTranscriptImportFormat = "srt" | "vtt";
+
+export class ManualTimedTranscriptImportError extends Error {
+  readonly retryable = false;
+
+  constructor(
+    readonly code:
+      | "manual_import_invalid_language"
+      | "manual_import_invalid_duration"
+      | "manual_import_invalid_utf8"
+      | "manual_import_too_large"
+      | "manual_import_invalid_format"
+      | "manual_import_empty"
+      | "manual_import_too_many_cues"
+      | "manual_import_cue_text_too_large"
+      | "manual_import_total_text_too_large"
+      | "manual_import_cue_order_invalid"
+      | "manual_import_cue_overlap"
+      | "manual_import_cue_out_of_bounds",
+  ) {
+    super(manualTimedImportErrorMessage(code));
+    this.name = "ManualTimedTranscriptImportError";
+  }
+}
+
+export async function normalizeManualTimedBilingualImport(input: {
+  importId: string;
+  videoId: string;
+  sourceLanguage: string;
+  durationMs: number;
+  original: {
+    format: ManualTimedTranscriptImportFormat;
+    bytes: Uint8Array;
+  };
+  english: {
+    format: ManualTimedTranscriptImportFormat;
+    bytes: Uint8Array;
+  };
+  schemaVersion?: number;
+  version?: number;
+}): Promise<{
+  original: NormalizedTranscript;
+  english: NormalizedTranscript;
+  originalSrt: string;
+  englishSrt: string;
+}> {
+  let sourceLanguage: string;
+  try {
+    sourceLanguage = normalizeLanguageTag(input.sourceLanguage);
+  } catch {
+    throw new ManualTimedTranscriptImportError(
+      "manual_import_invalid_language",
+    );
+  }
+  if (
+    languagesEquivalent(sourceLanguage, "en") ||
+    sourceLanguage === "und" ||
+    sourceLanguage === "mul"
+  ) {
+    throw new ManualTimedTranscriptImportError(
+      "manual_import_invalid_language",
+    );
+  }
+  if (!Number.isSafeInteger(input.durationMs) || input.durationMs <= 0) {
+    throw new ManualTimedTranscriptImportError(
+      "manual_import_invalid_duration",
+    );
+  }
+  const originalCues = parseStrictManualTimedText(
+    input.original.bytes,
+    input.original.format,
+    input.durationMs,
+  );
+  const englishCues = parseStrictManualTimedText(
+    input.english.bytes,
+    input.english.format,
+    input.durationMs,
+  );
+  const schemaVersion = input.schemaVersion ?? 1;
+  const version = input.version ?? 1;
+  const original = await normalizeManualTimedTrack({
+    importId: input.importId,
+    videoId: input.videoId,
+    language: sourceLanguage,
+    role: "original",
+    cues: originalCues,
+    schemaVersion,
+    version,
+  });
+  const english = await normalizeManualTimedTrack({
+    importId: input.importId,
+    videoId: input.videoId,
+    language: "en",
+    role: "english",
+    sourceTrackId: original.track.id,
+    cues: englishCues,
+    schemaVersion,
+    version,
+  });
+  return {
+    original,
+    english,
+    originalSrt: serializeSrtCues(originalCues),
+    englishSrt: serializeSrtCues(englishCues),
+  };
+}
 
 export async function normalizeGeneratedTranscript(input: {
   videoId: string;
@@ -919,6 +1283,213 @@ function assertOrdered(segments: readonly TranscriptSegment[]) {
     if (previous && current.startMs < previous.startMs) {
       throw new Error("Transcript segments must be ordered by source time.");
     }
+  }
+}
+
+const manualTimedImportMaxBytes = 20 * 1024 * 1024;
+const manualTimedImportMaxCues = 100_000;
+const manualTimedImportMaxCueTextBytes = 20_000;
+const manualTimedImportMaxTotalTextBytes = 10 * 1024 * 1024;
+
+function parseStrictManualTimedText(
+  bytes: Uint8Array,
+  format: ManualTimedTranscriptImportFormat,
+  durationMs: number,
+): ClipRelativeSrtCue[] {
+  if (bytes.byteLength === 0) {
+    throw new ManualTimedTranscriptImportError("manual_import_empty");
+  }
+  if (bytes.byteLength > manualTimedImportMaxBytes) {
+    throw new ManualTimedTranscriptImportError("manual_import_too_large");
+  }
+  let cues: ClipRelativeSrtCue[];
+  if (format === "srt") {
+    try {
+      cues = parseSrt(bytes);
+    } catch (error) {
+      if (error instanceof SrtValidationError) {
+        if (error.code === "srt_invalid_utf8") {
+          throw new ManualTimedTranscriptImportError(
+            "manual_import_invalid_utf8",
+          );
+        }
+        if (error.code === "srt_too_large") {
+          throw new ManualTimedTranscriptImportError("manual_import_too_large");
+        }
+        if (error.code === "srt_empty") {
+          throw new ManualTimedTranscriptImportError("manual_import_empty");
+        }
+        if (error.code === "srt_too_many_cues") {
+          throw new ManualTimedTranscriptImportError(
+            "manual_import_too_many_cues",
+          );
+        }
+      }
+      throw new ManualTimedTranscriptImportError(
+        "manual_import_invalid_format",
+      );
+    }
+  } else if (format === "vtt") {
+    try {
+      cues = parseWebVtt(decodeWebVtt(bytes)).map(
+        ({ startMs, endMs, text }) => ({ startMs, endMs, text }),
+      );
+    } catch (error) {
+      if (
+        error instanceof WebVttNormalizationError &&
+        error.message.includes("not valid UTF-8")
+      ) {
+        throw new ManualTimedTranscriptImportError(
+          "manual_import_invalid_utf8",
+        );
+      }
+      throw new ManualTimedTranscriptImportError(
+        "manual_import_invalid_format",
+      );
+    }
+  } else {
+    throw new ManualTimedTranscriptImportError("manual_import_invalid_format");
+  }
+  if (cues.length === 0) {
+    throw new ManualTimedTranscriptImportError("manual_import_empty");
+  }
+  if (cues.length > manualTimedImportMaxCues) {
+    throw new ManualTimedTranscriptImportError("manual_import_too_many_cues");
+  }
+  let totalTextBytes = 0;
+  for (let index = 0; index < cues.length; index += 1) {
+    const cue = cues[index]!;
+    const previous = cues[index - 1];
+    if (!cue.text.trim() || cue.text.includes("\0")) {
+      throw new ManualTimedTranscriptImportError(
+        "manual_import_invalid_format",
+      );
+    }
+    const cueTextBytes = new TextEncoder().encode(cue.text).byteLength;
+    if (cueTextBytes > manualTimedImportMaxCueTextBytes) {
+      throw new ManualTimedTranscriptImportError(
+        "manual_import_cue_text_too_large",
+      );
+    }
+    totalTextBytes += cueTextBytes;
+    if (totalTextBytes > manualTimedImportMaxTotalTextBytes) {
+      throw new ManualTimedTranscriptImportError(
+        "manual_import_total_text_too_large",
+      );
+    }
+    if (cue.startMs < 0 || cue.endMs <= cue.startMs || cue.endMs > durationMs) {
+      throw new ManualTimedTranscriptImportError(
+        "manual_import_cue_out_of_bounds",
+      );
+    }
+    if (previous && cue.startMs <= previous.startMs) {
+      throw new ManualTimedTranscriptImportError(
+        "manual_import_cue_order_invalid",
+      );
+    }
+    if (previous && cue.startMs < previous.endMs) {
+      throw new ManualTimedTranscriptImportError("manual_import_cue_overlap");
+    }
+  }
+  return cues;
+}
+
+async function normalizeManualTimedTrack(input: {
+  importId: string;
+  videoId: string;
+  language: string;
+  role: "original" | "english";
+  sourceTrackId?: string;
+  cues: readonly ClipRelativeSrtCue[];
+  schemaVersion: number;
+  version: number;
+}): Promise<NormalizedTranscript> {
+  const canonicalCues = input.cues.map((cue, ordinal) => ({
+    ordinal,
+    startMs: cue.startMs,
+    endMs: cue.endMs,
+    text: cue.text.trim(),
+  }));
+  const contentSha256 = await sha256Hex(
+    new TextEncoder().encode(JSON.stringify(canonicalCues)),
+  );
+  const trackId = await stableUuid(
+    `manual-import:${input.importId}:${input.role}:${input.videoId}:${input.language}:${contentSha256}`,
+  );
+  const segments = await Promise.all(
+    canonicalCues.map(async (cue) => ({
+      id: await stableUuid(
+        `manual-import-segment:${trackId}:${cue.ordinal}:${cue.startMs}:${cue.endMs}:${cue.text}`,
+      ),
+      trackId,
+      ...cue,
+    })),
+  );
+  const tokens = (
+    await Promise.all(
+      segments.map(async (segment) =>
+        Promise.all(
+          (segment.text.match(/\S+/gu) ?? []).map(async (text, ordinal) => ({
+            id: await stableUuid(
+              `manual-import-token:${segment.id}:${ordinal}:${text}`,
+            ),
+            segmentId: segment.id,
+            ordinal,
+            text,
+          })),
+        ),
+      ),
+    )
+  ).flat();
+  const transcript = NormalizedTranscriptSchema.parse({
+    track: {
+      id: trackId,
+      videoId: input.videoId,
+      language: input.language,
+      kind: input.role,
+      source: "manual-import",
+      provider: "researcher-timed-import",
+      ...(input.sourceTrackId ? { sourceTrackId: input.sourceTrackId } : {}),
+      timingPrecision: "cue",
+      schemaVersion: input.schemaVersion,
+      contentSha256,
+      version: input.version,
+    },
+    segments,
+    tokens,
+  });
+  assertOrdered(transcript.segments);
+  return transcript;
+}
+
+function manualTimedImportErrorMessage(
+  code: ManualTimedTranscriptImportError["code"],
+) {
+  switch (code) {
+    case "manual_import_invalid_language":
+      return "The confirmed source language is not eligible for bilingual import.";
+    case "manual_import_invalid_duration":
+      return "A verified positive video duration is required for timed import.";
+    case "manual_import_invalid_utf8":
+      return "A timed transcript is not valid UTF-8.";
+    case "manual_import_too_large":
+      return "A timed transcript exceeds the 20 MB limit.";
+    case "manual_import_empty":
+      return "A timed transcript contains no cues.";
+    case "manual_import_too_many_cues":
+      return "A timed transcript contains too many cues.";
+    case "manual_import_cue_text_too_large":
+      return "A timed transcript cue contains too much text.";
+    case "manual_import_total_text_too_large":
+      return "A timed transcript contains too much cue text.";
+    case "manual_import_cue_order_invalid":
+      return "Timed transcript cues must be in strict source order.";
+    case "manual_import_cue_overlap":
+      return "Timed transcript cues must not overlap.";
+    case "manual_import_cue_out_of_bounds":
+      return "Timed transcript cues must stay within the verified video duration.";
+    default:
+      return "The timed transcript format is invalid.";
   }
 }
 

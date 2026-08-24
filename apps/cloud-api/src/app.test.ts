@@ -46,6 +46,1201 @@ afterEach(async () => {
 });
 
 describe("cloud API", () => {
+  it("routes strict project keyword catalog, suggestion, and review commands", async () => {
+    const actor = {
+      userId: randomUUID(),
+      externalSubject: "fixture:keyword-routes",
+    };
+    const projectId = randomUUID();
+    const suggestionId = randomUUID();
+    const catalogResponse = {
+      projectId,
+      keywordSetVersion: 1,
+      keywords: [],
+      suggestions: [],
+    };
+    const suggestion = {
+      keywordId: randomUUID(),
+      language: "es",
+      phrase: "Cambio climático",
+      idempotencyKey: "suggest-spanish-route",
+    };
+    const review = {
+      action: "reject" as const,
+      expectedSuggestionVersion: 1,
+      expectedKeywordSetVersion: 1,
+      reason: "Needs a more specific phrase",
+      idempotencyKey: "reject-spanish-route",
+    };
+    const listProjectKeywords = vi.fn(async () => catalogResponse);
+    const suggestProjectKeyword = vi.fn(async () => ({
+      resolution: "created" as const,
+      suggestion: { id: suggestionId },
+    }));
+    const reviewProjectKeywordSuggestion = vi.fn(async () => ({
+      projectId,
+      keywordSetVersion: 1,
+      suggestion: { id: suggestionId, state: "rejected" },
+    }));
+    const app = createCloudApi({
+      catalog: {
+        listProjectKeywords,
+        suggestProjectKeyword,
+        reviewProjectKeywordSuggestion,
+      } as unknown as SharedProjectCatalog,
+      authenticate: async () => actor,
+    });
+    apps.add(app);
+
+    expect(
+      (
+        await app.inject({
+          method: "GET",
+          url: `/api/projects/${projectId}/keywords`,
+        })
+      ).json(),
+    ).toEqual(catalogResponse);
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: `/api/projects/${projectId}/keyword-suggestions`,
+          payload: suggestion,
+        })
+      ).statusCode,
+    ).toBe(200);
+    expect(suggestProjectKeyword).toHaveBeenCalledWith(
+      actor,
+      projectId,
+      suggestion,
+    );
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: `/api/projects/${projectId}/keyword-suggestions/${suggestionId}/review`,
+          payload: review,
+        })
+      ).statusCode,
+    ).toBe(200);
+    expect(reviewProjectKeywordSuggestion).toHaveBeenCalledWith(
+      actor,
+      projectId,
+      suggestionId,
+      review,
+    );
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: `/api/projects/${projectId}/keyword-suggestions`,
+          payload: { ...suggestion, proposedLabel: "Not allowed with keyword" },
+        })
+      ).statusCode,
+    ).toBe(400);
+    expect(suggestProjectKeyword).toHaveBeenCalledTimes(1);
+  });
+
+  it("routes strict project keyword scan lifecycle and artifact commands", async () => {
+    const actor = {
+      userId: randomUUID(),
+      externalSubject: "fixture:keyword-scan-routes",
+    };
+    const projectId = randomUUID();
+    const videoId = randomUUID();
+    const scanId = randomUUID();
+    const summary = { projectId, projectVideoId: videoId, status: "queued" };
+    const methods = {
+      getProjectKeywordScanSummary: vi.fn(async () => summary),
+      scheduleProjectKeywordScan: vi.fn(async () => summary),
+      claimProjectKeywordScan: vi.fn(async () => ({ scanId })),
+      getProjectKeywordScanInput: vi.fn(async () => ({ scanId })),
+      heartbeatProjectKeywordScan: vi.fn(async () => ({ scanId })),
+      createProjectKeywordScanArtifactUpload: vi.fn(async () => ({ scanId })),
+      finalizeProjectKeywordScan: vi.fn(async () => ({
+        ...summary,
+        status: "current",
+      })),
+      failProjectKeywordScan: vi.fn(async () => ({
+        ...summary,
+        status: "failed",
+      })),
+      getProjectKeywordScanArtifactDownload: vi.fn(async () => ({ scanId })),
+    };
+    const app = createCloudApi({
+      catalog: methods as unknown as SharedProjectCatalog,
+      authenticate: async () => actor,
+    });
+    apps.add(app);
+
+    expect(
+      (
+        await app.inject({
+          method: "GET",
+          url: `/api/projects/${projectId}/worklist/${videoId}/keyword-scan`,
+        })
+      ).statusCode,
+    ).toBe(200);
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: `/api/projects/${projectId}/worklist/${videoId}/keyword-scan`,
+        })
+      ).statusCode,
+    ).toBe(200);
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: `/api/projects/${projectId}/keyword-scans/claim`,
+          payload: { leaseSeconds: 60 },
+        })
+      ).statusCode,
+    ).toBe(200);
+    expect(methods.claimProjectKeywordScan).toHaveBeenCalledWith(
+      actor,
+      projectId,
+      {
+        leaseSeconds: 60,
+      },
+    );
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: "/api/keyword-scans/claim",
+          payload: { leaseSeconds: 60 },
+        })
+      ).statusCode,
+    ).toBe(200);
+    expect(methods.claimProjectKeywordScan).toHaveBeenCalledWith(
+      actor,
+      undefined,
+      { leaseSeconds: 60 },
+    );
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: `/api/projects/${projectId}/keyword-scans/${scanId}/input`,
+          payload: { attempt: 1 },
+        })
+      ).statusCode,
+    ).toBe(200);
+    expect(methods.getProjectKeywordScanInput).toHaveBeenCalledWith(
+      actor,
+      projectId,
+      scanId,
+      { attempt: 1 },
+    );
+    for (const [suffix, payload] of [
+      ["heartbeat", { attempt: 1, leaseSeconds: 60 }],
+      ["artifact-upload", { attempt: 1 }],
+      [
+        "finalize",
+        {
+          attempt: 1,
+          artifact: {
+            objectKey: `keyword-scans/${projectId}/${videoId}/${scanId}/matches.json`,
+            objectVersionId: "version-1",
+            sha256: "a".repeat(64),
+            sizeBytes: 100,
+            schemaVersion: 1,
+          },
+          occurrenceCount: 0,
+          matchedKeywordCount: 0,
+          keywordCounts: [],
+        },
+      ],
+      [
+        "fail",
+        {
+          attempt: 1,
+          error: { code: "scan_failed", message: "Fixture failure" },
+        },
+      ],
+    ] as const) {
+      expect(
+        (
+          await app.inject({
+            method: "POST",
+            url: `/api/projects/${projectId}/keyword-scans/${scanId}/${suffix}`,
+            payload,
+          })
+        ).statusCode,
+      ).toBe(200);
+    }
+    expect(
+      (
+        await app.inject({
+          method: "GET",
+          url: `/api/projects/${projectId}/keyword-scans/${scanId}/artifact-download`,
+        })
+      ).statusCode,
+    ).toBe(200);
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: `/api/projects/${projectId}/keyword-scans/claim`,
+          payload: { leaseSeconds: 1 },
+        })
+      ).statusCode,
+    ).toBe(400);
+    expect(methods.claimProjectKeywordScan).toHaveBeenCalledTimes(2);
+  });
+
+  it("routes strict project local-processing status and policy commands", async () => {
+    const actor = {
+      userId: randomUUID(),
+      externalSubject: "fixture:local-processing-route",
+    };
+    const projectId = randomUUID();
+    const status = {
+      projectId,
+      policy: { state: "automatic" as const, version: 1 },
+      workload: {
+        queuedJobs: 1,
+        activeJobs: 0,
+        queuedKnownDurationMs: 60_000,
+        activeKnownDurationMs: 0,
+        queuedUnknownDurationCount: 0,
+        activeUnknownDurationCount: 0,
+        unprocessedActiveVideoCount: 1,
+      },
+    };
+    const command = {
+      state: "paused" as const,
+      expectedVersion: 1,
+      idempotencyKey: "pause-local-route-v1",
+    };
+    const updated = {
+      ...status,
+      policy: { state: "paused" as const, version: 2 },
+      enqueuedCount: 0,
+      remainingUnprocessedCount: 1,
+    };
+    const getProjectLocalProcessingStatus = vi.fn(async () => status);
+    const updateProjectLocalProcessing = vi.fn(async () => updated);
+    const app = createCloudApi({
+      catalog: {
+        getProjectLocalProcessingStatus,
+        updateProjectLocalProcessing,
+      } as unknown as SharedProjectCatalog,
+      authenticate: async () => actor,
+    });
+    apps.add(app);
+
+    const read = await app.inject({
+      method: "GET",
+      url: `/api/projects/${projectId}/local-processing`,
+    });
+    expect(read.statusCode).toBe(200);
+    expect(read.json()).toEqual(status);
+    expect(getProjectLocalProcessingStatus).toHaveBeenCalledWith(
+      actor,
+      projectId,
+    );
+    const changed = await app.inject({
+      method: "PATCH",
+      url: `/api/projects/${projectId}/local-processing`,
+      payload: command,
+    });
+    expect(changed.statusCode).toBe(200);
+    expect(changed.json()).toEqual(updated);
+    expect(updateProjectLocalProcessing).toHaveBeenCalledWith(
+      actor,
+      projectId,
+      command,
+    );
+    expect(
+      (
+        await app.inject({
+          method: "PATCH",
+          url: `/api/projects/${projectId}/local-processing`,
+          payload: { ...command, state: "overnight" },
+        })
+      ).statusCode,
+    ).toBe(400);
+    expect(
+      (
+        await app.inject({
+          method: "PATCH",
+          url: "/api/projects/not-a-uuid/local-processing",
+          payload: command,
+        })
+      ).statusCode,
+    ).toBe(400);
+    expect(updateProjectLocalProcessing).toHaveBeenCalledTimes(1);
+  });
+
+  it("routes strict hosted transcription approval commands", async () => {
+    const actor = {
+      userId: randomUUID(),
+      externalSubject: "fixture:hosted-approval-route",
+    };
+    const projectId = randomUUID();
+    const batchId = randomUUID();
+    const now = "2026-08-24T12:00:00.000Z";
+    const command = {
+      action: "approve" as const,
+      idempotencyKey: "hosted-route-v1",
+      expectedVersion: 1,
+    };
+    const response = {
+      projectId,
+      batchId,
+      approval: {
+        state: "approved" as const,
+        version: 2,
+        decidedBy: {
+          userId: actor.userId,
+          handle: "hosted_route_admin",
+          displayName: "Hosted Route Admin",
+        },
+        decidedAt: now,
+      },
+    };
+    const updateHostedTranscriptionApproval = vi.fn(async () => response);
+    const app = createCloudApi({
+      catalog: {
+        updateHostedTranscriptionApproval,
+      } as unknown as SharedProjectCatalog,
+      authenticate: async () => actor,
+    });
+    apps.add(app);
+
+    const approved = await app.inject({
+      method: "POST",
+      url: `/api/projects/${projectId}/transcription-batches/${batchId}/hosted-approval`,
+      payload: command,
+    });
+    expect(approved.statusCode).toBe(200);
+    expect(approved.json()).toEqual(response);
+    expect(updateHostedTranscriptionApproval).toHaveBeenCalledWith(
+      actor,
+      projectId,
+      batchId,
+      command,
+    );
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: `/api/projects/${projectId}/transcription-batches/${batchId}/hosted-approval`,
+          payload: { ...command, unexpected: true },
+        })
+      ).statusCode,
+    ).toBe(400);
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: `/api/projects/${projectId}/transcription-batches/not-a-uuid/hosted-approval`,
+          payload: command,
+        })
+      ).statusCode,
+    ).toBe(400);
+    expect(updateHostedTranscriptionApproval).toHaveBeenCalledTimes(1);
+  });
+
+  it("routes bounded canonical worklist reads and optimistic own-flag changes", async () => {
+    const actor = {
+      userId: randomUUID(),
+      externalSubject: "fixture:worklist-routes",
+    };
+    const projectId = randomUUID();
+    const videoId = randomUUID();
+    const now = "2026-08-24T12:00:00.000Z";
+    const page = { items: [], total: 0 };
+    const priorityResponse = {
+      projectId,
+      priority: "high" as const,
+      items: [
+        {
+          projectId,
+          videoId,
+          priority: "high" as const,
+          completionPolicy: "researcher_or_administrator" as const,
+          projectVideoVersion: 2,
+          updatedAt: now,
+        },
+      ],
+    };
+    const flagResponse = {
+      projectId,
+      videoId,
+      flag: {
+        active: false,
+        version: 2,
+        createdAt: now,
+        updatedAt: now,
+        deactivatedAt: now,
+      },
+    };
+    const listProjectVideoWorklist = vi.fn(async () => page);
+    const updateOwnProjectVideoFlag = vi.fn(async () => flagResponse);
+    const bulkUpdateProjectVideoPriority = vi.fn(async () => priorityResponse);
+    const app = createCloudApi({
+      catalog: {
+        listProjectVideoWorklist,
+        updateOwnProjectVideoFlag,
+        bulkUpdateProjectVideoPriority,
+      } as unknown as SharedProjectCatalog,
+      authenticate: async () => actor,
+    });
+    apps.add(app);
+
+    const listed = await app.inject({
+      method: "GET",
+      url: `/api/projects/${projectId}/worklist?limit=10&view=queue`,
+    });
+    expect(listed.statusCode).toBe(200);
+    expect(listed.json()).toEqual(page);
+    expect(listProjectVideoWorklist).toHaveBeenCalledWith(actor, projectId, {
+      limit: 10,
+      view: "queue",
+    });
+    expect(
+      (
+        await app.inject({
+          method: "GET",
+          url: `/api/projects/${projectId}/worklist?limit=51`,
+        })
+      ).statusCode,
+    ).toBe(400);
+    expect(
+      (
+        await app.inject({
+          method: "GET",
+          url: `/api/projects/${projectId}/worklist?unexpected=true`,
+        })
+      ).statusCode,
+    ).toBe(400);
+    expect(
+      (
+        await app.inject({
+          method: "GET",
+          url: `/api/projects/${projectId}/worklist?view=archived`,
+        })
+      ).statusCode,
+    ).toBe(400);
+
+    const updated = await app.inject({
+      method: "PATCH",
+      url: `/api/projects/${projectId}/worklist/${videoId}/flag`,
+      payload: { active: false, expectedVersion: 1 },
+    });
+    expect(updated.statusCode).toBe(200);
+    expect(updated.json()).toEqual(flagResponse);
+    expect(updateOwnProjectVideoFlag).toHaveBeenCalledWith(
+      actor,
+      projectId,
+      videoId,
+      { active: false, expectedVersion: 1 },
+    );
+    expect(
+      (
+        await app.inject({
+          method: "PATCH",
+          url: `/api/projects/${projectId}/worklist/${videoId}/flag`,
+          payload: { active: true, expectedVersion: 2, unexpected: true },
+        })
+      ).statusCode,
+    ).toBe(400);
+
+    const priorityCommand = {
+      priority: "high",
+      items: [{ videoId, expectedProjectVideoVersion: 1 }],
+      idempotencyKey: "bulk-priority-v1",
+    };
+    const prioritized = await app.inject({
+      method: "PATCH",
+      url: `/api/projects/${projectId}/worklist/priority`,
+      payload: priorityCommand,
+    });
+    expect(prioritized.statusCode).toBe(200);
+    expect(prioritized.json()).toEqual(priorityResponse);
+    expect(bulkUpdateProjectVideoPriority).toHaveBeenCalledWith(
+      actor,
+      projectId,
+      priorityCommand,
+    );
+    expect(
+      (
+        await app.inject({
+          method: "PATCH",
+          url: `/api/projects/${projectId}/worklist/priority`,
+          payload: { ...priorityCommand, unexpected: true },
+        })
+      ).statusCode,
+    ).toBe(400);
+    expect(
+      (
+        await app.inject({
+          method: "PATCH",
+          url: `/api/projects/${projectId}/worklist/priority`,
+          payload: {
+            ...priorityCommand,
+            items: [priorityCommand.items[0], priorityCommand.items[0]],
+          },
+        })
+      ).statusCode,
+    ).toBe(400);
+    expect(bulkUpdateProjectVideoPriority).toHaveBeenCalledTimes(1);
+  });
+
+  it("routes strict bulk triage and per-user activity commands", async () => {
+    const actor = {
+      userId: randomUUID(),
+      externalSubject: "fixture:triage-activity-routes",
+    };
+    const projectId = randomUUID();
+    const videoId = randomUUID();
+    const eventId = randomUUID();
+    const now = "2026-08-24T12:00:00.000Z";
+    const triageCommand = {
+      action: "dismiss" as const,
+      idempotencyKey: "dismiss-route-v1",
+      items: [{ videoId, expectedProjectVideoVersion: 3 }],
+      reason: "Not relevant to this cut.",
+    };
+    const actorSummary = {
+      userId: actor.userId,
+      handle: "triage_admin",
+      displayName: "Triage Admin",
+    };
+    const triageResponse = {
+      projectId,
+      items: [
+        {
+          videoId,
+          projectVideoVersion: 4,
+          triage: {
+            state: "dismissed" as const,
+            version: 2,
+            dismissedAt: now,
+            dismissedBy: actorSummary,
+            reason: triageCommand.reason,
+          },
+        },
+      ],
+      cancellation: {
+        queuedJobsCanceled: 1,
+        activeJobsRequested: 0,
+        requestsRevoked: 0,
+      },
+    };
+    const receipt = {
+      eventId,
+      projectId,
+      videoId,
+      videoTitle: "Activity fixture",
+      eventType: "video_dismissed" as const,
+      actor: actorSummary,
+      reason: triageCommand.reason,
+      state: "unread" as const,
+      version: 1,
+      createdAt: now,
+    };
+    const activityPage = { items: [receipt], unreadCount: 1 };
+    const seenResponse = {
+      projectId,
+      items: [{ ...receipt, state: "seen" as const, version: 2, seenAt: now }],
+    };
+    const updateProjectVideoTriage = vi.fn(async () => triageResponse);
+    const listProjectVideoActivity = vi.fn(async () => activityPage);
+    const markProjectVideoActivitySeen = vi.fn(async () => seenResponse);
+    const app = createCloudApi({
+      catalog: {
+        updateProjectVideoTriage,
+        listProjectVideoActivity,
+        markProjectVideoActivitySeen,
+      } as unknown as SharedProjectCatalog,
+      authenticate: async () => actor,
+    });
+    apps.add(app);
+
+    const dismissed = await app.inject({
+      method: "PATCH",
+      url: `/api/projects/${projectId}/worklist/triage`,
+      payload: triageCommand,
+    });
+    expect(dismissed.statusCode).toBe(200);
+    expect(dismissed.json()).toEqual(triageResponse);
+    expect(updateProjectVideoTriage).toHaveBeenCalledWith(
+      actor,
+      projectId,
+      triageCommand,
+    );
+
+    const activity = await app.inject({
+      method: "GET",
+      url: `/api/projects/${projectId}/activity?state=unread&limit=10&cursor=next`,
+    });
+    expect(activity.statusCode).toBe(200);
+    expect(activity.json()).toEqual(activityPage);
+    expect(listProjectVideoActivity).toHaveBeenCalledWith(actor, projectId, {
+      state: "unread",
+      limit: 10,
+      cursor: "next",
+    });
+
+    const seenCommand = { items: [{ eventId, expectedVersion: 1 }] };
+    const seen = await app.inject({
+      method: "PATCH",
+      url: `/api/projects/${projectId}/activity/seen`,
+      payload: seenCommand,
+    });
+    expect(seen.statusCode).toBe(200);
+    expect(seen.json()).toEqual(seenResponse);
+    expect(markProjectVideoActivitySeen).toHaveBeenCalledWith(
+      actor,
+      projectId,
+      seenCommand,
+    );
+
+    for (const request of [
+      {
+        method: "PATCH" as const,
+        url: `/api/projects/${projectId}/worklist/triage`,
+        payload: { ...triageCommand, unexpected: true },
+      },
+      {
+        method: "GET" as const,
+        url: `/api/projects/${projectId}/activity?state=pending`,
+      },
+      {
+        method: "PATCH" as const,
+        url: `/api/projects/${projectId}/activity/seen`,
+        payload: { ...seenCommand, unexpected: true },
+      },
+    ]) {
+      expect((await app.inject(request)).statusCode).toBe(400);
+    }
+  });
+
+  it("returns the worker cancellation heartbeat outcome without renewing a lease", async () => {
+    const actor = {
+      userId: randomUUID(),
+      externalSubject: "fixture:canceled-heartbeat-route",
+    };
+    const jobId = randomUUID();
+    const requestedAt = "2026-08-24T12:00:00.000Z";
+    const heartbeatTranscriptionJob = vi.fn(async () => ({
+      status: "cancellation_requested" as const,
+      requestedAt,
+    }));
+    const app = createCloudApi({
+      catalog: {
+        heartbeatTranscriptionJob,
+      } as unknown as SharedProjectCatalog,
+      authenticate: async () => actor,
+    });
+    apps.add(app);
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/api/transcription-jobs/${jobId}/heartbeat`,
+      payload: { attempt: 2, leaseSeconds: 120, stage: "transcribing" },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({
+      status: "cancellation_requested",
+      requestedAt,
+    });
+    expect(heartbeatTranscriptionJob).toHaveBeenCalledWith(
+      actor,
+      jobId,
+      2,
+      120,
+      "transcribing",
+    );
+  });
+
+  it("routes strict claim, governance, and review-cycle commands", async () => {
+    const actor = {
+      userId: randomUUID(),
+      externalSubject: "fixture:review-coordination-routes",
+    };
+    const projectId = randomUUID();
+    const videoId = randomUUID();
+    const cycleId = randomUUID();
+    const now = "2026-08-24T12:00:00.000Z";
+    const claimResponse = {
+      projectId,
+      videoId,
+      claim: {
+        claimant: {
+          userId: actor.userId,
+          handle: "review_coordinator",
+          displayName: "Review Coordinator",
+        },
+        isCurrentUser: true,
+        active: true,
+        generation: 1,
+        version: 1,
+        claimedAt: now,
+        heartbeatAt: now,
+        expiresAt: "2026-08-24T12:05:00.000Z",
+      },
+    };
+    const governanceResponse = {
+      projectId,
+      videoId,
+      priority: "high",
+      completionPolicy: "administrator_only",
+      projectVideoVersion: 2,
+      updatedAt: now,
+    };
+    const reviewResponse = {
+      projectId,
+      videoId,
+      review: {
+        id: cycleId,
+        cycleNumber: 1,
+        status: "completed",
+        version: 2,
+        openedAt: now,
+        completionPolicy: "administrator_only",
+        completedAt: now,
+        completedBy: {
+          userId: actor.userId,
+          handle: "review_coordinator",
+          displayName: "Review Coordinator",
+        },
+        completionBasis: "without_ready_transcript_acknowledged",
+      },
+    };
+    const updateProjectVideoClaim = vi.fn(async () => claimResponse);
+    const updateProjectVideoGovernance = vi.fn(async () => governanceResponse);
+    const updateProjectVideoReview = vi.fn(async () => reviewResponse);
+    const app = createCloudApi({
+      catalog: {
+        updateProjectVideoClaim,
+        updateProjectVideoGovernance,
+        updateProjectVideoReview,
+      } as unknown as SharedProjectCatalog,
+      authenticate: async () => actor,
+    });
+    apps.add(app);
+
+    const claim = {
+      action: "claim",
+      idempotencyKey: "route-claim",
+      expectedClaimVersion: 0,
+      leaseSeconds: 300,
+      takeoverConfirmed: false,
+    };
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: `/api/projects/${projectId}/worklist/${videoId}/claim`,
+          payload: claim,
+        })
+      ).json(),
+    ).toEqual(claimResponse);
+    expect(updateProjectVideoClaim).toHaveBeenCalledWith(
+      actor,
+      projectId,
+      videoId,
+      claim,
+    );
+
+    const governance = {
+      idempotencyKey: "route-governance",
+      expectedProjectVideoVersion: 1,
+      priority: "high",
+      completionPolicy: "administrator_only",
+    };
+    expect(
+      (
+        await app.inject({
+          method: "PATCH",
+          url: `/api/projects/${projectId}/worklist/${videoId}/governance`,
+          payload: governance,
+        })
+      ).json(),
+    ).toEqual(governanceResponse);
+    expect(updateProjectVideoGovernance).toHaveBeenCalledWith(
+      actor,
+      projectId,
+      videoId,
+      governance,
+    );
+
+    const review = {
+      action: "complete",
+      idempotencyKey: "route-review",
+      expectedCycleId: cycleId,
+      expectedCycleVersion: 1,
+      acknowledgeTranscriptUnavailable: true,
+    };
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: `/api/projects/${projectId}/worklist/${videoId}/review`,
+          payload: review,
+        })
+      ).json(),
+    ).toEqual(reviewResponse);
+    expect(updateProjectVideoReview).toHaveBeenCalledWith(
+      actor,
+      projectId,
+      videoId,
+      review,
+    );
+
+    for (const [path, payload] of [
+      ["claim", { ...claim, unexpected: true }],
+      ["governance", { ...governance, unexpected: true }],
+      ["review", { ...review, unexpected: true }],
+    ] as const) {
+      expect(
+        (
+          await app.inject({
+            method: path === "governance" ? "PATCH" : "POST",
+            url: `/api/projects/${projectId}/worklist/${videoId}/${path}`,
+            payload,
+          })
+        ).statusCode,
+      ).toBe(400);
+    }
+  });
+
+  it("routes strict timed transcript import commands through the project-video boundary", async () => {
+    const actor = {
+      userId: randomUUID(),
+      externalSubject: "fixture:manual-importer",
+    };
+    const projectId = randomUUID();
+    const videoId = randomUUID();
+    const importId = randomUUID();
+    const batchItemId = randomUUID();
+    const decisionId = randomUUID();
+    const candidateId = randomUUID();
+    const transcriptVersionId = randomUUID();
+    const originalKey = "private-original";
+    const englishKey = "private-english";
+    const grant = {
+      importId,
+      projectId,
+      catalogVideoId: videoId,
+      batchItemId,
+      sourceLanguage: "dz",
+      languageDecisionId: decisionId,
+      languageDecisionVersion: 1,
+      expiresAt: "2026-08-24T00:15:00.000Z",
+      targets: [
+        {
+          role: "original" as const,
+          format: "srt" as const,
+          objectKey: originalKey,
+          uploadUrl: "memory://original",
+        },
+        {
+          role: "english" as const,
+          format: "vtt" as const,
+          objectKey: englishKey,
+          uploadUrl: "memory://english",
+        },
+      ],
+    };
+    const status = {
+      importId,
+      projectId,
+      catalogVideoId: videoId,
+      batchItemId,
+      state: "staged" as const,
+      version: 1,
+      sourceLanguage: "dz",
+      targetLanguage: "en" as const,
+      languageDecisionId: decisionId,
+      languageDecisionVersion: 1,
+      createdAt: "2026-08-24T00:00:00.000Z",
+      expiresAt: "2026-08-24T00:15:00.000Z",
+    };
+    const createManualTimedTranscriptImport = vi.fn(async () => grant);
+    const finalizeManualTimedTranscriptImport = vi.fn(async () => status);
+    const getManualTimedTranscriptImportForBatchItem = vi.fn(
+      async () => status,
+    );
+    const reviewManualTimedTranscriptCandidate = vi.fn(async () => ({
+      candidateId,
+    }));
+    const activateManualTimedTranscriptCandidate = vi.fn(async () => ({
+      candidateId,
+      state: "activated",
+    }));
+    const app = createCloudApi({
+      catalog: {
+        createManualTimedTranscriptImport,
+        finalizeManualTimedTranscriptImport,
+        getManualTimedTranscriptImportForBatchItem,
+        reviewManualTimedTranscriptCandidate,
+        activateManualTimedTranscriptCandidate,
+      } as unknown as SharedProjectCatalog,
+      authenticate: async () => actor,
+    });
+    apps.add(app);
+    const create = {
+      idempotencyKey: "manual-import-v1",
+      languageDecisionId: decisionId,
+      expectedDecisionVersion: 1,
+      batchItemId,
+      expectedBatchItemVersion: 1,
+      original: { format: "srt", byteSize: 12, sha256: "a".repeat(64) },
+      english: { format: "vtt", byteSize: 18, sha256: "b".repeat(64) },
+    };
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: `/api/projects/${projectId}/videos/${videoId}/timed-transcript-imports`,
+          payload: create,
+        })
+      ).statusCode,
+    ).toBe(201);
+    expect(createManualTimedTranscriptImport).toHaveBeenCalledWith(
+      actor,
+      projectId,
+      videoId,
+      create,
+    );
+    const finalize = {
+      idempotencyKey: "manual-finalize-v1",
+      original: { objectVersionId: "v1", byteSize: 12, sha256: "a".repeat(64) },
+      english: { objectVersionId: "v2", byteSize: 18, sha256: "b".repeat(64) },
+    };
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: `/api/projects/${projectId}/videos/${videoId}/timed-transcript-imports/${importId}/finalize`,
+          payload: finalize,
+        })
+      ).statusCode,
+    ).toBe(200);
+    expect(finalizeManualTimedTranscriptImport).toHaveBeenCalledWith(
+      actor,
+      projectId,
+      videoId,
+      importId,
+      finalize,
+    );
+    expect(
+      (
+        await app.inject({
+          method: "GET",
+          url: `/api/projects/${projectId}/videos/${videoId}/timed-transcript-imports?batchItemId=${batchItemId}`,
+        })
+      ).statusCode,
+    ).toBe(200);
+    expect(getManualTimedTranscriptImportForBatchItem).toHaveBeenCalledWith(
+      actor,
+      projectId,
+      videoId,
+      batchItemId,
+    );
+    const reviewUrl = `/api/projects/${projectId}/videos/${videoId}/timed-transcript-candidates/${candidateId}/review`;
+    expect(
+      (
+        await app.inject({
+          method: "GET",
+          url: `${reviewUrl}?offset=25&limit=50`,
+        })
+      ).statusCode,
+    ).toBe(200);
+    expect(reviewManualTimedTranscriptCandidate).toHaveBeenCalledWith(
+      actor,
+      projectId,
+      videoId,
+      candidateId,
+      { offset: 25, limit: 50 },
+    );
+    expect(
+      (await app.inject({ method: "GET", url: `${reviewUrl}?limit=101` }))
+        .statusCode,
+    ).toBe(400);
+    const activation = {
+      idempotencyKey: "activate-manual-v1",
+      importId,
+      candidateId,
+      transcriptVersionId,
+      expectedProjectVideoVersion: 3,
+      languageDecisionId: decisionId,
+      expectedLanguageDecisionVersion: 1,
+    };
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: `/api/projects/${projectId}/videos/${videoId}/timed-transcript-candidates/${candidateId}/activate`,
+          payload: activation,
+        })
+      ).statusCode,
+    ).toBe(200);
+    expect(activateManualTimedTranscriptCandidate).toHaveBeenCalledWith(
+      actor,
+      projectId,
+      videoId,
+      activation,
+    );
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: `/api/projects/${projectId}/videos/${videoId}/timed-transcript-candidates/${randomUUID()}/activate`,
+          payload: activation,
+        })
+      ).statusCode,
+    ).toBe(409);
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: `/api/projects/${projectId}/videos/${videoId}/timed-transcript-imports`,
+          payload: {
+            ...create,
+            original: { ...create.original, localPath: "/private" },
+          },
+        })
+      ).statusCode,
+    ).toBe(400);
+  });
+
+  it("routes bounded project-video language commands without accepting raw evidence", async () => {
+    const actor = {
+      userId: randomUUID(),
+      externalSubject: "fixture:language-owner",
+    };
+    const projectId = randomUUID();
+    const videoId = randomUUID();
+    const jobId = randomUUID();
+    const decisionId = randomUUID();
+    const evidenceId = randomUUID();
+    const gate = {
+      state: "ready" as const,
+      status: "confirmed" as const,
+      decision: {
+        id: decisionId,
+        projectId,
+        videoId,
+        decisionVersion: 1,
+        status: "confirmed" as const,
+        basis: "user_confirmation" as const,
+        resolvedLanguage: "dz",
+        actorId: actor.userId,
+        createdAt: "2024-01-01T00:00:00.000Z",
+      },
+      remediationReason: "none" as const,
+    };
+    const getProjectVideoLanguageGate = vi.fn(async () => gate);
+    const confirmProjectVideoLanguageDecision = vi.fn(async () => ({
+      decision: gate.decision,
+      gate,
+    }));
+    const observeWorkerLanguageEvidence = vi.fn(async () => ({
+      evidence: {
+        id: evidenceId,
+        projectId,
+        videoId,
+        source: "caption" as const,
+        provider: "youtube",
+        reportedLanguage: "ko",
+        captionKind: "automatic" as const,
+        jobId,
+        attempt: 1,
+        createdAt: "2024-01-01T00:00:00.000Z",
+      },
+      gate,
+    }));
+    const app = createCloudApi({
+      catalog: {
+        getProjectVideoLanguageGate,
+        confirmProjectVideoLanguageDecision,
+        observeWorkerLanguageEvidence,
+      } as unknown as SharedProjectCatalog,
+      authenticate: async () => actor,
+    });
+    apps.add(app);
+
+    expect(
+      (
+        await app.inject({
+          method: "GET",
+          url: `/api/projects/${projectId}/videos/${videoId}/language-gate`,
+        })
+      ).statusCode,
+    ).toBe(200);
+    const command = {
+      idempotencyKey: "confirm-dz-v1",
+      expectedDecisionVersion: 0,
+      resolvedLanguage: "dz",
+      basis: "user_confirmation",
+    };
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: `/api/projects/${projectId}/videos/${videoId}/language-decisions`,
+          payload: command,
+        })
+      ).statusCode,
+    ).toBe(200);
+    expect(confirmProjectVideoLanguageDecision).toHaveBeenCalledWith(
+      actor,
+      projectId,
+      videoId,
+      command,
+    );
+
+    const observation = {
+      attempt: 1,
+      evidence: {
+        id: evidenceId,
+        projectId,
+        videoId,
+        source: "caption",
+        provider: "youtube",
+        reportedLanguage: "ko",
+        captionKind: "automatic",
+        jobId,
+        attempt: 1,
+        createdAt: "2024-01-01T00:00:00.000Z",
+      },
+    };
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: `/api/transcription-jobs/${jobId}/language-evidence`,
+          payload: observation,
+        })
+      ).statusCode,
+    ).toBe(200);
+    expect(observeWorkerLanguageEvidence).toHaveBeenCalledWith(
+      actor,
+      jobId,
+      observation,
+    );
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: `/api/transcription-jobs/${jobId}/language-evidence`,
+          payload: {
+            ...observation,
+            evidence: { ...observation.evidence, rawTrackUrl: "private://x" },
+          },
+        })
+      ).statusCode,
+    ).toBe(400);
+  });
+
   it("reports a contract-valid health response", async () => {
     const app = createCloudApi();
     apps.add(app);
@@ -225,6 +1420,223 @@ describe("cloud API", () => {
     });
     expect(listed.statusCode).toBe(200);
     expect(listed.json()).toMatchObject([{ name: "Shared research" }]);
+  });
+
+  it("enforces strict handle, project-authority, summary, and member routes", async () => {
+    const database = new PGlite();
+    databases.add(database);
+    await runCloudMigrations(database);
+    const catalog = new SharedProjectCatalog(
+      database,
+      new MemoryTranscriptObjectStore(),
+    );
+    const app = createCloudApi({
+      catalog,
+      authenticate: authenticateDevBearer,
+    });
+    apps.add(app);
+    const identities = Object.fromEntries(
+      ["owner", "administrator", "researcher", "second-administrator"].map(
+        (name) => {
+          const id = randomUUID();
+          return [
+            name,
+            {
+              id,
+              authorization: `Bearer ${id}|fixture:authority-api:${name}`,
+            },
+          ];
+        },
+      ),
+    ) as Record<string, { id: string; authorization: string }>;
+    const owner = identities.owner!;
+
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: "/api/session/register",
+          headers: { authorization: owner.authorization },
+          payload: { displayName: "Owner", handle: "@Authority_Owner" },
+        })
+      ).json(),
+    ).toMatchObject({ handle: "authority_owner", displayName: "Owner" });
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: "/api/session/register",
+          headers: {
+            authorization: identities.administrator!.authorization,
+          },
+          payload: {
+            displayName: "Collision",
+            handle: "AUTHORITY_OWNER",
+          },
+        })
+      ).statusCode,
+    ).toBe(409);
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: "/api/session/register",
+          headers: { authorization: identities.researcher!.authorization },
+          payload: { displayName: "Invalid", handle: "not-valid-handle" },
+        })
+      ).statusCode,
+    ).toBe(400);
+    for (const [name, identity] of Object.entries(identities).filter(
+      ([name]) => name !== "owner",
+    )) {
+      expect(
+        (
+          await app.inject({
+            method: "POST",
+            url: "/api/session/register",
+            headers: { authorization: identity.authorization },
+            payload: {
+              displayName: name,
+              handle: `api_${name.replaceAll("-", "_")}`,
+            },
+          })
+        ).statusCode,
+      ).toBe(200);
+    }
+
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: "/api/projects",
+          headers: { authorization: owner.authorization },
+          payload: {
+            name: "Invalid personal",
+            kind: "personal",
+            visibility: "open_to_join",
+          },
+        })
+      ).statusCode,
+    ).toBe(400);
+    const personalResponse = await app.inject({
+      method: "POST",
+      url: "/api/projects",
+      headers: { authorization: owner.authorization },
+      payload: { name: "Personal authority", kind: "personal" },
+    });
+    expect(personalResponse.statusCode).toBe(201);
+    expect(personalResponse.json()).toMatchObject({
+      kind: "personal",
+      visibility: "private",
+    });
+    const sharedResponse = await app.inject({
+      method: "POST",
+      url: "/api/projects",
+      headers: { authorization: owner.authorization },
+      payload: {
+        name: "Shared authority",
+        kind: "shared",
+        visibility: "invitation_only",
+      },
+    });
+    expect(sharedResponse.statusCode).toBe(201);
+    const sharedProjectId = sharedResponse.json<{ id: string }>().id;
+
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: `/api/projects/${sharedProjectId}/members`,
+          headers: { authorization: owner.authorization },
+          payload: { userId: identities.researcher!.id, role: "viewer" },
+        })
+      ).statusCode,
+    ).toBe(400);
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: `/api/projects/${personalResponse.json<{ id: string }>().id}/members`,
+          headers: { authorization: owner.authorization },
+          payload: {
+            userId: identities.researcher!.id,
+            role: "researcher",
+          },
+        })
+      ).statusCode,
+    ).toBe(409);
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: `/api/projects/${sharedProjectId}/members`,
+          headers: { authorization: owner.authorization },
+          payload: {
+            userId: identities.administrator!.id,
+            role: "administrator",
+          },
+        })
+      ).statusCode,
+    ).toBe(204);
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: `/api/projects/${sharedProjectId}/members`,
+          headers: { authorization: identities.administrator!.authorization },
+          payload: {
+            userId: identities.researcher!.id,
+            role: "researcher",
+          },
+        })
+      ).statusCode,
+    ).toBe(204);
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: `/api/projects/${sharedProjectId}/members`,
+          headers: { authorization: identities.administrator!.authorization },
+          payload: {
+            userId: identities["second-administrator"]!.id,
+            role: "administrator",
+          },
+        })
+      ).statusCode,
+    ).toBe(403);
+
+    const ownerProjects = await app.inject({
+      method: "GET",
+      url: "/api/projects",
+      headers: { authorization: owner.authorization },
+    });
+    expect(ownerProjects.statusCode).toBe(200);
+    expect(ownerProjects.json()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: sharedProjectId,
+          kind: "shared",
+          visibility: "invitation_only",
+          currentUserRole: "owner",
+          memberCount: 3,
+        }),
+      ]),
+    );
+    expect(
+      (
+        await app.inject({
+          method: "GET",
+          url: "/api/projects",
+          headers: { authorization: identities.researcher!.authorization },
+        })
+      ).json(),
+    ).toEqual([
+      expect.objectContaining({
+        id: sharedProjectId,
+        currentUserRole: "researcher",
+        memberCount: 3,
+      }),
+    ]);
   });
 
   it("serves self-only personal and authorized project preset catalogs through strict routes", async () => {
@@ -1171,6 +2583,7 @@ describe("cloud API", () => {
         title: "IFrame API demo",
         channel: "Google Developers",
         durationMs: 60_000,
+        sourceLanguage: "en",
       }),
     };
     const app = createCloudApi({
@@ -1208,7 +2621,42 @@ describe("cloud API", () => {
       title: "IFrame API demo",
       channel: "Google Developers",
       durationMs: 60_000,
+      sourceLanguage: "en",
     });
+
+    const localProcessing = await app.inject({
+      method: "GET",
+      url: `/api/projects/${projectId}/local-processing`,
+      headers: { authorization },
+    });
+    expect(localProcessing.statusCode).toBe(200);
+    expect(localProcessing.json()).toMatchObject({
+      policy: { state: "automatic", version: 1 },
+      workload: {
+        queuedJobs: 1,
+        queuedKnownDurationMs: 60_000,
+        unprocessedActiveVideoCount: 0,
+      },
+    });
+    expect(
+      (
+        await database.query<{
+          source_policy: string;
+          processing_origin: string;
+        }>(
+          `SELECT b.source_policy, b.processing_origin
+           FROM transcription_batch_items bi
+           JOIN transcription_batches b ON b.id = bi.batch_id
+           WHERE b.project_id = $1`,
+          [projectId],
+        )
+      ).rows,
+    ).toEqual([
+      {
+        source_policy: "captions-then-generate",
+        processing_origin: "project_local",
+      },
+    ]);
 
     const listed = await app.inject({
       method: "GET",
@@ -1237,6 +2685,7 @@ describe("cloud API", () => {
           title: `Fixture ${videoId}`,
           channel: "Fixture channel",
           durationMs: 90_000,
+          sourceLanguage: "en",
         };
       },
     };
@@ -1577,6 +3026,10 @@ describe("cloud API", () => {
       payload: { attempt: 1, leaseSeconds: 15, stage: "resolving" },
     });
     expect(heartbeat.statusCode).toBe(200);
+    expect(heartbeat.json()).toMatchObject({
+      status: "active",
+      lease: { jobId, workerId: ownerId, attempt: 1 },
+    });
     const pausedAfterStart = await app.inject({
       method: "POST",
       url: `/api/projects/${projectId}/transcription-batches/${createdBody.batch.id}/control`,
@@ -1737,6 +3190,7 @@ describe("cloud API", () => {
         resolve: async (videoId) => ({
           videoId,
           title: `Control fixture ${videoId}`,
+          sourceLanguage: "en",
         }),
       },
     });
