@@ -610,4 +610,10 @@ infra/aws        storage, API, database, queues, identity, monitoring
 Milestones 1–6 and M7-04 are complete. M7-01's real AWS change-set and Cognito
 acceptance remain an explicit external prerequisite. The next unstarted local
 implementation slice is M7-05 complete export integration, and it must begin
-with its own bounded active specification.
+with its own bounded active specification. After M7-05 and its deterministic
+packaged-app regression establish a known-good baseline, follow the priority and
+dependency waves in `specs/future/PILOT-punch-list.md`; do not wait for externally
+gated M7-06 live dogfood before beginning bounded PUNCH-001 through PUNCH-008
+work. M7-06 remains the final M7 validation stream when its required external
+inputs are available, and the expanded workflow must be dogfooded again before
+signed-pilot distribution.

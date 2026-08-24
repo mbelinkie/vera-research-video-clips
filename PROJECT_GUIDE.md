@@ -1932,6 +1932,16 @@ Execute six bounded slices:
    degradation, low-space behavior, source cleanup, and persistent projects,
    transcripts, clips, jobs, and artifacts.
 
+M7-05 plus a deterministic packaged-app regression establishes the implementation
+baseline for the core pilot punch-list work. M7-06 remains the final M7
+validation/exit stream when its production-cloud, model-pin, and authorized
+source inputs are available, but it is not a technical prerequisite for bounded
+PUNCH-001 through PUNCH-008 implementation. After M7-05, follow the priority,
+dependency, and implementation waves in
+`specs/future/PILOT-punch-list.md`; dogfood the expanded workflow again before
+signed-pilot distribution. M7-01 and M7-06 external blockers must remain explicit
+and must not be replaced by fabricated live evidence.
+
 Exit only when the local `.app` completes project creation, real transcript
 resolution/transcription/translation, review, all three selection actions, the
 Clip Library, and real export/recovery without a terminal, manually launched
