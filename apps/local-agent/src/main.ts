@@ -12,6 +12,7 @@ import {
   ClipLibraryPageSchema,
   ClipLibraryQuerySchema,
   ClaimLoggedExportDeliveryResponseSchema,
+  ProcessAcceptedLoggedExportResponseSchema,
   LoggedExportDeliverySchema,
   LoggedExportFailureSchema,
   LoggedExportCanceledSchema,
@@ -79,16 +80,30 @@ import { LocalLoggedExportSourceGroupCoordinator } from "./shared-source-group.t
 import { LocalRuntimeCoordinator } from "./local-runtime.ts";
 import { LocalDesktopSetupService } from "./desktop-setup.ts";
 import { CloudDerivedTranslationClient } from "./derived-translation-client.ts";
+import { LocalExportSupervisor } from "./export-supervisor.ts";
 
 const config = loadConfig();
 await mkdir(config.dataDir, { recursive: true });
 const database = openLocalDatabase(join(config.dataDir, "local.sqlite"));
 runLocalMigrations(database);
 const exportQueue = new LocalExportQueue(database);
+let exportSupervisor: LocalExportSupervisor | undefined;
 const desktopSetupRepository = new LocalDesktopSetupRepository(database);
 const desktopSetup = new LocalDesktopSetupService(desktopSetupRepository, {
   measuredOperationBytes: (target) =>
     target === "output_root" ? measurePendingExportOutputBytes(exportQueue) : 0,
+  exportWorkerStatus: () => {
+    const snapshot = exportSupervisor?.snapshot();
+    const available =
+      snapshot?.enabled === true &&
+      ["idle", "processing_logged", "processing_export_only"].includes(
+        snapshot.state,
+      );
+    return {
+      available,
+      ...(snapshot?.issue ? { issue: snapshot.issue } : {}),
+    };
+  },
 });
 const startupReadiness = await desktopSetup.getReadinessReport();
 const readyComponents = new Set(
@@ -284,7 +299,100 @@ const clipLibraryExports = new ClipLibraryExportOperationService({
     callCloudExportBatch(projectId, command, authorization),
   capacity: exportStorageCapacity,
 });
-const app = createLocalAgent({
+const executeLocalExport = (input: {
+  requestId: string;
+  authorizationConfirmed: boolean;
+  signal?: AbortSignal;
+  requireLoggedExecution?: boolean;
+}) =>
+  runLocalExportOnce(input, {
+    queue: exportQueue,
+    ...(sourceProvider ? { sourceProvider } : {}),
+    inspector: sourceInspector,
+    renderer: rangeRenderer,
+    thumbnailExtractor,
+    thumbnailInspector,
+    capabilityProvider,
+    ...(sharedSourceCoordinator ? { sharedSourceCoordinator } : {}),
+    storageGuard: exportStorageGuard,
+    dataRoot: managedExportRoot,
+    exportRoot: managedExportRoot,
+  });
+
+let app!: ReturnType<typeof createLocalAgent>;
+const desktopSessionSecret = process.env.DESKTOP_SESSION_SECRET;
+if (desktopSessionSecret) {
+  exportSupervisor = new LocalExportSupervisor({
+    canRun: async () => {
+      const snapshot = desktopSetup.getSnapshot();
+      if (!snapshot.setup?.workerEnabled) return false;
+      const readiness = await desktopSetup.getReadinessReport();
+      const health = new Map(
+        readiness.components.map((component) => [
+          component.component,
+          component.state,
+        ]),
+      );
+      return (
+        [
+          "output_root",
+          "export_source_provider",
+          "ffmpeg",
+          "ffprobe",
+          "yt_dlp",
+          "output_storage",
+        ] as const
+      ).every((component) => {
+        const state = health.get(component);
+        return (
+          state === "ready" ||
+          (component === "output_storage" && state === "degraded")
+        );
+      });
+    },
+    isDraining: () => runtime.isDraining(),
+    register: async () => {
+      await injectAutomaticExportRoute("/api/export-workers/register");
+    },
+    heartbeat: async () => {
+      await injectAutomaticExportRoute("/api/export-workers/heartbeat");
+    },
+    nextAcceptedLoggedRequestId: () =>
+      exportQueue.getNextRunnableAcceptedLoggedDelivery()?.request.id,
+    claimLoggedRequestId: async () => {
+      const response = ClaimLoggedExportDeliveryResponseSchema.parse(
+        await injectAutomaticExportRoute("/api/export-deliveries/claim"),
+      );
+      return response.delivery?.request.id;
+    },
+    processLogged: async (requestId) => {
+      const response = ProcessAcceptedLoggedExportResponseSchema.parse(
+        await injectAutomaticExportRoute("/api/export-deliveries/process", {
+          requestId,
+          authorizationConfirmed: true,
+        }),
+      );
+      exportQueue.markLoggedExportReconciled(
+        requestId,
+        response.execution === "complete" ||
+          response.execution === "already_complete"
+          ? "success"
+          : response.execution === "failed"
+            ? "failure"
+            : "canceled",
+      );
+    },
+    nextExportOnlyRequestId: () => exportQueue.getNextRunnableExportOnly()?.id,
+    processExportOnly: async (requestId) => {
+      await executeLocalExport({
+        requestId,
+        authorizationConfirmed: true,
+      });
+    },
+  });
+}
+
+app = createLocalAgent({
   ...(process.env.DESKTOP_SESSION_SECRET
     ? {
         desktopSession: {
@@ -294,6 +402,7 @@ const app = createLocalAgent({
         desktopNativeActionSecret:
           process.env.DESKTOP_NATIVE_ACTION_SECRET ?? "",
         desktopSetup,
+        ...(exportSupervisor ? { exportSupervisor } : {}),
       }
     : {}),
   runtime,
@@ -569,20 +678,7 @@ const app = createLocalAgent({
       reason,
       cancelRequestedAt,
     ),
-  runLoggedExportOnce: (input) =>
-    runLocalExportOnce(input, {
-      queue: exportQueue,
-      ...(sourceProvider ? { sourceProvider } : {}),
-      inspector: sourceInspector,
-      renderer: rangeRenderer,
-      thumbnailExtractor,
-      thumbnailInspector,
-      capabilityProvider,
-      ...(sharedSourceCoordinator ? { sharedSourceCoordinator } : {}),
-      storageGuard: exportStorageGuard,
-      dataRoot: managedExportRoot,
-      exportRoot: managedExportRoot,
-    }),
+  runLoggedExportOnce: (input) => executeLocalExport(input),
   discardCompletedLoggedExportForCancellation: (requestId, reason) =>
     discardCompletedLoggedExportForCancellation(requestId, reason, {
       queue: exportQueue,
@@ -668,7 +764,10 @@ const app = createLocalAgent({
       offlineReviewCapability,
     ),
 });
-app.addHook("onClose", () => database.close());
+app.addHook("onClose", async () => {
+  await exportSupervisor?.stop();
+  database.close();
+});
 
 await app.listen({ host: config.localAgentHost, port: config.localAgentPort });
 const localAddress = app.server.address();
@@ -682,6 +781,50 @@ process.parentPort?.postMessage({
 app.log.info(
   `Local agent listening on http://${config.localAgentHost}:${localAddress.port}`,
 );
+
+async function injectAutomaticExportRoute(
+  url: string,
+  payload?: unknown,
+): Promise<unknown> {
+  if (!desktopSessionSecret) {
+    throw Object.assign(
+      new Error("Desktop export scheduling is unavailable."),
+      {
+        statusCode: 401,
+        code: "authentication_required",
+      },
+    );
+  }
+  const headers = {
+    authorization: `Bearer ${desktopSessionSecret}`,
+    origin: "rvc://app",
+    "x-research-video-session": desktopSessionSecret,
+  };
+  const response =
+    payload === undefined
+      ? await app.inject({ method: "POST", url, headers })
+      : await app.inject({
+          method: "POST",
+          url,
+          headers: { ...headers, "content-type": "application/json" },
+          payload: JSON.stringify(payload),
+        });
+  const body = response.json() as { error?: { code?: unknown } } & Record<
+    string,
+    unknown
+  >;
+  if (response.statusCode >= 400) {
+    const code =
+      typeof body.error?.code === "string"
+        ? body.error.code
+        : "export_worker_unavailable";
+    throw Object.assign(
+      new Error("Automatic export scheduling could not continue."),
+      { statusCode: response.statusCode, code },
+    );
+  }
+  return body;
+}
 
 async function callCloudRuntimeAuthorization(
   authorization: string,

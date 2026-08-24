@@ -29,6 +29,8 @@ import {
   PublishDerivedTranslationRequestSchema,
   RequestDerivedTranslationSchema,
   CreateTranscriptionBatchResponseSchema,
+  CreateClipExportRequestSchema,
+  ReexportArtifactVersionRequestSchema,
   CreateLoggedExportBatchRequestSchema,
   ExportRequestSchema,
   ClaimLoggedExportDeliveryRequestSchema,
@@ -624,6 +626,7 @@ export class SharedProjectCatalog {
          WHERE d.worker_id = $2 AND d.worker_epoch = $3
            AND d.accepted_at IS NULL AND d.reservation_expires_at > $4
            AND j.state = 'queued'
+           AND er.source_rights_snapshot IS NOT NULL
            AND NOT EXISTS (
              SELECT 1 FROM logged_export_cancel_intents cancel
              WHERE cancel.export_request_id = er.id
@@ -646,6 +649,7 @@ export class SharedProjectCatalog {
          LEFT JOIN logged_export_deliveries existing_delivery
            ON existing_delivery.export_request_id = er.id
          WHERE j.state = 'queued'
+           AND er.source_rights_snapshot IS NOT NULL
            AND NOT EXISTS (
              SELECT 1 FROM logged_export_cancel_intents cancel
              WHERE cancel.export_request_id = er.id
@@ -3033,7 +3037,12 @@ export class SharedProjectCatalog {
     clipId: string,
     input: CreateClipExportRequest,
   ): Promise<ExportRequest> {
-    return this.createClipExportInternal(actor, projectId, clipId, input);
+    return this.createClipExportInternal(
+      actor,
+      projectId,
+      clipId,
+      CreateClipExportRequestSchema.parse(input),
+    );
   }
 
   async reexportArtifactVersion(
@@ -3043,6 +3052,7 @@ export class SharedProjectCatalog {
     artifactVersionId: string,
     input: ReexportArtifactVersionRequest,
   ): Promise<ExportRequest> {
+    const parsed = ReexportArtifactVersionRequestSchema.parse(input);
     await this.authorize(actor, projectId, "write");
     const source = await this.getArtifactVersion(
       actor,
@@ -3051,15 +3061,15 @@ export class SharedProjectCatalog {
       artifactVersionId,
     );
     if (
-      input.sourceLanguageClass !== source.sourceLanguageClass ||
-      sha256Fingerprint(input.subtitleTracks ?? null) !==
+      parsed.sourceLanguageClass !== source.sourceLanguageClass ||
+      sha256Fingerprint(parsed.subtitleTracks ?? null) !==
         sha256Fingerprint(source.subtitleTracks ?? null)
     ) {
       throw new CatalogConflictError(
         "An explicit re-export must preserve the source version's language and subtitle evidence.",
       );
     }
-    return this.createClipExportInternal(actor, projectId, clipId, input, {
+    return this.createClipExportInternal(actor, projectId, clipId, parsed, {
       artifactVersionId,
     });
   }
@@ -3085,6 +3095,8 @@ export class SharedProjectCatalog {
         persisted.sourceLanguageClass !== input.sourceLanguageClass ||
         sha256Fingerprint(persisted.subtitleTracks ?? null) !==
           sha256Fingerprint(input.subtitleTracks ?? null) ||
+        sha256Fingerprint(persisted.sourceRights ?? null) !==
+          sha256Fingerprint(input.sourceRights) ||
         (input.expectedResolutionFingerprint !== undefined &&
           persistedFingerprint !== input.expectedResolutionFingerprint) ||
         (input.preset !== undefined &&
@@ -3103,6 +3115,7 @@ export class SharedProjectCatalog {
       [idempotencyKey, projectId],
     );
     if (existing.rows[0]) {
+      assertExportSourceRightsMatchVideo(input.sourceRights, clip.video);
       return adoptCompatibleReplay(existing.rows[0]);
     }
     const requestId = randomUUID();
@@ -3119,6 +3132,7 @@ export class SharedProjectCatalog {
       if (!lockedClip.rows[0]) {
         throw new CatalogNotFoundError("Clip candidate not found.");
       }
+      assertExportSourceRightsMatchVideo(input.sourceRights, clip.video);
       const racedReplay = await this.database.query<DbRow>(
         `${loggedExportRequestSelect}
          WHERE j.idempotency_key = $1 AND er.project_id = $2`,
@@ -3192,6 +3206,7 @@ export class SharedProjectCatalog {
         video: clip.video,
         selection: clip.selection,
         sourceLanguageClass: input.sourceLanguageClass,
+        sourceRights: input.sourceRights,
         ...(input.subtitleTracks
           ? { subtitleTracks: input.subtitleTracks }
           : {}),
@@ -3212,9 +3227,9 @@ export class SharedProjectCatalog {
         `INSERT INTO export_requests
             (id, job_id, clip_id, project_id, mode, video_snapshot,
             selection_snapshot, source_language_class, subtitle_tracks_snapshot, preset_snapshot,
-            resolved_settings_snapshot, requested_by, request_origin,
+            source_rights_snapshot, resolved_settings_snapshot, requested_by, request_origin,
             created_at, updated_at)
-         VALUES ($1, $2, $3, $4, 'logged', $5, $6, $7, $8, $9, $10, $11, $12, $13, $13)`,
+         VALUES ($1, $2, $3, $4, 'logged', $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $14)`,
         [
           requestId,
           jobId,
@@ -3225,6 +3240,7 @@ export class SharedProjectCatalog {
           input.sourceLanguageClass,
           input.subtitleTracks ? JSON.stringify(input.subtitleTracks) : null,
           JSON.stringify(preset),
+          JSON.stringify(input.sourceRights),
           JSON.stringify(preview.snapshot),
           actor.userId,
           input.requestOrigin ?? "selection_action",
@@ -3342,6 +3358,10 @@ export class SharedProjectCatalog {
           await this.loadClipTags(item.clipId),
           await this.loadClipLanguageEvidence(item.clipId),
         );
+        assertExportSourceRightsMatchVideo(
+          item.export.sourceRights,
+          clip.video,
+        );
         const preview = item.export.preset
           ? resolveExportSettings({
               context: "logged",
@@ -3416,6 +3436,7 @@ export class SharedProjectCatalog {
           video: resolved.clip.video,
           selection: resolved.clip.selection,
           sourceLanguageClass: resolved.input.sourceLanguageClass,
+          sourceRights: resolved.input.sourceRights,
           ...(resolved.input.subtitleTracks
             ? { subtitleTracks: resolved.input.subtitleTracks }
             : {}),
@@ -3440,11 +3461,11 @@ export class SharedProjectCatalog {
              (id, job_id, clip_id, project_id, mode, video_snapshot,
               selection_snapshot, source_language_class,
               subtitle_tracks_snapshot, preset_snapshot,
-              resolved_settings_snapshot, requested_by, request_origin,
+              source_rights_snapshot, resolved_settings_snapshot, requested_by, request_origin,
               batch_item_id,
               created_at, updated_at)
          VALUES ($1, $2, $3, $4, 'logged', $5, $6, $7, $8, $9, $10,
-                   $11, $12, $13, $14, $14)`,
+                   $11, $12, $13, $14, $15, $15)`,
           [
             requestId,
             jobId,
@@ -3457,6 +3478,7 @@ export class SharedProjectCatalog {
               ? JSON.stringify(resolved.input.subtitleTracks)
               : null,
             JSON.stringify(resolved.preset),
+            JSON.stringify(resolved.input.sourceRights),
             JSON.stringify(resolved.snapshot),
             actor.userId,
             resolved.input.requestOrigin ?? "selection_action",
@@ -3647,6 +3669,7 @@ export class SharedProjectCatalog {
         video: parent.video,
         selection: parent.selection,
         sourceLanguageClass: parent.sourceLanguageClass,
+        ...(parent.sourceRights ? { sourceRights: parent.sourceRights } : {}),
         ...(parent.subtitleTracks
           ? { subtitleTracks: parent.subtitleTracks }
           : {}),
@@ -3692,15 +3715,15 @@ export class SharedProjectCatalog {
            (id, job_id, clip_id, project_id, mode, video_snapshot,
             selection_snapshot, source_language_class,
             subtitle_tracks_snapshot, preset_snapshot,
-            resolved_settings_snapshot, requested_by, retry_of_request_id,
+            source_rights_snapshot, resolved_settings_snapshot, requested_by, retry_of_request_id,
             retry_ordinal, retry_idempotency_key, request_origin, batch_item_id,
             created_at, updated_at)
          SELECT $1, $2, parent.clip_id, parent.project_id, parent.mode,
                 parent.video_snapshot, parent.selection_snapshot,
                 parent.source_language_class, parent.subtitle_tracks_snapshot,
-                parent.preset_snapshot, parent.resolved_settings_snapshot,
-                $3, parent.id, $4, $5, parent.request_origin,
-                parent.batch_item_id, $6, $6
+                parent.preset_snapshot, parent.source_rights_snapshot,
+                parent.resolved_settings_snapshot, $3, parent.id, $4, $5,
+                parent.request_origin, parent.batch_item_id, $6, $6
          FROM export_requests parent
          WHERE parent.id = $7
          ON CONFLICT DO NOTHING
@@ -6903,6 +6926,7 @@ function assertLoggedExportRetryParentEvidence(
     video: request.video,
     selection: request.selection,
     sourceLanguageClass: request.sourceLanguageClass,
+    ...(request.sourceRights ? { sourceRights: request.sourceRights } : {}),
     ...(request.subtitleTracks
       ? { subtitleTracks: request.subtitleTracks }
       : {}),
@@ -7286,6 +7310,9 @@ function mapLoggedExportRequest(row: DbRow): ExportRequest {
     video: row.video_snapshot,
     selection: row.selection_snapshot,
     sourceLanguageClass: row.source_language_class,
+    ...(row.source_rights_snapshot
+      ? { sourceRights: row.source_rights_snapshot }
+      : {}),
     ...(row.subtitle_tracks_snapshot
       ? { subtitleTracks: row.subtitle_tracks_snapshot }
       : {}),
@@ -7316,6 +7343,22 @@ function mapLoggedExportRequest(row: DbRow): ExportRequest {
     createdAt: iso(row.created_at),
     updatedAt: iso(row.updated_at),
   });
+}
+
+function assertExportSourceRightsMatchVideo(
+  sourceRights: ExportRequest["sourceRights"],
+  video: ExportRequest["video"],
+): asserts sourceRights is NonNullable<ExportRequest["sourceRights"]> {
+  if (!sourceRights) {
+    throw new CatalogValidationError(
+      "A new export command requires an exact source-rights confirmation snapshot.",
+    );
+  }
+  if (sourceRights.youtubeVideoId !== video.youtubeVideoId) {
+    throw new CatalogValidationError(
+      "The source-rights confirmation does not match this exact clip video.",
+    );
+  }
 }
 
 function mapArtifactVersionSummary(row: DbRow) {
@@ -7351,6 +7394,9 @@ function mapArtifactVersionSummary(row: DbRow) {
     video: row.video_snapshot,
     selection: row.selection_snapshot,
     sourceLanguageClass: row.source_language_class,
+    ...(row.source_rights_snapshot
+      ? { sourceRights: row.source_rights_snapshot }
+      : {}),
     ...(row.subtitle_tracks_snapshot
       ? { subtitleTracks: row.subtitle_tracks_snapshot }
       : {}),

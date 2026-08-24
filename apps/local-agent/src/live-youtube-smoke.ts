@@ -435,6 +435,13 @@ function prepareLiveSmokeRequest(
         canonicalUrl: `https://www.youtube.com/watch?v=${descriptor.youtubeVideoId}`,
         title: "Authorized live smoke source",
       },
+      sourceRights: {
+        schemaVersion: 1,
+        source: "youtube",
+        youtubeVideoId: descriptor.youtubeVideoId,
+        confirmation: "authorized_to_process",
+        disclosureVersion: 1,
+      },
       selection: {
         trackId: descriptor.englishTranscript.track.id,
         transcriptVersion: descriptor.englishTranscript.track.version,

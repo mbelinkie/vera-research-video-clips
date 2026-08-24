@@ -567,6 +567,7 @@ test("maps transcript text selection to stable source and export bounds", async 
   let lastClipBody: Record<string, any> | undefined;
   let lastLoggedExportBody: Record<string, any> | undefined;
   let lastExportOnlyBody: Record<string, any> | undefined;
+  let lastBatchExportBody: Record<string, any> | undefined;
   let failExistingPresetDiscovery = false;
   await page.route("**/cloud-api/api/session/profile", async (route) => {
     const request = route.request();
@@ -1017,6 +1018,7 @@ test("maps transcript text selection to stable source and export bounds", async 
       if (path.endsWith("/exports") && request.method() === "POST") {
         batchExportPostCount += 1;
         const body = request.postDataJSON();
+        lastBatchExportBody = body;
         return route.fulfill({
           status: 201,
           json: {
@@ -1273,7 +1275,9 @@ test("maps transcript text selection to stable source and export bounds", async 
   await expect(page.getByLabel("Conversion preset picker")).toContainText(
     "Project presets are temporarily unavailable. Continue with the current valid personal selection or Editing MP4.",
   );
-  await expect(page.getByRole("button", { name: "Export only" })).toBeEnabled();
+  await expect(
+    page.getByRole("button", { name: "Export only" }),
+  ).toBeDisabled();
   failExistingPresetDiscovery = false;
   await page.getByLabel("Logging project").selectOption(createdProjectId);
   await page
@@ -1355,6 +1359,15 @@ test("maps transcript text selection to stable source and export bounds", async 
   await page
     .getByLabel("Omit subtitle files for confirmed-English videos")
     .check();
+  await expect(
+    page.getByRole("button", { name: "Export + log" }),
+  ).toBeDisabled();
+  expect(loggedExportPostCount).toBe(0);
+  await page
+    .getByLabel(
+      "I confirm I am authorized to process this exact YouTube source for export.",
+    )
+    .check();
   await page.getByRole("button", { name: "Export + log" }).click();
   await expect(panel).toContainText(
     "Logged to New essay and queued an export with the New Essay Edit snapshot.",
@@ -1375,7 +1388,23 @@ test("maps transcript text selection to stable source and export bounds", async 
   expect(lastLoggedExportBody?.expectedResolutionFingerprint).toMatch(
     /^[a-f0-9]{64}$/,
   );
+  expect(lastLoggedExportBody?.sourceRights).toEqual({
+    schemaVersion: 1,
+    source: "youtube",
+    youtubeVideoId: directVideo.youtubeVideoId,
+    confirmation: "authorized_to_process",
+    disclosureVersion: 1,
+  });
 
+  await expect(
+    page.getByRole("button", { name: "Export only" }),
+  ).toBeDisabled();
+  expect(exportOnlyPostCount).toBe(0);
+  await page
+    .getByLabel(
+      "I confirm I am authorized to process this exact YouTube source for export.",
+    )
+    .check();
   await page.getByRole("button", { name: "Export only" }).click();
   await expect(panel).toContainText(
     "Queued a local export-only job with the Personal Documentary snapshot. Nothing was added to a project.",
@@ -1392,6 +1421,13 @@ test("maps transcript text selection to stable source and export bounds", async 
       presetVersion: 1,
     },
     overrides: { omitSubtitleFilesForConfirmedEnglish: true },
+  });
+  expect(lastExportOnlyBody?.sourceRights).toEqual({
+    schemaVersion: 1,
+    source: "youtube",
+    youtubeVideoId: directVideo.youtubeVideoId,
+    confirmation: "authorized_to_process",
+    disclosureVersion: 1,
   });
 
   await page.getByLabel("Preferred transcript language").fill("es-MX");
@@ -1463,11 +1499,34 @@ test("maps transcript text selection to stable source and export bounds", async 
     "Source sizes are unavailable until acquisition",
   );
   await clipQueue.getByLabel(/Continue with unknown source sizes/u).check();
+  await expect(
+    clipQueue.getByRole("button", { name: "Submit durable batch" }),
+  ).toBeDisabled();
+  expect(batchExportPostCount).toBe(0);
+  await clipQueue
+    .getByLabel(
+      "I confirm I am authorized to process every exact YouTube source listed above for this export.",
+    )
+    .check();
   await clipQueue.getByRole("button", { name: "Submit durable batch" }).click();
   await expect(clipQueue).toContainText(
     "Queued 2 independent export requests.",
   );
   expect(batchExportPostCount).toBe(1);
+  expect(lastBatchExportBody?.sourceRights).toHaveLength(2);
+  expect(lastBatchExportBody?.sourceRights).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({
+        sourceRights: {
+          schemaVersion: 1,
+          source: "youtube",
+          youtubeVideoId: romanianVideo.youtubeVideoId,
+          confirmation: "authorized_to_process",
+          disclosureVersion: 1,
+        },
+      }),
+    ]),
+  );
   await clipQueue.getByLabel("Filter tag").selectOption("");
   await clipQueue.getByLabel("Search clips").fill("");
   await clipQueue.getByRole("button", { name: "Refresh" }).click();
@@ -1493,6 +1552,14 @@ test("maps transcript text selection to stable source and export bounds", async 
   await expect(clipQueue).toContainText(
     "La selección permanece vinculada por tiempo.",
   );
+  await expect(
+    clipQueue.getByRole("button", { name: "Submit durable export" }),
+  ).toBeDisabled();
+  await expect(
+    clipQueue.getByLabel(
+      "I confirm I am authorized to process every exact YouTube source listed above for this export.",
+    ),
+  ).not.toBeChecked();
   await page.getByLabel("Preferred transcript language").fill("en");
   await page.getByRole("button", { name: "Save preference" }).click();
   await clipQueue.getByRole("button", { name: "Refresh" }).click();

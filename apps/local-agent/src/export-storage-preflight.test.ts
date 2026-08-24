@@ -168,6 +168,7 @@ describe("Clip Library export storage preflight", () => {
           ...request,
           expectedPreflightFingerprint: preflight.preflightFingerprint,
           confirmUnknownSourceSizes: false,
+          sourceRights: rightsFor([candidate]),
         },
       }),
     ).rejects.toMatchObject({
@@ -216,6 +217,7 @@ describe("Clip Library export storage preflight", () => {
           ...request,
           expectedPreflightFingerprint: preflight.preflightFingerprint,
           confirmUnknownSourceSizes: true,
+          sourceRights: rightsFor(clips),
         },
       });
 
@@ -236,6 +238,7 @@ describe("Clip Library export storage preflight", () => {
           ...request,
           expectedPreflightFingerprint: preflight.preflightFingerprint,
           confirmUnknownSourceSizes: true,
+          sourceRights: rightsFor(clips),
         },
       }),
     ).resolves.toMatchObject({ kind: "batch", batch: { id: batchId } });
@@ -291,6 +294,7 @@ describe("Clip Library export storage preflight", () => {
           ...request,
           expectedPreflightFingerprint: preflight.preflightFingerprint,
           confirmUnknownSourceSizes: true,
+          sourceRights: rightsFor([candidate]),
         },
       });
     await expect(submit()).resolves.toMatchObject({ kind: "individual" });
@@ -303,6 +307,53 @@ describe("Clip Library export storage preflight", () => {
     expect(createReexport.mock.calls[1]![0].command).toEqual(
       createReexport.mock.calls[0]![0].command,
     );
+  });
+
+  it("rejects mismatched exact-source rights before creating cloud work", async () => {
+    const projectId = randomUUID();
+    const candidate = clip(projectId, "source-a", 1);
+    const createIndividual = vi.fn();
+    const service = serviceFixture([candidate], {
+      availableBytes: Number.MAX_SAFE_INTEGER,
+      createIndividual,
+    });
+    const request = {
+      clipIds: [candidate.id],
+      settingsSelection: {
+        base: "application_default" as const,
+        overrides: {},
+      },
+    };
+    const preflight = await service.prepare({
+      projectId,
+      authorization: "Bearer test",
+      request,
+    });
+
+    await expect(
+      service.submit({
+        projectId,
+        authorization: "Bearer test",
+        request: {
+          ...request,
+          expectedPreflightFingerprint: preflight.preflightFingerprint,
+          confirmUnknownSourceSizes: true,
+          sourceRights: [
+            {
+              clipId: candidate.id,
+              sourceRights: {
+                schemaVersion: 1,
+                source: "youtube",
+                youtubeVideoId: "different-source",
+                confirmation: "authorized_to_process",
+                disclosureVersion: 1,
+              },
+            },
+          ],
+        },
+      }),
+    ).rejects.toMatchObject({ code: "export_source_rights_mismatch" });
+    expect(createIndividual).not.toHaveBeenCalled();
   });
 
   it("rechecks remaining bytes after acquisition without double-counting the source", async () => {
@@ -398,6 +449,19 @@ describe("Clip Library export storage preflight", () => {
     secondSibling.release();
   });
 });
+
+function rightsFor(clips: readonly ClipCandidate[]) {
+  return clips.map((candidate) => ({
+    clipId: candidate.id,
+    sourceRights: {
+      schemaVersion: 1 as const,
+      source: "youtube" as const,
+      youtubeVideoId: candidate.video.youtubeVideoId,
+      confirmation: "authorized_to_process" as const,
+      disclosureVersion: 1,
+    },
+  }));
+}
 
 const now = "2026-08-22T20:00:00.000Z";
 

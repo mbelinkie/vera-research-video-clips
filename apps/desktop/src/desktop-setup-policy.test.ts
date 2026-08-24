@@ -13,6 +13,7 @@ import {
   parseTrustedRuntimePaths,
   resolveWorkerConfiguration,
   setupActionRequiresRuntimeRestart,
+  shouldRunExportSupervisor,
   shouldRunTranscriptionWorker,
 } from "./desktop-setup-policy.ts";
 
@@ -135,6 +136,80 @@ describe("desktop setup policy", () => {
                   state: "needs_action" as const,
                   reason: "model_changed" as const,
                   remediation: "select_whisper_model" as const,
+                }
+              : component,
+          ),
+        },
+      }),
+    ).toBe(false);
+  });
+
+  it("starts export scheduling only for a signed-in, enabled, locally ready setup", () => {
+    const components = [
+      "output_root",
+      "export_source_provider",
+      "ffmpeg",
+      "ffprobe",
+      "yt_dlp",
+      "output_storage",
+    ].map((component) => ready(component as ComponentHealth["component"]));
+    const localReadiness = deriveReadinessReport({
+      checkedAt: now,
+      components,
+      requirements: {
+        project_browsing: [],
+        verified_cached_review: [],
+        project_logging: [],
+        transcript_processing: [],
+        export_processing: [],
+      },
+    });
+    expect(
+      shouldRunExportSupervisor({
+        signedIn: true,
+        snapshot: setupSnapshot,
+        localReadiness,
+      }),
+    ).toBe(true);
+    expect(
+      shouldRunExportSupervisor({
+        signedIn: false,
+        snapshot: setupSnapshot,
+        localReadiness,
+      }),
+    ).toBe(false);
+    expect(
+      shouldRunExportSupervisor({
+        signedIn: true,
+        snapshot: setupSnapshot,
+        localReadiness: {
+          ...localReadiness,
+          components: components.map((component) =>
+            component.component === "output_storage"
+              ? {
+                  ...component,
+                  state: "degraded" as const,
+                  reason: "storage_recommended" as const,
+                  remediation: "free_storage" as const,
+                }
+              : component,
+          ),
+        },
+      }),
+    ).toBe(true);
+    expect(
+      shouldRunExportSupervisor({
+        signedIn: true,
+        snapshot: setupSnapshot,
+        localReadiness: {
+          ...localReadiness,
+          components: components.map((component) =>
+            component.component === "yt_dlp"
+              ? {
+                  ...component,
+                  state: "needs_action" as const,
+                  reason: "tool_changed" as const,
+                  remediation: "select_yt_dlp" as const,
                 }
               : component,
           ),

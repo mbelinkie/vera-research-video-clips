@@ -30,6 +30,13 @@ const presetSettings = {
   omitSubtitleFilesForConfirmedEnglish: false,
   embedEnglishSubtitleTrack: false,
 };
+const sourceRightsForVideo = (youtubeVideoId: string) => ({
+  schemaVersion: 1 as const,
+  source: "youtube" as const,
+  youtubeVideoId,
+  confirmation: "authorized_to_process" as const,
+  disclosureVersion: 1,
+});
 
 afterEach(async () => {
   await Promise.all([...apps].map((app) => app.close()));
@@ -96,6 +103,7 @@ describe("cloud API", () => {
       sourceLanguageClass: "confirmed_english",
       settingsSelection: { base: "application_default", overrides: {} },
       expectedResolutionFingerprint: "a".repeat(64),
+      sourceRights: sourceRightsForVideo("M7lc1UVf-VE"),
     };
     const response = await app.inject({
       method: "POST",
@@ -587,6 +595,7 @@ describe("cloud API", () => {
     const exportPayload = {
       idempotencyKey: "fixture-logged-export",
       sourceLanguageClass: "confirmed_english",
+      sourceRights: sourceRightsForVideo(payload.video.youtubeVideoId),
       preset: {
         presetVersion: 1,
         name: "Editing MP4",
@@ -666,6 +675,7 @@ describe("cloud API", () => {
       payload: {
         idempotencyKey: "catalog-resolved-export",
         sourceLanguageClass: "confirmed_english",
+        sourceRights: sourceRightsForVideo(payload.video.youtubeVideoId),
         settingsSelection: { base: "application_default", overrides: {} },
         expectedResolutionFingerprint,
       },
@@ -703,6 +713,7 @@ describe("cloud API", () => {
       payload: {
         idempotencyKey: "catalog-resolved-export",
         sourceLanguageClass: "confirmed_english",
+        sourceRights: sourceRightsForVideo(payload.video.youtubeVideoId),
         settingsSelection: {
           base: "context_default",
           selectedPreset: {
@@ -728,6 +739,7 @@ describe("cloud API", () => {
           payload: {
             idempotencyKey: "stale-catalog-export",
             sourceLanguageClass: "confirmed_english",
+            sourceRights: sourceRightsForVideo(payload.video.youtubeVideoId),
             settingsSelection: {
               base: "application_default",
               overrides: {},
@@ -2268,6 +2280,7 @@ describe("logged export delivery API", () => {
           idempotencyKey: `api-batch-item-${index}`,
           sourceLanguageClass: "confirmed_english",
           preset,
+          sourceRights: sourceRightsForVideo(`M7-batch-${index}`),
         },
       })),
     };

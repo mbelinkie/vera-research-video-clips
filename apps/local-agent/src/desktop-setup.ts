@@ -137,6 +137,14 @@ export class LocalDesktopSetupService {
       statfs?: DesktopSetupStatfs;
       now?: () => Date;
       measuredOperationBytes?: (target: "output_root" | "cache_root") => number;
+      exportWorkerStatus?: () => {
+        available: boolean;
+        issue?:
+          | "authentication_required"
+          | "cloud_unavailable"
+          | "configuration_required"
+          | "worker_unavailable";
+      };
     } = {},
   ) {}
 
@@ -316,6 +324,9 @@ export class LocalDesktopSetupService {
       localComponents.map((component) => [component.component, component]),
     );
     const setup = this.repository.getSetup();
+    const exportWorkerStatus = this.dependencies.exportWorkerStatus?.() ?? {
+      available: false,
+    };
     const components = [
       {
         component: "local_database" as const,
@@ -374,15 +385,7 @@ export class LocalDesktopSetupService {
         consented: setup?.translationConsent ?? false,
         checkedAt,
       }),
-      {
-        component: "export_worker" as const,
-        // M7-03 records the transcription-worker preference only. The durable
-        // local export-worker supervision arrives in M7-05.
-        state: "needs_action" as const,
-        reason: "worker_unavailable" as const,
-        remediation: "retry" as const,
-        checkedAt,
-      },
+      exportWorkerHealth(setup?.workerEnabled, exportWorkerStatus, checkedAt),
     ];
     return deriveReadinessReport({
       checkedAt,
@@ -702,6 +705,66 @@ function providerHealth(input: {
     reason: "ready",
     remediation: "none",
     checkedAt: input.checkedAt,
+  };
+}
+
+function exportWorkerHealth(
+  workerEnabled: boolean | undefined,
+  status: {
+    available: boolean;
+    issue?:
+      | "authentication_required"
+      | "cloud_unavailable"
+      | "configuration_required"
+      | "worker_unavailable";
+  },
+  checkedAt: string,
+): ComponentHealth {
+  if (workerEnabled !== true) {
+    return {
+      component: "export_worker",
+      state: "needs_action",
+      reason: "worker_disabled",
+      remediation: "enable_worker",
+      checkedAt,
+    };
+  }
+  if (status.available) {
+    return {
+      component: "export_worker",
+      state: "ready",
+      reason: "ready",
+      remediation: "none",
+      checkedAt,
+    };
+  }
+  if (status.issue === "authentication_required") {
+    return {
+      component: "export_worker",
+      state: "needs_action",
+      reason: "authentication_required",
+      remediation: "sign_in",
+      checkedAt,
+    };
+  }
+  if (status.issue === "cloud_unavailable") {
+    return {
+      component: "export_worker",
+      state: "blocked",
+      reason: "cloud_unavailable",
+      remediation: "retry",
+      checkedAt,
+    };
+  }
+  return {
+    component: "export_worker",
+    state: "needs_action",
+    reason:
+      status.issue === "configuration_required"
+        ? "configuration_required"
+        : "worker_unavailable",
+    remediation: "retry",
+    checkedAt,
   };
 }
 

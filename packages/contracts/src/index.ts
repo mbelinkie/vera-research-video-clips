@@ -1298,6 +1298,20 @@ export const ExportRequestOriginSchema = z.enum([
   "clip_library",
   "authoring_build",
 ]);
+/**
+ * Immutable, exact-source confirmation captured when a user creates a new
+ * logged export command. This is deliberately content-free: it records the
+ * authorization assertion, not a URL, filesystem path, credential, or media.
+ */
+export const ExportSourceRightsSnapshotSchema = z
+  .object({
+    schemaVersion: z.literal(1),
+    source: z.literal("youtube"),
+    youtubeVideoId: z.string().trim().min(1).max(64),
+    confirmation: z.literal("authorized_to_process"),
+    disclosureVersion: z.number().int().positive().max(1_000_000),
+  })
+  .strict();
 const createExportRequestBaseSchema = z
   .object({
     idempotencyKey: z.string().trim().min(1).max(512),
@@ -1310,6 +1324,9 @@ const createExportRequestBaseSchema = z
       .string()
       .regex(/^[a-f0-9]{64}$/)
       .optional(),
+    // Every new logged command requires this; it remains optional in this base
+    // shape so historical persisted ExportRequest reads stay compatible.
+    sourceRights: ExportSourceRightsSnapshotSchema.optional(),
   })
   .strict()
   .superRefine((request, context) => {
@@ -1358,10 +1375,46 @@ function requireBilingualSubtitleTrackSnapshots(
   }
 }
 
-export const CreateClipExportRequestSchema =
-  createExportRequestBaseSchema.superRefine(
-    requireBilingualSubtitleTrackSnapshots,
-  );
+function requireSourceRightsMatchVideo(
+  request: {
+    video: z.infer<typeof ClipVideoSnapshotSchema>;
+    sourceRights?: z.infer<typeof ExportSourceRightsSnapshotSchema> | undefined;
+  },
+  context: z.RefinementCtx,
+) {
+  if (
+    request.sourceRights &&
+    request.sourceRights.youtubeVideoId !== request.video.youtubeVideoId
+  ) {
+    context.addIssue({
+      code: "custom",
+      path: ["sourceRights", "youtubeVideoId"],
+      message:
+        "The source-rights confirmation must name the exact export request video.",
+    });
+  }
+}
+
+function requireSourceRightsSnapshot(
+  request: {
+    sourceRights?: z.infer<typeof ExportSourceRightsSnapshotSchema> | undefined;
+  },
+  context: z.RefinementCtx,
+) {
+  if (!request.sourceRights) {
+    context.addIssue({
+      code: "custom",
+      path: ["sourceRights"],
+      message:
+        "A new export command requires an exact source-rights confirmation snapshot.",
+    });
+  }
+}
+
+export const CreateClipExportRequestSchema = createExportRequestBaseSchema
+  .safeExtend({ sourceRights: ExportSourceRightsSnapshotSchema })
+  .superRefine(requireBilingualSubtitleTrackSnapshots)
+  .superRefine(requireSourceRightsSnapshot);
 export const ReexportArtifactVersionRequestSchema =
   CreateClipExportRequestSchema.safeExtend({
     requestOrigin: z
@@ -1398,11 +1451,14 @@ export const CreateLoggedExportBatchRequestSchema = z
     });
   });
 export const CreateExportOnlyRequestSchema = createExportRequestBaseSchema
-  .extend({
+  .safeExtend({
     video: ClipVideoSnapshotSchema,
     selection: TranscriptSelectionSchema,
+    sourceRights: ExportSourceRightsSnapshotSchema,
   })
-  .superRefine(requireBilingualSubtitleTrackSnapshots);
+  .superRefine(requireBilingualSubtitleTrackSnapshots)
+  .superRefine(requireSourceRightsSnapshot)
+  .superRefine(requireSourceRightsMatchVideo);
 export const TranscriptArtifactSchema = z.object({
   type: z.enum([
     "manifest",
@@ -2484,6 +2540,7 @@ export const ExportRequestSchema = z
     video: ClipVideoSnapshotSchema,
     selection: TranscriptSelectionSchema,
     sourceLanguageClass: ExportSourceLanguageClassSchema,
+    sourceRights: ExportSourceRightsSnapshotSchema.optional(),
     subtitleTracks: ExportSubtitleTrackSnapshotsSchema.optional(),
     preset: ExportPresetSnapshotSchema,
     resolvedSettingsSnapshot: ResolvedExportSettingsSnapshotSchema.optional(),
@@ -2508,6 +2565,17 @@ export const ExportRequestSchema = z
     updatedAt: UtcTimestampSchema,
   })
   .superRefine((request, context) => {
+    if (
+      request.sourceRights &&
+      request.sourceRights.youtubeVideoId !== request.video.youtubeVideoId
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["sourceRights", "youtubeVideoId"],
+        message:
+          "The source-rights confirmation must name the exact export request video.",
+      });
+    }
     if (
       Boolean(request.retryOfRequestId) !== Boolean(request.retryOrdinal) ||
       (request.retryOfRequestId && request.mode !== "logged")
@@ -3076,6 +3144,7 @@ export const ArtifactVersionSummarySchema = z
     video: ClipVideoSnapshotSchema,
     selection: TranscriptSelectionSchema,
     sourceLanguageClass: ExportSourceLanguageClassSchema,
+    sourceRights: ExportSourceRightsSnapshotSchema.optional(),
     subtitleTracks: ExportSubtitleTrackSnapshotsSchema.optional(),
     preset: ExportPresetSnapshotSchema,
     resolvedSettingsSnapshot: ResolvedExportSettingsSnapshotSchema,
@@ -3105,6 +3174,17 @@ export const ArtifactVersionSummarySchema = z
   })
   .strict()
   .superRefine((summary, context) => {
+    if (
+      summary.sourceRights &&
+      summary.sourceRights.youtubeVideoId !== summary.video.youtubeVideoId
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["sourceRights", "youtubeVideoId"],
+        message:
+          "Artifact history source-rights confirmation must match its exact export video.",
+      });
+    }
     if (summary.packageIdentity !== `clip-${summary.requestId}`) {
       context.addIssue({
         code: "custom",
@@ -3873,6 +3953,32 @@ export const SubmitClipLibraryExportRequestSchema =
   PrepareClipLibraryExportRequestSchema.safeExtend({
     expectedPreflightFingerprint: z.string().regex(/^[a-f0-9]{64}$/),
     confirmUnknownSourceSizes: z.boolean().default(false),
+    sourceRights: z
+      .array(
+        z
+          .object({
+            clipId: IdSchema,
+            sourceRights: ExportSourceRightsSnapshotSchema,
+          })
+          .strict(),
+      )
+      .min(1)
+      .max(25),
+  }).superRefine((request, context) => {
+    const selected = new Set(request.clipIds);
+    const confirmed = request.sourceRights.map((entry) => entry.clipId);
+    if (
+      confirmed.length !== request.clipIds.length ||
+      new Set(confirmed).size !== confirmed.length ||
+      confirmed.some((clipId) => !selected.has(clipId))
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["sourceRights"],
+        message:
+          "Source-rights confirmations must name each selected Clip Library clip exactly once.",
+      });
+    }
   });
 
 export const ClipLibraryExportSubmissionSchema = z.discriminatedUnion("kind", [

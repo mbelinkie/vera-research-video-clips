@@ -108,14 +108,14 @@ describe("cloud migrations", () => {
 
     const applied = await runCloudMigrations(database);
 
-    expect(applied).toHaveLength(22);
-    expect(calls.filter((call) => call === "pool:connect")).toHaveLength(23);
-    expect(calls.filter((call) => call === "client:BEGIN")).toHaveLength(23);
+    expect(applied).toHaveLength(23);
+    expect(calls.filter((call) => call === "pool:connect")).toHaveLength(24);
+    expect(calls.filter((call) => call === "client:BEGIN")).toHaveLength(24);
     expect(
       calls.filter((call) =>
         call.startsWith("client:SELECT pg_advisory_xact_lock"),
       ),
-    ).toHaveLength(23);
+    ).toHaveLength(24);
     expect(
       calls.some((call) =>
         call.startsWith("pool:INSERT INTO schema_migrations"),
@@ -174,6 +174,7 @@ describe("cloud migrations", () => {
           "0020_export_request_origin",
           "0021_cloud_translation_consent",
           "0022_job_queue_delivery",
+          "0023_export_source_rights_snapshots",
         ]);
         expect(
           (
@@ -211,8 +212,8 @@ describe("cloud migrations", () => {
           runCloudMigrations(first),
           runCloudMigrations(second),
         ]);
-        expect(results.flat()).toHaveLength(22);
-        expect(new Set(results.flat()).size).toBe(22);
+        expect(results.flat()).toHaveLength(23);
+        expect(new Set(results.flat()).size).toBe(23);
         expect(await runCloudMigrations(first)).toEqual([]);
       } finally {
         await Promise.all([first.close(), second.close()]);
@@ -249,6 +250,7 @@ describe("cloud migrations", () => {
       "0020_export_request_origin",
       "0021_cloud_translation_consent",
       "0022_job_queue_delivery",
+      "0023_export_source_rights_snapshots",
     ]);
     expect(await runCloudMigrations(database)).toEqual([]);
     expect(
@@ -259,6 +261,15 @@ describe("cloud migrations", () => {
         )
       ).rows,
     ).toEqual([{ column_name: "request_origin" }]);
+    expect(
+      (
+        await database.query<{ column_name: string }>(
+          `SELECT column_name FROM information_schema.columns
+           WHERE table_name = 'export_requests'
+             AND column_name = 'source_rights_snapshot'`,
+        )
+      ).rows,
+    ).toEqual([{ column_name: "source_rights_snapshot" }]);
     expect(
       (
         await database.query<{ table_name: string }>(
@@ -804,6 +815,52 @@ describe("cloud migrations", () => {
         )
       ).rows[0],
     ).toEqual({ request_origin: null });
+    copyFileSync(
+      resolve(
+        cloudMigrationDirectory,
+        "0023_export_source_rights_snapshots.sql",
+      ),
+      join(migrations, "0023_export_source_rights_snapshots.sql"),
+    );
+    expect(await runCloudMigrations(database, migrations)).toEqual([
+      "0023_export_source_rights_snapshots",
+    ]);
+    expect(
+      (
+        await database.query<{ source_rights_snapshot: unknown }>(
+          "SELECT source_rights_snapshot FROM export_requests WHERE id = $1",
+          [requestId],
+        )
+      ).rows[0],
+    ).toEqual({ source_rights_snapshot: null });
+    const tamperedJobId = randomUUID();
+    await database.query(
+      `INSERT INTO jobs
+         (id, project_id, kind, state, idempotency_key, attempt, payload,
+          created_at, updated_at)
+       SELECT $1, project_id, kind, 'queued', 'tampered-source-rights-job',
+              0, payload, created_at, updated_at
+       FROM jobs WHERE id = $2`,
+      [tamperedJobId, jobId],
+    );
+    await expect(
+      database.query(
+        `INSERT INTO export_requests
+           (id, job_id, clip_id, project_id, mode, video_snapshot,
+            selection_snapshot, source_language_class,
+            subtitle_tracks_snapshot, preset_snapshot,
+            source_rights_snapshot, resolved_settings_snapshot, requested_by,
+            request_origin, created_at, updated_at)
+         SELECT $1, $2, clip_id, project_id, mode, video_snapshot,
+                selection_snapshot, source_language_class,
+                subtitle_tracks_snapshot, preset_snapshot,
+                '{"schemaVersion":1,"source":"youtube","youtubeVideoId":"different-video","confirmation":"authorized_to_process","disclosureVersion":1}'::jsonb,
+                resolved_settings_snapshot, requested_by, request_origin,
+                created_at, updated_at
+         FROM export_requests WHERE id = $3`,
+        [randomUUID(), tamperedJobId, requestId],
+      ),
+    ).rejects.toThrow(/export_requests_source_rights_exact_video/u);
     expect(
       LoggedExportSuccessResultSchema.parse(legacySuccess!.result_json),
     ).toMatchObject({

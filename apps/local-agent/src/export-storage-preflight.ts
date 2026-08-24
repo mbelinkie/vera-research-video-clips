@@ -60,7 +60,7 @@ type PreparedItem = {
   clip: ClipCandidate;
   sourceLanguageClass: ExportSourceLanguageClass;
   preview: ExportSettingsPreview;
-  command: CreateClipExportRequest;
+  command: Omit<CreateClipExportRequest, "sourceRights">;
   outputEstimatedBytes: number;
 };
 
@@ -179,9 +179,28 @@ export class ClipLibraryExportOperationService {
       );
     }
 
+    const sourceRightsByClip = new Map(
+      request.sourceRights.map((entry) => [entry.clipId, entry.sourceRights]),
+    );
+    const commandFor = (item: PreparedItem): CreateClipExportRequest => {
+      const sourceRights = sourceRightsByClip.get(item.clip.id);
+      if (
+        !sourceRights ||
+        sourceRights.youtubeVideoId !== item.clip.video.youtubeVideoId
+      ) {
+        throw new ClipLibraryExportOperationError(
+          "Source-rights confirmation does not match the exact selected clip source.",
+          "export_source_rights_mismatch",
+          409,
+        );
+      }
+      return { ...item.command, sourceRights };
+    };
+
     const idempotencyKey = `clip-library:${prepared.preflight.preflightFingerprint}`;
     if (prepared.items.length === 1) {
       const item = prepared.items[0]!;
+      const command = commandFor(item);
       if (request.reexportArtifactVersionId) {
         if (!this.dependencies.createReexport) {
           throw new ClipLibraryExportOperationError(
@@ -197,7 +216,7 @@ export class ClipLibraryExportOperationService {
             clipId: item.clip.id,
             artifactVersionId: request.reexportArtifactVersionId,
             authorization: input.authorization,
-            command: { ...item.command, idempotencyKey },
+            command: { ...command, idempotencyKey },
           }),
         });
       }
@@ -207,7 +226,7 @@ export class ClipLibraryExportOperationService {
           projectId: input.projectId,
           clipId: item.clip.id,
           authorization: input.authorization,
-          command: { ...item.command, idempotencyKey },
+          command: { ...command, idempotencyKey },
         }),
       });
     }
@@ -221,7 +240,7 @@ export class ClipLibraryExportOperationService {
           items: prepared.items.map((item) => ({
             clipId: item.clip.id,
             export: {
-              ...item.command,
+              ...commandFor(item),
               idempotencyKey: `${idempotencyKey}:${item.clip.id}`,
             },
           })),

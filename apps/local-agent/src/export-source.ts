@@ -210,6 +210,33 @@ export class LocalExportSourceProcessor {
       throw error;
     }
     try {
+      this.queue.assertExactSourceRightsConfirmation(input.requestId);
+    } catch (error) {
+      const mismatch =
+        (error as { code?: unknown })?.code ===
+        "source_rights_confirmation_video_mismatch";
+      const authorizationError = new ExportSourceAcquisitionError(
+        mismatch
+          ? "Source-rights confirmation does not match this export request video."
+          : "Confirm source rights for this exact video before acquisition.",
+        {
+          code: mismatch
+            ? "source_rights_confirmation_video_mismatch"
+            : "source_rights_confirmation_required",
+          retryable: true,
+        },
+      );
+      recordNotStartedOutcome(
+        this.queue,
+        request,
+        input.signal,
+        input.requestId,
+        authorizationError.code,
+        authorizationError.message,
+      );
+      throw authorizationError;
+    }
+    try {
       assertSupportedExportRenderSettings(resolvedSettingsSnapshot.settings);
     } catch (error) {
       recordNotStartedOutcome(

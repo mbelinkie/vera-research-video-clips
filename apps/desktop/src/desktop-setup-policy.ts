@@ -79,6 +79,39 @@ export function shouldRunTranscriptionWorker(input: {
   );
 }
 
+export function shouldRunExportSupervisor(input: {
+  signedIn: boolean;
+  snapshot: SetupSnapshot;
+  localReadiness: ReadinessReport;
+}): boolean {
+  const health = new Map(
+    input.localReadiness.components.map((component) => [
+      component.component,
+      component.state,
+    ]),
+  );
+  return (
+    input.signedIn &&
+    input.snapshot.setup?.workerEnabled === true &&
+    (
+      [
+        "output_root",
+        "export_source_provider",
+        "ffmpeg",
+        "ffprobe",
+        "yt_dlp",
+        "output_storage",
+      ] as const
+    ).every((component) => {
+      const state = health.get(component);
+      return (
+        state === "ready" ||
+        (component === "output_storage" && state === "degraded")
+      );
+    })
+  );
+}
+
 export function applyModelPinAvailability(
   report: ReadinessReport,
   pinConfigured: boolean,

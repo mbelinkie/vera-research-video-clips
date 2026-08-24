@@ -89,6 +89,51 @@ afterEach(async () => {
 });
 
 describe("one-shot local export runtime", () => {
+  it("never calls an acquisition provider when durable source-rights evidence is absent", async () => {
+    const root = await createFixtureWorkspace();
+    const fixture = createFixtureRequest(root, "rights-missing");
+    const database = openLocalDatabase(join(root, "local.sqlite"));
+    try {
+      // This represents a pre-M7-05 row. The production trigger makes the
+      // snapshot immutable; removing it only constructs the historical row.
+      database.exec(
+        "DROP TRIGGER export_requests_source_rights_confirmation_immutable;",
+      );
+      database
+        .prepare(
+          "UPDATE export_requests SET source_rights_confirmation_json = NULL WHERE id = ?",
+        )
+        .run(fixture.requestId);
+    } finally {
+      database.close();
+    }
+    let acquisitions = 0;
+    const queueDatabase = openLocalDatabase(join(root, "local.sqlite"));
+    try {
+      const result = await runLocalExportOnce(
+        { requestId: fixture.requestId, authorizationConfirmed: true },
+        {
+          queue: new LocalExportQueue(queueDatabase),
+          sourceProvider: {
+            acquireAuthorizedFullSource: async () => {
+              acquisitions += 1;
+              throw new Error("must not acquire without durable rights");
+            },
+          },
+          dataRoot: root,
+        },
+      );
+      expect(result).toMatchObject({
+        status: "failed",
+        state: "needs_user_action",
+        error: { code: "source_rights_confirmation_required" },
+      });
+    } finally {
+      queueDatabase.close();
+    }
+    expect(acquisitions).toBe(0);
+  });
+
   it("processes one persisted export-only request with real FFmpeg and FFprobe", async () => {
     const root = await createFixtureWorkspace();
     const firstAttempt = createFixtureRequest(root);
@@ -1390,6 +1435,13 @@ function createFixtureRequest(
         timingPrecision: "cue",
       },
       sourceLanguageClass: "foreign",
+      sourceRights: {
+        schemaVersion: 1,
+        source: "youtube",
+        youtubeVideoId: videoId,
+        confirmation: "authorized_to_process",
+        disclosureVersion: 1,
+      },
       subtitleTracks: {
         original: { trackId: originalTrackId, trackVersion: 1 },
         english: { trackId: englishTrackId, trackVersion: 1 },
@@ -1440,6 +1492,7 @@ function createFixtureRequest(
           video: input.video,
           selection: input.selection,
           sourceLanguageClass: input.sourceLanguageClass,
+          sourceRights: input.sourceRights,
           subtitleTracks: input.subtitleTracks,
           preset: {
             presetId: preset.presetId,
@@ -1536,6 +1589,13 @@ function createConfirmedEnglishFixtureRequest(
         timingPrecision: "cue",
       },
       sourceLanguageClass: "confirmed_english",
+      sourceRights: {
+        schemaVersion: 1,
+        source: "youtube",
+        youtubeVideoId: videoId,
+        confirmation: "authorized_to_process",
+        disclosureVersion: 1,
+      },
       preset: {
         presetVersion: 1,
         name: "Confirmed-English fixture",
@@ -1597,6 +1657,13 @@ function createThirtySecondForeignFixtureRequest(root: string) {
         timingPrecision: "cue",
       },
       sourceLanguageClass: "foreign",
+      sourceRights: {
+        schemaVersion: 1,
+        source: "youtube",
+        youtubeVideoId: original.track.videoId,
+        confirmation: "authorized_to_process",
+        disclosureVersion: 1,
+      },
       subtitleTracks: {
         original: {
           trackId: original.track.id,

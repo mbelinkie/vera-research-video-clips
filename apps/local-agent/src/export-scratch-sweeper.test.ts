@@ -45,6 +45,13 @@ function fixtureQueue(now = "2026-08-21T12:00:00.000Z") {
       canonicalUrl: "https://www.youtube.com/watch?v=M7lc1UVf-VE",
       title: "Scratch sweep fixture",
     },
+    sourceRights: {
+      schemaVersion: 1,
+      source: "youtube",
+      youtubeVideoId: "M7lc1UVf-VE",
+      confirmation: "authorized_to_process",
+      disclosureVersion: 1,
+    },
     selection: {
       trackId: "019fbb95-cd76-7920-93fa-e23ba755e301",
       transcriptVersion: 1,

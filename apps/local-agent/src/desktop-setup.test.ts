@@ -40,6 +40,10 @@ function fixture(
     runner?: MediaCommandRunner;
     statfs?: DesktopSetupStatfs;
     measuredOperationBytes?: (target: "output_root" | "cache_root") => number;
+    exportWorkerStatus?: () => {
+      available: boolean;
+      issue?: "authentication_required" | "cloud_unavailable";
+    };
   } = {},
 ) {
   const temporaryRoot = mkdtempSync(join(tmpdir(), "desktop-setup-"));
@@ -58,6 +62,9 @@ function fixture(
         (async () => ({ bavail: 32n * 1024n * 1024n, bsize: 1024n })),
       ...(options.measuredOperationBytes
         ? { measuredOperationBytes: options.measuredOperationBytes }
+        : {}),
+      ...(options.exportWorkerStatus
+        ? { exportWorkerStatus: options.exportWorkerStatus }
         : {}),
       now,
     }),
@@ -325,6 +332,44 @@ describe("local desktop setup service", () => {
         "authentication",
         "cloud_api",
       ]),
+    });
+  });
+
+  it("reports the in-agent export scheduler without inventing a separate service", async () => {
+    let available = false;
+    const { service } = fixture({
+      exportWorkerStatus: () => ({ available }),
+    });
+    service.updateSetup({ action: "set_worker_enabled", enabled: true });
+    expect(
+      (await service.getReadinessReport()).components.find(
+        (component) => component.component === "export_worker",
+      ),
+    ).toMatchObject({ state: "needs_action", reason: "worker_unavailable" });
+
+    available = true;
+    expect(
+      (await service.getReadinessReport()).components.find(
+        (component) => component.component === "export_worker",
+      ),
+    ).toMatchObject({ state: "ready", reason: "ready" });
+
+    available = false;
+    const cloudFailure = fixture({
+      exportWorkerStatus: () => ({
+        available: false,
+        issue: "cloud_unavailable",
+      }),
+    }).service;
+    cloudFailure.updateSetup({ action: "set_worker_enabled", enabled: true });
+    expect(
+      (await cloudFailure.getReadinessReport()).components.find(
+        (component) => component.component === "export_worker",
+      ),
+    ).toMatchObject({
+      state: "blocked",
+      reason: "cloud_unavailable",
+      remediation: "retry",
     });
   });
 });

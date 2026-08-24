@@ -60,6 +60,7 @@ import {
   parseTrustedRuntimePaths,
   resolveWorkerConfiguration,
   setupActionRequiresRuntimeRestart,
+  shouldRunExportSupervisor,
   shouldRunTranscriptionWorker,
 } from "./desktop-setup-policy.ts";
 import { LocalAgentEndpointRegistry } from "./local-agent-endpoint.ts";
@@ -209,6 +210,12 @@ if (!app.requestSingleInstanceLock()) {
     );
     await supervisor.start("local-agent");
     if (broker?.getRendererStatus().state === "signed_in") {
+      await setLocalExportSupervisorEnabled({
+        port: localAgentEndpoint.currentPort() ?? 0,
+        sessionSecret,
+        nativeActionSecret,
+        enabled: true,
+      });
       await supervisor.start("transcription-worker");
     }
 
@@ -456,6 +463,34 @@ function installIpcHandlers(options: {
       await supervisor.stop("transcription-worker");
     }
   };
+  const reconcileExportSupervisor = async () => {
+    const broker = options.getBroker();
+    if (options.getLocalAgentPort() === 0) return;
+    let shouldRun = false;
+    try {
+      const [snapshot, localReadiness] = await Promise.all([
+        readSetup(),
+        readLocalReadiness(),
+      ]);
+      shouldRun = shouldRunExportSupervisor({
+        signedIn: broker?.getRendererStatus().state === "signed_in",
+        snapshot,
+        localReadiness,
+      });
+    } catch {
+      shouldRun = false;
+    }
+    await setLocalExportSupervisorEnabled({
+      port: options.getLocalAgentPort(),
+      sessionSecret: options.sessionSecret,
+      nativeActionSecret: options.nativeActionSecret,
+      enabled: shouldRun,
+    });
+  };
+  const reconcileLocalWorkers = async () => {
+    await reconcileExportSupervisor();
+    await reconcileTranscriptionWorker();
+  };
   const restartConfiguredRuntime = async () => {
     const supervisor = options.getSupervisor();
     if (!supervisor) return;
@@ -480,7 +515,7 @@ function installIpcHandlers(options: {
     }
     await supervisor.stop("local-agent");
     await supervisor.start("local-agent");
-    await reconcileTranscriptionWorker();
+    await reconcileLocalWorkers();
   };
   const readReadiness = async () => {
     const localReport = await readLocalReadiness();
@@ -507,7 +542,7 @@ function installIpcHandlers(options: {
     requireTrustedRenderer(event);
     const broker = options.getBroker();
     await broker?.drainNativeCallbacks();
-    await reconcileTranscriptionWorker();
+    await reconcileLocalWorkers();
     return DesktopStatusSchema.parse({
       auth: rendererAuthStatus(broker, options.getStartupAuthIssue()),
       services: rendererServiceStatus(options.getSupervisor()),
@@ -518,6 +553,7 @@ function installIpcHandlers(options: {
     const broker = options.getBroker();
     if (!broker) return unavailableAuthStatus(options.getStartupAuthIssue());
     await broker.beginSignIn();
+    await reconcileLocalWorkers();
     return DesktopAuthStatusSchema.parse(
       rendererAuthStatus(broker, options.getStartupAuthIssue()),
     );
@@ -526,6 +562,12 @@ function installIpcHandlers(options: {
     requireTrustedRenderer(event);
     const broker = options.getBroker();
     if (!broker) return unavailableAuthStatus(options.getStartupAuthIssue());
+    await setLocalExportSupervisorEnabled({
+      port: options.getLocalAgentPort(),
+      sessionSecret: options.sessionSecret,
+      nativeActionSecret: options.nativeActionSecret,
+      enabled: false,
+    });
     await options.getSupervisor()?.stop("transcription-worker");
     await broker.signOut();
     return DesktopAuthStatusSchema.parse(
@@ -552,7 +594,7 @@ function installIpcHandlers(options: {
     if (setupActionRequiresRuntimeRestart(action)) {
       await restartConfiguredRuntime();
     } else {
-      await reconcileTranscriptionWorker();
+      await reconcileLocalWorkers();
     }
     return snapshot;
   });
@@ -1147,6 +1189,34 @@ function wrapUtilityProcess(
       if (pid) process.kill(pid, "SIGKILL");
     },
   };
+}
+
+async function setLocalExportSupervisorEnabled(input: {
+  port: number;
+  sessionSecret: string;
+  nativeActionSecret: string;
+  enabled: boolean;
+}): Promise<void> {
+  if (input.port === 0) return;
+  const response = await fetch(
+    `http://127.0.0.1:${input.port}/api/desktop-setup/export-supervisor`,
+    {
+      method: "POST",
+      headers: {
+        accept: "application/json",
+        authorization: `Bearer ${input.sessionSecret}`,
+        "content-type": "application/json",
+        origin: trustedRendererOrigin,
+        "x-research-video-session": input.sessionSecret,
+        "x-research-video-native-action": input.nativeActionSecret,
+      },
+      body: JSON.stringify({ enabled: input.enabled }),
+      redirect: "error",
+    },
+  );
+  if (!response.ok) {
+    throw new Error("Local export supervision is unavailable.");
+  }
 }
 
 async function readTrustedWorkerConfiguration(input: {

@@ -67,6 +67,7 @@ export function ClipQueue({
   const [presetKey, setPresetKey] = useState("context_default");
   const [preflight, setPreflight] = useState<ExportStoragePreflight>();
   const [confirmUnknownSources, setConfirmUnknownSources] = useState(false);
+  const [sourceRightsConfirmed, setSourceRightsConfirmed] = useState(false);
   const [reexportArtifactVersionId, setReexportArtifactVersionId] =
     useState<string>();
   const [artifactRoots, setArtifactRoots] = useState<ArtifactRootSummary[]>([]);
@@ -256,6 +257,7 @@ export function ClipQueue({
     setAvailabilityFilter("all");
     setPreflight(undefined);
     setConfirmUnknownSources(false);
+    setSourceRightsConfirmed(false);
     setReexportArtifactVersionId(undefined);
     setArtifactRoots([]);
     setResolutions(new Map());
@@ -360,6 +362,7 @@ export function ClipQueue({
     setSelected(next);
     setPreflight(undefined);
     setConfirmUnknownSources(false);
+    setSourceRightsConfirmed(false);
     setReexportArtifactVersionId(undefined);
     try {
       const response = await apiFetch(
@@ -401,6 +404,7 @@ export function ClipQueue({
     setBusy(true);
     setPreflight(undefined);
     setConfirmUnknownSources(false);
+    setSourceRightsConfirmed(false);
     setMessage("Resolving immutable settings and measuring storage…");
     try {
       const response = await apiFetch(
@@ -444,7 +448,22 @@ export function ClipQueue({
   }
 
   async function submitExport() {
-    if (!preflight || page?.freshness !== "fresh") return;
+    if (!preflight || page?.freshness !== "fresh" || !sourceRightsConfirmed)
+      return;
+    const sourceRights = preflight.items.map((item) => {
+      const clip = entries.find((entry) => entry.clip.id === item.clipId)?.clip;
+      if (!clip) throw new Error("The selected clip is no longer available.");
+      return {
+        clipId: clip.id,
+        sourceRights: {
+          schemaVersion: 1,
+          source: "youtube" as const,
+          youtubeVideoId: clip.video.youtubeVideoId,
+          confirmation: "authorized_to_process" as const,
+          disclosureVersion: 1,
+        },
+      };
+    });
     const generation = requestGeneration.current;
     setBusy(true);
     setMessage("Submitting the durable export command…");
@@ -460,6 +479,7 @@ export function ClipQueue({
             ...(reexportArtifactVersionId ? { reexportArtifactVersionId } : {}),
             expectedPreflightFingerprint: preflight.preflightFingerprint,
             confirmUnknownSourceSizes: confirmUnknownSources,
+            sourceRights,
           }),
         },
         authorization,
@@ -473,6 +493,7 @@ export function ClipQueue({
           ? `Queued ${submitted.batch.summary.total} independent export requests.`
           : "Queued one durable export request.";
       setPreflight(undefined);
+      setSourceRightsConfirmed(false);
       const reloadPromise = reload();
       const reloadGeneration = requestGeneration.current;
       await reloadPromise;
@@ -884,7 +905,8 @@ export function ClipQueue({
                 const settings = item.resolvedSettingsSnapshot.settings;
                 return (
                   <li key={item.clipId}>
-                    {clip?.video.title ?? "Selected clip"}:{" "}
+                    {clip?.video.title ?? "Selected clip"} (YouTube ID:{" "}
+                    {clip?.video.youtubeVideoId ?? "unavailable"}):{" "}
                     {settings.videoCodec.toUpperCase()} /{" "}
                     {settings.audioCodec.toUpperCase()} /{" "}
                     {settings.container.toUpperCase()} ·{" "}
@@ -911,11 +933,23 @@ export function ClipQueue({
                 before rendering
               </label>
             ) : null}
+            <label className="export-checkbox">
+              <input
+                type="checkbox"
+                checked={sourceRightsConfirmed}
+                onChange={(event) =>
+                  setSourceRightsConfirmed(event.target.checked)
+                }
+              />
+              I confirm I am authorized to process every exact YouTube source
+              listed above for this export.
+            </label>
             <button
               type="button"
               disabled={
                 busy ||
                 preflight.decision === "insufficient" ||
+                !sourceRightsConfirmed ||
                 (preflight.decision === "confirmation_required" &&
                   !confirmUnknownSources)
               }

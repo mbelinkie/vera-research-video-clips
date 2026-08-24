@@ -759,6 +759,18 @@ describe("shared contracts", () => {
       SubmitClipLibraryExportRequestSchema.parse({
         ...command,
         expectedPreflightFingerprint: "a".repeat(64),
+        sourceRights: [
+          {
+            clipId,
+            sourceRights: {
+              schemaVersion: 1,
+              source: "youtube",
+              youtubeVideoId: "M7lc1UVf-VE",
+              confirmation: "authorized_to_process",
+              disclosureVersion: 1,
+            },
+          },
+        ],
       }),
     ).toMatchObject({ confirmUnknownSourceSizes: false });
     const preflight = {
@@ -939,6 +951,13 @@ describe("shared contracts", () => {
         overrides: {},
       },
       expectedResolutionFingerprint: "a".repeat(64),
+      sourceRights: {
+        schemaVersion: 1,
+        source: "youtube",
+        youtubeVideoId: "M7lc1UVf-VE",
+        confirmation: "authorized_to_process",
+        disclosureVersion: 1,
+      },
     };
     expect(ReexportArtifactVersionRequestSchema.parse(command)).toMatchObject({
       requestOrigin: "clip_library",
@@ -1164,6 +1183,13 @@ describe("shared contracts", () => {
           omitSubtitleFilesForConfirmedEnglish: false,
           embedEnglishSubtitleTrack: false,
         },
+      },
+      sourceRights: {
+        schemaVersion: 1,
+        source: "youtube",
+        youtubeVideoId: "M7lc1UVf-VE",
+        confirmation: "authorized_to_process",
+        disclosureVersion: 1,
       },
     };
     expect(
@@ -1525,6 +1551,13 @@ describe("shared contracts", () => {
           omitSubtitleFilesForConfirmedEnglish: true,
           embedEnglishSubtitleTrack: false,
         },
+      },
+      sourceRights: {
+        schemaVersion: 1,
+        source: "youtube",
+        youtubeVideoId: "M7lc1UVf-VE",
+        confirmation: "authorized_to_process",
+        disclosureVersion: 1,
       },
     };
     expect(CreateClipExportRequestSchema.safeParse(request).success).toBe(

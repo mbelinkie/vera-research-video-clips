@@ -177,6 +177,18 @@ describe("simulated same-workstation authoring client", () => {
         ...exportRequest,
         expectedPreflightFingerprint: "b".repeat(64),
         confirmUnknownSourceSizes: true,
+        sourceRights: [
+          {
+            clipId: missingClipId,
+            sourceRights: {
+              schemaVersion: 1,
+              source: "youtube",
+              youtubeVideoId: "M7lc1UVf-VE",
+              confirmation: "authorized_to_process",
+              disclosureVersion: 1,
+            },
+          },
+        ],
       },
     });
     expect(submitted.statusCode).toBe(201);

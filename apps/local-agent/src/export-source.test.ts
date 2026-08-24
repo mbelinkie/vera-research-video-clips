@@ -72,6 +72,13 @@ function fixtureQueue(
       timingPrecision: "cue",
     },
     sourceLanguageClass: "confirmed_english",
+    sourceRights: {
+      schemaVersion: 1,
+      source: "youtube",
+      youtubeVideoId: "M7lc1UVf-VE",
+      confirmation: "authorized_to_process",
+      disclosureVersion: 1,
+    },
     preset: {
       presetVersion: 1,
       name: "Editing MP4",

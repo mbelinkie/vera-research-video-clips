@@ -85,6 +85,10 @@ import type {
   LocalExportWorkerIdentityRepository,
 } from "@research-video/db-local";
 import type { LocalExportOnceResult } from "./export-run-once.ts";
+import type {
+  LocalExportSupervisorSnapshot,
+  LocalExportSupervisor,
+} from "./export-supervisor.ts";
 import type { LocalRuntimeCoordinator } from "./local-runtime.ts";
 
 const DesktopModelPinSchema = z
@@ -130,12 +134,20 @@ const DesktopModelActivationSchema = z
   })
   .strict();
 
+const DesktopExportSupervisorActionSchema = z
+  .object({ enabled: z.boolean() })
+  .strict();
+
 export interface LocalAgentDependencies {
   desktopSession?: {
     secret: string;
     origin: string;
   };
   desktopNativeActionSecret?: string;
+  exportSupervisor?: Pick<
+    LocalExportSupervisor,
+    "enable" | "pause" | "snapshot"
+  >;
   desktopSetup?: {
     getSnapshot(): SetupSnapshot;
     updateSetup(action: SetupAction): SetupSnapshot;
@@ -609,6 +621,24 @@ export function createLocalAgent(
           : {}),
       });
     });
+    if (dependencies.exportSupervisor) {
+      app.post(
+        "/api/desktop-setup/export-supervisor",
+        async (request, reply) => {
+          requireDesktopNativeAction(request, dependencies);
+          const action = DesktopExportSupervisorActionSchema.parse(
+            request.body,
+          );
+          if (action.enabled) dependencies.exportSupervisor!.enable();
+          else await dependencies.exportSupervisor!.pause();
+          return reply.send(
+            sanitizeExportSupervisorSnapshot(
+              dependencies.exportSupervisor!.snapshot(),
+            ),
+          );
+        },
+      );
+    }
   }
 
   if (
@@ -1706,6 +1736,17 @@ export function createLocalAgent(
   }
 
   return app;
+}
+
+function sanitizeExportSupervisorSnapshot(
+  snapshot: LocalExportSupervisorSnapshot,
+): LocalExportSupervisorSnapshot {
+  return {
+    state: snapshot.state,
+    enabled: snapshot.enabled,
+    registered: snapshot.registered,
+    ...(snapshot.issue ? { issue: snapshot.issue } : {}),
+  };
 }
 
 function requireRuntimeAuthorization(

@@ -145,10 +145,27 @@ describe("desktop launch session", () => {
         whisperModel: undefined,
       })),
     };
+    let exportSupervisorEnabled = false;
+    const exportSupervisor = {
+      enable: vi.fn(() => {
+        exportSupervisorEnabled = true;
+      }),
+      pause: vi.fn(async () => {
+        exportSupervisorEnabled = false;
+      }),
+      snapshot: vi.fn(() => ({
+        state: exportSupervisorEnabled
+          ? ("idle" as const)
+          : ("paused" as const),
+        enabled: exportSupervisorEnabled,
+        registered: false,
+      })),
+    };
     const app = createLocalAgent({
       desktopSession: { secret: sessionSecret, origin: "rvc://app" },
       desktopNativeActionSecret: nativeSecret,
       desktopSetup,
+      exportSupervisor,
     });
     const sessionHeaders = {
       origin: "rvc://app",
@@ -218,6 +235,33 @@ describe("desktop launch session", () => {
     });
     expect(filteredRuntimeConfig.statusCode).toBe(200);
     expect(filteredRuntimeConfig.json()).toEqual({});
+
+    const deniedSupervisor = await app.inject({
+      method: "POST",
+      url: "/api/desktop-setup/export-supervisor",
+      headers: sessionHeaders,
+      payload: { enabled: true },
+    });
+    expect(deniedSupervisor.statusCode).toBe(401);
+    expect(exportSupervisor.enable).not.toHaveBeenCalled();
+    const enabledSupervisor = await app.inject({
+      method: "POST",
+      url: "/api/desktop-setup/export-supervisor",
+      headers: {
+        ...sessionHeaders,
+        "x-research-video-native-action": nativeSecret,
+      },
+      payload: { enabled: true },
+    });
+    expect(enabledSupervisor.statusCode).toBe(200);
+    expect(enabledSupervisor.json()).toEqual({
+      state: "idle",
+      enabled: true,
+      registered: false,
+    });
+    expect(JSON.stringify(enabledSupervisor.json())).not.toContain(
+      sessionSecret,
+    );
     await app.close();
   });
 });
@@ -367,6 +411,16 @@ describe("local agent", () => {
     apps.add(app);
     const preflightUrl = `/api/projects/${projectId}/clip-library/export-preflight`;
     const submitUrl = `/api/projects/${projectId}/clip-library/exports`;
+    const sourceRights = request.clipIds.map((clipId) => ({
+      clipId,
+      sourceRights: {
+        schemaVersion: 1 as const,
+        source: "youtube" as const,
+        youtubeVideoId: "M7lc1UVf-VE",
+        confirmation: "authorized_to_process" as const,
+        disclosureVersion: 1,
+      },
+    }));
     expect(
       (
         await app.inject({
@@ -385,6 +439,7 @@ describe("local agent", () => {
             ...request,
             expectedPreflightFingerprint: "a".repeat(64),
             confirmUnknownSourceSizes: true,
+            sourceRights,
           },
         })
       ).statusCode,
@@ -414,6 +469,7 @@ describe("local agent", () => {
             ...request,
             expectedPreflightFingerprint: "a".repeat(64),
             confirmUnknownSourceSizes: true,
+            sourceRights,
           },
         })
       ).statusCode,
@@ -449,6 +505,7 @@ describe("local agent", () => {
             ...request,
             expectedPreflightFingerprint: "a".repeat(64),
             confirmUnknownSourceSizes: true,
+            sourceRights,
           },
         })
       ).statusCode,
@@ -2483,6 +2540,13 @@ function exportOnlyFixture() {
       youtubeVideoId: "M7lc1UVf-VE",
       canonicalUrl: "https://www.youtube.com/watch?v=M7lc1UVf-VE",
       title: "Fixture video",
+    },
+    sourceRights: {
+      schemaVersion: 1 as const,
+      source: "youtube" as const,
+      youtubeVideoId: "M7lc1UVf-VE",
+      confirmation: "authorized_to_process" as const,
+      disclosureVersion: 1,
     },
     selection: {
       trackId: "019fbb95-cd76-7920-93fa-e23ba755e301",

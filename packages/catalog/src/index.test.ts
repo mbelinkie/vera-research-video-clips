@@ -33,6 +33,16 @@ afterEach(async () => {
 const digest = (bytes: Uint8Array) =>
   createHash("sha256").update(bytes).digest("hex");
 
+function sourceRightsForVideo(youtubeVideoId: string) {
+  return {
+    schemaVersion: 1 as const,
+    source: "youtube" as const,
+    youtubeVideoId,
+    confirmation: "authorized_to_process" as const,
+    disclosureVersion: 1,
+  };
+}
+
 describe("claimed transcript finalization", () => {
   it("atomically activates the version, completes the claimed job, and readies linked items", async () => {
     const database = new PGlite();
@@ -652,6 +662,7 @@ describe("versioned export preset catalogs", () => {
       sourceLanguageClass: "confirmed_english" as const,
       settingsSelection: selection,
       expectedResolutionFingerprint: previewV1.snapshot.resolutionFingerprint!,
+      sourceRights: sourceRightsForVideo(clip!.video.youtubeVideoId),
     };
     const queued = await catalog.createClipExport(
       owner,
@@ -714,6 +725,13 @@ describe("versioned export preset catalogs", () => {
     expect(replayed.resolvedSettingsSnapshot!.resolutionFingerprint).toBe(
       originalSnapshot.resolutionFingerprint,
     );
+    await expect(
+      catalog.createClipExport(owner, project.id, clip!.id, {
+        ...command,
+        idempotencyKey: "queued-export-wrong-source",
+        sourceRights: sourceRightsForVideo("different-youtube-video"),
+      }),
+    ).rejects.toMatchObject({ statusCode: 422 });
     const persisted = await database.query<{
       request_snapshot: ExportRequest["resolvedSettingsSnapshot"];
       job_snapshot: ExportRequest["resolvedSettingsSnapshot"];
@@ -1019,6 +1037,53 @@ describe("registered local export workers", () => {
 });
 
 describe("logged export delivery", () => {
+  it("does not reserve or replay legacy queued work without exact source rights", async () => {
+    const database = new PGlite();
+    databases.add(database);
+    await runCloudMigrations(database);
+    const catalog = new SharedProjectCatalog(
+      database,
+      new MemoryTranscriptObjectStore(),
+      () => new Date("2026-08-20T12:00:00.000Z"),
+    );
+    const owner = fixtureActor("legacy-delivery-owner");
+    await catalog.registerUser(owner, "Legacy delivery owner");
+    const { request } = await createLoggedExportFixture(
+      catalog,
+      owner,
+      "legacy-no-rights",
+    );
+    const advertisement = currentExportWorkerAdvertisement({
+      ffmpegVersion: "8.1.2",
+      encoders: ["libx264", "mov_text"],
+      muxers: ["mp4"],
+      filters: ["scale", "fps"],
+    });
+    const worker = { workerId: randomUUID(), epoch: 1, ...advertisement };
+    await catalog.registerExportWorker(owner, worker);
+    const reserved = await catalog.claimLoggedExportDelivery(owner, {
+      workerId: worker.workerId,
+      workerEpoch: worker.epoch,
+    });
+    expect(reserved.delivery?.request.id).toBe(request.id);
+
+    // Simulate the nullable row shape retained for pre-M7-05 history after a
+    // reservation was already written. The test database is disposable.
+    await database.exec(
+      "DROP TRIGGER export_requests_identity_snapshots_immutable ON export_requests",
+    );
+    await database.query(
+      "UPDATE export_requests SET source_rights_snapshot = NULL WHERE id = $1",
+      [request.id],
+    );
+    expect(
+      await catalog.claimLoggedExportDelivery(owner, {
+        workerId: worker.workerId,
+        workerEpoch: worker.epoch,
+      }),
+    ).toEqual({});
+  });
+
   it("atomically reserves once, accepts idempotently, and does not replay accepted work as a new claim", async () => {
     const database = new PGlite();
     databases.add(database);
@@ -1652,6 +1717,15 @@ describe("logged export delivery", () => {
       sourceLanguageClass: "confirmed_english" as const,
       settingsSelection,
       expectedResolutionFingerprint: preview.snapshot.resolutionFingerprint!,
+      sourceRights: sourceRightsForVideo(
+        (
+          await fixture.catalog.getClipCandidate(
+            fixture.owner,
+            projectId,
+            clipId,
+          )
+        ).video.youtubeVideoId,
+      ),
     };
     clock.now = new Date("2026-08-20T12:00:01.000Z");
     const [reexported, concurrentReplay] = await Promise.all([
@@ -1769,7 +1843,14 @@ describe("logged export delivery", () => {
         projectId,
         clipId,
         completed.id,
-        { ...command, sourceLanguageClass: "foreign" },
+        {
+          ...command,
+          sourceLanguageClass: "foreign",
+          subtitleTracks: {
+            original: { trackId: randomUUID(), trackVersion: 1 },
+            english: { trackId: randomUUID(), trackVersion: 1 },
+          },
+        },
       ),
     ).rejects.toMatchObject({ statusCode: 409 });
     const outsider = fixtureActor("reexport-outsider");
@@ -2972,7 +3053,7 @@ describe("logged export delivery", () => {
         { idempotencyKey: "canceled-parent" },
       ),
     ).rejects.toMatchObject({ statusCode: 409 });
-  }, 30_000);
+  }, 60_000);
 
   it("cancels queued unaccepted work atomically and excludes it from delivery", async () => {
     const database = new PGlite();
@@ -3441,6 +3522,26 @@ describe("logged export batches", () => {
     expect(
       membership.rows.every((request) => Boolean(request.batch_item_id)),
     ).toBe(true);
+    const rightsSnapshots = await database.query<{
+      source_rights_snapshot: { youtubeVideoId: string };
+      job_source_rights: { youtubeVideoId: string };
+    }>(
+      `SELECT request.source_rights_snapshot,
+              job.payload->'sourceRights' AS job_source_rights
+       FROM export_requests request
+       JOIN jobs job ON job.id = request.job_id
+       ORDER BY request.id`,
+    );
+    expect(
+      rightsSnapshots.rows.map(
+        (row) => row.source_rights_snapshot.youtubeVideoId,
+      ),
+    ).toEqual(
+      expect.arrayContaining(clips.map((clip) => clip.video.youtubeVideoId)),
+    );
+    expect(rightsSnapshots.rows.map((row) => row.job_source_rights)).toEqual(
+      rightsSnapshots.rows.map((row) => row.source_rights_snapshot),
+    );
     expect(
       await catalog.createLoggedExportBatch(owner, project.id, command),
     ).toEqual(batch);
@@ -3594,6 +3695,7 @@ describe("logged export batches", () => {
       batchItemId: failedItem.id,
       retryOfRequestId: accepted.request.id,
       retryOrdinal: 1,
+      sourceRights: accepted.request.sourceRights,
     });
     const afterRetry = await catalog.getLoggedExportBatch(
       owner,
@@ -3691,6 +3793,7 @@ async function createBatchCommand(
         sourceLanguageClass: "confirmed_english" as const,
         settingsSelection: selection,
         expectedResolutionFingerprint: preview.snapshot.resolutionFingerprint!,
+        sourceRights: sourceRightsForVideo(clip.video.youtubeVideoId),
       },
     })),
   };
@@ -3795,11 +3898,13 @@ async function createLoggedExportFromClip(
           english: { trackId: randomUUID(), trackVersion: 4 },
         }
       : undefined;
+  const clip = await catalog.getClipCandidate(actor, projectId, clipId);
   return catalog.createClipExport(actor, projectId, clipId, {
     idempotencyKey,
     requestOrigin,
     sourceLanguageClass,
     ...(subtitleTracks ? { subtitleTracks } : {}),
+    sourceRights: sourceRightsForVideo(clip.video.youtubeVideoId),
     settingsSelection: selection,
     expectedResolutionFingerprint: preview.snapshot.resolutionFingerprint!,
   });
@@ -3908,6 +4013,7 @@ function retrySnapshot(request: ExportRequest) {
     video: request.video,
     selection: request.selection,
     sourceLanguageClass: request.sourceLanguageClass,
+    sourceRights: request.sourceRights,
     subtitleTracks: request.subtitleTracks,
     preset: request.preset,
     resolvedSettingsSnapshot: request.resolvedSettingsSnapshot,

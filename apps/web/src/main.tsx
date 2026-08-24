@@ -10,6 +10,7 @@ import {
   ProjectExportPresetCatalogSchema,
   ExportRequestSchema,
   ProjectSchema,
+  ExportSourceRightsSnapshotSchema,
   TranscriptSelectionSchema,
   TranscriptWorkspaceResponseSchema,
   UserSchema,
@@ -175,6 +176,7 @@ function App() {
   const [loggedClipId, setLoggedClipId] = useState<string>();
   const [loggedExportRequestId, setLoggedExportRequestId] = useState<string>();
   const [exportOnlyRequestId, setExportOnlyRequestId] = useState<string>();
+  const [sourceRightsConfirmed, setSourceRightsConfirmed] = useState(false);
   const [personalPresets, setPersonalPresets] = useState<
     ExportPresetCatalogEntry[]
   >([]);
@@ -250,6 +252,7 @@ function App() {
     setLoggedClipId(undefined);
     setLoggedExportRequestId(undefined);
     setExportOnlyRequestId(undefined);
+    setSourceRightsConfirmed(false);
   }
 
   async function refreshDesktopStatus() {
@@ -486,6 +489,19 @@ function App() {
           sourceLanguage: workspace.original.track.language,
         }
       : undefined;
+  const sourceRights = useMemo(
+    () =>
+      selectedVideoSnapshot
+        ? ExportSourceRightsSnapshotSchema.parse({
+            schemaVersion: 1,
+            source: "youtube",
+            youtubeVideoId: selectedVideoSnapshot.youtubeVideoId,
+            confirmation: "authorized_to_process",
+            disclosureVersion: 1,
+          })
+        : undefined,
+    [selectedVideoSnapshot],
+  );
   const selectedRendererCapabilityId =
     exportContainer === "mp4" && exportVideoCodec === "h264"
       ? "h264_mp4"
@@ -549,6 +565,17 @@ function App() {
   }, [selection, transcript]);
 
   useEffect(() => setMatchIndex(0), [query, videoId]);
+
+  useEffect(() => {
+    setSourceRightsConfirmed(false);
+  }, [
+    projectId,
+    selection?.exportEndMs,
+    selection?.exportStartMs,
+    selection?.firstSegmentId,
+    selection?.lastSegmentId,
+    selectedVideoSnapshot?.youtubeVideoId,
+  ]);
 
   useEffect(() => {
     if (!authorization) {
@@ -1226,6 +1253,8 @@ function App() {
       !selection ||
       !transcriptTracks ||
       offlineCachedWorkspace ||
+      !sourceRightsConfirmed ||
+      !sourceRights ||
       loggedSettingsState !== "ready" ||
       !loggedSettingsPreview?.snapshot.resolutionFingerprint
     )
@@ -1265,6 +1294,7 @@ function App() {
             settingsSelection: loggedSettingsSelection,
             expectedResolutionFingerprint:
               loggedSettingsPreview.snapshot.resolutionFingerprint,
+            sourceRights,
           }),
         },
         authorization,
@@ -1285,6 +1315,7 @@ function App() {
       }
       const exportRequest = ExportRequestSchema.parse(payload);
       setLoggedExportRequestId(exportRequest.id);
+      setSourceRightsConfirmed(false);
       setClipActionMessage(
         `Logged to ${projects.find((project) => project.id === projectId)?.name ?? "the selected project"} and queued an export with the ${exportRequest.preset.name} snapshot.`,
       );
@@ -1305,6 +1336,8 @@ function App() {
       !selection ||
       !transcriptTracks ||
       !selectedVideoSnapshot ||
+      !sourceRightsConfirmed ||
+      !sourceRights ||
       exportOnlySettingsState !== "ready" ||
       !exportOnlySettingsPreview?.snapshot.resolutionFingerprint
     )
@@ -1342,6 +1375,7 @@ function App() {
             settingsSelection: exportOnlySettingsSelection,
             expectedResolutionFingerprint:
               exportOnlySettingsPreview.snapshot.resolutionFingerprint,
+            sourceRights,
           }),
         },
         authorization,
@@ -1362,6 +1396,7 @@ function App() {
       }
       const exportRequest = ExportRequestSchema.parse(payload);
       setExportOnlyRequestId(exportRequest.id);
+      setSourceRightsConfirmed(false);
       setClipActionMessage(
         `Queued a local export-only job with the ${exportRequest.preset.name} snapshot. Nothing was added to a project.`,
       );
@@ -2308,6 +2343,22 @@ function App() {
                   </p>
                 ) : null}
               </details>
+              <p className="muted">
+                Export source: YouTube video ID{" "}
+                {sourceRights?.youtubeVideoId ?? "unavailable"}
+              </p>
+              <label className="export-checkbox">
+                <input
+                  type="checkbox"
+                  checked={sourceRightsConfirmed}
+                  disabled={!selectedVideoSnapshot}
+                  onChange={(event) =>
+                    setSourceRightsConfirmed(event.target.checked)
+                  }
+                />
+                I confirm I am authorized to process this exact YouTube source
+                for export.
+              </label>
               <div className="selection-actions">
                 <button
                   type="button"
@@ -2337,6 +2388,7 @@ function App() {
                     !selectedVideoSnapshot ||
                     !languageEvidenceReady ||
                     offlineCachedWorkspace ||
+                    !sourceRightsConfirmed ||
                     loggedSettingsState !== "ready"
                   }
                   onClick={() => void requestLoggedExport()}
@@ -2349,6 +2401,7 @@ function App() {
                     clipActionBusy ||
                     Boolean(exportOnlyRequestId) ||
                     !selectedVideoSnapshot ||
+                    !sourceRightsConfirmed ||
                     exportOnlySettingsState !== "ready"
                   }
                   onClick={() => void requestExportOnly()}

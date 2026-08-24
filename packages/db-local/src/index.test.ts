@@ -61,6 +61,13 @@ const fixtureExportInput = {
     timingPrecision: "word" as const,
   },
   sourceLanguageClass: "confirmed_english" as const,
+  sourceRights: {
+    schemaVersion: 1 as const,
+    source: "youtube" as const,
+    youtubeVideoId: "M7lc1UVf-VE",
+    confirmation: "authorized_to_process" as const,
+    disclosureVersion: 1,
+  },
   preset: {
     presetVersion: 1,
     name: "Editing MP4",
@@ -158,6 +165,7 @@ describe("local migrations", () => {
       "0027_clip_library_cache",
       "0028_desktop_setup_and_validated_components",
       "0029_verified_transcript_cache_authorizations",
+      "0030_export_source_rights_and_terminal_reconciliation",
     ]);
     expect(runLocalMigrations(database)).toEqual([]);
     expect(
@@ -491,6 +499,7 @@ describe("local migrations", () => {
     expect(runLocalMigrations(database)).toEqual([
       "0028_desktop_setup_and_validated_components",
       "0029_verified_transcript_cache_authorizations",
+      "0030_export_source_rights_and_terminal_reconciliation",
     ]);
     expect(
       database
@@ -541,6 +550,7 @@ describe("local migrations", () => {
       );
     expect(runLocalMigrations(database)).toEqual([
       "0029_verified_transcript_cache_authorizations",
+      "0030_export_source_rights_and_terminal_reconciliation",
     ]);
     expect(
       database
@@ -848,6 +858,7 @@ describe("local migrations", () => {
       "0027_clip_library_cache",
       "0028_desktop_setup_and_validated_components",
       "0029_verified_transcript_cache_authorizations",
+      "0030_export_source_rights_and_terminal_reconciliation",
     ]);
     expect(
       database
@@ -1031,6 +1042,7 @@ describe("local migrations", () => {
       "0027_clip_library_cache",
       "0028_desktop_setup_and_validated_components",
       "0029_verified_transcript_cache_authorizations",
+      "0030_export_source_rights_and_terminal_reconciliation",
     ]);
     expect(
       database.prepare("SELECT * FROM export_final_artifacts").all(),
@@ -1170,6 +1182,7 @@ describe("local migrations", () => {
       "0027_clip_library_cache",
       "0028_desktop_setup_and_validated_components",
       "0029_verified_transcript_cache_authorizations",
+      "0030_export_source_rights_and_terminal_reconciliation",
     ]);
     expect(
       database
@@ -2385,6 +2398,7 @@ describe("logged export delivery import", () => {
       "0027_clip_library_cache",
       "0028_desktop_setup_and_validated_components",
       "0029_verified_transcript_cache_authorizations",
+      "0030_export_source_rights_and_terminal_reconciliation",
     ]);
     const after = new LocalExportQueue(database).get(before.id);
     expect(after).toEqual(before);
@@ -2461,6 +2475,7 @@ describe("logged export delivery import", () => {
       "0027_clip_library_cache",
       "0028_desktop_setup_and_validated_components",
       "0029_verified_transcript_cache_authorizations",
+      "0030_export_source_rights_and_terminal_reconciliation",
     ]);
     expect(
       new LocalExportQueue(database).getAcceptedLoggedDelivery(
@@ -2472,6 +2487,232 @@ describe("logged export delivery import", () => {
       acceptedAt,
       request: { id: delivery.request.id, state: "queued" },
     });
+    database.close();
+  });
+});
+
+describe("local export source-rights and restart scheduling", () => {
+  it("persists exact rights, excludes unconfirmed rows, and reconciles accepted terminal work once", () => {
+    const directory = mkdtempSync(join(tmpdir(), "research-video-rights-"));
+    temporaryDirectories.add(directory);
+    const database = openLocalDatabase(join(directory, "rights.sqlite"));
+    runLocalMigrations(database);
+    const queue = new LocalExportQueue(
+      database,
+      () => new Date("2026-08-23T12:00:00.000Z"),
+    );
+
+    const exportOnly = queue.createExportOnly(fixtureExportInput);
+    expect(queue.getNextRunnableExportOnly()).toMatchObject({
+      id: exportOnly.id,
+      sourceRights: fixtureExportInput.sourceRights,
+    });
+    const stored = database
+      .prepare(
+        `SELECT source_rights_confirmation_json,
+                json_extract(j.payload_json, '$.sourceRights') AS payload_source_rights
+         FROM export_requests er JOIN jobs j ON j.id = er.job_id
+         WHERE er.id = ?`,
+      )
+      .get(exportOnly.id) as {
+      source_rights_confirmation_json: string;
+      payload_source_rights: string;
+    };
+    expect(JSON.parse(stored.source_rights_confirmation_json)).toEqual(
+      fixtureExportInput.sourceRights,
+    );
+    expect(JSON.parse(stored.payload_source_rights)).toEqual(
+      fixtureExportInput.sourceRights,
+    );
+    expect(() =>
+      queue.createExportOnly({
+        ...fixtureExportInput,
+        sourceRights: {
+          ...fixtureExportInput.sourceRights,
+          disclosureVersion: 2,
+        },
+      }),
+    ).toThrowError(
+      expect.objectContaining({ code: "source_rights_confirmation_conflict" }),
+    );
+
+    const legacyJobId = randomUUID();
+    const legacyRequestId = randomUUID();
+    const now = "2026-08-22T12:00:00.000Z";
+    const resolved = resolveExportSettings({
+      context: "export_only",
+      sourceLanguageClass: "confirmed_english",
+      legacyPreset: fixtureExportInput.preset,
+      resolvedAt: now,
+    }).snapshot;
+    database
+      .prepare(
+        `INSERT INTO jobs
+           (id, kind, state, idempotency_key, attempt, payload_json, created_at, updated_at)
+         VALUES (?, 'export', 'queued', ?, 0, '{}', ?, ?)`,
+      )
+      .run(legacyJobId, `export-only:legacy-${legacyRequestId}`, now, now);
+    database
+      .prepare(
+        `INSERT INTO export_requests
+           (id, job_id, mode, video_snapshot_json, selection_snapshot_json,
+            source_language_class, preset_snapshot_json,
+            resolved_settings_snapshot_json, created_at, updated_at)
+         VALUES (?, ?, 'export_only', ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        legacyRequestId,
+        legacyJobId,
+        JSON.stringify(fixtureExportInput.video),
+        JSON.stringify(fixtureExportInput.selection),
+        fixtureExportInput.sourceLanguageClass,
+        JSON.stringify(fixtureExportInput.preset),
+        JSON.stringify(resolved),
+        now,
+        now,
+      );
+    expect(queue.get(legacyRequestId)?.sourceRights).toBeUndefined();
+    expect(queue.getNextRunnableExportOnly()?.id).toBe(exportOnly.id);
+    expect(() =>
+      queue.assertExactSourceRightsConfirmation(legacyRequestId),
+    ).toThrowError(
+      expect.objectContaining({ code: "source_rights_confirmation_required" }),
+    );
+    const acceptedLegacyJobId = randomUUID();
+    const acceptedLegacyRequestId = randomUUID();
+    database
+      .prepare(
+        `INSERT INTO jobs
+           (id, kind, state, idempotency_key, attempt, payload_json, created_at, updated_at)
+         VALUES (?, 'export', 'queued', ?, 0, '{}', ?, ?)`,
+      )
+      .run(
+        acceptedLegacyJobId,
+        `logged:legacy-${acceptedLegacyRequestId}`,
+        now,
+        now,
+      );
+    database
+      .prepare(
+        `INSERT INTO export_requests
+           (id, job_id, mode, video_snapshot_json, selection_snapshot_json,
+            source_language_class, preset_snapshot_json,
+            resolved_settings_snapshot_json, cloud_project_id, cloud_clip_id,
+            cloud_delivery_id, cloud_delivery_generation,
+            cloud_reservation_token, cloud_worker_id, cloud_worker_epoch,
+            cloud_reserved_at, cloud_reservation_expires_at,
+            cloud_delivery_state, created_at, updated_at)
+         VALUES (?, ?, 'export_only', ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 1,
+                 ?, ?, 'pending_acceptance', ?, ?)`,
+      )
+      .run(
+        acceptedLegacyRequestId,
+        acceptedLegacyJobId,
+        JSON.stringify(fixtureExportInput.video),
+        JSON.stringify(fixtureExportInput.selection),
+        fixtureExportInput.sourceLanguageClass,
+        JSON.stringify(fixtureExportInput.preset),
+        JSON.stringify(resolved),
+        randomUUID(),
+        randomUUID(),
+        randomUUID(),
+        randomUUID(),
+        randomUUID(),
+        "2026-08-22T12:00:01.000Z",
+        "2026-08-22T12:01:01.000Z",
+        now,
+        now,
+      );
+    database
+      .prepare(
+        `UPDATE export_requests
+         SET cloud_delivery_state = 'accepted', cloud_accepted_at = ?
+         WHERE id = ?`,
+      )
+      .run("2026-08-22T12:00:02.000Z", acceptedLegacyRequestId);
+    const acceptedLegacy = queue.getNextRunnableAcceptedLoggedDelivery();
+    expect(acceptedLegacy).toMatchObject({
+      request: { id: acceptedLegacyRequestId },
+      status: "accepted",
+    });
+    expect(acceptedLegacy?.request).not.toHaveProperty("sourceRights");
+    queue.recordSourceNotStartedFailure(
+      acceptedLegacyRequestId,
+      "source_rights_confirmation_required",
+      "Exact source rights are required before acquisition.",
+    );
+    expect(
+      queue.markLoggedExportReconciled(
+        acceptedLegacyRequestId,
+        "failure",
+        "2026-08-23T12:00:30.000Z",
+      ),
+    ).toEqual({
+      outcome: "failure",
+      reconciledAt: "2026-08-23T12:00:30.000Z",
+    });
+
+    const delivery = fixtureLoggedDelivery();
+    queue.importLoggedDeliveryPending(delivery);
+    expect(queue.get(delivery.request.id)?.sourceRights).toEqual(
+      delivery.request.sourceRights,
+    );
+    expect(() =>
+      queue.importLoggedDeliveryPending({
+        ...delivery,
+        request: {
+          ...delivery.request,
+          sourceRights: {
+            ...delivery.request.sourceRights!,
+            disclosureVersion: 2,
+          },
+        },
+      }),
+    ).toThrowError(
+      expect.objectContaining({ code: "logged_export_delivery_conflict" }),
+    );
+    const accepted: LoggedExportDelivery = {
+      ...delivery,
+      status: "accepted",
+      acceptedAt: "2026-08-20T12:00:05.000Z",
+    };
+    queue.activateLoggedDelivery(accepted);
+    expect(queue.getNextRunnableAcceptedLoggedDelivery()).toMatchObject({
+      deliveryId: accepted.deliveryId,
+      request: { id: accepted.request.id, state: "queued" },
+    });
+    queue.recordSourceNotStartedFailure(
+      accepted.request.id,
+      "fixture_failure",
+      "Fixture failure after restart.",
+    );
+    const reconciledAt = "2026-08-23T12:01:00.000Z";
+    expect(
+      queue.markLoggedExportReconciled(
+        accepted.request.id,
+        "failure",
+        reconciledAt,
+      ),
+    ).toEqual({ outcome: "failure", reconciledAt });
+    expect(
+      queue.markLoggedExportReconciled(
+        accepted.request.id,
+        "failure",
+        reconciledAt,
+      ),
+    ).toEqual({ outcome: "failure", reconciledAt });
+    expect(queue.getNextRunnableAcceptedLoggedDelivery()).toBeUndefined();
+    expect(() =>
+      queue.markLoggedExportReconciled(
+        accepted.request.id,
+        "success",
+        reconciledAt,
+      ),
+    ).toThrowError(
+      expect.objectContaining({
+        code: "logged_export_terminal_outcome_state_conflict",
+      }),
+    );
     database.close();
   });
 });
@@ -2508,6 +2749,7 @@ function fixtureLoggedDelivery(): LoggedExportDelivery {
     video: fixtureExportInput.video,
     selection: fixtureExportInput.selection,
     sourceLanguageClass: "confirmed_english" as const,
+    sourceRights: fixtureExportInput.sourceRights,
     preset: {
       presetVersion: 1,
       name: "Editing MP4",

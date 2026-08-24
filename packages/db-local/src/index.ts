@@ -6,6 +6,7 @@ import { DatabaseSync } from "node:sqlite";
 
 import {
   CreateExportOnlyRequestSchema,
+  ExportSourceRightsSnapshotSchema,
   ArtifactLocatorSummarySchema,
   ArtifactRootSummarySchema,
   ClipLibraryPageSchema,
@@ -263,6 +264,10 @@ export class LocalExportQueue {
     resolvedSettingsSnapshot?: ResolvedExportSettingsSnapshot,
   ): ExportRequest {
     const request = CreateExportOnlyRequestSchema.parse(input);
+    const sourceRights = requireExactSourceRightsSnapshot(
+      request.sourceRights,
+      request.video.youtubeVideoId,
+    );
     const idempotencyKey = `export-only:${request.idempotencyKey}`;
     const existing = this.database
       .prepare(
@@ -270,7 +275,10 @@ export class LocalExportQueue {
          WHERE j.idempotency_key = ?`,
       )
       .get(idempotencyKey) as Record<string, unknown> | undefined;
-    if (existing) return this.mapRequest(existing);
+    if (existing) {
+      this.assertExactSourceRightsSnapshot(existing, sourceRights);
+      return this.mapRequest(existing);
+    }
 
     const requestId = randomUUID();
     const jobId = randomUUID();
@@ -318,6 +326,7 @@ export class LocalExportQueue {
             video: request.video,
             selection: request.selection,
             sourceLanguageClass: request.sourceLanguageClass,
+            sourceRights,
             preset,
             resolvedSettingsSnapshot: resolved,
           }),
@@ -325,15 +334,20 @@ export class LocalExportQueue {
           now,
         );
       const originColumn = this.hasRequestOriginColumn();
+      const sourceRightsColumn = this.hasSourceRightsConfirmationColumn();
       this.database
         .prepare(
           `INSERT INTO export_requests
              (id, job_id, mode, video_snapshot_json,
               selection_snapshot_json, source_language_class,
               preset_snapshot_json, resolved_settings_snapshot_json,
-              subtitle_tracks_snapshot_json${originColumn ? ", request_origin" : ""},
+              subtitle_tracks_snapshot_json
+              ${sourceRightsColumn ? ", source_rights_confirmation_json" : ""}
+              ${originColumn ? ", request_origin" : ""},
               created_at, updated_at)
-           VALUES (?, ?, 'export_only', ?, ?, ?, ?, ?, ?${originColumn ? ", ?" : ""}, ?, ?)`,
+           VALUES (?, ?, 'export_only', ?, ?, ?, ?, ?, ?
+             ${sourceRightsColumn ? ", ?" : ""}
+             ${originColumn ? ", ?" : ""}, ?, ?)`,
         )
         .run(
           requestId,
@@ -344,6 +358,7 @@ export class LocalExportQueue {
           presetSnapshot,
           resolvedSettingsSnapshotJson,
           subtitleTracksSnapshot,
+          ...(sourceRightsColumn ? [JSON.stringify(sourceRights)] : []),
           ...(originColumn
             ? [request.requestOrigin ?? "selection_action"]
             : []),
@@ -361,6 +376,12 @@ export class LocalExportQueue {
   importLoggedDeliveryPending(input: LoggedExportDelivery): ExportRequest {
     const delivery = LoggedExportDeliverySchema.parse(input);
     const request = delivery.request;
+    const sourceRights = request.sourceRights
+      ? requireExactSourceRightsSnapshot(
+          request.sourceRights,
+          request.video.youtubeVideoId,
+        )
+      : undefined;
     const physicalMode = "export_only";
     this.database.exec("BEGIN IMMEDIATE;");
     try {
@@ -415,6 +436,7 @@ export class LocalExportQueue {
             video: request.video,
             selection: request.selection,
             sourceLanguageClass: request.sourceLanguageClass,
+            ...(sourceRights ? { sourceRights } : {}),
             ...(request.subtitleTracks
               ? { subtitleTracks: request.subtitleTracks }
               : {}),
@@ -428,12 +450,14 @@ export class LocalExportQueue {
           request.updatedAt,
         );
       const originColumn = this.hasRequestOriginColumn();
+      const sourceRightsColumn = this.hasSourceRightsConfirmationColumn();
       this.database
         .prepare(
           `INSERT INTO export_requests
              (id, job_id, mode, video_snapshot_json, selection_snapshot_json,
               source_language_class, preset_snapshot_json,
-              resolved_settings_snapshot_json, subtitle_tracks_snapshot_json,
+              resolved_settings_snapshot_json, subtitle_tracks_snapshot_json
+              ${sourceRightsColumn ? ", source_rights_confirmation_json" : ""},
               cloud_project_id, cloud_clip_id, cloud_delivery_id,
               cloud_delivery_generation, cloud_reservation_token,
               cloud_worker_id, cloud_worker_epoch, cloud_reserved_at,
@@ -441,7 +465,9 @@ export class LocalExportQueue {
               ${originColumn ? ", request_origin" : ""},
               created_at, updated_at)
            VALUES ($id, $jobId, $mode, $video, $selection, $sourceLanguage,
-                   $preset, $resolved, $subtitleTracks, $projectId, $clipId,
+                   $preset, $resolved, $subtitleTracks
+                   ${sourceRightsColumn ? ", $sourceRights" : ""},
+                   $projectId, $clipId,
                    $deliveryId, $generation, $reservationToken, $workerId,
                    $workerEpoch, $reservedAt, $reservationExpiresAt,
                    'pending_acceptance'
@@ -460,6 +486,13 @@ export class LocalExportQueue {
           $subtitleTracks: request.subtitleTracks
             ? JSON.stringify(request.subtitleTracks)
             : null,
+          ...(sourceRightsColumn
+            ? {
+                $sourceRights: sourceRights
+                  ? JSON.stringify(sourceRights)
+                  : null,
+              }
+            : {}),
           $projectId: request.projectId!,
           $clipId: request.clipId!,
           $deliveryId: delivery.deliveryId,
@@ -1340,6 +1373,129 @@ export class LocalExportQueue {
     return row ? this.mapRequest(row) : undefined;
   }
 
+  /**
+   * Returns only a confirmed projectless request that the local scheduler may
+   * begin. Logged deliveries, recovery/cleanup states, and historical rows
+   * without durable source-rights evidence are intentionally excluded.
+   */
+  getNextRunnableExportOnly(): ExportRequest | undefined {
+    const row = this.database
+      .prepare(
+        `${localExportRequestSelect}
+         WHERE er.mode = 'export_only'
+           AND er.cloud_delivery_id IS NULL
+           AND er.source_rights_confirmation_json IS NOT NULL
+           AND j.state = 'queued'
+         ORDER BY er.created_at ASC, er.id ASC LIMIT 1`,
+      )
+      .get() as Record<string, unknown> | undefined;
+    return row ? this.mapRequest(row) : undefined;
+  }
+
+  /**
+   * Finds the oldest cloud-accepted delivery that has not yet had its durable
+   * terminal result acknowledged. Processing is excluded so restart recovery
+   * first settles scratch/lease evidence instead of racing a live attempt.
+   */
+  getNextRunnableAcceptedLoggedDelivery(): LoggedExportDelivery | undefined {
+    const row = this.database
+      .prepare(
+        `${localExportRequestSelect}
+         WHERE er.cloud_delivery_state = 'accepted'
+           AND er.cloud_terminal_reconciled_at IS NULL
+           AND j.state IN ('queued', 'needs_user_action', 'complete', 'canceled')
+         ORDER BY er.created_at ASC, er.id ASC LIMIT 1`,
+      )
+      .get() as Record<string, unknown> | undefined;
+    if (!row || !row.cloud_accepted_at) return undefined;
+    return LoggedExportDeliverySchema.parse({
+      deliveryId: row.cloud_delivery_id,
+      generation: Number(row.cloud_delivery_generation),
+      reservationToken: row.cloud_reservation_token,
+      workerId: row.cloud_worker_id,
+      workerEpoch: Number(row.cloud_worker_epoch),
+      status: "accepted",
+      reservedAt: row.cloud_reserved_at,
+      reservationExpiresAt: row.cloud_reservation_expires_at,
+      acceptedAt: row.cloud_accepted_at,
+      ...sourceGroupFromLocalRow(row),
+      request: this.mapRequest(row),
+    });
+  }
+
+  markLoggedExportReconciled(
+    requestId: string,
+    outcome: LocalLoggedExportTerminalOutcome,
+    reconciledAt = this.now().toISOString(),
+  ): LocalLoggedExportTerminalReconciliation {
+    assertUtcTimestamp(reconciledAt, "Cloud terminal reconciliation time");
+    const request = this.get(requestId);
+    if (!request || request.mode !== "logged") {
+      throw new LocalExportRequestNotFoundError();
+    }
+    if (!this.getAcceptedLoggedDelivery(requestId)) {
+      throw new LocalExportLifecycleError(
+        "Only an accepted logged delivery can record cloud reconciliation.",
+        "logged_export_delivery_not_accepted",
+      );
+    }
+    const expectedState =
+      outcome === "success"
+        ? "complete"
+        : outcome === "failure"
+          ? "needs_user_action"
+          : "canceled";
+    if (request.state !== expectedState) {
+      throw new LocalExportLifecycleError(
+        "The requested cloud terminal outcome does not match durable local state.",
+        "logged_export_terminal_outcome_state_conflict",
+      );
+    }
+    const existing = this.database
+      .prepare(
+        `SELECT cloud_terminal_outcome, cloud_terminal_reconciled_at
+         FROM export_requests WHERE id = ?`,
+      )
+      .get(requestId) as
+      | {
+          cloud_terminal_outcome: string | null;
+          cloud_terminal_reconciled_at: string | null;
+        }
+      | undefined;
+    if (!existing) throw new LocalExportRequestNotFoundError();
+    if (
+      existing.cloud_terminal_outcome !== null ||
+      existing.cloud_terminal_reconciled_at !== null
+    ) {
+      if (
+        existing.cloud_terminal_outcome === outcome &&
+        existing.cloud_terminal_reconciled_at === reconciledAt
+      ) {
+        return { outcome, reconciledAt };
+      }
+      throw new LocalExportLifecycleError(
+        "The logged export already has different immutable cloud terminal reconciliation evidence.",
+        "logged_export_terminal_reconciliation_conflict",
+      );
+    }
+    const updated = this.database
+      .prepare(
+        `UPDATE export_requests
+         SET cloud_terminal_outcome = ?, cloud_terminal_reconciled_at = ?
+         WHERE id = ? AND cloud_delivery_state = 'accepted'
+           AND cloud_terminal_outcome IS NULL
+           AND cloud_terminal_reconciled_at IS NULL`,
+      )
+      .run(outcome, reconciledAt, requestId);
+    if (updated.changes !== 1) {
+      throw new LocalExportLifecycleError(
+        "Cloud terminal reconciliation lost exact local ownership.",
+        "logged_export_terminal_reconciliation_conflict",
+      );
+    }
+    return { outcome, reconciledAt };
+  }
+
   list(): ExportRequest[] {
     return (
       this.database
@@ -1956,6 +2112,15 @@ export class LocalExportQueue {
         "logged_export_delivery_not_accepted",
       );
     }
+  }
+
+  assertExactSourceRightsConfirmation(requestId: string): void {
+    const request = this.get(requestId);
+    if (!request) throw new LocalExportRequestNotFoundError();
+    requireExactSourceRightsSnapshot(
+      request.sourceRights,
+      request.video.youtubeVideoId,
+    );
   }
 
   recordSourceNotStartedFailure(
@@ -3305,6 +3470,48 @@ export class LocalExportQueue {
     ).some((column) => column.name === "request_origin");
   }
 
+  private hasSourceRightsConfirmationColumn(): boolean {
+    return (
+      this.database
+        .prepare("PRAGMA table_info(export_requests)")
+        .all() as Array<{ name: string }>
+    ).some((column) => column.name === "source_rights_confirmation_json");
+  }
+
+  private assertExactSourceRightsSnapshot(
+    row: Record<string, unknown>,
+    incoming: ReturnType<typeof requireExactSourceRightsSnapshot>,
+  ): void {
+    if (
+      row.source_rights_confirmation_json === null ||
+      row.source_rights_confirmation_json === undefined
+    ) {
+      throw new LocalExportLifecycleError(
+        "The existing export request has no immutable source-rights confirmation.",
+        "source_rights_confirmation_conflict",
+      );
+    }
+    let existing: ReturnType<typeof requireExactSourceRightsSnapshot>;
+    try {
+      existing = requireExactSourceRightsSnapshot(
+        JSON.parse(String(row.source_rights_confirmation_json)),
+        incoming.youtubeVideoId,
+      );
+    } catch (error) {
+      if (error instanceof LocalExportLifecycleError) throw error;
+      throw new LocalExportLifecycleError(
+        "The existing export request has invalid immutable source-rights confirmation.",
+        "source_rights_confirmation_conflict",
+      );
+    }
+    if (canonicalJson(existing) !== canonicalJson(incoming)) {
+      throw new LocalExportLifecycleError(
+        "The existing export request has different immutable source-rights confirmation.",
+        "source_rights_confirmation_conflict",
+      );
+    }
+  }
+
   private assertExactLoggedDelivery(
     row: Record<string, unknown>,
     delivery: LoggedExportDelivery,
@@ -3343,6 +3550,7 @@ export class LocalExportQueue {
       video: existing.video,
       selection: existing.selection,
       sourceLanguageClass: existing.sourceLanguageClass,
+      sourceRights: existing.sourceRights,
       subtitleTracks: existing.subtitleTracks,
       preset: existing.preset,
       resolvedSettingsSnapshot: existing.resolvedSettingsSnapshot,
@@ -3359,6 +3567,7 @@ export class LocalExportQueue {
       video: request.video,
       selection: request.selection,
       sourceLanguageClass: request.sourceLanguageClass,
+      sourceRights: request.sourceRights,
       subtitleTracks: request.subtitleTracks,
       preset: request.preset,
       resolvedSettingsSnapshot: request.resolvedSettingsSnapshot,
@@ -3423,6 +3632,14 @@ export class LocalExportQueue {
 export type LocalExportSourceAttempt = {
   request: ExportRequest;
   attempt: number;
+};
+
+export type LocalLoggedExportTerminalOutcome =
+  "success" | "failure" | "canceled";
+
+export type LocalLoggedExportTerminalReconciliation = {
+  outcome: LocalLoggedExportTerminalOutcome;
+  reconciledAt: string;
 };
 
 export type LocalRuntimeQuiescenceEvidence = {
@@ -4704,6 +4921,14 @@ function mapLocalExportRequest(
     video: JSON.parse(String(row.video_snapshot_json)),
     selection: JSON.parse(String(row.selection_snapshot_json)),
     sourceLanguageClass: row.source_language_class,
+    ...(row.source_rights_confirmation_json === null ||
+    row.source_rights_confirmation_json === undefined
+      ? {}
+      : {
+          sourceRights: ExportSourceRightsSnapshotSchema.parse(
+            JSON.parse(String(row.source_rights_confirmation_json)),
+          ),
+        }),
     ...(row.subtitle_tracks_snapshot_json === null ||
     row.subtitle_tracks_snapshot_json === undefined
       ? {}
@@ -4883,6 +5108,40 @@ function mapLocalExportRequest(
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   });
+}
+
+function requireExactSourceRightsSnapshot(
+  value: unknown,
+  youtubeVideoId: string,
+) {
+  if (!value) {
+    throw new LocalExportLifecycleError(
+      "Confirm source rights for this exact video before creating or processing an export.",
+      "source_rights_confirmation_required",
+    );
+  }
+  const rights = ExportSourceRightsSnapshotSchema.parse(value);
+  if (rights.youtubeVideoId !== youtubeVideoId) {
+    throw new LocalExportLifecycleError(
+      "Source-rights confirmation does not match this export request video.",
+      "source_rights_confirmation_video_mismatch",
+    );
+  }
+  return rights;
+}
+
+function assertUtcTimestamp(value: string, label: string): void {
+  if (
+    !Number.isFinite(Date.parse(value)) ||
+    !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/u.test(
+      value,
+    )
+  ) {
+    throw new LocalExportLifecycleError(
+      `${label} is invalid.`,
+      "logged_export_terminal_reconciliation_time_invalid",
+    );
+  }
 }
 
 function mapLocalSourceScratchAsset(
