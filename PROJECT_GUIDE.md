@@ -2,7 +2,7 @@
 
 ## Project guide and implementation plan
 
-Status: Milestones 1–6 and M7-03 complete; M7-01 real AWS acceptance remains blocked
+Status: Milestones 1–6 and M7-04 complete; M7-01 real AWS acceptance remains blocked
 Last updated: 2026-08-23
 
 This document is the source of truth for product scope, architecture, sequencing, and acceptance criteria. Update it when a deliberate product or architectural decision changes. Use `outline.md` as the shorter execution checklist.
@@ -1904,6 +1904,21 @@ Execute six bounded slices:
    publication, cache resolution, and `Ready for review`; expose durable
    progress, retry, cancellation, actionable degraded states, and preferred,
    English, original, and paired views without manual worker commands.
+
+   Completed 2026-08-23 in implementation commit `3b7e35f`. Normal workspace
+   hydration now resolves exact authorized project/catalog video identities
+   through the shared-first immutable manifest boundary; validates, caches, and
+   indexes original plus canonical-English tracks; reuses exact local/shared
+   preferred translations without creating unowned work; and never substitutes
+   production fixtures. Same-login offline review uses a volatile main-process
+   capability whose hash is scoped to an exact verified cache row, while
+   sign-out, new sessions, access denial, and cloud mutations fail closed.
+   Ready-item navigation, retry, all language views, search, selection, and
+   provenance evidence use the typed workspace. Startup scratch recovery runs
+   before the supervised transcription worker claims work. Deterministic UI,
+   cache, migration, build, x64 package, and independent integrity review gates
+   passed; real cloud/live-source proof remains reserved for M7-06 after the
+   recorded M7-01 and model-pin prerequisites are supplied.
 5. **Complete export workflow integration:** automatically register and
    heartbeat the local export worker, claim and process accepted logged work,
    and process export-only requests. Replace manual `curl`, register,

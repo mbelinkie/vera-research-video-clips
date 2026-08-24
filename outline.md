@@ -418,7 +418,7 @@ conflict behavior are proven.
       installed FFmpeg/FFprobe, yt-dlp, and whisper-cli; download or select and
       checksum-verify the pinned model; expose `ComponentHealth` and
       `ReadinessReport` without globally blocking lightweight work.
-- [ ] M7-04 complete transcript integration: hydrate verified local/shared
+- [x] M7-04 complete transcript integration: hydrate verified local/shared
       transcripts for arbitrary supported videos instead of fixtures only;
       automatically supervise caption/audio/Whisper/translation/publication and
       expose progress, retry/cancel, degraded states, review readiness, and all
@@ -607,7 +607,7 @@ infra/aws        storage, API, database, queues, identity, monitoring
 
 ## Next action
 
-Milestones 1–6 and M7-03 are complete. M7-01's real AWS change-set and Cognito
+Milestones 1–6 and M7-04 are complete. M7-01's real AWS change-set and Cognito
 acceptance remain an explicit external prerequisite. The next unstarted local
-implementation slice is M7-04 complete transcript integration, and it must
-begin with its own bounded active specification.
+implementation slice is M7-05 complete export integration, and it must begin
+with its own bounded active specification.
