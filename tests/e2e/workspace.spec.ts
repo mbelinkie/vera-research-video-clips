@@ -1,49 +1,167 @@
-import { expect, test } from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
 import {
   CURRENT_EXPORT_WORKER_CAPABILITY,
   sha256Fingerprint,
 } from "@research-video/export-settings";
+import englishWordFixture from "../fixtures/transcripts/english-word.json" with { type: "json" };
+import multilingualFixture from "../fixtures/transcripts/romanian-multilingual.json" with { type: "json" };
+
+const directVideo = {
+  id: "019fbb95-cd76-7920-93fa-e23ba755ee33",
+  youtubeVideoId: "M7lc1UVf-VE",
+  canonicalUrl: "https://www.youtube.com/watch?v=M7lc1UVf-VE",
+  title: "Fixture review video",
+  channel: "Fixture channel",
+};
+
+const romanianVideo = {
+  id: "019fbb95-cd76-7920-93fa-e23ba755ee53",
+  youtubeVideoId: "Romanian001",
+  canonicalUrl: "https://www.youtube.com/watch?v=Romanian001",
+  title: "Romanian review video",
+  channel: "Fixture channel",
+};
+
+function projectVideoFixture(
+  video: typeof directVideo | typeof romanianVideo,
+  now: string,
+) {
+  return { ...video, version: 1, createdAt: now, updatedAt: now };
+}
+
+function transcriptWithSegmentTrackIds(transcript: {
+  track: { id: string };
+  segments: readonly Record<string, unknown>[];
+  tokens: readonly Record<string, unknown>[];
+}) {
+  return {
+    ...transcript,
+    segments: transcript.segments.map((segment) => ({
+      ...segment,
+      trackId: transcript.track.id,
+    })),
+  };
+}
+
+function workspaceFixture(input: {
+  projectId: string;
+  video: typeof directVideo | typeof romanianVideo;
+  preferredLanguage: string;
+}) {
+  if (input.video.youtubeVideoId === directVideo.youtubeVideoId) {
+    const english = transcriptWithSegmentTrackIds(englishWordFixture);
+    return {
+      schemaVersion: 1,
+      projectId: input.projectId,
+      catalogVideoId: input.video.id,
+      youtubeVideoId: input.video.youtubeVideoId,
+      transcriptVersionId: "019fbb95-cd76-7920-93fa-e23ba755ee34",
+      source: "shared-store",
+      catalogState: "active_verified",
+      original: english,
+      english,
+      preferred: {
+        state: "ready",
+        source: "english",
+        transcript: english,
+      },
+    };
+  }
+  const original = transcriptWithSegmentTrackIds(multilingualFixture.original);
+  const english = transcriptWithSegmentTrackIds(multilingualFixture.english);
+  const spanish = transcriptWithSegmentTrackIds(multilingualFixture.spanish);
+  return {
+    schemaVersion: 1,
+    projectId: input.projectId,
+    catalogVideoId: input.video.id,
+    youtubeVideoId: input.video.youtubeVideoId,
+    transcriptVersionId: "019fbb95-cd76-7920-93fa-e23ba755ee54",
+    source: "verified-local-cache",
+    catalogState: "active_verified",
+    original,
+    english,
+    preferred: input.preferredLanguage.toLowerCase().startsWith("es")
+      ? {
+          state: "ready",
+          source: "shared",
+          transcript: spanish,
+        }
+      : {
+          state: "ready",
+          source: "english",
+          transcript: english,
+        },
+  };
+}
+
+async function selectDirectFixturePassage(page: Page) {
+  await page.evaluate(() => {
+    const anchor = Array.from(
+      document.querySelectorAll<HTMLElement>("[data-transcript-token-id]"),
+    ).find((token) => token.textContent === "fixture");
+    const focus = Array.from(
+      document.querySelectorAll<HTMLElement>("[data-transcript-token-id]"),
+    ).find((token) => token.textContent === "any word");
+    if (!anchor?.firstChild || !focus?.firstChild || !focus.textContent) {
+      throw new Error("Expected typed direct-English workspace tokens.");
+    }
+    const range = document.createRange();
+    range.setStart(anchor.firstChild, 0);
+    range.setEnd(focus.firstChild, focus.textContent.length);
+    const selection = window.getSelection();
+    selection?.removeAllRanges();
+    selection?.addRange(range);
+    focus.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+  });
+}
+
+async function selectFirstTwoTranscriptRows(page: Page) {
+  await page.evaluate(() => {
+    const rows = Array.from(
+      document.querySelectorAll<HTMLElement>(
+        "[data-testid=transcript-window-row]",
+      ),
+    );
+    const anchor = rows[0]?.querySelector<HTMLElement>(".transcript-text span");
+    const focus = rows[1]?.querySelector<HTMLElement>(".transcript-text span");
+    if (!anchor?.firstChild || !focus?.firstChild || !focus.textContent) {
+      throw new Error("Expected two typed transcript cue rows.");
+    }
+    const range = document.createRange();
+    range.setStart(anchor.firstChild, 0);
+    range.setEnd(focus.firstChild, focus.textContent.length);
+    const selection = window.getSelection();
+    selection?.removeAllRanges();
+    selection?.addRange(range);
+    focus.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+  });
+}
 
 test.beforeEach(async ({ page }) => {
-  await page.addInitScript(() => {
-    class MockPlayer {
-      private currentTime = 0;
-
-      constructor(
-        _element: HTMLElement,
-        options: { events: { onReady(): void } },
-      ) {
-        queueMicrotask(() => options.events.onReady());
-      }
-
-      cueVideoById() {}
-      destroy() {}
-      getCurrentTime() {
-        return this.currentTime;
-      }
-      seekTo(seconds: number) {
-        this.currentTime = seconds;
-        Object.assign(window, { __lastSeekSeconds: seconds });
-      }
-      playVideo() {
-        Object.assign(window, {
-          __playCalls: Number(Reflect.get(window, "__playCalls") ?? 0) + 1,
-        });
-      }
-      pauseVideo() {
-        Object.assign(window, {
-          __pauseCalls: Number(Reflect.get(window, "__pauseCalls") ?? 0) + 1,
-        });
-      }
-    }
-
-    Object.assign(window, {
-      YT: { Player: MockPlayer, PlayerState: { PLAYING: 1 } },
-    });
-  });
+  await page.route(
+    "https://www.youtube-nocookie.com/embed/**",
+    async (route) => {
+      await route.fulfill({
+        contentType: "text/html",
+        body: `<!doctype html><script>
+          window.__receivedPlayerCommands = [];
+          window.addEventListener("message", (event) => {
+            let message;
+            try { message = JSON.parse(event.data); } catch { return; }
+            window.__receivedPlayerCommands.push(message);
+            if (message.event !== "command") return;
+            const state = message.func === "playVideo" ? 1 : message.func === "pauseVideo" ? 2 : undefined;
+            if (state !== undefined) {
+              event.source.postMessage(JSON.stringify({ info: { playerState: state } }), event.origin);
+            }
+          });
+        </script>`,
+      });
+    },
+  );
 });
 
-test("loads a canonical YouTube video and seeks from its transcript", async ({
+test("does not hydrate fixture text for an arbitrary projectless URL", async ({
   page,
 }) => {
   await page.goto("/");
@@ -51,20 +169,17 @@ test("loads a canonical YouTube video and seeks from its transcript", async ({
   await expect(
     page.getByRole("heading", { name: "Navigate video by transcript" }),
   ).toBeVisible();
+  await page
+    .getByLabel("YouTube URL or video ID")
+    .fill(directVideo.canonicalUrl);
   await page.getByRole("button", { name: "Load video" }).click();
-  await expect(page.getByText("word timing", { exact: true })).toBeVisible();
-  await expect(page.getByTestId("transcript-window-row")).toHaveCount(2);
-  await page.getByRole("button", { name: "any word", exact: true }).click();
 
-  await expect(page.getByText("Word requested 0:02.")).toBeVisible();
-  await expect
-    .poll(() => page.evaluate(() => Reflect.get(window, "__lastSeekSeconds")))
-    .toBe(2.2);
-
-  await page.getByLabel("Search transcript").fill("accurate");
-  await expect(page.getByText("1 of 1")).toBeVisible();
-  await page.getByRole("button", { name: "Next match", exact: true }).click();
-  await expect(page.getByText("Cue requested 0:00.")).toBeVisible();
+  await expect(
+    page.getByText(
+      "Choose a project before loading a project-authorized video.",
+    ),
+  ).toBeVisible();
+  await expect(page.getByTestId("transcript-window-row")).toHaveCount(0);
 });
 
 test("rejects a non-YouTube URL without replacing the workspace", async ({
@@ -78,8 +193,164 @@ test("rejects a non-YouTube URL without replacing the workspace", async ({
 
   await expect(page.getByText(/Enter a YouTube watch/)).toBeVisible();
   await expect(
-    page.getByRole("heading", { name: "Load a video" }),
+    page.getByRole("heading", { name: "Open a project video" }),
   ).toBeVisible();
+});
+
+async function mockAuthenticatedWorkspace(
+  page: Page,
+  input: {
+    projectId: string;
+    preferredLanguage: string;
+    workspace: Record<string, unknown>;
+  },
+) {
+  const now = "2026-08-01T12:00:00.000Z";
+  await page.route("**/cloud-api/**", async (route) => {
+    const path = new URL(route.request().url()).pathname.replace(
+      "/cloud-api",
+      "",
+    );
+    if (path === "/api/session/profile") {
+      return route.fulfill({
+        json: {
+          id: "019fbb95-cd76-7920-93fa-e23ba755ee36",
+          externalSubject: "fixture:e2e-user",
+          displayName: "E2E User",
+          preferredLanguage: input.preferredLanguage,
+          createdAt: now,
+          updatedAt: now,
+        },
+      });
+    }
+    if (path === "/api/projects") {
+      return route.fulfill({
+        json: [
+          {
+            id: input.projectId,
+            name: "Workspace fixture project",
+            description: "",
+            version: 1,
+            createdAt: now,
+            updatedAt: now,
+          },
+        ],
+      });
+    }
+    if (path === `/api/projects/${input.projectId}/videos`) {
+      return route.fulfill({ json: [projectVideoFixture(romanianVideo, now)] });
+    }
+    return route.fulfill({ status: 404, json: { error: "not found" } });
+  });
+  await page.route(
+    "**/local-agent/api/projects/*/videos/*/transcript?*",
+    async (route) => route.fulfill({ json: input.workspace }),
+  );
+}
+
+test("keeps verified offline cache review readable but blocks logged work", async ({
+  page,
+}) => {
+  const projectId = "019fbb95-cd76-7920-93fa-e23ba755ee60";
+  await mockAuthenticatedWorkspace(page, {
+    projectId,
+    preferredLanguage: "en",
+    workspace: {
+      ...workspaceFixture({
+        projectId,
+        video: romanianVideo,
+        preferredLanguage: "en",
+      }),
+      catalogState: "offline_cached",
+    },
+  });
+
+  await page.goto("/");
+  await page
+    .getByLabel("Development session credential")
+    .fill("Bearer 019fbb95-cd76-7920-93fa-e23ba755ee36|fixture:web");
+  await page.getByRole("button", { name: "Connect" }).click();
+  await expect(page.getByLabel("Target project")).toHaveValue(projectId);
+  await page
+    .getByLabel("YouTube URL or video ID")
+    .fill(romanianVideo.canonicalUrl);
+  await page.getByRole("button", { name: "Load video" }).click();
+
+  await expect(page.getByText("This is a Romanian example.")).toBeVisible();
+  await page.getByLabel("Language view").selectOption("original");
+  await expect(
+    page.getByText("Acesta este un exemplu românesc."),
+  ).toBeVisible();
+  await page.getByLabel("Language view").selectOption("english");
+  await expect(page.getByText("This is a Romanian example.")).toBeVisible();
+  await selectFirstTwoTranscriptRows(page);
+  await expect(
+    page.getByText(
+      "This is verified offline cache review. Reconnect to confirm the current project transcript; Queue / log only and Export + log are unavailable until then.",
+    ),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "Queue / log only" }),
+  ).toBeDisabled();
+  await expect(
+    page.getByRole("button", { name: "Export + log" }),
+  ).toBeDisabled();
+});
+
+test("keeps English explicit when preferred translation is unavailable", async ({
+  page,
+}) => {
+  const projectId = "019fbb95-cd76-7920-93fa-e23ba755ee61";
+  const workspace = workspaceFixture({
+    projectId,
+    video: romanianVideo,
+    preferredLanguage: "es-MX",
+  });
+  await mockAuthenticatedWorkspace(page, {
+    projectId,
+    preferredLanguage: "es-MX",
+    workspace: {
+      ...workspace,
+      preferred: {
+        state: "preferred_translation_unavailable",
+        targetLanguage: "es-MX",
+        reason: "No verified Spanish translation is published.",
+      },
+    },
+  });
+
+  await page.goto("/");
+  await page
+    .getByLabel("Development session credential")
+    .fill("Bearer 019fbb95-cd76-7920-93fa-e23ba755ee36|fixture:web");
+  await page.getByRole("button", { name: "Connect" }).click();
+  await page
+    .getByLabel("YouTube URL or video ID")
+    .fill(romanianVideo.canonicalUrl);
+  await page.getByRole("button", { name: "Load video" }).click();
+
+  await expect(page.getByLabel("Language view")).toHaveValue("english");
+  await expect(page.getByText("This is a Romanian example.")).toBeVisible();
+  await expect(
+    page.getByLabel("Language view").locator("option[value=preferred]"),
+  ).toHaveAttribute("disabled", "");
+  await expect(
+    page.getByText(
+      "Preferred translation unavailable for es-MX. Original and English remain available; logging waits for the required preferred evidence.",
+    ),
+  ).toBeVisible();
+  await page.getByLabel("Language view").selectOption("original");
+  await expect(
+    page.getByText("Acesta este un exemplu românesc."),
+  ).toBeVisible();
+  await page.getByLabel("Language view").selectOption("english");
+  await selectFirstTwoTranscriptRows(page);
+  await expect(
+    page.getByRole("button", { name: "Queue / log only" }),
+  ).toBeDisabled();
+  await expect(
+    page.getByRole("button", { name: "Export + log" }),
+  ).toBeDisabled();
 });
 
 test("maps transcript text selection to stable source and export bounds", async ({
@@ -353,6 +624,17 @@ test("maps transcript text selection to stable source and export bounds", async 
       });
     }
     if (
+      path === `/cloud-api/api/projects/${existingProjectId}/videos` ||
+      path === `/cloud-api/api/projects/${createdProjectId}/videos`
+    ) {
+      return route.fulfill({
+        json: [
+          projectVideoFixture(directVideo, now),
+          projectVideoFixture(romanianVideo, now),
+        ],
+      });
+    }
+    if (
       path === `/cloud-api/api/projects/${existingProjectId}/export-presets`
     ) {
       if (failExistingPresetDiscovery) {
@@ -538,9 +820,9 @@ test("maps transcript text selection to stable source and export bounds", async 
           projectId: createdProjectId,
           clipId: "019fbb95-cd76-7920-93fa-e23ba755ee42",
           video: {
-            youtubeVideoId: "M7lc1UVf-VE",
-            canonicalUrl: "https://www.youtube.com/watch?v=M7lc1UVf-VE",
-            title: "YouTube IFrame API demo",
+            youtubeVideoId: directVideo.youtubeVideoId,
+            canonicalUrl: directVideo.canonicalUrl,
+            title: directVideo.title,
           },
           selection: body.selection ?? {
             trackId: "019fbb95-cd76-7920-93fa-e23ba755e301",
@@ -625,6 +907,24 @@ test("maps transcript text selection to stable source and export bounds", async 
       },
     });
   });
+  await page.route(
+    "**/local-agent/api/projects/*/videos/*/transcript?*",
+    async (route) => {
+      const url = new URL(route.request().url());
+      const parts = url.pathname.split("/");
+      const projectId = parts[4]!;
+      const catalogVideoId = parts[6]!;
+      const video =
+        catalogVideoId === romanianVideo.id ? romanianVideo : directVideo;
+      return route.fulfill({
+        json: workspaceFixture({
+          projectId,
+          video,
+          preferredLanguage: url.searchParams.get("preferredLanguage") ?? "en",
+        }),
+      });
+    },
+  );
   await page.route(
     "**/local-agent/api/projects/*/clips/*/artifact-resolution",
     async (route) => {
@@ -839,7 +1139,18 @@ test("maps transcript text selection to stable source and export bounds", async 
     });
   });
   await page.goto("/");
+  await page
+    .getByLabel("Development session credential")
+    .fill("Bearer 019fbb95-cd76-7920-93fa-e23ba755ee36|fixture:web");
+  await page.getByRole("button", { name: "Connect" }).click();
+  await expect(page.getByLabel("Target project")).toHaveValue(
+    existingProjectId,
+  );
+  await page
+    .getByLabel("YouTube URL or video ID")
+    .fill(directVideo.canonicalUrl);
   await page.getByRole("button", { name: "Load video" }).click();
+  await expect(page.getByText("word timing", { exact: true })).toBeVisible();
 
   await page.evaluate(() => {
     const anchor = Array.from(
@@ -869,29 +1180,48 @@ test("maps transcript text selection to stable source and export bounds", async 
   await expect(page.getByLabel("Export end (seconds)")).toHaveValue("2.900");
 
   await page.getByRole("button", { name: "Loop preview" }).click();
+  const playerFrame = page
+    .frames()
+    .find((frame) =>
+      frame.url().startsWith("https://www.youtube-nocookie.com/embed/"),
+    );
+  if (!playerFrame) {
+    throw new Error("Expected the isolated YouTube player frame.");
+  }
+  await expect
+    .poll(() =>
+      playerFrame.evaluate(
+        () =>
+          (
+            window as typeof window & {
+              __receivedPlayerCommands?: Array<{ func?: string }>;
+            }
+          ).__receivedPlayerCommands?.map((command) => command.func) ?? [],
+      ),
+    )
+    .toEqual(expect.arrayContaining(["seekTo", "playVideo"]));
   await expect(
     page.getByRole("button", { name: "Stop preview" }),
   ).toBeVisible();
-  await expect
-    .poll(() => page.evaluate(() => Reflect.get(window, "__lastSeekSeconds")))
-    .toBe(0.3);
-  await expect
-    .poll(() => page.evaluate(() => Reflect.get(window, "__playCalls")))
-    .toBe(1);
   await page.getByRole("button", { name: "Stop preview" }).click();
   await expect
-    .poll(() => page.evaluate(() => Reflect.get(window, "__pauseCalls")))
-    .toBeGreaterThan(0);
+    .poll(() =>
+      playerFrame.evaluate(
+        () =>
+          (
+            window as typeof window & {
+              __receivedPlayerCommands?: Array<{ func?: string }>;
+            }
+          ).__receivedPlayerCommands?.map((command) => command.func) ?? [],
+      ),
+    )
+    .toContain("pauseVideo");
 
   await page.getByRole("button", { name: "Add 0.5s handles" }).click();
   await expect(page.getByLabel("Export start (seconds)")).toHaveValue("0.000");
   await expect(page.getByLabel("Export end (seconds)")).toHaveValue("3.400");
   await expect(panel).toContainText("Transcript selection: 0.300s–2.900s");
 
-  await page
-    .getByLabel("Development session credential")
-    .fill("Bearer 019fbb95-cd76-7920-93fa-e23ba755ee36|fixture:web");
-  await page.getByRole("button", { name: "Connect" }).click();
   await expect(page.getByLabel("Logging project")).toHaveValue(
     existingProjectId,
   );
@@ -916,9 +1246,13 @@ test("maps transcript text selection to stable source and export bounds", async 
     .getByLabel("Description (optional)")
     .fill("Created without losing the selection");
   await page.getByRole("button", { name: "Create and select project" }).click();
-  await expect(page.getByLabel("Logging project")).toHaveValue(
-    createdProjectId,
-  );
+  await expect(page.getByLabel("Target project")).toHaveValue(createdProjectId);
+  await page
+    .getByLabel("YouTube URL or video ID")
+    .fill(directVideo.canonicalUrl);
+  await page.getByRole("button", { name: "Load video" }).click();
+  await expect(page.getByText("word timing", { exact: true })).toBeVisible();
+  await selectDirectFixturePassage(page);
   await expect(page.getByLabel("Logged export preset")).toHaveValue(
     `project:${createdProjectPresetId}:v1`,
   );
@@ -927,6 +1261,12 @@ test("maps transcript text selection to stable source and export bounds", async 
   ).resolves.not.toContain("Existing Project Edit v1 — project default");
   failExistingPresetDiscovery = true;
   await page.getByLabel("Logging project").selectOption(existingProjectId);
+  await page
+    .getByLabel("YouTube URL or video ID")
+    .fill(directVideo.canonicalUrl);
+  await page.getByRole("button", { name: "Load video" }).click();
+  await expect(page.getByText("word timing", { exact: true })).toBeVisible();
+  await selectDirectFixturePassage(page);
   await expect(page.getByLabel("Logged export preset")).toHaveValue(
     "built-in:editing-mp4:v1",
   );
@@ -936,6 +1276,12 @@ test("maps transcript text selection to stable source and export bounds", async 
   await expect(page.getByRole("button", { name: "Export only" })).toBeEnabled();
   failExistingPresetDiscovery = false;
   await page.getByLabel("Logging project").selectOption(createdProjectId);
+  await page
+    .getByLabel("YouTube URL or video ID")
+    .fill(directVideo.canonicalUrl);
+  await page.getByRole("button", { name: "Load video" }).click();
+  await expect(page.getByText("word timing", { exact: true })).toBeVisible();
+  await selectDirectFixturePassage(page);
   await expect(page.getByLabel("Logged export preset")).toHaveValue(
     `project:${createdProjectPresetId}:v1`,
   );
@@ -955,16 +1301,16 @@ test("maps transcript text selection to stable source and export bounds", async 
 
   const clipQueue = page.getByRole("article", { name: /clip library/i });
   await clipQueue.getByRole("button", { name: "Refresh" }).click();
-  await expect(clipQueue).toContainText("YouTube IFrame API demo");
+  await expect(clipQueue).toContainText(directVideo.title);
   await expect(clipQueue).toContainText(
     "Use this to establish the central argument.",
   );
   await clipQueue.getByRole("button", { name: "Edit notes/tags" }).click();
   await page
-    .getByLabel("Notes for YouTube IFrame API demo")
+    .getByLabel(`Notes for ${directVideo.title}`)
     .fill("Use this in the revised opening.");
   await page
-    .getByLabel("Tags for YouTube IFrame API demo")
+    .getByLabel(`Tags for ${directVideo.title}`)
     .fill("Opening, Theme: Institutions");
   await clipQueue.getByRole("button", { name: "Save clip" }).click();
   await expect(clipQueue).toContainText("Clip notes and tags saved.");
@@ -973,7 +1319,7 @@ test("maps transcript text selection to stable source and export bounds", async 
   await expect(clipQueue).toContainText("Use this in the revised opening.");
   await clipQueue.getByLabel("Search clips").fill("institutions");
   await clipQueue.getByRole("button", { name: "Apply cloud filters" }).click();
-  await expect(clipQueue).toContainText("YouTube IFrame API demo");
+  await expect(clipQueue).toContainText(directVideo.title);
   await clipQueue.getByRole("button", { name: "Export CSV" }).click();
   await expect(clipQueue).toContainText(
     "Downloaded the project clip log as CSV.",
@@ -1056,7 +1402,9 @@ test("maps transcript text selection to stable source and export bounds", async 
   await page.getByLabel("YouTube URL or video ID").fill("Romanian001");
   await page.getByRole("button", { name: "Load video" }).click();
   await expect(page.getByText("es transcript")).toBeVisible();
-  await expect(page.getByText(/Romanian → English \+ Spanish/u)).toBeVisible();
+  await expect(
+    page.getByText("Loaded the exact verified local transcript cache."),
+  ).toBeVisible();
   await page.getByLabel("Search transcript").fill("vinculada");
   await expect(page.getByText(/La selección permanece/u)).toBeVisible();
   await page.getByLabel("Search transcript").fill("");
@@ -1161,6 +1509,8 @@ test("connects an explicit project, controls a batch, and updates review state",
   let dispatchStatus = "active";
   let reviewVersion = 1;
   let reviewStatus = "unreviewed";
+  let workspaceRequestPath: string | undefined;
+  let workspaceRequests = 0;
   const progress = {
     total: 1,
     queued: 0,
@@ -1251,6 +1601,9 @@ test("connects an explicit project, controls a batch, and updates review state",
         json: { items: [{ ...item(), batchName: "Interview research" }] },
       });
     }
+    if (path === `/api/projects/${projectId}/videos`) {
+      return route.fulfill({ json: [projectVideoFixture(directVideo, now)] });
+    }
     if (
       path === `/api/projects/${projectId}/transcription-batches/${batchId}` &&
       request.method() === "GET"
@@ -1273,6 +1626,33 @@ test("connects an explicit project, controls a batch, and updates review state",
     }
     return route.fulfill({ status: 404, json: { error: "not found" } });
   });
+  await page.route(
+    "**/local-agent/api/projects/*/videos/*/transcript?*",
+    async (route) => {
+      const url = new URL(route.request().url());
+      workspaceRequestPath = `${url.pathname}${url.search}`;
+      workspaceRequests += 1;
+      if (workspaceRequests === 1) {
+        return route.fulfill({
+          status: 503,
+          json: {
+            error: {
+              code: "transcript_unavailable",
+              message: "Fixture transcript temporarily unavailable.",
+              retryable: true,
+            },
+          },
+        });
+      }
+      return route.fulfill({
+        json: workspaceFixture({
+          projectId,
+          video: directVideo,
+          preferredLanguage: url.searchParams.get("preferredLanguage") ?? "en",
+        }),
+      });
+    },
+  );
 
   await page.goto("/");
   await page
@@ -1301,6 +1681,23 @@ test("connects an explicit project, controls a batch, and updates review state",
       exact: true,
     }),
   ).toBeVisible();
+  await page
+    .locator(".review-card")
+    .getByRole("button", { name: "Open video" })
+    .click();
+  await expect(
+    page.getByRole("heading", { name: "No active project transcript" }),
+  ).toBeVisible();
+  await expect(
+    page.getByText("Fixture transcript temporarily unavailable."),
+  ).toBeVisible();
+  await expect(page.getByTestId("transcript-window-row")).toHaveCount(0);
+  await page.getByRole("button", { name: "Retry transcript" }).click();
+  await expect(page.getByText("word timing", { exact: true })).toBeVisible();
+  expect(workspaceRequests).toBe(2);
+  expect(workspaceRequestPath).toBe(
+    `/local-agent/api/projects/${projectId}/videos/${directVideo.id}/transcript?preferredLanguage=en`,
+  );
 
   await page
     .getByLabel("Review status for Fixture review video")

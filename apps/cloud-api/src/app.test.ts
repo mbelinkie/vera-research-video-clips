@@ -926,6 +926,16 @@ describe("cloud API", () => {
         },
       },
     });
+    const lookedUp = await app.inject({
+      method: "POST",
+      url: `/api/projects/${projectId}/videos/${video.id}/derived-translations/lookup`,
+      headers: { authorization },
+      payload: { identity },
+    });
+    expect(lookedUp.statusCode).toBe(200);
+    expect(lookedUp.json()).toMatchObject({
+      manifest: { identity: { baseTranscriptVersionId: baseVersionId } },
+    });
     const resolved = await app.inject({
       method: "POST",
       url: `/api/projects/${projectId}/videos/${video.id}/derived-translations/resolve`,
@@ -939,6 +949,25 @@ describe("cloud API", () => {
     expect(resolved.json()).toMatchObject({
       manifest: { identity: { baseTranscriptVersionId: baseVersionId } },
     });
+    expect(
+      (
+        await database.query<{ count: string }>(
+          "SELECT count(*)::text AS count FROM transcript_translation_jobs",
+        )
+      ).rows[0]?.count,
+    ).toBe("1");
+
+    const missingIdentity = {
+      ...identity,
+      targetLanguage: "fr-CA",
+    };
+    const missingLookup = await app.inject({
+      method: "POST",
+      url: `/api/projects/${projectId}/videos/${video.id}/derived-translations/lookup`,
+      headers: { authorization },
+      payload: { identity: missingIdentity },
+    });
+    expect(missingLookup.statusCode).toBe(204);
     expect(
       (
         await database.query<{ count: string }>(
@@ -1107,6 +1136,13 @@ describe("cloud API", () => {
         })
       ).statusCode,
     ).toBe(403);
+    const outsiderLookup = await app.inject({
+      method: "POST",
+      url: `/api/projects/${projectId}/videos/${video.id}/derived-translations/lookup`,
+      headers: { authorization: outsiderAuthorization },
+      payload: { identity },
+    });
+    expect(outsiderLookup.statusCode).toBe(403);
   });
 
   it("normalizes a YouTube URL, resolves metadata, and persists the project video", async () => {

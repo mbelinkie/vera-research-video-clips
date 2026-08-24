@@ -12,7 +12,6 @@ import {
   currentExportWorkerAdvertisement,
   resolveExportSettings,
 } from "@research-video/export-settings";
-import type { WorkspaceTranscriptResolution } from "@research-video/sync";
 import { normalizeTranscriptFixture } from "@research-video/transcript";
 import transcriptFixture from "../../../tests/fixtures/transcripts/english-word.json" with { type: "json" };
 
@@ -724,21 +723,31 @@ describe("local agent", () => {
     ).toBe(400);
   });
 
-  it("requires authentication and returns a resolved normalized transcript", async () => {
+  it("requires authentication and returns the path-free direct-English transcript workspace", async () => {
     const transcript = normalizeTranscriptFixture(transcriptFixture);
     const transcriptVersionId = "019fbb95-cd76-7920-93fa-e23ba755e399";
-    const app = createLocalAgent({
-      resolveTranscript: async () =>
-        ({
-          source: "verified-local-cache",
-          cachePath: "/private/cache/fixture",
-          transcript,
-          bundle: { transcriptVersionId },
-        }) as WorkspaceTranscriptResolution,
-    });
-    apps.add(app);
     const projectId = "019fbb95-cd76-7920-93fa-e23ba755e391";
     const videoId = "019fbb95-cd76-7920-93fa-e23ba755e392";
+    const resolveTranscript = vi.fn(async () => ({
+      schemaVersion: 1 as const,
+      projectId,
+      catalogVideoId: videoId,
+      youtubeVideoId: transcript.track.videoId,
+      transcriptVersionId,
+      source: "verified-local-cache" as const,
+      catalogState: "active_verified" as const,
+      original: transcript,
+      english: transcript,
+      preferred: {
+        state: "ready" as const,
+        source: "english" as const,
+        transcript,
+      },
+    }));
+    const app = createLocalAgent({
+      resolveTranscript,
+    });
+    apps.add(app);
     const url = `/api/projects/${projectId}/videos/${videoId}/transcript`;
 
     expect((await app.inject({ method: "GET", url })).statusCode).toBe(401);
@@ -749,11 +758,159 @@ describe("local agent", () => {
     });
     expect(response.statusCode).toBe(200);
     expect(response.json()).toMatchObject({
+      schemaVersion: 1,
+      projectId,
+      catalogVideoId: videoId,
       source: "verified-local-cache",
+      catalogState: "active_verified",
       transcriptVersionId,
-      transcript: { track: { timingPrecision: "word" } },
+      original: { track: { timingPrecision: "word" } },
+      english: { track: { timingPrecision: "word" } },
+      preferred: { state: "ready", source: "english" },
     });
-    expect(response.json()).not.toHaveProperty("cachePath");
+    expect(JSON.stringify(response.json())).not.toMatch(
+      /cachePath|objectKey|downloadUrl|presigned|Bearer/i,
+    );
+    expect(resolveTranscript).toHaveBeenCalledWith({
+      projectId,
+      catalogVideoId: videoId,
+      authorization: "Bearer fixture-session",
+      preferredLanguage: "en",
+    });
+
+    const romanian = await app.inject({
+      method: "GET",
+      url: `${url}?preferredLanguage=ro-RO`,
+      headers: { authorization: "Bearer fixture-session" },
+    });
+    expect(romanian.statusCode).toBe(200);
+    expect(resolveTranscript).toHaveBeenLastCalledWith(
+      expect.objectContaining({ preferredLanguage: "ro-RO" }),
+    );
+    expect(
+      (
+        await app.inject({
+          method: "GET",
+          url: `${url}?unexpected=value`,
+          headers: { authorization: "Bearer fixture-session" },
+        })
+      ).statusCode,
+    ).toBe(400);
+  });
+
+  it("keeps transcript cache failures path-free and actionable", async () => {
+    const app = createLocalAgent({
+      resolveTranscript: async () => {
+        throw Object.assign(
+          new Error(
+            "cache /private/secret and https://bucket.example/presigned?token=secret failed",
+          ),
+          { statusCode: 422, code: "local_cache_integrity_failed" },
+        );
+      },
+    });
+    apps.add(app);
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/projects/019fbb95-cd76-7920-93fa-e23ba755e391/videos/019fbb95-cd76-7920-93fa-e23ba755e392/transcript",
+      headers: { authorization: "Bearer fixture-session" },
+    });
+    expect(response.statusCode).toBe(422);
+    expect(response.json()).toMatchObject({
+      error: {
+        code: "local_cache_integrity_failed",
+        message:
+          "Local data verification failed. Refresh the transcript when the project connection is available.",
+      },
+      operationFailure: {
+        operation: "transcript",
+        failureClass: "verification_failed",
+      },
+    });
+    expect(response.body).not.toMatch(/private|bucket|presigned|secret/i);
+  });
+
+  it("accepts an offline-review capability only on the trusted desktop transcript hop", async () => {
+    const secret = "s".repeat(64);
+    const capability = "c".repeat(43);
+    const projectId = "019fbb95-cd76-7920-93fa-e23ba755e391";
+    const videoId = "019fbb95-cd76-7920-93fa-e23ba755e392";
+    const transcript = normalizeTranscriptFixture(transcriptFixture);
+    const resolveTranscript = vi.fn(async () => ({
+      schemaVersion: 1 as const,
+      projectId,
+      catalogVideoId: videoId,
+      youtubeVideoId: transcript.track.videoId,
+      transcriptVersionId: "019fbb95-cd76-7920-93fa-e23ba755e399",
+      source: "verified-local-cache" as const,
+      catalogState: "offline_cached" as const,
+      original: transcript,
+      english: transcript,
+      preferred: {
+        state: "ready" as const,
+        source: "english" as const,
+        transcript,
+      },
+    }));
+    const app = createLocalAgent({
+      desktopSession: { secret, origin: "rvc://app" },
+      resolveTranscript,
+    });
+    apps.add(app);
+    const url = `/api/projects/${projectId}/videos/${videoId}/transcript`;
+    const headers = {
+      authorization: `Bearer ${secret}`,
+      origin: "rvc://app",
+      "x-research-video-session": secret,
+    };
+    expect((await app.inject({ method: "GET", url, headers })).statusCode).toBe(
+      401,
+    );
+    expect(
+      (
+        await app.inject({
+          method: "GET",
+          url,
+          headers: {
+            ...headers,
+            "x-research-video-offline-review": capability,
+          },
+        })
+      ).statusCode,
+    ).toBe(200);
+    expect(resolveTranscript).toHaveBeenCalledWith(
+      expect.objectContaining({ offlineReviewCapability: capability }),
+    );
+  });
+
+  it("keeps an unavailable offline cache response actionable and path-free", async () => {
+    const app = createLocalAgent({
+      resolveTranscript: async () => {
+        throw Object.assign(new Error("private /cache/path"), {
+          statusCode: 503,
+          code: "offline_transcript_not_authorized",
+        });
+      },
+    });
+    apps.add(app);
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/projects/019fbb95-cd76-7920-93fa-e23ba755e391/videos/019fbb95-cd76-7920-93fa-e23ba755e392/transcript",
+      headers: { authorization: "Bearer fixture-session" },
+    });
+    expect(response.statusCode).toBe(503);
+    expect(response.json()).toMatchObject({
+      error: {
+        code: "offline_transcript_not_authorized",
+        message:
+          "Reconnect to verify project access before reviewing this cached transcript.",
+      },
+      operationFailure: {
+        operation: "transcript",
+        failureClass: "provider_unavailable",
+      },
+    });
+    expect(response.body).not.toContain("/cache/path");
   });
 
   it("accepts a projectless export-only request through the loopback boundary", async () => {

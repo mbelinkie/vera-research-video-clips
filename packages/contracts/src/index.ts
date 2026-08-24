@@ -1522,6 +1522,11 @@ export const RequestDerivedTranslationSchema = z.object({
   idempotencyKey: z.string().trim().min(1).max(512),
 });
 
+/** Read-only project-authorized lookup; it never creates translation work. */
+export const LookupDerivedTranslationSchema = z
+  .object({ identity: DerivedTranslationIdentitySchema })
+  .strict();
+
 export const DerivedTranslationJobSchema = z.object({
   id: IdSchema,
   lineageId: IdSchema,
@@ -1562,6 +1567,153 @@ export const PreferredTranscriptResolutionSchema = z.discriminatedUnion(
     }),
   ],
 );
+
+/**
+ * The renderer-safe transcript workspace projection. This deliberately
+ * contains normalized track data and provenance only: cache locations,
+ * object keys, presigned URLs, and credentials remain behind the local-agent
+ * boundary.
+ */
+export const TranscriptWorkspaceResponseSchema = z
+  .object({
+    schemaVersion: z.literal(1),
+    projectId: IdSchema,
+    catalogVideoId: IdSchema,
+    youtubeVideoId: z.string().min(1).max(64),
+    transcriptVersionId: IdSchema,
+    source: z.enum(["verified-local-cache", "shared-store"]),
+    /** Whether the active catalog version was checked in this login session. */
+    catalogState: z.enum(["active_verified", "offline_cached"]),
+    original: NormalizedTranscriptSchema,
+    english: NormalizedTranscriptSchema,
+    preferred: PreferredTranscriptResolutionSchema,
+  })
+  .strict()
+  .superRefine((workspace, context) => {
+    const original = workspace.original.track;
+    const english = workspace.english.track;
+    const directEnglish = languagesEquivalent(original.language, "en");
+    const sameTrack =
+      original.id === english.id &&
+      original.version === english.version &&
+      original.contentSha256 === english.contentSha256;
+
+    if (
+      workspace.catalogState === "offline_cached" &&
+      workspace.source !== "verified-local-cache"
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["catalogState"],
+        message:
+          "Offline transcript review must use an exact verified local cache.",
+      });
+    }
+
+    for (const [name, transcript] of [
+      ["original", workspace.original],
+      ["english", workspace.english],
+    ] as const) {
+      if (transcript.track.videoId !== workspace.youtubeVideoId) {
+        context.addIssue({
+          code: "custom",
+          path: [name, "track", "videoId"],
+          message: "Workspace tracks must identify the workspace video.",
+        });
+      }
+    }
+    if (
+      english.kind !== "english" ||
+      !languagesEquivalent(english.language, "en")
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["english", "track"],
+        message: "The workspace English track must be canonical English.",
+      });
+    }
+    if (directEnglish) {
+      if (
+        !sameTrack ||
+        JSON.stringify(workspace.original) !== JSON.stringify(workspace.english)
+      ) {
+        context.addIssue({
+          code: "custom",
+          path: ["original"],
+          message:
+            "A direct-English workspace must alias the exact canonical English track.",
+        });
+      }
+    } else if (
+      original.kind !== "original" ||
+      english.sourceTrackId !== original.id ||
+      english.timingPrecision !== original.timingPrecision
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["english", "track"],
+        message:
+          "A foreign-language workspace English track must be time-linked directly to its original track.",
+      });
+    }
+
+    if (workspace.preferred.state !== "ready") {
+      if (
+        languagesEquivalent(workspace.preferred.targetLanguage, "en") ||
+        languagesEquivalent(
+          workspace.preferred.targetLanguage,
+          original.language,
+        )
+      ) {
+        context.addIssue({
+          code: "custom",
+          path: ["preferred", "targetLanguage"],
+          message:
+            "A non-ready preferred resolution must not request an already available base track.",
+        });
+      }
+      return;
+    }
+
+    const preferred = workspace.preferred.transcript;
+    if (preferred.track.videoId !== workspace.youtubeVideoId) {
+      context.addIssue({
+        code: "custom",
+        path: ["preferred", "transcript", "track", "videoId"],
+        message: "The preferred track must identify the workspace video.",
+      });
+    }
+    if (workspace.preferred.source === "original") {
+      if (JSON.stringify(preferred) !== JSON.stringify(workspace.original)) {
+        context.addIssue({
+          code: "custom",
+          path: ["preferred", "transcript"],
+          message:
+            "The preferred original track must match the exact original track.",
+        });
+      }
+    } else if (workspace.preferred.source === "english") {
+      if (JSON.stringify(preferred) !== JSON.stringify(workspace.english)) {
+        context.addIssue({
+          code: "custom",
+          path: ["preferred", "transcript"],
+          message:
+            "The preferred English track must match the exact English track.",
+        });
+      }
+    } else if (
+      preferred.track.kind !== "translation" ||
+      preferred.track.sourceTrackId !== original.id ||
+      preferred.track.timingPrecision !== original.timingPrecision
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["preferred", "transcript", "track"],
+        message:
+          "A preferred translation must be time-linked directly to the exact original track.",
+      });
+    }
+  });
 
 export const FinalizedObjectSchema = TranscriptArtifactSchema.extend({
   objectVersionId: z.string().min(1),
@@ -3975,6 +4127,7 @@ export const LocalOperationClassSchema = z.enum([
   "clip_library",
   "artifact",
   "authoring",
+  "transcript",
   "export",
   "runtime",
 ]);
@@ -4032,6 +4185,7 @@ export const LocalRuntimeQuiescenceSchema = z
         clipLibrary: LocalRuntimeCountSchema,
         artifact: LocalRuntimeCountSchema,
         authoring: LocalRuntimeCountSchema,
+        transcript: LocalRuntimeCountSchema,
         export: LocalRuntimeCountSchema,
         runtime: LocalRuntimeCountSchema,
       })
@@ -4537,8 +4691,14 @@ export type RequestDerivedTranslation = z.infer<
 >;
 export type DerivedTranslationJob = z.infer<typeof DerivedTranslationJobSchema>;
 export type DerivedTranslation = z.infer<typeof DerivedTranslationSchema>;
+export type LookupDerivedTranslation = z.infer<
+  typeof LookupDerivedTranslationSchema
+>;
 export type PreferredTranscriptResolution = z.infer<
   typeof PreferredTranscriptResolutionSchema
+>;
+export type TranscriptWorkspaceResponse = z.infer<
+  typeof TranscriptWorkspaceResponseSchema
 >;
 export type FinalizedObject = z.infer<typeof FinalizedObjectSchema>;
 export type TranscriptUploadGrant = z.infer<typeof TranscriptUploadGrantSchema>;

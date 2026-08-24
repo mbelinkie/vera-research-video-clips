@@ -176,6 +176,82 @@ export function runLocalMigrations(
   return newlyApplied;
 }
 
+/**
+ * Stores only a hash of a volatile desktop login capability. It is deliberately
+ * separate from transcript bytes so multiple authorized login sessions can
+ * reuse one immutable cache bundle without sharing an authority record.
+ */
+export class LocalTranscriptCacheAuthorizationRepository {
+  constructor(
+    private readonly database: DatabaseSync,
+    private readonly now: () => Date = () => new Date(),
+  ) {}
+
+  authorize(input: {
+    projectId: string;
+    catalogVideoId: string;
+    transcriptVersionId: string;
+    authorizationScopeSha256: string;
+  }): void {
+    this.database
+      .prepare(
+        `INSERT INTO verified_transcript_cache_authorizations
+           (project_id, video_id, transcript_version_id,
+            authorization_scope_sha256, authorized_at)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT (
+           project_id, video_id, transcript_version_id,
+           authorization_scope_sha256
+         ) DO UPDATE SET authorized_at = excluded.authorized_at`,
+      )
+      .run(
+        input.projectId,
+        input.catalogVideoId,
+        input.transcriptVersionId,
+        requireAuthorizationScopeSha256(input.authorizationScopeSha256),
+        this.now().toISOString(),
+      );
+  }
+
+  hasAuthorization(input: {
+    projectId: string;
+    catalogVideoId: string;
+    transcriptVersionId: string;
+    authorizationScopeSha256: string;
+  }): boolean {
+    return Boolean(
+      this.database
+        .prepare(
+          `SELECT 1 FROM verified_transcript_cache_authorizations
+           WHERE project_id = ? AND video_id = ? AND transcript_version_id = ?
+             AND authorization_scope_sha256 = ? LIMIT 1`,
+        )
+        .get(
+          input.projectId,
+          input.catalogVideoId,
+          input.transcriptVersionId,
+          requireAuthorizationScopeSha256(input.authorizationScopeSha256),
+        ),
+    );
+  }
+
+  revokeScope(authorizationScopeSha256: string): void {
+    this.database
+      .prepare(
+        `DELETE FROM verified_transcript_cache_authorizations
+         WHERE authorization_scope_sha256 = ?`,
+      )
+      .run(requireAuthorizationScopeSha256(authorizationScopeSha256));
+  }
+}
+
+function requireAuthorizationScopeSha256(value: string): string {
+  if (!/^[a-f0-9]{64}$/u.test(value)) {
+    throw new RangeError("Transcript cache authorization scope is invalid.");
+  }
+  return value;
+}
+
 export class LocalExportQueue {
   constructor(
     private readonly database: DatabaseSync,

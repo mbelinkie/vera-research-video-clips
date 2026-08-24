@@ -3,6 +3,7 @@ import {
   type CognitoAuthorizationAttempt,
   type CognitoTokenSet,
 } from "@research-video/auth";
+import { randomBytes } from "node:crypto";
 
 import {
   NativeOAuthCallbackQueue,
@@ -40,6 +41,7 @@ export class DesktopAuthenticationBroker {
   private activeAttempt: CognitoAuthorizationAttempt | undefined;
   private accessToken: string | undefined;
   private refreshToken: string | undefined;
+  private offlineReviewCapability: string | undefined;
   private callbackDrain: Promise<void> | undefined;
 
   constructor(
@@ -150,6 +152,17 @@ export class DesktopAuthenticationBroker {
     return this.accessToken;
   }
 
+  /**
+   * Returns a volatile capability only to trusted Electron main-process code.
+   * It is neither a user identity nor a credential and is never IPC-exposed.
+   */
+  getOfflineReviewCapability(): string {
+    if (this.status.state !== "signed_in" || !this.offlineReviewCapability) {
+      throw new DesktopAuthenticationError();
+    }
+    return this.offlineReviewCapability;
+  }
+
   /** Clears protected/local sessions before best-effort remote revoke/logout. */
   async signOut(): Promise<RendererAuthStatus> {
     const refreshToken = this.refreshToken;
@@ -196,6 +209,7 @@ export class DesktopAuthenticationBroker {
     await this.refreshTokens.save(tokens.refreshToken);
     this.accessToken = tokens.accessToken;
     this.refreshToken = tokens.refreshToken;
+    this.offlineReviewCapability ??= randomBytes(32).toString("base64url");
     this.status = {
       state: "signed_in",
       expiresAt: this.now() + tokens.expiresIn * 1_000,
@@ -206,5 +220,6 @@ export class DesktopAuthenticationBroker {
     this.activeAttempt = undefined;
     this.accessToken = undefined;
     this.refreshToken = undefined;
+    this.offlineReviewCapability = undefined;
   }
 }

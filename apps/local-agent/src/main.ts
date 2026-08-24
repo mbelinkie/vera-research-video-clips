@@ -19,6 +19,7 @@ import {
   HeartbeatLoggedExportExecutionResponseSchema,
   LoggedExportSuccessSchema,
   RegisteredExportWorkerSchema,
+  DerivedTranslationIdentitySchema,
   type ClipLibraryQuery,
   type CreateClipExportRequest,
   type CreateLoggedExportBatchRequest,
@@ -39,6 +40,7 @@ import {
   CachedTranscriptDocumentReader,
   HttpActiveTranscriptCatalogClient,
   HttpArtifactDownloader,
+  SharedDerivedTranslationResolver,
   SharedFirstTranscriptResolver,
   SharedTranscriptWorkspaceService,
   VerifiedTranscriptCache,
@@ -76,6 +78,7 @@ import {
 import { LocalLoggedExportSourceGroupCoordinator } from "./shared-source-group.ts";
 import { LocalRuntimeCoordinator } from "./local-runtime.ts";
 import { LocalDesktopSetupService } from "./desktop-setup.ts";
+import { CloudDerivedTranslationClient } from "./derived-translation-client.ts";
 
 const config = loadConfig();
 await mkdir(config.dataDir, { recursive: true });
@@ -205,12 +208,39 @@ const cache = new VerifiedTranscriptCache(
   new HttpArtifactDownloader(),
   transcriptCacheRoot,
 );
+const transcriptIndex = new LocalTranscriptIndex(database);
 const reader = new CachedTranscriptDocumentReader(
-  new LocalTranscriptIndex(database),
+  transcriptIndex,
+  transcriptCacheRoot,
 );
 const cloudApiUrl =
   config.publicApiOrigin ??
   `http://${config.cloudApiHost}:${config.cloudApiPort}`;
+
+function derivedTranslationIdentity(input: {
+  projectId: string;
+  catalogVideoId: string;
+  transcriptVersionId: string;
+  preferredLanguage: string;
+  original: {
+    track: {
+      id: string;
+      contentSha256: string;
+      schemaVersion: number;
+    };
+  };
+}) {
+  return DerivedTranslationIdentitySchema.parse({
+    projectId: input.projectId,
+    catalogVideoId: input.catalogVideoId,
+    baseTranscriptVersionId: input.transcriptVersionId,
+    originalTrackId: input.original.track.id,
+    originalContentSha256: input.original.track.contentSha256,
+    targetLanguage: input.preferredLanguage,
+    provider: "amazon-translate",
+    normalizationSchemaVersion: input.original.track.schemaVersion,
+  });
+}
 const exportStorageCapacity =
   createFileSystemStorageCapacityProvider(managedExportRoot);
 const exportStorageGuard = createPostAcquisitionExportStorageGuard(
@@ -596,14 +626,47 @@ const app = createLocalAgent({
     return ExportSettingsPreviewSchema.parse(payload);
   },
   listExportRequests: () => exportQueue.list(),
-  resolveTranscript: async ({ projectId, catalogVideoId, authorization }) =>
+  resolveTranscript: async ({
+    projectId,
+    catalogVideoId,
+    authorization,
+    preferredLanguage,
+    offlineReviewCapability,
+  }) =>
     new SharedTranscriptWorkspaceService(
       new SharedFirstTranscriptResolver(
         new HttpActiveTranscriptCatalogClient(cloudApiUrl, authorization),
         cache,
       ),
       reader,
-    ).resolve(projectId, catalogVideoId),
+      {
+        findLocal: async (input) =>
+          transcriptIndex.findDerivedTranslation(
+            derivedTranslationIdentity(input),
+          ),
+        findShared: async (input) => {
+          const identity = derivedTranslationIdentity(input);
+          const client = new CloudDerivedTranslationClient(
+            cloudApiUrl,
+            authorization,
+          );
+          return (
+            await new SharedDerivedTranslationResolver(
+              {
+                getDerivedTranslation: (candidate) =>
+                  client.lookupDerivedTranslation(candidate),
+              },
+              transcriptIndex,
+            ).resolve(identity)
+          )?.transcript;
+        },
+      },
+    ).resolveWorkspace(
+      projectId,
+      catalogVideoId,
+      preferredLanguage,
+      offlineReviewCapability,
+    ),
 });
 app.addHook("onClose", () => database.close());
 

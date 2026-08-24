@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   desktopIpcChannels,
+  isLocalTranscriptWorkspaceRequest,
   isPrivateDesktopSetupPath,
   requireTrustedRenderer,
 } from "./ipc.ts";
@@ -59,5 +60,35 @@ describe("desktop private setup route policy", () => {
       ),
     ).toBe(true);
     expect(isPrivateDesktopSetupPath("/api/projects?limit=25")).toBe(false);
+  });
+});
+
+describe("desktop transcript capability route policy", () => {
+  const request = {
+    target: "local" as const,
+    method: "GET" as const,
+    path: "/api/projects/019fbb95-cd76-7920-93fa-e23ba755e391/videos/019fbb95-cd76-7920-93fa-e23ba755e392/transcript?preferredLanguage=es-MX",
+  };
+
+  it("matches only the exact canonical local transcript GET", () => {
+    expect(isLocalTranscriptWorkspaceRequest(request)).toBe(true);
+    expect(
+      isLocalTranscriptWorkspaceRequest({
+        ...request,
+        path: request.path.replace("?preferredLanguage=es-MX", ""),
+      }),
+    ).toBe(true);
+    for (const candidate of [
+      { ...request, target: "cloud" as const },
+      { ...request, method: "POST" as const },
+      { ...request, path: `${request.path}&extra=1` },
+      {
+        ...request,
+        path: request.path.replace("/transcript?", "/other/../transcript?"),
+      },
+      { ...request, path: `https://attacker.example${request.path}` },
+    ]) {
+      expect(isLocalTranscriptWorkspaceRequest(candidate)).toBe(false);
+    }
   });
 });

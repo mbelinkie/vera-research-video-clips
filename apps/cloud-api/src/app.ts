@@ -24,6 +24,7 @@ import {
   ClaimLoggedExportDeliveryRequestSchema,
   ClipLibraryQuerySchema,
   PublishDerivedTranslationRequestSchema,
+  LookupDerivedTranslationSchema,
   RequestDerivedTranslationSchema,
   TranscriptionBatchControlRequestSchema,
   UpdateReviewStatusRequestSchema,
@@ -498,6 +499,34 @@ export function createCloudApi(
     const { projectId } = IdParamsSchema.parse(request.params);
     return catalog.listVideos(await authenticate(request), projectId);
   });
+
+  app.post(
+    "/api/projects/:projectId/videos/:videoId/derived-translations/lookup",
+    async (request, reply) => {
+      const { projectId, videoId } = ProjectVideoParamsSchema.parse(
+        request.params,
+      );
+      const actor = await authenticate(request);
+      const body = LookupDerivedTranslationSchema.parse(request.body);
+      if (body.identity.catalogVideoId !== videoId) {
+        return reply.status(400).send({
+          error: {
+            code: "invalid_request",
+            message: "Translation video identity does not match the route.",
+            retryable: false,
+          },
+        });
+      }
+      const ready = await catalog.getDerivedTranslation(
+        actor,
+        projectId,
+        body.identity,
+      );
+      return ready === undefined
+        ? reply.status(204).send()
+        : reply.status(200).send(ready);
+    },
+  );
 
   app.post(
     "/api/projects/:projectId/videos/:videoId/derived-translations/resolve",

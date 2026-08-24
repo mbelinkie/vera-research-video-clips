@@ -49,6 +49,7 @@ import {
 } from "./electron-auth-adapters.ts";
 import {
   desktopIpcChannels,
+  isLocalTranscriptWorkspaceRequest,
   isPrivateDesktopSetupPath,
   requireTrustedRenderer,
 } from "./ipc.ts";
@@ -716,6 +717,24 @@ function installIpcHandlers(options: {
     }
     const broker = options.getBroker();
     let accessToken: string | undefined;
+    let offlineReviewCapability: string | undefined;
+    if (isLocalTranscriptWorkspaceRequest(input)) {
+      try {
+        offlineReviewCapability = broker?.getOfflineReviewCapability();
+        if (!offlineReviewCapability) throw new Error("signed out");
+      } catch {
+        return DesktopApiResponseSchema.parse({
+          status: 401,
+          body: JSON.stringify({
+            error: {
+              code: "authentication_required",
+              message: "Sign in required before reviewing cached transcripts.",
+            },
+          }),
+          contentType: "application/json",
+        });
+      }
+    }
     if (input.target === "cloud") {
       try {
         accessToken = await broker!.getAccessTokenForTrustedProxy();
@@ -774,6 +793,11 @@ function installIpcHandlers(options: {
           ? {
               origin: trustedRendererOrigin,
               "x-research-video-session": options.sessionSecret,
+              ...(offlineReviewCapability
+                ? {
+                    "x-research-video-offline-review": offlineReviewCapability,
+                  }
+                : {}),
             }
           : {}),
       },

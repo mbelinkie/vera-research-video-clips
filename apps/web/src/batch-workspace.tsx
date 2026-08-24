@@ -33,6 +33,13 @@ type BatchWorkspaceProps = {
   onDesktopSignIn?(): Promise<void>;
   onDesktopSignOut?(): Promise<void>;
   onOpenVideo(canonicalUrl: string): void;
+  onOpenReadyVideo(target: {
+    projectId: string;
+    catalogVideoId: string;
+    youtubeVideoId: string;
+    canonicalUrl: string;
+    title?: string;
+  }): void;
   onProjectChange(projectId: string): void;
   onProjectsChange(projects: Project[]): void;
   projectId: string;
@@ -46,6 +53,7 @@ export function BatchWorkspace({
   onDesktopSignIn,
   onDesktopSignOut,
   onOpenVideo,
+  onOpenReadyVideo,
   onProjectChange,
   onProjectsChange,
   projectId,
@@ -623,10 +631,20 @@ export function BatchWorkspace({
                       <option value="reviewed">Reviewed</option>
                       <option value="skipped">Skipped</option>
                     </select>
-                    {item.canonicalUrl ? (
+                    {item.canonicalUrl &&
+                    item.catalogVideoId &&
+                    item.youtubeVideoId ? (
                       <button
                         type="button"
-                        onClick={() => onOpenVideo(item.canonicalUrl!)}
+                        onClick={() =>
+                          onOpenReadyVideo({
+                            projectId,
+                            catalogVideoId: item.catalogVideoId!,
+                            youtubeVideoId: item.youtubeVideoId!,
+                            canonicalUrl: item.canonicalUrl!,
+                            ...(item.title ? { title: item.title } : {}),
+                          })
+                        }
                       >
                         Open video
                       </button>

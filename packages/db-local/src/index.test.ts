@@ -28,6 +28,7 @@ import {
   LocalDesktopSetupRepository,
   LocalExportWorkerIdentityRepository,
   LocalTranscriptIndex,
+  LocalTranscriptCacheAuthorizationRepository,
   openLocalDatabase,
   runLocalMigrations,
   clipLibraryAuthorizationScope,
@@ -156,6 +157,7 @@ describe("local migrations", () => {
       "0026_artifact_roots_and_locators",
       "0027_clip_library_cache",
       "0028_desktop_setup_and_validated_components",
+      "0029_verified_transcript_cache_authorizations",
     ]);
     expect(runLocalMigrations(database)).toEqual([]);
     expect(
@@ -191,6 +193,13 @@ describe("local migrations", () => {
       database
         .prepare(
           "SELECT name FROM sqlite_master WHERE name = 'verified_transcript_cache'",
+        )
+        .get(),
+    ).toBeDefined();
+    expect(
+      database
+        .prepare(
+          "SELECT name FROM sqlite_master WHERE name = 'verified_transcript_cache_authorizations'",
         )
         .get(),
     ).toBeDefined();
@@ -481,6 +490,7 @@ describe("local migrations", () => {
       );
     expect(runLocalMigrations(database)).toEqual([
       "0028_desktop_setup_and_validated_components",
+      "0029_verified_transcript_cache_authorizations",
     ]);
     expect(
       database
@@ -491,6 +501,73 @@ describe("local migrations", () => {
       database.prepare("SELECT count(*) AS count FROM desktop_setup").get(),
     ).toEqual({ count: 0 });
     expect(runLocalMigrations(database)).toEqual([]);
+    database.close();
+  });
+
+  it("adds empty transcript-cache authorizations to a populated 0028 database without rewriting cache rows", () => {
+    const directory = mkdtempSync(
+      join(tmpdir(), "research-video-transcript-cache-scope-migration-"),
+    );
+    temporaryDirectories.add(directory);
+    const legacyMigrations = join(directory, "migrations-before-0029");
+    mkdirSync(legacyMigrations);
+    for (const filename of readdirSync(localMigrationDirectory)) {
+      if (filename < "0029_verified_transcript_cache_authorizations.sql") {
+        copyFileSync(
+          join(localMigrationDirectory, filename),
+          join(legacyMigrations, filename),
+        );
+      }
+    }
+    const database = openLocalDatabase(join(directory, "legacy.sqlite"));
+    runLocalMigrations(database, legacyMigrations);
+    const projectId = randomUUID();
+    const catalogVideoId = randomUUID();
+    const transcriptVersionId = randomUUID();
+    database
+      .prepare(
+        `INSERT INTO verified_transcript_cache
+           (project_id, video_id, transcript_version_id, manifest_sha256,
+            cache_path, sync_state, server_version, verified_at)
+         VALUES (?, ?, ?, ?, ?, 'verified', 1, ?)`,
+      )
+      .run(
+        projectId,
+        catalogVideoId,
+        transcriptVersionId,
+        "a".repeat(64),
+        "/private/unchanged-cache",
+        "2026-08-23T00:00:00.000Z",
+      );
+    expect(runLocalMigrations(database)).toEqual([
+      "0029_verified_transcript_cache_authorizations",
+    ]);
+    expect(
+      database
+        .prepare(
+          `SELECT manifest_sha256, cache_path FROM verified_transcript_cache
+           WHERE project_id = ? AND video_id = ? AND transcript_version_id = ?`,
+        )
+        .get(projectId, catalogVideoId, transcriptVersionId),
+    ).toEqual({
+      manifest_sha256: "a".repeat(64),
+      cache_path: "/private/unchanged-cache",
+    });
+    const scopes = new LocalTranscriptCacheAuthorizationRepository(database);
+    scopes.authorize({
+      projectId,
+      catalogVideoId,
+      transcriptVersionId,
+      authorizationScopeSha256: "b".repeat(64),
+    });
+    expect(
+      scopes.hasAuthorization({
+        projectId,
+        catalogVideoId,
+        transcriptVersionId,
+        authorizationScopeSha256: "b".repeat(64),
+      }),
+    ).toBe(true);
     database.close();
   });
 
@@ -770,6 +847,7 @@ describe("local migrations", () => {
       "0026_artifact_roots_and_locators",
       "0027_clip_library_cache",
       "0028_desktop_setup_and_validated_components",
+      "0029_verified_transcript_cache_authorizations",
     ]);
     expect(
       database
@@ -952,6 +1030,7 @@ describe("local migrations", () => {
       "0026_artifact_roots_and_locators",
       "0027_clip_library_cache",
       "0028_desktop_setup_and_validated_components",
+      "0029_verified_transcript_cache_authorizations",
     ]);
     expect(
       database.prepare("SELECT * FROM export_final_artifacts").all(),
@@ -1090,6 +1169,7 @@ describe("local migrations", () => {
       "0026_artifact_roots_and_locators",
       "0027_clip_library_cache",
       "0028_desktop_setup_and_validated_components",
+      "0029_verified_transcript_cache_authorizations",
     ]);
     expect(
       database
@@ -1182,6 +1262,73 @@ describe("local migrations", () => {
       expect.objectContaining({ role: "video_mp4", byteSize: 2_048 }),
     ]);
     database.close();
+  });
+});
+
+describe("verified transcript cache authorizations", () => {
+  it("stores only exact hashed volatile scopes and cascades with the cache row", () => {
+    const directory = mkdtempSync(join(tmpdir(), "transcript-cache-scope-"));
+    temporaryDirectories.add(directory);
+    const database = openLocalDatabase(join(directory, "test.sqlite"));
+    runLocalMigrations(database);
+    const projectId = randomUUID();
+    const catalogVideoId = randomUUID();
+    const transcriptVersionId = randomUUID();
+    const scope = "a".repeat(64);
+    database
+      .prepare(
+        `INSERT INTO verified_transcript_cache
+           (project_id, video_id, transcript_version_id, manifest_sha256,
+            cache_path, sync_state, server_version, verified_at)
+         VALUES (?, ?, ?, ?, ?, 'verified', 1, ?)`,
+      )
+      .run(
+        projectId,
+        catalogVideoId,
+        transcriptVersionId,
+        "b".repeat(64),
+        "/cache/not-exposed",
+        "2026-08-23T00:00:00.000Z",
+      );
+    const cacheAuthorizations = new LocalTranscriptCacheAuthorizationRepository(
+      database,
+      () => new Date("2026-08-23T00:00:00.000Z"),
+    );
+    cacheAuthorizations.authorize({
+      projectId,
+      catalogVideoId,
+      transcriptVersionId,
+      authorizationScopeSha256: scope,
+    });
+    expect(
+      cacheAuthorizations.hasAuthorization({
+        projectId,
+        catalogVideoId,
+        transcriptVersionId,
+        authorizationScopeSha256: scope,
+      }),
+    ).toBe(true);
+    expect(() =>
+      cacheAuthorizations.authorize({
+        projectId,
+        catalogVideoId,
+        transcriptVersionId,
+        authorizationScopeSha256: "not-a-hash",
+      }),
+    ).toThrow("authorization scope");
+    database
+      .prepare(
+        `DELETE FROM verified_transcript_cache
+         WHERE project_id = ? AND video_id = ? AND transcript_version_id = ?`,
+      )
+      .run(projectId, catalogVideoId, transcriptVersionId);
+    expect(
+      database
+        .prepare(
+          "SELECT count(*) AS count FROM verified_transcript_cache_authorizations",
+        )
+        .get(),
+    ).toEqual({ count: 0 });
   });
 });
 
@@ -2237,6 +2384,7 @@ describe("logged export delivery import", () => {
       "0026_artifact_roots_and_locators",
       "0027_clip_library_cache",
       "0028_desktop_setup_and_validated_components",
+      "0029_verified_transcript_cache_authorizations",
     ]);
     const after = new LocalExportQueue(database).get(before.id);
     expect(after).toEqual(before);
@@ -2312,6 +2460,7 @@ describe("logged export delivery import", () => {
       "0026_artifact_roots_and_locators",
       "0027_clip_library_cache",
       "0028_desktop_setup_and_validated_components",
+      "0029_verified_transcript_cache_authorizations",
     ]);
     expect(
       new LocalExportQueue(database).getAcceptedLoggedDelivery(

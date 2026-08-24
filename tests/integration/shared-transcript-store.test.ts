@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -226,7 +226,9 @@ describe("shared transcript store", () => {
       video.id,
     );
     expect(secondResolution.source).toBe("verified-local-cache");
-    expect(secondResolution.cachePath).toBe(cachePath);
+    expect(realpathSync(secondResolution.cachePath)).toBe(
+      realpathSync(cachePath),
+    );
     expect(downloadCount).toBe(downloadsAfterPromotion);
     const cacheRow = localDatabase
       .prepare(

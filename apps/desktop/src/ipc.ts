@@ -49,3 +49,37 @@ export function isPrivateDesktopSetupPath(path: string): boolean {
     pathname === "/api/desktop-setup/runtime-config"
   );
 }
+
+/** Exact renderer request eligible for the main-only offline-review capability. */
+export function isLocalTranscriptWorkspaceRequest(input: {
+  target: "cloud" | "local";
+  method: "GET" | "POST" | "PUT" | "PATCH";
+  path: string;
+}): boolean {
+  if (input.target !== "local" || input.method !== "GET") return false;
+  let target: URL;
+  try {
+    target = new URL(input.path, "https://desktop.invalid");
+  } catch {
+    return false;
+  }
+  if (
+    target.origin !== "https://desktop.invalid" ||
+    target.hash ||
+    input.path !== `${target.pathname}${target.search}`
+  ) {
+    return false;
+  }
+  if (
+    !/^\/api\/projects\/[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\/videos\/[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\/transcript$/iu.test(
+      target.pathname,
+    )
+  ) {
+    return false;
+  }
+  return (
+    target.searchParams.size === 0 ||
+    (target.searchParams.size === 1 &&
+      target.searchParams.has("preferredLanguage"))
+  );
+}

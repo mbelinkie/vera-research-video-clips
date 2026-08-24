@@ -76,6 +76,7 @@ export class LocalRuntimeCoordinator {
       clipLibrary: this.#count("clip_library"),
       artifact: this.#count("artifact"),
       authoring: this.#count("authoring"),
+      transcript: this.#count("transcript"),
       export: this.#count("export"),
       runtime: this.#count("runtime"),
     };

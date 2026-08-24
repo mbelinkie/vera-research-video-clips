@@ -11,7 +11,9 @@ import {
   ExportRequestSchema,
   ProjectSchema,
   TranscriptSelectionSchema,
+  TranscriptWorkspaceResponseSchema,
   UserSchema,
+  VideoSchema,
   languagesEquivalent,
   type ClipCandidate,
   type DesktopAuthStatus,
@@ -24,13 +26,14 @@ import {
   type NormalizedTranscript,
   type Project,
   type TranscriptSelection,
+  type TranscriptWorkspaceResponse,
   type User,
+  type Video,
 } from "@research-video/contracts";
 import { normalizeYouTubeUrl } from "@research-video/providers";
 import {
   deriveTranscriptSelection,
   buildClipLanguageEvidence,
-  normalizeTranscriptFixture,
   searchTranscript,
   segmentAtTime,
   timedTranscriptTokens,
@@ -38,8 +41,6 @@ import {
   tokenAtTime,
   updateTranscriptSelectionExportBounds,
 } from "@research-video/transcript";
-import transcriptFixture from "../../../tests/fixtures/transcripts/english-word.json" with { type: "json" };
-import multilingualFixture from "../../../tests/fixtures/transcripts/romanian-multilingual.json" with { type: "json" };
 
 import "./styles.css";
 import {
@@ -52,10 +53,17 @@ import { DesktopSetup } from "./desktop-setup.tsx";
 import { YouTubePlayer, type YouTubePlayerHandle } from "./youtube-player.tsx";
 import { VirtualTranscript } from "./virtual-transcript.tsx";
 
-const demoVideoId = "M7lc1UVf-VE";
-const multilingualDemoVideoId = "Romanian001";
-const demoUrl = `https://www.youtube.com/watch?v=${demoVideoId}`;
 const builtInPresetKey = "built-in:editing-mp4:v1";
+
+type WorkspaceVideoTarget = Readonly<{
+  projectId: string;
+  catalogVideoId: string;
+  youtubeVideoId: string;
+  canonicalUrl: string;
+  title?: string;
+}>;
+
+type WorkspaceLoadState = "idle" | "loading" | "unavailable" | "failed";
 
 function catalogPresetKey(
   scope: "personal" | "project",
@@ -120,8 +128,16 @@ function mapSelectionToTranscript(
 }
 
 function App() {
-  const [url, setUrl] = useState(demoUrl);
-  const [videoId, setVideoId] = useState<string>();
+  const [url, setUrl] = useState("");
+  const [workspaceTarget, setWorkspaceTarget] =
+    useState<WorkspaceVideoTarget>();
+  const [workspace, setWorkspace] = useState<TranscriptWorkspaceResponse>();
+  const [workspaceLoadState, setWorkspaceLoadState] =
+    useState<WorkspaceLoadState>("idle");
+  const [workspaceMessage, setWorkspaceMessage] = useState<string>();
+  const [workspaceReload, setWorkspaceReload] = useState(0);
+  const workspaceGeneration = useRef(0);
+  const [projectVideos, setProjectVideos] = useState<Video[]>();
   const [error, setError] = useState<string>();
   const [query, setQuery] = useState("");
   const [matchIndex, setMatchIndex] = useState(0);
@@ -213,6 +229,28 @@ function App() {
   const [omitEnglishSubtitles, setOmitEnglishSubtitles] = useState(false);
   const [embedEnglishSubtitles, setEmbedEnglishSubtitles] = useState(false);
   const playerRef = useRef<YouTubePlayerHandle>(null);
+  const videoId = workspaceTarget?.youtubeVideoId;
+
+  function clearWorkspaceInteraction() {
+    workspaceGeneration.current += 1;
+    setWorkspace(undefined);
+    setWorkspaceLoadState("idle");
+    setWorkspaceMessage(undefined);
+    setCurrentMs(0);
+    setLastSeekMs(undefined);
+    setQuery("");
+    setTranscriptView("preferred");
+    setSelection(undefined);
+    setSelectionError(undefined);
+    setPreviewingSelection(false);
+    setClipNotes("");
+    setClipTags("");
+    setSelectionCommandId(crypto.randomUUID());
+    setClipActionMessage(undefined);
+    setLoggedClipId(undefined);
+    setLoggedExportRequestId(undefined);
+    setExportOnlyRequestId(undefined);
+  }
 
   async function refreshDesktopStatus() {
     const bridge = desktopBridge();
@@ -234,10 +272,12 @@ function App() {
   async function completeDesktopSignOut() {
     const bridge = desktopBridge();
     if (!bridge) return;
+    clearWorkspaceInteraction();
+    setWorkspaceTarget(undefined);
     await bridge.signOut();
     await refreshDesktopStatus();
     setProjects([]);
-    setProjectId("");
+    selectProject("");
     setProjectMessage(undefined);
   }
 
@@ -262,54 +302,36 @@ function App() {
     }, 1_000);
     return () => window.clearInterval(timer);
   }, [desktopAuthStatus?.state]);
-  const transcriptTracks = useMemo(() => {
-    if (videoId === demoVideoId) {
-      const english = normalizeTranscriptFixture({
-        ...transcriptFixture,
-        track: { ...transcriptFixture.track, videoId: demoVideoId },
-      });
-      return { original: english, english, translations: [] };
-    }
-    if (videoId === multilingualDemoVideoId) {
-      return {
-        original: normalizeTranscriptFixture(multilingualFixture.original),
-        english: normalizeTranscriptFixture(multilingualFixture.english),
-        translations: [normalizeTranscriptFixture(multilingualFixture.spanish)],
-      };
-    }
-    return undefined;
-  }, [videoId]);
-  const preferredTranscript = useMemo(() => {
-    if (!transcriptTracks || !user) return undefined;
-    if (
-      languagesEquivalent(
-        transcriptTracks.original.track.language,
-        user.preferredLanguage,
-      )
-    ) {
-      return transcriptTracks.original;
-    }
-    if (languagesEquivalent(user.preferredLanguage, "en")) {
-      return transcriptTracks.english;
-    }
-    return transcriptTracks.translations.find((candidate) =>
-      languagesEquivalent(candidate.track.language, user.preferredLanguage),
-    );
-  }, [transcriptTracks, user]);
+  const transcriptTracks = useMemo(
+    () =>
+      workspace
+        ? {
+            original: workspace.original,
+            english: workspace.english,
+            translations:
+              workspace.preferred.state === "ready" &&
+              workspace.preferred.source !== "original" &&
+              workspace.preferred.source !== "english"
+                ? [workspace.preferred.transcript]
+                : [],
+          }
+        : undefined,
+    [workspace],
+  );
+  const preferredTranscript =
+    workspace?.preferred.state === "ready"
+      ? workspace.preferred.transcript
+      : undefined;
+  const offlineCachedWorkspace = workspace?.catalogState === "offline_cached";
   const transcript = useMemo(() => {
     if (!transcriptTracks) return undefined;
     if (transcriptView === "original") return transcriptTracks.original;
     if (transcriptView === "english") return transcriptTracks.english;
-    return preferredTranscript ?? transcriptTracks.english;
+    return preferredTranscript;
   }, [preferredTranscript, transcriptTracks, transcriptView]);
   const preferredEvidenceRequired = Boolean(
-    transcriptTracks &&
-    user &&
-    !languagesEquivalent(user.preferredLanguage, "en") &&
-    !languagesEquivalent(
-      user.preferredLanguage,
-      transcriptTracks.original.track.language,
-    ),
+    workspace?.preferred.state !== undefined &&
+    workspace.preferred.state !== "ready",
   );
   const languageEvidenceReady =
     !preferredEvidenceRequired || Boolean(preferredTranscript);
@@ -450,6 +472,20 @@ function App() {
     languagesEquivalent(transcriptTracks.original.track.language, "en")
       ? ("confirmed_english" as const)
       : ("foreign" as const);
+  const selectedVideoTitle =
+    workspaceTarget?.title ??
+    projectVideos?.find(
+      (candidate) => candidate.id === workspaceTarget?.catalogVideoId,
+    )?.title;
+  const selectedVideoSnapshot =
+    workspace && workspaceTarget && selectedVideoTitle
+      ? {
+          youtubeVideoId: workspace.youtubeVideoId,
+          canonicalUrl: workspaceTarget.canonicalUrl,
+          title: selectedVideoTitle,
+          sourceLanguage: workspace.original.track.language,
+        }
+      : undefined;
   const selectedRendererCapabilityId =
     exportContainer === "mp4" && exportVideoCodec === "h264"
       ? "h264_mp4"
@@ -541,6 +577,141 @@ function App() {
             : "Unable to load account settings.",
         );
       });
+  }, [authorization]);
+
+  useEffect(() => {
+    if (!authorization || !projectId) {
+      setProjectVideos(undefined);
+      return;
+    }
+    const controller = new AbortController();
+    setProjectVideos(undefined);
+    void apiFetch(
+      "cloud",
+      `/api/projects/${projectId}/videos`,
+      { signal: controller.signal },
+      authorization,
+    )
+      .then(async (response) => {
+        const payload = await response.json().catch(() => undefined);
+        if (!response.ok) {
+          const parsed = ApiErrorSchema.safeParse(payload);
+          throw new Error(
+            parsed.success
+              ? parsed.data.error.message
+              : "Unable to load this project’s videos.",
+          );
+        }
+        return VideoSchema.array().parse(payload);
+      })
+      .then((videos) => {
+        if (!controller.signal.aborted) setProjectVideos(videos);
+      })
+      .catch(() => {
+        if (!controller.signal.aborted) setProjectVideos([]);
+      });
+    return () => controller.abort();
+  }, [authorization, projectId]);
+
+  useEffect(() => {
+    const target = workspaceTarget;
+    const generation = ++workspaceGeneration.current;
+    if (!authorization || !target || target.projectId !== projectId) {
+      setWorkspace(undefined);
+      setWorkspaceLoadState("idle");
+      return;
+    }
+    const controller = new AbortController();
+    const preferredLanguage = user?.preferredLanguage ?? "en";
+    setWorkspace(undefined);
+    setWorkspaceLoadState("loading");
+    setWorkspaceMessage("Resolving the project’s verified transcript…");
+    const parameters = new URLSearchParams({ preferredLanguage });
+    void apiFetch(
+      "local",
+      `/api/projects/${target.projectId}/videos/${target.catalogVideoId}/transcript?${parameters}`,
+      { signal: controller.signal },
+      authorization,
+    )
+      .then(async (response) => {
+        const payload = await response.json().catch(() => undefined);
+        if (!response.ok) {
+          const parsed = ApiErrorSchema.safeParse(payload);
+          throw new Error(
+            parsed.success
+              ? parsed.data.error.message
+              : "The verified transcript is unavailable right now.",
+          );
+        }
+        const parsed = TranscriptWorkspaceResponseSchema.parse(payload);
+        if (
+          parsed.projectId !== target.projectId ||
+          parsed.catalogVideoId !== target.catalogVideoId ||
+          parsed.youtubeVideoId !== target.youtubeVideoId
+        ) {
+          throw new Error(
+            "The returned transcript does not belong to the selected project video.",
+          );
+        }
+        return parsed;
+      })
+      .then((resolved) => {
+        if (
+          controller.signal.aborted ||
+          generation !== workspaceGeneration.current
+        )
+          return;
+        setWorkspace(resolved);
+        setTranscriptView(
+          resolved.preferred.state === "ready" ? "preferred" : "english",
+        );
+        setWorkspaceLoadState("idle");
+        setWorkspaceMessage(
+          resolved.catalogState === "offline_cached"
+            ? "Reviewing the exact verified cached transcript. Reconnect before creating project work or checking for a newer active version."
+            : resolved.source === "verified-local-cache"
+              ? "Loaded the exact verified local transcript cache."
+              : "Downloaded and verified the project transcript.",
+        );
+      })
+      .catch((caught: unknown) => {
+        if (
+          controller.signal.aborted ||
+          generation !== workspaceGeneration.current
+        )
+          return;
+        const message =
+          caught instanceof Error
+            ? caught.message
+            : "The verified transcript is unavailable right now.";
+        setWorkspace(undefined);
+        setWorkspaceLoadState(
+          /no active transcript|not found|unavailable/i.test(message)
+            ? "unavailable"
+            : "failed",
+        );
+        setWorkspaceMessage(message);
+      });
+    return () => controller.abort();
+  }, [
+    authorization,
+    projectId,
+    user?.preferredLanguage,
+    workspaceReload,
+    workspaceTarget,
+  ]);
+
+  useEffect(() => {
+    if (workspaceTarget && workspaceTarget.projectId !== projectId) {
+      clearWorkspaceInteraction();
+      setWorkspaceTarget(undefined);
+    }
+  }, [projectId, workspaceTarget]);
+
+  useEffect(() => {
+    if (authorization) return;
+    clearWorkspaceInteraction();
+    setWorkspaceTarget(undefined);
   }, [authorization]);
 
   useEffect(() => {
@@ -836,28 +1007,58 @@ function App() {
   function loadVideoUrl(nextUrl: string) {
     try {
       const normalized = normalizeYouTubeUrl(nextUrl);
-      setVideoId(normalized.videoId);
+      clearWorkspaceInteraction();
+      setWorkspaceTarget(undefined);
       setUrl(normalized.canonicalUrl);
-      setCurrentMs(0);
-      setLastSeekMs(undefined);
-      setQuery("");
-      setTranscriptView("preferred");
-      setSelection(undefined);
-      setSelectionError(undefined);
-      setPreviewingSelection(false);
-      setClipNotes("");
-      setClipTags("");
-      setSelectionCommandId(crypto.randomUUID());
-      setClipActionMessage(undefined);
-      setLoggedClipId(undefined);
-      setLoggedExportRequestId(undefined);
-      setExportOnlyRequestId(undefined);
-      setError(undefined);
+      if (!authorization || !projectId) {
+        setError("Choose a project before loading a project-authorized video.");
+        return;
+      }
+      if (!projectVideos) {
+        setError(
+          "Checking this project’s videos. Try Load video again shortly.",
+        );
+        return;
+      }
+      const projectVideo = projectVideos.find(
+        (candidate) =>
+          candidate.youtubeVideoId === normalized.videoId ||
+          candidate.canonicalUrl === normalized.canonicalUrl,
+      );
+      if (projectVideo) {
+        openProjectVideo({
+          projectId,
+          catalogVideoId: projectVideo.id,
+          youtubeVideoId: projectVideo.youtubeVideoId,
+          canonicalUrl: projectVideo.canonicalUrl,
+          title: projectVideo.title,
+        });
+        return;
+      }
+      setError(
+        `“${normalized.videoId}” is not in this project yet. Add it through the transcription batch workflow, then open it from Ready for review.`,
+      );
     } catch (caught) {
       setError(
         caught instanceof Error ? caught.message : "Unable to load video.",
       );
     }
+  }
+
+  function openProjectVideo(target: WorkspaceVideoTarget) {
+    clearWorkspaceInteraction();
+    setProjectId(target.projectId);
+    setWorkspaceTarget(target);
+    setUrl(target.canonicalUrl);
+    setError(undefined);
+  }
+
+  function selectProject(nextProjectId: string) {
+    if (nextProjectId !== projectId) {
+      clearWorkspaceInteraction();
+      setWorkspaceTarget(undefined);
+    }
+    setProjectId(nextProjectId);
   }
 
   function changeExportBound(bound: "start" | "end", secondsText: string) {
@@ -940,7 +1141,7 @@ function App() {
         ...current.filter((candidate) => candidate.id !== project.id),
         project,
       ]);
-      setProjectId(project.id);
+      selectProject(project.id);
       setNewProjectName("");
       setNewProjectDescription("");
       setCreatingProject(false);
@@ -961,16 +1162,16 @@ function App() {
       !videoId ||
       !selection ||
       !transcriptTracks ||
+      !selectedVideoSnapshot ||
       !user ||
-      !languageEvidenceReady
+      !languageEvidenceReady ||
+      offlineCachedWorkspace
     )
       return undefined;
     const languageEvidence = buildClipLanguageEvidence({
       original: transcriptTracks.original,
       english: transcriptTracks.english,
-      ...(preferredEvidenceRequired && preferredTranscript
-        ? { preferred: preferredTranscript }
-        : {}),
+      ...(preferredTranscript ? { preferred: preferredTranscript } : {}),
       startMs: selection.transcriptStartMs,
       endMs: selection.transcriptEndMs,
     });
@@ -983,17 +1184,7 @@ function App() {
           method: "POST",
           body: JSON.stringify({
             idempotencyKey: `queue:${selectionCommandId}`,
-            video: {
-              youtubeVideoId: videoId,
-              canonicalUrl: `https://www.youtube.com/watch?v=${videoId}`,
-              title:
-                videoId === demoVideoId
-                  ? "YouTube IFrame API demo"
-                  : videoId === multilingualDemoVideoId
-                    ? "Romanian multilingual proof fixture"
-                    : `YouTube video ${videoId}`,
-              sourceLanguage: transcriptTracks.original.track.language,
-            },
+            video: selectedVideoSnapshot,
             selection,
             languageEvidence,
             notes: clipNotes,
@@ -1034,6 +1225,7 @@ function App() {
       !projectId ||
       !selection ||
       !transcriptTracks ||
+      offlineCachedWorkspace ||
       loggedSettingsState !== "ready" ||
       !loggedSettingsPreview?.snapshot.resolutionFingerprint
     )
@@ -1112,6 +1304,7 @@ function App() {
       !videoId ||
       !selection ||
       !transcriptTracks ||
+      !selectedVideoSnapshot ||
       exportOnlySettingsState !== "ready" ||
       !exportOnlySettingsPreview?.snapshot.resolutionFingerprint
     )
@@ -1125,17 +1318,7 @@ function App() {
           method: "POST",
           body: JSON.stringify({
             idempotencyKey: `export-only:${selectionCommandId}`,
-            video: {
-              youtubeVideoId: videoId,
-              canonicalUrl: `https://www.youtube.com/watch?v=${videoId}`,
-              title:
-                videoId === demoVideoId
-                  ? "YouTube IFrame API demo"
-                  : videoId === multilingualDemoVideoId
-                    ? "Romanian multilingual proof fixture"
-                    : `YouTube video ${videoId}`,
-              sourceLanguage: transcriptTracks.original.track.language,
-            },
+            video: selectedVideoSnapshot,
             selection,
             sourceLanguageClass:
               transcriptTracks.original.track.id ===
@@ -1239,7 +1422,7 @@ function App() {
         projects={projects}
         projectId={projectId}
         onProjectsChange={setProjects}
-        onProjectChange={setProjectId}
+        onProjectChange={selectProject}
         onSignIn={beginDesktopSignIn}
         onSignOut={completeDesktopSignOut}
       />
@@ -1263,7 +1446,7 @@ function App() {
         </div>
         <p className={error ? "form-message error" : "form-message"}>
           {error ??
-            "The included API demo opens with a short navigation fixture; other valid videos load without inventing a transcript."}
+            "Open a project video from Ready for review to resolve its verified transcript."}
         </p>
       </form>
 
@@ -1353,16 +1536,21 @@ function App() {
 
           {transcript ? (
             <>
-              <div className="fixture-warning">
-                {videoId === multilingualDemoVideoId
-                  ? "Romanian → English + Spanish deterministic proof fixture."
-                  : "Navigation fixture for the API demo—not a transcript of the video."}
-              </div>
+              <p className="form-message" role="status">
+                {workspaceMessage}
+              </p>
               {preferredEvidenceRequired && !preferredTranscript ? (
                 <p className="form-message error" role="status">
                   Preferred translation unavailable for{" "}
                   {user?.preferredLanguage}. Original and English remain
                   available; logging waits for the required preferred evidence.
+                </p>
+              ) : null}
+              {offlineCachedWorkspace ? (
+                <p className="form-message" role="status">
+                  This is verified offline cache review. Reconnect to confirm
+                  the current project transcript; Queue / log only and Export +
+                  log are unavailable until then.
                 </p>
               ) : null}
               <div className="search-field">
@@ -1435,12 +1623,27 @@ function App() {
           ) : (
             <div className="empty-state">
               <span className="step">01</span>
-              <h2>{videoId ? "No shared transcript yet" : "Load a video"}</h2>
+              <h2>
+                {workspaceLoadState === "loading"
+                  ? "Loading verified transcript"
+                  : workspaceLoadState === "unavailable"
+                    ? "No active project transcript"
+                    : workspaceLoadState === "failed"
+                      ? "Transcript unavailable"
+                      : "Open a project video"}
+              </h2>
               <p>
-                {videoId
-                  ? "This slice will not invent transcript text. Shared transcript resolution is the next connection."
-                  : "Paste a supported YouTube URL to create a canonical video identity."}
+                {workspaceMessage ??
+                  "Open a Ready for review project video. The app never substitutes fixture text when real resolution is unavailable."}
               </p>
+              {workspaceTarget && workspaceLoadState !== "loading" ? (
+                <button
+                  type="button"
+                  onClick={() => setWorkspaceReload((value) => value + 1)}
+                >
+                  Retry transcript
+                </button>
+              ) : null}
             </div>
           )}
         </article>
@@ -1507,7 +1710,7 @@ function App() {
                   id="selection-project"
                   value={projectId}
                   disabled={projects.length === 0 || Boolean(loggedClipId)}
-                  onChange={(event) => setProjectId(event.target.value)}
+                  onChange={(event) => selectProject(event.target.value)}
                 >
                   <option value="">Choose a project</option>
                   {projects.map((project) => (
@@ -2115,7 +2318,9 @@ function App() {
                     !authorization ||
                     !projectId ||
                     !user ||
-                    !languageEvidenceReady
+                    !selectedVideoSnapshot ||
+                    !languageEvidenceReady ||
+                    offlineCachedWorkspace
                   }
                   onClick={() => void queueClipOnly()}
                 >
@@ -2129,7 +2334,9 @@ function App() {
                     !authorization ||
                     !projectId ||
                     !user ||
+                    !selectedVideoSnapshot ||
                     !languageEvidenceReady ||
+                    offlineCachedWorkspace ||
                     loggedSettingsState !== "ready"
                   }
                   onClick={() => void requestLoggedExport()}
@@ -2141,6 +2348,7 @@ function App() {
                   disabled={
                     clipActionBusy ||
                     Boolean(exportOnlyRequestId) ||
+                    !selectedVideoSnapshot ||
                     exportOnlySettingsState !== "ready"
                   }
                   onClick={() => void requestExportOnly()}
@@ -2181,14 +2389,15 @@ function App() {
         onAuthorizationChange={(value) => {
           setAuthorization(value);
           setProjects([]);
-          setProjectId("");
+          selectProject("");
           setProjectMessage(undefined);
         }}
-        onOpenVideo={(canonicalUrl) => {
-          loadVideoUrl(canonicalUrl);
+        onOpenVideo={loadVideoUrl}
+        onOpenReadyVideo={(target) => {
+          openProjectVideo(target);
           window.scrollTo({ top: 0, behavior: "smooth" });
         }}
-        onProjectChange={setProjectId}
+        onProjectChange={selectProject}
         onProjectsChange={setProjects}
         projectId={projectId}
         projects={projects}

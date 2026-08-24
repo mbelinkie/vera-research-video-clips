@@ -10,6 +10,7 @@ import {
   createTranscriptPipelineExecutor,
 } from "./pipeline.ts";
 import { HttpClaimedTranslationClient } from "./translation-cloud.ts";
+import { sweepAbandonedTranscriptionScratch } from "./transcription-scratch-sweeper.ts";
 import {
   ClaimingTranscriptionWorker,
   HttpTranscriptionWorkerControlPlane,
@@ -58,6 +59,8 @@ if (!config.workerAuthorization) {
     baseUrl,
     authorization: config.workerAuthorization,
   });
+  const scratchRoot = join(config.dataDir, "jobs", "transcription-scratch");
+  await sweepAbandonedTranscriptionScratch(scratchRoot);
   const execute = createTranscriptPipelineExecutor({
     ...(captions ? { captions } : {}),
     media,
@@ -71,7 +74,7 @@ if (!config.workerAuthorization) {
         }
       : {}),
     publication,
-    scratchRoot: join(config.dataDir, "jobs", "transcription-scratch"),
+    scratchRoot,
   });
   const worker = new ClaimingTranscriptionWorker(
     controlPlane,

@@ -81,6 +81,34 @@ function makeBroker(
 }
 
 describe("desktop authentication broker", () => {
+  it("keeps its volatile offline-review capability stable across a token refresh and clears it on sign-out", async () => {
+    let now = 1_000;
+    const { broker, browser } = makeBroker({ now: () => now });
+    await broker.beginSignIn();
+    const authorizationUrl = new URL(
+      vi.mocked(browser.open).mock.calls[0]?.[0].href ?? "",
+    );
+    const callback = new URL("research-video-clips://oauth/callback");
+    callback.searchParams.set("code", "one-time-code");
+    callback.searchParams.set(
+      "state",
+      authorizationUrl.searchParams.get("state") ?? "",
+    );
+    broker.acceptNativeCallback(callback.href);
+    await broker.drainNativeCallbacks();
+    const capability = broker.getOfflineReviewCapability();
+    expect(capability).toMatch(/^[A-Za-z0-9_-]{43}$/u);
+
+    now += 3_541_000;
+    await broker.getAccessTokenForTrustedProxy();
+    expect(broker.getOfflineReviewCapability()).toBe(capability);
+
+    await broker.signOut();
+    expect(() => broker.getOfflineReviewCapability()).toThrow(
+      "Authentication could not be completed",
+    );
+  });
+
   it("exchanges an exact queued callback and exposes only a sanitized renderer status", async () => {
     const { broker, browser } = makeBroker();
 

@@ -70,6 +70,9 @@ import {
   LocalOperationFailureSchema,
   LocalRuntimeDrainResultSchema,
   LocalRuntimeQuiescenceSchema,
+  LanguageTagSchema,
+  TranscriptWorkspaceResponseSchema,
+  type TranscriptWorkspaceResponse,
 } from "@research-video/contracts";
 import {
   currentExportWorkerAdvertisement,
@@ -81,8 +84,6 @@ import type {
   LocalExportWorkerIdentity,
   LocalExportWorkerIdentityRepository,
 } from "@research-video/db-local";
-import type { WorkspaceTranscriptResolution } from "@research-video/sync";
-
 import type { LocalExportOnceResult } from "./export-run-once.ts";
 import type { LocalRuntimeCoordinator } from "./local-runtime.ts";
 
@@ -244,7 +245,9 @@ export interface LocalAgentDependencies {
     projectId: string;
     catalogVideoId: string;
     authorization: string;
-  }): Promise<WorkspaceTranscriptResolution>;
+    preferredLanguage: string;
+    offlineReviewCapability?: string;
+  }): Promise<TranscriptWorkspaceResponse>;
   previewExportSettings?(input: {
     request: ExportSettingsPreviewRequest;
     authorization: string;
@@ -348,6 +351,9 @@ const TranscriptParamsSchema = z.object({
   projectId: z.uuid(),
   videoId: z.uuid(),
 });
+const TranscriptQuerySchema = z
+  .object({ preferredLanguage: LanguageTagSchema.optional() })
+  .strict();
 const LocalProjectParamsSchema = z.object({ projectId: z.uuid() });
 const LocalClipParamsSchema = z.object({
   projectId: z.uuid(),
@@ -502,7 +508,10 @@ export function createLocalAgent(
     return reply.status(statusCode).send({
       error: {
         code: localFailureCode(candidate.code, operationFailure.failureClass),
-        message: localFailureMessage(operationFailure.failureClass),
+        message: localFailureMessage(
+          operationFailure.failureClass,
+          candidate.code,
+        ),
         retryable: statusCode >= 500,
       },
       operationFailure,
@@ -927,22 +936,41 @@ export function createLocalAgent(
         const { projectId, videoId } = TranscriptParamsSchema.parse(
           request.params,
         );
+        const { preferredLanguage = "en" } = TranscriptQuerySchema.parse(
+          request.query,
+        );
         const authorization = request.headers.authorization;
         if (!authorization) {
           throw new LocalAuthenticationError(
             "Authentication is required to resolve a project transcript.",
           );
         }
-        const resolution = await dependencies.resolveTranscript!({
-          projectId,
-          catalogVideoId: videoId,
-          authorization,
-        });
-        return {
-          transcriptVersionId: resolution.bundle.transcriptVersionId,
-          source: resolution.source,
-          transcript: resolution.transcript,
-        };
+        const offlineReviewCapability = dependencies.desktopSession
+          ? requireOfflineReviewCapability(
+              request.headers["x-research-video-offline-review"],
+            )
+          : undefined;
+        const workspace = TranscriptWorkspaceResponseSchema.parse(
+          await dependencies.resolveTranscript!({
+            projectId,
+            catalogVideoId: videoId,
+            authorization,
+            preferredLanguage,
+            ...(offlineReviewCapability ? { offlineReviewCapability } : {}),
+          }),
+        );
+        if (
+          workspace.projectId !== projectId ||
+          workspace.catalogVideoId !== videoId
+        ) {
+          throw Object.assign(
+            new Error(
+              "Transcript workspace identity did not match the request.",
+            ),
+            { statusCode: 502, code: "transcript_workspace_identity_mismatch" },
+          );
+        }
+        return workspace;
       },
     );
   }
@@ -1728,6 +1756,7 @@ function registerRuntimeOperation(
 
 function localOperationClass(url: string) {
   if (url.includes("/runtime/")) return "runtime" as const;
+  if (url.includes("/transcript")) return "transcript" as const;
   if (url.includes("/authoring/")) return "authoring" as const;
   if (url.includes("artifact")) return "artifact" as const;
   if (url.includes("clip-library")) return "clip_library" as const;
@@ -1741,7 +1770,12 @@ function localFailureClass(code: string | undefined, statusCode: number) {
   if (statusCode === 400) return "invalid_request" as const;
   if (code === "runtime_draining") return "runtime_draining" as const;
   if (code?.includes("storage")) return "storage_insufficient" as const;
-  if (code?.includes("verification") || code?.includes("artifact"))
+  if (
+    code === "local_cache_integrity_failed" ||
+    code === "transcript_workspace_identity_mismatch" ||
+    code?.includes("verification") ||
+    code?.includes("artifact")
+  )
     return "verification_failed" as const;
   if (code?.includes("cleanup")) return "cleanup_required" as const;
   if (code?.includes("lease") || code?.includes("execution"))
@@ -1753,7 +1787,11 @@ function localFailureClass(code: string | undefined, statusCode: number) {
 
 function localFailureMessage(
   failureClass: ReturnType<typeof localFailureClass>,
+  candidateCode?: string,
 ): string {
+  if (candidateCode === "offline_transcript_not_authorized") {
+    return "Reconnect to verify project access before reviewing this cached transcript.";
+  }
   switch (failureClass) {
     case "authentication_required":
       return "Authentication is required.";
@@ -1768,7 +1806,7 @@ function localFailureMessage(
     case "storage_insufficient":
       return "Local storage is insufficient for this operation.";
     case "verification_failed":
-      return "Local artifact verification failed.";
+      return "Local data verification failed. Refresh the transcript when the project connection is available.";
     case "provider_unavailable":
       return "A required local or cloud provider is unavailable.";
     case "execution_lost":
@@ -1811,6 +1849,7 @@ const SafeLocalErrorCodes = new Set([
   "invalid_request",
   "invalid_tool",
   "launch_failed",
+  "local_cache_integrity_failed",
   "logged_export_delivery_not_accepted",
   "logged_export_execution_ownership_mismatch",
   "logged_export_failure_cleanup_incomplete",
@@ -1818,10 +1857,21 @@ const SafeLocalErrorCodes = new Set([
   "runtime_draining",
   "runtime_operation_conflict",
   "model_pin_invalid",
+  "offline_transcript_not_authorized",
   "tool_probe_failed",
+  "transcript_workspace_identity_mismatch",
   "unsupported",
   "worker_registration_required",
 ]);
+
+function requireOfflineReviewCapability(value: unknown): string {
+  if (typeof value !== "string" || !/^[A-Za-z0-9_-]{43,512}$/u.test(value)) {
+    throw new LocalAuthenticationError(
+      "A signed desktop session is required to review cached transcripts.",
+    );
+  }
+  return value;
+}
 
 function localFailureCode(
   candidateCode: string | undefined,

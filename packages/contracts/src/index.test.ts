@@ -58,6 +58,7 @@ import {
   LocalOperationFailureSchema,
   LocalRuntimeDrainResultSchema,
   LocalRuntimeQuiescenceSchema,
+  LookupDerivedTranslationSchema,
   PrepareClipLibraryExportRequestSchema,
   SubmitClipLibraryExportRequestSchema,
   UpdateLocalClipLibrarySelectionSchema,
@@ -75,6 +76,7 @@ import {
   JobSchema,
   ProjectSchema,
   TranscriptTrackSchema,
+  TranscriptWorkspaceResponseSchema,
   TranscriptionBatchControlRequestSchema,
   UpdateReviewStatusRequestSchema,
   UpdatePreferredLanguageRequestSchema,
@@ -87,6 +89,27 @@ const now = "2026-08-01T12:00:00.000Z";
 const id = "019fbb95-cd76-7920-93fa-e23ba755ee3f";
 
 describe("shared contracts", () => {
+  it("keeps derived translation lookup read-only and identity-only", () => {
+    const identity = {
+      projectId: id,
+      catalogVideoId: "019fbb95-cd76-7920-93fa-e23ba755ee40",
+      baseTranscriptVersionId: "019fbb95-cd76-7920-93fa-e23ba755ee41",
+      originalTrackId: "019fbb95-cd76-7920-93fa-e23ba755ee42",
+      originalContentSha256: "a".repeat(64),
+      targetLanguage: "es-MX",
+      provider: "amazon-translate",
+      normalizationSchemaVersion: 1,
+    };
+    expect(LookupDerivedTranslationSchema.parse({ identity })).toEqual({
+      identity,
+    });
+    expect(
+      LookupDerivedTranslationSchema.safeParse({
+        identity,
+        idempotencyKey: "must-not-create-work",
+      }).success,
+    ).toBe(false);
+  });
   it("keeps M7 setup and readiness contracts closed, path-free, and operation-specific", () => {
     const health = [
       {
@@ -234,6 +257,7 @@ describe("shared contracts", () => {
         clipLibrary: 0,
         artifact: 0,
         authoring: 0,
+        transcript: 0,
         export: 0,
         runtime: 0,
       },
@@ -260,9 +284,9 @@ describe("shared contracts", () => {
     ).toBe(correlationId);
     expect(
       LocalOperationFailureSchema.parse({
-        operation: "export",
-        failureClass: "runtime_draining",
-        retryable: false,
+        operation: "transcript",
+        failureClass: "verification_failed",
+        retryable: true,
         correlationId,
       }),
     ).not.toHaveProperty("message");
@@ -1817,7 +1841,169 @@ describe("desktop boundary contracts", () => {
     });
     expect(JSON.stringify(status)).not.toMatch(/token|path|authorization/i);
   });
+
+  it("keeps transcript workspaces closed, time-linked, and free of local transport details", () => {
+    const workspace = transcriptWorkspaceFixture();
+    expect(TranscriptWorkspaceResponseSchema.parse(workspace)).toMatchObject({
+      schemaVersion: 1,
+      source: "verified-local-cache",
+      preferred: { state: "ready", source: "local" },
+    });
+    expect(
+      TranscriptWorkspaceResponseSchema.safeParse({
+        ...workspace,
+        cachePath: "/private/transcript-cache/should-not-leak",
+      }).success,
+    ).toBe(false);
+    expect(
+      TranscriptWorkspaceResponseSchema.safeParse({
+        ...workspace,
+        downloadUrl: "https://storage.example.test/private-object",
+      }).success,
+    ).toBe(false);
+    expect(
+      TranscriptWorkspaceResponseSchema.safeParse({
+        ...workspace,
+        authorization: "Bearer must-not-cross-the-boundary",
+      }).success,
+    ).toBe(false);
+    expect(
+      TranscriptWorkspaceResponseSchema.safeParse({
+        ...workspace,
+        source: "shared-store",
+        catalogState: "offline_cached",
+      }).success,
+    ).toBe(false);
+    expect(
+      TranscriptWorkspaceResponseSchema.safeParse({
+        ...workspace,
+        english: {
+          ...workspace.english,
+          track: { ...workspace.english.track, sourceTrackId: id },
+        },
+      }).success,
+    ).toBe(false);
+  });
+
+  it("permits only an exact canonical-English alias for direct-English workspaces", () => {
+    const workspace = transcriptWorkspaceFixture();
+    const english = {
+      ...workspace.english,
+      track: {
+        ...workspace.english.track,
+        id: "019fbb95-cd76-7920-93fa-e23ba755ee61",
+        videoId: workspace.youtubeVideoId,
+        contentSha256: "b".repeat(64),
+      },
+      segments: workspace.english.segments.map((segment) => ({
+        ...segment,
+        trackId: "019fbb95-cd76-7920-93fa-e23ba755ee61",
+      })),
+    };
+    const directEnglish = {
+      ...workspace,
+      original: english,
+      english,
+      preferred: {
+        state: "ready" as const,
+        source: "english" as const,
+        transcript: english,
+      },
+    };
+    expect(
+      TranscriptWorkspaceResponseSchema.safeParse(directEnglish).success,
+    ).toBe(true);
+    expect(
+      TranscriptWorkspaceResponseSchema.safeParse({
+        ...directEnglish,
+        original: { ...english, segments: [] },
+      }).success,
+    ).toBe(false);
+  });
 });
+
+function transcriptWorkspaceFixture() {
+  const projectId = "019fbb95-cd76-7920-93fa-e23ba755ee41";
+  const catalogVideoId = "019fbb95-cd76-7920-93fa-e23ba755ee42";
+  const transcriptVersionId = "019fbb95-cd76-7920-93fa-e23ba755ee43";
+  const originalTrackId = "019fbb95-cd76-7920-93fa-e23ba755ee44";
+  const englishTrackId = "019fbb95-cd76-7920-93fa-e23ba755ee45";
+  const preferredTrackId = "019fbb95-cd76-7920-93fa-e23ba755ee46";
+  const youtubeVideoId = "foreign-video";
+  const transcript = (input: {
+    id: string;
+    language: string;
+    kind: "original" | "english" | "translation";
+    sourceTrackId?: string;
+    contentSha256: string;
+  }) => ({
+    track: {
+      id: input.id,
+      videoId: youtubeVideoId,
+      language: input.language,
+      kind: input.kind,
+      source: input.kind === "original" ? "youtube-manual" : "translated",
+      provider: input.kind === "english" ? "amazon-translate" : "fixture",
+      ...(input.sourceTrackId ? { sourceTrackId: input.sourceTrackId } : {}),
+      timingPrecision: "cue" as const,
+      schemaVersion: 1,
+      contentSha256: input.contentSha256,
+      version: 1,
+    },
+    segments: [
+      {
+        id:
+          input.id === originalTrackId
+            ? "019fbb95-cd76-7920-93fa-e23ba755ee47"
+            : input.id === englishTrackId
+              ? "019fbb95-cd76-7920-93fa-e23ba755ee48"
+              : "019fbb95-cd76-7920-93fa-e23ba755ee49",
+        trackId: input.id,
+        ordinal: 0,
+        startMs: 0,
+        endMs: 1_000,
+        text: "Fixture text",
+      },
+    ],
+    tokens: [],
+  });
+  const original = transcript({
+    id: originalTrackId,
+    language: "ro",
+    kind: "original",
+    contentSha256: "a".repeat(64),
+  });
+  const english = transcript({
+    id: englishTrackId,
+    language: "en",
+    kind: "english",
+    sourceTrackId: originalTrackId,
+    contentSha256: "b".repeat(64),
+  });
+  const preferred = transcript({
+    id: preferredTrackId,
+    language: "es",
+    kind: "translation",
+    sourceTrackId: originalTrackId,
+    contentSha256: "c".repeat(64),
+  });
+  return {
+    schemaVersion: 1 as const,
+    projectId,
+    catalogVideoId,
+    youtubeVideoId,
+    transcriptVersionId,
+    source: "verified-local-cache" as const,
+    catalogState: "active_verified" as const,
+    original,
+    english,
+    preferred: {
+      state: "ready" as const,
+      source: "local" as const,
+      transcript: preferred,
+    },
+  };
+}
 
 function successResultContractFixture() {
   const requestId = "019fbb95-cd76-7920-93fa-e23ba755ee51";
