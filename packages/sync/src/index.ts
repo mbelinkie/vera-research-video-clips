@@ -972,6 +972,12 @@ export class SharedTranscriptWorkspaceService {
       projectId,
       catalogVideoId,
       youtubeVideoId: resolution.bundle.manifest.videoId,
+      sourceIdentity: {
+        schemaVersion: 1,
+        provider: "youtube",
+        providerMediaId: resolution.bundle.manifest.videoId,
+        canonicalUrl: `https://www.youtube.com/watch?v=${resolution.bundle.manifest.videoId}`,
+      },
       transcriptVersionId: resolution.bundle.transcriptVersionId,
       source: resolution.source,
       catalogState: resolution.catalogState,
@@ -1084,6 +1090,8 @@ export interface OutboxCommand {
   attempt: number;
   nextAttemptAt?: string;
   createdAt: string;
+  lastErrorCode?: string;
+  conflict?: unknown;
 }
 
 export class OfflineOutbox {
@@ -1134,26 +1142,87 @@ export class OfflineOutbox {
     });
   }
 
+  enqueueClipCommentCreate(
+    projectId: string,
+    clipId: string,
+    input: CreateClipCommentRequest,
+  ): string {
+    const command = CreateClipCommentRequestSchema.parse(input);
+    return this.enqueue({
+      projectId,
+      commandType: "clip_comment.create.v1",
+      idempotencyKey: command.idempotencyKey,
+      payload: { clipId, command },
+    });
+  }
+
+  enqueueClipCommentUpdate(
+    projectId: string,
+    clipId: string,
+    commentId: string,
+    input: UpdateClipCommentRequest,
+  ): string {
+    const command = UpdateClipCommentRequestSchema.parse(input);
+    return this.enqueue({
+      projectId,
+      commandType: "clip_comment.update.v1",
+      idempotencyKey: command.idempotencyKey,
+      payload: { clipId, commentId, command },
+    });
+  }
+
+  enqueueClipCommentDelete(
+    projectId: string,
+    clipId: string,
+    commentId: string,
+    input: DeleteClipCommentRequest,
+  ): string {
+    const command = DeleteClipCommentRequestSchema.parse(input);
+    return this.enqueue({
+      projectId,
+      commandType: "clip_comment.delete.v1",
+      idempotencyKey: command.idempotencyKey,
+      payload: { clipId, commentId, command },
+    });
+  }
+
   due(limit = 50): OutboxCommand[] {
     const rows = this.database
       .prepare(
         `SELECT * FROM sync_outbox
-         WHERE next_attempt_at IS NULL OR next_attempt_at <= ?
-         ORDER BY created_at LIMIT ?`,
+         WHERE conflict_json IS NULL
+           AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+         ORDER BY created_at, rowid LIMIT ?`,
       )
       .all(this.now().toISOString(), limit) as Record<string, unknown>[];
-    return rows.map((row) => ({
-      id: String(row.id),
-      ...(row.project_id === null ? {} : { projectId: String(row.project_id) }),
-      commandType: String(row.command_type),
-      idempotencyKey: String(row.idempotency_key),
-      payload: JSON.parse(String(row.payload_json)),
-      attempt: Number(row.attempt),
-      ...(row.next_attempt_at === null
-        ? {}
-        : { nextAttemptAt: String(row.next_attempt_at) }),
-      createdAt: String(row.created_at),
-    }));
+    return rows.map(mapOutboxCommand);
+  }
+
+  list(projectId?: string, limit = 100): OutboxCommand[] {
+    const rows = (
+      projectId
+        ? this.database
+            .prepare(
+              `SELECT * FROM sync_outbox
+             WHERE project_id = ?
+             ORDER BY created_at, rowid LIMIT ?`,
+            )
+            .all(projectId, limit)
+        : this.database
+            .prepare(
+              `SELECT * FROM sync_outbox
+             ORDER BY created_at, rowid LIMIT ?`,
+            )
+            .all(limit)
+    ) as Record<string, unknown>[];
+    return rows.map(mapOutboxCommand);
+  }
+
+  get(id: string): OutboxCommand | undefined {
+    const row = this.database
+      .prepare("SELECT * FROM sync_outbox WHERE id = ?")
+      .get(id) as Record<string, unknown> | undefined;
+    return row ? mapOutboxCommand(row) : undefined;
   }
 
   acknowledge(id: string): void {
@@ -1176,6 +1245,37 @@ export class OfflineOutbox {
       )
       .run(attempt, nextAttemptAt, id);
   }
+
+  recordConflict(id: string, code: string, evidence: unknown): void {
+    this.database
+      .prepare(
+        `UPDATE sync_outbox
+         SET conflict_json = ?, last_error_code = ?, next_attempt_at = NULL
+         WHERE id = ?`,
+      )
+      .run(JSON.stringify(evidence), code, id);
+  }
+}
+
+function mapOutboxCommand(row: Record<string, unknown>): OutboxCommand {
+  return {
+    id: String(row.id),
+    ...(row.project_id === null ? {} : { projectId: String(row.project_id) }),
+    commandType: String(row.command_type),
+    idempotencyKey: String(row.idempotency_key),
+    payload: JSON.parse(String(row.payload_json)),
+    attempt: Number(row.attempt),
+    ...(row.next_attempt_at === null
+      ? {}
+      : { nextAttemptAt: String(row.next_attempt_at) }),
+    createdAt: String(row.created_at),
+    ...(row.last_error_code === null
+      ? {}
+      : { lastErrorCode: String(row.last_error_code) }),
+    ...(row.conflict_json === null
+      ? {}
+      : { conflict: JSON.parse(String(row.conflict_json)) }),
+  };
 }
 import { createHash, randomUUID } from "node:crypto";
 import {
@@ -1200,6 +1300,9 @@ import { gunzipSync } from "node:zlib";
 import {
   ActiveTranscriptBundleSchema,
   CreateClipCandidateRequestSchema,
+  CreateClipCommentRequestSchema,
+  UpdateClipCommentRequestSchema,
+  DeleteClipCommentRequestSchema,
   DerivedTranslationSchema,
   LanguageTagSchema,
   NormalizedTranscriptSchema,
@@ -1207,6 +1310,9 @@ import {
   TranscriptManifestSchema,
   type ActiveTranscriptBundle,
   type CreateClipCandidateRequest,
+  type CreateClipCommentRequest,
+  type UpdateClipCommentRequest,
+  type DeleteClipCommentRequest,
   type DerivedTranslation,
   type DerivedTranslationIdentity,
   type NormalizedTranscript,

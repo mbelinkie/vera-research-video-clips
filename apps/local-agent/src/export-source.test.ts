@@ -131,6 +131,79 @@ function fixtureQueue(
   return { root, database, queue, request };
 }
 
+function noSpeechFixture(
+  sourceLanguageClass: "confirmed_english" | "foreign" | "mixed" | "unknown",
+  options: { embedEnglishSubtitleTrack?: boolean } = {},
+) {
+  const root = mkdtempSync(join(tmpdir(), "local-no-speech-export-"));
+  directories.add(root);
+  const database = openLocalDatabase(join(root, "local.sqlite"));
+  runLocalMigrations(database);
+  const queue = new LocalExportQueue(
+    database,
+    () => new Date("2026-08-14T12:00:00.000Z"),
+  );
+  const noSpeechAttestation = {
+    schemaVersion: 1 as const,
+    actor: {
+      id: "019fbb95-cd76-7920-93fa-e23ba755e351",
+      handle: "vera_researcher",
+      displayName: "VERA Researcher",
+    },
+    attestedAt: "2026-08-14T11:58:00.000Z",
+  };
+  const command = {
+    idempotencyKey: `no-speech-${sourceLanguageClass}`,
+    video: {
+      youtubeVideoId: "M7lc1UVf-VE",
+      canonicalUrl: "https://www.youtube.com/watch?v=M7lc1UVf-VE",
+      title: "No-speech fixture source",
+      sourceLanguage: sourceLanguageClass === "confirmed_english" ? "en" : "es",
+    },
+    selection: {
+      selectionType: "player_time_range",
+      sourceStartMs: 0,
+      sourceEndMs: 2_000,
+      exportStartMs: 0,
+      exportEndMs: 2_000,
+      origin: "manual_player",
+      speechStatus: "no_speech",
+      noSpeechAttestation,
+    },
+    sourceLanguageClass,
+    noSpeechAttestation,
+    sourceRights: {
+      schemaVersion: 1,
+      source: "youtube",
+      youtubeVideoId: "M7lc1UVf-VE",
+      confirmation: "authorized_to_process",
+      disclosureVersion: 1,
+    },
+    preset: {
+      presetVersion: 1,
+      name: "Editing MP4",
+      settings: {
+        container: "mp4",
+        videoCodec: "h264",
+        videoRateControl: { mode: "crf", value: 20 },
+        frameRate: "source",
+        audioCodec: "aac",
+        omitSubtitleFilesForConfirmedEnglish: true,
+        embedEnglishSubtitleTrack: options.embedEnglishSubtitleTrack ?? false,
+      },
+    },
+  } satisfies Parameters<LocalExportQueue["createExportOnly"]>[0];
+  const request = queue.createExportOnly(command);
+  return {
+    root,
+    database,
+    queue,
+    request,
+    command,
+    noSpeechAttestation,
+  };
+}
+
 function configureBilingualFixture(input: {
   database: ReturnType<typeof openLocalDatabase>;
   requestId: string;
@@ -626,6 +699,267 @@ describe("LocalExportSourceProcessor", () => {
     database.close();
   });
 
+  it("promotes deterministic attested empty sidecars for every no-speech language policy", async () => {
+    for (const sourceLanguageClass of [
+      "confirmed_english",
+      "foreign",
+      "mixed",
+      "unknown",
+    ] as const) {
+      const { root, database, queue, request, command, noSpeechAttestation } =
+        noSpeechFixture(sourceLanguageClass);
+      expect(queue.createExportOnly(command)).toEqual(request);
+      const divergentAttestation = {
+        ...noSpeechAttestation,
+        attestedAt: "2026-08-14T11:58:01.000Z",
+      };
+      expect(
+        queue.createExportOnly({
+          ...command,
+          noSpeechAttestation: divergentAttestation,
+          selection: {
+            ...command.selection,
+            noSpeechAttestation: divergentAttestation,
+          },
+        }),
+      ).toEqual(request);
+      expect(queue.get(request.id)).toMatchObject({
+        selection: request.selection,
+        noSpeechAttestation,
+      });
+      const getEnglish = vi.spyOn(queue, "getVerifiedEnglishTranscript");
+      const getOriginal = vi.spyOn(queue, "getVerifiedOriginalTranscript");
+      const processor = new LocalExportSourceProcessor(
+        queue,
+        fixtureSourceProvider(),
+        fixtureInspector(),
+        fixtureRenderer(),
+        root,
+        fixtureThumbnailExtractor(),
+        fixtureThumbnailInspector(),
+      );
+
+      await processor.process({
+        requestId: request.id,
+        authorizationConfirmed: true,
+      });
+
+      expect(getEnglish).not.toHaveBeenCalled();
+      expect(getOriginal).not.toHaveBeenCalled();
+      const completed = queue.get(request.id);
+      expect(completed).toMatchObject({
+        state: "complete",
+        selection: request.selection,
+        noSpeechAttestation,
+      });
+      const expectedRoles =
+        sourceLanguageClass === "confirmed_english"
+          ? ["english"]
+          : ["english", "original"];
+      expect(
+        completed?.subtitleSidecars?.map((sidecar) => sidecar.role),
+      ).toEqual(expectedRoles);
+      for (const sidecar of completed?.subtitleSidecars ?? []) {
+        expect(sidecar).toMatchObject({
+          emptyReason: "attested_no_speech",
+          noSpeechAttestation,
+          cueCount: 0,
+          byteSize: 1,
+          contentSha256: sha256(Buffer.from("\n")),
+          startMs: 0,
+          endMs: 0,
+          sourceAttempt: 1,
+        });
+        expect(sidecar).not.toHaveProperty("trackId");
+        expect(sidecar).not.toHaveProperty("trackVersion");
+      }
+      const filenames =
+        sourceLanguageClass === "confirmed_english"
+          ? [`clip-${request.id}.en.srt`]
+          : [`clip-${request.id}.en.srt`, `clip-${request.id}.original.srt`];
+      for (const filename of filenames) {
+        const bytes = await readFile(packageFile(root, request.id, filename));
+        expect(bytes.equals(Buffer.from("\n"))).toBe(true);
+      }
+      expect(
+        database
+          .prepare(
+            "SELECT count(*) AS count FROM export_subtitle_sidecars WHERE export_request_id = ?",
+          )
+          .get(request.id),
+      ).toEqual({ count: 0 });
+      const emptySidecarRows = database
+        .prepare(
+          `SELECT role, cue_count, byte_size, content_sha256,
+                  no_speech_attestation_json
+           FROM export_empty_subtitle_sidecars
+           WHERE export_request_id = ? ORDER BY role`,
+        )
+        .all(request.id) as Array<{
+        role: string;
+        cue_count: number;
+        byte_size: number;
+        content_sha256: string;
+        no_speech_attestation_json: string;
+      }>;
+      expect(
+        emptySidecarRows.map((row) => ({
+          ...row,
+          no_speech_attestation: JSON.parse(
+            row.no_speech_attestation_json,
+          ) as unknown,
+          no_speech_attestation_json: undefined,
+        })),
+      ).toEqual(
+        expectedRoles.toSorted().map((role) => ({
+          role,
+          cue_count: 0,
+          byte_size: 1,
+          content_sha256: sha256(Buffer.from("\n")),
+          no_speech_attestation: noSpeechAttestation,
+          no_speech_attestation_json: undefined,
+        })),
+      );
+      const metadata = await readPromotedMetadata(root, request.id);
+      const manifest = await readPromotedManifest(root, request.id);
+      expect(metadata).toMatchObject({
+        selection: request.selection,
+        noSpeechAttestation,
+        subtitlePolicy: { noSpeechAttestation },
+      });
+      expect(manifest).toMatchObject({
+        subtitlePolicy: { noSpeechAttestation },
+      });
+      expect(
+        manifest.artifacts.filter((artifact) => artifact.role.endsWith("_srt")),
+      ).toEqual(
+        expect.arrayContaining(
+          expectedRoles.map((role) =>
+            expect.objectContaining({
+              role: role === "english" ? "english_srt" : "original_srt",
+              subtitle: expect.objectContaining({
+                emptyReason: "attested_no_speech",
+                noSpeechAttestation,
+                cueCount: 0,
+              }),
+            }),
+          ),
+        ),
+      );
+      database.close();
+      const restartedDatabase = openLocalDatabase(join(root, "local.sqlite"));
+      const restartedQueue = new LocalExportQueue(
+        restartedDatabase,
+        () => new Date("2026-08-14T12:01:00.000Z"),
+      );
+      expect(restartedQueue.get(request.id)).toMatchObject({
+        state: "complete",
+        selection: request.selection,
+        noSpeechAttestation,
+        subtitleSidecars: expect.arrayContaining(
+          expectedRoles.map((role) =>
+            expect.objectContaining({
+              role,
+              cueCount: 0,
+              noSpeechAttestation,
+            }),
+          ),
+        ),
+      });
+      restartedDatabase.close();
+    }
+  });
+
+  it("rejects embedded subtitles for attested no-speech before transcript or source work", async () => {
+    const { root, database, queue, request } = noSpeechFixture(
+      "confirmed_english",
+      { embedEnglishSubtitleTrack: true },
+    );
+    const acquireAuthorizedFullSource = vi.fn();
+    const render = vi.fn();
+    const getEnglish = vi.spyOn(queue, "getVerifiedEnglishTranscript");
+    const getOriginal = vi.spyOn(queue, "getVerifiedOriginalTranscript");
+    const processor = new LocalExportSourceProcessor(
+      queue,
+      { acquireAuthorizedFullSource },
+      fixtureInspector(),
+      fixtureRenderer(render),
+      root,
+      fixtureThumbnailExtractor(),
+      fixtureThumbnailInspector(),
+    );
+
+    await expect(
+      processor.process({
+        requestId: request.id,
+        authorizationConfirmed: true,
+      }),
+    ).rejects.toMatchObject({
+      code: "no_speech_embedded_subtitle_unsupported",
+      retryable: false,
+    });
+    expect(getEnglish).not.toHaveBeenCalled();
+    expect(getOriginal).not.toHaveBeenCalled();
+    expect(acquireAuthorizedFullSource).not.toHaveBeenCalled();
+    expect(render).not.toHaveBeenCalled();
+    expect(queue.getSourceAttempt(request.jobId, 1)).toBeUndefined();
+    database.close();
+  });
+
+  it("fails closed before capability, transcript, source, or render work for malformed legacy player exports", async () => {
+    for (const speechStatus of ["speech", "transcript_unavailable"] as const) {
+      const { root, database, queue, request } = fixtureQueue();
+      database
+        .prepare(
+          "UPDATE export_requests SET selection_snapshot_json = ? WHERE id = ?",
+        )
+        .run(
+          JSON.stringify({
+            selectionType: "player_time_range",
+            sourceStartMs: 300,
+            sourceEndMs: 2_900,
+            exportStartMs: 0,
+            exportEndMs: 3_400,
+            origin: "manual_player",
+            speechStatus,
+          }),
+          request.id,
+        );
+      const acquireAuthorizedFullSource = vi.fn();
+      const render = vi.fn();
+      const discover = vi.fn();
+      const getEnglish = vi.spyOn(queue, "getVerifiedEnglishTranscript");
+      const getOriginal = vi.spyOn(queue, "getVerifiedOriginalTranscript");
+      const processor = new LocalExportSourceProcessor(
+        queue,
+        { acquireAuthorizedFullSource },
+        fixtureInspector(),
+        fixtureRenderer(render),
+        root,
+        fixtureThumbnailExtractor(),
+        fixtureThumbnailInspector(),
+        { discover },
+      );
+
+      await expect(
+        processor.process({
+          requestId: request.id,
+          authorizationConfirmed: true,
+        }),
+      ).rejects.toThrow(
+        speechStatus === "transcript_unavailable"
+          ? /cannot be exported/u
+          : /requires exact attached transcript evidence/u,
+      );
+      expect(discover).not.toHaveBeenCalled();
+      expect(getEnglish).not.toHaveBeenCalled();
+      expect(getOriginal).not.toHaveBeenCalled();
+      expect(acquireAuthorizedFullSource).not.toHaveBeenCalled();
+      expect(render).not.toHaveBeenCalled();
+      database.close();
+    }
+  });
+
   it("fails closed and cleans scratch when thumbnail extraction fails", async () => {
     const { root, database, queue, request } = fixtureQueue();
     const processor = new LocalExportSourceProcessor(
@@ -1049,6 +1383,9 @@ describe("LocalExportSourceProcessor", () => {
     ).toBeUndefined();
 
     const mismatched = fixtureQueue();
+    if (mismatched.request.selection.selectionType === "player_time_range") {
+      throw new Error("This fixture requires a transcript selection.");
+    }
     mismatched.database
       .prepare("UPDATE transcript_tracks SET language = 'fr' WHERE id = ?")
       .run(mismatched.request.selection.trackId);

@@ -472,11 +472,14 @@ issues, and the release decision are retained.
 
 ### 9. Research + capacity expansion
 
-- [ ] Bookmarks, timeline markers, and segment notes.
+- [x] Project-shared point bookmarks with optional searchable notes and offline
+      replay.
+- [ ] Richer timeline overlays and transcript-segment notes.
 - [ ] Fuzzy/regex/cross-video/semantic search.
 - [ ] Optional AI summaries, quotes, arguments, and B-roll suggestions.
 - [ ] Deploy AWS Batch GPU workers when hosted capacity is justified.
-- [ ] Add autoscaling, priorities, spend controls, and completion notifications.
+- [ ] Add autoscaling, priorities, and spend controls.
+- [x] Add opt-in desktop workflow outcomes and direct-mention notifications.
 - [ ] Add cloud clip storage and richer real-time collaboration only after shared transcripts/batches stabilize.
 
 ## Canonical domains
@@ -586,6 +589,13 @@ infra/aws        storage, API, database, queues, identity, monitoring
   evidence across reload, offline replay, queue search, and CSV; legacy reads do
   not invent track provenance.
 - Atomic note/tag persistence for both logging actions, project-scoped tag deduplication, offline replay, and collaborator edits.
+- Flat clip comments remain independently versioned from Clip description/tags,
+  use stable author snapshots and body-free tombstones, enforce own-author and
+  Owner/Administrator moderation authority, paginate deterministically, and
+  replay exact create/edit/delete commands without leaking deleted content.
+- Optional first-comment logging shares the clip's transaction and request
+  fingerprint: exact replay returns one clip/comment pair, divergent replay
+  conflicts, and an invalid source-time anchor rolls back the entire log.
 - Export-only creation without a project clip or spreadsheet row.
 - Conversion-preset precedence, capability validation, and immutable job snapshots.
 - Representative preset outputs verified with FFprobe.
@@ -607,13 +617,172 @@ infra/aws        storage, API, database, queues, identity, monitoring
 
 ## Next action
 
-Milestones 1–6 and M7-04 are complete. M7-01's real AWS change-set and Cognito
-acceptance remain an explicit external prerequisite. The next unstarted local
-implementation slice is M7-05 complete export integration, and it must begin
-with its own bounded active specification. After M7-05 and its deterministic
-packaged-app regression establish a known-good baseline, follow the priority and
-dependency waves in `specs/future/PILOT-punch-list.md`; do not wait for externally
-gated M7-06 live dogfood before beginning bounded PUNCH-001 through PUNCH-008
-work. M7-06 remains the final M7 validation stream when its required external
-inputs are available, and the expanded workflow must be dogfooded again before
-signed-pilot distribution.
+Milestones 1–6, M7-04, and the deterministic M7-05 export baseline are complete.
+M7-01's real AWS change-set and Cognito acceptance remain an explicit external
+prerequisite. PUNCH-001 completed on 2026-08-24: versioned language decisions,
+conflict/capability gates, strict immutable timed bilingual import, bounded
+side-by-side review, explicit activation, two-workstation verified-cache reuse,
+and corrected clip/export provenance are implemented and verified. PUNCH-006
+slice 1 also completed on 2026-08-24: the workspace now has bounded typed
+shell/ingest, transcript, player, selection, command, batch/worklist, and Clip
+Library seams behind unchanged browser behavior. PUNCH-003 slice 1 completed on
+2026-08-24: stable normalized handles, explicit project kind/visibility,
+Owner/Administrator/Researcher authority, safe Editor/Viewer migration,
+membership-bounded summaries, concurrent collision/replay behavior, and the
+correct one-Owner migration constraint are implemented and verified. PUNCH-004
+slice 1 completed on 2026-08-24: direct and bulk ingest now converge on one
+canonical project-video row with independent durable member flags, safe replay
+and restore, bounded authorized flagger/processing/transcript/clip aggregates,
+optimistic own-flag commands, migration backfill, and a real Workbench read
+surface independent of transcription batch-item identity. PUNCH-004 slice 2
+also completed on 2026-08-24: renewable soft claims, explicit audited takeover,
+independent priority and Administrator-only completion policy, append-only
+review cycles, transcript/no-transcript completion basis, reasoned reopen,
+transactional role checks, exact replay, and concurrent completion now flow
+through the real canonical Workbench routes without changing processing or
+flags. PUNCH-004 slice 3 completed on 2026-08-24: optimistic individual/bulk
+dismissal and restore preserve every research record, Queue/Reviewed/Dismissed
+reads stay independent, queued/active transcription cancellation is
+dependency-aware and heartbeat-rechecked, and safe per-user review/triage
+receipts drive `New for you`, bounded activity, and idempotent mark-seen in the
+real Workbench. Migration 0030 backfills Active without fabricated history and
+current reads hide removed-member identities while retaining durable audit.
+PUNCH-004 slice 4 completed on 2026-08-24: hosted batches persist an independent
+Pending/Approved/Revoked axis, current Owners/Administrators approve or revoke
+with optimistic exact replay, and catalog queue reservation/delivery plus worker
+claim all enforce the current decision without replacing the existing job.
+Migration 0031 leaves local work automatic, pauses historical active hosted
+batches as Pending, preserves canceled state, and fabricates no authority.
+PUNCH-004 slice 5 completed on 2026-08-24: project-local Automatic/Paused policy,
+optimistic exact replay, automatic direct caption-first composition, bounded
+50-video resume catch-up, membership-bounded workload estimates, and policy
+checks at dispatch reservation/delivery plus worker claim now flow through the
+real Workbench. Migration 0032 safely defaults historical projects to Automatic
+and historical batches to Manual without fabricated policy actors.
+PUNCH-003 slice 2 and PUNCH-004 slice 6 completed on 2026-08-24: expiring
+handle-addressed invitation decisions/revocation, actor-scoped transactional
+replay, bounded open discovery plus explicit Researcher join, one-way personal
+conversion, shared visibility, role administration, ownership transfer, and
+sanitized governance events now flow through the real cloud catalog/API and
+Project Settings. Current authority is rechecked under lock, exactly one Owner
+survives concurrent transfer, removed members immediately lose worklist,
+comment, activity, processing-policy, and all other project reads, and existing
+explicit Administrator approval remains the supported paid-hosted gate. Cloud
+migration 0040, strict contract/API tests, the concurrent catalog matrix, and
+the full Project Settings browser flow are verified. PUNCH-003 and PUNCH-004
+are complete; optional monetary budget and idle/overnight OS policy modes remain
+later configurable enhancements.
+PUNCH-005 slice 1 completed on 2026-08-24: project-scoped approved positive
+literal keywords and exact-language aliases, Researcher suggestions,
+Owner/Administrator decisions, normalized deduplication, optimistic/exact
+replay, migration 0033, and the real Workbench governance path are verified.
+PUNCH-005 slice 2 completed on 2026-08-24: deterministic exact-language
+Unicode matching, linked-track time-overlap dedupe, exact lease-bound input,
+private immutable checksummed evidence, current/stale summaries, a real scan
+worker, replay/reclaim authorization, active-transcript replacement, and
+second-client pinned reuse are verified through migration 0034 and the
+aggregate repository gate. PUNCH-005 slice 3 completed on 2026-08-24: stable
+Promising/No matches/Processing/Action needed groups, exact filters and sorts,
+summary-level per-keyword counts, lazy checksum/size/schema/input-verified
+bounded context, honest click-to-seek/highlight, current/prior evidence,
+scan-completed activity receipts, and confirmed all-or-nothing bulk priority
+are implemented through migration 0035. The complete 11-flow browser file and
+606-test aggregate network-free gate pass. PUNCH-005 is complete. Post-punch
+keyword/alias maintenance and own-pending withdrawal completed on 2026-08-24
+through cloud migration 0041, exact optimistic/idempotent catalog commands, and
+the real Project Settings flow. Disabled vocabulary remains reserved, the
+last-enabled-alias invariant is enforced, and every effective catalog mutation
+stales prior summaries and queues replacement scans. Explicit hosted
+project-budget accounting, idle/overnight OS scheduling, and broader
+notification policy remain separate later work.
+Project-shared point bookmarks completed on 2026-08-24 through cloud migration
+0042 and local migration 0034. Current members can create/read bare or
+titled/noted point markers without a transcript; creators edit, archive, and
+restore their own records while Owners/Administrators may moderate state but
+not rewrite another member's text. Authorized bounded video/project reads,
+Unicode literal search, stable pagination, optimistic/idempotent commands,
+cross-video open/seek, and transcript-version independence are implemented.
+The account-scoped local cache and ordered outbox survive restart and response
+loss, retain stale/authorization conflicts with entered text, and surface
+queued/conflict state in the internally scrolling player panel. The gate passed
+652 Vitest tests with 4 optional skips, 19 one-worker Playwright flows,
+typecheck, web/desktop builds, 34 local migrations, and 42 cloud migrations.
+Opt-in desktop workflow and direct-mention notifications completed on
+2026-08-24 through cloud migration 0043 and local migration 0035. Stable,
+recipient-unique events cover the first terminal transcription-batch summary,
+transcription action-needed states, logged-export outcomes, local export-only
+outcomes, and existing direct mentions only. Payloads use bounded sanitized
+labels and validated navigation identities without bodies, transcripts,
+errors, paths, URLs, credentials, or artifact locators. One account-scoped,
+device-local setting defaults off, records `enabledAt`, persists a bounded
+delivered ledger, polls cloud/local feeds without overlap only while signed in,
+and stops on sign-out. Validated native-notification clicks route to the exact
+authorized batch/video, clip/request, local export surface, or clip/comment;
+removed projects fall back safely and browser development performs no native
+call. The gate passed 667 Vitest tests with 4 optional skips, all 19 one-worker
+Playwright flows, typecheck, web/desktop builds, 35 local migrations, and 43
+cloud migrations.
+PUNCH-002 and all PUNCH-006 slices completed on 2026-08-24:
+VERA — Research Video Clips now has authoritative grouped project summaries,
+membership-revalidated account-scoped recency, role-aware project destinations,
+an unread badge, separated account preferences, readable full BCP-47 labels, a
+real Bulk add handoff, bounded persisted Workbench dimensions, a separate Clip
+Library destination, and deterministic 1440×900/narrow browser geometry. Clip
+opening now resolves compatible immutable artifacts and freshly verifies bytes
+before local open, otherwise opens and loops the exact authorized source range.
+Visible Back/recent navigation restores playhead, language view, query/match,
+and exact safe selections from bounded account/project-private state while
+discarding removed identities and stale transcript selections. The 15-flow
+workspace browser file, 606-test aggregate suite, desktop build, and both
+migration gates pass. PUNCH-006 is complete.
+PUNCH-008 slice 1 foundation completed on 2026-08-24: flat chronological clip
+comments now have stable author snapshots, optional exact source-time anchors,
+optimistic versions, body-free author/moderation tombstones, bounded cursors,
+stable command receipts, safe sync events, and current-role authorization.
+Clip creation stores a canonical request fingerprint and atomically creates an
+optional first comment; exact and concurrent replay produce one pair while
+divergent evidence conflicts. The existing notes field remains compatible but
+is presented as Clip description / intended use, and the logging panel exposes
+the optional first comment separately. Cloud migration 0036 adds the comment
+and command authorities. The focused browser flow, desktop build, 36 cloud and
+30 local migrations, and 610-test aggregate suite pass. Mentions, follows,
+PUNCH-008 collaboration and PUNCH-010 Topics completed on 2026-08-24: stable
+member mentions, follows, deduplicated body-free notices, authorized comment
+search/activity and separate CSV, ordered restart-safe local replay with
+retained conflicts, and paginated authoring live reads now compose the flat
+comment authority. Existing clip tags are presented as the sole canonical
+Topics facet with suggestions, chips, match-any/match-all filtering, grouping,
+and authorized authoring retrieval. Explicit build snapshots freeze clip
+ID/version, canonical Topic labels, and only promoted active comment versions;
+later edits/deletions cannot mutate exact replay. Cloud migration 0039 and local
+migration 0033 add the missing durable authorities without copying existing
+tags, fabricating notices, or making export-only work eligible.
+PUNCH-007 completed on 2026-08-24: exact player in/out controls and guarded
+`I`/`O` produce immutable player-originated ranges with explicit Speech, No
+speech, or Transcript unavailable status. Verified overlapping transcript
+evidence attaches only by explicit action. Context and current-actor no-speech
+attestation are enforced atomically with the optional first comment; batch,
+retry, restart, and cloud success paths preserve the exact selection. Required
+no-speech sidecars are one-newline, zero-cue artifacts, while unsupported
+speech/unavailable exports fail before render. Log clip is primary and the two
+other effects remain explicit menu commands. Cloud migration 0037, local
+migration 0031, 625 aggregate tests, 16 browser flows, typecheck, migration
+gates, and desktop build pass. PUNCH-008 and PUNCH-010 are complete.
+The deterministic core punch-list sequence is complete: PUNCH-001 through
+PUNCH-008 and PUNCH-010 have completed specs and final aggregate evidence.
+PLATFORM-001 also completed the provider-neutral source-identity and official
+YouTube-search foundation with explicit candidate-to-preflight handoff; it does
+not complete the remaining PUNCH-009 social/AI candidates. Post-punch keyword
+maintenance and shared point bookmarks are complete in FEATURE-001 and
+FEATURE-002. Opt-in desktop workflow and direct-mention notifications are
+complete in FEATURE-003. Richer timelines, transcript-segment notes, remote
+push/email delivery, full activity mirroring, and delivery while fully quit
+remain deferred.
+
+Dogfood the freshly packaged unsigned Intel macOS app across the deterministic
+workflow and record any discovered defect as a new bounded spec. M7-06
+production-cloud/live-source evidence still requires its separately authorized
+AWS/Cognito, model, quota, and source-rights inputs. PUNCH-009 expansion and M8
+signing, updater, diagnostics, documentation, and independent-QA work require
+deliberate new scope; do not infer permission from the completed platform
+foundation.

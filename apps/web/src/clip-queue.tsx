@@ -8,12 +8,20 @@ import {
   ArtifactRootListResponseSchema,
   ClipLibraryExportSubmissionSchema,
   ClipCandidateSchema,
+  ClipCommentPageSchema,
+  ClipCommentSchema,
+  OfflineClipCommentMutationResultSchema,
+  OfflineClipCommentReplayResultSchema,
+  ClipFollowSchema,
   ClipTagNameSchema,
   ExportStoragePreflightSchema,
+  formatLanguageLabel,
   LocalClipLibrarySelectionSchema,
   LocalClipLibraryPageSchema,
   ProjectExportPresetCatalogSchema,
   type ClipCandidate,
+  type ClipComment,
+  type DesktopNotificationNavigationTarget,
   type ArtifactResolutionResult,
   type ArtifactRootSummary,
   type ClipLibraryEntry,
@@ -28,15 +36,21 @@ type CloudRequest = (path: string, init?: RequestInit) => Promise<unknown>;
 type ClipQueueProps = {
   authorization: string;
   projectId: string;
+  notificationTarget?: DesktopNotificationNavigationTarget;
   request: CloudRequest;
-  onOpenVideo(canonicalUrl: string): void;
+  onOpenSourceClip(
+    clip: ClipCandidate,
+    fallbackNotice?: string,
+    sourceTimeMs?: number,
+  ): void;
 };
 
 export function ClipQueue({
   authorization,
   projectId,
+  notificationTarget,
   request,
-  onOpenVideo,
+  onOpenSourceClip,
 }: ClipQueueProps) {
   const [entries, setEntries] = useState<ClipLibraryEntry[]>([]);
   const [page, setPage] = useState<LocalClipLibraryPage>();
@@ -47,6 +61,8 @@ export function ClipQueue({
   const [suggestedTags, setSuggestedTags] = useState<string[]>([]);
   const [query, setQuery] = useState("");
   const [tagFilter, setTagFilter] = useState("");
+  const [topicMatch, setTopicMatch] = useState<"any" | "all">("any");
+  const [topicGrouping, setTopicGrouping] = useState(false);
   const [researchFilter, setResearchFilter] = useState("all");
   const [statusFilter, setStatusFilter] = useState("all");
   const [completedFilter, setCompletedFilter] = useState("any");
@@ -54,6 +70,19 @@ export function ClipQueue({
   const [editingClipId, setEditingClipId] = useState<string>();
   const [notes, setNotes] = useState("");
   const [tagsText, setTagsText] = useState("");
+  const [commentsByClip, setCommentsByClip] = useState<
+    Map<string, ClipComment[]>
+  >(() => new Map());
+  const [notificationClip, setNotificationClip] = useState<ClipCandidate>();
+  const [commentDrafts, setCommentDrafts] = useState<Map<string, string>>(
+    () => new Map(),
+  );
+  const [commentAnchorDrafts, setCommentAnchorDrafts] = useState<
+    Map<string, string>
+  >(() => new Map());
+  const [editingCommentId, setEditingCommentId] = useState<string>();
+  const [commentEditDraft, setCommentEditDraft] = useState("");
+  const [commentEditAnchorDraft, setCommentEditAnchorDraft] = useState("");
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("Loading project Clip Library…");
   const [settingsSelection, setSettingsSelection] =
@@ -90,7 +119,10 @@ export function ClipQueue({
     });
     if (cursor) parameters.set("cursor", cursor);
     if (!resetFilters && query.trim()) parameters.set("query", query.trim());
-    if (!resetFilters && tagFilter) parameters.set("tag", tagFilter);
+    if (!resetFilters && tagFilter.trim()) {
+      parameters.set("topics", tagFilter.trim());
+      parameters.set("topicMatch", topicMatch);
+    }
     if (!resetFilters && researchFilter !== "all")
       parameters.set("researchStatus", researchFilter);
     if (!resetFilters && statusFilter !== "all")
@@ -123,7 +155,8 @@ export function ClipQueue({
       if (generation !== requestGeneration.current) return;
       if (restoreLatest) {
         setQuery(loaded.query.query ?? "");
-        setTagFilter(loaded.query.tag ?? "");
+        setTagFilter(loaded.query.topics?.join(", ") ?? loaded.query.tag ?? "");
+        setTopicMatch(loaded.query.topicMatch ?? "any");
         setResearchFilter(loaded.query.researchStatus ?? "all");
         setStatusFilter(loaded.query.exportStatus ?? "all");
         setCompletedFilter(loaded.query.completed);
@@ -251,6 +284,8 @@ export function ClipQueue({
     setEditingClipId(undefined);
     setQuery("");
     setTagFilter("");
+    setTopicMatch("any");
+    setTopicGrouping(false);
     setResearchFilter("all");
     setStatusFilter("all");
     setCompletedFilter("any");
@@ -261,6 +296,13 @@ export function ClipQueue({
     setReexportArtifactVersionId(undefined);
     setArtifactRoots([]);
     setResolutions(new Map());
+    setCommentsByClip(new Map());
+    setNotificationClip(undefined);
+    setCommentDrafts(new Map());
+    setCommentAnchorDrafts(new Map());
+    setEditingCommentId(undefined);
+    setCommentEditDraft("");
+    setCommentEditAnchorDraft("");
     setPresetKey("context_default");
     setSettingsSelection({ base: "context_default", overrides: {} });
     void reload(undefined, true, true);
@@ -268,6 +310,87 @@ export function ClipQueue({
     // authorization-fingerprint cache only after the same credential returns.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [projectId, authorization]);
+
+  useEffect(() => {
+    if (
+      !notificationTarget ||
+      (notificationTarget.kind !== "logged_export" &&
+        notificationTarget.kind !== "mention") ||
+      notificationTarget.projectId !== projectId ||
+      !authorization
+    ) {
+      return;
+    }
+    const clipId = notificationTarget.clipId;
+    let active = true;
+    void Promise.all([
+      request(`/api/projects/${projectId}/clips/${clipId}`).then((payload) =>
+        ClipCandidateSchema.parse(payload),
+      ),
+      notificationTarget.kind === "mention"
+        ? request(
+            `/api/projects/${projectId}/clips/${clipId}/comments/${notificationTarget.commentId}`,
+          ).then((payload) => ClipCommentSchema.parse(payload))
+        : Promise.resolve(undefined),
+    ])
+      .then(([clip, comment]) => {
+        if (!active) return;
+        setNotificationClip(clip);
+        if (comment) {
+          setCommentsByClip((current) =>
+            new Map(current).set(clipId, [comment]),
+          );
+        }
+        setMessage(
+          notificationTarget.kind === "mention"
+            ? "Opened the exact mentioned clip comment."
+            : "Opened the export request clip.",
+        );
+      })
+      .catch((error) => {
+        if (active) {
+          setMessage(
+            error instanceof Error
+              ? error.message
+              : "The notification target is no longer available.",
+          );
+        }
+      });
+    return () => {
+      active = false;
+    };
+    // The request adapter is stable for the mounted Clip Library.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [authorization, notificationTarget, projectId]);
+
+  useEffect(() => {
+    if (
+      !notificationTarget ||
+      (notificationTarget.kind !== "logged_export" &&
+        notificationTarget.kind !== "mention") ||
+      notificationClip?.id !== notificationTarget.clipId
+    ) {
+      return;
+    }
+    if (
+      notificationTarget.kind === "mention" &&
+      !commentsByClip
+        .get(notificationTarget.clipId)
+        ?.some((comment) => comment.id === notificationTarget.commentId)
+    ) {
+      return;
+    }
+    const frame = window.requestAnimationFrame(() => {
+      const anchor =
+        notificationTarget.kind === "mention"
+          ? document.getElementById(
+              `clip-comment-${notificationTarget.commentId}`,
+            )
+          : document.getElementById(`clip-${notificationTarget.clipId}`);
+      anchor?.scrollIntoView({ block: "center" });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [commentsByClip, notificationClip, notificationTarget]);
 
   const availabilityByVersion = useMemo(
     () =>
@@ -294,21 +417,32 @@ export function ClipQueue({
   }
 
   const visibleEntries = useMemo(
-    () =>
-      availabilityFilter === "all"
-        ? entries
-        : entries.filter(
-            (entry) => entryAvailability(entry) === availabilityFilter,
-          ),
+    () => {
+      const filtered =
+        availabilityFilter === "all"
+          ? entries
+          : entries.filter(
+              (entry) => entryAvailability(entry) === availabilityFilter,
+            );
+      return topicGrouping
+        ? [...filtered].toSorted((left, right) =>
+            (left.clip.tags[0] ?? "No Topics").localeCompare(
+              right.clip.tags[0] ?? "No Topics",
+            ),
+          )
+        : filtered;
+    },
     // Availability is a local filter over the cached subset, not a cloud-global
     // predicate.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [entries, availabilityFilter, availabilityByVersion],
+    [entries, availabilityFilter, availabilityByVersion, topicGrouping],
   );
 
   function beginEdit(clip: ClipCandidate) {
     if (page?.freshness !== "fresh") {
-      setMessage("Reconnect before changing shared clip notes or tags.");
+      setMessage(
+        "Reconnect before changing shared clip descriptions or Topics.",
+      );
       return;
     }
     setEditingClipId(clip.id);
@@ -342,7 +476,9 @@ export function ClipQueue({
         ),
       );
       setEditingClipId(undefined);
-      setMessage("Clip notes and tags saved. Refresh to update the cache.");
+      setMessage(
+        "Clip description and Topics saved. Refresh to update the cache.",
+      );
     } catch (error) {
       setMessage(
         error instanceof Error
@@ -558,7 +694,8 @@ export function ClipQueue({
   async function resolveArtifact(
     clip: ClipCandidate,
     version: ClipLibraryEntry["recentArtifactVersions"][number],
-  ) {
+    options: { announce?: boolean; refresh?: boolean } = {},
+  ): Promise<ArtifactResolutionResult | undefined> {
     const generation = requestGeneration.current;
     const { text: _text, ...selection } = version.selection;
     const rendererCapabilityId =
@@ -619,14 +756,16 @@ export function ClipQueue({
       const payload: unknown = await response.json().catch(() => undefined);
       if (!response.ok) throw apiError(payload, "Unable to resolve artifact.");
       const resolution = ArtifactResolutionResultSchema.parse(payload);
-      if (generation !== requestGeneration.current) return;
+      if (generation !== requestGeneration.current) return undefined;
       setResolutions((current) =>
         new Map(current).set(version.artifactVersionId, resolution),
       );
-      setMessage(
-        `Artifact resolution: ${resolution.state.replaceAll("_", " ")}.`,
-      );
-      void reload();
+      if (options.announce !== false)
+        setMessage(
+          `Artifact resolution: ${resolution.state.replaceAll("_", " ")}.`,
+        );
+      if (options.refresh !== false) void reload();
+      return resolution;
     } catch (error) {
       if (generation === requestGeneration.current) {
         setMessage(
@@ -635,6 +774,7 @@ export function ClipQueue({
             : "Unable to resolve artifact.",
         );
       }
+      return undefined;
     } finally {
       if (generation === requestGeneration.current) setBusy(false);
     }
@@ -644,10 +784,10 @@ export function ClipQueue({
     locatorId: string,
     action: "verify" | "reveal" | "open" | "relink",
     targetRootId?: string,
-  ) {
+  ): Promise<boolean> {
     if (action === "relink" && page?.freshness !== "fresh") {
       setMessage("Reconnect before relinking a project artifact.");
-      return;
+      return false;
     }
     const generation = requestGeneration.current;
     setBusy(true);
@@ -671,7 +811,7 @@ export function ClipQueue({
         action !== "relink"
           ? ArtifactLocatorActionResultSchema.parse(payload)
           : undefined;
-      if (generation !== requestGeneration.current) return;
+      if (generation !== requestGeneration.current) return false;
       if (actionResult) {
         setMessage(
           actionResult.freshness === "stale"
@@ -683,6 +823,7 @@ export function ClipQueue({
         setMessage("Local artifact relink completed after full verification.");
       }
       void reload();
+      return true;
     } catch (error) {
       if (generation === requestGeneration.current) {
         setMessage(
@@ -691,8 +832,253 @@ export function ClipQueue({
             : `Unable to ${action} local artifact.`,
         );
       }
+      return false;
     } finally {
       if (generation === requestGeneration.current) setBusy(false);
+    }
+  }
+
+  async function openClip(entry: ClipLibraryEntry) {
+    let artifactFailure = false;
+    for (const version of entry.recentArtifactVersions) {
+      const cachedResolution = resolutions.get(version.artifactVersionId);
+      const resolution =
+        cachedResolution ??
+        (await resolveArtifact(entry.clip, version, {
+          announce: false,
+          refresh: false,
+        }));
+      if (!resolution) {
+        artifactFailure = true;
+        continue;
+      }
+      if (resolution.state !== "reusable_local") continue;
+      const opened = await actOnArtifact(resolution.locator.id, "open");
+      if (opened) return;
+      artifactFailure = true;
+    }
+    const fallbackNotice = artifactFailure
+      ? "A compatible local artifact could not be freshly verified, so VERA opened the authorized source range instead."
+      : undefined;
+    if (fallbackNotice) setMessage(fallbackNotice);
+    onOpenSourceClip(entry.clip, fallbackNotice);
+  }
+
+  async function loadComments(clipId: string) {
+    try {
+      const replayResponse = await apiFetch(
+        "local",
+        `/api/projects/${projectId}/clip-comment-outbox/replay`,
+        { method: "POST" },
+        authorization,
+      );
+      if (replayResponse.ok) {
+        const replay = OfflineClipCommentReplayResultSchema.parse(
+          await replayResponse.json(),
+        );
+        if (replay.conflicts > 0) {
+          setMessage(
+            `${replay.conflicts} offline comment edit requires conflict review; no author data was discarded.`,
+          );
+        }
+      }
+      const comments: ClipComment[] = [];
+      let cursor: string | undefined;
+      for (let pageIndex = 0; pageIndex < 10; pageIndex += 1) {
+        const parameters = new URLSearchParams({ limit: "50" });
+        if (cursor) parameters.set("cursor", cursor);
+        const commentPage = ClipCommentPageSchema.parse(
+          await request(
+            `/api/projects/${projectId}/clips/${clipId}/comments?${parameters}`,
+          ),
+        );
+        comments.push(...commentPage.comments);
+        cursor = commentPage.nextCursor;
+        if (!cursor) break;
+      }
+      setCommentsByClip((current) => new Map(current).set(clipId, comments));
+    } catch (error) {
+      setMessage(
+        error instanceof Error ? error.message : "Unable to load comments.",
+      );
+    }
+  }
+
+  async function createComment(clipId: string) {
+    const body = commentDrafts.get(clipId)?.trim();
+    if (!body || page?.freshness !== "fresh") return;
+    const sourceTimeSeconds = Number(commentAnchorDrafts.get(clipId));
+    setBusy(true);
+    try {
+      const response = await apiFetch(
+        "local",
+        `/api/projects/${projectId}/clips/${clipId}/comments`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            idempotencyKey: `vera-comment:${clipId}:${crypto.randomUUID()}`,
+            body,
+            ...(Number.isFinite(sourceTimeSeconds) && sourceTimeSeconds >= 0
+              ? { sourceTimeMs: Math.round(sourceTimeSeconds * 1_000) }
+              : {}),
+          }),
+        },
+        authorization,
+      );
+      const result = OfflineClipCommentMutationResultSchema.parse(
+        await response.json(),
+      );
+      if (result.state === "queued") {
+        setCommentDrafts((current) => new Map(current).set(clipId, ""));
+        setCommentAnchorDrafts((current) => new Map(current).set(clipId, ""));
+        setMessage(
+          "Comment queued offline and will replay in order after reconnecting.",
+        );
+        return;
+      }
+      if (result.state === "conflict") {
+        setMessage(
+          `Comment was retained for conflict review (${result.code}); refresh before resolving it.`,
+        );
+        return;
+      }
+      const comment = ClipCommentSchema.parse(result.comment);
+      setCommentsByClip((current) =>
+        new Map(current).set(clipId, [...(current.get(clipId) ?? []), comment]),
+      );
+      setCommentDrafts((current) => new Map(current).set(clipId, ""));
+      setCommentAnchorDrafts((current) => new Map(current).set(clipId, ""));
+      setMessage("Comment added; this clip is now followed.");
+    } catch (error) {
+      setMessage(
+        error instanceof Error ? error.message : "Unable to add comment.",
+      );
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function setFollowing(clipId: string, following: boolean) {
+    setBusy(true);
+    try {
+      ClipFollowSchema.parse(
+        await request(`/api/projects/${projectId}/clips/${clipId}/follow`, {
+          method: "PUT",
+          body: JSON.stringify({
+            idempotencyKey: `vera-follow:${clipId}:${following}:${crypto.randomUUID()}`,
+            following,
+          }),
+        }),
+      );
+      setMessage(following ? "Following clip comments." : "Clip unfollowed.");
+    } catch (error) {
+      setMessage(
+        error instanceof Error ? error.message : "Unable to update follow.",
+      );
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function updateComment(clipId: string, comment: ClipComment) {
+    if (!commentEditDraft.trim()) return;
+    const sourceTimeSeconds = Number(commentEditAnchorDraft);
+    setBusy(true);
+    try {
+      const response = await apiFetch(
+        "local",
+        `/api/projects/${projectId}/clips/${clipId}/comments/${comment.id}`,
+        {
+          method: "PATCH",
+          body: JSON.stringify({
+            idempotencyKey: `vera-comment-edit:${comment.id}:${crypto.randomUUID()}`,
+            expectedVersion: comment.version,
+            body: commentEditDraft.trim(),
+            sourceTimeMs:
+              commentEditAnchorDraft.trim() &&
+              Number.isFinite(sourceTimeSeconds) &&
+              sourceTimeSeconds >= 0
+                ? Math.round(sourceTimeSeconds * 1_000)
+                : null,
+          }),
+        },
+        authorization,
+      );
+      const result = OfflineClipCommentMutationResultSchema.parse(
+        await response.json(),
+      );
+      if (result.state === "applied") {
+        setCommentsByClip((current) =>
+          new Map(current).set(
+            clipId,
+            (current.get(clipId) ?? []).map((candidate) =>
+              candidate.id === comment.id ? result.comment : candidate,
+            ),
+          ),
+        );
+        setEditingCommentId(undefined);
+        setMessage("Comment updated.");
+      } else {
+        setMessage(
+          result.state === "queued"
+            ? "Comment edit queued offline; its original text remains visible until replay."
+            : `Comment edit retained for conflict review (${result.code}).`,
+        );
+      }
+    } catch (error) {
+      setMessage(
+        error instanceof Error ? error.message : "Unable to update comment.",
+      );
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function deleteComment(clipId: string, comment: ClipComment) {
+    if (
+      !window.confirm("Delete this comment? Its audit tombstone will remain.")
+    )
+      return;
+    setBusy(true);
+    try {
+      const response = await apiFetch(
+        "local",
+        `/api/projects/${projectId}/clips/${clipId}/comments/${comment.id}`,
+        {
+          method: "DELETE",
+          body: JSON.stringify({
+            idempotencyKey: `vera-comment-delete:${comment.id}:${crypto.randomUUID()}`,
+            expectedVersion: comment.version,
+          }),
+        },
+        authorization,
+      );
+      const result = OfflineClipCommentMutationResultSchema.parse(
+        await response.json(),
+      );
+      if (result.state === "applied") {
+        setCommentsByClip((current) =>
+          new Map(current).set(
+            clipId,
+            (current.get(clipId) ?? []).map((candidate) =>
+              candidate.id === comment.id ? result.comment : candidate,
+            ),
+          ),
+        );
+        setMessage("Comment deleted; its body is no longer available.");
+      } else {
+        setMessage(
+          result.state === "queued"
+            ? "Comment deletion queued offline."
+            : `Comment deletion retained for conflict review (${result.code}).`,
+        );
+      }
+    } catch (error) {
+      setMessage(
+        error instanceof Error ? error.message : "Unable to delete comment.",
+      );
+    } finally {
+      setBusy(false);
     }
   }
 
@@ -725,6 +1111,32 @@ export function ClipQueue({
     }
   }
 
+  async function downloadCommentsCsv() {
+    setBusy(true);
+    try {
+      const response = await apiFetch(
+        "cloud",
+        `/api/projects/${projectId}/clip-comments.csv`,
+        {},
+        authorization,
+      );
+      if (!response.ok) throw new Error("Unable to export comments CSV.");
+      const objectUrl = URL.createObjectURL(await response.blob());
+      const link = document.createElement("a");
+      link.href = objectUrl;
+      link.download = `project-clip-comments-${projectId}.csv`;
+      link.click();
+      URL.revokeObjectURL(objectUrl);
+      setMessage("Downloaded the authorized project comments CSV.");
+    } catch (error) {
+      setMessage(
+        error instanceof Error ? error.message : "Unable to export comments.",
+      );
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
     <article
       className="queue-card clip-queue"
@@ -743,6 +1155,13 @@ export function ClipQueue({
           >
             Export CSV
           </button>
+          <button
+            type="button"
+            disabled={busy || page?.freshness !== "fresh"}
+            onClick={() => void downloadCommentsCsv()}
+          >
+            Export comments CSV
+          </button>
           <button type="button" disabled={busy} onClick={() => void reload()}>
             Refresh
           </button>
@@ -754,21 +1173,40 @@ export function ClipQueue({
           <input
             value={query}
             onChange={(event) => setQuery(event.target.value)}
-            placeholder="Passage, note, tag, or video"
+            placeholder="Passage, description, comment, Topic, or video"
           />
         </label>
         <label>
-          Filter tag
-          <select
+          Topics
+          <input
             value={tagFilter}
             onChange={(event) => setTagFilter(event.target.value)}
+            list="project-topic-suggestions"
+            placeholder="Comma-separated Topics"
+          />
+        </label>
+        <label>
+          Topic matching
+          <select
+            value={topicMatch}
+            onChange={(event) =>
+              setTopicMatch(event.target.value as "any" | "all")
+            }
           >
-            <option value="">All tags</option>
-            {suggestedTags.map((tag) => (
-              <option key={tag} value={tag}>
-                {tag}
-              </option>
-            ))}
+            <option value="any">Match any</option>
+            <option value="all">Match all</option>
+          </select>
+        </label>
+        <label>
+          Topic grouping
+          <select
+            value={topicGrouping ? "topic" : "none"}
+            onChange={(event) =>
+              setTopicGrouping(event.target.value === "topic")
+            }
+          >
+            <option value="none">Canonical order</option>
+            <option value="topic">Group by first Topic</option>
           </select>
         </label>
         <label>
@@ -964,6 +1402,45 @@ export function ClipQueue({
         {message ||
           `${visibleEntries.length} cached result${visibleEntries.length === 1 ? "" : "s"}; ${selected.size} selected.`}
       </p>
+      {notificationClip &&
+      !visibleEntries.some((entry) => entry.clip.id === notificationClip.id) ? (
+        <section
+          className="clip-card notification-target-card"
+          id={`clip-${notificationClip.id}`}
+          aria-label="Notification target clip"
+        >
+          <div className="clip-card-heading">
+            <div>
+              <strong>{notificationClip.video.title}</strong>
+              <span>
+                {formatTime(notificationClip.selection.exportStartMs)}–
+                {formatTime(notificationClip.selection.exportEndMs)} · exact
+                notification target
+              </span>
+            </div>
+            <button
+              type="button"
+              onClick={() => onOpenSourceClip(notificationClip)}
+            >
+              Open source
+            </button>
+          </div>
+          {(commentsByClip.get(notificationClip.id) ?? []).map((comment) => (
+            <article
+              className="clip-comment"
+              id={`clip-comment-${comment.id}`}
+              key={comment.id}
+            >
+              <strong>@{comment.author.handle}</strong>
+              {comment.status === "active" ? (
+                <p>{comment.body}</p>
+              ) : (
+                <p>Deleted comment</p>
+              )}
+            </article>
+          ))}
+        </section>
+      ) : null}
       {visibleEntries.length ? (
         <div className="clip-list">
           {visibleEntries.map((entry) => {
@@ -971,7 +1448,11 @@ export function ClipQueue({
             const editing = editingClipId === clip.id;
             const localState = entryAvailability(entry);
             return (
-              <section className="clip-card" key={clip.id}>
+              <section
+                className="clip-card"
+                id={`clip-${clip.id}`}
+                key={clip.id}
+              >
                 <div className="clip-card-heading">
                   <div>
                     <label className="clip-library-select">
@@ -997,6 +1478,32 @@ export function ClipQueue({
                         ? "no verified locator"
                         : localState}
                     </span>
+                    <span>
+                      Comments: {entry.commentCount ?? 0}
+                      {entry.latestCommentAt
+                        ? ` · latest ${new Date(entry.latestCommentAt).toLocaleString()}`
+                        : ""}
+                    </span>
+                    {topicGrouping ? (
+                      <span>Topic group: {clip.tags[0] ?? "No Topics"}</span>
+                    ) : null}
+                    {entry.matchingComment ? (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          void loadComments(clip.id);
+                          if (entry.matchingComment?.sourceTimeMs !== undefined)
+                            onOpenSourceClip(
+                              clip,
+                              "Opened the matching comment time anchor.",
+                              entry.matchingComment.sourceTimeMs,
+                            );
+                        }}
+                      >
+                        Matching comment by @
+                        {entry.matchingComment.author.handle}
+                      </button>
+                    ) : null}
                     {entry.currentLeaves.map((leaf) => (
                       <span key={leaf.requestId}>
                         Export {leaf.state.replaceAll("_", " ")}
@@ -1039,16 +1546,24 @@ export function ClipQueue({
                   <div className="clip-card-actions">
                     <button
                       type="button"
-                      onClick={() => onOpenVideo(clip.video.canonicalUrl)}
+                      disabled={busy}
+                      onClick={() => void openClip(entry)}
                     >
-                      Open video
+                      Open clip
                     </button>
                     <button
                       type="button"
                       disabled={busy || page?.freshness !== "fresh"}
                       onClick={() => beginEdit(clip)}
                     >
-                      Edit notes/tags
+                      Edit description/Topics
+                    </button>
+                    <button
+                      type="button"
+                      disabled={busy}
+                      onClick={() => void loadComments(clip.id)}
+                    >
+                      Comments
                     </button>
                   </div>
                 </div>
@@ -1056,7 +1571,10 @@ export function ClipQueue({
                   <div className="clip-language-evidence">
                     <blockquote>
                       <strong>
-                        Native ({clip.languageEvidence.native.language})
+                        Native —{" "}
+                        {formatLanguageLabel(
+                          clip.languageEvidence.native.language,
+                        )}
                       </strong>
                       {clip.languageEvidence.native.text}
                     </blockquote>
@@ -1067,7 +1585,10 @@ export function ClipQueue({
                     {clip.languageEvidence.preferred ? (
                       <blockquote>
                         <strong>
-                          Preferred ({clip.languageEvidence.preferred.language})
+                          Preferred —{" "}
+                          {formatLanguageLabel(
+                            clip.languageEvidence.preferred.language,
+                          )}
                         </strong>
                         {clip.languageEvidence.preferred.text}
                       </blockquote>
@@ -1143,7 +1664,7 @@ export function ClipQueue({
                                       void actOnArtifact(locator.id, "open")
                                     }
                                   >
-                                    Open clip
+                                    Open artifact
                                   </button>
                                   {artifactRoots
                                     .filter(
@@ -1194,7 +1715,7 @@ export function ClipQueue({
                 {editing ? (
                   <div className="clip-edit-form">
                     <label>
-                      Notes / intended use
+                      Clip description / intended use
                       <textarea
                         aria-label={`Notes for ${clip.video.title}`}
                         rows={3}
@@ -1203,10 +1724,10 @@ export function ClipQueue({
                       />
                     </label>
                     <label>
-                      Tags
+                      Topics
                       <input
-                        aria-label={`Tags for ${clip.video.title}`}
-                        list="project-tag-suggestions"
+                        aria-label={`Topics for ${clip.video.title}`}
+                        list="project-topic-suggestions"
                         value={tagsText}
                         onChange={(event) => setTagsText(event.target.value)}
                       />
@@ -1233,15 +1754,192 @@ export function ClipQueue({
                     {clip.notes ? (
                       <p className="clip-notes">{clip.notes}</p>
                     ) : null}
-                    <div className="clip-tags">
+                    <div className="clip-tags" aria-label="Topics">
                       {clip.tags.length ? (
                         clip.tags.map((tag) => <span key={tag}>{tag}</span>)
                       ) : (
-                        <span className="muted">No tags</span>
+                        <span className="muted">No Topics</span>
                       )}
                     </div>
                   </>
                 )}
+                {commentsByClip.has(clip.id) ? (
+                  <section className="clip-comments" aria-label="Clip comments">
+                    <div className="section-heading">
+                      <h4>Comments</h4>
+                      <div className="action-row">
+                        <button
+                          type="button"
+                          disabled={busy || page?.freshness !== "fresh"}
+                          onClick={() => void setFollowing(clip.id, true)}
+                        >
+                          Follow
+                        </button>
+                        <button
+                          type="button"
+                          disabled={busy || page?.freshness !== "fresh"}
+                          onClick={() => void setFollowing(clip.id, false)}
+                        >
+                          Unfollow
+                        </button>
+                      </div>
+                    </div>
+                    {(commentsByClip.get(clip.id) ?? []).map((comment) => (
+                      <article
+                        key={comment.id}
+                        id={`clip-comment-${comment.id}`}
+                        className="clip-comment"
+                      >
+                        <strong>@{comment.author.handle}</strong>{" "}
+                        <span>
+                          {new Date(comment.createdAt).toLocaleString()}
+                        </span>
+                        {comment.status === "active" ? (
+                          <>
+                            {editingCommentId === comment.id ? (
+                              <div className="clip-edit-form">
+                                <label>
+                                  Edit comment
+                                  <textarea
+                                    value={commentEditDraft}
+                                    onChange={(event) =>
+                                      setCommentEditDraft(event.target.value)
+                                    }
+                                  />
+                                </label>
+                                <label>
+                                  Optional source time (seconds)
+                                  <input
+                                    type="number"
+                                    min="0"
+                                    step="0.001"
+                                    value={commentEditAnchorDraft}
+                                    onChange={(event) =>
+                                      setCommentEditAnchorDraft(
+                                        event.target.value,
+                                      )
+                                    }
+                                  />
+                                </label>
+                                <div className="action-row">
+                                  <button
+                                    type="button"
+                                    disabled={busy}
+                                    onClick={() =>
+                                      void updateComment(clip.id, comment)
+                                    }
+                                  >
+                                    Save comment
+                                  </button>
+                                  <button
+                                    type="button"
+                                    disabled={busy}
+                                    onClick={() =>
+                                      setEditingCommentId(undefined)
+                                    }
+                                  >
+                                    Cancel
+                                  </button>
+                                </div>
+                              </div>
+                            ) : (
+                              <p>{comment.body}</p>
+                            )}
+                            {comment.sourceTimeMs !== undefined ? (
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  onOpenSourceClip(
+                                    clip,
+                                    "Opened the selected comment time anchor.",
+                                    comment.sourceTimeMs,
+                                  )
+                                }
+                              >
+                                Open at {formatTime(comment.sourceTimeMs)}
+                              </button>
+                            ) : null}
+                            {comment.mentions?.length ? (
+                              <span>
+                                Mentions{" "}
+                                {comment.mentions
+                                  .map((mention) => `@${mention.handle}`)
+                                  .join(", ")}
+                              </span>
+                            ) : null}
+                            {editingCommentId !== comment.id ? (
+                              <div className="action-row">
+                                <button
+                                  type="button"
+                                  disabled={busy}
+                                  onClick={() => {
+                                    setEditingCommentId(comment.id);
+                                    setCommentEditDraft(comment.body);
+                                    setCommentEditAnchorDraft(
+                                      comment.sourceTimeMs === undefined
+                                        ? ""
+                                        : String(comment.sourceTimeMs / 1_000),
+                                    );
+                                  }}
+                                >
+                                  Edit
+                                </button>
+                                <button
+                                  type="button"
+                                  disabled={busy}
+                                  onClick={() =>
+                                    void deleteComment(clip.id, comment)
+                                  }
+                                >
+                                  Delete
+                                </button>
+                              </div>
+                            ) : null}
+                          </>
+                        ) : (
+                          <p className="muted">Comment deleted</p>
+                        )}
+                      </article>
+                    ))}
+                    <label>
+                      Add comment
+                      <textarea
+                        value={commentDrafts.get(clip.id) ?? ""}
+                        onChange={(event) =>
+                          setCommentDrafts((current) =>
+                            new Map(current).set(clip.id, event.target.value),
+                          )
+                        }
+                        placeholder="Use @handle to mention a current project member"
+                      />
+                    </label>
+                    <label>
+                      Optional source time (seconds)
+                      <input
+                        type="number"
+                        min="0"
+                        step="0.001"
+                        value={commentAnchorDrafts.get(clip.id) ?? ""}
+                        onChange={(event) =>
+                          setCommentAnchorDrafts((current) =>
+                            new Map(current).set(clip.id, event.target.value),
+                          )
+                        }
+                      />
+                    </label>
+                    <button
+                      type="button"
+                      disabled={
+                        busy ||
+                        page?.freshness !== "fresh" ||
+                        !(commentDrafts.get(clip.id) ?? "").trim()
+                      }
+                      onClick={() => void createComment(clip.id)}
+                    >
+                      Add comment
+                    </button>
+                  </section>
+                ) : null}
               </section>
             );
           })}
@@ -1258,7 +1956,7 @@ export function ClipQueue({
           Load next page
         </button>
       ) : null}
-      <datalist id="project-tag-suggestions">
+      <datalist id="project-topic-suggestions">
         {suggestedTags.map((tag) => (
           <option key={tag} value={tag} />
         ))}

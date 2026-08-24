@@ -5,7 +5,7 @@ import {
   type ServerResponse,
 } from "node:http";
 
-const PERMITTED_METHODS = new Set(["GET", "POST", "PUT", "PATCH"]);
+const PERMITTED_METHODS = new Set(["GET", "POST", "PUT", "PATCH", "DELETE"]);
 const DEFAULT_MAX_REQUEST_BODY_BYTES = 1_048_576;
 const DEFAULT_MAX_RESPONSE_BODY_BYTES = 4_194_304;
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;

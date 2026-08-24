@@ -26,6 +26,39 @@ export function languagesEquivalent(left: string, right: string): boolean {
   return primaryLanguage(left) === primaryLanguage(right);
 }
 
+export function formatLanguageLabel(
+  value: string,
+  displayLocale = "en",
+): string {
+  const normalized = normalizeLanguageTag(value);
+  const locale = new Intl.Locale(normalized);
+  try {
+    const languageNames = new Intl.DisplayNames([displayLocale], {
+      type: "language",
+      fallback: "code",
+    });
+    const regionNames = new Intl.DisplayNames([displayLocale], {
+      type: "region",
+      fallback: "code",
+    });
+    const scriptNames = new Intl.DisplayNames([displayLocale], {
+      type: "script",
+      fallback: "code",
+    });
+    const parts = [languageNames.of(locale.language) ?? locale.language];
+    if (locale.script)
+      parts.push(scriptNames.of(locale.script) ?? locale.script);
+    if (locale.region)
+      parts.push(regionNames.of(locale.region) ?? locale.region);
+    const readable = parts
+      .map((part, index) => (index === 0 ? part : `(${part})`))
+      .join(" ");
+    return `${readable} (${normalized})`;
+  } catch {
+    return `Language (${normalized})`;
+  }
+}
+
 export const LanguageTagSchema = z
   .string()
   .trim()
@@ -48,10 +81,55 @@ export const LanguageTagSchema = z
 
 export const ProjectRoleSchema = z.enum([
   "owner",
+  "administrator",
+  // Compatibility-only roles. New membership commands cannot assign these.
   "editor",
   "researcher",
   "viewer",
 ]);
+
+export const AssignableProjectRoleSchema = z.enum([
+  "administrator",
+  "researcher",
+]);
+
+export const ProjectKindSchema = z.enum(["personal", "shared"]);
+export const ProjectVisibilitySchema = z.enum([
+  "private",
+  "invitation_only",
+  "open_to_join",
+]);
+
+export function normalizeUserHandle(value: string): string {
+  const normalized = value
+    .trim()
+    .replace(/^@/u, "")
+    .normalize("NFKC")
+    .toLocaleLowerCase("en-US");
+  if (!/^[a-z][a-z0-9_]{2,31}$/u.test(normalized)) {
+    throw new Error(
+      "Handle must be 3–32 characters and use letters, numbers, or underscores, starting with a letter.",
+    );
+  }
+  return normalized;
+}
+
+export const UserHandleSchema = z
+  .string()
+  .trim()
+  .min(3)
+  .max(33)
+  .transform((value, context) => {
+    try {
+      return normalizeUserHandle(value);
+    } catch (error) {
+      context.addIssue({
+        code: "custom",
+        message: error instanceof Error ? error.message : "Handle is invalid.",
+      });
+      return z.NEVER;
+    }
+  });
 
 export const AuthenticatedActorSchema = z.object({
   userId: IdSchema,
@@ -112,7 +190,7 @@ export const DesktopStatusSchema = z
 export const DesktopApiRequestSchema = z
   .object({
     target: z.enum(["cloud", "local"]),
-    method: z.enum(["GET", "POST", "PUT", "PATCH"]),
+    method: z.enum(["GET", "POST", "PUT", "PATCH", "DELETE"]),
     path: z
       .string()
       .min(4)
@@ -154,6 +232,26 @@ export const DesktopApiResponseSchema = z
     status: z.number().int().min(100).max(599),
     body: z.string().max(4_000_000),
     contentType: z.string().max(160).optional(),
+  })
+  .strict();
+
+export const DesktopTimedTranscriptUploadRequestSchema = z
+  .object({
+    importId: IdSchema,
+    role: z.enum(["original", "english"]),
+    contentType: z.enum(["application/x-subrip", "text/vtt"]),
+    bytes: z
+      .instanceof(Uint8Array)
+      .refine(
+        (value) => value.byteLength > 0 && value.byteLength <= 20 * 1024 * 1024,
+        { message: "Timed transcript upload bytes are out of bounds." },
+      ),
+  })
+  .strict();
+
+export const DesktopTimedTranscriptUploadResponseSchema = z
+  .object({
+    objectVersionId: z.string().min(1).max(1_024),
   })
   .strict();
 
@@ -510,6 +608,7 @@ export const ModelDownloadProgressSchema = z
 export const UserSchema = z.object({
   id: IdSchema,
   externalSubject: z.string().min(1).max(512),
+  handle: UserHandleSchema,
   displayName: z.string().trim().min(1).max(160),
   preferredLanguage: LanguageTagSchema,
   createdAt: UtcTimestampSchema,
@@ -520,24 +619,81 @@ export const UpdatePreferredLanguageRequestSchema = z.object({
   preferredLanguage: LanguageTagSchema,
 });
 
-export const CreateProjectRequestSchema = z.object({
-  name: z.string().trim().min(1).max(160),
-  description: z.string().trim().max(2_000).default(""),
+export const RegisterUserRequestSchema = z.object({
+  displayName: z.string().trim().min(1).max(160),
+  handle: UserHandleSchema.optional(),
 });
+
+export const CreateProjectRequestSchema = z
+  .object({
+    name: z.string().trim().min(1).max(160),
+    description: z.string().trim().max(2_000).default(""),
+    kind: ProjectKindSchema.default("shared"),
+    visibility: ProjectVisibilitySchema.optional(),
+  })
+  .transform((project, context) => {
+    const visibility =
+      project.visibility ??
+      (project.kind === "personal" ? "private" : "invitation_only");
+    if (
+      (project.kind === "personal" && visibility !== "private") ||
+      (project.kind === "shared" && visibility === "private")
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["visibility"],
+        message:
+          "Personal projects must be private; shared projects must use invitation-only or open-to-join visibility.",
+      });
+      return z.NEVER;
+    }
+    return { ...project, visibility };
+  });
 
 export const AddProjectMemberRequestSchema = z.object({
   userId: IdSchema,
-  role: z.enum(["editor", "researcher", "viewer"]),
+  role: AssignableProjectRoleSchema,
 });
 
-export const ProjectSchema = z.object({
+const ProjectShape = {
   id: IdSchema,
   name: z.string().trim().min(1).max(160),
   description: z.string().trim().max(2_000).default(""),
+  kind: ProjectKindSchema,
+  visibility: ProjectVisibilitySchema,
   version: z.number().int().positive(),
   createdAt: UtcTimestampSchema,
   updatedAt: UtcTimestampSchema,
-});
+};
+
+function validateProjectKindVisibility(
+  project: { kind: ProjectKind; visibility: ProjectVisibility },
+  context: z.RefinementCtx,
+) {
+  if (
+    (project.kind === "personal" && project.visibility !== "private") ||
+    (project.kind === "shared" && project.visibility === "private")
+  ) {
+    context.addIssue({
+      code: "custom",
+      path: ["visibility"],
+      message:
+        "Personal projects must be private; shared projects must use invitation-only or open-to-join visibility.",
+    });
+  }
+}
+
+export const ProjectSchema = z
+  .object(ProjectShape)
+  .superRefine(validateProjectKindVisibility);
+
+export const ProjectSummarySchema = z
+  .object({
+    ...ProjectShape,
+    currentUserRole: ProjectRoleSchema,
+    memberCount: z.number().int().positive().max(100_000),
+  })
+  .superRefine(validateProjectKindVisibility);
 
 export const ProjectMemberSchema = z.object({
   projectId: IdSchema,
@@ -548,26 +704,277 @@ export const ProjectMemberSchema = z.object({
   updatedAt: UtcTimestampSchema,
 });
 
-export const VideoSchema = z.object({
-  id: IdSchema,
-  youtubeVideoId: z.string().min(1).max(64),
-  canonicalUrl: z.url(),
-  title: z.string().trim().min(1).max(500),
-  channel: z.string().trim().min(1).max(300).optional(),
-  durationMs: z.number().int().nonnegative().optional(),
-  sourceLanguage: z.string().min(2).max(35).optional(),
-  createdAt: UtcTimestampSchema,
-  updatedAt: UtcTimestampSchema,
+export const ProjectMemberSummarySchema = ProjectMemberSchema.extend({
+  user: z
+    .object({
+      id: IdSchema,
+      handle: UserHandleSchema,
+      displayName: z.string().trim().min(1).max(160),
+    })
+    .strict(),
 });
+export const ProjectInvitationStateSchema = z.enum([
+  "pending",
+  "accepted",
+  "rejected",
+  "revoked",
+  "expired",
+]);
+export const ProjectInvitationSchema = z
+  .object({
+    id: IdSchema,
+    projectId: IdSchema,
+    projectName: z.string().trim().min(1).max(160),
+    invitee: z.object({ id: IdSchema, handle: UserHandleSchema }).strict(),
+    inviter: z.object({ id: IdSchema, handle: UserHandleSchema }).strict(),
+    role: AssignableProjectRoleSchema,
+    state: ProjectInvitationStateSchema,
+    version: z.number().int().positive(),
+    expiresAt: UtcTimestampSchema,
+    createdAt: UtcTimestampSchema,
+    updatedAt: UtcTimestampSchema,
+  })
+  .strict();
+export const CreateProjectInvitationRequestSchema = z
+  .object({
+    idempotencyKey: z.string().trim().min(1).max(512),
+    handle: UserHandleSchema,
+    role: AssignableProjectRoleSchema,
+    expiresInDays: z.number().int().min(1).max(30).default(7),
+  })
+  .strict();
+export const DecideProjectInvitationRequestSchema = z
+  .object({
+    idempotencyKey: z.string().trim().min(1).max(512),
+    expectedVersion: z.number().int().positive(),
+    decision: z.enum(["accept", "reject"]),
+  })
+  .strict();
+export const RevokeProjectInvitationRequestSchema = z
+  .object({
+    idempotencyKey: z.string().trim().min(1).max(512),
+    expectedVersion: z.number().int().positive(),
+  })
+  .strict();
+export const OpenProjectDiscoverySchema = z
+  .object({
+    id: IdSchema,
+    name: z.string().trim().min(1).max(160),
+    description: z.string().trim().max(2_000),
+    memberCount: z.number().int().positive().max(100_000),
+  })
+  .strict();
+export const JoinOpenProjectRequestSchema = z
+  .object({ idempotencyKey: z.string().trim().min(1).max(512) })
+  .strict();
+export const UpdateProjectGovernanceRequestSchema = z
+  .object({
+    idempotencyKey: z.string().trim().min(1).max(512),
+    expectedVersion: z.number().int().positive(),
+    action: z.discriminatedUnion("type", [
+      z
+        .object({
+          type: z.literal("convert_to_shared"),
+          visibility: z
+            .enum(["invitation_only", "open_to_join"])
+            .default("invitation_only"),
+        })
+        .strict(),
+      z
+        .object({
+          type: z.literal("set_visibility"),
+          visibility: z.enum(["invitation_only", "open_to_join"]),
+        })
+        .strict(),
+      z
+        .object({ type: z.literal("transfer_ownership"), userId: IdSchema })
+        .strict(),
+      z
+        .object({
+          type: z.literal("set_member_role"),
+          userId: IdSchema,
+          role: AssignableProjectRoleSchema,
+          expectedMemberVersion: z.number().int().positive(),
+        })
+        .strict(),
+      z
+        .object({
+          type: z.literal("remove_member"),
+          userId: IdSchema,
+          expectedMemberVersion: z.number().int().positive(),
+        })
+        .strict(),
+    ]),
+  })
+  .strict();
+export const ProjectGovernanceEventSchema = z
+  .object({
+    id: IdSchema,
+    projectId: IdSchema,
+    eventType: z.enum([
+      "project_converted",
+      "visibility_changed",
+      "invitation_created",
+      "invitation_accepted",
+      "invitation_rejected",
+      "invitation_revoked",
+      "open_joined",
+      "member_role_changed",
+      "member_removed",
+      "ownership_transferred",
+    ]),
+    actorId: IdSchema,
+    targetUserId: IdSchema.optional(),
+    createdAt: UtcTimestampSchema,
+  })
+  .strict();
 
-export const AddProjectVideoRequestSchema = z.object({
-  youtubeVideoId: z.string().min(1).max(64),
-  canonicalUrl: z.url(),
-  title: z.string().trim().min(1).max(500),
-  channel: z.string().trim().min(1).max(300).optional(),
-  durationMs: z.number().int().nonnegative().optional(),
-  sourceLanguage: z.string().min(2).max(35).optional(),
-});
+/** Stable provider identity. Mutable media revision evidence is deliberately
+ * stored separately so a provider replacing bytes does not create a new
+ * logical source. */
+export const SourceProviderSchema = z.enum([
+  "youtube",
+  "tiktok",
+  "instagram",
+  "facebook",
+]);
+
+export const SourceIdentityV1Schema = z
+  .object({
+    schemaVersion: z.literal(1),
+    provider: SourceProviderSchema,
+    providerMediaId: z.string().trim().min(1).max(256),
+    canonicalUrl: z.url(),
+  })
+  .strict();
+
+function validateSourceIdentityCompatibility(
+  value: {
+    youtubeVideoId: string;
+    canonicalUrl: string;
+    sourceIdentity?: z.infer<typeof SourceIdentityV1Schema> | undefined;
+  },
+  context: z.RefinementCtx,
+) {
+  if (!value.sourceIdentity) return;
+  if (value.sourceIdentity.canonicalUrl !== value.canonicalUrl) {
+    context.addIssue({
+      code: "custom",
+      path: ["sourceIdentity", "canonicalUrl"],
+      message: "The stable source identity must use the record canonical URL.",
+    });
+  }
+  if (
+    value.sourceIdentity.provider === "youtube" &&
+    value.sourceIdentity.providerMediaId !== value.youtubeVideoId
+  ) {
+    context.addIssue({
+      code: "custom",
+      path: ["sourceIdentity", "providerMediaId"],
+      message: "The YouTube source identity must match the legacy video ID.",
+    });
+  }
+}
+
+export const SourceFingerprintEvidenceSchema = z
+  .object({
+    schemaVersion: z.literal(1),
+    algorithm: z.literal("sha256"),
+    value: z.string().regex(/^[a-f0-9]{64}$/u),
+    observedAt: UtcTimestampSchema,
+    byteSize: z.number().int().positive().optional(),
+  })
+  .strict();
+
+export const SourceOperationSchema = z.enum([
+  "search",
+  "metadata",
+  "embed-preview",
+  "precise-navigation",
+  "captions",
+  "audio-acquisition",
+  "full-media-acquisition",
+  "availability",
+]);
+
+export const SourceCapabilityStateSchema = z.enum([
+  "available",
+  "unavailable",
+  "unsupported",
+  "auth-required",
+  "quota-limited",
+]);
+
+export const SourceOperationCapabilitySchema = z
+  .object({
+    operation: SourceOperationSchema,
+    state: SourceCapabilityStateSchema,
+    configured: z.boolean(),
+    explanation: z.string().trim().min(1).max(500).optional(),
+  })
+  .strict();
+
+export const SourceProviderCapabilitySchema = z
+  .object({
+    provider: SourceProviderSchema,
+    operations: z.array(SourceOperationCapabilitySchema).min(1),
+  })
+  .strict()
+  .superRefine((capability, context) => {
+    const operations = capability.operations.map((entry) => entry.operation);
+    if (new Set(operations).size !== operations.length) {
+      context.addIssue({
+        code: "custom",
+        path: ["operations"],
+        message: "Provider operations must be unique.",
+      });
+    }
+  });
+
+export const SourceProviderCapabilitiesResponseSchema = z
+  .object({
+    providers: z.array(SourceProviderCapabilitySchema).length(4),
+  })
+  .strict()
+  .superRefine((response, context) => {
+    const providers = response.providers.map((entry) => entry.provider);
+    if (new Set(providers).size !== providers.length) {
+      context.addIssue({
+        code: "custom",
+        path: ["providers"],
+        message: "Provider capability entries must be unique.",
+      });
+    }
+  });
+
+export const VideoSchema = z
+  .object({
+    id: IdSchema,
+    youtubeVideoId: z.string().min(1).max(64),
+    canonicalUrl: z.url(),
+    sourceIdentity: SourceIdentityV1Schema.optional(),
+    sourceFingerprint: SourceFingerprintEvidenceSchema.optional(),
+    title: z.string().trim().min(1).max(500),
+    channel: z.string().trim().min(1).max(300).optional(),
+    durationMs: z.number().int().nonnegative().optional(),
+    sourceLanguage: z.string().min(2).max(35).optional(),
+    createdAt: UtcTimestampSchema,
+    updatedAt: UtcTimestampSchema,
+  })
+  .superRefine(validateSourceIdentityCompatibility);
+
+export const AddProjectVideoRequestSchema = z
+  .object({
+    youtubeVideoId: z.string().min(1).max(64),
+    canonicalUrl: z.url(),
+    sourceIdentity: SourceIdentityV1Schema.optional(),
+    sourceFingerprint: SourceFingerprintEvidenceSchema.optional(),
+    title: z.string().trim().min(1).max(500),
+    channel: z.string().trim().min(1).max(300).optional(),
+    durationMs: z.number().int().nonnegative().optional(),
+    sourceLanguage: z.string().min(2).max(35).optional(),
+  })
+  .superRefine(validateSourceIdentityCompatibility);
 
 export const ProjectVideoSchema = z.object({
   projectId: IdSchema,
@@ -577,11 +984,1560 @@ export const ProjectVideoSchema = z.object({
   updatedAt: UtcTimestampSchema,
 });
 
+export const ProjectVideoWorklistQuerySchema = z
+  .object({
+    cursor: z.string().min(1).max(2_048).optional(),
+    limit: z.coerce.number().int().min(1).max(50).default(25),
+    view: z.enum(["all", "queue", "reviewed", "dismissed"]).optional(),
+  })
+  .strict();
+
+export const ProjectVideoWorklistProcessingStateSchema = z.enum([
+  "not_requested",
+  "queued",
+  "resolving",
+  "acquiring",
+  "transcribing",
+  "translating",
+  "aligning",
+  "uploading",
+  "needs_language_confirmation",
+  "blocked",
+  "ready",
+  "failed",
+  "canceled",
+]);
+
+export const ProjectVideoWorklistProcessingSchema = z.object({
+  state: ProjectVideoWorklistProcessingStateSchema,
+  batchId: IdSchema.optional(),
+  batchItemId: IdSchema.optional(),
+  jobId: IdSchema.optional(),
+  attempt: z.number().int().nonnegative(),
+  updatedAt: UtcTimestampSchema,
+  error: z
+    .object({
+      code: z.string().trim().min(1).max(160),
+      message: z.string().trim().min(1).max(2_000),
+      retryable: z.boolean().optional(),
+    })
+    .optional(),
+});
+
+export const ProjectVideoFlaggerSummarySchema = z.object({
+  userId: IdSchema,
+  handle: UserHandleSchema,
+  displayName: z.string().trim().min(1).max(200),
+  flaggedAt: UtcTimestampSchema,
+});
+
+export const ProjectVideoOwnFlagSchema = z.object({
+  active: z.boolean(),
+  version: z.number().int().positive(),
+  createdAt: UtcTimestampSchema,
+  updatedAt: UtcTimestampSchema,
+  deactivatedAt: UtcTimestampSchema.optional(),
+});
+
+export const ProjectVideoPrioritySchema = z.enum(["high", "normal", "low"]);
+export const ProjectVideoReviewCompletionPolicySchema = z.enum([
+  "researcher_or_administrator",
+  "administrator_only",
+]);
+
+export const ProjectVideoClaimSchema = z.object({
+  claimant: z.object({
+    userId: IdSchema,
+    handle: UserHandleSchema,
+    displayName: z.string().trim().min(1).max(200),
+  }),
+  isCurrentUser: z.boolean(),
+  active: z.boolean(),
+  generation: z.number().int().positive(),
+  version: z.number().int().positive(),
+  claimedAt: UtcTimestampSchema,
+  heartbeatAt: UtcTimestampSchema,
+  expiresAt: UtcTimestampSchema,
+});
+
+export const ProjectVideoReviewActorSchema = z.object({
+  userId: IdSchema,
+  handle: UserHandleSchema,
+  displayName: z.string().trim().min(1).max(200),
+});
+
+export const ProjectVideoTriageSchema = z
+  .object({
+    state: z.enum(["active", "dismissed"]),
+    version: z.number().int().positive(),
+    dismissedAt: UtcTimestampSchema.optional(),
+    dismissedBy: ProjectVideoReviewActorSchema.optional(),
+    reason: z.string().trim().min(1).max(1_000).optional(),
+  })
+  .strict()
+  .superRefine((triage, context) => {
+    const dismissalFields = [triage.dismissedAt, triage.dismissedBy];
+    if (
+      (triage.state === "active" &&
+        [...dismissalFields, triage.reason].some(
+          (value) => value !== undefined,
+        )) ||
+      (triage.state === "dismissed" &&
+        dismissalFields.some((value) => value === undefined))
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "Project-video dismissal evidence must match triage state.",
+      });
+    }
+  });
+
+export const ProjectVideoReviewCycleSchema = z
+  .object({
+    id: IdSchema,
+    cycleNumber: z.number().int().positive(),
+    status: z.enum(["open", "completed"]),
+    version: z.number().int().positive(),
+    openedAt: UtcTimestampSchema,
+    openedBy: ProjectVideoReviewActorSchema.optional(),
+    reopenReason: z.string().trim().min(1).max(1_000).optional(),
+    completionPolicy: ProjectVideoReviewCompletionPolicySchema.optional(),
+    completedAt: UtcTimestampSchema.optional(),
+    completedBy: ProjectVideoReviewActorSchema.optional(),
+    completionBasis: z
+      .enum(["ready_transcript", "without_ready_transcript_acknowledged"])
+      .optional(),
+    transcriptVersionId: IdSchema.optional(),
+  })
+  .strict()
+  .superRefine((cycle, context) => {
+    const completionFields = [
+      cycle.completionPolicy,
+      cycle.completedAt,
+      cycle.completedBy,
+      cycle.completionBasis,
+    ];
+    if (
+      (cycle.status === "open" &&
+        [...completionFields, cycle.transcriptVersionId].some(
+          (value) => value !== undefined,
+        )) ||
+      (cycle.status === "completed" &&
+        (completionFields.some((value) => value === undefined) ||
+          (cycle.completionBasis === "ready_transcript") !==
+            (cycle.transcriptVersionId !== undefined)))
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "Review-cycle completion evidence must match its status.",
+      });
+    }
+  });
+
+export const ProjectVideoWorklistItemSchema = z.object({
+  projectId: IdSchema,
+  video: VideoSchema,
+  projectVideoVersion: z.number().int().positive(),
+  priority: ProjectVideoPrioritySchema,
+  completionPolicy: ProjectVideoReviewCompletionPolicySchema,
+  triage: ProjectVideoTriageSchema,
+  unreadActivityCount: z.number().int().nonnegative(),
+  claim: ProjectVideoClaimSchema.optional(),
+  review: ProjectVideoReviewCycleSchema,
+  activeTranscriptVersionId: IdSchema.optional(),
+  activeFlagCount: z.number().int().nonnegative(),
+  flaggers: z.array(ProjectVideoFlaggerSummarySchema).max(25),
+  flaggersTruncated: z.boolean(),
+  ownFlag: ProjectVideoOwnFlagSchema.optional(),
+  processing: ProjectVideoWorklistProcessingSchema,
+  keywordScan: z.lazy(() => ProjectKeywordScanSummarySchema),
+  clipCount: z.number().int().nonnegative(),
+  createdAt: UtcTimestampSchema,
+  updatedAt: UtcTimestampSchema,
+});
+
+export const ProjectVideoWorklistPageSchema = z.object({
+  items: z.array(ProjectVideoWorklistItemSchema).max(50),
+  total: z.number().int().nonnegative(),
+  nextCursor: z.string().min(1).max(2_048).optional(),
+});
+
+export const ProjectLocalProcessingStateSchema = z.enum([
+  "automatic",
+  "paused",
+]);
+
+export const ProjectLocalProcessingPolicySchema = z
+  .object({
+    state: ProjectLocalProcessingStateSchema,
+    version: z.number().int().positive(),
+    updatedBy: ProjectVideoReviewActorSchema.optional(),
+    updatedAt: UtcTimestampSchema.optional(),
+  })
+  .strict()
+  .superRefine((policy, context) => {
+    if ((policy.updatedBy === undefined) !== (policy.updatedAt === undefined)) {
+      context.addIssue({
+        code: "custom",
+        message: "Local-processing policy actor and time must appear together.",
+      });
+    }
+  });
+
+export const ProjectLocalProcessingWorkloadSchema = z
+  .object({
+    queuedJobs: z.number().int().nonnegative(),
+    activeJobs: z.number().int().nonnegative(),
+    queuedKnownDurationMs: z.number().int().nonnegative(),
+    activeKnownDurationMs: z.number().int().nonnegative(),
+    queuedUnknownDurationCount: z.number().int().nonnegative(),
+    activeUnknownDurationCount: z.number().int().nonnegative(),
+    unprocessedActiveVideoCount: z.number().int().nonnegative(),
+  })
+  .strict();
+
+export const ProjectLocalProcessingStatusSchema = z
+  .object({
+    projectId: IdSchema,
+    policy: ProjectLocalProcessingPolicySchema,
+    workload: ProjectLocalProcessingWorkloadSchema,
+  })
+  .strict();
+
+export function normalizeProjectKeywordPhrase(value: string): string {
+  const normalized = value
+    .normalize("NFKC")
+    .trim()
+    .replace(/\s+/gu, " ")
+    .toLocaleLowerCase("en-US");
+  if (!normalized || normalized.length > 160) {
+    throw new Error(
+      "Keyword phrases must contain 1–160 normalized characters.",
+    );
+  }
+  return normalized;
+}
+
+export const ProjectKeywordPhraseSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(160)
+  .transform((value, context) => {
+    try {
+      return normalizeProjectKeywordPhrase(value);
+    } catch (error) {
+      context.addIssue({
+        code: "custom",
+        message:
+          error instanceof Error ? error.message : "Keyword phrase is invalid.",
+      });
+      return z.NEVER;
+    }
+  });
+
+export const ProjectKeywordAliasSchema = z
+  .object({
+    id: IdSchema,
+    projectId: IdSchema,
+    keywordId: IdSchema,
+    language: LanguageTagSchema,
+    phrase: z.string().trim().min(1).max(160),
+    normalizedPhrase: ProjectKeywordPhraseSchema,
+    enabled: z.boolean(),
+    version: z.number().int().positive(),
+    createdBy: ProjectVideoReviewActorSchema,
+    updatedBy: ProjectVideoReviewActorSchema.optional(),
+    createdAt: UtcTimestampSchema,
+    updatedAt: UtcTimestampSchema,
+  })
+  .strict();
+
+export const ProjectKeywordSchema = z
+  .object({
+    id: IdSchema,
+    projectId: IdSchema,
+    label: z.string().trim().min(1).max(120),
+    description: z.string().trim().max(1_000).optional(),
+    enabled: z.boolean(),
+    version: z.number().int().positive(),
+    createdBy: ProjectVideoReviewActorSchema,
+    updatedBy: ProjectVideoReviewActorSchema.optional(),
+    createdAt: UtcTimestampSchema,
+    updatedAt: UtcTimestampSchema,
+    aliases: z.array(ProjectKeywordAliasSchema).min(1).max(100),
+  })
+  .strict();
+
+export const ProjectKeywordSuggestionStateSchema = z.enum([
+  "pending",
+  "approved",
+  "rejected",
+  "withdrawn",
+]);
+
+export const ProjectKeywordSuggestionSchema = z
+  .object({
+    id: IdSchema,
+    projectId: IdSchema,
+    keywordId: IdSchema.optional(),
+    proposedLabel: z.string().trim().min(1).max(120).optional(),
+    proposedDescription: z.string().trim().max(1_000).optional(),
+    language: LanguageTagSchema,
+    phrase: z.string().trim().min(1).max(160),
+    normalizedPhrase: ProjectKeywordPhraseSchema,
+    rationale: z.string().trim().min(1).max(1_000).optional(),
+    state: ProjectKeywordSuggestionStateSchema,
+    version: z.number().int().positive(),
+    proposedBy: ProjectVideoReviewActorSchema,
+    reviewedBy: ProjectVideoReviewActorSchema.optional(),
+    reviewedAt: UtcTimestampSchema.optional(),
+    reviewReason: z.string().trim().min(1).max(1_000).optional(),
+    withdrawnBy: ProjectVideoReviewActorSchema.optional(),
+    withdrawnAt: UtcTimestampSchema.optional(),
+    withdrawReason: z.string().trim().min(1).max(1_000).optional(),
+    createdAt: UtcTimestampSchema,
+    updatedAt: UtcTimestampSchema,
+  })
+  .strict()
+  .superRefine((suggestion, context) => {
+    if (!suggestion.keywordId && !suggestion.proposedLabel) {
+      context.addIssue({
+        code: "custom",
+        path: ["proposedLabel"],
+        message: "A new keyword suggestion requires a display label.",
+      });
+    }
+    const reviewed = ["approved", "rejected"].includes(suggestion.state);
+    if (
+      reviewed !==
+      (suggestion.reviewedBy !== undefined &&
+        suggestion.reviewedAt !== undefined)
+    ) {
+      context.addIssue({
+        code: "custom",
+        message:
+          "Reviewed suggestion actor and time evidence must appear together.",
+      });
+    }
+    const withdrawn = suggestion.state === "withdrawn";
+    if (
+      withdrawn !==
+      (suggestion.withdrawnBy !== undefined &&
+        suggestion.withdrawnAt !== undefined)
+    ) {
+      context.addIssue({
+        code: "custom",
+        message:
+          "Withdrawn suggestion actor and time evidence must appear together.",
+      });
+    }
+    if (reviewed && suggestion.withdrawnBy !== undefined) {
+      context.addIssue({
+        code: "custom",
+        message: "A reviewed suggestion cannot also be withdrawn.",
+      });
+    }
+  });
+
+export const ProjectKeywordCatalogSchema = z
+  .object({
+    projectId: IdSchema,
+    currentUserId: IdSchema.optional(),
+    keywordSetVersion: z.number().int().positive(),
+    keywords: z.array(ProjectKeywordSchema).max(200),
+    suggestions: z.array(ProjectKeywordSuggestionSchema).max(200),
+  })
+  .strict();
+
+export const SuggestProjectKeywordRequestSchema = z
+  .object({
+    keywordId: IdSchema.optional(),
+    proposedLabel: z.string().trim().min(1).max(120).optional(),
+    proposedDescription: z.string().trim().max(1_000).optional(),
+    language: LanguageTagSchema,
+    phrase: z.string().trim().min(1).max(160),
+    rationale: z.string().trim().min(1).max(1_000).optional(),
+    idempotencyKey: z.string().trim().min(1).max(512),
+  })
+  .strict()
+  .superRefine((suggestion, context) => {
+    if (!suggestion.keywordId && !suggestion.proposedLabel) {
+      context.addIssue({
+        code: "custom",
+        path: ["proposedLabel"],
+        message: "A new keyword suggestion requires a display label.",
+      });
+    }
+    if (suggestion.keywordId && suggestion.proposedLabel) {
+      context.addIssue({
+        code: "custom",
+        path: ["proposedLabel"],
+        message: "An alias suggestion cannot rename its target keyword.",
+      });
+    }
+  });
+
+export const SuggestProjectKeywordResponseSchema = z.discriminatedUnion(
+  "resolution",
+  [
+    z
+      .object({
+        resolution: z.enum(["created", "existing_pending"]),
+        suggestion: ProjectKeywordSuggestionSchema,
+      })
+      .strict(),
+    z
+      .object({
+        resolution: z.literal("already_approved"),
+        keyword: ProjectKeywordSchema,
+        alias: ProjectKeywordAliasSchema,
+      })
+      .strict(),
+  ],
+);
+
+export const ReviewProjectKeywordSuggestionRequestSchema = z
+  .object({
+    action: z.enum(["approve", "reject"]),
+    expectedSuggestionVersion: z.number().int().positive(),
+    expectedKeywordSetVersion: z.number().int().positive(),
+    reason: z.string().trim().min(1).max(1_000).optional(),
+    idempotencyKey: z.string().trim().min(1).max(512),
+  })
+  .strict();
+
+export const ReviewProjectKeywordSuggestionResponseSchema = z
+  .object({
+    projectId: IdSchema,
+    keywordSetVersion: z.number().int().positive(),
+    suggestion: ProjectKeywordSuggestionSchema,
+    keyword: ProjectKeywordSchema.optional(),
+    alias: ProjectKeywordAliasSchema.optional(),
+  })
+  .strict()
+  .superRefine((response, context) => {
+    const approved = response.suggestion.state === "approved";
+    if (
+      approved !==
+      (response.keyword !== undefined && response.alias !== undefined)
+    ) {
+      context.addIssue({
+        code: "custom",
+        message:
+          "Approved suggestions require their canonical keyword and alias.",
+      });
+    }
+  });
+
+export const WithdrawProjectKeywordSuggestionRequestSchema = z
+  .object({
+    expectedSuggestionVersion: z.number().int().positive(),
+    reason: z.string().trim().min(1).max(1_000).optional(),
+    idempotencyKey: z.string().trim().min(1).max(512),
+  })
+  .strict();
+
+export const WithdrawProjectKeywordSuggestionResponseSchema = z
+  .object({
+    projectId: IdSchema,
+    keywordSetVersion: z.number().int().positive(),
+    suggestion: ProjectKeywordSuggestionSchema,
+  })
+  .strict();
+
+export const UpdateProjectKeywordRequestSchema = z
+  .object({
+    label: z.string().trim().min(1).max(120).optional(),
+    description: z.string().trim().max(1_000).nullable().optional(),
+    enabled: z.boolean().optional(),
+    expectedKeywordVersion: z.number().int().positive(),
+    expectedKeywordSetVersion: z.number().int().positive(),
+    idempotencyKey: z.string().trim().min(1).max(512),
+  })
+  .strict()
+  .refine(
+    (command) =>
+      command.label !== undefined ||
+      command.description !== undefined ||
+      command.enabled !== undefined,
+    { message: "A keyword update must change at least one editable field." },
+  );
+
+export const UpdateProjectKeywordResponseSchema = z
+  .object({
+    projectId: IdSchema,
+    keywordSetVersion: z.number().int().positive(),
+    keyword: ProjectKeywordSchema,
+  })
+  .strict();
+
+export const UpdateProjectKeywordAliasRequestSchema = z
+  .object({
+    language: LanguageTagSchema.optional(),
+    phrase: z.string().trim().min(1).max(160).optional(),
+    enabled: z.boolean().optional(),
+    expectedAliasVersion: z.number().int().positive(),
+    expectedKeywordSetVersion: z.number().int().positive(),
+    idempotencyKey: z.string().trim().min(1).max(512),
+  })
+  .strict()
+  .refine(
+    (command) =>
+      command.language !== undefined ||
+      command.phrase !== undefined ||
+      command.enabled !== undefined,
+    { message: "An alias update must change at least one editable field." },
+  );
+
+export const UpdateProjectKeywordAliasResponseSchema = z
+  .object({
+    projectId: IdSchema,
+    keywordSetVersion: z.number().int().positive(),
+    keyword: ProjectKeywordSchema,
+    alias: ProjectKeywordAliasSchema,
+  })
+  .strict();
+
+export const ProjectKeywordScannerSchemaVersion = 1 as const;
+
+export function normalizeBookmarkSearch(value: string): string {
+  return value
+    .normalize("NFKC")
+    .trim()
+    .replace(/\s+/gu, " ")
+    .toLocaleLowerCase("en-US");
+}
+
+export const ProjectBookmarkStateSchema = z.enum(["active", "archived"]);
+export const ProjectBookmarkActorSchema = ProjectVideoReviewActorSchema;
+export const ProjectBookmarkSchema = z
+  .object({
+    id: IdSchema,
+    projectId: IdSchema,
+    videoId: IdSchema,
+    sourceTimeMs: z.number().int().nonnegative(),
+    title: z.string().trim().min(1).max(120).optional(),
+    note: z.string().trim().min(1).max(4_000).optional(),
+    state: ProjectBookmarkStateSchema,
+    version: z.number().int().positive(),
+    createdBy: ProjectBookmarkActorSchema,
+    updatedBy: ProjectBookmarkActorSchema,
+    createdAt: UtcTimestampSchema,
+    updatedAt: UtcTimestampSchema,
+    source: z
+      .object({
+        youtubeVideoId: z.string().min(1),
+        canonicalUrl: z.url(),
+        title: z.string().min(1),
+      })
+      .strict()
+      .optional(),
+  })
+  .strict();
+
+export const ProjectBookmarkQuerySchema = z
+  .object({
+    scope: z.enum(["video", "project"]).default("video"),
+    videoId: IdSchema.optional(),
+    state: z.enum(["active", "archived", "all"]).default("active"),
+    search: z.string().trim().min(1).max(200).optional(),
+    limit: z.coerce.number().int().min(1).max(100).default(50),
+    cursor: z.string().min(1).max(2_048).optional(),
+  })
+  .strict()
+  .superRefine((query, context) => {
+    if (query.scope === "video" && !query.videoId) {
+      context.addIssue({
+        code: "custom",
+        path: ["videoId"],
+        message: "Video scope requires a video ID.",
+      });
+    }
+  });
+
+export const ProjectBookmarkPageSchema = z.object({
+  projectId: IdSchema,
+  items: z.array(ProjectBookmarkSchema).max(100),
+  nextCursor: z.string().optional(),
+});
+
+export const CreateProjectBookmarkRequestSchema = z
+  .object({
+    videoId: IdSchema,
+    sourceTimeMs: z.number().int().nonnegative(),
+    title: z.string().trim().min(1).max(120).optional(),
+    note: z.string().trim().min(1).max(4_000).optional(),
+    idempotencyKey: z.string().trim().min(1).max(512),
+  })
+  .strict();
+
+export const UpdateProjectBookmarkRequestSchema = z
+  .object({
+    title: z.string().trim().min(1).max(120).nullable().optional(),
+    note: z.string().trim().min(1).max(4_000).nullable().optional(),
+    expectedVersion: z.number().int().positive(),
+    idempotencyKey: z.string().trim().min(1).max(512),
+  })
+  .strict()
+  .refine((value) => value.title !== undefined || value.note !== undefined, {
+    message: "A bookmark update must change title or note.",
+  });
+
+export const ChangeProjectBookmarkStateRequestSchema = z
+  .object({
+    expectedVersion: z.number().int().positive(),
+    idempotencyKey: z.string().trim().min(1).max(512),
+  })
+  .strict();
+
+export const ProjectBookmarkMutationResponseSchema = z.object({
+  bookmark: ProjectBookmarkSchema,
+});
+
+export const OfflineProjectBookmarkCommandTypeSchema = z.enum([
+  "bookmark.create.v1",
+  "bookmark.update.v1",
+  "bookmark.archive.v1",
+  "bookmark.restore.v1",
+]);
+
+export const OfflineProjectBookmarkCommandSchema = z
+  .object({
+    outboxId: IdSchema,
+    commandType: OfflineProjectBookmarkCommandTypeSchema,
+    bookmarkId: IdSchema.optional(),
+    videoId: IdSchema.optional(),
+    sourceTimeMs: z.number().int().nonnegative().optional(),
+    title: z.string().trim().min(1).max(120).nullable().optional(),
+    note: z.string().trim().min(1).max(4_000).nullable().optional(),
+    expectedVersion: z.number().int().positive().optional(),
+    state: z.enum(["queued", "conflict"]),
+    code: z.string().trim().min(1).max(160).optional(),
+    createdAt: UtcTimestampSchema,
+  })
+  .strict()
+  .superRefine((command, context) => {
+    if (command.state === "conflict" && !command.code) {
+      context.addIssue({
+        code: "custom",
+        path: ["code"],
+        message: "A bookmark conflict requires a bounded conflict code.",
+      });
+    }
+    if (command.state === "queued" && command.code) {
+      context.addIssue({
+        code: "custom",
+        path: ["code"],
+        message: "A queued bookmark command cannot carry a conflict code.",
+      });
+    }
+  });
+
+export const LocalProjectBookmarkPageSchema = ProjectBookmarkPageSchema.extend({
+  freshness: z.enum(["fresh", "stale"]),
+  cachedAt: UtcTimestampSchema,
+  outbox: z.array(OfflineProjectBookmarkCommandSchema).max(100),
+}).strict();
+
+export const OfflineProjectBookmarkMutationResultSchema = z.discriminatedUnion(
+  "state",
+  [
+    z
+      .object({
+        state: z.literal("applied"),
+        outboxId: IdSchema,
+        bookmark: ProjectBookmarkSchema,
+      })
+      .strict(),
+    z
+      .object({
+        state: z.literal("queued"),
+        outboxId: IdSchema,
+        command: OfflineProjectBookmarkCommandSchema,
+      })
+      .strict(),
+    z
+      .object({
+        state: z.literal("conflict"),
+        outboxId: IdSchema,
+        command: OfflineProjectBookmarkCommandSchema,
+      })
+      .strict(),
+  ],
+);
+
+export const OfflineProjectBookmarkReplayResultSchema = z
+  .object({
+    applied: z.number().int().nonnegative(),
+    queued: z.number().int().nonnegative(),
+    conflicts: z.number().int().nonnegative(),
+  })
+  .strict();
+
+export const ProjectKeywordScanAliasInputSchema = z
+  .object({
+    keywordId: IdSchema,
+    aliasId: IdSchema,
+    language: LanguageTagSchema,
+    phrase: z.string().trim().min(1).max(160),
+  })
+  .strict();
+
+export const ProjectKeywordMatchEvidenceSchema = z
+  .object({
+    keywordId: IdSchema,
+    aliasId: IdSchema,
+    trackId: IdSchema,
+    language: LanguageTagSchema,
+    segmentIds: z.array(IdSchema).min(1).max(20),
+    startMs: z.number().int().nonnegative(),
+    endMs: z.number().int().positive(),
+    timingPrecision: z.enum(["word", "cue", "estimated"]),
+    context: z.string().trim().min(1).max(500),
+  })
+  .strict()
+  .refine((evidence) => evidence.endMs > evidence.startMs, {
+    message: "Keyword evidence end must be after its start.",
+  });
+
+export const ProjectKeywordOccurrenceSchema = z
+  .object({
+    id: IdSchema,
+    keywordId: IdSchema,
+    startMs: z.number().int().nonnegative(),
+    endMs: z.number().int().positive(),
+    timingPrecision: z.enum(["word", "cue", "estimated"]),
+    evidence: z.array(ProjectKeywordMatchEvidenceSchema).min(1).max(50),
+  })
+  .strict()
+  .refine((occurrence) => occurrence.endMs > occurrence.startMs, {
+    message: "Keyword occurrence end must be after its start.",
+  });
+
+export const ProjectKeywordOccurrenceCountSchema = z
+  .object({
+    keywordId: IdSchema,
+    occurrenceCount: z.number().int().positive().max(50_000),
+  })
+  .strict();
+
+export const ProjectKeywordMatchArtifactSchema = z
+  .object({
+    schemaVersion: z.literal(ProjectKeywordScannerSchemaVersion),
+    projectId: IdSchema,
+    projectVideoId: IdSchema,
+    transcriptVersionId: IdSchema,
+    keywordSetVersion: z.number().int().positive(),
+    scannerSchemaVersion: z.literal(ProjectKeywordScannerSchemaVersion),
+    occurrences: z.array(ProjectKeywordOccurrenceSchema).max(50_000),
+  })
+  .strict();
+
+export const ProjectKeywordMatchArtifactDescriptorSchema = z
+  .object({
+    objectKey: z.string().trim().min(1).max(1_024),
+    objectVersionId: z.string().trim().min(1).max(1_024),
+    sha256: z.string().regex(/^[a-f0-9]{64}$/),
+    sizeBytes: z.number().int().nonnegative().max(50_000_000),
+    schemaVersion: z.literal(ProjectKeywordScannerSchemaVersion),
+  })
+  .strict();
+
+export const ProjectKeywordScanStatusSchema = z.enum([
+  "not_scanned",
+  "waiting_for_transcript",
+  "queued",
+  "scanning",
+  "current",
+  "stale",
+  "failed",
+]);
+
+export const ProjectKeywordScanCompletedResultSchema = z
+  .object({
+    scanId: IdSchema,
+    transcriptVersionId: IdSchema,
+    keywordSetVersion: z.number().int().positive(),
+    scannerSchemaVersion: z.literal(ProjectKeywordScannerSchemaVersion),
+    occurrenceCount: z.number().int().nonnegative().max(50_000),
+    matchedKeywordCount: z.number().int().nonnegative().max(200),
+    keywordCounts: z
+      .array(ProjectKeywordOccurrenceCountSchema)
+      .max(200)
+      .optional(),
+    approvedKeywordCount: z.number().int().nonnegative().max(200),
+    durationMs: z.number().int().positive().optional(),
+    matchesPerMinute: z.number().nonnegative().finite().optional(),
+    artifact: ProjectKeywordMatchArtifactDescriptorSchema,
+    completedAt: UtcTimestampSchema,
+  })
+  .strict()
+  .superRefine((result, context) => {
+    if (
+      result.keywordCounts &&
+      (new Set(result.keywordCounts.map((entry) => entry.keywordId)).size !==
+        result.keywordCounts.length ||
+        result.keywordCounts.length !== result.matchedKeywordCount ||
+        result.keywordCounts.reduce(
+          (total, entry) => total + entry.occurrenceCount,
+          0,
+        ) !== result.occurrenceCount)
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["keywordCounts"],
+        message: "Keyword counts must exactly match the scan aggregates.",
+      });
+    }
+  });
+
+export const ProjectKeywordScanSummarySchema = z
+  .object({
+    projectId: IdSchema,
+    projectVideoId: IdSchema,
+    scanId: IdSchema.optional(),
+    status: ProjectKeywordScanStatusSchema,
+    transcriptVersionId: IdSchema.optional(),
+    keywordSetVersion: z.number().int().positive(),
+    scannerSchemaVersion: z.literal(ProjectKeywordScannerSchemaVersion),
+    occurrenceCount: z.number().int().nonnegative().max(50_000).optional(),
+    matchedKeywordCount: z.number().int().nonnegative().max(200).optional(),
+    keywordCounts: z
+      .array(ProjectKeywordOccurrenceCountSchema)
+      .max(200)
+      .optional(),
+    approvedKeywordCount: z.number().int().nonnegative().max(200),
+    durationMs: z.number().int().positive().optional(),
+    matchesPerMinute: z.number().nonnegative().finite().optional(),
+    artifact: ProjectKeywordMatchArtifactDescriptorSchema.optional(),
+    completedAt: UtcTimestampSchema.optional(),
+    error: z
+      .object({
+        code: z.string().trim().min(1).max(120),
+        message: z.string().trim().min(1).max(500),
+      })
+      .strict()
+      .optional(),
+    priorResult: ProjectKeywordScanCompletedResultSchema.optional(),
+  })
+  .strict()
+  .superRefine((summary, context) => {
+    const completed =
+      summary.status === "current" || summary.status === "stale";
+    const completedFields =
+      summary.occurrenceCount !== undefined &&
+      summary.matchedKeywordCount !== undefined &&
+      summary.artifact !== undefined &&
+      summary.completedAt !== undefined;
+    const anyCompletedField =
+      summary.occurrenceCount !== undefined ||
+      summary.matchedKeywordCount !== undefined ||
+      summary.keywordCounts !== undefined ||
+      summary.artifact !== undefined ||
+      summary.completedAt !== undefined;
+    if ((completed && !completedFields) || (!completed && anyCompletedField)) {
+      context.addIssue({
+        code: "custom",
+        message:
+          "Current or stale keyword scans require complete artifact evidence.",
+      });
+    }
+    if ((summary.status === "failed") !== (summary.error !== undefined)) {
+      context.addIssue({
+        code: "custom",
+        message: "Only failed keyword scans carry bounded error evidence.",
+      });
+    }
+    if (
+      summary.keywordCounts &&
+      (new Set(summary.keywordCounts.map((entry) => entry.keywordId)).size !==
+        summary.keywordCounts.length ||
+        summary.keywordCounts.length !== summary.matchedKeywordCount ||
+        summary.keywordCounts.reduce(
+          (total, entry) => total + entry.occurrenceCount,
+          0,
+        ) !== summary.occurrenceCount)
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["keywordCounts"],
+        message: "Keyword counts must exactly match the scan aggregates.",
+      });
+    }
+    if (
+      summary.priorResult &&
+      !["queued", "scanning", "failed"].includes(summary.status)
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["priorResult"],
+        message:
+          "Prior keyword evidence is exposed only while a replacement is queued, scanning, or failed.",
+      });
+    }
+    const hasPersistedScan = ![
+      "not_scanned",
+      "waiting_for_transcript",
+    ].includes(summary.status);
+    if (hasPersistedScan !== (summary.scanId !== undefined)) {
+      context.addIssue({
+        code: "custom",
+        path: ["scanId"],
+        message: "Persisted keyword scan states require their stable scan ID.",
+      });
+    }
+  });
+
+export const ProjectKeywordScanJobSchema = z
+  .object({
+    id: IdSchema,
+    projectId: IdSchema,
+    projectVideoId: IdSchema,
+    transcriptVersionId: IdSchema,
+    keywordSetVersion: z.number().int().positive(),
+    scannerSchemaVersion: z.literal(ProjectKeywordScannerSchemaVersion),
+    state: z.enum(["queued", "scanning", "completed", "failed"]),
+    attempt: z.number().int().nonnegative(),
+    approvedKeywordCount: z.number().int().nonnegative().max(200),
+    createdAt: UtcTimestampSchema,
+    updatedAt: UtcTimestampSchema,
+  })
+  .strict();
+
+export const ClaimProjectKeywordScanRequestSchema = z
+  .object({
+    leaseSeconds: z.number().int().min(30).max(3_600),
+  })
+  .strict();
+
+export const ProjectKeywordScanClaimSchema = z
+  .object({
+    job: ProjectKeywordScanJobSchema,
+    workerId: IdSchema,
+    attempt: z.number().int().positive(),
+    claimedAt: UtcTimestampSchema,
+    heartbeatAt: UtcTimestampSchema,
+    expiresAt: UtcTimestampSchema,
+  })
+  .strict();
+
+export const HeartbeatProjectKeywordScanRequestSchema = z
+  .object({
+    attempt: z.number().int().positive(),
+    leaseSeconds: z.number().int().min(30).max(3_600),
+  })
+  .strict();
+
+export const GetProjectKeywordScanInputRequestSchema = z
+  .object({
+    attempt: z.number().int().positive(),
+  })
+  .strict();
+
+export const FinalizeProjectKeywordScanRequestSchema = z
+  .object({
+    attempt: z.number().int().positive(),
+    artifact: ProjectKeywordMatchArtifactDescriptorSchema,
+    occurrenceCount: z.number().int().nonnegative().max(50_000),
+    matchedKeywordCount: z.number().int().nonnegative().max(200),
+    keywordCounts: z.array(ProjectKeywordOccurrenceCountSchema).max(200),
+    durationMs: z.number().int().positive().optional(),
+  })
+  .strict()
+  .superRefine((result, context) => {
+    if (
+      new Set(result.keywordCounts.map((entry) => entry.keywordId)).size !==
+        result.keywordCounts.length ||
+      result.keywordCounts.length !== result.matchedKeywordCount ||
+      result.keywordCounts.reduce(
+        (total, entry) => total + entry.occurrenceCount,
+        0,
+      ) !== result.occurrenceCount
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["keywordCounts"],
+        message: "Keyword counts must exactly match the scan aggregates.",
+      });
+    }
+  });
+
+export const FailProjectKeywordScanRequestSchema = z
+  .object({
+    attempt: z.number().int().positive(),
+    error: z
+      .object({
+        code: z.string().trim().min(1).max(120),
+        message: z.string().trim().min(1).max(500),
+      })
+      .strict(),
+  })
+  .strict();
+
+export const CreateProjectKeywordScanArtifactUploadRequestSchema = z
+  .object({
+    attempt: z.number().int().positive(),
+  })
+  .strict();
+
+export const ProjectKeywordScanArtifactUploadGrantSchema = z
+  .object({
+    scanId: IdSchema,
+    objectKey: z.string().trim().min(1).max(1_024),
+    uploadUrl: z.url(),
+    expiresAt: UtcTimestampSchema,
+  })
+  .strict();
+
+export const ProjectKeywordScanArtifactDownloadTargetSchema = z
+  .object({
+    scanId: IdSchema,
+    artifact: ProjectKeywordMatchArtifactDescriptorSchema,
+    downloadUrl: z.url(),
+    expiresAt: UtcTimestampSchema,
+  })
+  .strict();
+
+export const UpdateProjectLocalProcessingRequestSchema = z
+  .object({
+    state: ProjectLocalProcessingStateSchema,
+    expectedVersion: z.number().int().positive(),
+    idempotencyKey: z.string().trim().min(1).max(512),
+  })
+  .strict();
+
+export const UpdateProjectLocalProcessingResponseSchema =
+  ProjectLocalProcessingStatusSchema.extend({
+    enqueuedCount: z.number().int().min(0).max(50),
+    remainingUnprocessedCount: z.number().int().nonnegative(),
+  }).strict();
+
+export const UpdateOwnProjectVideoFlagRequestSchema = z
+  .object({
+    active: z.boolean(),
+    expectedVersion: z.number().int().nonnegative(),
+  })
+  .strict();
+
+export const ProjectVideoOwnFlagResponseSchema = z.object({
+  projectId: IdSchema,
+  videoId: IdSchema,
+  flag: ProjectVideoOwnFlagSchema,
+});
+
+export const UpdateProjectVideoClaimRequestSchema = z
+  .object({
+    action: z.enum(["claim", "renew", "release"]),
+    idempotencyKey: z.string().trim().min(1).max(512),
+    expectedClaimVersion: z.number().int().nonnegative(),
+    leaseSeconds: z.number().int().min(60).max(900).optional(),
+    takeoverConfirmed: z.boolean().optional(),
+  })
+  .strict()
+  .superRefine((command, context) => {
+    if (
+      (command.action === "release" && command.leaseSeconds !== undefined) ||
+      (command.action !== "claim" && command.takeoverConfirmed !== undefined)
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "Claim command fields do not match the requested action.",
+      });
+    }
+    if (command.action !== "release" && command.leaseSeconds === undefined) {
+      context.addIssue({
+        code: "custom",
+        path: ["leaseSeconds"],
+        message: "Claim and renew commands require a bounded lease.",
+      });
+    }
+  });
+
+export const ProjectVideoClaimResponseSchema = z.object({
+  projectId: IdSchema,
+  videoId: IdSchema,
+  claim: ProjectVideoClaimSchema.optional(),
+});
+
+export const UpdateProjectVideoGovernanceRequestSchema = z
+  .object({
+    idempotencyKey: z.string().trim().min(1).max(512),
+    expectedProjectVideoVersion: z.number().int().positive(),
+    priority: ProjectVideoPrioritySchema.optional(),
+    completionPolicy: ProjectVideoReviewCompletionPolicySchema.optional(),
+  })
+  .strict()
+  .refine(
+    (command) =>
+      command.priority !== undefined || command.completionPolicy !== undefined,
+    { message: "A priority or completion policy change is required." },
+  );
+
+export const ProjectVideoGovernanceResponseSchema = z.object({
+  projectId: IdSchema,
+  videoId: IdSchema,
+  priority: ProjectVideoPrioritySchema,
+  completionPolicy: ProjectVideoReviewCompletionPolicySchema,
+  projectVideoVersion: z.number().int().positive(),
+  updatedAt: UtcTimestampSchema,
+});
+
+export const BulkUpdateProjectVideoPriorityRequestSchema = z
+  .object({
+    priority: ProjectVideoPrioritySchema,
+    items: z
+      .array(
+        z
+          .object({
+            videoId: IdSchema,
+            expectedProjectVideoVersion: z.number().int().positive(),
+          })
+          .strict(),
+      )
+      .min(1)
+      .max(50),
+    idempotencyKey: z.string().trim().min(1).max(512),
+  })
+  .strict()
+  .refine(
+    (command) =>
+      new Set(command.items.map((item) => item.videoId)).size ===
+      command.items.length,
+    { message: "A bulk priority command cannot repeat a video." },
+  );
+
+export const BulkUpdateProjectVideoPriorityResponseSchema = z.object({
+  projectId: IdSchema,
+  priority: ProjectVideoPrioritySchema,
+  items: z.array(ProjectVideoGovernanceResponseSchema).min(1).max(50),
+});
+
+export const UpdateProjectVideoReviewRequestSchema = z
+  .object({
+    action: z.enum(["complete", "reopen"]),
+    idempotencyKey: z.string().trim().min(1).max(512),
+    expectedCycleId: IdSchema,
+    expectedCycleVersion: z.number().int().positive(),
+    acknowledgeTranscriptUnavailable: z.boolean().optional(),
+    reason: z.string().trim().min(1).max(1_000).optional(),
+  })
+  .strict()
+  .superRefine((command, context) => {
+    if (
+      (command.action === "complete" && command.reason !== undefined) ||
+      (command.action === "reopen" &&
+        (command.reason === undefined ||
+          command.acknowledgeTranscriptUnavailable !== undefined))
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "Review command fields do not match the requested action.",
+      });
+    }
+  });
+
+export const ProjectVideoReviewResponseSchema = z.object({
+  projectId: IdSchema,
+  videoId: IdSchema,
+  review: ProjectVideoReviewCycleSchema,
+});
+
+export const UpdateProjectVideoTriageRequestSchema = z
+  .object({
+    action: z.enum(["dismiss", "restore"]),
+    idempotencyKey: z.string().trim().min(1).max(512),
+    items: z
+      .array(
+        z
+          .object({
+            videoId: IdSchema,
+            expectedProjectVideoVersion: z.number().int().positive(),
+          })
+          .strict(),
+      )
+      .min(1)
+      .max(50),
+    reason: z.string().trim().min(1).max(1_000).optional(),
+  })
+  .strict()
+  .superRefine((command, context) => {
+    if (
+      new Set(command.items.map((item) => item.videoId)).size !==
+      command.items.length
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["items"],
+        message: "A bulk triage command cannot repeat a video.",
+      });
+    }
+    if (command.action === "restore" && command.reason !== undefined) {
+      context.addIssue({
+        code: "custom",
+        path: ["reason"],
+        message: "Restore commands do not accept a dismissal reason.",
+      });
+    }
+  });
+
+export const ProjectVideoTriageResultSchema = z.object({
+  videoId: IdSchema,
+  projectVideoVersion: z.number().int().positive(),
+  triage: ProjectVideoTriageSchema,
+});
+
+export const ProjectVideoTriageResponseSchema = z.object({
+  projectId: IdSchema,
+  items: z.array(ProjectVideoTriageResultSchema).min(1).max(50),
+  cancellation: z.object({
+    queuedJobsCanceled: z.number().int().nonnegative(),
+    activeJobsRequested: z.number().int().nonnegative(),
+    requestsRevoked: z.number().int().nonnegative(),
+  }),
+});
+
+export const ProjectVideoActivityEventTypeSchema = z.enum([
+  "review_completed",
+  "review_reopened",
+  "video_dismissed",
+  "video_restored",
+  "keyword_scan_completed",
+]);
+
+export const ProjectVideoActivityReceiptSchema = z.object({
+  eventId: IdSchema,
+  projectId: IdSchema,
+  videoId: IdSchema,
+  videoTitle: z.string().trim().min(1).max(500),
+  eventType: ProjectVideoActivityEventTypeSchema,
+  actor: ProjectVideoReviewActorSchema,
+  reason: z.string().trim().min(1).max(1_000).optional(),
+  state: z.enum(["unread", "seen"]),
+  version: z.number().int().positive(),
+  createdAt: UtcTimestampSchema,
+  seenAt: UtcTimestampSchema.optional(),
+});
+
+export const ProjectVideoActivityQuerySchema = z
+  .object({
+    cursor: z.string().min(1).max(2_048).optional(),
+    limit: z.coerce.number().int().min(1).max(50).default(25),
+    state: z.enum(["all", "unread", "seen"]).default("all"),
+  })
+  .strict();
+
+export const ProjectVideoActivityPageSchema = z.object({
+  items: z.array(ProjectVideoActivityReceiptSchema).max(50),
+  unreadCount: z.number().int().nonnegative(),
+  nextCursor: z.string().min(1).max(2_048).optional(),
+});
+
+export const MarkProjectVideoActivitySeenRequestSchema = z
+  .object({
+    items: z
+      .array(
+        z
+          .object({
+            eventId: IdSchema,
+            expectedVersion: z.number().int().positive(),
+          })
+          .strict(),
+      )
+      .min(1)
+      .max(50),
+  })
+  .strict()
+  .refine(
+    (command) =>
+      new Set(command.items.map((item) => item.eventId)).size ===
+      command.items.length,
+    { message: "A mark-seen command cannot repeat an event." },
+  );
+
+export const MarkProjectVideoActivitySeenResponseSchema = z.object({
+  projectId: IdSchema,
+  items: z.array(ProjectVideoActivityReceiptSchema).min(1).max(50),
+});
+
+/**
+ * A closed, renderer-safe statement of the current language evidence state.
+ * Provider claims remain distinct from an authorized resolution.
+ */
+export const LanguageDecisionStatusSchema = z.enum([
+  "unverified",
+  "confirmed",
+  "conflict",
+  "unknown",
+  "mixed",
+]);
+
+export const LanguageDecisionBasisSchema = z.enum([
+  "provider_metadata",
+  "creator_metadata",
+  "user_confirmation",
+  "speech_detection",
+  "manual_transcript",
+]);
+
+const LanguageEvidenceSourceSchema = z.enum([
+  "creator_metadata",
+  "caption",
+  "speech_detection",
+  "manual_transcript",
+]);
+
+const BoundedProviderSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(160)
+  .regex(
+    /^[a-z0-9](?:[a-z0-9.-]{0,158}[a-z0-9])?$/,
+    "Provider identifiers must be bounded lowercase names, not paths or URLs.",
+  );
+const Sha256Schema = z.string().regex(/^[a-f0-9]{64}$/);
+
+export const ProviderLanguageEvidenceSchema = z
+  .object({
+    id: IdSchema,
+    projectId: IdSchema,
+    videoId: IdSchema,
+    source: LanguageEvidenceSourceSchema,
+    provider: BoundedProviderSchema,
+    reportedLanguage: LanguageTagSchema.optional(),
+    trackFingerprint: Sha256Schema.optional(),
+    captionKind: z.enum(["manual", "automatic"]).optional(),
+    jobId: IdSchema.optional(),
+    attempt: z.number().int().positive().optional(),
+    createdAt: UtcTimestampSchema,
+  })
+  .strict()
+  .superRefine((evidence, context) => {
+    if ((evidence.jobId === undefined) !== (evidence.attempt === undefined)) {
+      context.addIssue({
+        code: "custom",
+        path: [evidence.jobId === undefined ? "attempt" : "jobId"],
+        message:
+          "Worker language evidence must include both job ID and attempt.",
+      });
+    }
+    if (evidence.source === "caption" && evidence.captionKind === undefined) {
+      context.addIssue({
+        code: "custom",
+        path: ["captionKind"],
+        message:
+          "Caption evidence must identify whether it is manual or automatic.",
+      });
+    }
+    if (evidence.source !== "caption" && evidence.captionKind !== undefined) {
+      context.addIssue({
+        code: "custom",
+        path: ["captionKind"],
+        message: "Only caption evidence can include a caption kind.",
+      });
+    }
+  });
+
+export const ProjectVideoLanguageDecisionSchema = z
+  .object({
+    id: IdSchema,
+    projectId: IdSchema,
+    videoId: IdSchema,
+    decisionVersion: z.number().int().positive(),
+    status: LanguageDecisionStatusSchema,
+    basis: LanguageDecisionBasisSchema,
+    resolvedLanguage: LanguageTagSchema.optional(),
+    evidenceId: IdSchema.optional(),
+    actorId: IdSchema,
+    createdAt: UtcTimestampSchema,
+  })
+  .strict()
+  .superRefine((decision, context) => {
+    if (
+      decision.status === "confirmed" &&
+      decision.resolvedLanguage === undefined
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["resolvedLanguage"],
+        message: "A confirmed language decision must resolve a language.",
+      });
+    }
+  });
+
+/** Immutable decision identity carried by queued work and manifests. */
+export const LanguageDecisionSnapshotSchema = z
+  .object({
+    schemaVersion: z.literal(1),
+    decisionId: IdSchema,
+    decisionVersion: z.number().int().positive(),
+    status: LanguageDecisionStatusSchema,
+    basis: LanguageDecisionBasisSchema,
+    resolvedLanguage: LanguageTagSchema.optional(),
+    evidenceId: IdSchema.optional(),
+  })
+  .strict()
+  .superRefine((snapshot, context) => {
+    if (
+      snapshot.status === "confirmed" &&
+      snapshot.resolvedLanguage === undefined
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["resolvedLanguage"],
+        message: "A confirmed language snapshot must resolve a language.",
+      });
+    }
+  });
+
+export const LanguageCapabilityReasonSchema = z.enum([
+  "provider_not_configured",
+  "language_not_supported",
+  "capability_not_advertised",
+  "provider_unavailable",
+  "configuration_unknown",
+]);
+
+const LanguageCapabilityBaseSchema = z
+  .object({
+    provider: BoundedProviderSchema,
+    operation: z.enum(["speech_to_text", "translation"]),
+    sourceLanguage: LanguageTagSchema.optional(),
+    targetLanguage: LanguageTagSchema.optional(),
+    version: BoundedProviderSchema.optional(),
+  })
+  .strict();
+
+export const LanguageCapabilityResultSchema = z.discriminatedUnion("state", [
+  LanguageCapabilityBaseSchema.extend({ state: z.literal("supported") }),
+  LanguageCapabilityBaseSchema.extend({
+    state: z.literal("unsupported"),
+    reason: LanguageCapabilityReasonSchema,
+  }),
+  LanguageCapabilityBaseSchema.extend({
+    state: z.literal("unknown"),
+    reason: LanguageCapabilityReasonSchema,
+  }),
+]);
+
+export const LanguageGateRemediationReasonSchema = z.enum([
+  "confirm_language",
+  "resolve_conflict",
+  "select_supported_provider",
+  "none",
+]);
+
+export const LanguageGateStateSchema = z.enum([
+  "ready",
+  "needs_language_confirmation",
+  "needs_transcript",
+  "needs_translation",
+]);
+
+export const LanguageGateSchema = z
+  .object({
+    state: LanguageGateStateSchema,
+    status: LanguageDecisionStatusSchema,
+    creatorReportedLanguage: LanguageTagSchema.optional(),
+    providerEvidence: ProviderLanguageEvidenceSchema.optional(),
+    decision: ProjectVideoLanguageDecisionSchema.optional(),
+    speechCapability: LanguageCapabilityResultSchema.optional(),
+    translationCapability: LanguageCapabilityResultSchema.optional(),
+    remediationReason: LanguageGateRemediationReasonSchema,
+  })
+  .strict()
+  .superRefine((gate, context) => {
+    if (gate.state === "ready" && gate.status === "conflict") {
+      context.addIssue({
+        code: "custom",
+        path: ["status"],
+        message: "A conflicting language decision cannot pass the gate.",
+      });
+    }
+    if (gate.state === "ready" && gate.remediationReason !== "none") {
+      context.addIssue({
+        code: "custom",
+        path: ["remediationReason"],
+        message: "A ready language gate cannot require remediation.",
+      });
+    }
+    if (gate.state !== "ready" && gate.remediationReason === "none") {
+      context.addIssue({
+        code: "custom",
+        path: ["remediationReason"],
+        message: "An actionable language gate must provide remediation.",
+      });
+    }
+  });
+
+export const CreateProjectVideoLanguageDecisionRequestSchema = z
+  .object({
+    idempotencyKey: z.string().trim().min(1).max(512),
+    expectedDecisionVersion: z.number().int().nonnegative(),
+    resolvedLanguage: LanguageTagSchema,
+    basis: z.literal("user_confirmation"),
+    evidenceId: IdSchema.optional(),
+    batchItemId: IdSchema.optional(),
+    expectedBatchItemVersion: z.number().int().positive().optional(),
+  })
+  .strict()
+  .superRefine((command, context) => {
+    if (
+      (command.batchItemId === undefined) !==
+      (command.expectedBatchItemVersion === undefined)
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: [
+          command.batchItemId === undefined
+            ? "expectedBatchItemVersion"
+            : "batchItemId",
+        ],
+        message:
+          "Batch-item language confirmation requires both item ID and expected version.",
+      });
+    }
+  });
+
+export const ProjectVideoLanguageDecisionResponseSchema = z
+  .object({
+    decision: ProjectVideoLanguageDecisionSchema,
+    gate: LanguageGateSchema,
+  })
+  .strict();
+
+export const WorkerObserveLanguageEvidenceRequestSchema = z
+  .object({
+    attempt: z.number().int().positive(),
+    evidence: ProviderLanguageEvidenceSchema,
+    speechCapability: LanguageCapabilityResultSchema.optional(),
+    translationCapability: LanguageCapabilityResultSchema.optional(),
+  })
+  .strict()
+  .superRefine((request, context) => {
+    if (request.evidence.attempt !== request.attempt) {
+      context.addIssue({
+        code: "custom",
+        path: ["evidence", "attempt"],
+        message: "Observed evidence attempt must match the worker request.",
+      });
+    }
+  });
+
+export const WorkerObserveLanguageEvidenceResponseSchema = z
+  .object({
+    evidence: ProviderLanguageEvidenceSchema,
+    gate: LanguageGateSchema,
+  })
+  .strict();
+
 export const TimingPrecisionSchema = z.enum(["word", "cue", "estimated"]);
 
 export const TranscriptSourceSchema = z.enum([
   "youtube-manual",
   "youtube-auto",
+  "manual-import",
   "generated",
   "translated",
   "fixture",
@@ -641,6 +2597,9 @@ export const NormalizedTranscriptSchema = z.object({
 
 export const TranscriptSelectionSchema = z
   .object({
+    // Missing only for historical payload compatibility; every new producer
+    // emits the explicit discriminant.
+    selectionType: z.literal("transcript_range").optional(),
     trackId: IdSchema,
     transcriptVersion: z.number().int().positive(),
     firstSegmentId: IdSchema,
@@ -670,6 +2629,112 @@ export const TranscriptSelectionSchema = z
     message: "Export end must include the transcript selection.",
   });
 
+export const NoSpeechAttestationSchema = z
+  .object({
+    schemaVersion: z.literal(1),
+    actor: z
+      .object({
+        id: IdSchema,
+        handle: UserHandleSchema,
+        displayName: z.string().trim().min(1).max(160),
+      })
+      .strict(),
+    attestedAt: UtcTimestampSchema,
+  })
+  .strict();
+
+export const PlayerTimeRangeSelectionSchema = z
+  .object({
+    selectionType: z.literal("player_time_range"),
+    sourceStartMs: z.number().int().nonnegative(),
+    sourceEndMs: z.number().int().positive(),
+    exportStartMs: z.number().int().nonnegative(),
+    exportEndMs: z.number().int().positive(),
+    origin: z.literal("manual_player"),
+    speechStatus: z.enum(["speech", "no_speech", "transcript_unavailable"]),
+    transcriptAttachment: TranscriptSelectionSchema.optional(),
+    noSpeechAttestation: NoSpeechAttestationSchema.optional(),
+    // Explicitly absent transcript-only fields keep generic read code honest
+    // without fabricating values.
+    trackId: z.never().optional(),
+    transcriptVersion: z.never().optional(),
+    firstSegmentId: z.never().optional(),
+    lastSegmentId: z.never().optional(),
+    firstTokenId: z.never().optional(),
+    lastTokenId: z.never().optional(),
+    transcriptStartMs: z.never().optional(),
+    transcriptEndMs: z.never().optional(),
+    text: z.never().optional(),
+    timingPrecision: z.never().optional(),
+  })
+  .strict()
+  .superRefine((selection, context) => {
+    if (selection.sourceEndMs <= selection.sourceStartMs) {
+      context.addIssue({
+        code: "custom",
+        path: ["sourceEndMs"],
+        message: "Player range end must be after its start.",
+      });
+    }
+    if (selection.exportStartMs > selection.sourceStartMs) {
+      context.addIssue({
+        code: "custom",
+        path: ["exportStartMs"],
+        message: "Export start must include the player source range.",
+      });
+    }
+    if (selection.exportEndMs < selection.sourceEndMs) {
+      context.addIssue({
+        code: "custom",
+        path: ["exportEndMs"],
+        message: "Export end must include the player source range.",
+      });
+    }
+    if (selection.exportEndMs <= selection.exportStartMs) {
+      context.addIssue({
+        code: "custom",
+        path: ["exportEndMs"],
+        message: "Player export bounds must be nonempty.",
+      });
+    }
+    const attested = selection.speechStatus === "no_speech";
+    if (attested !== Boolean(selection.noSpeechAttestation)) {
+      context.addIssue({
+        code: "custom",
+        path: ["noSpeechAttestation"],
+        message:
+          "Only an explicit no-speech range requires actor and time attestation.",
+      });
+    }
+    if (selection.speechStatus !== "speech" && selection.transcriptAttachment) {
+      context.addIssue({
+        code: "custom",
+        path: ["transcriptAttachment"],
+        message: "Only a speech range can attach transcript evidence.",
+      });
+    }
+    const attachment = selection.transcriptAttachment;
+    if (
+      attachment &&
+      (attachment.transcriptStartMs < selection.sourceStartMs ||
+        attachment.transcriptEndMs > selection.sourceEndMs ||
+        attachment.exportStartMs !== selection.exportStartMs ||
+        attachment.exportEndMs !== selection.exportEndMs)
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["transcriptAttachment"],
+        message:
+          "Attached transcript evidence must be clipped to the player source range and preserve its exact export bounds.",
+      });
+    }
+  });
+
+export const ClipSelectionSchema = z.union([
+  TranscriptSelectionSchema,
+  PlayerTimeRangeSelectionSchema,
+]);
+
 export const ClipResearchStatusSchema = z.enum([
   "candidate",
   "approved",
@@ -694,6 +2759,7 @@ export const ClipTagNameSchema = z
 export const ClipVideoSnapshotSchema = z.object({
   youtubeVideoId: z.string().min(1).max(64),
   canonicalUrl: z.url(),
+  sourceIdentity: SourceIdentityV1Schema.optional(),
   title: z.string().trim().min(1).max(500),
   channel: z.string().trim().min(1).max(300).optional(),
   sourceLanguage: LanguageTagSchema.optional(),
@@ -771,27 +2837,427 @@ export const LegacyClipLanguageEvidenceSchema = z.object({
   originalText: z.string().min(1).optional(),
 });
 
+export const UnavailableClipLanguageEvidenceSchema = z
+  .object({
+    schemaVersion: z.literal(3),
+    state: z.literal("unavailable"),
+    reason: z.enum(["speech", "no_speech", "transcript_unavailable"]),
+  })
+  .strict();
+
 export const ClipLanguageEvidenceSchema = z.union([
   ClipLanguageEvidenceV2Schema,
   LegacyClipLanguageEvidenceSchema,
+  UnavailableClipLanguageEvidenceSchema,
 ]);
 
-export const CreateClipCandidateRequestSchema = z.object({
-  idempotencyKey: z.string().trim().min(1).max(512),
-  video: ClipVideoSnapshotSchema,
-  selection: TranscriptSelectionSchema,
-  languageEvidence: ClipLanguageEvidenceV2Schema,
-  notes: z.string().trim().max(20_000).default(""),
-  tags: z.array(ClipTagNameSchema).max(50).default([]),
+export const ClipCommentAuthorSnapshotSchema = z
+  .object({
+    id: IdSchema,
+    handle: UserHandleSchema,
+    displayName: z.string().trim().min(1).max(160),
+  })
+  .strict();
+const ClipCommentBaseSchema = z.object({
+  id: IdSchema,
+  projectId: IdSchema,
+  clipId: IdSchema,
+  author: ClipCommentAuthorSnapshotSchema,
+  sourceTimeMs: z.number().int().nonnegative().optional(),
+  version: z.number().int().positive(),
+  createdAt: UtcTimestampSchema,
+  updatedAt: UtcTimestampSchema,
+  mentions: z.array(ClipCommentAuthorSnapshotSchema).max(50).optional(),
 });
+export const ActiveClipCommentSchema = ClipCommentBaseSchema.extend({
+  status: z.literal("active"),
+  body: z.string().trim().min(1).max(20_000),
+}).strict();
+export const DeletedClipCommentSchema = ClipCommentBaseSchema.extend({
+  status: z.literal("deleted"),
+  deletionKind: z.enum(["author", "moderation"]),
+  deletedBy: ClipCommentAuthorSnapshotSchema,
+  deletedAt: UtcTimestampSchema,
+}).strict();
+export const ClipCommentSchema = z.discriminatedUnion("status", [
+  ActiveClipCommentSchema,
+  DeletedClipCommentSchema,
+]);
+export const InitialClipCommentSchema = z
+  .object({
+    body: z.string().trim().min(1).max(20_000),
+    sourceTimeMs: z.number().int().nonnegative().optional(),
+  })
+  .strict();
+export const CreateClipCommentRequestSchema = InitialClipCommentSchema.extend({
+  idempotencyKey: z.string().trim().min(1).max(512),
+}).strict();
+export const UpdateClipCommentRequestSchema = z
+  .object({
+    idempotencyKey: z.string().trim().min(1).max(512),
+    expectedVersion: z.number().int().positive(),
+    body: z.string().trim().min(1).max(20_000),
+    sourceTimeMs: z.number().int().nonnegative().nullable().optional(),
+  })
+  .strict();
+export const DeleteClipCommentRequestSchema = z
+  .object({
+    idempotencyKey: z.string().trim().min(1).max(512),
+    expectedVersion: z.number().int().positive(),
+  })
+  .strict();
+export const ModerateClipCommentRequestSchema = DeleteClipCommentRequestSchema;
+export const ClipCommentListQuerySchema = z
+  .object({
+    limit: z.coerce.number().int().min(1).max(50).default(25),
+    cursor: z
+      .string()
+      .regex(/^[A-Za-z0-9_-]{10,1024}$/)
+      .optional(),
+  })
+  .strict();
+export const ClipCommentPageSchema = z
+  .object({
+    projectId: IdSchema,
+    clipId: IdSchema,
+    comments: z.array(ClipCommentSchema).max(50),
+    nextCursor: z.string().optional(),
+    fetchedAt: UtcTimestampSchema,
+  })
+  .strict();
+
+export const OfflineClipCommentCommandTypeSchema = z.enum([
+  "clip_comment.create.v1",
+  "clip_comment.update.v1",
+  "clip_comment.delete.v1",
+]);
+export const OfflineClipCommentMutationResultSchema = z.discriminatedUnion(
+  "state",
+  [
+    z
+      .object({
+        state: z.literal("applied"),
+        outboxId: IdSchema,
+        comment: ClipCommentSchema,
+      })
+      .strict(),
+    z
+      .object({
+        state: z.literal("queued"),
+        outboxId: IdSchema,
+        commandType: OfflineClipCommentCommandTypeSchema,
+      })
+      .strict(),
+    z
+      .object({
+        state: z.literal("conflict"),
+        outboxId: IdSchema,
+        commandType: OfflineClipCommentCommandTypeSchema,
+        code: z.string().trim().min(1).max(160),
+      })
+      .strict(),
+  ],
+);
+export const OfflineClipCommentReplayResultSchema = z
+  .object({
+    applied: z.number().int().nonnegative(),
+    queued: z.number().int().nonnegative(),
+    conflicts: z.number().int().nonnegative(),
+  })
+  .strict();
+
+export const ClipFollowSchema = z
+  .object({
+    projectId: IdSchema,
+    clipId: IdSchema,
+    userId: IdSchema,
+    following: z.boolean(),
+    version: z.number().int().positive(),
+    updatedAt: UtcTimestampSchema,
+  })
+  .strict();
+export const UpdateClipFollowRequestSchema = z
+  .object({
+    idempotencyKey: z.string().trim().min(1).max(512),
+    following: z.boolean(),
+  })
+  .strict();
+export const ClipCommentNoticeSchema = z
+  .object({
+    id: IdSchema,
+    projectId: IdSchema,
+    clipId: IdSchema,
+    commentId: IdSchema,
+    commentVersion: z.number().int().positive(),
+    reason: z.enum(["mention", "followed_comment"]),
+    actor: ClipCommentAuthorSnapshotSchema,
+    sourceTimeMs: z.number().int().nonnegative().optional(),
+    state: z.enum(["unread", "seen"]),
+    version: z.number().int().positive(),
+    createdAt: UtcTimestampSchema,
+    seenAt: UtcTimestampSchema.optional(),
+  })
+  .strict();
+export const ClipCommentNoticePageSchema = z
+  .object({
+    notices: z.array(ClipCommentNoticeSchema).max(50),
+    unreadCount: z.number().int().nonnegative(),
+    fetchedAt: UtcTimestampSchema,
+  })
+  .strict();
+export const MarkClipCommentNoticeSeenRequestSchema = z
+  .object({ expectedVersion: z.number().int().positive() })
+  .strict();
+
+const TranscriptionNotificationNavigationTargetSchema = z
+  .object({
+    kind: z.literal("transcription"),
+    projectId: IdSchema,
+    batchId: IdSchema,
+    videoId: IdSchema.optional(),
+  })
+  .strict();
+const LoggedExportNotificationNavigationTargetSchema = z
+  .object({
+    kind: z.literal("logged_export"),
+    projectId: IdSchema,
+    clipId: IdSchema,
+    requestId: IdSchema,
+  })
+  .strict();
+const LocalExportNotificationNavigationTargetSchema = z
+  .object({
+    kind: z.literal("local_export"),
+    requestId: IdSchema,
+  })
+  .strict();
+const MentionNotificationNavigationTargetSchema = z
+  .object({
+    kind: z.literal("mention"),
+    projectId: IdSchema,
+    clipId: IdSchema,
+    commentId: IdSchema,
+    sourceTimeMs: z.number().int().nonnegative().optional(),
+  })
+  .strict();
+export const DesktopNotificationNavigationTargetSchema = z.discriminatedUnion(
+  "kind",
+  [
+    TranscriptionNotificationNavigationTargetSchema,
+    LoggedExportNotificationNavigationTargetSchema,
+    LocalExportNotificationNavigationTargetSchema,
+    MentionNotificationNavigationTargetSchema,
+  ],
+);
+
+const NotificationSafeLabelSchema = z.string().trim().min(1).max(160);
+export function sanitizeNotificationLabel(value: unknown): string {
+  const normalized = String(value ?? "")
+    .normalize("NFKC")
+    .replaceAll(/https?:\/\/[^\s'"<>]+/giu, "<url>")
+    .replaceAll(/file:\/\/[^\s'"<>]+/giu, "<path>")
+    .replaceAll(/\\\\[^\s'"]+/gu, "<path>")
+    .replaceAll(/\b[A-Za-z]:\\[^\s'"]+/gu, "<path>")
+    .replaceAll(/(^|\s)\/(?:[^\s'"]+)/gu, "$1<path>")
+    .replaceAll(/\bBearer\s+[A-Za-z0-9._~+\/-]+={0,2}/giu, "Bearer <redacted>")
+    .replaceAll(
+      /\b(token|secret|credential|authorization)=\S+/giu,
+      "$1=<redacted>",
+    )
+    .replaceAll(/[\u0000-\u001f\u007f]+/gu, " ")
+    .replaceAll(/\s+/gu, " ")
+    .trim();
+  return (normalized || "Untitled").slice(0, 160);
+}
+const NotificationEventBaseSchema = z.object({
+  id: IdSchema,
+  createdAt: UtcTimestampSchema,
+  projectLabel: NotificationSafeLabelSchema.optional(),
+  sourceLabel: NotificationSafeLabelSchema.optional(),
+  clipLabel: NotificationSafeLabelSchema.optional(),
+});
+
+export const NotificationEventSchema = z.discriminatedUnion("kind", [
+  NotificationEventBaseSchema.extend({
+    kind: z.literal("transcription_batch_terminal"),
+    status: z.enum(["ready", "action_needed"]),
+    batchLabel: NotificationSafeLabelSchema,
+    navigation: TranscriptionNotificationNavigationTargetSchema,
+  }).strict(),
+  NotificationEventBaseSchema.extend({
+    kind: z.literal("transcription_action_needed"),
+    status: z.enum(["blocked", "failed", "action_needed"]),
+    batchLabel: NotificationSafeLabelSchema,
+    navigation: TranscriptionNotificationNavigationTargetSchema,
+  }).strict(),
+  NotificationEventBaseSchema.extend({
+    kind: z.literal("logged_export_terminal"),
+    status: z.enum(["completed", "action_needed"]),
+    navigation: LoggedExportNotificationNavigationTargetSchema,
+  }).strict(),
+  NotificationEventBaseSchema.extend({
+    kind: z.literal("local_export_terminal"),
+    status: z.enum(["completed", "action_needed"]),
+    navigation: LocalExportNotificationNavigationTargetSchema,
+  }).strict(),
+  NotificationEventBaseSchema.extend({
+    kind: z.literal("mention"),
+    status: z.literal("mentioned"),
+    actorLabel: NotificationSafeLabelSchema,
+    navigation: MentionNotificationNavigationTargetSchema,
+  }).strict(),
+]);
+
+export const NotificationFeedQuerySchema = z
+  .object({
+    limit: z.coerce.number().int().min(1).max(50).default(25),
+    cursor: z
+      .string()
+      .regex(/^[A-Za-z0-9_-]{10,1024}$/)
+      .optional(),
+    since: UtcTimestampSchema.optional(),
+  })
+  .strict();
+
+export const NotificationFeedPageSchema = z
+  .object({
+    events: z.array(NotificationEventSchema).max(50),
+    nextCursor: z.string().optional(),
+    fetchedAt: UtcTimestampSchema,
+  })
+  .strict();
+
+export const DesktopNotificationPreferencesSchema = z
+  .object({
+    enabled: z.boolean(),
+    enabledAt: UtcTimestampSchema.optional(),
+    updatedAt: UtcTimestampSchema,
+  })
+  .strict()
+  .superRefine((preferences, context) => {
+    if (preferences.enabled !== Boolean(preferences.enabledAt)) {
+      context.addIssue({
+        code: "custom",
+        path: ["enabledAt"],
+        message: "Enabled desktop notifications require an activation time.",
+      });
+    }
+  });
+
+export const UpdateDesktopNotificationPreferencesSchema = z
+  .object({ enabled: z.boolean() })
+  .strict();
+
+export const DesktopNotificationSupportStatusSchema = z
+  .object({
+    available: z.boolean(),
+    reason: z.enum(["available", "browser_runtime", "unsupported_platform"]),
+  })
+  .strict();
+
+export const AuthoringPromotedCommentSchema = z
+  .object({
+    commentId: IdSchema,
+    version: z.number().int().positive(),
+    text: z.string().trim().min(1).max(20_000),
+    author: ClipCommentAuthorSnapshotSchema,
+    sourceTimeMs: z.number().int().nonnegative().optional(),
+  })
+  .strict();
+export const CreateAuthoringBuildSnapshotRequestSchema = z
+  .object({
+    idempotencyKey: z.string().trim().min(1).max(512),
+    clips: z
+      .array(
+        z
+          .object({
+            clipId: IdSchema,
+            expectedClipVersion: z.number().int().positive(),
+            promotedComments: z
+              .array(
+                z
+                  .object({
+                    commentId: IdSchema,
+                    expectedVersion: z.number().int().positive(),
+                  })
+                  .strict(),
+              )
+              .max(50)
+              .default([]),
+          })
+          .strict(),
+      )
+      .min(1)
+      .max(100),
+  })
+  .strict();
+export const AuthoringBuildClipSnapshotSchema = z
+  .object({
+    clipId: IdSchema,
+    clipVersion: z.number().int().positive(),
+    topics: z.array(ClipTagNameSchema).max(50),
+    promotedComments: z.array(AuthoringPromotedCommentSchema).max(50),
+  })
+  .strict();
+export const AuthoringBuildSnapshotSchema = z
+  .object({
+    id: IdSchema,
+    projectId: IdSchema,
+    createdBy: IdSchema,
+    clips: z.array(AuthoringBuildClipSnapshotSchema).min(1).max(100),
+    createdAt: UtcTimestampSchema,
+  })
+  .strict();
+
+export const CreateClipCandidateRequestSchema = z
+  .object({
+    idempotencyKey: z.string().trim().min(1).max(512),
+    video: ClipVideoSnapshotSchema,
+    selection: ClipSelectionSchema,
+    languageEvidence: ClipLanguageEvidenceV2Schema.optional(),
+    notes: z.string().trim().max(20_000).default(""),
+    tags: z.array(ClipTagNameSchema).max(50).default([]),
+    firstComment: InitialClipCommentSchema.optional(),
+  })
+  .strict()
+  .superRefine((request, context) => {
+    const transcriptSelection =
+      request.selection.selectionType !== "player_time_range";
+    const attached =
+      request.selection.selectionType === "player_time_range" &&
+      Boolean(request.selection.transcriptAttachment);
+    if (
+      (transcriptSelection || attached) !== Boolean(request.languageEvidence)
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["languageEvidence"],
+        message:
+          "Exact language evidence is required exactly when transcript evidence is selected or attached.",
+      });
+    }
+    if (
+      request.selection.selectionType === "player_time_range" &&
+      request.selection.speechStatus !== "speech" &&
+      !request.notes.trim() &&
+      !request.firstComment?.body.trim()
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["notes"],
+        message:
+          "No-speech and transcript-unavailable clips require a description or first comment.",
+      });
+    }
+  });
 export const ClipCandidateSchema = z.object({
   id: IdSchema,
   projectId: IdSchema,
   catalogVideoId: IdSchema,
   video: ClipVideoSnapshotSchema,
-  selection: TranscriptSelectionSchema,
+  selection: ClipSelectionSchema,
   languageEvidence: ClipLanguageEvidenceSchema,
-  englishText: z.string().min(1),
+  englishText: z.string().min(1).optional(),
   originalText: z.string().min(1).optional(),
   notes: z.string(),
   tags: z.array(ClipTagNameSchema),
@@ -801,6 +3267,9 @@ export const ClipCandidateSchema = z.object({
   version: z.number().int().positive(),
   createdAt: UtcTimestampSchema,
   updatedAt: UtcTimestampSchema,
+});
+export const CreateClipCandidateResponseSchema = ClipCandidateSchema.extend({
+  firstComment: ClipCommentSchema.optional(),
 });
 export const UpdateClipCandidateRequestSchema = z.object({
   expectedVersion: z.number().int().positive(),
@@ -1312,12 +3781,30 @@ export const ExportSourceRightsSnapshotSchema = z
     disclosureVersion: z.number().int().positive().max(1_000_000),
   })
   .strict();
+
+/** Provider-neutral rights evidence for future qualified source adapters.
+ * Existing export commands and immutable packages continue to use the legacy
+ * YouTube snapshot above until their full workflows are qualified. */
+export const SourceRightsSnapshotV2Schema = z
+  .object({
+    schemaVersion: z.literal(2),
+    sourceIdentity: SourceIdentityV1Schema,
+    confirmation: z.literal("authorized_to_process"),
+    disclosureVersion: z.number().int().positive().max(1_000_000),
+  })
+  .strict();
+
+export const SourceRightsSnapshotSchema = z.union([
+  ExportSourceRightsSnapshotSchema,
+  SourceRightsSnapshotV2Schema,
+]);
 const createExportRequestBaseSchema = z
   .object({
     idempotencyKey: z.string().trim().min(1).max(512),
     requestOrigin: ExportRequestOriginSchema.optional(),
     sourceLanguageClass: ExportSourceLanguageClassSchema,
     subtitleTracks: ExportSubtitleTrackSnapshotsSchema.optional(),
+    noSpeechAttestation: NoSpeechAttestationSchema.optional(),
     preset: ExportPresetSnapshotSchema.optional(),
     settingsSelection: ExportSettingsSelectionSchema.optional(),
     expectedResolutionFingerprint: z
@@ -1352,6 +3839,14 @@ const createExportRequestBaseSchema = z
         message: "Legacy inline presets do not accept a preview fingerprint.",
       });
     }
+    if (request.noSpeechAttestation && request.subtitleTracks) {
+      context.addIssue({
+        code: "custom",
+        path: ["subtitleTracks"],
+        message:
+          "An attested no-speech export uses empty sidecars instead of transcript tracks.",
+      });
+    }
   });
 
 function requireBilingualSubtitleTrackSnapshots(
@@ -1359,18 +3854,68 @@ function requireBilingualSubtitleTrackSnapshots(
     sourceLanguageClass: z.infer<typeof ExportSourceLanguageClassSchema>;
     subtitleTracks?:
       z.infer<typeof ExportSubtitleTrackSnapshotsSchema> | undefined;
+    noSpeechAttestation?: z.infer<typeof NoSpeechAttestationSchema> | undefined;
   },
   context: z.RefinementCtx,
 ) {
   if (
     request.sourceLanguageClass !== "confirmed_english" &&
-    !request.subtitleTracks
+    !request.subtitleTracks &&
+    !request.noSpeechAttestation
   ) {
     context.addIssue({
       code: "custom",
       path: ["subtitleTracks"],
       message:
         "Foreign, mixed, and unknown exports require immutable original and English subtitle track snapshots.",
+    });
+  }
+}
+
+function requireNoSpeechSelectionConsistency(
+  request: {
+    selection: z.infer<typeof ClipSelectionSchema>;
+    noSpeechAttestation?: z.infer<typeof NoSpeechAttestationSchema> | undefined;
+    subtitleTracks?:
+      z.infer<typeof ExportSubtitleTrackSnapshotsSchema> | undefined;
+  },
+  context: z.RefinementCtx,
+) {
+  if (
+    request.selection.selectionType === "player_time_range" &&
+    request.selection.speechStatus !== "no_speech" &&
+    !request.selection.transcriptAttachment
+  ) {
+    context.addIssue({
+      code: "custom",
+      path: ["selection", "transcriptAttachment"],
+      message:
+        request.selection.speechStatus === "transcript_unavailable"
+          ? "Transcript-unavailable ranges can be logged but cannot be exported."
+          : "A player speech range requires exact attached transcript evidence before export.",
+    });
+  }
+  const selectionAttestation =
+    request.selection.selectionType === "player_time_range"
+      ? request.selection.noSpeechAttestation
+      : undefined;
+  if (
+    JSON.stringify(selectionAttestation ?? null) !==
+    JSON.stringify(request.noSpeechAttestation ?? null)
+  ) {
+    context.addIssue({
+      code: "custom",
+      path: ["noSpeechAttestation"],
+      message:
+        "Export no-speech attestation must exactly match the immutable player selection.",
+    });
+  }
+  if (selectionAttestation && request.subtitleTracks) {
+    context.addIssue({
+      code: "custom",
+      path: ["subtitleTracks"],
+      message:
+        "An attested no-speech export uses explicit empty sidecars, not transcript track snapshots.",
     });
   }
 }
@@ -1453,12 +3998,13 @@ export const CreateLoggedExportBatchRequestSchema = z
 export const CreateExportOnlyRequestSchema = createExportRequestBaseSchema
   .safeExtend({
     video: ClipVideoSnapshotSchema,
-    selection: TranscriptSelectionSchema,
+    selection: ClipSelectionSchema,
     sourceRights: ExportSourceRightsSnapshotSchema,
   })
   .superRefine(requireBilingualSubtitleTrackSnapshots)
   .superRefine(requireSourceRightsSnapshot)
-  .superRefine(requireSourceRightsMatchVideo);
+  .superRefine(requireSourceRightsMatchVideo)
+  .superRefine(requireNoSpeechSelectionConsistency);
 export const TranscriptArtifactSchema = z.object({
   type: z.enum([
     "manifest",
@@ -1474,25 +4020,43 @@ export const TranscriptArtifactSchema = z.object({
   sha256: z.string().regex(/^[a-f0-9]{64}$/),
 });
 
-export const TranscriptManifestSchema = z.object({
-  schemaVersion: z.number().int().positive(),
-  id: IdSchema,
-  projectId: IdSchema,
-  catalogVideoId: IdSchema,
-  videoId: z.string().min(1).max(64),
-  lineageId: IdSchema,
-  version: z.number().int().positive(),
-  sourceLanguage: z.string().min(2).max(35),
-  targetLanguage: z.string().min(2).max(35),
-  timingPrecision: TimingPrecisionSchema,
-  provider: z.string().min(1),
-  model: z.string().min(1).optional(),
-  normalizationSchemaVersion: z.number().int().positive(),
-  jobId: IdSchema,
-  createdBy: IdSchema,
-  createdAt: UtcTimestampSchema,
-  artifacts: z.array(TranscriptArtifactSchema).min(1),
-});
+export const TranscriptManifestSchema = z
+  .object({
+    schemaVersion: z.number().int().positive(),
+    id: IdSchema,
+    projectId: IdSchema,
+    catalogVideoId: IdSchema,
+    videoId: z.string().min(1).max(64),
+    lineageId: IdSchema,
+    version: z.number().int().positive(),
+    sourceLanguage: z.string().min(2).max(35),
+    targetLanguage: z.string().min(2).max(35),
+    timingPrecision: TimingPrecisionSchema,
+    provider: z.string().min(1),
+    model: z.string().min(1).optional(),
+    normalizationSchemaVersion: z.number().int().positive(),
+    jobId: IdSchema.optional(),
+    manualImportId: IdSchema.optional(),
+    createdBy: IdSchema,
+    createdAt: UtcTimestampSchema,
+    /** Absent only on immutable manifests created before language gating. */
+    languageDecision: LanguageDecisionSnapshotSchema.optional(),
+    artifacts: z.array(TranscriptArtifactSchema).min(1),
+  })
+  .strict()
+  .superRefine((manifest, context) => {
+    if (
+      (manifest.jobId === undefined) ===
+      (manifest.manualImportId === undefined)
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["jobId"],
+        message:
+          "A transcript manifest requires exactly one worker job or manual import identity.",
+      });
+    }
+  });
 
 export const DerivedTranslationIdentitySchema = z
   .object({
@@ -1636,6 +4200,7 @@ export const TranscriptWorkspaceResponseSchema = z
     projectId: IdSchema,
     catalogVideoId: IdSchema,
     youtubeVideoId: z.string().min(1).max(64),
+    sourceIdentity: SourceIdentityV1Schema.optional(),
     transcriptVersionId: IdSchema,
     source: z.enum(["verified-local-cache", "shared-store"]),
     /** Whether the active catalog version was checked in this login session. */
@@ -1646,6 +4211,17 @@ export const TranscriptWorkspaceResponseSchema = z
   })
   .strict()
   .superRefine((workspace, context) => {
+    if (
+      workspace.sourceIdentity?.provider === "youtube" &&
+      workspace.sourceIdentity.providerMediaId !== workspace.youtubeVideoId
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["sourceIdentity", "providerMediaId"],
+        message:
+          "The workspace source identity must match its legacy YouTube ID.",
+      });
+    }
     const original = workspace.original.track;
     const english = workspace.english.track;
     const directEnglish = languagesEquivalent(original.language, "en");
@@ -1811,9 +4387,280 @@ export const ActiveTranscriptBundleSchema = z.object({
   downloads: z.array(TranscriptDownloadTargetSchema).min(2),
 });
 
+export const ProjectKeywordScanInputSnapshotSchema = z
+  .object({
+    job: ProjectKeywordScanJobSchema,
+    attempt: z.number().int().positive(),
+    aliases: z.array(ProjectKeywordScanAliasInputSchema).max(20_000),
+    transcript: ActiveTranscriptBundleSchema,
+    durationMs: z.number().int().positive().optional(),
+  })
+  .strict()
+  .superRefine((snapshot, context) => {
+    if (
+      snapshot.job.state !== "scanning" ||
+      snapshot.job.attempt !== snapshot.attempt ||
+      snapshot.transcript.transcriptVersionId !==
+        snapshot.job.transcriptVersionId ||
+      snapshot.transcript.manifest.id !== snapshot.job.transcriptVersionId ||
+      snapshot.transcript.manifest.projectId !== snapshot.job.projectId ||
+      snapshot.transcript.manifest.catalogVideoId !==
+        snapshot.job.projectVideoId
+    ) {
+      context.addIssue({
+        code: "custom",
+        message:
+          "Keyword scan input must bind one active lease to its exact transcript bundle.",
+      });
+    }
+    if (
+      new Set(snapshot.aliases.map((alias) => alias.aliasId)).size !==
+      snapshot.aliases.length
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["aliases"],
+        message: "Keyword scan aliases must be unique by stable alias ID.",
+      });
+    }
+  });
+
+export const ManualTimedTranscriptFormatSchema = z.enum(["srt", "vtt"]);
+
+export const ManualTimedTranscriptFileDescriptorSchema = z
+  .object({
+    format: ManualTimedTranscriptFormatSchema,
+    byteSize: z
+      .number()
+      .int()
+      .positive()
+      .max(20 * 1024 * 1024),
+    sha256: z.string().regex(/^[a-f0-9]{64}$/),
+  })
+  .strict();
+
+export const CreateManualTimedTranscriptImportRequestSchema = z
+  .object({
+    idempotencyKey: z.string().trim().min(1).max(512),
+    languageDecisionId: IdSchema,
+    expectedDecisionVersion: z.number().int().positive(),
+    batchItemId: IdSchema,
+    expectedBatchItemVersion: z.number().int().positive(),
+    original: ManualTimedTranscriptFileDescriptorSchema,
+    english: ManualTimedTranscriptFileDescriptorSchema,
+  })
+  .strict();
+
+export const ManualTimedTranscriptUploadTargetSchema = z
+  .object({
+    role: z.enum(["original", "english"]),
+    format: ManualTimedTranscriptFormatSchema,
+    objectKey: z.string().min(1).max(2_048),
+    uploadUrl: z.string().min(1).max(8_192),
+  })
+  .strict();
+
+export const ManualTimedTranscriptImportUploadGrantSchema = z
+  .object({
+    importId: IdSchema,
+    projectId: IdSchema,
+    catalogVideoId: IdSchema,
+    batchItemId: IdSchema,
+    sourceLanguage: LanguageTagSchema,
+    languageDecisionId: IdSchema,
+    languageDecisionVersion: z.number().int().positive(),
+    expiresAt: UtcTimestampSchema,
+    targets: z.array(ManualTimedTranscriptUploadTargetSchema).length(2),
+  })
+  .strict()
+  .superRefine((grant, context) => {
+    const roles = new Set(grant.targets.map((target) => target.role));
+    if (roles.size !== 2 || !roles.has("original") || !roles.has("english")) {
+      context.addIssue({
+        code: "custom",
+        path: ["targets"],
+        message:
+          "A timed transcript import requires one target per track role.",
+      });
+    }
+  });
+
+export const ManualTimedTranscriptUploadReceiptSchema = z
+  .object({
+    objectVersionId: z.string().min(1).max(1_024),
+    byteSize: z
+      .number()
+      .int()
+      .positive()
+      .max(20 * 1024 * 1024),
+    sha256: z.string().regex(/^[a-f0-9]{64}$/),
+  })
+  .strict();
+
+export const FinalizeManualTimedTranscriptImportRequestSchema = z
+  .object({
+    idempotencyKey: z.string().trim().min(1).max(512),
+    original: ManualTimedTranscriptUploadReceiptSchema,
+    english: ManualTimedTranscriptUploadReceiptSchema,
+  })
+  .strict();
+
+export const ManualTimedTranscriptCandidateSchema = z
+  .object({
+    candidateId: IdSchema,
+    transcriptVersionId: IdSchema,
+    timingPrecision: z.literal("cue"),
+    finalizedAt: UtcTimestampSchema,
+  })
+  .strict();
+
+export const ManualTimedTranscriptImportStatusSchema = z
+  .object({
+    importId: IdSchema,
+    projectId: IdSchema,
+    catalogVideoId: IdSchema,
+    batchItemId: IdSchema,
+    state: z.enum(["staged", "finalizing", "finalized", "expired"]),
+    version: z.number().int().positive(),
+    sourceLanguage: LanguageTagSchema,
+    targetLanguage: z.literal("en"),
+    languageDecisionId: IdSchema,
+    languageDecisionVersion: z.number().int().positive(),
+    createdAt: UtcTimestampSchema,
+    expiresAt: UtcTimestampSchema,
+    candidate: ManualTimedTranscriptCandidateSchema.optional(),
+  })
+  .strict()
+  .superRefine((status, context) => {
+    if ((status.state === "finalized") !== (status.candidate !== undefined)) {
+      context.addIssue({
+        code: "custom",
+        path: ["candidate"],
+        message: "Only a finalized import may expose its candidate identity.",
+      });
+    }
+  });
+
+export const ManualTimedTranscriptImportStatusQuerySchema = z
+  .object({ batchItemId: IdSchema })
+  .strict();
+
+export const ManualTimedTranscriptCandidateReviewQuerySchema = z
+  .object({
+    offset: z.coerce.number().int().nonnegative().default(0),
+    limit: z.coerce.number().int().min(1).max(100).default(25),
+  })
+  .strict();
+
+export const ManualTimedTranscriptReviewCueSchema = z
+  .object({
+    id: IdSchema,
+    ordinal: z.number().int().nonnegative(),
+    startMs: z.number().int().nonnegative(),
+    endMs: z.number().int().positive(),
+    text: z.string().trim().min(1).max(20_000),
+  })
+  .strict()
+  .refine((cue) => cue.endMs > cue.startMs, {
+    message: "Transcript review cue end must be after its start.",
+  });
+
+export const ManualTimedTranscriptReviewTrackSchema = z
+  .object({
+    trackId: IdSchema,
+    trackVersion: z.number().int().positive(),
+    language: LanguageTagSchema,
+    kind: z.enum(["original", "english"]),
+    source: z.literal("manual-import"),
+    provider: z.string().min(1).max(160),
+    sourceTrackId: IdSchema.optional(),
+    timingPrecision: z.literal("cue"),
+    contentSha256: z.string().regex(/^[a-f0-9]{64}$/),
+    totalCues: z.number().int().nonnegative(),
+    cues: z.array(ManualTimedTranscriptReviewCueSchema).max(100),
+  })
+  .strict();
+
+export const ManualTimedTranscriptCandidateReviewPageSchema = z
+  .object({
+    candidateId: IdSchema,
+    importId: IdSchema,
+    transcriptVersionId: IdSchema,
+    projectId: IdSchema,
+    catalogVideoId: IdSchema,
+    projectVideoVersion: z.number().int().positive(),
+    languageDecisionId: IdSchema,
+    languageDecisionVersion: z.number().int().positive(),
+    finalizedAt: UtcTimestampSchema,
+    offset: z.number().int().nonnegative(),
+    limit: z.number().int().min(1).max(100),
+    hasMore: z.boolean(),
+    original: ManualTimedTranscriptReviewTrackSchema.extend({
+      kind: z.literal("original"),
+      sourceTrackId: z.undefined().optional(),
+    }).strict(),
+    english: ManualTimedTranscriptReviewTrackSchema.extend({
+      kind: z.literal("english"),
+      language: z.literal("en"),
+      sourceTrackId: IdSchema,
+    }).strict(),
+  })
+  .strict()
+  .superRefine((page, context) => {
+    if (page.english.sourceTrackId !== page.original.trackId) {
+      context.addIssue({
+        code: "custom",
+        path: ["english", "sourceTrackId"],
+        message:
+          "The reviewed English track must link directly to the reviewed original track.",
+      });
+    }
+    for (const [role, track] of [
+      ["original", page.original],
+      ["english", page.english],
+    ] as const) {
+      if (track.cues.length > page.limit) {
+        context.addIssue({
+          code: "custom",
+          path: [role, "cues"],
+          message: "Transcript review pages must remain within their limit.",
+        });
+      }
+    }
+  });
+
+export const ActivateManualTimedTranscriptCandidateRequestSchema = z
+  .object({
+    idempotencyKey: z.string().trim().min(1).max(512),
+    importId: IdSchema,
+    candidateId: IdSchema,
+    transcriptVersionId: IdSchema,
+    expectedProjectVideoVersion: z.number().int().positive(),
+    languageDecisionId: IdSchema,
+    expectedLanguageDecisionVersion: z.number().int().positive(),
+  })
+  .strict();
+
+export const ManualTimedTranscriptActivationStatusSchema = z
+  .object({
+    activationId: IdSchema,
+    state: z.enum(["activated", "superseded"]),
+    projectId: IdSchema,
+    catalogVideoId: IdSchema,
+    importId: IdSchema,
+    candidateId: IdSchema,
+    transcriptVersionId: IdSchema,
+    languageDecisionId: IdSchema,
+    languageDecisionVersion: z.number().int().positive(),
+    projectVideoVersion: z.number().int().positive(),
+    activatedAt: UtcTimestampSchema,
+  })
+  .strict();
+
 export const TranscriptionItemStateSchema = z.enum([
   "draft",
   "preflight",
+  "needs_language_confirmation",
   "queued",
   "resolving",
   "acquiring",
@@ -1921,6 +4768,7 @@ export const BatchPreflightItemSchema = z.object({
   processingNeed: BatchProcessingNeedSchema,
   youtubeVideoId: z.string().min(1).max(64).optional(),
   canonicalUrl: z.url().optional(),
+  sourceIdentity: SourceIdentityV1Schema.optional(),
   title: z.string().trim().min(1).max(500).optional(),
   channel: z.string().trim().min(1).max(300).optional(),
   durationMs: z.number().int().nonnegative().optional(),
@@ -1952,10 +4800,149 @@ export const BatchPreflightResponseSchema = z.object({
   summary: BatchPreflightSummarySchema,
 });
 
+export const SourceSearchRequestSchema = z
+  .object({
+    query: z.string().trim().min(1).max(500),
+    providers: z.array(SourceProviderSchema).min(1).max(4),
+    pageSize: z.number().int().min(1).max(25).default(12),
+    cursors: z
+      .partialRecord(SourceProviderSchema, z.string().trim().min(1).max(2_048))
+      .optional(),
+  })
+  .strict()
+  .superRefine((request, context) => {
+    if (new Set(request.providers).size !== request.providers.length) {
+      context.addIssue({
+        code: "custom",
+        path: ["providers"],
+        message: "Search providers must be unique.",
+      });
+    }
+    for (const provider of Object.keys(request.cursors ?? {})) {
+      if (!request.providers.includes(provider as never)) {
+        context.addIssue({
+          code: "custom",
+          path: ["cursors", provider],
+          message: "A cursor may only be supplied for a requested provider.",
+        });
+      }
+    }
+  });
+
+export const SourceSearchCandidateSchema = z
+  .object({
+    sourceIdentity: SourceIdentityV1Schema,
+    title: z.string().trim().min(1).max(500),
+    creator: z.string().trim().min(1).max(300).optional(),
+    thumbnailUrl: z.url().optional(),
+    durationMs: z.number().int().nonnegative().optional(),
+    publishedAt: UtcTimestampSchema.optional(),
+    availability: SourceCapabilityStateSchema,
+    provenance: z
+      .object({
+        provider: SourceProviderSchema,
+        resultPosition: z.number().int().nonnegative(),
+      })
+      .strict(),
+  })
+  .strict()
+  .superRefine((candidate, context) => {
+    if (candidate.provenance.provider !== candidate.sourceIdentity.provider) {
+      context.addIssue({
+        code: "custom",
+        path: ["provenance", "provider"],
+        message: "Search provenance must match the candidate source provider.",
+      });
+    }
+  });
+
+export const SourceSearchProviderOutcomeSchema = z
+  .object({
+    provider: SourceProviderSchema,
+    state: z.enum([
+      "success",
+      "unavailable",
+      "unsupported",
+      "auth-required",
+      "quota-limited",
+      "failed",
+    ]),
+    candidates: z.array(SourceSearchCandidateSchema).max(25),
+    nextCursor: z.string().trim().min(1).max(2_048).optional(),
+    explanation: z.string().trim().min(1).max(500).optional(),
+  })
+  .strict()
+  .superRefine((outcome, context) => {
+    outcome.candidates.forEach((candidate, index) => {
+      if (candidate.sourceIdentity.provider !== outcome.provider) {
+        context.addIssue({
+          code: "custom",
+          path: ["candidates", index, "sourceIdentity", "provider"],
+          message: "Every search result must belong to the outcome provider.",
+        });
+      }
+    });
+  });
+
+export const SourceSearchResponseSchema = z
+  .object({
+    outcomes: z.array(SourceSearchProviderOutcomeSchema).min(1).max(4),
+  })
+  .strict()
+  .superRefine((response, context) => {
+    const providers = response.outcomes.map((outcome) => outcome.provider);
+    if (new Set(providers).size !== providers.length) {
+      context.addIssue({
+        code: "custom",
+        path: ["outcomes"],
+        message: "Search outcomes must contain each provider at most once.",
+      });
+    }
+  });
+
 export const CreateTranscriptionBatchRequestSchema =
   BatchPreflightRequestSchema.extend({
     name: z.string().trim().min(1).max(160),
   });
+
+export const HostedTranscriptionApprovalSchema = z
+  .object({
+    state: z.enum(["pending", "approved", "revoked"]),
+    version: z.number().int().positive(),
+    decidedBy: ProjectVideoReviewActorSchema.optional(),
+    decidedAt: UtcTimestampSchema.optional(),
+  })
+  .strict()
+  .superRefine((approval, context) => {
+    if (
+      (approval.state === "pending" &&
+        (approval.decidedBy !== undefined ||
+          approval.decidedAt !== undefined)) ||
+      (approval.state !== "pending" &&
+        (approval.decidedBy === undefined || approval.decidedAt === undefined))
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "Hosted approval evidence must match its state.",
+      });
+    }
+  });
+
+export const UpdateHostedTranscriptionApprovalRequestSchema = z
+  .object({
+    action: z.enum(["approve", "revoke"]),
+    idempotencyKey: z.string().trim().min(1).max(512),
+    expectedVersion: z.number().int().positive(),
+  })
+  .strict();
+
+export const HostedTranscriptionApprovalResponseSchema = z
+  .object({
+    projectId: IdSchema,
+    batchId: IdSchema,
+    approval: HostedTranscriptionApprovalSchema,
+  })
+  .strict();
 
 export const TranscriptionBatchSchema = z.object({
   id: IdSchema,
@@ -1966,6 +4953,7 @@ export const TranscriptionBatchSchema = z.object({
   sourcePolicy: BatchSourcePolicySchema,
   executionLocation: z.enum(["local", "hosted"]),
   priority: BatchPrioritySchema,
+  hostedApproval: HostedTranscriptionApprovalSchema.optional(),
   translationConsent: CloudTranslationConsentSchema.optional(),
   dispatchStatus: z.enum(["active", "paused", "canceled"]),
   createdBy: IdSchema,
@@ -1981,6 +4969,7 @@ export const TranscriptionBatchItemSchema = BatchPreflightItemSchema.extend({
   reviewStatus: z.enum(["unreviewed", "reviewing", "reviewed", "skipped"]),
   jobId: IdSchema.optional(),
   idempotencyKey: z.string().min(1).max(512).optional(),
+  languageGate: LanguageGateSchema.optional(),
   sourcePlan: TranscriptSourcePlanSchema.optional(),
   sourceResolvedAt: UtcTimestampSchema.optional(),
   attempt: z.number().int().nonnegative(),
@@ -2204,7 +5193,7 @@ export const EnglishSubtitleSidecarProvenanceSchema = z
     message: "English subtitle timing bounds must be nonempty.",
   });
 
-export const SubtitleSidecarProvenanceSchema = z
+export const TranscriptSubtitleSidecarProvenanceSchema = z
   .object({
     role: z.enum(["original", "english"]),
     language: z.string().trim().min(2).max(35),
@@ -2221,6 +5210,29 @@ export const SubtitleSidecarProvenanceSchema = z
   .refine((sidecar) => sidecar.endMs > sidecar.startMs, {
     message: "Subtitle timing bounds must be nonempty.",
   });
+
+export const EmptySubtitleSidecarProvenanceSchema = z
+  .object({
+    role: z.enum(["original", "english"]),
+    language: z.string().trim().min(2).max(35),
+    emptyReason: z.literal("attested_no_speech"),
+    noSpeechAttestation: NoSpeechAttestationSchema,
+    trackId: z.never().optional(),
+    trackVersion: z.never().optional(),
+    cueCount: z.literal(0),
+    byteSize: z.number().int().positive(),
+    contentSha256: z.string().regex(/^[a-f0-9]{64}$/),
+    startMs: z.literal(0),
+    endMs: z.literal(0),
+    sourceAttempt: z.number().int().positive(),
+    validatedAt: UtcTimestampSchema,
+  })
+  .strict();
+
+export const SubtitleSidecarProvenanceSchema = z.union([
+  TranscriptSubtitleSidecarProvenanceSchema,
+  EmptySubtitleSidecarProvenanceSchema,
+]);
 
 export const FinalArtifactRoleSchema = z.enum([
   "video_mp4",
@@ -2271,6 +5283,7 @@ export const ExportResolvedSubtitlePolicySchema = z.object({
   subtitleSidecarsOmittedReason: z
     .literal("confirmed_english_user_setting")
     .optional(),
+  noSpeechAttestation: NoSpeechAttestationSchema.optional(),
 });
 
 /**
@@ -2289,7 +5302,8 @@ const ExportClipMetadataBaseSchema = z.object({
   validatedAt: UtcTimestampSchema,
   video: PackageVideoSnapshotSchema,
   sourceLanguageClass: ExportSourceLanguageClassSchema,
-  selection: TranscriptSelectionSchema,
+  selection: ClipSelectionSchema,
+  noSpeechAttestation: NoSpeechAttestationSchema.optional(),
   resolvedExportBounds: z.object({
     startMs: z.number().int().nonnegative(),
     endMs: z.number().int().positive(),
@@ -2357,15 +5371,32 @@ export const ExportClipManifestArtifactSchema = z.object({
   byteSize: z.number().int().positive(),
   contentSha256: z.string().regex(/^[a-f0-9]{64}$/),
   subtitle: z
-    .object({
-      language: z.string().trim().min(2).max(35),
-      trackId: IdSchema,
-      trackVersion: z.number().int().positive(),
-      timingPrecision: TimingPrecisionSchema,
-      cueCount: z.number().int().positive(),
-      startMs: z.number().int().nonnegative(),
-      endMs: z.number().int().positive(),
-    })
+    .union([
+      z
+        .object({
+          language: z.string().trim().min(2).max(35),
+          trackId: IdSchema,
+          trackVersion: z.number().int().positive(),
+          timingPrecision: TimingPrecisionSchema,
+          cueCount: z.number().int().positive(),
+          startMs: z.number().int().nonnegative(),
+          endMs: z.number().int().positive(),
+        })
+        .strict(),
+      z
+        .object({
+          language: z.string().trim().min(2).max(35),
+          emptyReason: z.literal("attested_no_speech"),
+          noSpeechAttestation: NoSpeechAttestationSchema,
+          trackId: z.never().optional(),
+          trackVersion: z.never().optional(),
+          timingPrecision: z.never().optional(),
+          cueCount: z.literal(0),
+          startMs: z.literal(0),
+          endMs: z.literal(0),
+        })
+        .strict(),
+    ])
     .optional(),
   thumbnail: ExportClipManifestThumbnailSchema.optional(),
 });
@@ -2538,10 +5569,11 @@ export const ExportRequestSchema = z
     retryOrdinal: z.number().int().positive().optional(),
     batchItemId: IdSchema.optional(),
     video: ClipVideoSnapshotSchema,
-    selection: TranscriptSelectionSchema,
+    selection: ClipSelectionSchema,
     sourceLanguageClass: ExportSourceLanguageClassSchema,
     sourceRights: ExportSourceRightsSnapshotSchema.optional(),
     subtitleTracks: ExportSubtitleTrackSnapshotsSchema.optional(),
+    noSpeechAttestation: NoSpeechAttestationSchema.optional(),
     preset: ExportPresetSnapshotSchema,
     resolvedSettingsSnapshot: ResolvedExportSettingsSnapshotSchema.optional(),
     mediaProvenance: ExportMediaProvenanceSchema.optional(),
@@ -2565,6 +5597,7 @@ export const ExportRequestSchema = z
     updatedAt: UtcTimestampSchema,
   })
   .superRefine((request, context) => {
+    requireNoSpeechSelectionConsistency(request, context);
     if (
       request.sourceRights &&
       request.sourceRights.youtubeVideoId !== request.video.youtubeVideoId
@@ -2950,6 +5983,7 @@ export const LoggedExportSuccessResultSchema = z
     projectId: IdSchema,
     clipId: IdSchema,
     sourceLanguageClass: ExportSourceLanguageClassSchema,
+    noSpeechAttestation: NoSpeechAttestationSchema.optional(),
     resolvedExportBounds: ResolvedExportBoundsSchema,
     renderedMediaProvenance: RenderedExportMediaProvenanceSchema,
     thumbnailProvenance: ExportThumbnailProvenanceSchema,
@@ -3065,7 +6099,35 @@ export const LoggedExportSuccessResultSchema = z
         message: "Subtitle result roles must be canonically sorted.",
       });
     }
-    if (result.sourceLanguageClass === "confirmed_english") {
+    if (result.noSpeechAttestation) {
+      const expectedRoles =
+        result.sourceLanguageClass === "confirmed_english"
+          ? ["english"]
+          : ["english", "original"];
+      const sidecarRoles = sidecars.map((sidecar) => sidecar.role).sort();
+      if (
+        result.subtitleOmissionProvenance ||
+        result.englishSubtitleProvenance ||
+        sidecars.length !== expectedRoles.length ||
+        sidecars.some(
+          (sidecar) =>
+            sidecar.cueCount !== 0 ||
+            !("emptyReason" in sidecar) ||
+            JSON.stringify(sidecar.noSpeechAttestation) !==
+              JSON.stringify(result.noSpeechAttestation),
+        ) ||
+        expectedRoles.some((role, index) => sidecarRoles[index] !== role) ||
+        !roles.includes("english_srt") ||
+        expectedRoles.includes("original") !== roles.includes("original_srt")
+      ) {
+        context.addIssue({
+          code: "custom",
+          path: ["subtitleSidecars"],
+          message:
+            "Attested no-speech results require the exact policy sidecar roles with zero-cue provenance.",
+        });
+      }
+    } else if (result.sourceLanguageClass === "confirmed_english") {
       const omitted = Boolean(result.subtitleOmissionProvenance);
       if (
         sidecars.length > 0 ||
@@ -3142,10 +6204,11 @@ export const ArtifactVersionSummarySchema = z
     batchItemId: IdSchema.optional(),
     packageIdentity: z.string().regex(/^clip-[a-f0-9-]{36}$/),
     video: ClipVideoSnapshotSchema,
-    selection: TranscriptSelectionSchema,
+    selection: ClipSelectionSchema,
     sourceLanguageClass: ExportSourceLanguageClassSchema,
     sourceRights: ExportSourceRightsSnapshotSchema.optional(),
     subtitleTracks: ExportSubtitleTrackSnapshotsSchema.optional(),
+    noSpeechAttestation: NoSpeechAttestationSchema.optional(),
     preset: ExportPresetSnapshotSchema,
     resolvedSettingsSnapshot: ResolvedExportSettingsSnapshotSchema,
     resolvedExportBounds: ResolvedExportBoundsSchema,
@@ -3537,6 +6600,12 @@ export const AuthoringArtifactDescriptorRequestSchema = z
     requirements: ArtifactCompatibilityRequirementsSchema,
   })
   .strict();
+export const AuthoringSourceReferenceSchema = z
+  .object({
+    schemaVersion: z.literal(1),
+    sourceIdentity: SourceIdentityV1Schema,
+  })
+  .strict();
 export const LocalAuthoringArtifactDescriptorSchema = z
   .object({
     schemaVersion: z.literal(1),
@@ -3547,6 +6616,8 @@ export const LocalAuthoringArtifactDescriptorSchema = z
     locatorId: IdSchema,
     packageIdentity: z.string().regex(/^clip-[a-f0-9-]{36}$/),
     resultFingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+    // Optional so every historical YouTube-only descriptor remains readable.
+    sourceReference: AuthoringSourceReferenceSchema.optional(),
     manifest: z
       .object({
         schemaVersion: z.union([z.literal(1), z.literal(2)]),
@@ -3647,6 +6718,16 @@ function canonicalLocalAbsolutePath(value: string): string | undefined {
   return `/${segments.join("/")}`;
 }
 
+const ClipLibraryTopicsQuerySchema = z.preprocess((value) => {
+  if (typeof value === "string") {
+    return value
+      .split(",")
+      .map((topic) => topic.trim())
+      .filter(Boolean);
+  }
+  return value;
+}, z.array(ClipTagNameSchema).max(20).optional());
+
 export const ClipLibraryQuerySchema = z
   .object({
     limit: z.coerce.number().int().min(1).max(50).default(25),
@@ -3655,7 +6736,10 @@ export const ClipLibraryQuerySchema = z
       .regex(/^[A-Za-z0-9_-]{10,1024}$/)
       .optional(),
     query: z.string().trim().max(200).optional(),
+    /** Legacy single-value compatibility; new clients use topics. */
     tag: ClipTagNameSchema.optional(),
+    topics: ClipLibraryTopicsQuerySchema,
+    topicMatch: z.enum(["any", "all"]).optional(),
     researchStatus: ClipResearchStatusSchema.optional(),
     exportStatus: ClipExportStatusSchema.optional(),
     completed: z.enum(["any", "yes", "no"]).default("any"),
@@ -3681,6 +6765,18 @@ export const ClipLibraryExportLeafSchema = z
 export const ClipLibraryEntrySchema = z
   .object({
     clip: ClipCandidateSchema,
+    commentCount: z.number().int().nonnegative().optional(),
+    latestCommentAt: UtcTimestampSchema.optional(),
+    matchingComment: z
+      .object({
+        commentId: IdSchema,
+        version: z.number().int().positive(),
+        author: ClipCommentAuthorSnapshotSchema,
+        sourceTimeMs: z.number().int().nonnegative().optional(),
+        excerpt: z.string().min(1).max(500),
+      })
+      .strict()
+      .optional(),
     currentLeaves: z.array(ClipLibraryExportLeafSchema).max(10),
     hasMoreLeaves: z.boolean(),
     completedVersionCount: z.number().int().nonnegative(),
@@ -4416,18 +7512,35 @@ export const WorkerTranslateTranscriptResponseSchema = z
   })
   .strict();
 
-export const TranscriptionJobPayloadSchema = z.object({
-  batchId: IdSchema,
-  catalogVideoId: IdSchema,
-  youtubeVideoId: z.string().min(1).max(64),
-  targetLanguage: z.string().min(2).max(35),
-  transcriptionProfile: z.string().trim().min(1).max(160),
-  sourcePolicy: BatchSourcePolicySchema,
-  executionLocation: z.enum(["local", "hosted"]),
-  priority: BatchPrioritySchema,
-  translationConsent: CloudTranslationConsentSchema.optional(),
-  sourcePlan: TranscriptSourcePlanSchema.optional(),
-});
+export const TranscriptionJobPayloadSchema = z
+  .object({
+    batchId: IdSchema,
+    catalogVideoId: IdSchema,
+    youtubeVideoId: z.string().min(1).max(64),
+    sourceIdentity: SourceIdentityV1Schema.optional(),
+    targetLanguage: z.string().min(2).max(35),
+    transcriptionProfile: z.string().trim().min(1).max(160),
+    sourcePolicy: BatchSourcePolicySchema,
+    executionLocation: z.enum(["local", "hosted"]),
+    priority: BatchPrioritySchema,
+    translationConsent: CloudTranslationConsentSchema.optional(),
+    creatorReportedLanguage: LanguageTagSchema.optional(),
+    /** Absent only for legacy queued work created before language gating. */
+    languageDecision: LanguageDecisionSnapshotSchema.optional(),
+    sourcePlan: TranscriptSourcePlanSchema.optional(),
+  })
+  .superRefine((payload, context) => {
+    if (
+      payload.sourceIdentity?.provider === "youtube" &&
+      payload.sourceIdentity.providerMediaId !== payload.youtubeVideoId
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["sourceIdentity", "providerMediaId"],
+        message: "The job source identity must match its legacy YouTube ID.",
+      });
+    }
+  });
 
 export const WorkerFailureRequestSchema = z.object({
   attempt: z.number().int().positive(),
@@ -4444,6 +7557,14 @@ export const WorkerLeaseSchema = z.object({
   heartbeatAt: UtcTimestampSchema,
   expiresAt: UtcTimestampSchema,
 });
+
+export const WorkerHeartbeatResponseSchema = z.discriminatedUnion("status", [
+  z.object({ status: z.literal("active"), lease: WorkerLeaseSchema }),
+  z.object({
+    status: z.literal("cancellation_requested"),
+    requestedAt: UtcTimestampSchema,
+  }),
+]);
 
 export const ClaimedTranscriptionJobSchema = z.object({
   job: JobSchema,
@@ -4468,27 +7589,168 @@ export const HealthResponseSchema = z.object({
 
 export type Project = z.infer<typeof ProjectSchema>;
 export type ProjectRole = z.infer<typeof ProjectRoleSchema>;
+export type AssignableProjectRole = z.infer<typeof AssignableProjectRoleSchema>;
+export type ProjectKind = z.infer<typeof ProjectKindSchema>;
+export type ProjectVisibility = z.infer<typeof ProjectVisibilitySchema>;
+export type ProjectSummary = z.infer<typeof ProjectSummarySchema>;
 export type AuthenticatedActor = z.infer<typeof AuthenticatedActorSchema>;
 export type User = z.infer<typeof UserSchema>;
 export type UpdatePreferredLanguageRequest = z.infer<
   typeof UpdatePreferredLanguageRequestSchema
 >;
 export type ProjectMember = z.infer<typeof ProjectMemberSchema>;
+export type ProjectMemberSummary = z.infer<typeof ProjectMemberSummarySchema>;
+export type ProjectInvitation = z.infer<typeof ProjectInvitationSchema>;
+export type CreateProjectInvitationRequest = z.infer<
+  typeof CreateProjectInvitationRequestSchema
+>;
+export type DecideProjectInvitationRequest = z.infer<
+  typeof DecideProjectInvitationRequestSchema
+>;
+export type RevokeProjectInvitationRequest = z.infer<
+  typeof RevokeProjectInvitationRequestSchema
+>;
+export type OpenProjectDiscovery = z.infer<typeof OpenProjectDiscoverySchema>;
+export type JoinOpenProjectRequest = z.infer<
+  typeof JoinOpenProjectRequestSchema
+>;
+export type UpdateProjectGovernanceRequest = z.infer<
+  typeof UpdateProjectGovernanceRequestSchema
+>;
+export type ProjectGovernanceEvent = z.infer<
+  typeof ProjectGovernanceEventSchema
+>;
+export type SourceProvider = z.infer<typeof SourceProviderSchema>;
+export type SourceIdentityV1 = z.infer<typeof SourceIdentityV1Schema>;
+export type SourceFingerprintEvidence = z.infer<
+  typeof SourceFingerprintEvidenceSchema
+>;
+export type SourceRightsSnapshotV2 = z.infer<
+  typeof SourceRightsSnapshotV2Schema
+>;
+export type SourceRightsSnapshot = z.infer<typeof SourceRightsSnapshotSchema>;
+export type SourceOperation = z.infer<typeof SourceOperationSchema>;
+export type SourceCapabilityState = z.infer<typeof SourceCapabilityStateSchema>;
+export type SourceOperationCapability = z.infer<
+  typeof SourceOperationCapabilitySchema
+>;
+export type SourceProviderCapability = z.infer<
+  typeof SourceProviderCapabilitySchema
+>;
+export type SourceProviderCapabilitiesResponse = z.infer<
+  typeof SourceProviderCapabilitiesResponseSchema
+>;
+export type SourceSearchRequest = z.infer<typeof SourceSearchRequestSchema>;
+export type SourceSearchCandidate = z.infer<typeof SourceSearchCandidateSchema>;
+export type SourceSearchProviderOutcome = z.infer<
+  typeof SourceSearchProviderOutcomeSchema
+>;
+export type SourceSearchResponse = z.infer<typeof SourceSearchResponseSchema>;
 export type Video = z.infer<typeof VideoSchema>;
 export type ProjectVideo = z.infer<typeof ProjectVideoSchema>;
+export type LanguageDecisionStatus = z.infer<
+  typeof LanguageDecisionStatusSchema
+>;
+export type LanguageDecisionBasis = z.infer<typeof LanguageDecisionBasisSchema>;
+export type ProviderLanguageEvidence = z.infer<
+  typeof ProviderLanguageEvidenceSchema
+>;
+export type ProjectVideoLanguageDecision = z.infer<
+  typeof ProjectVideoLanguageDecisionSchema
+>;
+export type LanguageDecisionSnapshot = z.infer<
+  typeof LanguageDecisionSnapshotSchema
+>;
+export type LanguageCapabilityReason = z.infer<
+  typeof LanguageCapabilityReasonSchema
+>;
+export type LanguageCapabilityResult = z.infer<
+  typeof LanguageCapabilityResultSchema
+>;
+export type LanguageGateRemediationReason = z.infer<
+  typeof LanguageGateRemediationReasonSchema
+>;
+export type LanguageGateState = z.infer<typeof LanguageGateStateSchema>;
+export type LanguageGate = z.infer<typeof LanguageGateSchema>;
+export type CreateProjectVideoLanguageDecisionRequest = z.infer<
+  typeof CreateProjectVideoLanguageDecisionRequestSchema
+>;
+export type ProjectVideoLanguageDecisionResponse = z.infer<
+  typeof ProjectVideoLanguageDecisionResponseSchema
+>;
+export type WorkerObserveLanguageEvidenceRequest = z.infer<
+  typeof WorkerObserveLanguageEvidenceRequestSchema
+>;
+export type WorkerObserveLanguageEvidenceResponse = z.infer<
+  typeof WorkerObserveLanguageEvidenceResponseSchema
+>;
 export type TranscriptTrack = z.infer<typeof TranscriptTrackSchema>;
 export type TranscriptSegment = z.infer<typeof TranscriptSegmentSchema>;
 export type TranscriptToken = z.infer<typeof TranscriptTokenSchema>;
 export type NormalizedTranscript = z.infer<typeof NormalizedTranscriptSchema>;
 export type TranscriptSelection = z.infer<typeof TranscriptSelectionSchema>;
+export type PlayerTimeRangeSelection = z.infer<
+  typeof PlayerTimeRangeSelectionSchema
+>;
+export type ClipSelection = z.infer<typeof ClipSelectionSchema>;
+export type NoSpeechAttestation = z.infer<typeof NoSpeechAttestationSchema>;
 export type ClipLanguageSnapshot = z.infer<typeof ClipLanguageSnapshotSchema>;
 export type ClipLanguageEvidenceV2 = z.infer<
   typeof ClipLanguageEvidenceV2Schema
 >;
+export type UnavailableClipLanguageEvidence = z.infer<
+  typeof UnavailableClipLanguageEvidenceSchema
+>;
 export type ClipLanguageEvidence = z.infer<typeof ClipLanguageEvidenceSchema>;
 export type ClipCandidate = z.infer<typeof ClipCandidateSchema>;
+export type ClipCommentAuthorSnapshot = z.infer<
+  typeof ClipCommentAuthorSnapshotSchema
+>;
+export type ClipComment = z.infer<typeof ClipCommentSchema>;
+export type InitialClipComment = z.infer<typeof InitialClipCommentSchema>;
+export type CreateClipCommentRequest = z.infer<
+  typeof CreateClipCommentRequestSchema
+>;
+export type UpdateClipCommentRequest = z.infer<
+  typeof UpdateClipCommentRequestSchema
+>;
+export type DeleteClipCommentRequest = z.infer<
+  typeof DeleteClipCommentRequestSchema
+>;
+export type ModerateClipCommentRequest = z.infer<
+  typeof ModerateClipCommentRequestSchema
+>;
+export type ClipCommentListQuery = z.infer<typeof ClipCommentListQuerySchema>;
+export type ClipCommentPage = z.infer<typeof ClipCommentPageSchema>;
+export type OfflineClipCommentCommandType = z.infer<
+  typeof OfflineClipCommentCommandTypeSchema
+>;
+export type OfflineClipCommentMutationResult = z.infer<
+  typeof OfflineClipCommentMutationResultSchema
+>;
+export type OfflineClipCommentReplayResult = z.infer<
+  typeof OfflineClipCommentReplayResultSchema
+>;
+export type ClipFollow = z.infer<typeof ClipFollowSchema>;
+export type UpdateClipFollowRequest = z.infer<
+  typeof UpdateClipFollowRequestSchema
+>;
+export type ClipCommentNotice = z.infer<typeof ClipCommentNoticeSchema>;
+export type ClipCommentNoticePage = z.infer<typeof ClipCommentNoticePageSchema>;
+export type MarkClipCommentNoticeSeenRequest = z.infer<
+  typeof MarkClipCommentNoticeSeenRequestSchema
+>;
+export type CreateAuthoringBuildSnapshotRequest = z.infer<
+  typeof CreateAuthoringBuildSnapshotRequestSchema
+>;
+export type AuthoringBuildSnapshot = z.infer<
+  typeof AuthoringBuildSnapshotSchema
+>;
 export type CreateClipCandidateRequest = z.infer<
   typeof CreateClipCandidateRequestSchema
+>;
+export type CreateClipCandidateResponse = z.infer<
+  typeof CreateClipCandidateResponseSchema
 >;
 export type UpdateClipCandidateRequest = z.infer<
   typeof UpdateClipCandidateRequestSchema
@@ -4555,6 +7817,9 @@ export type ExportSubtitleTrackSnapshots = z.infer<
 >;
 export type SubtitleSidecarProvenance = z.infer<
   typeof SubtitleSidecarProvenanceSchema
+>;
+export type EmptySubtitleSidecarProvenance = z.infer<
+  typeof EmptySubtitleSidecarProvenanceSchema
 >;
 export type CreateClipExportRequest = z.infer<
   typeof CreateClipExportRequestSchema
@@ -4712,6 +7977,9 @@ export type ArtifactLocatorActionResult = z.infer<
 export type AuthoringArtifactDescriptorRequest = z.infer<
   typeof AuthoringArtifactDescriptorRequestSchema
 >;
+export type AuthoringSourceReference = z.infer<
+  typeof AuthoringSourceReferenceSchema
+>;
 export type LocalAuthoringArtifactDescriptor = z.infer<
   typeof LocalAuthoringArtifactDescriptorSchema
 >;
@@ -4817,7 +8085,273 @@ export type FinalizeTranscriptRequest = z.infer<
 export type ActiveTranscriptBundle = z.infer<
   typeof ActiveTranscriptBundleSchema
 >;
+export type ManualTimedTranscriptFormat = z.infer<
+  typeof ManualTimedTranscriptFormatSchema
+>;
+export type ManualTimedTranscriptFileDescriptor = z.infer<
+  typeof ManualTimedTranscriptFileDescriptorSchema
+>;
+export type CreateManualTimedTranscriptImportRequest = z.infer<
+  typeof CreateManualTimedTranscriptImportRequestSchema
+>;
+export type ManualTimedTranscriptUploadTarget = z.infer<
+  typeof ManualTimedTranscriptUploadTargetSchema
+>;
+export type ManualTimedTranscriptImportUploadGrant = z.infer<
+  typeof ManualTimedTranscriptImportUploadGrantSchema
+>;
+export type ManualTimedTranscriptUploadReceipt = z.infer<
+  typeof ManualTimedTranscriptUploadReceiptSchema
+>;
+export type FinalizeManualTimedTranscriptImportRequest = z.infer<
+  typeof FinalizeManualTimedTranscriptImportRequestSchema
+>;
+export type ManualTimedTranscriptCandidate = z.infer<
+  typeof ManualTimedTranscriptCandidateSchema
+>;
+export type ManualTimedTranscriptImportStatus = z.infer<
+  typeof ManualTimedTranscriptImportStatusSchema
+>;
+export type ManualTimedTranscriptCandidateReviewQuery = z.infer<
+  typeof ManualTimedTranscriptCandidateReviewQuerySchema
+>;
+export type ManualTimedTranscriptCandidateReviewPage = z.infer<
+  typeof ManualTimedTranscriptCandidateReviewPageSchema
+>;
+export type ActivateManualTimedTranscriptCandidateRequest = z.infer<
+  typeof ActivateManualTimedTranscriptCandidateRequestSchema
+>;
+export type ManualTimedTranscriptActivationStatus = z.infer<
+  typeof ManualTimedTranscriptActivationStatusSchema
+>;
 export type TranscriptionBatch = z.infer<typeof TranscriptionBatchSchema>;
+export type UpdateHostedTranscriptionApprovalRequest = z.infer<
+  typeof UpdateHostedTranscriptionApprovalRequestSchema
+>;
+export type HostedTranscriptionApprovalResponse = z.infer<
+  typeof HostedTranscriptionApprovalResponseSchema
+>;
+export type ProjectVideoWorklistQuery = z.infer<
+  typeof ProjectVideoWorklistQuerySchema
+>;
+export type ProjectVideoWorklistProcessingState = z.infer<
+  typeof ProjectVideoWorklistProcessingStateSchema
+>;
+export type ProjectVideoWorklistProcessing = z.infer<
+  typeof ProjectVideoWorklistProcessingSchema
+>;
+export type ProjectVideoFlaggerSummary = z.infer<
+  typeof ProjectVideoFlaggerSummarySchema
+>;
+export type ProjectVideoOwnFlag = z.infer<typeof ProjectVideoOwnFlagSchema>;
+export type ProjectVideoWorklistItem = z.infer<
+  typeof ProjectVideoWorklistItemSchema
+>;
+export type ProjectVideoWorklistPage = z.infer<
+  typeof ProjectVideoWorklistPageSchema
+>;
+export type ProjectLocalProcessingState = z.infer<
+  typeof ProjectLocalProcessingStateSchema
+>;
+export type ProjectLocalProcessingPolicy = z.infer<
+  typeof ProjectLocalProcessingPolicySchema
+>;
+export type ProjectLocalProcessingWorkload = z.infer<
+  typeof ProjectLocalProcessingWorkloadSchema
+>;
+export type ProjectLocalProcessingStatus = z.infer<
+  typeof ProjectLocalProcessingStatusSchema
+>;
+export type ProjectKeywordAlias = z.infer<typeof ProjectKeywordAliasSchema>;
+export type ProjectKeyword = z.infer<typeof ProjectKeywordSchema>;
+export type ProjectKeywordSuggestion = z.infer<
+  typeof ProjectKeywordSuggestionSchema
+>;
+export type ProjectKeywordCatalog = z.infer<typeof ProjectKeywordCatalogSchema>;
+export type SuggestProjectKeywordRequest = z.infer<
+  typeof SuggestProjectKeywordRequestSchema
+>;
+export type SuggestProjectKeywordResponse = z.infer<
+  typeof SuggestProjectKeywordResponseSchema
+>;
+export type ReviewProjectKeywordSuggestionRequest = z.infer<
+  typeof ReviewProjectKeywordSuggestionRequestSchema
+>;
+export type ReviewProjectKeywordSuggestionResponse = z.infer<
+  typeof ReviewProjectKeywordSuggestionResponseSchema
+>;
+export type WithdrawProjectKeywordSuggestionRequest = z.infer<
+  typeof WithdrawProjectKeywordSuggestionRequestSchema
+>;
+export type WithdrawProjectKeywordSuggestionResponse = z.infer<
+  typeof WithdrawProjectKeywordSuggestionResponseSchema
+>;
+export type UpdateProjectKeywordRequest = z.infer<
+  typeof UpdateProjectKeywordRequestSchema
+>;
+export type UpdateProjectKeywordResponse = z.infer<
+  typeof UpdateProjectKeywordResponseSchema
+>;
+export type UpdateProjectKeywordAliasRequest = z.infer<
+  typeof UpdateProjectKeywordAliasRequestSchema
+>;
+export type UpdateProjectKeywordAliasResponse = z.infer<
+  typeof UpdateProjectKeywordAliasResponseSchema
+>;
+export type ProjectBookmark = z.infer<typeof ProjectBookmarkSchema>;
+export type ProjectBookmarkQuery = z.infer<typeof ProjectBookmarkQuerySchema>;
+export type ProjectBookmarkPage = z.infer<typeof ProjectBookmarkPageSchema>;
+export type CreateProjectBookmarkRequest = z.infer<
+  typeof CreateProjectBookmarkRequestSchema
+>;
+export type UpdateProjectBookmarkRequest = z.infer<
+  typeof UpdateProjectBookmarkRequestSchema
+>;
+export type ChangeProjectBookmarkStateRequest = z.infer<
+  typeof ChangeProjectBookmarkStateRequestSchema
+>;
+export type ProjectBookmarkMutationResponse = z.infer<
+  typeof ProjectBookmarkMutationResponseSchema
+>;
+export type OfflineProjectBookmarkCommandType = z.infer<
+  typeof OfflineProjectBookmarkCommandTypeSchema
+>;
+export type OfflineProjectBookmarkCommand = z.infer<
+  typeof OfflineProjectBookmarkCommandSchema
+>;
+export type LocalProjectBookmarkPage = z.infer<
+  typeof LocalProjectBookmarkPageSchema
+>;
+export type OfflineProjectBookmarkMutationResult = z.infer<
+  typeof OfflineProjectBookmarkMutationResultSchema
+>;
+export type OfflineProjectBookmarkReplayResult = z.infer<
+  typeof OfflineProjectBookmarkReplayResultSchema
+>;
+export type ProjectKeywordScanAliasInput = z.infer<
+  typeof ProjectKeywordScanAliasInputSchema
+>;
+export type ProjectKeywordMatchEvidence = z.infer<
+  typeof ProjectKeywordMatchEvidenceSchema
+>;
+export type ProjectKeywordOccurrence = z.infer<
+  typeof ProjectKeywordOccurrenceSchema
+>;
+export type ProjectKeywordMatchArtifact = z.infer<
+  typeof ProjectKeywordMatchArtifactSchema
+>;
+export type ProjectKeywordMatchArtifactDescriptor = z.infer<
+  typeof ProjectKeywordMatchArtifactDescriptorSchema
+>;
+export type ProjectKeywordScanStatus = z.infer<
+  typeof ProjectKeywordScanStatusSchema
+>;
+export type ProjectKeywordScanCompletedResult = z.infer<
+  typeof ProjectKeywordScanCompletedResultSchema
+>;
+export type ProjectKeywordScanSummary = z.infer<
+  typeof ProjectKeywordScanSummarySchema
+>;
+export type ProjectKeywordScanJob = z.infer<typeof ProjectKeywordScanJobSchema>;
+export type ClaimProjectKeywordScanRequest = z.infer<
+  typeof ClaimProjectKeywordScanRequestSchema
+>;
+export type ProjectKeywordScanClaim = z.infer<
+  typeof ProjectKeywordScanClaimSchema
+>;
+export type HeartbeatProjectKeywordScanRequest = z.infer<
+  typeof HeartbeatProjectKeywordScanRequestSchema
+>;
+export type GetProjectKeywordScanInputRequest = z.infer<
+  typeof GetProjectKeywordScanInputRequestSchema
+>;
+export type ProjectKeywordScanInputSnapshot = z.infer<
+  typeof ProjectKeywordScanInputSnapshotSchema
+>;
+export type FinalizeProjectKeywordScanRequest = z.infer<
+  typeof FinalizeProjectKeywordScanRequestSchema
+>;
+export type FailProjectKeywordScanRequest = z.infer<
+  typeof FailProjectKeywordScanRequestSchema
+>;
+export type CreateProjectKeywordScanArtifactUploadRequest = z.infer<
+  typeof CreateProjectKeywordScanArtifactUploadRequestSchema
+>;
+export type ProjectKeywordScanArtifactUploadGrant = z.infer<
+  typeof ProjectKeywordScanArtifactUploadGrantSchema
+>;
+export type ProjectKeywordScanArtifactDownloadTarget = z.infer<
+  typeof ProjectKeywordScanArtifactDownloadTargetSchema
+>;
+export type UpdateProjectLocalProcessingRequest = z.infer<
+  typeof UpdateProjectLocalProcessingRequestSchema
+>;
+export type UpdateProjectLocalProcessingResponse = z.infer<
+  typeof UpdateProjectLocalProcessingResponseSchema
+>;
+export type UpdateOwnProjectVideoFlagRequest = z.infer<
+  typeof UpdateOwnProjectVideoFlagRequestSchema
+>;
+export type ProjectVideoOwnFlagResponse = z.infer<
+  typeof ProjectVideoOwnFlagResponseSchema
+>;
+export type ProjectVideoPriority = z.infer<typeof ProjectVideoPrioritySchema>;
+export type ProjectVideoReviewCompletionPolicy = z.infer<
+  typeof ProjectVideoReviewCompletionPolicySchema
+>;
+export type ProjectVideoClaim = z.infer<typeof ProjectVideoClaimSchema>;
+export type UpdateProjectVideoClaimRequest = z.infer<
+  typeof UpdateProjectVideoClaimRequestSchema
+>;
+export type ProjectVideoClaimResponse = z.infer<
+  typeof ProjectVideoClaimResponseSchema
+>;
+export type ProjectVideoReviewActor = z.infer<
+  typeof ProjectVideoReviewActorSchema
+>;
+export type ProjectVideoReviewCycle = z.infer<
+  typeof ProjectVideoReviewCycleSchema
+>;
+export type UpdateProjectVideoGovernanceRequest = z.infer<
+  typeof UpdateProjectVideoGovernanceRequestSchema
+>;
+export type ProjectVideoGovernanceResponse = z.infer<
+  typeof ProjectVideoGovernanceResponseSchema
+>;
+export type UpdateProjectVideoReviewRequest = z.infer<
+  typeof UpdateProjectVideoReviewRequestSchema
+>;
+export type ProjectVideoReviewResponse = z.infer<
+  typeof ProjectVideoReviewResponseSchema
+>;
+export type ProjectVideoTriage = z.infer<typeof ProjectVideoTriageSchema>;
+export type UpdateProjectVideoTriageRequest = z.infer<
+  typeof UpdateProjectVideoTriageRequestSchema
+>;
+export type ProjectVideoTriageResponse = z.infer<
+  typeof ProjectVideoTriageResponseSchema
+>;
+export type BulkUpdateProjectVideoPriorityRequest = z.infer<
+  typeof BulkUpdateProjectVideoPriorityRequestSchema
+>;
+export type BulkUpdateProjectVideoPriorityResponse = z.infer<
+  typeof BulkUpdateProjectVideoPriorityResponseSchema
+>;
+export type ProjectVideoActivityReceipt = z.infer<
+  typeof ProjectVideoActivityReceiptSchema
+>;
+export type ProjectVideoActivityQuery = z.infer<
+  typeof ProjectVideoActivityQuerySchema
+>;
+export type ProjectVideoActivityPage = z.infer<
+  typeof ProjectVideoActivityPageSchema
+>;
+export type MarkProjectVideoActivitySeenRequest = z.infer<
+  typeof MarkProjectVideoActivitySeenRequestSchema
+>;
+export type MarkProjectVideoActivitySeenResponse = z.infer<
+  typeof MarkProjectVideoActivitySeenResponseSchema
+>;
 export type BatchOptions = z.infer<typeof BatchOptionsSchema>;
 export type CloudTranslationConsent = z.infer<
   typeof CloudTranslationConsentSchema
@@ -4854,6 +8388,9 @@ export type UpdateReviewStatusRequest = z.infer<
 >;
 export type Job = z.infer<typeof JobSchema>;
 export type WorkerLease = z.infer<typeof WorkerLeaseSchema>;
+export type WorkerHeartbeatResponse = z.infer<
+  typeof WorkerHeartbeatResponseSchema
+>;
 export type ClaimedTranscriptionJob = z.infer<
   typeof ClaimedTranscriptionJobSchema
 >;
@@ -4915,6 +8452,27 @@ export type DesktopServiceStatus = z.infer<typeof DesktopServiceStatusSchema>;
 export type DesktopStatus = z.infer<typeof DesktopStatusSchema>;
 export type DesktopApiRequest = z.infer<typeof DesktopApiRequestSchema>;
 export type DesktopApiResponse = z.infer<typeof DesktopApiResponseSchema>;
+export type DesktopTimedTranscriptUploadRequest = z.infer<
+  typeof DesktopTimedTranscriptUploadRequestSchema
+>;
+export type DesktopTimedTranscriptUploadResponse = z.infer<
+  typeof DesktopTimedTranscriptUploadResponseSchema
+>;
+export type DesktopNotificationNavigationTarget = z.infer<
+  typeof DesktopNotificationNavigationTargetSchema
+>;
+export type NotificationEvent = z.infer<typeof NotificationEventSchema>;
+export type NotificationFeedQuery = z.infer<typeof NotificationFeedQuerySchema>;
+export type NotificationFeedPage = z.infer<typeof NotificationFeedPageSchema>;
+export type DesktopNotificationPreferences = z.infer<
+  typeof DesktopNotificationPreferencesSchema
+>;
+export type UpdateDesktopNotificationPreferences = z.infer<
+  typeof UpdateDesktopNotificationPreferencesSchema
+>;
+export type DesktopNotificationSupportStatus = z.infer<
+  typeof DesktopNotificationSupportStatusSchema
+>;
 export type RegisteredExportWorker = z.infer<
   typeof RegisteredExportWorkerSchema
 >;

@@ -3,6 +3,11 @@ import {
   DesktopApiResponseSchema,
   type DesktopApiRequest,
   type DesktopApiResponse,
+  type DesktopTimedTranscriptUploadRequest,
+  type DesktopTimedTranscriptUploadResponse,
+  type DesktopNotificationNavigationTarget,
+  type DesktopNotificationPreferences,
+  type DesktopNotificationSupportStatus,
   type DesktopStatus,
   type ModelDownloadProgress,
   type ReadinessReport,
@@ -27,6 +32,17 @@ export type DesktopBridge = Readonly<{
     listener: (progress: ModelDownloadProgress) => void,
   ): () => void;
   request(request: DesktopApiRequest): Promise<DesktopApiResponse>;
+  uploadTimedTranscript(
+    request: DesktopTimedTranscriptUploadRequest,
+  ): Promise<DesktopTimedTranscriptUploadResponse>;
+  getNotificationPreferences(): Promise<DesktopNotificationPreferences>;
+  updateNotificationPreferences(input: {
+    enabled: boolean;
+  }): Promise<DesktopNotificationPreferences>;
+  getNotificationSupport(): Promise<DesktopNotificationSupportStatus>;
+  onNotificationNavigation(
+    listener: (target: DesktopNotificationNavigationTarget) => void,
+  ): () => void;
 }>;
 
 export function desktopBridge(): DesktopBridge | undefined {

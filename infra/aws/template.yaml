@@ -197,6 +197,12 @@ Resources:
             ExpirationInDays: 7
             NoncurrentVersionExpiration:
               NoncurrentDays: 7
+          - Id: ExpireAbandonedManualTranscriptImports
+            Status: Enabled
+            Prefix: staging/manual-imports/
+            ExpirationInDays: 1
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 1
       Tags:
         - Key: application
           Value: !Ref ApplicationName

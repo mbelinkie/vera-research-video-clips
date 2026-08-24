@@ -3,7 +3,7 @@ import {
   type CognitoAuthorizationAttempt,
   type CognitoTokenSet,
 } from "@research-video/auth";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 
 import {
   NativeOAuthCallbackQueue,
@@ -42,6 +42,7 @@ export class DesktopAuthenticationBroker {
   private accessToken: string | undefined;
   private refreshToken: string | undefined;
   private offlineReviewCapability: string | undefined;
+  private notificationAccountScope: string | undefined;
   private callbackDrain: Promise<void> | undefined;
 
   constructor(
@@ -163,6 +164,14 @@ export class DesktopAuthenticationBroker {
     return this.offlineReviewCapability;
   }
 
+  /** Stable, one-way local account partition; never exposed through IPC. */
+  getNotificationAccountScope(): string {
+    if (this.status.state !== "signed_in" || !this.notificationAccountScope) {
+      throw new DesktopAuthenticationError();
+    }
+    return this.notificationAccountScope;
+  }
+
   /** Clears protected/local sessions before best-effort remote revoke/logout. */
   async signOut(): Promise<RendererAuthStatus> {
     const refreshToken = this.refreshToken;
@@ -210,6 +219,9 @@ export class DesktopAuthenticationBroker {
     this.accessToken = tokens.accessToken;
     this.refreshToken = tokens.refreshToken;
     this.offlineReviewCapability ??= randomBytes(32).toString("base64url");
+    this.notificationAccountScope =
+      notificationAccountScope(tokens.accessToken) ??
+      this.notificationAccountScope;
     this.status = {
       state: "signed_in",
       expiresAt: this.now() + tokens.expiresIn * 1_000,
@@ -221,5 +233,24 @@ export class DesktopAuthenticationBroker {
     this.accessToken = undefined;
     this.refreshToken = undefined;
     this.offlineReviewCapability = undefined;
+    this.notificationAccountScope = undefined;
+  }
+}
+
+function notificationAccountScope(accessToken: string): string | undefined {
+  try {
+    const parts = accessToken.split(".");
+    if (parts.length !== 3 || !parts[1]) return undefined;
+    const claims = JSON.parse(
+      Buffer.from(parts[1], "base64url").toString("utf8"),
+    ) as { iss?: unknown; sub?: unknown };
+    if (typeof claims.iss !== "string" || typeof claims.sub !== "string") {
+      return undefined;
+    }
+    return createHash("sha256")
+      .update(`${claims.iss}\u0000${claims.sub}`)
+      .digest("hex");
+  } catch {
+    return undefined;
   }
 }

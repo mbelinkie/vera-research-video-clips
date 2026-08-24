@@ -113,29 +113,38 @@ export function ExportBatchPanel(props: {
               "One selected clip has no compatible export worker settings.",
             );
           }
-          const evidence = ClipLanguageEvidenceV2Schema.parse(
-            clip.languageEvidence,
-          );
+          const noSpeechSelection =
+            clip.selection.selectionType === "player_time_range" &&
+            clip.selection.speechStatus === "no_speech"
+              ? clip.selection
+              : undefined;
+          const evidence = noSpeechSelection
+            ? undefined
+            : ClipLanguageEvidenceV2Schema.parse(clip.languageEvidence);
           return {
             clipId: clip.id,
             export: {
               idempotencyKey: `batch-item:${index}:${clip.id}`,
               requestOrigin: "selection_action",
               sourceLanguageClass,
-              ...(sourceLanguageClass === "confirmed_english"
-                ? {}
-                : {
-                    subtitleTracks: {
-                      original: {
-                        trackId: evidence.native.trackId,
-                        trackVersion: evidence.native.trackVersion,
+              ...(noSpeechSelection
+                ? {
+                    noSpeechAttestation: noSpeechSelection.noSpeechAttestation,
+                  }
+                : sourceLanguageClass === "confirmed_english"
+                  ? {}
+                  : {
+                      subtitleTracks: {
+                        original: {
+                          trackId: evidence!.native.trackId,
+                          trackVersion: evidence!.native.trackVersion,
+                        },
+                        english: {
+                          trackId: evidence!.english!.trackId,
+                          trackVersion: evidence!.english!.trackVersion,
+                        },
                       },
-                      english: {
-                        trackId: evidence.english!.trackId,
-                        trackVersion: evidence.english!.trackVersion,
-                      },
-                    },
-                  }),
+                    }),
               settingsSelection,
               expectedResolutionFingerprint:
                 preview.snapshot.resolutionFingerprint,
@@ -206,7 +215,7 @@ export function ExportBatchPanel(props: {
                   })
                 }
               />
-              {clip.video.title} — {clip.selection.text.slice(0, 80)}
+              {clip.video.title} — {clipSelectionSummary(clip)}
             </label>
           ))}
         </div>
@@ -252,15 +261,44 @@ export function ExportBatchPanel(props: {
 }
 
 function isBatchEligible(clip: ClipCandidate) {
+  const playerSelection =
+    clip.selection.selectionType === "player_time_range"
+      ? clip.selection
+      : undefined;
   return (
     clip.exportStatus === "not_requested" &&
-    ClipLanguageEvidenceV2Schema.safeParse(clip.languageEvidence).success
+    (playerSelection?.speechStatus === "no_speech" ||
+      ((playerSelection === undefined ||
+        (playerSelection.speechStatus === "speech" &&
+          Boolean(playerSelection.transcriptAttachment))) &&
+        ClipLanguageEvidenceV2Schema.safeParse(clip.languageEvidence).success))
   );
+}
+
+function clipSelectionSummary(clip: ClipCandidate) {
+  if (clip.selection.selectionType !== "player_time_range")
+    return clip.selection.text.slice(0, 80);
+  const label =
+    clip.selection.speechStatus === "no_speech"
+      ? "No speech"
+      : clip.selection.speechStatus === "transcript_unavailable"
+        ? "Transcript unavailable"
+        : "Speech";
+  return `${label} · ${(clip.selection.sourceStartMs / 1_000).toFixed(3)}–${(clip.selection.sourceEndMs / 1_000).toFixed(3)}s${clip.selection.transcriptAttachment ? ` · ${clip.selection.transcriptAttachment.text.slice(0, 50)}` : ""}`;
 }
 
 function clipSourceLanguageClass(
   clip: ClipCandidate,
 ): "confirmed_english" | "foreign" {
+  if (
+    clip.selection.selectionType === "player_time_range" &&
+    clip.selection.speechStatus === "no_speech"
+  ) {
+    return clip.video.sourceLanguage &&
+      languagesEquivalent(clip.video.sourceLanguage, "en")
+      ? "confirmed_english"
+      : "foreign";
+  }
   const evidence = ClipLanguageEvidenceV2Schema.parse(clip.languageEvidence);
   return evidence.native.trackId === evidence.english.trackId &&
     languagesEquivalent(evidence.native.language, "en")

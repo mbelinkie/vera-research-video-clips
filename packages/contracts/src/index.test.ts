@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   AcceptLoggedExportDeliveryRequestSchema,
+  ActivateManualTimedTranscriptCandidateRequestSchema,
   ArtifactVersionHistoryQuerySchema,
   ArtifactVersionHistoryResponseSchema,
   ArtifactVersionSummarySchema,
@@ -17,13 +18,34 @@ import {
   CancelLoggedExportRequestSchema,
   BatchPreflightRequestSchema,
   CloudTranslationConsentSchema,
+  ClipCommentSchema,
+  ClipCommentListQuerySchema,
+  ClipCommentPageSchema,
+  OfflineClipCommentMutationResultSchema,
+  OfflineClipCommentReplayResultSchema,
+  CreateProjectBookmarkRequestSchema,
+  LocalProjectBookmarkPageSchema,
+  OfflineProjectBookmarkMutationResultSchema,
+  ProjectBookmarkQuerySchema,
+  ProjectBookmarkSchema,
+  UpdateProjectBookmarkRequestSchema,
+  ClipSelectionSchema,
   ClipLanguageEvidenceV2Schema,
+  CreateClipCommentRequestSchema,
+  CreateClipCandidateRequestSchema,
+  CreateExportOnlyRequestSchema,
+  UpdateClipCommentRequestSchema,
+  DeleteClipCommentRequestSchema,
+  InitialClipCommentSchema,
+  CreateProjectVideoLanguageDecisionRequestSchema,
   ClipLibraryPageSchema,
   ClipLibraryQuerySchema,
   CreateClipExportRequestSchema,
   CreateLoggedExportBatchRequestSchema,
   CreateTranscriptionBatchRequestSchema,
+  CreateManualTimedTranscriptImportRequestSchema,
   DesktopApiRequestSchema,
+  DesktopTimedTranscriptUploadRequestSchema,
   DesktopStatusSchema,
   ComponentHealthSchema,
   ReadinessReportSchema,
@@ -34,6 +56,7 @@ import {
   ExportRequestOriginSchema,
   ExportClipManifestSchema,
   ExportClipMetadataSchema,
+  EmptySubtitleSidecarProvenanceSchema,
   ExportPresetCatalogEntrySchema,
   ExportPresetDefaultSchema,
   ExportPresetSnapshotSchema,
@@ -59,6 +82,11 @@ import {
   LocalRuntimeDrainResultSchema,
   LocalRuntimeQuiescenceSchema,
   LookupDerivedTranslationSchema,
+  LanguageCapabilityResultSchema,
+  LanguageDecisionSnapshotSchema,
+  LanguageGateSchema,
+  ProjectVideoLanguageDecisionSchema,
+  ProviderLanguageEvidenceSchema,
   PrepareClipLibraryExportRequestSchema,
   SubmitClipLibraryExportRequestSchema,
   UpdateLocalClipLibrarySelectionSchema,
@@ -73,14 +101,70 @@ import {
   StartLoggedExportExecutionResponseSchema,
   FinalArtifactProvenanceSchema,
   HealthResponseSchema,
+  HostedTranscriptionApprovalSchema,
   JobSchema,
+  AddProjectMemberRequestSchema,
+  CreateProjectRequestSchema,
+  CreateProjectInvitationRequestSchema,
+  DecideProjectInvitationRequestSchema,
+  RevokeProjectInvitationRequestSchema,
+  JoinOpenProjectRequestSchema,
+  UpdateProjectGovernanceRequestSchema,
+  ProjectInvitationSchema,
+  OpenProjectDiscoverySchema,
+  ProjectGovernanceEventSchema,
+  ProjectSummarySchema,
   ProjectSchema,
+  SourceIdentityV1Schema,
+  SourceRightsSnapshotSchema,
+  SourceSearchRequestSchema,
+  ProjectVideoWorklistPageSchema,
+  ProjectVideoWorklistQuerySchema,
+  ProjectLocalProcessingStatusSchema,
+  ProjectKeywordCatalogSchema,
+  SuggestProjectKeywordRequestSchema,
+  ReviewProjectKeywordSuggestionRequestSchema,
+  WithdrawProjectKeywordSuggestionRequestSchema,
+  UpdateProjectKeywordRequestSchema,
+  UpdateProjectKeywordAliasRequestSchema,
+  ProjectKeywordMatchArtifactSchema,
+  ProjectKeywordScanSummarySchema,
+  FinalizeProjectKeywordScanRequestSchema,
+  UpdateProjectLocalProcessingRequestSchema,
+  UpdateProjectLocalProcessingResponseSchema,
+  UpdateProjectVideoClaimRequestSchema,
+  UpdateProjectVideoGovernanceRequestSchema,
+  BulkUpdateProjectVideoPriorityRequestSchema,
+  UpdateProjectVideoReviewRequestSchema,
+  UpdateProjectVideoTriageRequestSchema,
+  ProjectVideoActivityPageSchema,
+  MarkProjectVideoActivitySeenRequestSchema,
+  UpdateOwnProjectVideoFlagRequestSchema,
+  RegisterUserRequestSchema,
+  UserHandleSchema,
+  normalizeUserHandle,
+  FinalizeManualTimedTranscriptImportRequestSchema,
+  ManualTimedTranscriptImportStatusSchema,
+  ManualTimedTranscriptImportUploadGrantSchema,
+  ManualTimedTranscriptActivationStatusSchema,
+  ManualTimedTranscriptCandidateReviewPageSchema,
+  ManualTimedTranscriptCandidateReviewQuerySchema,
+  TranscriptManifestSchema,
   TranscriptTrackSchema,
   TranscriptWorkspaceResponseSchema,
   TranscriptionBatchControlRequestSchema,
+  UpdateHostedTranscriptionApprovalRequestSchema,
   UpdateReviewStatusRequestSchema,
   UpdatePreferredLanguageRequestSchema,
   WorkerTranslateTranscriptRequestSchema,
+  WorkerObserveLanguageEvidenceRequestSchema,
+  DesktopNotificationNavigationTargetSchema,
+  DesktopNotificationPreferencesSchema,
+  NotificationEventSchema,
+  NotificationFeedPageSchema,
+  NotificationFeedQuerySchema,
+  sanitizeNotificationLabel,
+  formatLanguageLabel,
   languagesEquivalent,
   primaryLanguage,
 } from "./index.ts";
@@ -89,6 +173,1417 @@ const now = "2026-08-01T12:00:00.000Z";
 const id = "019fbb95-cd76-7920-93fa-e23ba755ee3f";
 
 describe("shared contracts", () => {
+  it("keeps transcript and player selections distinct without fabricated transcript fields", () => {
+    const attachment = {
+      selectionType: "transcript_range" as const,
+      trackId: id,
+      transcriptVersion: 2,
+      firstSegmentId: "019fbb95-cd76-7920-93fa-e23ba755ee40",
+      lastSegmentId: "019fbb95-cd76-7920-93fa-e23ba755ee41",
+      transcriptStartMs: 1_000,
+      transcriptEndMs: 2_000,
+      exportStartMs: 900,
+      exportEndMs: 2_100,
+      text: "Exact overlapping evidence",
+      timingPrecision: "cue" as const,
+    };
+    const playerSelection = {
+      selectionType: "player_time_range" as const,
+      sourceStartMs: 1_000,
+      sourceEndMs: 2_000,
+      exportStartMs: 900,
+      exportEndMs: 2_100,
+      origin: "manual_player" as const,
+      speechStatus: "speech" as const,
+      transcriptAttachment: attachment,
+    };
+    expect(ClipSelectionSchema.parse(playerSelection)).toEqual(playerSelection);
+    expect(
+      ClipSelectionSchema.safeParse({
+        ...playerSelection,
+        trackId: id,
+        text: "fabricated hybrid",
+      }).success,
+    ).toBe(false);
+    expect(
+      ClipSelectionSchema.safeParse({
+        ...playerSelection,
+        sourceEndMs: 1_000,
+      }).success,
+    ).toBe(false);
+    expect(
+      ClipSelectionSchema.safeParse({
+        ...playerSelection,
+        transcriptAttachment: {
+          ...attachment,
+          transcriptStartMs: 999,
+        },
+      }).success,
+    ).toBe(false);
+  });
+
+  it("requires explicit context for no-speech and transcript-unavailable clip logs", () => {
+    const actor = {
+      schemaVersion: 1 as const,
+      actor: {
+        id,
+        handle: "vera_researcher",
+        displayName: "VERA Researcher",
+      },
+      attestedAt: now,
+    };
+    const video = {
+      youtubeVideoId: "M7lc1UVf-VE",
+      canonicalUrl: "https://www.youtube.com/watch?v=M7lc1UVf-VE",
+      title: "Fixture video",
+    };
+    const noSpeech = {
+      selectionType: "player_time_range" as const,
+      sourceStartMs: 1_000,
+      sourceEndMs: 2_000,
+      exportStartMs: 1_000,
+      exportEndMs: 2_000,
+      origin: "manual_player" as const,
+      speechStatus: "no_speech" as const,
+      noSpeechAttestation: actor,
+    };
+    const base = {
+      idempotencyKey: "player-log",
+      video,
+      selection: noSpeech,
+      tags: [],
+    };
+    expect(CreateClipCandidateRequestSchema.safeParse(base).success).toBe(
+      false,
+    );
+    expect(
+      CreateClipCandidateRequestSchema.parse({
+        ...base,
+        notes: "Silent title card used as visual context.",
+      }).selection,
+    ).toEqual(noSpeech);
+    expect(
+      CreateClipCandidateRequestSchema.parse({
+        ...base,
+        idempotencyKey: "transcript-unavailable-log",
+        selection: {
+          ...noSpeech,
+          speechStatus: "transcript_unavailable",
+          noSpeechAttestation: undefined,
+        },
+        firstComment: { body: "Review the exact source range manually." },
+      }).firstComment,
+    ).toEqual({ body: "Review the exact source range manually." });
+  });
+
+  it("exports only attested no-speech or player speech with exact transcript evidence", () => {
+    const noSpeechAttestation = {
+      schemaVersion: 1 as const,
+      actor: {
+        id,
+        handle: "vera_researcher",
+        displayName: "VERA Researcher",
+      },
+      attestedAt: now,
+    };
+    const transcriptAttachment = {
+      selectionType: "transcript_range" as const,
+      trackId: id,
+      transcriptVersion: 1,
+      firstSegmentId: "019fbb95-cd76-7920-93fa-e23ba755ee40",
+      lastSegmentId: "019fbb95-cd76-7920-93fa-e23ba755ee41",
+      transcriptStartMs: 100,
+      transcriptEndMs: 900,
+      exportStartMs: 0,
+      exportEndMs: 1_000,
+      text: "Verified speech",
+      timingPrecision: "cue" as const,
+    };
+    const base = {
+      idempotencyKey: "player-export",
+      video: {
+        youtubeVideoId: "M7lc1UVf-VE",
+        canonicalUrl: "https://www.youtube.com/watch?v=M7lc1UVf-VE",
+        title: "Fixture video",
+        sourceLanguage: "en",
+      },
+      sourceLanguageClass: "confirmed_english" as const,
+      sourceRights: {
+        schemaVersion: 1 as const,
+        source: "youtube" as const,
+        youtubeVideoId: "M7lc1UVf-VE",
+        confirmation: "authorized_to_process" as const,
+        disclosureVersion: 1,
+      },
+      preset: {
+        presetVersion: 1,
+        name: "Editing MP4",
+        settings: {
+          container: "mp4" as const,
+          videoCodec: "h264" as const,
+          videoRateControl: { mode: "crf" as const, value: 20 },
+          frameRate: "source" as const,
+          audioCodec: "aac" as const,
+          omitSubtitleFilesForConfirmedEnglish: false,
+          embedEnglishSubtitleTrack: false,
+        },
+      },
+    };
+    const playerBase = {
+      selectionType: "player_time_range" as const,
+      sourceStartMs: 100,
+      sourceEndMs: 900,
+      exportStartMs: 0,
+      exportEndMs: 1_000,
+      origin: "manual_player" as const,
+    };
+    expect(
+      CreateExportOnlyRequestSchema.safeParse({
+        ...base,
+        selection: { ...playerBase, speechStatus: "speech" },
+      }).success,
+    ).toBe(false);
+    expect(
+      CreateExportOnlyRequestSchema.safeParse({
+        ...base,
+        selection: {
+          ...playerBase,
+          speechStatus: "transcript_unavailable",
+        },
+      }).success,
+    ).toBe(false);
+    expect(
+      CreateExportOnlyRequestSchema.parse({
+        ...base,
+        selection: {
+          ...playerBase,
+          speechStatus: "speech",
+          transcriptAttachment,
+        },
+      }).selection,
+    ).toMatchObject({ speechStatus: "speech", transcriptAttachment });
+    const noSpeechRequest = {
+      ...base,
+      selection: {
+        ...playerBase,
+        speechStatus: "no_speech" as const,
+        noSpeechAttestation,
+      },
+      noSpeechAttestation,
+    };
+    expect(CreateExportOnlyRequestSchema.parse(noSpeechRequest)).toMatchObject({
+      selection: noSpeechRequest.selection,
+      noSpeechAttestation,
+    });
+    expect(
+      CreateExportOnlyRequestSchema.safeParse({
+        ...noSpeechRequest,
+        noSpeechAttestation: {
+          ...noSpeechAttestation,
+          attestedAt: "2026-08-01T12:00:01.000Z",
+        },
+      }).success,
+    ).toBe(false);
+  });
+
+  it("represents attested zero-cue sidecars without transcript sentinels", () => {
+    const sidecar = EmptySubtitleSidecarProvenanceSchema.parse({
+      role: "english",
+      language: "en",
+      emptyReason: "attested_no_speech",
+      noSpeechAttestation: {
+        schemaVersion: 1,
+        actor: {
+          id,
+          handle: "vera_researcher",
+          displayName: "VERA Researcher",
+        },
+        attestedAt: now,
+      },
+      cueCount: 0,
+      byteSize: 1,
+      contentSha256: "a".repeat(64),
+      startMs: 0,
+      endMs: 0,
+      sourceAttempt: 1,
+      validatedAt: now,
+    });
+    expect(sidecar).not.toHaveProperty("trackId");
+    expect(sidecar).not.toHaveProperty("trackVersion");
+    expect(
+      EmptySubtitleSidecarProvenanceSchema.safeParse({
+        ...sidecar,
+        trackId: id,
+      }).success,
+    ).toBe(false);
+  });
+
+  it("validates bounded flat clip comments and body-free tombstones", () => {
+    const clipId = "019fbb95-cd76-7920-93fa-e23ba755ee40";
+    const commentId = "019fbb95-cd76-7920-93fa-e23ba755ee41";
+    const author = {
+      id,
+      handle: "comment_author",
+      displayName: "Comment Author",
+    };
+    const active = {
+      id: commentId,
+      projectId: id,
+      clipId,
+      author,
+      status: "active" as const,
+      body: "Useful context",
+      sourceTimeMs: 1_250,
+      version: 1,
+      createdAt: now,
+      updatedAt: now,
+    };
+    expect(ClipCommentSchema.parse(active)).toEqual(active);
+
+    const tombstone = {
+      id: commentId,
+      projectId: id,
+      clipId,
+      author,
+      status: "deleted" as const,
+      deletionKind: "moderation" as const,
+      deletedBy: author,
+      deletedAt: now,
+      version: 2,
+      createdAt: now,
+      updatedAt: now,
+    };
+    expect(ClipCommentSchema.parse(tombstone)).toEqual(tombstone);
+    expect(
+      ClipCommentSchema.safeParse({ ...tombstone, body: "must not leak" })
+        .success,
+    ).toBe(false);
+    expect(
+      ClipCommentSchema.safeParse({ ...active, body: "x".repeat(20_001) })
+        .success,
+    ).toBe(false);
+
+    expect(
+      CreateClipCommentRequestSchema.parse({
+        idempotencyKey: " create-1 ",
+        body: " first comment ",
+        sourceTimeMs: 500,
+      }),
+    ).toEqual({
+      idempotencyKey: "create-1",
+      body: "first comment",
+      sourceTimeMs: 500,
+    });
+    expect(
+      UpdateClipCommentRequestSchema.parse({
+        idempotencyKey: "update-1",
+        expectedVersion: 1,
+        body: "Revised",
+        sourceTimeMs: null,
+      }),
+    ).toMatchObject({ sourceTimeMs: null, expectedVersion: 1 });
+    expect(
+      DeleteClipCommentRequestSchema.safeParse({
+        idempotencyKey: "delete-1",
+        expectedVersion: 0,
+      }).success,
+    ).toBe(false);
+    expect(
+      InitialClipCommentSchema.safeParse({ body: " ".repeat(10) }).success,
+    ).toBe(false);
+
+    expect(ClipCommentListQuerySchema.parse({ limit: "2" })).toEqual({
+      limit: 2,
+    });
+    expect(ClipCommentListQuerySchema.safeParse({ limit: 51 }).success).toBe(
+      false,
+    );
+    expect(
+      ClipCommentPageSchema.parse({
+        projectId: id,
+        clipId,
+        comments: [active, tombstone],
+        fetchedAt: now,
+      }).comments,
+    ).toHaveLength(2);
+    expect(
+      OfflineClipCommentMutationResultSchema.parse({
+        state: "queued",
+        outboxId: id,
+        commandType: "clip_comment.create.v1",
+      }),
+    ).toMatchObject({ state: "queued" });
+    expect(
+      OfflineClipCommentReplayResultSchema.parse({
+        applied: 1,
+        queued: 0,
+        conflicts: 1,
+      }),
+    ).toEqual({ applied: 1, queued: 0, conflicts: 1 });
+  });
+
+  it("keeps provider media identity composite and bounds mixed search requests", () => {
+    const youtube = SourceIdentityV1Schema.parse({
+      schemaVersion: 1,
+      provider: "youtube",
+      providerMediaId: "same-provider-id",
+      canonicalUrl: "https://www.youtube.com/watch?v=M7lc1UVf-VE",
+    });
+    const tiktok = SourceIdentityV1Schema.parse({
+      ...youtube,
+      provider: "tiktok",
+      canonicalUrl: "https://www.tiktok.com/@fixture/video/same-provider-id",
+    });
+    expect(`${youtube.provider}:${youtube.providerMediaId}`).not.toBe(
+      `${tiktok.provider}:${tiktok.providerMediaId}`,
+    );
+    expect(
+      SourceSearchRequestSchema.parse({
+        query: "research workflow",
+        providers: ["youtube", "tiktok"],
+        cursors: { youtube: "page-two" },
+      }),
+    ).toMatchObject({ pageSize: 12, providers: ["youtube", "tiktok"] });
+    expect(() =>
+      SourceSearchRequestSchema.parse({
+        query: "fixture",
+        providers: ["youtube", "youtube"],
+      }),
+    ).toThrow("unique");
+    expect(
+      SourceRightsSnapshotSchema.parse({
+        schemaVersion: 2,
+        sourceIdentity: tiktok,
+        confirmation: "authorized_to_process",
+        disclosureVersion: 1,
+      }),
+    ).toMatchObject({ schemaVersion: 2, sourceIdentity: tiktok });
+  });
+
+  it("normalizes and bounds project keyword governance", () => {
+    const actor = {
+      userId: id,
+      handle: "keyword_admin",
+      displayName: "Keyword Admin",
+    };
+    const keywordId = "019fbb95-cd76-7920-93fa-e23ba755ee40";
+    const aliasId = "019fbb95-cd76-7920-93fa-e23ba755ee41";
+    const suggestionId = "019fbb95-cd76-7920-93fa-e23ba755ee42";
+    expect(
+      SuggestProjectKeywordRequestSchema.parse({
+        proposedLabel: "Climate change",
+        language: "EN_us",
+        phrase: "  Climate\u00a0 CHANGE  ",
+        idempotencyKey: "suggest-climate",
+      }),
+    ).toEqual({
+      proposedLabel: "Climate change",
+      language: "en-US",
+      phrase: "Climate\u00a0 CHANGE",
+      idempotencyKey: "suggest-climate",
+    });
+    const catalog = {
+      projectId: id,
+      keywordSetVersion: 2,
+      keywords: [
+        {
+          id: keywordId,
+          projectId: id,
+          label: "Climate change",
+          enabled: true,
+          version: 1,
+          createdBy: actor,
+          createdAt: now,
+          updatedAt: now,
+          aliases: [
+            {
+              id: aliasId,
+              projectId: id,
+              keywordId,
+              language: "en",
+              phrase: "Climate change",
+              normalizedPhrase: "climate change",
+              enabled: true,
+              version: 1,
+              createdBy: actor,
+              createdAt: now,
+              updatedAt: now,
+            },
+          ],
+        },
+      ],
+      suggestions: [
+        {
+          id: suggestionId,
+          projectId: id,
+          keywordId,
+          language: "es",
+          phrase: "Cambio climático",
+          normalizedPhrase: "cambio climático",
+          state: "pending",
+          version: 1,
+          proposedBy: actor,
+          createdAt: now,
+          updatedAt: now,
+        },
+      ],
+    };
+    expect(ProjectKeywordCatalogSchema.parse(catalog)).toEqual(catalog);
+    expect(
+      ProjectKeywordCatalogSchema.parse({
+        ...catalog,
+        suggestions: [
+          {
+            ...catalog.suggestions[0],
+            state: "withdrawn",
+            withdrawnBy: actor,
+            withdrawnAt: now,
+            withdrawReason: "No longer needed",
+          },
+        ],
+      }).suggestions[0]?.state,
+    ).toBe("withdrawn");
+    expect(
+      ReviewProjectKeywordSuggestionRequestSchema.parse({
+        action: "approve",
+        expectedSuggestionVersion: 1,
+        expectedKeywordSetVersion: 2,
+        idempotencyKey: "approve-spanish",
+      }),
+    ).toMatchObject({ action: "approve", expectedKeywordSetVersion: 2 });
+    expect(
+      SuggestProjectKeywordRequestSchema.safeParse({
+        language: "en",
+        phrase: "climate",
+        idempotencyKey: "missing-target",
+      }).success,
+    ).toBe(false);
+    expect(
+      WithdrawProjectKeywordSuggestionRequestSchema.parse({
+        expectedSuggestionVersion: 1,
+        reason: "Duplicate research direction",
+        idempotencyKey: "withdraw-spanish",
+      }),
+    ).toMatchObject({ expectedSuggestionVersion: 1 });
+    expect(
+      UpdateProjectKeywordRequestSchema.parse({
+        description: null,
+        expectedKeywordVersion: 2,
+        expectedKeywordSetVersion: 3,
+        idempotencyKey: "clear-description",
+      }),
+    ).toMatchObject({ description: null });
+    expect(
+      UpdateProjectKeywordAliasRequestSchema.parse({
+        language: "EN_us",
+        phrase: " Updated phrase ",
+        expectedAliasVersion: 1,
+        expectedKeywordSetVersion: 3,
+        idempotencyKey: "update-alias",
+      }),
+    ).toMatchObject({ language: "en-US", phrase: "Updated phrase" });
+  });
+
+  it("bounds shared bookmark records, searches, and retained offline commands", () => {
+    const videoId = "019fbb95-cd76-7920-93fa-e23ba755ee40";
+    const bookmarkId = "019fbb95-cd76-7920-93fa-e23ba755ee41";
+    const bookmark = ProjectBookmarkSchema.parse({
+      id: bookmarkId,
+      projectId: id,
+      videoId,
+      sourceTimeMs: 12_345,
+      state: "active",
+      version: 1,
+      createdBy: {
+        userId: id,
+        handle: "researcher",
+        displayName: "Researcher",
+      },
+      updatedBy: {
+        userId: id,
+        handle: "researcher",
+        displayName: "Researcher",
+      },
+      createdAt: now,
+      updatedAt: now,
+    });
+    expect(bookmark.title).toBeUndefined();
+    expect(
+      CreateProjectBookmarkRequestSchema.parse({
+        videoId,
+        sourceTimeMs: 0,
+        idempotencyKey: "bare-bookmark",
+      }),
+    ).toMatchObject({ sourceTimeMs: 0 });
+    expect(
+      UpdateProjectBookmarkRequestSchema.parse({
+        title: null,
+        note: null,
+        expectedVersion: 1,
+        idempotencyKey: "clear-bookmark-copy",
+      }),
+    ).toMatchObject({ title: null, note: null });
+    expect(
+      ProjectBookmarkQuerySchema.parse({
+        scope: "project",
+        state: "all",
+        search: "Ｃｌｉｍａｔｅ",
+        limit: "25",
+      }),
+    ).toMatchObject({ scope: "project", state: "all", limit: 25 });
+    expect(
+      ProjectBookmarkQuerySchema.safeParse({ scope: "video" }).success,
+    ).toBe(false);
+    expect(
+      CreateProjectBookmarkRequestSchema.safeParse({
+        videoId,
+        sourceTimeMs: 1,
+        title: "x".repeat(121),
+        idempotencyKey: "too-long-title",
+      }).success,
+    ).toBe(false);
+    expect(
+      LocalProjectBookmarkPageSchema.parse({
+        projectId: id,
+        items: [bookmark],
+        freshness: "stale",
+        cachedAt: now,
+        outbox: [
+          {
+            outboxId: "019fbb95-cd76-7920-93fa-e23ba755ee42",
+            commandType: "bookmark.update.v1",
+            bookmarkId,
+            title: "Retained edit",
+            note: "Do not discard this text",
+            expectedVersion: 1,
+            state: "conflict",
+            code: "version_conflict",
+            createdAt: now,
+          },
+        ],
+      }).outbox[0],
+    ).toMatchObject({ state: "conflict", note: "Do not discard this text" });
+    expect(
+      OfflineProjectBookmarkMutationResultSchema.parse({
+        state: "applied",
+        outboxId: "019fbb95-cd76-7920-93fa-e23ba755ee43",
+        bookmark,
+      }),
+    ).toMatchObject({ state: "applied", bookmark: { id: bookmarkId } });
+  });
+
+  it("keeps keyword scan lifecycle, aggregate, and private artifact evidence exact", () => {
+    const videoId = "019fbb95-cd76-7920-93fa-e23ba755ee40";
+    const transcriptVersionId = "019fbb95-cd76-7920-93fa-e23ba755ee41";
+    const descriptor = {
+      objectKey: `keyword-scans/${id}/${videoId}/scan/matches.json`,
+      objectVersionId: "object-version-1",
+      sha256: "a".repeat(64),
+      sizeBytes: 128,
+      schemaVersion: 1 as const,
+    };
+    expect(
+      ProjectKeywordScanSummarySchema.parse({
+        projectId: id,
+        projectVideoId: videoId,
+        scanId: id,
+        status: "current",
+        transcriptVersionId,
+        keywordSetVersion: 2,
+        scannerSchemaVersion: 1,
+        occurrenceCount: 0,
+        matchedKeywordCount: 0,
+        keywordCounts: [],
+        approvedKeywordCount: 1,
+        artifact: descriptor,
+        completedAt: now,
+      }),
+    ).toMatchObject({ status: "current", occurrenceCount: 0 });
+    expect(
+      ProjectKeywordScanSummarySchema.safeParse({
+        projectId: id,
+        projectVideoId: videoId,
+        status: "queued",
+        transcriptVersionId,
+        keywordSetVersion: 2,
+        scannerSchemaVersion: 1,
+        approvedKeywordCount: 1,
+        occurrenceCount: 0,
+      }).success,
+    ).toBe(false);
+    const priorResult = {
+      scanId: "019fbb95-cd76-7920-93fa-e23ba755ee42",
+      transcriptVersionId,
+      keywordSetVersion: 1,
+      scannerSchemaVersion: 1 as const,
+      occurrenceCount: 2,
+      matchedKeywordCount: 1,
+      keywordCounts: [
+        {
+          keywordId: "019fbb95-cd76-7920-93fa-e23ba755ee43",
+          occurrenceCount: 2,
+        },
+      ],
+      approvedKeywordCount: 1,
+      durationMs: 60_000,
+      matchesPerMinute: 2,
+      artifact: descriptor,
+      completedAt: now,
+    };
+    expect(
+      ProjectKeywordScanSummarySchema.parse({
+        projectId: id,
+        projectVideoId: videoId,
+        scanId: id,
+        status: "scanning",
+        transcriptVersionId,
+        keywordSetVersion: 2,
+        scannerSchemaVersion: 1,
+        approvedKeywordCount: 2,
+        priorResult,
+      }),
+    ).toMatchObject({ status: "scanning", priorResult });
+    for (const status of ["current", "stale"] as const) {
+      expect(
+        ProjectKeywordScanSummarySchema.safeParse({
+          projectId: id,
+          projectVideoId: videoId,
+          scanId: id,
+          status,
+          transcriptVersionId,
+          keywordSetVersion: 2,
+          scannerSchemaVersion: 1,
+          occurrenceCount: 0,
+          matchedKeywordCount: 0,
+          keywordCounts: [],
+          approvedKeywordCount: 1,
+          artifact: descriptor,
+          completedAt: now,
+          priorResult,
+        }).success,
+      ).toBe(false);
+    }
+    expect(
+      ProjectKeywordMatchArtifactSchema.parse({
+        schemaVersion: 1,
+        projectId: id,
+        projectVideoId: videoId,
+        transcriptVersionId,
+        keywordSetVersion: 2,
+        scannerSchemaVersion: 1,
+        occurrences: [],
+      }),
+    ).toMatchObject({ occurrences: [] });
+    expect(
+      FinalizeProjectKeywordScanRequestSchema.safeParse({
+        attempt: 1,
+        artifact: { ...descriptor, objectVersionId: "" },
+        occurrenceCount: 0,
+        matchedKeywordCount: 0,
+        keywordCounts: [],
+      }).success,
+    ).toBe(false);
+  });
+
+  it("bounds project local-processing policy and workload commands", () => {
+    const status = {
+      projectId: id,
+      policy: { state: "automatic" as const, version: 1 },
+      workload: {
+        queuedJobs: 2,
+        activeJobs: 1,
+        queuedKnownDurationMs: 120_000,
+        activeKnownDurationMs: 60_000,
+        queuedUnknownDurationCount: 1,
+        activeUnknownDurationCount: 0,
+        unprocessedActiveVideoCount: 3,
+      },
+    };
+    expect(ProjectLocalProcessingStatusSchema.parse(status)).toEqual(status);
+    expect(
+      UpdateProjectLocalProcessingRequestSchema.parse({
+        state: "paused",
+        expectedVersion: 1,
+        idempotencyKey: "pause-local-v1",
+      }),
+    ).toEqual({
+      state: "paused",
+      expectedVersion: 1,
+      idempotencyKey: "pause-local-v1",
+    });
+    expect(
+      UpdateProjectLocalProcessingResponseSchema.parse({
+        ...status,
+        enqueuedCount: 50,
+        remainingUnprocessedCount: 2,
+      }),
+    ).toMatchObject({ enqueuedCount: 50, remainingUnprocessedCount: 2 });
+    expect(
+      UpdateProjectLocalProcessingRequestSchema.safeParse({
+        state: "overnight",
+        expectedVersion: 1,
+        idempotencyKey: "invalid-state",
+      }).success,
+    ).toBe(false);
+    expect(
+      UpdateProjectLocalProcessingResponseSchema.safeParse({
+        ...status,
+        enqueuedCount: 51,
+        remainingUnprocessedCount: 0,
+      }).success,
+    ).toBe(false);
+    expect(
+      ProjectLocalProcessingStatusSchema.safeParse({
+        ...status,
+        policy: {
+          ...status.policy,
+          updatedAt: now,
+        },
+      }).success,
+    ).toBe(false);
+  });
+
+  it("bounds canonical project-video worklist reads and optimistic own-flag commands", () => {
+    const videoId = "019fbb95-cd76-7920-93fa-e23ba755ee40";
+    const userId = "019fbb95-cd76-7920-93fa-e23ba755ee41";
+    expect(ProjectVideoWorklistQuerySchema.parse({})).toEqual({ limit: 25 });
+    expect(
+      ProjectVideoWorklistQuerySchema.parse({ limit: "50", cursor: "next" }),
+    ).toEqual({ limit: 50, cursor: "next" });
+    expect(
+      ProjectVideoWorklistQuerySchema.safeParse({ limit: 51 }).success,
+    ).toBe(false);
+    expect(
+      UpdateOwnProjectVideoFlagRequestSchema.parse({
+        active: false,
+        expectedVersion: 3,
+      }),
+    ).toEqual({ active: false, expectedVersion: 3 });
+    expect(
+      UpdateOwnProjectVideoFlagRequestSchema.safeParse({
+        active: true,
+        expectedVersion: -1,
+      }).success,
+    ).toBe(false);
+
+    const page = {
+      items: [
+        {
+          projectId: id,
+          video: {
+            id: videoId,
+            youtubeVideoId: "Worklist1",
+            canonicalUrl: "https://www.youtube.com/watch?v=Worklist1",
+            title: "Canonical worklist fixture",
+            channel: "Fixture channel",
+            durationMs: 60_000,
+            sourceLanguage: "en",
+            createdAt: now,
+            updatedAt: now,
+          },
+          projectVideoVersion: 4,
+          priority: "normal" as const,
+          completionPolicy: "researcher_or_administrator" as const,
+          triage: { state: "active" as const, version: 1 },
+          unreadActivityCount: 0,
+          review: {
+            id: "019fbb95-cd76-7920-93fa-e23ba755ee46",
+            cycleNumber: 1,
+            status: "open" as const,
+            version: 1,
+            openedAt: now,
+          },
+          activeTranscriptVersionId: "019fbb95-cd76-7920-93fa-e23ba755ee42",
+          activeFlagCount: 1,
+          flaggers: [
+            {
+              userId,
+              handle: "worklist_user",
+              displayName: "Worklist User",
+              flaggedAt: now,
+            },
+          ],
+          flaggersTruncated: false,
+          ownFlag: {
+            active: true,
+            version: 2,
+            createdAt: now,
+            updatedAt: now,
+          },
+          processing: {
+            state: "ready",
+            batchId: "019fbb95-cd76-7920-93fa-e23ba755ee43",
+            batchItemId: "019fbb95-cd76-7920-93fa-e23ba755ee44",
+            jobId: "019fbb95-cd76-7920-93fa-e23ba755ee45",
+            attempt: 1,
+            updatedAt: now,
+          },
+          keywordScan: {
+            projectId: id,
+            projectVideoId: videoId,
+            status: "waiting_for_transcript" as const,
+            keywordSetVersion: 1,
+            scannerSchemaVersion: 1 as const,
+            approvedKeywordCount: 0,
+          },
+          clipCount: 2,
+          createdAt: now,
+          updatedAt: now,
+        },
+      ],
+      total: 1,
+      nextCursor: "next-page",
+    };
+    expect(ProjectVideoWorklistPageSchema.parse(page)).toEqual(page);
+    expect(
+      ProjectVideoWorklistPageSchema.safeParse({
+        ...page,
+        items: Array.from({ length: 51 }, () => page.items[0]),
+      }).success,
+    ).toBe(false);
+  });
+
+  it("keeps soft-claim and worklist-governance commands closed and action-specific", () => {
+    expect(
+      UpdateProjectVideoClaimRequestSchema.parse({
+        action: "claim",
+        idempotencyKey: "claim-v1",
+        expectedClaimVersion: 0,
+        leaseSeconds: 300,
+        takeoverConfirmed: false,
+      }),
+    ).toMatchObject({ action: "claim", leaseSeconds: 300 });
+    expect(
+      UpdateProjectVideoClaimRequestSchema.safeParse({
+        action: "renew",
+        idempotencyKey: "renew-v1",
+        expectedClaimVersion: 1,
+        leaseSeconds: 300,
+        takeoverConfirmed: true,
+      }).success,
+    ).toBe(false);
+    expect(
+      UpdateProjectVideoClaimRequestSchema.safeParse({
+        action: "release",
+        idempotencyKey: "release-v1",
+        expectedClaimVersion: 1,
+        leaseSeconds: 300,
+      }).success,
+    ).toBe(false);
+    expect(
+      UpdateProjectVideoGovernanceRequestSchema.parse({
+        idempotencyKey: "governance-v1",
+        expectedProjectVideoVersion: 2,
+        priority: "high",
+        completionPolicy: "administrator_only",
+      }),
+    ).toMatchObject({
+      priority: "high",
+      completionPolicy: "administrator_only",
+    });
+    expect(
+      UpdateProjectVideoGovernanceRequestSchema.safeParse({
+        idempotencyKey: "governance-empty",
+        expectedProjectVideoVersion: 2,
+      }).success,
+    ).toBe(false);
+    expect(
+      UpdateProjectVideoReviewRequestSchema.parse({
+        action: "complete",
+        idempotencyKey: "complete-v1",
+        expectedCycleId: "019fbb95-cd76-7920-93fa-e23ba755ee46",
+        expectedCycleVersion: 1,
+        acknowledgeTranscriptUnavailable: true,
+      }),
+    ).toMatchObject({ action: "complete" });
+    expect(
+      UpdateProjectVideoReviewRequestSchema.parse({
+        action: "reopen",
+        idempotencyKey: "reopen-v1",
+        expectedCycleId: "019fbb95-cd76-7920-93fa-e23ba755ee46",
+        expectedCycleVersion: 2,
+        reason: "Additional evidence arrived.",
+      }),
+    ).toMatchObject({ action: "reopen" });
+    expect(
+      UpdateProjectVideoReviewRequestSchema.safeParse({
+        action: "reopen",
+        idempotencyKey: "reopen-invalid",
+        expectedCycleId: "019fbb95-cd76-7920-93fa-e23ba755ee46",
+        expectedCycleVersion: 2,
+      }).success,
+    ).toBe(false);
+  });
+
+  it("keeps project governance invitations and lifecycle commands strict", () => {
+    expect(
+      CreateProjectInvitationRequestSchema.parse({
+        idempotencyKey: "invite-researcher",
+        handle: "researcher_one",
+        role: "researcher",
+        expiresInDays: 7,
+      }),
+    ).toMatchObject({ handle: "researcher_one", role: "researcher" });
+    expect(
+      CreateProjectInvitationRequestSchema.safeParse({
+        idempotencyKey: "invite-owner",
+        handle: "owner_one",
+        role: "owner",
+        expiresInDays: 7,
+      }).success,
+    ).toBe(false);
+    expect(
+      DecideProjectInvitationRequestSchema.parse({
+        idempotencyKey: "accept-invitation",
+        expectedVersion: 1,
+        decision: "accept",
+      }),
+    ).toMatchObject({ decision: "accept" });
+    expect(
+      RevokeProjectInvitationRequestSchema.parse({
+        idempotencyKey: "revoke-invitation",
+        expectedVersion: 1,
+      }),
+    ).toMatchObject({ expectedVersion: 1 });
+    expect(
+      JoinOpenProjectRequestSchema.safeParse({
+        idempotencyKey: "join-open",
+        unexpected: true,
+      }).success,
+    ).toBe(false);
+    expect(
+      UpdateProjectGovernanceRequestSchema.parse({
+        idempotencyKey: "transfer-owner",
+        expectedVersion: 2,
+        action: { type: "transfer_ownership", userId: id },
+      }),
+    ).toMatchObject({ action: { type: "transfer_ownership", userId: id } });
+    expect(
+      UpdateProjectGovernanceRequestSchema.safeParse({
+        idempotencyKey: "remove-without-member-version",
+        expectedVersion: 2,
+        action: { type: "remove_member", userId: id },
+      }).success,
+    ).toBe(false);
+
+    expect(
+      ProjectInvitationSchema.parse({
+        id,
+        projectId: "019fbb95-cd76-7920-93fa-e23ba755ee40",
+        projectName: "Governance fixture",
+        invitee: { id, handle: "researcher_one" },
+        inviter: {
+          id: "019fbb95-cd76-7920-93fa-e23ba755ee41",
+          handle: "owner_one",
+        },
+        role: "researcher",
+        state: "pending",
+        version: 1,
+        expiresAt: "2026-08-31T12:00:00.000Z",
+        createdAt: now,
+        updatedAt: now,
+      }),
+    ).toMatchObject({ state: "pending" });
+    expect(
+      OpenProjectDiscoverySchema.parse({
+        id,
+        name: "Open fixture",
+        description: "Bounded public summary",
+        memberCount: 2,
+      }),
+    ).not.toHaveProperty("currentUserRole");
+    expect(
+      ProjectGovernanceEventSchema.parse({
+        id,
+        projectId: "019fbb95-cd76-7920-93fa-e23ba755ee40",
+        eventType: "member_removed",
+        actorId: "019fbb95-cd76-7920-93fa-e23ba755ee41",
+        targetUserId: "019fbb95-cd76-7920-93fa-e23ba755ee42",
+        createdAt: now,
+      }),
+    ).not.toHaveProperty("body");
+  });
+
+  it("keeps bulk triage and per-user activity commands bounded and closed", () => {
+    const videoId = "019fbb95-cd76-7920-93fa-e23ba755ee40";
+    const eventId = "019fbb95-cd76-7920-93fa-e23ba755ee47";
+    const userId = "019fbb95-cd76-7920-93fa-e23ba755ee41";
+    expect(
+      UpdateProjectVideoTriageRequestSchema.parse({
+        action: "dismiss",
+        idempotencyKey: "dismiss:1",
+        items: [{ videoId, expectedProjectVideoVersion: 4 }],
+        reason: "Out of scope for this cut.",
+      }),
+    ).toMatchObject({ action: "dismiss" });
+    expect(
+      UpdateProjectVideoTriageRequestSchema.safeParse({
+        action: "restore",
+        idempotencyKey: "restore:invalid",
+        items: [{ videoId, expectedProjectVideoVersion: 5 }],
+        reason: "Not valid on restore.",
+      }).success,
+    ).toBe(false);
+    expect(
+      BulkUpdateProjectVideoPriorityRequestSchema.parse({
+        priority: "high",
+        idempotencyKey: "priority:1",
+        items: [{ videoId, expectedProjectVideoVersion: 4 }],
+      }),
+    ).toMatchObject({ priority: "high" });
+    expect(
+      BulkUpdateProjectVideoPriorityRequestSchema.safeParse({
+        priority: "low",
+        idempotencyKey: "priority:duplicate",
+        items: [
+          { videoId, expectedProjectVideoVersion: 4 },
+          { videoId, expectedProjectVideoVersion: 4 },
+        ],
+      }).success,
+    ).toBe(false);
+    expect(
+      UpdateProjectVideoTriageRequestSchema.safeParse({
+        action: "dismiss",
+        idempotencyKey: "dismiss:duplicate",
+        items: [
+          { videoId, expectedProjectVideoVersion: 4 },
+          { videoId, expectedProjectVideoVersion: 4 },
+        ],
+      }).success,
+    ).toBe(false);
+    expect(
+      ProjectVideoActivityPageSchema.parse({
+        items: [
+          {
+            eventId,
+            projectId: id,
+            videoId,
+            videoTitle: "Activity fixture",
+            eventType: "video_dismissed",
+            actor: {
+              userId,
+              handle: "worklist_user",
+              displayName: "Worklist User",
+            },
+            reason: "Out of scope for this cut.",
+            state: "unread",
+            version: 1,
+            createdAt: now,
+          },
+        ],
+        unreadCount: 1,
+      }).items,
+    ).toHaveLength(1);
+    expect(
+      ProjectVideoActivityPageSchema.parse({
+        items: [
+          {
+            eventId,
+            projectId: id,
+            videoId,
+            videoTitle: "Keyword scan fixture",
+            eventType: "keyword_scan_completed",
+            actor: {
+              userId,
+              handle: "scan_worker",
+              displayName: "Scan Worker",
+            },
+            state: "unread",
+            version: 1,
+            createdAt: now,
+          },
+        ],
+        unreadCount: 1,
+      }).items[0]?.eventType,
+    ).toBe("keyword_scan_completed");
+    expect(
+      MarkProjectVideoActivitySeenRequestSchema.safeParse({
+        items: [
+          { eventId, expectedVersion: 1 },
+          { eventId, expectedVersion: 1 },
+        ],
+      }).success,
+    ).toBe(false);
+  });
+
+  it("keeps manual timed import commands closed and candidate status storage-free", () => {
+    const projectId = id;
+    const videoId = "019fbb95-cd76-7920-93fa-e23ba755ee40";
+    const batchItemId = "019fbb95-cd76-7920-93fa-e23ba755ee41";
+    const decisionId = "019fbb95-cd76-7920-93fa-e23ba755ee42";
+    const importId = "019fbb95-cd76-7920-93fa-e23ba755ee43";
+    const descriptor = {
+      format: "srt" as const,
+      byteSize: 128,
+      sha256: "a".repeat(64),
+    };
+    const create = {
+      idempotencyKey: "manual-import:create:1",
+      languageDecisionId: decisionId,
+      expectedDecisionVersion: 2,
+      batchItemId,
+      expectedBatchItemVersion: 3,
+      original: descriptor,
+      english: { ...descriptor, sha256: "b".repeat(64) },
+    };
+    expect(
+      CreateManualTimedTranscriptImportRequestSchema.parse(create),
+    ).toEqual(create);
+    expect(
+      CreateManualTimedTranscriptImportRequestSchema.safeParse({
+        ...create,
+        fileName: "/private/original.srt",
+      }).success,
+    ).toBe(false);
+
+    const grant = {
+      importId,
+      projectId,
+      catalogVideoId: videoId,
+      batchItemId,
+      sourceLanguage: "dz",
+      languageDecisionId: decisionId,
+      languageDecisionVersion: 2,
+      expiresAt: now,
+      targets: [
+        {
+          role: "original" as const,
+          format: "srt" as const,
+          objectKey: "private/import/original",
+          uploadUrl: "https://upload.invalid/original",
+        },
+        {
+          role: "english" as const,
+          format: "srt" as const,
+          objectKey: "private/import/english",
+          uploadUrl: "https://upload.invalid/english",
+        },
+      ],
+    };
+    expect(ManualTimedTranscriptImportUploadGrantSchema.parse(grant)).toEqual(
+      grant,
+    );
+    expect(
+      ManualTimedTranscriptImportUploadGrantSchema.safeParse({
+        ...grant,
+        targets: [grant.targets[0], grant.targets[0]],
+      }).success,
+    ).toBe(false);
+
+    const receipt = {
+      objectVersionId: "version-1",
+      byteSize: 128,
+      sha256: "a".repeat(64),
+    };
+    expect(
+      FinalizeManualTimedTranscriptImportRequestSchema.parse({
+        idempotencyKey: "manual-import:finalize:1",
+        original: receipt,
+        english: { ...receipt, sha256: "b".repeat(64) },
+      }),
+    ).toBeTruthy();
+    const status = {
+      importId,
+      projectId,
+      catalogVideoId: videoId,
+      batchItemId,
+      state: "finalized" as const,
+      version: 2,
+      sourceLanguage: "dz",
+      targetLanguage: "en" as const,
+      languageDecisionId: decisionId,
+      languageDecisionVersion: 2,
+      createdAt: now,
+      expiresAt: now,
+      candidate: {
+        candidateId: "019fbb95-cd76-7920-93fa-e23ba755ee44",
+        transcriptVersionId: "019fbb95-cd76-7920-93fa-e23ba755ee45",
+        timingPrecision: "cue" as const,
+        finalizedAt: now,
+      },
+    };
+    expect(ManualTimedTranscriptImportStatusSchema.parse(status)).toEqual(
+      status,
+    );
+    expect(
+      ManualTimedTranscriptImportStatusSchema.safeParse({
+        ...status,
+        objectKey: "private/import/original",
+      }).success,
+    ).toBe(false);
+  });
+
+  it("keeps corrected-candidate review bounded, linked, and activation exact", () => {
+    const projectId = id;
+    const videoId = "019fbb95-cd76-7920-93fa-e23ba755ee40";
+    const importId = "019fbb95-cd76-7920-93fa-e23ba755ee41";
+    const candidateId = "019fbb95-cd76-7920-93fa-e23ba755ee42";
+    const transcriptVersionId = "019fbb95-cd76-7920-93fa-e23ba755ee43";
+    const decisionId = "019fbb95-cd76-7920-93fa-e23ba755ee44";
+    const originalTrackId = "019fbb95-cd76-7920-93fa-e23ba755ee45";
+    const englishTrackId = "019fbb95-cd76-7920-93fa-e23ba755ee46";
+    const cue = {
+      id: "019fbb95-cd76-7920-93fa-e23ba755ee47",
+      ordinal: 0,
+      startMs: 0,
+      endMs: 1_000,
+      text: "Reviewed cue",
+    };
+    const page = {
+      candidateId,
+      importId,
+      transcriptVersionId,
+      projectId,
+      catalogVideoId: videoId,
+      projectVideoVersion: 4,
+      languageDecisionId: decisionId,
+      languageDecisionVersion: 2,
+      finalizedAt: now,
+      offset: 0,
+      limit: 25,
+      hasMore: false,
+      original: {
+        trackId: originalTrackId,
+        trackVersion: 1,
+        language: "dz",
+        kind: "original" as const,
+        source: "manual-import" as const,
+        provider: "researcher-timed-import",
+        timingPrecision: "cue" as const,
+        contentSha256: "a".repeat(64),
+        totalCues: 1,
+        cues: [cue],
+      },
+      english: {
+        trackId: englishTrackId,
+        trackVersion: 1,
+        language: "en" as const,
+        kind: "english" as const,
+        source: "manual-import" as const,
+        provider: "researcher-timed-import",
+        sourceTrackId: originalTrackId,
+        timingPrecision: "cue" as const,
+        contentSha256: "b".repeat(64),
+        totalCues: 1,
+        cues: [{ ...cue, id: englishTrackId, text: "English cue" }],
+      },
+    };
+    expect(ManualTimedTranscriptCandidateReviewPageSchema.parse(page)).toEqual(
+      page,
+    );
+    expect(
+      ManualTimedTranscriptCandidateReviewPageSchema.safeParse({
+        ...page,
+        objectKey: "private/candidate/original.json",
+      }).success,
+    ).toBe(false);
+    expect(
+      ManualTimedTranscriptCandidateReviewPageSchema.safeParse({
+        ...page,
+        english: { ...page.english, sourceTrackId: englishTrackId },
+      }).success,
+    ).toBe(false);
+    expect(
+      ManualTimedTranscriptCandidateReviewQuerySchema.parse({ limit: "100" }),
+    ).toEqual({ offset: 0, limit: 100 });
+    expect(
+      ManualTimedTranscriptCandidateReviewQuerySchema.safeParse({
+        limit: 101,
+      }).success,
+    ).toBe(false);
+
+    const activation = {
+      idempotencyKey: "activate-corrected-v1",
+      importId,
+      candidateId,
+      transcriptVersionId,
+      expectedProjectVideoVersion: 4,
+      languageDecisionId: decisionId,
+      expectedLanguageDecisionVersion: 2,
+    };
+    expect(
+      ActivateManualTimedTranscriptCandidateRequestSchema.parse(activation),
+    ).toEqual(activation);
+    expect(
+      ActivateManualTimedTranscriptCandidateRequestSchema.safeParse({
+        ...activation,
+        signedUrl: "https://private.invalid",
+      }).success,
+    ).toBe(false);
+    expect(
+      ManualTimedTranscriptActivationStatusSchema.parse({
+        activationId: "019fbb95-cd76-7920-93fa-e23ba755ee48",
+        state: "activated",
+        projectId,
+        catalogVideoId: videoId,
+        importId,
+        candidateId,
+        transcriptVersionId,
+        languageDecisionId: decisionId,
+        languageDecisionVersion: 2,
+        projectVideoVersion: 5,
+        activatedAt: now,
+      }),
+    ).toBeTruthy();
+  });
+
+  it("requires exactly one worker-job or manual-import manifest identity", () => {
+    const base = {
+      schemaVersion: 1,
+      id,
+      projectId: "019fbb95-cd76-7920-93fa-e23ba755ee40",
+      catalogVideoId: "019fbb95-cd76-7920-93fa-e23ba755ee41",
+      videoId: "fixture-video",
+      lineageId: "019fbb95-cd76-7920-93fa-e23ba755ee42",
+      version: 1,
+      sourceLanguage: "dz",
+      targetLanguage: "en",
+      timingPrecision: "cue" as const,
+      provider: "researcher-timed-import",
+      normalizationSchemaVersion: 1,
+      createdBy: "019fbb95-cd76-7920-93fa-e23ba755ee43",
+      createdAt: now,
+      artifacts: [
+        {
+          type: "original-normalized" as const,
+          objectKey: "private/original",
+          byteSize: 1,
+          sha256: "a".repeat(64),
+        },
+      ],
+    };
+    expect(
+      TranscriptManifestSchema.parse({ ...base, manualImportId: id }),
+    ).toBeTruthy();
+    expect(TranscriptManifestSchema.safeParse(base).success).toBe(false);
+    expect(
+      TranscriptManifestSchema.safeParse({
+        ...base,
+        jobId: id,
+        manualImportId: id,
+      }).success,
+    ).toBe(false);
+  });
+
+  it("bounds the dedicated native timed upload bridge", () => {
+    expect(
+      DesktopTimedTranscriptUploadRequestSchema.parse({
+        importId: id,
+        role: "original",
+        contentType: "application/x-subrip",
+        bytes: new Uint8Array([1, 2, 3]),
+      }),
+    ).toBeTruthy();
+    expect(
+      DesktopTimedTranscriptUploadRequestSchema.safeParse({
+        importId: "not-an-id",
+        role: "not-a-role",
+        contentType: "text/plain",
+        bytes: new Uint8Array([1]),
+      }).success,
+    ).toBe(false);
+  });
+
   it("keeps derived translation lookup read-only and identity-only", () => {
     const identity = {
       projectId: id,
@@ -1233,12 +2728,103 @@ describe("shared contracts", () => {
     const project = ProjectSchema.parse({
       id,
       name: "Essay research",
+      kind: "shared",
+      visibility: "invitation_only",
       version: 1,
       createdAt: now,
       updatedAt: now,
     });
 
     expect(project.description).toBe("");
+  });
+
+  it("normalizes stable handles and rejects invalid shapes", () => {
+    expect(normalizeUserHandle("  @Researcher_01 ")).toBe("researcher_01");
+    expect(UserHandleSchema.parse("Ｒｅｓｅａｒｃｈｅｒ_01")).toBe(
+      "researcher_01",
+    );
+    expect(
+      RegisterUserRequestSchema.parse({
+        displayName: "Researcher",
+        handle: "@Case_Equivalent",
+      }),
+    ).toEqual({ displayName: "Researcher", handle: "case_equivalent" });
+    for (const handle of ["ab", "1researcher", "research-er", "a".repeat(33)]) {
+      expect(UserHandleSchema.safeParse(handle).success).toBe(false);
+    }
+  });
+
+  it("defaults and validates project kind and visibility combinations", () => {
+    expect(CreateProjectRequestSchema.parse({ name: "Shared" })).toMatchObject({
+      kind: "shared",
+      visibility: "invitation_only",
+    });
+    expect(
+      CreateProjectRequestSchema.parse({ name: "Personal", kind: "personal" }),
+    ).toMatchObject({ kind: "personal", visibility: "private" });
+    expect(
+      CreateProjectRequestSchema.parse({
+        name: "Open",
+        kind: "shared",
+        visibility: "open_to_join",
+      }),
+    ).toMatchObject({ kind: "shared", visibility: "open_to_join" });
+    for (const project of [
+      {
+        name: "Invalid personal",
+        kind: "personal",
+        visibility: "open_to_join",
+      },
+      { name: "Invalid shared", kind: "shared", visibility: "private" },
+    ]) {
+      expect(CreateProjectRequestSchema.safeParse(project).success).toBe(false);
+    }
+  });
+
+  it("keeps new role assignments closed to Administrator and Researcher", () => {
+    for (const role of ["administrator", "researcher"]) {
+      expect(
+        AddProjectMemberRequestSchema.safeParse({ userId: id, role }).success,
+      ).toBe(true);
+    }
+    for (const role of ["owner", "editor", "viewer"]) {
+      expect(
+        AddProjectMemberRequestSchema.safeParse({ userId: id, role }).success,
+      ).toBe(false);
+    }
+  });
+
+  it("requires complete authorized project summaries and valid persisted combinations", () => {
+    const summary = {
+      id,
+      name: "Shared project",
+      description: "",
+      kind: "shared",
+      visibility: "invitation_only",
+      version: 1,
+      currentUserRole: "administrator",
+      memberCount: 2,
+      createdAt: now,
+      updatedAt: now,
+    };
+    expect(ProjectSummarySchema.parse(summary)).toMatchObject({
+      currentUserRole: "administrator",
+      memberCount: 2,
+    });
+    expect(
+      ProjectSummarySchema.safeParse({ ...summary, currentUserRole: undefined })
+        .success,
+    ).toBe(false);
+    expect(
+      ProjectSummarySchema.safeParse({ ...summary, memberCount: 0 }).success,
+    ).toBe(false);
+    expect(
+      ProjectSchema.safeParse({
+        ...summary,
+        kind: "personal",
+        visibility: "open_to_join",
+      }).success,
+    ).toBe(false);
   });
 
   it("rejects a projectless non-export job only at the command boundary, not transport", () => {
@@ -1311,6 +2897,168 @@ describe("shared contracts", () => {
     expect(
       UpdatePreferredLanguageRequestSchema.safeParse({
         preferredLanguage: "not a language",
+      }).success,
+    ).toBe(false);
+    expect(formatLanguageLabel("ES_mx")).toBe("Spanish (Mexico) (es-MX)");
+    expect(formatLanguageLabel("fr-CA")).toBe("French (Canada) (fr-CA)");
+    expect(formatLanguageLabel("zh-Hant-TW")).toBe(
+      "Chinese (Traditional) (Taiwan) (zh-Hant-TW)",
+    );
+    expect(formatLanguageLabel("dz")).toBe("Dzongkha (dz)");
+  });
+
+  it("keeps provider claims, authorized decisions, capabilities, and gate remediation strict", () => {
+    const videoId = "019fbb95-cd76-7920-93fa-e23ba755ee42";
+    const evidenceId = "019fbb95-cd76-7920-93fa-e23ba755ee43";
+    const decisionId = "019fbb95-cd76-7920-93fa-e23ba755ee44";
+    const evidence = {
+      id: evidenceId,
+      projectId: id,
+      videoId,
+      source: "caption" as const,
+      provider: "fixture-caption-provider",
+      reportedLanguage: "KO_kr",
+      trackFingerprint: "a".repeat(64),
+      captionKind: "automatic" as const,
+      createdAt: now,
+    };
+    expect(ProviderLanguageEvidenceSchema.parse(evidence)).toMatchObject({
+      reportedLanguage: "ko-KR",
+    });
+    expect(
+      ProviderLanguageEvidenceSchema.safeParse({
+        ...evidence,
+        captionKind: undefined,
+      }).success,
+    ).toBe(false);
+    expect(
+      ProviderLanguageEvidenceSchema.safeParse({
+        ...evidence,
+        source: "speech_detection",
+      }).success,
+    ).toBe(false);
+    for (const provider of [
+      "https://provider.example/token",
+      "/private/provider",
+      "provider bearer-token",
+    ]) {
+      expect(
+        ProviderLanguageEvidenceSchema.safeParse({ ...evidence, provider })
+          .success,
+      ).toBe(false);
+    }
+
+    const decision = {
+      id: decisionId,
+      projectId: id,
+      videoId,
+      decisionVersion: 1,
+      status: "confirmed" as const,
+      basis: "user_confirmation" as const,
+      resolvedLanguage: "dz",
+      evidenceId,
+      actorId: "019fbb95-cd76-7920-93fa-e23ba755ee45",
+      createdAt: now,
+    };
+    expect(ProjectVideoLanguageDecisionSchema.parse(decision)).toEqual(
+      decision,
+    );
+    expect(
+      ProjectVideoLanguageDecisionSchema.safeParse({
+        ...decision,
+        resolvedLanguage: undefined,
+      }).success,
+    ).toBe(false);
+
+    const snapshot = {
+      schemaVersion: 1 as const,
+      decisionId,
+      decisionVersion: 1,
+      status: "confirmed" as const,
+      basis: "user_confirmation" as const,
+      resolvedLanguage: "dz",
+      evidenceId,
+    };
+    expect(LanguageDecisionSnapshotSchema.parse(snapshot)).toEqual(snapshot);
+    expect(
+      LanguageDecisionSnapshotSchema.safeParse({
+        ...snapshot,
+        actorId: decision.actorId,
+      }).success,
+    ).toBe(false);
+
+    const unsupportedSpeech = {
+      state: "unsupported" as const,
+      provider: "fixture-speech",
+      operation: "speech_to_text" as const,
+      sourceLanguage: "dz",
+      version: "fixture-v1",
+      reason: "language_not_supported" as const,
+    };
+    expect(LanguageCapabilityResultSchema.parse(unsupportedSpeech)).toEqual(
+      unsupportedSpeech,
+    );
+    expect(
+      LanguageCapabilityResultSchema.safeParse({
+        ...unsupportedSpeech,
+        reason: "free-form provider output",
+      }).success,
+    ).toBe(false);
+    expect(
+      LanguageCapabilityResultSchema.safeParse({
+        ...unsupportedSpeech,
+        version: "/private/runtime",
+      }).success,
+    ).toBe(false);
+
+    const gate = {
+      state: "needs_language_confirmation" as const,
+      status: "conflict" as const,
+      creatorReportedLanguage: "dz",
+      providerEvidence: evidence,
+      decision,
+      speechCapability: unsupportedSpeech,
+      remediationReason: "resolve_conflict" as const,
+    };
+    expect(LanguageGateSchema.parse(gate)).toMatchObject({
+      status: "conflict",
+      providerEvidence: { reportedLanguage: "ko-KR" },
+    });
+    expect(
+      LanguageGateSchema.safeParse({
+        ...gate,
+        state: "ready",
+        remediationReason: "none",
+      }).success,
+    ).toBe(false);
+
+    const command = {
+      idempotencyKey: "confirm-dz-1",
+      expectedDecisionVersion: 0,
+      resolvedLanguage: "dz",
+      basis: "user_confirmation" as const,
+      evidenceId,
+      batchItemId: "019fbb95-cd76-7920-93fa-e23ba755ee46",
+      expectedBatchItemVersion: 1,
+    };
+    expect(
+      CreateProjectVideoLanguageDecisionRequestSchema.parse(command),
+    ).toEqual(command);
+    expect(
+      CreateProjectVideoLanguageDecisionRequestSchema.safeParse({
+        ...command,
+        expectedBatchItemVersion: undefined,
+      }).success,
+    ).toBe(false);
+
+    expect(
+      WorkerObserveLanguageEvidenceRequestSchema.safeParse({
+        attempt: 2,
+        evidence: {
+          ...evidence,
+          jobId: "019fbb95-cd76-7920-93fa-e23ba755ee47",
+          attempt: 1,
+        },
       }).success,
     ).toBe(false);
   });
@@ -1439,6 +3187,49 @@ describe("shared contracts", () => {
       TranscriptionBatchControlRequestSchema.safeParse({
         action: "retry_failed",
         expectedVersion: 0,
+      }).success,
+    ).toBe(false);
+  });
+
+  it("keeps hosted transcription approval strict and evidence-consistent", () => {
+    const actor = {
+      userId: id,
+      handle: "hosted_admin",
+      displayName: "Hosted Admin",
+    };
+    expect(
+      HostedTranscriptionApprovalSchema.parse({ state: "pending", version: 1 }),
+    ).toEqual({ state: "pending", version: 1 });
+    for (const state of ["approved", "revoked"] as const) {
+      expect(
+        HostedTranscriptionApprovalSchema.parse({
+          state,
+          version: 2,
+          decidedBy: actor,
+          decidedAt: now,
+        }),
+      ).toMatchObject({ state, decidedBy: actor });
+    }
+    expect(
+      HostedTranscriptionApprovalSchema.safeParse({
+        state: "approved",
+        version: 2,
+      }).success,
+    ).toBe(false);
+    expect(
+      HostedTranscriptionApprovalSchema.safeParse({
+        state: "pending",
+        version: 1,
+        decidedBy: actor,
+        decidedAt: now,
+      }).success,
+    ).toBe(false);
+    expect(
+      UpdateHostedTranscriptionApprovalRequestSchema.safeParse({
+        action: "approve",
+        idempotencyKey: "hosted-approval-v1",
+        expectedVersion: 1,
+        unexpected: true,
       }).success,
     ).toBe(false);
   });
@@ -1832,6 +3623,159 @@ function deliveryContractFixture() {
 }
 
 describe("desktop boundary contracts", () => {
+  it("keeps notification events bounded, body-free, and exactly navigable", () => {
+    const projectId = "019fbb95-cd76-7920-93fa-e23ba755ee70";
+    const batchId = "019fbb95-cd76-7920-93fa-e23ba755ee71";
+    const videoId = "019fbb95-cd76-7920-93fa-e23ba755ee72";
+    const clipId = "019fbb95-cd76-7920-93fa-e23ba755ee73";
+    const requestId = "019fbb95-cd76-7920-93fa-e23ba755ee74";
+    const commentId = "019fbb95-cd76-7920-93fa-e23ba755ee75";
+    const base = {
+      id: "019fbb95-cd76-7920-93fa-e23ba755ee76",
+      createdAt: "2026-08-24T12:00:00.000Z",
+      projectLabel: "Documentary",
+      sourceLabel: "Fixture source",
+    };
+    const events = [
+      {
+        ...base,
+        kind: "transcription_batch_terminal",
+        status: "ready",
+        batchLabel: "Morning batch",
+        navigation: { kind: "transcription", projectId, batchId },
+      },
+      {
+        ...base,
+        kind: "transcription_action_needed",
+        status: "failed",
+        batchLabel: "Morning batch",
+        navigation: { kind: "transcription", projectId, batchId, videoId },
+      },
+      {
+        ...base,
+        kind: "logged_export_terminal",
+        status: "completed",
+        navigation: { kind: "logged_export", projectId, clipId, requestId },
+      },
+      {
+        id: base.id,
+        createdAt: base.createdAt,
+        sourceLabel: base.sourceLabel,
+        kind: "local_export_terminal",
+        status: "action_needed",
+        navigation: { kind: "local_export", requestId },
+      },
+      {
+        ...base,
+        kind: "mention",
+        status: "mentioned",
+        actorLabel: "A. Researcher",
+        navigation: {
+          kind: "mention",
+          projectId,
+          clipId,
+          commentId,
+          sourceTimeMs: 42,
+        },
+      },
+    ];
+
+    for (const event of events) {
+      expect(NotificationEventSchema.parse(event)).toEqual(event);
+      for (const forbidden of [
+        "commentBody",
+        "transcriptText",
+        "errorDetails",
+        "path",
+        "url",
+        "artifactLocator",
+      ]) {
+        expect(
+          NotificationEventSchema.safeParse({ ...event, [forbidden]: "secret" })
+            .success,
+        ).toBe(false);
+      }
+    }
+    expect(
+      NotificationEventSchema.safeParse({
+        ...events[4],
+        actorLabel: "x".repeat(161),
+      }).success,
+    ).toBe(false);
+    expect(
+      DesktopNotificationNavigationTargetSchema.safeParse({
+        kind: "mention",
+        projectId,
+        clipId,
+        commentId,
+        requestId,
+      }).success,
+    ).toBe(false);
+    expect(
+      DesktopNotificationNavigationTargetSchema.safeParse({
+        kind: "logged_export",
+        projectId,
+        clipId,
+      }).success,
+    ).toBe(false);
+  });
+
+  it("validates notification preference invariants and bounded feed queries", () => {
+    expect(
+      sanitizeNotificationLabel(
+        "Interview https://private.invalid/watch /Users/research/source.mp4 token=secret",
+      ),
+    ).toBe("Interview <url> <path> token=<redacted>");
+    expect(sanitizeNotificationLabel("News/Politics")).toBe("News/Politics");
+    expect(
+      DesktopNotificationPreferencesSchema.parse({
+        enabled: true,
+        enabledAt: "2026-08-24T12:00:00.000Z",
+        updatedAt: "2026-08-24T12:00:00.000Z",
+      }),
+    ).toMatchObject({ enabled: true });
+    for (const invalid of [
+      {
+        enabled: true,
+        updatedAt: "2026-08-24T12:00:00.000Z",
+      },
+      {
+        enabled: false,
+        enabledAt: "2026-08-24T12:00:00.000Z",
+        updatedAt: "2026-08-24T12:00:00.000Z",
+      },
+    ]) {
+      expect(
+        DesktopNotificationPreferencesSchema.safeParse(invalid).success,
+      ).toBe(false);
+    }
+    expect(NotificationFeedQuerySchema.parse({})).toEqual({ limit: 25 });
+    expect(NotificationFeedQuerySchema.parse({ limit: "50" })).toEqual({
+      limit: 50,
+    });
+    expect(NotificationFeedQuerySchema.safeParse({ limit: 51 }).success).toBe(
+      false,
+    );
+    expect(
+      NotificationFeedQuerySchema.safeParse({ cursor: "bad" }).success,
+    ).toBe(false);
+    expect(
+      NotificationFeedPageSchema.safeParse({
+        events: Array.from({ length: 51 }, () => ({
+          id: "019fbb95-cd76-7920-93fa-e23ba755ee77",
+          kind: "local_export_terminal",
+          status: "completed",
+          navigation: {
+            kind: "local_export",
+            requestId: "019fbb95-cd76-7920-93fa-e23ba755ee78",
+          },
+          createdAt: "2026-08-24T12:00:00.000Z",
+        })),
+        fetchedAt: "2026-08-24T12:00:00.000Z",
+      }).success,
+    ).toBe(false);
+  });
+
   it("accepts only closed token-free renderer requests", () => {
     expect(
       DesktopApiRequestSchema.parse({

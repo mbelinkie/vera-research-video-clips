@@ -17,6 +17,32 @@ entries here until they are deliberately completed or deferred.
 - Completion requires a linked completed spec and verification record, not only
   a code change.
 
+### Current snapshot — 2026-08-24
+
+- PUNCH-001 through PUNCH-008 and PUNCH-010 are completed and linked to bounded
+  records in `specs/completed/`.
+- The latest network-free feature gate passed 667 Vitest tests (4 optional
+  skips), 19 one-worker Playwright flows, 35 local migrations, 43 cloud
+  migrations, typecheck, web/desktop builds, the real 30-second
+  foreign-language fixture, Electron Forge packaging, and packaged SQLite
+  integrity verification.
+- PUNCH-009 remains proposed M8 scope. Its platform-neutral source-identity and
+  official YouTube-search prerequisite was completed separately as
+  `specs/completed/PLATFORM-001-youtube-search-source-foundation.md`; TikTok,
+  Instagram, Facebook, and AI candidates remain unsupported/unimplemented.
+- Post-punch keyword/alias maintenance is completed and recorded in
+  `specs/completed/FEATURE-001-keyword-alias-maintenance.md`; it does not reopen
+  the completed PUNCH-005 entry.
+- Project-shared point bookmarks with optional searchable notes, authorized
+  cross-video navigation, and restart-safe offline replay are completed in
+  `specs/completed/FEATURE-002-project-shared-bookmarks.md`. Richer timeline
+  overlays and transcript-segment notes remain deferred.
+- Opt-in desktop workflow outcomes and direct-mention notifications are
+  completed in
+  `specs/completed/FEATURE-003-desktop-workflow-mention-notifications.md`.
+  Email, remote push, delivery while fully quit, and mirroring routine activity
+  remain deferred.
+
 ## Prioritization and dependency plan
 
 Priority describes pilot value and urgency; it is not a promise to implement
@@ -26,21 +52,21 @@ active specifications before code changes begin.
 
 ### Sequencing decision
 
-- Complete M7-05 export integration and its deterministic packaged-app
-  regression/smoke evidence before reorganizing the workspace or changing the
-  established selection/export surfaces.
-- Do not wait for full M7-06 dogfood to begin PUNCH-001 through PUNCH-008.
-  M7-06 depends on external production-cloud, model-pin, and authorized-source
-  inputs; it remains a validation stream and final M7 exit gate rather than a
-  technical prerequisite for the new project, worklist, keyword, UI, logging,
-  or comment contracts.
+- M7-05 export integration and its deterministic packaged-app regression/smoke
+  evidence completed before the workspace and established selection/export
+  surfaces were expanded.
+- PUNCH-001 through PUNCH-008 and PUNCH-010 completed without waiting for full
+  M7-06 dogfood. M7-06 depends on external production-cloud, model-pin, and
+  authorized-source inputs; it remains a validation stream and final M7 exit
+  gate rather than a technical prerequisite for the completed project,
+  worklist, keyword, UI, logging, comment, or topic contracts.
 - M7-01 production AWS/Cognito acceptance likewise remains an explicit external
   prerequisite for real-cloud proof, not a blocker for deterministic contract,
   migration, repository-fixture, or packaged-app implementation.
-- Run a short fixture-backed baseline regression after M7-05, then dogfood the
-  expanded VERA workflow again before signed-pilot distribution. Any available
-  authorized live-source evidence supplements rather than replaces the
-  deterministic gates.
+- The fixture-backed M7-05 baseline and expanded deterministic validation are
+  complete. Dogfood the expanded VERA workflow again before signed-pilot
+  distribution. Any available authorized live-source evidence supplements
+  rather than replaces the deterministic gates.
 
 ### Priority map
 
@@ -55,6 +81,7 @@ active specifications before code changes begin.
 | PUNCH-007 | `P2 medium` | Important expansion beyond transcript-driven logging, after the worklist baseline is stable.     |
 | PUNCH-008 | `P1 high`   | Essential collaborative research context and safe Script to Timeline handoff.                    |
 | PUNCH-009 | `P3 low`    | Unprioritized M8 discovery/platform/AI candidates after the core pilot workflow.                 |
+| PUNCH-010 | `P1 high`   | Optional clip topics for research organization and script-building retrieval.                    |
 
 Within `P1 high`, the dependency waves below are authoritative. A later-numbered
 P1 entry may begin before an earlier-numbered P2 entry, and an entry may be
@@ -69,12 +96,17 @@ split across waves when it contains both foundation and integration work.
 | PUNCH-003 | Existing centralized authentication/catalog authorization                                                                     | Its handles, role matrix, and project summaries precede administrative PUNCH-004/PUNCH-005 commands and PUNCH-008 mentions. |
 | PUNCH-004 | PUNCH-003 authorization foundation and completed M7-04 transcript supervision                                                 | Becomes the canonical row/notification authority consumed by PUNCH-005, PUNCH-006, and PUNCH-008.                           |
 | PUNCH-005 | PUNCH-001 language integrity, PUNCH-003 keyword permissions, and PUNCH-004 project-video identity                             | Supplies durable relevance summaries, filters, context, and highlighting to the Workbench.                                  |
-| PUNCH-006 | Slice 1 follows M7-05; final layout composes PUNCH-002, PUNCH-004, and PUNCH-005                                              | Provides bounded UI seams for PUNCH-007/PUNCH-008 without changing their domain authority.                                  |
+| PUNCH-006 | Slice 1 follows M7-05; final layout composes PUNCH-002, PUNCH-004, and PUNCH-005                                              | Provides bounded UI seams for PUNCH-007/PUNCH-008/PUNCH-010 without changing their domain authority.                        |
 | PUNCH-007 | Existing M7-05 selection/export behavior; atomic initial-comment completion depends on PUNCH-008 comment core                 | Extends worklist and Clip Library reads with manual range and structured speech state.                                      |
 | PUNCH-008 | PUNCH-003 stable handles/authorization and PUNCH-004 activity receipts; its core comment transaction is required by PUNCH-007 | Supplies collaborative context, no-speech explanation, and immutable authoring snapshots.                                   |
-| PUNCH-009 | Stabilized core pilot contracts; platform-neutral source identity must be its first slice                                     | Keeps each new provider or AI capability separate from literal evidence and human authority.                                |
+| PUNCH-009 | Stabilized core pilot contracts plus completed PLATFORM-001 source identity and YouTube-search foundation                     | Keeps each remaining provider or AI capability separate from literal evidence and human authority.                          |
+| PUNCH-010 | Existing project-scoped clip tags and M6 authoring handoff; visible workflow composes PUNCH-006                               | Gives Clip Library and Script to Timeline a shared topic vocabulary without coupling it to comments or scan keywords.       |
 
-### Implementation waves
+### Completed core implementation sequence
+
+Waves 0–11 below are retained as the dependency record used to complete the
+core punch list. Wave 12 remains proposed M8 work; only its provider-neutral
+identity and YouTube-search prerequisite has completed through PLATFORM-001.
 
 0. **Close the active baseline.** Complete M7-05 through its bounded active
    specification, then run the deterministic packaged-app regression/smoke
@@ -114,30 +146,34 @@ split across waves when it contains both foundation and integration work.
    selection, guarded shortcuts, transcript attachment, structured speech
    status, required description/initial comment, no-speech subtitle provenance,
    transcript-unavailable blocking, and split-button actions.
-9. **Complete the authoring conversation.** Finish PUNCH-008 offline replay,
-   mentions/follows, search/activity, stable comment export, and authorized
-   Script to Timeline live-thread plus explicit immutable snapshot handoff.
+9. **Complete the authoring conversation and topic organization.** Finish
+   PUNCH-008 offline replay, mentions/follows, search/activity, stable comment
+   export, and authorized Script to Timeline live-thread plus explicit
+   immutable snapshot handoff. Implement PUNCH-010 topic entry, filtering,
+   grouping, authoring reads, and build-snapshot compatibility on the existing
+   project-scoped clip-tag authority.
 10. **Finish governance and collaboration policy.** Complete PUNCH-003
     invitations/open discovery/ownership/settings/audit slices and any remaining
     PUNCH-004 automatic-processing, budget, cancellation, notification, and
     multi-user acceptance work not required by earlier vertical slices.
 11. **Validate the expanded pilot workflow.** Exercise migrations, two-user
     authorization/concurrency, fifty-video keyword triage, no-speech logging,
-    comments, restart/offline behavior, export/recovery, and 1440×900 plus
-    responsive UI. Run authorized real-cloud/live-source M7-06 evidence when
-    its external inputs are available; otherwise retain the explicit external
-    blocker without stalling deterministic work.
-12. **Treat PUNCH-009 separately in M8.** Generalize source identity first, then
-    prioritize YouTube search, each additional platform, AI discovery,
-    contextual relevance, and visual annotations as independent candidates.
-    None silently displaces signing, updater, documentation, diagnostics, or
-    independent-QA obligations.
+    comments, optional topic tagging, topic-driven script retrieval,
+    restart/offline behavior, export/recovery, and 1440×900 plus responsive UI.
+    Run authorized real-cloud/live-source M7-06 evidence when its external
+    inputs are available; otherwise retain the explicit external blocker
+    without stalling deterministic work.
+12. **Treat remaining PUNCH-009 separately in M8.** PLATFORM-001 already
+    generalized source identity and added official YouTube search. Prioritize
+    each additional platform, AI discovery, contextual relevance, and visual
+    annotation as an independent candidate. None silently displaces signing,
+    updater, documentation, diagnostics, or independent-QA obligations.
 
-## Open items
+## Entries
 
 ### PUNCH-001 — Conflicting source-language evidence and unsupported-language recovery
 
-- Status: `triaged`
+- Status: `completed` — all three slices completed 2026-08-24
 - Priority: `P1 high`
 - Area: transcript acquisition, language provenance, translation, review
 - Discovered by: M6 real-source exit-gate preparation
@@ -273,12 +309,17 @@ media unnecessarily.
 
 #### Suggested implementation slices
 
-1. Add versioned language decisions, conflict-aware caption selection, provider
-   capability preflight, and the `needs_language_confirmation` UI path.
-2. Add strict timed original/English transcript import through the existing
-   immutable upload/finalize boundary.
-3. Add side-by-side approval/activation, second-workstation reuse, and complete
-   clip/export regressions for corrected versions.
+1. **Completed 2026-08-24:** add versioned language decisions, conflict-aware
+   caption selection, provider capability preflight, and the
+   `needs_language_confirmation` UI path. See
+   `../completed/PUNCH-001A-language-decision-conflict-gate.md`.
+2. **Completed 2026-08-24:** add strict timed original/English transcript import
+   through the existing immutable upload/finalize boundary. See
+   `../completed/PUNCH-001B-timed-bilingual-transcript-import.md`.
+3. **Completed 2026-08-24:** add side-by-side approval/activation,
+   second-workstation reuse, and complete clip/export regressions for corrected
+   versions. See
+   `../completed/PUNCH-001C-corrected-transcript-review-activation.md`.
 
 These slices form one product enhancement but should remain independently
 reviewable and migration-safe.
@@ -324,7 +365,7 @@ reviewable and migration-safe.
 
 ### PUNCH-002 — VERA identity and application shell
 
-- Status: `proposed`
+- Status: `completed` — VERA shell and project destinations completed 2026-08-24
 - Priority: `P2 medium`
 - Area: product identity, application shell, project navigation, account settings
 - Candidate window: after the M7-05 deterministic baseline and before signed-pilot work
@@ -457,7 +498,7 @@ in Project Settings. Language choices use readable labels such as `Spanish
 
 ### PUNCH-003 — Project kinds, membership, and access governance
 
-- Status: `proposed`
+- Status: `completed` — identity foundation and governance lifecycle completed 2026-08-24
 - Priority: `P1 high`
 - Area: projects, identity, membership, invitations, authorization, audit
 - Candidate window: after the M7-05 deterministic baseline and before signed-pilot work
@@ -555,12 +596,17 @@ acceptance before membership begins and arrive in the in-app activity inbox.
 
 #### Suggested implementation slices
 
-1. Add handles, project kind/visibility, new roles, migrations, and the closed
-   authorization matrix while retaining legacy reads.
-2. Add pending invitations, acceptance/rejection/revocation, open discovery,
-   explicit self-join, and in-app invitation notices.
-3. Add Project Settings, personal-to-shared conversion, ownership transfer,
-   member administration, and complete audit/activity views.
+1. **Completed:** add handles, project kind/visibility, new roles, migrations,
+   authorized project summaries, and the closed authorization matrix while
+   retaining safe legacy reads
+   (`specs/completed/PUNCH-003A-identity-project-authority-foundation.md`).
+2. **Completed 2026-08-24 — PUNCH-003B:** added expiring pending invitations,
+   acceptance/rejection/revocation, actor-scoped exact replay, bounded open
+   discovery, explicit Researcher self-join, and the in-app access surface.
+3. **Completed 2026-08-24 — PUNCH-003B / PUNCH-004F:** added Project Settings,
+   one-way personal-to-shared conversion, visibility controls, role-valid
+   member administration, ownership transfer, and sanitized governance history.
+   See `specs/completed/PUNCH-003B-004F-governance-collaboration-policy.md`.
 
 #### Acceptance checks
 
@@ -592,7 +638,7 @@ acceptance before membership begins and arrive in the in-app activity inbox.
 
 ### PUNCH-004 — Canonical project-video worklist and bulk triage
 
-- Status: `proposed`
+- Status: `completed` — all six worklist, policy, activity, and member-lifecycle slices completed 2026-08-24
 - Priority: `P1 high`
 - Area: ingest, project videos, transcription orchestration, review, triage, activity
 - Candidate window: after the M7-05 deterministic baseline and before signed-pilot work
@@ -712,14 +758,35 @@ dead ends.
 
 #### Suggested implementation slices
 
-1. Add the canonical worklist/flag read model and unify direct plus batch ingest
-   without replacing worker or transcript authority.
-2. Add soft claims, review cycles, Administrator completion policy, priorities,
-   and optimistic multi-user commands.
-3. Add bulk dismissal/restore, dependency-aware cancellation, durable activity
-   notifications, and restart-safe Queue/Reviewed/Dismissed reads.
-4. Compose automatic local processing/resource policy after M7 proves the
-   supervised transcript workflow, then attach keyword summaries from PUNCH-005.
+1. **Completed 2026-08-24 — PUNCH-004A:** add the canonical worklist/flag read
+   model and unify direct plus batch ingest without replacing worker or
+   transcript authority. See
+   `specs/completed/PUNCH-004A-canonical-worklist-flags-and-ingest.md`.
+2. **Completed 2026-08-24 — PUNCH-004B:** add soft claims, review cycles,
+   Administrator completion policy, priorities, and optimistic multi-user
+   commands. See
+   `specs/completed/PUNCH-004B-soft-claims-review-policy-and-priority.md`.
+3. **Completed 2026-08-24 — PUNCH-004C:** add bulk dismissal/restore,
+   dependency-aware queued/active cancellation, durable review/triage activity
+   receipts, and restart-safe Queue/Reviewed/Dismissed reads. See
+   `specs/completed/PUNCH-004C-dismissal-cancellation-and-activity-receipts.md`.
+4. **Completed 2026-08-24 — PUNCH-004D:** persist explicit hosted approval,
+   require current Owner/Administrator optimistic approval, and enforce it at
+   queue reservation/delivery plus worker claim. See
+   `specs/completed/PUNCH-004D-hosted-transcription-approval-gate.md`.
+5. **Completed 2026-08-24 — PUNCH-004E:** add project-local Automatic/Paused
+   policy, direct caption-first composition, bounded catch-up/workload reads,
+   and dispatch/delivery/claim enforcement. See
+   `specs/completed/PUNCH-004E-automatic-local-processing-policy.md`. Attach
+   keyword summaries from PUNCH-005 after their versioned scan authority exists.
+6. **Completed 2026-08-24 — PUNCH-004F:** composed every worklist, review,
+   activity, automatic-local, and paid-hosted command with current membership;
+   removed members lose reads immediately, ownership transitions remain
+   single-Owner and stale-safe, and Project Settings exposes the final policy
+   authority. Explicit current Administrator approval remains the supported
+   paid-hosted gate. Project monetary budgets and idle/overnight OS scheduling
+   remain optional later policy modes rather than prerequisites for the pilot.
+   See `specs/completed/PUNCH-003B-004F-governance-collaboration-policy.md`.
 
 #### Acceptance checks
 
@@ -755,7 +822,7 @@ dead ends.
 
 ### PUNCH-005 — Project keyword governance and relevance scanning
 
-- Status: `proposed`
+- Status: `completed` — all three slices completed 2026-08-24
 - Priority: `P1 high`
 - Area: project keywords, transcript analysis, durable jobs, triage UI
 - Candidate window: after the M7-05 deterministic baseline and before signed-pilot work
@@ -823,8 +890,10 @@ without silently discarding anything.
 
 2. **Suggestion and approval workflow**
    - Researchers can submit a new keyword or alias suggestion with optional
-     rationale. Use `pending | approved | rejected | withdrawn`, stable ID,
-     proposer, reviewer, optimistic version, and timestamps.
+     rationale. The completed creation/review slice uses `pending | approved |
+rejected`, stable ID, proposer, reviewer, optimistic version, and
+     timestamps. Post-punch maintenance adds explicit own-pending withdrawal
+     evidence without rewriting earlier suggestion decisions.
    - Owners/Administrators may approve/reject; approval transactionally updates
      the canonical keyword-set version and schedules affected scans.
    - Detect suggestions equivalent to an approved/pending alias and return the
@@ -868,12 +937,23 @@ current | stale | failed` distinctly. Pending or failed is never displayed
 
 #### Suggested implementation slices
 
-1. Add keyword/alias/suggestion schemas, authorization, migrations, versioning,
-   and Project Settings management without scans.
-2. Add the deterministic multilingual matcher, durable scan lifecycle, private
-   result artifact, aggregate catalog summary, and transcript-version reuse.
-3. Add worklist grouping/counts/context, click-to-highlight/seek, rescan
-   freshness, second-workstation reuse, and bulk-triage integration.
+1. **Completed 2026-08-24:** add keyword/alias/suggestion schemas,
+   authorization, migration/versioning, normalized suggestion/approval
+   creation, and a real Workbench management path without scans. Direct
+   maintenance and the final Project Settings destination completed separately
+   in `../completed/FEATURE-001-keyword-alias-maintenance.md`. See
+   `../completed/PUNCH-005A-project-keyword-governance.md`.
+2. **Completed 2026-08-24:** add the deterministic multilingual matcher,
+   durable lease/replay scan lifecycle, exact transcript/alias snapshot,
+   private checksummed result artifact, authorized aggregate catalog summary,
+   real worker composition, and transcript-version replacement/reuse. See
+   `../completed/PUNCH-005B-deterministic-keyword-scan-evidence.md`.
+3. **Completed 2026-08-24:** add stable worklist grouping/counts/filters/sorts,
+   exact-keyword summary counts, lazy verified bounded context,
+   click-to-highlight/seek, current/prior freshness, scan-completed activity
+   receipts, second-workstation access, and confirmed optimistic bulk-priority
+   integration. See
+   `../completed/PUNCH-005C-worklist-keyword-evidence-triage.md`.
 
 #### Acceptance checks
 
@@ -911,7 +991,7 @@ current | stale | failed` distinctly. Pending or failed is never displayed
 
 ### PUNCH-006 — Workbench and Clip Library reorganization
 
-- Status: `proposed`
+- Status: `completed` — all four slices completed 2026-08-24
 - Priority: `P1 high`
 - Area: web UI, workspace layout, responsive behavior, navigation history
 - Candidate window: decomposition after M7-05; final integration after PUNCH-002, PUNCH-004, and PUNCH-005
@@ -1015,13 +1095,21 @@ transcript while retaining bounded scrolling and sticky selection actions.
 
 #### Suggested implementation slices
 
-1. Decompose the current component behind unchanged behavior and browser tests.
-2. Add the VERA shell and responsive Workbench geometry using fixture/cached
-   reads, then manually verify 1440×900 and narrow layouts.
-3. Connect the canonical worklist/keyword summaries and move the Clip Library
-   into its project destination.
-4. Add fast clip opening, breadcrumb/Back state, local persistence, and full
-   packaged-app navigation recovery.
+1. **Completed 2026-08-24:** decompose the current component behind unchanged
+   behavior and browser tests. See
+   `../completed/PUNCH-006A-behavior-preserving-workspace-decomposition.md`.
+2. **Completed 2026-08-24:** add the VERA shell and responsive Workbench
+   geometry using fixture/cached reads, including deterministic 1440×900 and
+   narrow browser gates. See
+   `../completed/PUNCH-002-006B-vera-shell-destinations.md`.
+3. **Completed 2026-08-24:** connect canonical worklist/keyword summaries and
+   move the Clip Library into its project destination. See the same completed
+   shell/destination record.
+4. **Completed 2026-08-24:** add exact compatible-artifact resolution/fresh
+   opening, honest authorized-source fallback with range looping, breadcrumb/
+   Back state, private bounded persistence, and membership/transcript-
+   revalidated restart recovery. See
+   `../completed/PUNCH-006C-fast-clip-open-navigation-history.md`.
 
 #### Acceptance checks
 
@@ -1057,7 +1145,7 @@ transcript while retaining bounded scrolling and sticky selection actions.
 
 ### PUNCH-007 — Player-range clip logging and speech status
 
-- Status: `proposed`
+- Status: `completed` — 2026-08-24
 - Priority: `P2 medium`
 - Area: player interaction, selection contracts, clip logging, subtitle policy
 - Candidate window: after the M7-05 baseline and PUNCH-008 comment core; before signed-pilot work
@@ -1203,7 +1291,7 @@ unavailable` labels rather than fabricated text.
 
 ### PUNCH-008 — Collaborative clip comments and Script to Timeline handoff
 
-- Status: `proposed`
+- Status: `completed` — both slices completed 2026-08-24
 - Priority: `P1 high`
 - Area: clip collaboration, comments, notifications, search, authoring handoff
 - Candidate window: after PUNCH-003 identity and PUNCH-004 activity receipts; before signed-pilot work
@@ -1314,12 +1402,17 @@ notes/instructions.
 
 #### Suggested implementation slices
 
-1. Add comment/follow schemas, cloud migrations, authorization, idempotent
-   commands, paginated reads, moderation, and optimistic concurrency.
-2. Add atomic first comment, offline replay, Clip Library search/counts, time
-   anchors, mentions/follows, and in-app notices.
-3. Add separate comments CSV and Script to Timeline live-thread plus explicit
-   immutable snapshot handoff.
+1. **Completed 2026-08-24 — PUNCH-008A:** add the separate flat comment
+   authority, cloud migration, stable author snapshots, bounded pagination,
+   own-author and moderation rules, optimistic/idempotent commands, safe sync
+   events, and optional atomic first-comment logging. See
+   `specs/completed/PUNCH-008A-comment-authority-atomic-first-comment.md`.
+2. **Completed 2026-08-24 — PUNCH-008B / PUNCH-010:** added persisted ordered
+   offline replay for later comments, retained conflict evidence, Clip Library
+   search/counts, visible time-anchor navigation, mentions/follows/notices,
+   separate comments CSV, and the authorized live-thread plus explicit
+   immutable authoring snapshot handoff. See
+   `specs/completed/PUNCH-008B-010-collaboration-topics-authoring.md`.
 
 #### Acceptance checks
 
@@ -1355,7 +1448,7 @@ notes/instructions.
 
 ### PUNCH-009 — M8 discovery, platform, and AI candidates
 
-- Status: `proposed`
+- Status: `proposed` — remaining M8 scope; source identity and YouTube-search foundation completed 2026-08-24
 - Priority: `P3 low`
 - Area: M8 research expansion, source providers, discovery, AI annotations
 - Candidate window: M8, sequence intentionally unassigned
@@ -1364,12 +1457,15 @@ notes/instructions.
 
 #### Problem
 
-The current source, player, video snapshot, clip selection, export acquisition,
-and several durable identities are explicitly YouTube-specific. Adding TikTok
-or Instagram directly to those schemas would spread provider conditionals
-through UI, catalog, workers, filenames, and authoring compatibility. Platform
-access, embedding, metadata, captions, and authorized media acquisition also
-vary and cannot be promised for arbitrary public URLs.
+The original product model coupled source, player, video snapshot, clip
+selection, export acquisition, and several durable identities to YouTube.
+PLATFORM-001 has now generalized the durable source identity and compatibility
+seams without rewriting historical packages, but supported product behavior
+remains YouTube-only. Adding TikTok, Instagram, or Facebook directly to generic
+business logic would still spread provider conditionals through UI, catalog,
+workers, filenames, and authoring compatibility. Platform access, embedding,
+metadata, captions, and authorized media acquisition vary and cannot be
+promised for arbitrary public URLs.
 
 The desired future ingest experience also includes YouTube search, AI-assisted
 topic discovery, contextual relevance, and optional visual descriptions. These
@@ -1380,11 +1476,16 @@ the project's explicit authority and provenance rules.
 
 #### User-visible outcome
 
-M8 may add provider-backed discovery and additional video platforms through one
-platform-neutral source model. Search or AI discovery returns reviewable
-candidates with origin/provenance, duplicates, availability, and estimated
-resource/cost information. A user explicitly approves candidates before they
-enter the project worklist or start processing.
+The current ingest Search tab can query the official YouTube Data API when a
+backend key is configured, preview one result, select several candidates, and
+hand them explicitly to the existing project preflight without creating records
+or jobs during search. Other platform controls remain visibly disabled.
+
+Later M8 slices may add provider-backed discovery and additional platforms
+through the platform-neutral source model. Search or AI discovery returns
+reviewable candidates with origin/provenance, duplicates, availability, and
+estimated resource/cost information. A user explicitly approves candidates
+before they enter the project worklist or start processing.
 
 Literal project-keyword evidence remains visible and explainable. Optional AI
 context scoring appears as separately versioned analysis with provider/model,
@@ -1394,12 +1495,21 @@ comments, speech status, transcript evidence, or immutable authoring snapshots.
 
 #### Current evidence and seams
 
-- `VideoSchema`, `ClipVideoSnapshotSchema`, project-video lookup, worklist inputs,
-  YouTube player wrapper, and source grouping rely on `youtubeVideoId` and
-  YouTube canonical URLs.
-- Metadata, captions, media acquisition, player, object storage, and worker
-  execution already use adapter boundaries that can be extended after the
-  canonical source identity is generalized.
+- Cloud migration `0038` and local migration `0032` add provider-neutral source
+  identity while preserving legacy YouTube readers and immutable historical
+  package compatibility.
+- Shared contracts and workspaces now carry canonical source identity through
+  generic project-video, job, clip, artifact, and authoring boundaries. YouTube
+  remains the only accepted project-ingest and playback provider.
+- The official backend YouTube Data API adapter provides bounded search,
+  sanitized quota/auth/provider outcomes, one-result preview, multi-select, and
+  an explicit handoff to existing preflight. Search/preview has no catalog or
+  worker side effect.
+- TikTok, Instagram, and Facebook capabilities are backend-reported as disabled.
+  The opt-in fixture-backed acquisition spike is non-shipping and proves no
+  product support or arbitrary public-media access.
+- Completion and deterministic verification evidence is recorded in
+  `specs/completed/PLATFORM-001-youtube-search-source-foundation.md`.
 - M8 is currently responsible for signed cross-platform distribution, updates,
   documentation, diagnostics, and independent QA. These product candidates are
   unprioritized additions; recording them does not silently displace the release
@@ -1409,7 +1519,7 @@ comments, speech status, transcript evidence, or immutable authoring snapshots.
 
 #### Scoped fix
 
-1. **Platform-neutral source identity prerequisite**
+1. **Completed 2026-08-24 — platform-neutral source identity prerequisite**
    - Introduce an immutable source identity containing provider, provider media
      ID, canonical URL, and provider-specific version/fingerprint evidence.
      Preserve safe compatibility readers/migrations for every existing YouTube
@@ -1433,7 +1543,7 @@ comments, speech status, transcript evidence, or immutable authoring snapshots.
    - Keep ordinary deterministic tests adapter/fake-backed; any live proof is
      optional, explicitly authorized, redacted, and independently scoped.
 
-3. **YouTube search ingest**
+3. **Completed 2026-08-24 — YouTube search ingest**
    - Add a quota-aware search provider returning bounded candidate metadata,
      canonical IDs, result provenance, pagination, and actionable quota/error
      states.
@@ -1465,11 +1575,12 @@ comments, speech status, transcript evidence, or immutable authoring snapshots.
 
 #### Suggested implementation slices
 
-1. Generalize source identity and compatibility across contracts, databases,
-   cache/jobs, player/provider boundaries, export packages, and authoring reads
-   while keeping all current YouTube tests green.
-2. Add YouTube search as the first discovery adapter and prove explicit
-   candidate-to-preflight handoff with quota/failure behavior.
+1. **Completed 2026-08-24:** generalized source identity and compatibility
+   across contracts, databases, cache/jobs, player/provider boundaries, export
+   packages, and authoring reads while preserving current YouTube behavior.
+2. **Completed 2026-08-24:** added official YouTube search and proved explicit
+   candidate-to-preflight handoff with deterministic quota/failure behavior.
+   See `../completed/PLATFORM-001-youtube-search-source-foundation.md`.
 3. Evaluate and add TikTok and Instagram separately only where authorized,
    documented access supports the requested read/play/acquire capability.
 4. Add AI topic discovery, then contextual relevance, then visual annotations as
@@ -1497,6 +1608,11 @@ comments, speech status, transcript evidence, or immutable authoring snapshots.
    only with current documentation review, explicit authorization, bounded
    cost, redacted evidence, and cleanup.
 
+Checks 1–4 have deterministic coverage through PLATFORM-001, except that no
+live quota-bearing YouTube key was used. Checks 5–7 remain future acceptance for
+the unimplemented AI/platform slices; check 8 remains mandatory for every such
+slice.
+
 #### Non-goals
 
 - Prioritizing these candidates relative to one another in this intake update.
@@ -1506,6 +1622,139 @@ comments, speech status, transcript evidence, or immutable authoring snapshots.
   access, or storing user credentials in research artifacts.
 - Allowing AI to ingest/process sources, dismiss work, rewrite human evidence,
   or control a timeline without explicit user action.
+
+### PUNCH-010 — Clip topic tagging and scripting organization
+
+- Status: `completed` — Topic and authoring integration completed 2026-08-24
+- Priority: `P1 high`
+- Area: clip metadata, Clip Library, search/filter, authoring handoff, scripting
+- Candidate window: with the PUNCH-008 authoring handoff; before expanded pilot validation
+- Depends on: existing project-scoped clip tags and M6 authoring handoff; PUNCH-006 for the final visible surfaces
+- Discovered by: VERA pilot scripting workflow planning
+
+#### Problem
+
+Logged clips already support reusable project-scoped free-form tags, but the
+pilot plan does not make topic organization an explicit research or scripting
+workflow. Without a visible topic facet, researchers may bury the subject of a
+clip in its description or comment thread, and a scriptwriter cannot reliably
+retrieve or group all candidate clips about the same subject.
+
+Project keywords solve a different problem: they define shared terms used to
+scan whole-video transcripts for relevance. Comments are authored conversation,
+and Clip description is curated intended-use metadata. Neither should become an
+implicit topic taxonomy or be parsed to guess one.
+
+#### User-visible outcome
+
+A researcher may assign zero or more reusable **Topics** while logging a clip
+or later editing it in the Clip Library. Existing project topics are suggested,
+new free-form topics are allowed, and no topic is required. Topic changes do
+not create, edit, or delete comments.
+
+Clip Library and Script to Timeline can search, filter, and group clips by one
+or more topics, making it easy to gather the source material for a script
+section. Script builds snapshot the topic labels associated with selected clips
+at build time so later metadata edits do not silently rewrite an existing
+build's organizational context.
+
+#### Current evidence and seams
+
+- `ClipCandidateSchema` already carries bounded `tags`; clip creation commits
+  them atomically with notes and language/selection evidence.
+- The shared catalog already stores normalized project-scoped `clip_tags` and
+  `clip_candidate_tags`, preserves display names, suggests existing values, and
+  supports authorized optimistic edits plus search/filter and CSV projection.
+- The current logging UI labels the field `Clip tags`, while the Clip Library
+  can edit and filter tags. The pilot work is primarily a clear topic-oriented
+  workflow and authoring integration, not a second tag database.
+- M6 exposes authorized clip search and handoff APIs to Script to Timeline;
+  PUNCH-008 separately adds live comments and explicit comment snapshots.
+- PUNCH-005 project keywords remain video-relevance scan inputs and must not be
+  silently copied onto clips as topics.
+
+#### Scoped fix
+
+1. **Topic entry and editing**
+   - Present the existing project-scoped clip-tag capability as an optional
+     **Topics** facet at both logging actions and in Clip Library details.
+   - Reuse case/Unicode-normalized uniqueness, preserved display form,
+     suggestions, authorization, optimistic versions, atomic clip creation,
+     offline replay, and current tag limits. Do not create parallel topic rows
+     or silently migrate keywords, descriptions, or comments into topics.
+   - Preserve every existing clip tag and compatibility field. If later usage
+     demonstrates a need for typed person/theme/topic facets, promote that as a
+     separate migration rather than inferring types from punctuation or text.
+
+2. **Research retrieval**
+   - Show topic chips on clip cards/details and provide bounded topic
+     search/filter with explicit `match any` versus `match all` behavior.
+   - Allow topic grouping in the Clip Library without changing canonical clip
+     ordering, research status, export status, or artifact identity.
+   - Keep topic-only edits out of the comment thread. They may emit the ordinary
+     clip-metadata activity receipt without impersonating a comment author.
+
+3. **Scripting handoff**
+   - Extend authorized authoring reads to return the same canonical topic labels
+     and support bounded topic filters; never use direct database access or a
+     second Script to Timeline taxonomy.
+   - Let script organization group or shortlist clips by topic while preserving
+     the clip's description, comments, transcript evidence, and artifact state
+     as separate fields.
+   - When a clip enters an immutable script build, snapshot its clip ID/version
+     and current topic display labels. Later topic edits update live research
+     views but do not mutate that prior build.
+
+4. **Projection and compatibility**
+   - Keep the canonical API/CSV compatibility field backed by existing clip
+     tags; label it Topics in the user-facing VERA surfaces and authoring
+     workflow. Do not create duplicate `Topic` and `Tags` values for one clip.
+   - Projectless `Export without logging` remains ineligible for topics,
+     comments, Clip Library search, CSV rows, or authoring discovery unless the
+     user later adds it to a project.
+
+#### Suggested implementation slices
+
+1. **Completed 2026-08-24:** added Topic-oriented UI wording, chips,
+   suggestions, `any`/`all` filters, grouping, and deterministic coverage on
+   the existing tag contracts and catalog queries.
+2. **Completed 2026-08-24:** extended authorized Script to Timeline reads and
+   immutable build-snapshot compatibility without coupling Topics to comments.
+   See `specs/completed/PUNCH-008B-010-collaboration-topics-authoring.md`.
+
+#### Acceptance checks
+
+1. A clip can be logged with no topics, one topic, or several topics; all three
+   paths preserve selection, language, description, comment, and export effects.
+2. Topic creation/editing deduplicates case/Unicode-equivalent project values,
+   preserves the chosen display form, and survives reload plus offline replay.
+3. `Match any` and `match all` topic filters return deterministic bounded Clip
+   Library and Script to Timeline results without leaking another project's
+   topics or clips.
+4. Two members can comment while either member edits topics without overwriting
+   or manufacturing comment records; stale topic edits conflict safely.
+5. Script to Timeline receives the same canonical topics as the Clip Library,
+   can group clips by them, and keeps an earlier build snapshot unchanged after
+   a live topic rename/add/remove.
+6. Existing clip tags remain readable and searchable with no lossy migration;
+   CSV/API compatibility contains one canonical topic/tag value set rather than
+   duplicate columns with divergent contents.
+7. Project keywords do not become clip topics automatically, and topic edits do
+   not trigger keyword rescans, transcript mutation, render work, or artifact
+   invalidation.
+8. Export-only jobs never acquire topics or appear in topic-filtered authoring
+   results until explicitly converted into a project clip.
+
+#### Non-goals
+
+- A hierarchical ontology, mandatory controlled vocabulary, topic ownership,
+  colors/icons, or per-topic permissions in the first pilot version.
+- AI-generated or keyword-derived automatic topics; suggestions come only from
+  the project's existing human-authored topic vocabulary.
+- Replacing Clip description, comments, project keywords, speech status,
+  transcript evidence, research status, or export status with topics.
+- Treating topics as authorization rules, factual claims, transcript
+  corrections, or automatic Script to Timeline instructions.
 
 ## Entry template
 

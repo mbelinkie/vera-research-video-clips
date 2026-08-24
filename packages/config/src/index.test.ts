@@ -75,6 +75,14 @@ describe("configuration", () => {
     expect(config.ytDlpPath).toBe("/opt/tools/yt-dlp");
   });
 
+  it("keeps official YouTube search optional and backend-configured", () => {
+    expect(loadConfig({ NODE_ENV: "test" }).youtubeApiKey).toBeUndefined();
+    expect(
+      loadConfig({ NODE_ENV: "test", YOUTUBE_API_KEY: "fixture-api-key" })
+        .youtubeApiKey,
+    ).toBe("fixture-api-key");
+  });
+
   it("rejects exposing the local agent", () => {
     expect(() => loadConfig({ LOCAL_AGENT_HOST: "0.0.0.0" })).toThrow(
       "Local services must bind to a loopback address",

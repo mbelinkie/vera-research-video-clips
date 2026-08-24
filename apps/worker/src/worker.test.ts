@@ -10,6 +10,7 @@ import { MemoryJobQueue } from "@research-video/sync";
 
 import {
   ClaimingTranscriptionWorker,
+  ActionableLanguageGateError,
   HttpTranscriptionWorkerControlPlane,
   TranscriptionWorkerService,
   Worker,
@@ -96,6 +97,14 @@ function controlPlane(
     claim: vi.fn(async () => claimed),
     heartbeat: vi.fn(async () => claimed.lease),
     recordSourcePlan: vi.fn(async () => undefined),
+    observeLanguageEvidence: vi.fn(async (request) => ({
+      evidence: request.evidence,
+      gate: {
+        state: "ready" as const,
+        status: "confirmed" as const,
+        remediationReason: "none" as const,
+      },
+    })),
     fail: vi.fn(async () => undefined),
     ...overrides,
   };
@@ -166,6 +175,97 @@ describe("claiming transcription worker", () => {
     });
 
     await expect(worker.runOnce()).resolves.toBe("lease-lost");
+  });
+
+  it("treats a durable actionable language gate as terminal without failing its released lease", async () => {
+    const api = controlPlane({
+      observeLanguageEvidence: vi.fn(async (request) => ({
+        evidence: request.evidence,
+        gate: {
+          state: "needs_language_confirmation" as const,
+          status: "conflict" as const,
+          providerEvidence: request.evidence,
+          remediationReason: "resolve_conflict" as const,
+        },
+      })),
+    });
+    const worker = new ClaimingTranscriptionWorker(
+      api,
+      async (_claimed, context) => {
+        const observed = await context.observeLanguageEvidence({
+          attempt: 1,
+          evidence: {
+            id: randomUUID(),
+            projectId: job.projectId!,
+            videoId: randomUUID(),
+            source: "caption",
+            provider: "fixture",
+            reportedLanguage: "ko",
+            trackFingerprint: "a".repeat(64),
+            captionKind: "automatic",
+            jobId: job.id,
+            attempt: 1,
+            createdAt: new Date().toISOString(),
+          },
+        });
+        if (observed.gate.state !== "ready")
+          throw new ActionableLanguageGateError();
+      },
+    );
+
+    await expect(worker.runOnce()).resolves.toBe("actionable");
+    expect(api.fail).not.toHaveBeenCalled();
+  });
+
+  it("settles an actionable observation even if a concurrent heartbeat loses the released lease", async () => {
+    let heartbeats = 0;
+    const api = controlPlane({
+      heartbeat: vi.fn(async () => {
+        heartbeats += 1;
+        if (heartbeats > 1) throw new Error("lease released by language gate");
+        return claimed.lease;
+      }),
+      observeLanguageEvidence: vi.fn(async (request) => ({
+        evidence: request.evidence,
+        gate: {
+          state: "needs_language_confirmation" as const,
+          status: "conflict" as const,
+          providerEvidence: request.evidence,
+          remediationReason: "resolve_conflict" as const,
+        },
+      })),
+    });
+    const worker = new ClaimingTranscriptionWorker(
+      api,
+      async (_claimed, context) => {
+        await context.setStage("resolving");
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        const observed = await context.observeLanguageEvidence({
+          attempt: 1,
+          evidence: {
+            id: randomUUID(),
+            projectId: job.projectId!,
+            videoId: randomUUID(),
+            source: "caption",
+            provider: "fixture",
+            reportedLanguage: "ko",
+            trackFingerprint: "b".repeat(64),
+            captionKind: "automatic",
+            jobId: job.id,
+            attempt: 1,
+            createdAt: new Date().toISOString(),
+          },
+        });
+        if (observed.gate.state !== "ready") {
+          throw new ActionableLanguageGateError();
+        }
+      },
+      undefined,
+      { heartbeatIntervalMs: 1 },
+    );
+
+    await expect(worker.runOnce()).resolves.toBe("actionable");
+    expect(api.fail).not.toHaveBeenCalled();
   });
 });
 
@@ -251,6 +351,7 @@ describe("continuous transcription worker service", () => {
 
     await expect(result).resolves.toEqual({
       processed: 1,
+      actionable: 0,
       failed: 0,
       leaseLost: 0,
       unexpectedErrors: 0,
@@ -298,5 +399,120 @@ describe("HTTP worker control plane", () => {
     });
 
     await expect(client.claim()).resolves.toBeUndefined();
+  });
+
+  it("unwraps active heartbeat leases and stops on durable cancellation", async () => {
+    const activeFetcher = vi.fn(
+      async () =>
+        new Response(
+          JSON.stringify({ status: "active", lease: claimed.lease }),
+          {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          },
+        ),
+    );
+    const activeClient = new HttpTranscriptionWorkerControlPlane({
+      baseUrl: "http://127.0.0.1:43111",
+      authorization: "Bearer development-worker",
+      executionLocation: "local",
+      leaseSeconds: 60,
+      fetcher: activeFetcher,
+    });
+
+    await expect(
+      activeClient.heartbeat(job.id, 1, "transcribing"),
+    ).resolves.toEqual(claimed.lease);
+    expect(activeFetcher).toHaveBeenCalledWith(
+      new URL(
+        `http://127.0.0.1:43111/api/transcription-jobs/${job.id}/heartbeat`,
+      ),
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({
+          attempt: 1,
+          leaseSeconds: 60,
+          stage: "transcribing",
+        }),
+      }),
+    );
+
+    const requestedAt = "2026-08-24T12:00:00.000Z";
+    const canceledClient = new HttpTranscriptionWorkerControlPlane({
+      baseUrl: "http://127.0.0.1:43111",
+      authorization: "Bearer development-worker",
+      executionLocation: "local",
+      fetcher: vi.fn(
+        async () =>
+          new Response(
+            JSON.stringify({
+              status: "cancellation_requested",
+              requestedAt,
+            }),
+            {
+              status: 200,
+              headers: { "content-type": "application/json" },
+            },
+          ),
+      ),
+    });
+    await expect(
+      canceledClient.heartbeat(job.id, 1, "transcribing"),
+    ).rejects.toMatchObject({
+      statusCode: 409,
+      code: "transcription_cancellation_requested",
+      retryable: false,
+    });
+  });
+
+  it("serializes bounded language evidence to the control-plane route", async () => {
+    const evidence = {
+      id: randomUUID(),
+      projectId: job.projectId!,
+      videoId: randomUUID(),
+      source: "caption" as const,
+      provider: "caption-discovery",
+      reportedLanguage: "ko",
+      trackFingerprint: "c".repeat(64),
+      captionKind: "automatic" as const,
+      jobId: job.id,
+      attempt: 1,
+      createdAt: "2026-08-01T12:00:00.000Z",
+    };
+    const request = { attempt: 1, evidence };
+    const response = {
+      evidence,
+      gate: {
+        state: "ready" as const,
+        status: "confirmed" as const,
+        remediationReason: "none" as const,
+      },
+    };
+    const fetcher = vi.fn(
+      async () =>
+        new Response(JSON.stringify(response), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+    );
+    const client = new HttpTranscriptionWorkerControlPlane({
+      baseUrl: "http://127.0.0.1:43111",
+      authorization: "Bearer development-worker",
+      executionLocation: "local",
+      fetcher,
+    });
+
+    await expect(
+      client.observeLanguageEvidence(job.id, request),
+    ).resolves.toEqual(response);
+    expect(fetcher).toHaveBeenCalledWith(
+      new URL(
+        `http://127.0.0.1:43111/api/transcription-jobs/${job.id}/language-evidence`,
+      ),
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify(request),
+      }),
+    );
   });
 });

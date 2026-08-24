@@ -87,6 +87,57 @@ describe("offline sync outbox", () => {
     rmSync(directory, { recursive: true, force: true });
   });
 
+  it("persists later comment commands across restart and retains conflicts", () => {
+    const directory = mkdtempSync(join(tmpdir(), "comment-outbox-test-"));
+    const path = join(directory, "local.sqlite");
+    let database = openLocalDatabase(path);
+    runLocalMigrations(database);
+    const projectId = randomUUID();
+    const clipId = randomUUID();
+    const commentId = randomUUID();
+    const outbox = new OfflineOutbox(database);
+    const createId = outbox.enqueueClipCommentCreate(projectId, clipId, {
+      idempotencyKey: "offline-comment-create",
+      body: "Queued while offline",
+      sourceTimeMs: 1_000,
+    });
+    outbox.enqueueClipCommentUpdate(projectId, clipId, commentId, {
+      idempotencyKey: "offline-comment-update",
+      expectedVersion: 1,
+      body: "Edited while offline",
+    });
+    outbox.enqueueClipCommentDelete(projectId, clipId, commentId, {
+      idempotencyKey: "offline-comment-delete",
+      expectedVersion: 2,
+    });
+    database.close();
+
+    database = openLocalDatabase(path);
+    runLocalMigrations(database);
+    const restarted = new OfflineOutbox(database);
+    expect(restarted.due().map((command) => command.commandType)).toEqual([
+      "clip_comment.create.v1",
+      "clip_comment.update.v1",
+      "clip_comment.delete.v1",
+    ]);
+    restarted.recordConflict(createId, "conflict", {
+      expectedVersion: 1,
+      actualVersion: 2,
+    });
+    expect(restarted.due().map((command) => command.id)).not.toContain(
+      createId,
+    );
+    expect(
+      database
+        .prepare(
+          "SELECT last_error_code, conflict_json FROM sync_outbox WHERE id = ?",
+        )
+        .get(createId),
+    ).toMatchObject({ last_error_code: "conflict" });
+    database.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+
   it("snapshots multilingual clip evidence without recomputing on replay", () => {
     const directory = mkdtempSync(join(tmpdir(), "clip-outbox-test-"));
     const database = openLocalDatabase(join(directory, "local.sqlite"));

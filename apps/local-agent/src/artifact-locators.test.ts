@@ -809,6 +809,9 @@ describe("local artifact locator verification", () => {
 function compatibilityRequirements(
   summary: ArtifactVersionSummary,
 ): ArtifactCompatibilityRequirements {
+  if (summary.selection.selectionType === "player_time_range") {
+    throw new Error("This compatibility fixture requires transcript evidence.");
+  }
   const { text: _text, ...selection } = summary.selection;
   return {
     clipId: summary.clipId,

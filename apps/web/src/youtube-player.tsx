@@ -7,15 +7,19 @@ import {
   useState,
 } from "react";
 
-export type YouTubePlayerHandle = {
+export type SourcePlayerHandle = {
   seekTo(milliseconds: number): boolean;
   play(): boolean;
   pause(): boolean;
+  requestDuration(): boolean;
 };
+
+export type YouTubePlayerHandle = SourcePlayerHandle;
 
 type YouTubePlayerProps = {
   videoId: string;
   onTimeChange(milliseconds: number): void;
+  onDurationChange(milliseconds: number | undefined): void;
 };
 
 const playerOrigin = "https://www.youtube-nocookie.com";
@@ -28,7 +32,10 @@ const playerOrigin = "https://www.youtube-nocookie.com";
 export const YouTubePlayer = forwardRef<
   YouTubePlayerHandle,
   YouTubePlayerProps
->(function YouTubePlayer({ videoId, onTimeChange }, forwardedRef) {
+>(function YouTubePlayer(
+  { videoId, onTimeChange, onDurationChange },
+  forwardedRef,
+) {
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const playingRef = useRef(false);
   const latestTimeMs = useRef(0);
@@ -63,9 +70,14 @@ export const YouTubePlayer = forwardRef<
       },
       play: () => command("playVideo"),
       pause: () => command("pauseVideo"),
+      requestDuration: () => command("getDuration"),
     }),
     [onTimeChange],
   );
+
+  useEffect(() => {
+    onDurationChange(undefined);
+  }, [onDurationChange, videoId]);
 
   useEffect(() => {
     const receivePlayerMessage = (event: MessageEvent) => {
@@ -87,14 +99,23 @@ export const YouTubePlayer = forwardRef<
         latestTimeMs.current = Math.max(0, Math.round(seconds * 1_000));
         onTimeChange(latestTimeMs.current);
       }
+      const durationSeconds = message.info?.duration;
+      if (
+        typeof durationSeconds === "number" &&
+        Number.isFinite(durationSeconds) &&
+        durationSeconds > 0
+      ) {
+        onDurationChange(Math.round(durationSeconds * 1_000));
+      }
     };
     window.addEventListener("message", receivePlayerMessage);
     return () => window.removeEventListener("message", receivePlayerMessage);
-  }, [onTimeChange]);
+  }, [onDurationChange, onTimeChange]);
 
   useEffect(() => {
     const interval = window.setInterval(() => {
       if (playingRef.current) command("getCurrentTime");
+      command("getDuration");
     }, 250);
     return () => window.clearInterval(interval);
   });
@@ -116,6 +137,7 @@ export const YouTubePlayer = forwardRef<
             JSON.stringify({ event: "listening" }),
             playerOrigin,
           );
+          command("getDuration");
         }}
         onError={() => setState("error")}
       />
@@ -128,16 +150,28 @@ export const YouTubePlayer = forwardRef<
   );
 });
 
-function parsePlayerMessage(
-  value: unknown,
-): { info?: { playerState?: unknown; currentTime?: unknown } } | undefined {
+function parsePlayerMessage(value: unknown):
+  | {
+      info?: {
+        playerState?: unknown;
+        currentTime?: unknown;
+        duration?: unknown;
+      };
+    }
+  | undefined {
   try {
     const parsed =
       typeof value === "string" ? (JSON.parse(value) as unknown) : value;
     if (typeof parsed !== "object" || parsed === null) return undefined;
     const info = (parsed as { info?: unknown }).info;
     return typeof info === "object" && info !== null
-      ? { info: info as { playerState?: unknown; currentTime?: unknown } }
+      ? {
+          info: info as {
+            playerState?: unknown;
+            currentTime?: unknown;
+            duration?: unknown;
+          },
+        }
       : {};
   } catch {
     return undefined;

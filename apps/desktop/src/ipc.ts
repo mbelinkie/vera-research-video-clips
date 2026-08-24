@@ -11,6 +11,11 @@ export const desktopIpcChannels = {
   startModelDownload: "desktop:start-model-download",
   cancelModelDownload: "desktop:cancel-model-download",
   modelDownloadProgress: "desktop:model-download-progress",
+  timedTranscriptUpload: "desktop:timed-transcript-upload",
+  getNotificationPreferences: "desktop:get-notification-preferences",
+  updateNotificationPreferences: "desktop:update-notification-preferences",
+  getNotificationSupport: "desktop:get-notification-support",
+  notificationNavigation: "desktop:notification-navigation",
   request: "desktop:request",
 } as const;
 
@@ -53,7 +58,7 @@ export function isPrivateDesktopSetupPath(path: string): boolean {
 /** Exact renderer request eligible for the main-only offline-review capability. */
 export function isLocalTranscriptWorkspaceRequest(input: {
   target: "cloud" | "local";
-  method: "GET" | "POST" | "PUT" | "PATCH";
+  method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
   path: string;
 }): boolean {
   if (input.target !== "local" || input.method !== "GET") return false;

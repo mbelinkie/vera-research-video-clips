@@ -21,11 +21,16 @@ import {
   LoggedExportSuccessSchema,
   RegisteredExportWorkerSchema,
   DerivedTranslationIdentitySchema,
+  ClipCommentSchema,
+  ProjectBookmarkMutationResponseSchema,
+  ProjectBookmarkPageSchema,
+  ProjectBookmarkQuerySchema,
   type ClipLibraryQuery,
   type CreateClipExportRequest,
   type CreateLoggedExportBatchRequest,
   type ExportSourceLanguageClass,
   type ExportSettingsSelection,
+  type ProjectBookmarkQuery,
 } from "@research-video/contracts";
 import {
   LocalExportQueue,
@@ -33,6 +38,7 @@ import {
   LocalClipLibraryCacheRepository,
   LocalExportWorkerIdentityRepository,
   LocalDesktopSetupRepository,
+  LocalProjectBookmarkRepository,
   LocalTranscriptIndex,
   openLocalDatabase,
   runLocalMigrations,
@@ -45,6 +51,7 @@ import {
   SharedFirstTranscriptResolver,
   SharedTranscriptWorkspaceService,
   VerifiedTranscriptCache,
+  OfflineOutbox,
 } from "@research-video/sync";
 import {
   createExportSourceAcquisitionProvider,
@@ -81,12 +88,40 @@ import { LocalRuntimeCoordinator } from "./local-runtime.ts";
 import { LocalDesktopSetupService } from "./desktop-setup.ts";
 import { CloudDerivedTranslationClient } from "./derived-translation-client.ts";
 import { LocalExportSupervisor } from "./export-supervisor.ts";
+import {
+  ClipCommentOutboxService,
+  type ClipCommentCloudCommand,
+} from "./comment-outbox.ts";
+import {
+  BookmarkOutboxService,
+  type BookmarkOutboxCommand,
+} from "./bookmark-outbox.ts";
 
 const config = loadConfig();
 await mkdir(config.dataDir, { recursive: true });
 const database = openLocalDatabase(join(config.dataDir, "local.sqlite"));
 runLocalMigrations(database);
 const exportQueue = new LocalExportQueue(database);
+const commentOutbox = new ClipCommentOutboxService(
+  new OfflineOutbox(database),
+  {
+    send: callCloudClipComment,
+    authorizationRevoked: (projectId, authorization, statusCode) =>
+      clipLibrary.purgeRevokedAuthorization({
+        projectId,
+        authorization,
+        statusCode,
+      }),
+  },
+);
+const bookmarkOutbox = new BookmarkOutboxService(
+  new LocalProjectBookmarkRepository(database),
+  {
+    list: ({ projectId, query, authorization }) =>
+      callCloudProjectBookmarks(projectId, query, authorization),
+    send: callCloudProjectBookmarkCommand,
+  },
+);
 let exportSupervisor: LocalExportSupervisor | undefined;
 const desktopSetupRepository = new LocalDesktopSetupRepository(database);
 const desktopSetup = new LocalDesktopSetupService(desktopSetupRepository, {
@@ -424,6 +459,52 @@ app = createLocalAgent({
     }),
   updateClipLibrarySelection: ({ projectId, authorization, command }) =>
     clipLibrary.updateSelection({ projectId, authorization, command }),
+  createClipComment: ({ projectId, clipId, authorization, request }) =>
+    commentOutbox.create(projectId, clipId, authorization, request),
+  updateClipComment: ({
+    projectId,
+    clipId,
+    commentId,
+    authorization,
+    request,
+  }) =>
+    commentOutbox.update(projectId, clipId, commentId, authorization, request),
+  deleteClipComment: ({
+    projectId,
+    clipId,
+    commentId,
+    authorization,
+    request,
+  }) =>
+    commentOutbox.delete(projectId, clipId, commentId, authorization, request),
+  replayClipComments: ({ projectId, authorization }) =>
+    commentOutbox.replay(projectId, authorization),
+  listClipCommentConflicts: ({ projectId }) =>
+    commentOutbox.conflicts(projectId),
+  listProjectBookmarks: ({ projectId, authorization, query }) =>
+    bookmarkOutbox.list(projectId, authorization, query),
+  createProjectBookmark: ({ projectId, authorization, request }) =>
+    bookmarkOutbox.create(projectId, authorization, request),
+  updateProjectBookmark: ({ projectId, bookmarkId, authorization, request }) =>
+    bookmarkOutbox.update(projectId, bookmarkId, authorization, request),
+  changeProjectBookmarkState: ({
+    projectId,
+    bookmarkId,
+    action,
+    authorization,
+    request,
+  }) =>
+    bookmarkOutbox.changeState(
+      projectId,
+      bookmarkId,
+      action,
+      authorization,
+      request,
+    ),
+  replayProjectBookmarks: ({ projectId, authorization }) =>
+    bookmarkOutbox.replay(projectId, authorization),
+  listProjectBookmarkOutbox: ({ projectId, authorization }) =>
+    bookmarkOutbox.listOutbox(projectId, authorization),
   prepareClipLibraryExport: async (input) => {
     try {
       return await clipLibraryExports.prepare(input);
@@ -691,8 +772,12 @@ app = createLocalAgent({
     callCloudLoggedExportFailureReconcile(request, authorization),
   reconcileLoggedExportCanceled: async ({ request, authorization }) =>
     callCloudLoggedExportCanceledReconcile(request, authorization),
-  createExportOnly: (input, snapshot) =>
-    exportQueue.createExportOnly(input, snapshot),
+  createExportOnly: (input, snapshot, notificationAccountScopeSha256) =>
+    exportQueue.createExportOnly(
+      input,
+      snapshot,
+      notificationAccountScopeSha256,
+    ),
   findExportOnlyByIdempotencyKey: (idempotencyKey) =>
     exportQueue.getByIdempotencyKey(idempotencyKey),
   previewExportSettings: async ({ request, authorization }) => {
@@ -722,6 +807,8 @@ app = createLocalAgent({
     return ExportSettingsPreviewSchema.parse(payload);
   },
   listExportRequests: () => exportQueue.list(),
+  listLocalNotificationFeed: (accountScopeSha256, query) =>
+    exportQueue.listNotificationFeed(accountScopeSha256, query),
   resolveTranscript: async ({
     projectId,
     catalogVideoId,
@@ -951,6 +1038,8 @@ async function callCloudClipLibrary(
   if (parsed.cursor) parameters.set("cursor", parsed.cursor);
   if (parsed.query) parameters.set("query", parsed.query);
   if (parsed.tag) parameters.set("tag", parsed.tag);
+  if (parsed.topics?.length) parameters.set("topics", parsed.topics.join(","));
+  if (parsed.topicMatch) parameters.set("topicMatch", parsed.topicMatch);
   if (parsed.researchStatus)
     parameters.set("researchStatus", parsed.researchStatus);
   if (parsed.exportStatus) parameters.set("exportStatus", parsed.exportStatus);
@@ -993,6 +1082,130 @@ async function callCloudClipCandidate(
       undefined,
       authorization,
     ),
+  );
+}
+
+async function callCloudClipComment(command: ClipCommentCloudCommand) {
+  const suffix =
+    command.commandType === "clip_comment.create.v1"
+      ? ""
+      : `/${command.commentId}`;
+  const method =
+    command.commandType === "clip_comment.create.v1"
+      ? "POST"
+      : command.commandType === "clip_comment.update.v1"
+        ? "PATCH"
+        : "DELETE";
+  let response: Response;
+  try {
+    response = await fetch(
+      `${cloudApiUrl}/api/projects/${command.projectId}/clips/${command.clipId}/comments${suffix}`,
+      {
+        method,
+        headers: {
+          authorization: command.authorization,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(command.command),
+      },
+    );
+  } catch {
+    throw Object.assign(new Error("Cloud comment service is unreachable."), {
+      statusCode: 503,
+      code: "cloud_unreachable",
+    });
+  }
+  const payload = await response.json().catch(() => undefined);
+  if (!response.ok) {
+    const remote = payload as
+      { error?: { code?: string; message?: string } } | undefined;
+    throw Object.assign(
+      new Error(remote?.error?.message ?? "Cloud comment request failed."),
+      {
+        statusCode: response.status,
+        code: remote?.error?.code ?? "clip_comment_cloud_failed",
+      },
+    );
+  }
+  return ClipCommentSchema.parse(payload);
+}
+
+async function callCloudProjectBookmarks(
+  projectId: string,
+  input: ProjectBookmarkQuery,
+  authorization: string,
+) {
+  const query = ProjectBookmarkQuerySchema.parse(input);
+  const parameters = new URLSearchParams({
+    scope: query.scope,
+    state: query.state,
+    limit: String(query.limit),
+  });
+  if (query.videoId) parameters.set("videoId", query.videoId);
+  if (query.search) parameters.set("search", query.search);
+  if (query.cursor) parameters.set("cursor", query.cursor);
+  let response: Response;
+  try {
+    response = await fetch(
+      `${cloudApiUrl}/api/projects/${projectId}/bookmarks?${parameters}`,
+      { headers: { authorization } },
+    );
+  } catch {
+    throw Object.assign(new Error("Cloud bookmark service is unreachable."), {
+      statusCode: 503,
+      code: "cloud_unreachable",
+    });
+  }
+  const payload = await response.json().catch(() => undefined);
+  if (!response.ok) throwCloudBookmarkError(response.status, payload);
+  return ProjectBookmarkPageSchema.parse(payload);
+}
+
+async function callCloudProjectBookmarkCommand(
+  command: BookmarkOutboxCommand,
+  authorization: string,
+) {
+  const suffix =
+    command.commandType === "bookmark.create.v1"
+      ? ""
+      : command.commandType === "bookmark.update.v1"
+        ? `/${command.bookmarkId}`
+        : `/${command.bookmarkId}/${command.commandType === "bookmark.archive.v1" ? "archive" : "restore"}`;
+  const method =
+    command.commandType === "bookmark.update.v1" ? "PATCH" : "POST";
+  let response: Response;
+  try {
+    response = await fetch(
+      `${cloudApiUrl}/api/projects/${command.projectId}/bookmarks${suffix}`,
+      {
+        method,
+        headers: {
+          authorization,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(command.command),
+      },
+    );
+  } catch {
+    throw Object.assign(new Error("Cloud bookmark service is unreachable."), {
+      statusCode: 503,
+      code: "cloud_unreachable",
+    });
+  }
+  const payload = await response.json().catch(() => undefined);
+  if (!response.ok) throwCloudBookmarkError(response.status, payload);
+  return ProjectBookmarkMutationResponseSchema.parse(payload).bookmark;
+}
+
+function throwCloudBookmarkError(statusCode: number, payload: unknown): never {
+  const remote = payload as
+    { error?: { code?: string; message?: string } } | undefined;
+  throw Object.assign(
+    new Error(remote?.error?.message ?? "Cloud bookmark request failed."),
+    {
+      statusCode,
+      code: remote?.error?.code ?? "project_bookmark_cloud_failed",
+    },
   );
 }
 

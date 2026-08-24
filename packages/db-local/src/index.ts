@@ -11,6 +11,12 @@ import {
   ArtifactRootSummarySchema,
   ClipLibraryPageSchema,
   ClipLibraryQuerySchema,
+  OfflineProjectBookmarkCommandSchema,
+  NotificationFeedPageSchema,
+  NotificationFeedQuerySchema,
+  ProjectBookmarkPageSchema,
+  ProjectBookmarkQuerySchema,
+  ProjectBookmarkSchema,
   DesktopSetupSchema,
   ExportObservedMediaPropertiesSchema,
   ExportRequestSchema,
@@ -29,6 +35,7 @@ import {
   primaryLanguage,
   sanitizeLoggedExportFailureCode,
   sanitizeLoggedExportFailureMessage,
+  sanitizeNotificationLabel,
   type CreateExportOnlyRequest,
   type ArtifactAvailabilityState,
   type ArtifactLocatorSummary,
@@ -38,6 +45,13 @@ import {
   type ArtifactVersionSummary,
   type ClipLibraryPage,
   type ClipLibraryQuery,
+  type OfflineProjectBookmarkCommand,
+  type OfflineProjectBookmarkCommandType,
+  type NotificationFeedPage,
+  type NotificationFeedQuery,
+  type ProjectBookmark,
+  type ProjectBookmarkPage,
+  type ProjectBookmarkQuery,
   type DesktopSetup,
   type DerivedTranslationIdentity,
   type ExportRequest,
@@ -48,12 +62,14 @@ import {
   type LoggedExportProgressSnapshot,
   type LoggedExportProgressStage,
   type LoggedExportSuccessResult,
+  type NoSpeechAttestation,
   type ExportObservedMediaProperties,
   type ResolvedExportSettingsSnapshot,
   type NormalizedTranscript,
   type LocalComponentReference,
   type SetupSelectionTarget,
   type SetupSnapshot,
+  type SourceIdentityV1,
 } from "@research-video/contracts";
 import {
   resolveExportSettings,
@@ -253,6 +269,26 @@ function requireAuthorizationScopeSha256(value: string): string {
   return value;
 }
 
+function parseLocalNotificationCursor(value: string): {
+  createdAt: string;
+  id: string;
+} {
+  try {
+    const parsed = JSON.parse(Buffer.from(value, "base64url").toString("utf8"));
+    if (
+      typeof parsed.createdAt !== "string" ||
+      !Number.isFinite(Date.parse(parsed.createdAt)) ||
+      typeof parsed.id !== "string" ||
+      !/^[0-9a-f-]{36}$/iu.test(parsed.id)
+    ) {
+      throw new Error("invalid");
+    }
+    return parsed;
+  } catch {
+    throw new RangeError("Local notification cursor is invalid.");
+  }
+}
+
 export class LocalExportQueue {
   constructor(
     private readonly database: DatabaseSync,
@@ -262,6 +298,7 @@ export class LocalExportQueue {
   createExportOnly(
     input: CreateExportOnlyRequest,
     resolvedSettingsSnapshot?: ResolvedExportSettingsSnapshot,
+    notificationAccountScopeSha256?: string,
   ): ExportRequest {
     const request = CreateExportOnlyRequestSchema.parse(input);
     const sourceRights = requireExactSourceRightsSnapshot(
@@ -277,8 +314,22 @@ export class LocalExportQueue {
       .get(idempotencyKey) as Record<string, unknown> | undefined;
     if (existing) {
       this.assertExactSourceRightsSnapshot(existing, sourceRights);
+      if (
+        notificationAccountScopeSha256 &&
+        existing.notification_account_scope_sha256 !==
+          notificationAccountScopeSha256
+      ) {
+        throw new LocalExportLifecycleError(
+          "This export command belongs to another signed-in account.",
+          "export_notification_account_conflict",
+        );
+      }
       return this.mapRequest(existing);
     }
+
+    const accountScope = notificationAccountScopeSha256
+      ? requireAuthorizationScopeSha256(notificationAccountScopeSha256)
+      : undefined;
 
     const requestId = randomUUID();
     const jobId = randomUUID();
@@ -335,6 +386,7 @@ export class LocalExportQueue {
         );
       const originColumn = this.hasRequestOriginColumn();
       const sourceRightsColumn = this.hasSourceRightsConfirmationColumn();
+      const notificationScopeColumn = this.hasNotificationAccountScopeColumn();
       this.database
         .prepare(
           `INSERT INTO export_requests
@@ -342,10 +394,12 @@ export class LocalExportQueue {
               selection_snapshot_json, source_language_class,
               preset_snapshot_json, resolved_settings_snapshot_json,
               subtitle_tracks_snapshot_json
+              ${notificationScopeColumn ? ", notification_account_scope_sha256" : ""}
               ${sourceRightsColumn ? ", source_rights_confirmation_json" : ""}
               ${originColumn ? ", request_origin" : ""},
               created_at, updated_at)
            VALUES (?, ?, 'export_only', ?, ?, ?, ?, ?, ?
+             ${notificationScopeColumn ? ", ?" : ""}
              ${sourceRightsColumn ? ", ?" : ""}
              ${originColumn ? ", ?" : ""}, ?, ?)`,
         )
@@ -358,6 +412,7 @@ export class LocalExportQueue {
           presetSnapshot,
           resolvedSettingsSnapshotJson,
           subtitleTracksSnapshot,
+          ...(notificationScopeColumn ? [accountScope ?? null] : []),
           ...(sourceRightsColumn ? [JSON.stringify(sourceRights)] : []),
           ...(originColumn
             ? [request.requestOrigin ?? "selection_action"]
@@ -371,6 +426,105 @@ export class LocalExportQueue {
       throw error;
     }
     return this.get(requestId)!;
+  }
+
+  listNotificationFeed(
+    accountScopeSha256: string,
+    input: NotificationFeedQuery,
+  ): NotificationFeedPage {
+    const scope = requireAuthorizationScopeSha256(accountScopeSha256);
+    const query = NotificationFeedQuerySchema.parse(input);
+    const terminal = this.database
+      .prepare(
+        `SELECT er.id, er.video_snapshot_json, j.attempt, j.state, j.updated_at
+         FROM export_requests er
+         JOIN jobs j ON j.id = er.job_id
+         WHERE er.cloud_delivery_id IS NULL
+           AND er.notification_account_scope_sha256 = ?
+           AND j.state IN ('complete', 'failed', 'needs_user_action')`,
+      )
+      .all(scope) as Array<{
+      id: string;
+      video_snapshot_json: string;
+      attempt: number;
+      state: string;
+      updated_at: string;
+    }>;
+    for (const row of terminal) {
+      const status = row.state === "complete" ? "completed" : "action_needed";
+      const sourceKey = `${row.id}:attempt:${Number(row.attempt)}:${status}`;
+      const video = JSON.parse(row.video_snapshot_json) as { title?: unknown };
+      this.database
+        .prepare(
+          `INSERT INTO local_export_notification_receipts
+             (id, export_request_id, account_scope_sha256, source_key, status,
+              source_label, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT (account_scope_sha256, source_key) DO NOTHING`,
+        )
+        .run(
+          randomUUID(),
+          row.id,
+          scope,
+          sourceKey,
+          status,
+          sanitizeNotificationLabel(video.title ?? "Untitled source"),
+          row.updated_at,
+        );
+    }
+
+    const cursor = query.cursor
+      ? parseLocalNotificationCursor(query.cursor)
+      : undefined;
+    const rows = this.database
+      .prepare(
+        `SELECT * FROM local_export_notification_receipts
+         WHERE account_scope_sha256 = ?
+           AND (? IS NULL OR created_at >= ?)
+           AND (? IS NULL OR created_at < ? OR (created_at = ? AND id < ?))
+         ORDER BY created_at DESC, id DESC
+         LIMIT ?`,
+      )
+      .all(
+        scope,
+        query.since ?? null,
+        query.since ?? null,
+        cursor?.createdAt ?? null,
+        cursor?.createdAt ?? null,
+        cursor?.createdAt ?? null,
+        cursor?.id ?? null,
+        query.limit + 1,
+      ) as Array<{
+      id: string;
+      export_request_id: string;
+      status: "completed" | "action_needed";
+      source_label: string;
+      created_at: string;
+    }>;
+    const hasMore = rows.length > query.limit;
+    const page = rows.slice(0, query.limit);
+    const last = page.at(-1);
+    return NotificationFeedPageSchema.parse({
+      events: page.map((row) => ({
+        id: row.id,
+        kind: "local_export_terminal",
+        status: row.status,
+        sourceLabel: sanitizeNotificationLabel(row.source_label),
+        navigation: {
+          kind: "local_export",
+          requestId: row.export_request_id,
+        },
+        createdAt: row.created_at,
+      })),
+      ...(hasMore && last
+        ? {
+            nextCursor: Buffer.from(
+              JSON.stringify({ createdAt: last.created_at, id: last.id }),
+            ).toString("base64url"),
+          }
+        : {}),
+      fetchedAt: this.now().toISOString(),
+    });
   }
 
   importLoggedDeliveryPending(input: LoggedExportDelivery): ExportRequest {
@@ -1116,6 +1270,9 @@ export class LocalExportQueue {
       projectId: request.projectId,
       clipId: request.clipId,
       sourceLanguageClass: request.sourceLanguageClass,
+      ...(request.noSpeechAttestation
+        ? { noSpeechAttestation: request.noSpeechAttestation }
+        : {}),
       resolvedExportBounds: request.resolvedExportBounds,
       renderedMediaProvenance: request.renderedMediaProvenance,
       thumbnailProvenance: request.thumbnailProvenance,
@@ -1736,9 +1893,10 @@ export class LocalExportQueue {
         .prepare(
           `INSERT INTO logged_export_source_groups
              (id, compatibility_key, project_id, batch_id, youtube_video_id,
+              source_provider, provider_media_id, canonical_url,
               acquisition_profile_fingerprint, worker_id, worker_epoch,
               lifecycle_state, created_at, expires_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'acquiring', ?, ?, ?)`,
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'acquiring', ?, ?, ?)`,
         )
         .run(
           input.groupId,
@@ -1746,6 +1904,9 @@ export class LocalExportQueue {
           first.request.projectId!,
           first.sourceGroup.batchId,
           first.request.video.youtubeVideoId,
+          "youtube",
+          first.request.video.youtubeVideoId,
+          first.request.video.canonicalUrl,
           input.acquisitionProfileFingerprint,
           first.workerId,
           first.workerEpoch,
@@ -2563,6 +2724,93 @@ export class LocalExportQueue {
     }
   }
 
+  recordNoSpeechSubtitleValidation(
+    jobId: string,
+    attempt: number,
+    sidecars: readonly LocalEmptySubtitleSidecarValidation[],
+  ): void {
+    const now = this.now().toISOString();
+    this.database.exec("BEGIN IMMEDIATE;");
+    try {
+      const request = this.database
+        .prepare(
+          `SELECT id, source_language_class, selection_snapshot_json
+           FROM export_requests
+           WHERE job_id = ? AND resolved_source_attempt = ?
+             AND rendered_source_attempt = ?`,
+        )
+        .get(jobId, attempt, attempt) as
+        | {
+            id: string;
+            source_language_class: string;
+            selection_snapshot_json: string;
+          }
+        | undefined;
+      if (!request) throw new LocalExportLifecycleError();
+      const selection = JSON.parse(request.selection_snapshot_json) as {
+        selectionType?: unknown;
+        speechStatus?: unknown;
+        noSpeechAttestation?: unknown;
+      };
+      const expectedRoles =
+        request.source_language_class === "confirmed_english"
+          ? ["english"]
+          : ["english", "original"];
+      const actualRoles = sidecars.map((sidecar) => sidecar.role).sort();
+      if (
+        selection.selectionType !== "player_time_range" ||
+        selection.speechStatus !== "no_speech" ||
+        !selection.noSpeechAttestation ||
+        sidecars.length !== expectedRoles.length ||
+        expectedRoles.some((role, index) => actualRoles[index] !== role) ||
+        sidecars.some(
+          (sidecar) =>
+            !validEmptySubtitleSidecar(sidecar) ||
+            canonicalJson(sidecar.noSpeechAttestation) !==
+              canonicalJson(selection.noSpeechAttestation),
+        )
+      ) {
+        throw new LocalExportLifecycleError(
+          "No-speech subtitle provenance is invalid.",
+          "no_speech_subtitle_provenance_invalid",
+        );
+      }
+      const insert = this.database.prepare(
+        `INSERT INTO export_empty_subtitle_sidecars
+           (export_request_id, role, language, empty_reason,
+            no_speech_attestation_json, cue_count, byte_size, content_sha256,
+            start_ms, end_ms, source_attempt, validated_at)
+         VALUES (?, ?, ?, 'attested_no_speech', ?, 0, ?, ?, 0, 0, ?, ?)
+         ON CONFLICT (export_request_id, role) DO UPDATE SET
+           language = excluded.language,
+           no_speech_attestation_json = excluded.no_speech_attestation_json,
+           byte_size = excluded.byte_size,
+           content_sha256 = excluded.content_sha256,
+           source_attempt = excluded.source_attempt,
+           validated_at = excluded.validated_at`,
+      );
+      for (const sidecar of sidecars) {
+        insert.run(
+          request.id,
+          sidecar.role,
+          safeSubtitleLanguage(sidecar.language),
+          canonicalJson(sidecar.noSpeechAttestation),
+          sidecar.byteSize,
+          sidecar.contentSha256,
+          attempt,
+          now,
+        );
+      }
+      this.database
+        .prepare("UPDATE export_requests SET updated_at = ? WHERE id = ?")
+        .run(now, request.id);
+      this.database.exec("COMMIT;");
+    } catch (error) {
+      this.database.exec("ROLLBACK;");
+      throw error;
+    }
+  }
+
   recordFinalArtifactPromotion(
     jobId: string,
     attempt: number,
@@ -2667,6 +2915,7 @@ export class LocalExportQueue {
            WHERE id = ? AND state = 'processing'`,
         )
         .run(jobId, attempt, now, jobId);
+      this.recordExportOnlyNotification(jobId, "completed", now);
       this.database.exec("COMMIT;");
     } catch (error) {
       this.database.exec("ROLLBACK;");
@@ -3162,6 +3411,7 @@ export class LocalExportQueue {
                AND attempt = ?`,
           )
           .run(JSON.stringify(payload), now, claim.jobId, claim.attempt);
+        this.recordExportOnlyNotification(claim.jobId, "completed", now);
         settlement = { restoredComplete: true, markedNeedsUserAction: false };
       } else if (
         !hasPackage &&
@@ -3440,17 +3690,31 @@ export class LocalExportQueue {
   }
 
   private mapRequest(row: Record<string, unknown>): ExportRequest {
+    const transcriptSidecars = this.database
+      .prepare(
+        `SELECT role, language, track_id, track_version, cue_count,
+                byte_size, content_sha256, start_ms, end_ms,
+                source_attempt, validated_at
+         FROM export_subtitle_sidecars
+         WHERE export_request_id = ? ORDER BY role`,
+      )
+      .all(String(row.id)) as Record<string, unknown>[];
+    const emptySidecars = this.hasEmptySubtitleSidecarTable()
+      ? (this.database
+          .prepare(
+            `SELECT role, language, empty_reason, no_speech_attestation_json,
+                    cue_count, byte_size, content_sha256, start_ms, end_ms,
+                    source_attempt, validated_at
+             FROM export_empty_subtitle_sidecars
+             WHERE export_request_id = ? ORDER BY role`,
+          )
+          .all(String(row.id)) as Record<string, unknown>[])
+      : [];
     return mapLocalExportRequest(
       row,
-      this.database
-        .prepare(
-          `SELECT role, language, track_id, track_version, cue_count,
-                  byte_size, content_sha256, start_ms, end_ms,
-                  source_attempt, validated_at
-           FROM export_subtitle_sidecars
-           WHERE export_request_id = ? ORDER BY role`,
-        )
-        .all(String(row.id)) as Record<string, unknown>[],
+      [...transcriptSidecars, ...emptySidecars].sort((left, right) =>
+        String(left.role).localeCompare(String(right.role)),
+      ),
       this.database
         .prepare(
           `SELECT role, package_identity, byte_size, content_sha256,
@@ -3468,6 +3732,24 @@ export class LocalExportQueue {
         .prepare("PRAGMA table_info(export_requests)")
         .all() as Array<{ name: string }>
     ).some((column) => column.name === "request_origin");
+  }
+
+  private hasNotificationAccountScopeColumn(): boolean {
+    return (
+      this.database
+        .prepare("PRAGMA table_info(export_requests)")
+        .all() as Array<{ name: string }>
+    ).some((column) => column.name === "notification_account_scope_sha256");
+  }
+
+  private hasEmptySubtitleSidecarTable(): boolean {
+    return Boolean(
+      this.database
+        .prepare(
+          "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'export_empty_subtitle_sidecars'",
+        )
+        .get(),
+    );
   }
 
   private hasSourceRightsConfirmationColumn(): boolean {
@@ -3626,6 +3908,55 @@ export class LocalExportQueue {
          WHERE id = ?`,
       )
       .run(JSON.stringify(payload), now, jobId);
+    this.recordExportOnlyNotification(jobId, "action_needed", now);
+  }
+
+  private recordExportOnlyNotification(
+    jobId: string,
+    status: "completed" | "action_needed",
+    createdAt: string,
+  ): void {
+    const expectedState =
+      status === "completed" ? "complete" : "needs_user_action";
+    const row = this.database
+      .prepare(
+        `SELECT er.id AS export_request_id,
+                er.notification_account_scope_sha256 AS account_scope_sha256,
+                er.video_snapshot_json, j.attempt
+         FROM export_requests er
+         JOIN jobs j ON j.id = er.job_id
+         WHERE j.id = ? AND j.state = ?
+           AND er.cloud_delivery_id IS NULL
+           AND er.notification_account_scope_sha256 IS NOT NULL`,
+      )
+      .get(jobId, expectedState) as
+      | {
+          export_request_id: string;
+          account_scope_sha256: string;
+          video_snapshot_json: string;
+          attempt: number;
+        }
+      | undefined;
+    if (!row) return;
+    const video = JSON.parse(row.video_snapshot_json) as { title?: unknown };
+    const sourceKey = `${row.export_request_id}:attempt:${Number(row.attempt)}:${status}`;
+    this.database
+      .prepare(
+        `INSERT INTO local_export_notification_receipts
+           (id, export_request_id, account_scope_sha256, source_key, status,
+            source_label, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT (account_scope_sha256, source_key) DO NOTHING`,
+      )
+      .run(
+        randomUUID(),
+        row.export_request_id,
+        row.account_scope_sha256,
+        sourceKey,
+        status,
+        sanitizeNotificationLabel(video.title ?? "Untitled source"),
+        createdAt,
+      );
   }
 }
 
@@ -3668,6 +3999,7 @@ export type LocalLoggedExportSourceGroup = {
   projectId: string;
   batchId: string;
   youtubeVideoId: string;
+  sourceIdentity: SourceIdentityV1;
   acquisitionProfileFingerprint: string;
   workerId: string;
   workerEpoch: number;
@@ -3703,6 +4035,18 @@ type LocalSubtitleSidecarValidation = {
   contentSha256: string;
   startMs: number;
   endMs: number;
+};
+
+type LocalEmptySubtitleSidecarValidation = {
+  role: "original" | "english";
+  language: string;
+  emptyReason: "attested_no_speech";
+  noSpeechAttestation: NoSpeechAttestation;
+  cueCount: 0;
+  byteSize: number;
+  contentSha256: string;
+  startMs: 0;
+  endMs: 0;
 };
 
 type LocalFinalArtifactProvenance = {
@@ -4643,6 +4987,433 @@ export class LocalClipLibraryCacheRepository {
   }
 }
 
+export interface LocalBookmarkOutboxRecord {
+  outboxId: string;
+  accountId: string;
+  projectId: string;
+  bookmarkId?: string;
+  commandType: OfflineProjectBookmarkCommandType;
+  idempotencyKey: string;
+  request: unknown;
+  state: "queued" | "conflict";
+  attempt: number;
+  nextAttemptAt?: string;
+  code?: string;
+  createdAt: string;
+}
+
+/** Account-scoped authorized cache plus ordered bookmark mutation outbox. */
+export class LocalProjectBookmarkRepository {
+  constructor(
+    private readonly database: DatabaseSync,
+    private readonly now: () => Date = () => new Date(),
+  ) {}
+
+  storeAuthorizedPage(input: {
+    authorizationScopeSha256: string;
+    projectId: string;
+    query: ProjectBookmarkQuery;
+    page: ProjectBookmarkPage;
+  }): { page: ProjectBookmarkPage; cachedAt: string } {
+    const query = ProjectBookmarkQuerySchema.parse(input.query);
+    const page = ProjectBookmarkPageSchema.parse(input.page);
+    if (page.projectId !== input.projectId) {
+      throw new LocalBookmarkOutboxError(
+        "Bookmark page does not match the requested project.",
+      );
+    }
+    const cachedAt = this.now().toISOString();
+    const fingerprint = bookmarkQueryFingerprint(query);
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const storeBookmark = this.database.prepare(
+        `INSERT INTO bookmark_cache
+           (authorized_account_id, project_id, bookmark_id, video_id,
+            payload_json, state, source_time_ms, cached_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT (authorized_account_id, project_id, bookmark_id)
+         DO UPDATE SET video_id = excluded.video_id,
+           payload_json = excluded.payload_json, state = excluded.state,
+           source_time_ms = excluded.source_time_ms,
+           cached_at = excluded.cached_at`,
+      );
+      for (const bookmark of page.items) {
+        storeBookmark.run(
+          input.authorizationScopeSha256,
+          input.projectId,
+          bookmark.id,
+          bookmark.videoId,
+          canonicalJson(bookmark),
+          bookmark.state,
+          bookmark.sourceTimeMs,
+          cachedAt,
+        );
+      }
+      this.database
+        .prepare(
+          `INSERT INTO bookmark_cache_reads
+             (authorized_account_id, project_id, query_fingerprint,
+              query_json, response_json, cached_at)
+           VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT (authorized_account_id, project_id, query_fingerprint)
+           DO UPDATE SET query_json = excluded.query_json,
+             response_json = excluded.response_json,
+             cached_at = excluded.cached_at`,
+        )
+        .run(
+          input.authorizationScopeSha256,
+          input.projectId,
+          fingerprint,
+          canonicalJson(query),
+          canonicalJson(page),
+          cachedAt,
+        );
+      this.database.exec("COMMIT");
+      return { page, cachedAt };
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  storeBookmark(input: {
+    authorizationScopeSha256: string;
+    bookmark: ProjectBookmark;
+  }): ProjectBookmark {
+    const bookmark = ProjectBookmarkSchema.parse(input.bookmark);
+    this.database
+      .prepare(
+        `INSERT INTO bookmark_cache
+           (authorized_account_id, project_id, bookmark_id, video_id,
+            payload_json, state, source_time_ms, cached_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT (authorized_account_id, project_id, bookmark_id)
+         DO UPDATE SET video_id = excluded.video_id,
+           payload_json = excluded.payload_json, state = excluded.state,
+           source_time_ms = excluded.source_time_ms,
+           cached_at = excluded.cached_at`,
+      )
+      .run(
+        input.authorizationScopeSha256,
+        bookmark.projectId,
+        bookmark.id,
+        bookmark.videoId,
+        canonicalJson(bookmark),
+        bookmark.state,
+        bookmark.sourceTimeMs,
+        this.now().toISOString(),
+      );
+    return bookmark;
+  }
+
+  getAuthorizedPage(input: {
+    authorizationScopeSha256: string;
+    projectId: string;
+    query: ProjectBookmarkQuery;
+  }): { page: ProjectBookmarkPage; cachedAt: string } | undefined {
+    const query = ProjectBookmarkQuerySchema.parse(input.query);
+    const row = this.database
+      .prepare(
+        `SELECT response_json, cached_at FROM bookmark_cache_reads
+         WHERE authorized_account_id = ? AND project_id = ?
+           AND query_fingerprint = ?`,
+      )
+      .get(
+        input.authorizationScopeSha256,
+        input.projectId,
+        bookmarkQueryFingerprint(query),
+      ) as { response_json: string; cached_at: string } | undefined;
+    return row
+      ? {
+          page: ProjectBookmarkPageSchema.parse(JSON.parse(row.response_json)),
+          cachedAt: row.cached_at,
+        }
+      : undefined;
+  }
+
+  enqueue(input: {
+    authorizationScopeSha256: string;
+    projectId: string;
+    bookmarkId?: string;
+    commandType: OfflineProjectBookmarkCommandType;
+    idempotencyKey: string;
+    request: unknown;
+  }): string {
+    const requestJson = canonicalJson(input.request);
+    const existing = this.database
+      .prepare(
+        `SELECT command_id, command_kind, bookmark_id, request_json
+         FROM bookmark_outbox
+         WHERE account_id = ? AND project_id = ? AND idempotency_key = ?`,
+      )
+      .get(
+        input.authorizationScopeSha256,
+        input.projectId,
+        input.idempotencyKey,
+      ) as
+      | {
+          command_id: string;
+          command_kind: string;
+          bookmark_id: string | null;
+          request_json: string;
+        }
+      | undefined;
+    const commandKind = bookmarkCommandKind(input.commandType);
+    if (existing) {
+      if (
+        existing.command_kind !== commandKind ||
+        existing.bookmark_id !== (input.bookmarkId ?? null) ||
+        existing.request_json !== requestJson
+      ) {
+        throw new LocalBookmarkOutboxError(
+          "Bookmark idempotency key was already used for another command.",
+        );
+      }
+      return existing.command_id;
+    }
+    const outboxId = randomUUID();
+    const now = this.now().toISOString();
+    this.database
+      .prepare(
+        `INSERT INTO bookmark_outbox
+           (command_id, account_id, project_id, bookmark_id, command_kind,
+            idempotency_key, request_json, state, attempt, next_attempt_at,
+            created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', 0, NULL, ?, ?)`,
+      )
+      .run(
+        outboxId,
+        input.authorizationScopeSha256,
+        input.projectId,
+        input.bookmarkId ?? null,
+        commandKind,
+        input.idempotencyKey,
+        requestJson,
+        now,
+        now,
+      );
+    return outboxId;
+  }
+
+  due(input: {
+    authorizationScopeSha256: string;
+    projectId: string;
+    limit?: number;
+  }): LocalBookmarkOutboxRecord[] {
+    const rows = this.database
+      .prepare(
+        `SELECT o.*, c.conflict_code
+         FROM bookmark_outbox o
+         LEFT JOIN bookmark_outbox_conflicts c ON c.command_id = o.command_id
+         WHERE o.account_id = ? AND o.project_id = ? AND o.state = 'queued'
+           AND (o.next_attempt_at IS NULL OR o.next_attempt_at <= ?)
+         ORDER BY o.sequence LIMIT ?`,
+      )
+      .all(
+        input.authorizationScopeSha256,
+        input.projectId,
+        this.now().toISOString(),
+        Math.min(100, Math.max(1, input.limit ?? 50)),
+      ) as Record<string, unknown>[];
+    return rows.map(mapLocalBookmarkOutboxRecord);
+  }
+
+  list(input: {
+    authorizationScopeSha256: string;
+    projectId: string;
+    limit?: number;
+  }): OfflineProjectBookmarkCommand[] {
+    const rows = this.database
+      .prepare(
+        `SELECT o.*, c.conflict_code
+         FROM bookmark_outbox o
+         LEFT JOIN bookmark_outbox_conflicts c ON c.command_id = o.command_id
+         WHERE o.account_id = ? AND o.project_id = ?
+         ORDER BY o.sequence LIMIT ?`,
+      )
+      .all(
+        input.authorizationScopeSha256,
+        input.projectId,
+        Math.min(100, Math.max(1, input.limit ?? 100)),
+      ) as Record<string, unknown>[];
+    return rows.map((row) =>
+      bookmarkOutboxSummary(mapLocalBookmarkOutboxRecord(row)),
+    );
+  }
+
+  get(outboxId: string): LocalBookmarkOutboxRecord | undefined {
+    const row = this.database
+      .prepare(
+        `SELECT o.*, c.conflict_code FROM bookmark_outbox o
+         LEFT JOIN bookmark_outbox_conflicts c ON c.command_id = o.command_id
+         WHERE o.command_id = ?`,
+      )
+      .get(outboxId) as Record<string, unknown> | undefined;
+    return row ? mapLocalBookmarkOutboxRecord(row) : undefined;
+  }
+
+  acknowledge(outboxId: string): void {
+    this.database
+      .prepare("DELETE FROM bookmark_outbox WHERE command_id = ?")
+      .run(outboxId);
+  }
+
+  retry(outboxId: string, baseDelayMs = 1_000): void {
+    const row = this.database
+      .prepare("SELECT attempt FROM bookmark_outbox WHERE command_id = ?")
+      .get(outboxId) as { attempt: number } | undefined;
+    if (!row) return;
+    const attempt = row.attempt + 1;
+    const nextAttemptAt = new Date(
+      this.now().getTime() + Math.min(baseDelayMs * 2 ** (attempt - 1), 60_000),
+    ).toISOString();
+    this.database
+      .prepare(
+        `UPDATE bookmark_outbox
+         SET attempt = ?, next_attempt_at = ?, updated_at = ?
+         WHERE command_id = ?`,
+      )
+      .run(attempt, nextAttemptAt, this.now().toISOString(), outboxId);
+  }
+
+  recordConflict(outboxId: string, code: string, message: string): void {
+    const row = this.get(outboxId);
+    if (!row) return;
+    const now = this.now().toISOString();
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      this.database
+        .prepare(
+          `UPDATE bookmark_outbox SET state = 'conflict', next_attempt_at = NULL,
+             updated_at = ? WHERE command_id = ?`,
+        )
+        .run(now, outboxId);
+      this.database
+        .prepare(
+          `INSERT INTO bookmark_outbox_conflicts
+             (command_id, conflict_code, conflict_message,
+              retained_request_json, created_at)
+           VALUES (?, ?, ?, ?, ?)
+           ON CONFLICT (command_id) DO UPDATE SET
+             conflict_code = excluded.conflict_code,
+             conflict_message = excluded.conflict_message,
+             retained_request_json = excluded.retained_request_json`,
+        )
+        .run(
+          outboxId,
+          code.slice(0, 160),
+          message.slice(0, 500),
+          canonicalJson(row.request),
+          now,
+        );
+      this.database.exec("COMMIT");
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  purgeScope(projectId: string, authorizationScopeSha256: string): void {
+    this.database
+      .prepare(
+        `DELETE FROM bookmark_cache_reads
+         WHERE authorized_account_id = ? AND project_id = ?`,
+      )
+      .run(authorizationScopeSha256, projectId);
+    this.database
+      .prepare(
+        `DELETE FROM bookmark_cache
+         WHERE authorized_account_id = ? AND project_id = ?`,
+      )
+      .run(authorizationScopeSha256, projectId);
+  }
+
+  purgeAuthorizationScope(authorizationScopeSha256: string): void {
+    this.database
+      .prepare(
+        "DELETE FROM bookmark_cache_reads WHERE authorized_account_id = ?",
+      )
+      .run(authorizationScopeSha256);
+    this.database
+      .prepare("DELETE FROM bookmark_cache WHERE authorized_account_id = ?")
+      .run(authorizationScopeSha256);
+  }
+}
+
+export class LocalBookmarkOutboxError extends Error {
+  readonly code = "bookmark_outbox_conflict";
+  readonly statusCode = 409;
+}
+
+function bookmarkQueryFingerprint(query: ProjectBookmarkQuery): string {
+  return createHash("sha256")
+    .update(canonicalJson(ProjectBookmarkQuerySchema.parse(query)))
+    .digest("hex");
+}
+
+function bookmarkCommandKind(
+  commandType: OfflineProjectBookmarkCommandType,
+): "create" | "update" | "archive" | "restore" {
+  return commandType.split(".")[1] as
+    "create" | "update" | "archive" | "restore";
+}
+
+function mapLocalBookmarkOutboxRecord(
+  row: Record<string, unknown>,
+): LocalBookmarkOutboxRecord {
+  const commandKind = String(row.command_kind) as
+    "create" | "update" | "archive" | "restore";
+  return {
+    outboxId: String(row.command_id),
+    accountId: String(row.account_id),
+    projectId: String(row.project_id),
+    ...(row.bookmark_id === null
+      ? {}
+      : { bookmarkId: String(row.bookmark_id) }),
+    commandType: `bookmark.${commandKind}.v1`,
+    idempotencyKey: String(row.idempotency_key),
+    request: JSON.parse(String(row.request_json)),
+    state: row.state === "conflict" ? "conflict" : "queued",
+    attempt: Number(row.attempt),
+    ...(row.next_attempt_at === null
+      ? {}
+      : { nextAttemptAt: String(row.next_attempt_at) }),
+    ...(row.conflict_code === null || row.conflict_code === undefined
+      ? {}
+      : { code: String(row.conflict_code) }),
+    createdAt: String(row.created_at),
+  };
+}
+
+function bookmarkOutboxSummary(
+  row: LocalBookmarkOutboxRecord,
+): OfflineProjectBookmarkCommand {
+  const request = row.request as Record<string, unknown>;
+  return OfflineProjectBookmarkCommandSchema.parse({
+    outboxId: row.outboxId,
+    commandType: row.commandType,
+    ...(row.bookmarkId ? { bookmarkId: row.bookmarkId } : {}),
+    ...(typeof request.videoId === "string"
+      ? { videoId: request.videoId }
+      : {}),
+    ...(typeof request.sourceTimeMs === "number"
+      ? { sourceTimeMs: request.sourceTimeMs }
+      : {}),
+    ...(request.title === null || typeof request.title === "string"
+      ? { title: request.title }
+      : {}),
+    ...(request.note === null || typeof request.note === "string"
+      ? { note: request.note }
+      : {}),
+    ...(typeof request.expectedVersion === "number"
+      ? { expectedVersion: request.expectedVersion }
+      : {}),
+    state: row.state,
+    ...(row.code ? { code: row.code } : {}),
+    createdAt: row.createdAt,
+  });
+}
+
 export class LocalArtifactCatalogError extends Error {
   readonly code = "artifact_catalog_conflict";
 
@@ -4862,6 +5633,20 @@ function mapLocalLoggedExportSourceGroup(
     projectId: String(row.project_id),
     batchId: String(row.batch_id),
     youtubeVideoId: String(row.youtube_video_id),
+    sourceIdentity: {
+      schemaVersion: 1,
+      provider:
+        row.source_provider === "tiktok" ||
+        row.source_provider === "instagram" ||
+        row.source_provider === "facebook"
+          ? row.source_provider
+          : "youtube",
+      providerMediaId: String(row.provider_media_id ?? row.youtube_video_id),
+      canonicalUrl: String(
+        row.canonical_url ??
+          `https://www.youtube.com/watch?v=${String(row.provider_media_id ?? row.youtube_video_id)}`,
+      ),
+    },
     acquisitionProfileFingerprint: String(row.acquisition_profile_fingerprint),
     workerId: String(row.worker_id),
     workerEpoch: Number(row.worker_epoch),
@@ -4899,6 +5684,13 @@ function mapLocalExportRequest(
   subtitleSidecars: readonly Record<string, unknown>[] = [],
   finalArtifacts: readonly Record<string, unknown>[] = [],
 ): ExportRequest {
+  const selection = JSON.parse(
+    String(row.selection_snapshot_json),
+  ) as ExportRequest["selection"];
+  const noSpeechAttestation =
+    selection.selectionType === "player_time_range"
+      ? selection.noSpeechAttestation
+      : undefined;
   return ExportRequestSchema.parse({
     id: row.id,
     jobId: row.job_id,
@@ -4919,7 +5711,8 @@ function mapLocalExportRequest(
         }
       : {}),
     video: JSON.parse(String(row.video_snapshot_json)),
-    selection: JSON.parse(String(row.selection_snapshot_json)),
+    selection,
+    ...(noSpeechAttestation ? { noSpeechAttestation } : {}),
     sourceLanguageClass: row.source_language_class,
     ...(row.source_rights_confirmation_json === null ||
     row.source_rights_confirmation_json === undefined
@@ -5078,19 +5871,37 @@ function mapLocalExportRequest(
     ...(subtitleSidecars.length === 0
       ? {}
       : {
-          subtitleSidecars: subtitleSidecars.map((sidecar) => ({
-            role: String(sidecar.role),
-            language: String(sidecar.language),
-            trackId: String(sidecar.track_id),
-            trackVersion: Number(sidecar.track_version),
-            cueCount: Number(sidecar.cue_count),
-            byteSize: Number(sidecar.byte_size),
-            contentSha256: String(sidecar.content_sha256),
-            startMs: Number(sidecar.start_ms),
-            endMs: Number(sidecar.end_ms),
-            sourceAttempt: Number(sidecar.source_attempt),
-            validatedAt: String(sidecar.validated_at),
-          })),
+          subtitleSidecars: subtitleSidecars.map((sidecar) =>
+            sidecar.empty_reason
+              ? {
+                  role: String(sidecar.role),
+                  language: String(sidecar.language),
+                  emptyReason: "attested_no_speech",
+                  noSpeechAttestation: JSON.parse(
+                    String(sidecar.no_speech_attestation_json),
+                  ),
+                  cueCount: 0,
+                  byteSize: Number(sidecar.byte_size),
+                  contentSha256: String(sidecar.content_sha256),
+                  startMs: 0,
+                  endMs: 0,
+                  sourceAttempt: Number(sidecar.source_attempt),
+                  validatedAt: String(sidecar.validated_at),
+                }
+              : {
+                  role: String(sidecar.role),
+                  language: String(sidecar.language),
+                  trackId: String(sidecar.track_id),
+                  trackVersion: Number(sidecar.track_version),
+                  cueCount: Number(sidecar.cue_count),
+                  byteSize: Number(sidecar.byte_size),
+                  contentSha256: String(sidecar.content_sha256),
+                  startMs: Number(sidecar.start_ms),
+                  endMs: Number(sidecar.end_ms),
+                  sourceAttempt: Number(sidecar.source_attempt),
+                  validatedAt: String(sidecar.validated_at),
+                },
+          ),
         }),
     ...(finalArtifacts.length === 0
       ? {}
@@ -5233,6 +6044,21 @@ function validSubtitleSidecar(sidecar: LocalSubtitleSidecarValidation) {
     Number.isSafeInteger(sidecar.endMs) &&
     sidecar.startMs >= 0 &&
     sidecar.endMs > sidecar.startMs
+  );
+}
+
+function validEmptySubtitleSidecar(
+  sidecar: LocalEmptySubtitleSidecarValidation,
+) {
+  return (
+    safeSubtitleLanguage(sidecar.language) !== null &&
+    sidecar.emptyReason === "attested_no_speech" &&
+    sidecar.cueCount === 0 &&
+    Number.isSafeInteger(sidecar.byteSize) &&
+    sidecar.byteSize > 0 &&
+    /^[a-f0-9]{64}$/u.test(sidecar.contentSha256) &&
+    sidecar.startMs === 0 &&
+    sidecar.endMs === 0
   );
 }
 

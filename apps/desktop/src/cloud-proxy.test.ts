@@ -100,8 +100,36 @@ describe("loopback cloud credential proxy", () => {
     expect(upstream).not.toHaveBeenCalled();
   });
 
+  it("forwards bounded DELETE commands for authenticated comment tombstones", async () => {
+    const upstream = vi.fn(async () => new Response("{}"));
+    const proxy = await start({
+      cloudOrigin: "https://api.example.test",
+      launchSecret,
+      tokenProvider: async () => cloudBearer,
+      fetch: upstream,
+    });
+    const response = await fetch(
+      `${proxy.origin}/api/projects/project-1/clips/clip-1/comments/comment-1`,
+      {
+        method: "DELETE",
+        headers: localHeaders({ "content-type": "application/json" }),
+        body: JSON.stringify({
+          idempotencyKey: "delete-1",
+          expectedVersion: 1,
+        }),
+      },
+    );
+    expect(response.status).toBe(200);
+    expect(upstream).toHaveBeenCalledWith(
+      new URL(
+        "https://api.example.test/api/projects/project-1/clips/clip-1/comments/comment-1",
+      ),
+      expect.objectContaining({ method: "DELETE" }),
+    );
+  });
+
   it.each([
-    ["DELETE", "/api/projects"],
+    ["HEAD", "/api/projects"],
     ["OPTIONS", "/api/projects"],
     ["GET", "/not-api/projects"],
     ["GET", "/api/../private"],

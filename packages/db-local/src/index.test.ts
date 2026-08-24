@@ -166,6 +166,11 @@ describe("local migrations", () => {
       "0028_desktop_setup_and_validated_components",
       "0029_verified_transcript_cache_authorizations",
       "0030_export_source_rights_and_terminal_reconciliation",
+      "0031_attested_empty_subtitle_sidecars",
+      "0032_platform_neutral_source_identity",
+      "0033_comment_outbox_conflicts",
+      "0034_bookmark_cache_outbox",
+      "0035_local_export_notification_receipts",
     ]);
     expect(runLocalMigrations(database)).toEqual([]);
     expect(
@@ -500,6 +505,11 @@ describe("local migrations", () => {
       "0028_desktop_setup_and_validated_components",
       "0029_verified_transcript_cache_authorizations",
       "0030_export_source_rights_and_terminal_reconciliation",
+      "0031_attested_empty_subtitle_sidecars",
+      "0032_platform_neutral_source_identity",
+      "0033_comment_outbox_conflicts",
+      "0034_bookmark_cache_outbox",
+      "0035_local_export_notification_receipts",
     ]);
     expect(
       database
@@ -551,6 +561,11 @@ describe("local migrations", () => {
     expect(runLocalMigrations(database)).toEqual([
       "0029_verified_transcript_cache_authorizations",
       "0030_export_source_rights_and_terminal_reconciliation",
+      "0031_attested_empty_subtitle_sidecars",
+      "0032_platform_neutral_source_identity",
+      "0033_comment_outbox_conflicts",
+      "0034_bookmark_cache_outbox",
+      "0035_local_export_notification_receipts",
     ]);
     expect(
       database
@@ -859,6 +874,11 @@ describe("local migrations", () => {
       "0028_desktop_setup_and_validated_components",
       "0029_verified_transcript_cache_authorizations",
       "0030_export_source_rights_and_terminal_reconciliation",
+      "0031_attested_empty_subtitle_sidecars",
+      "0032_platform_neutral_source_identity",
+      "0033_comment_outbox_conflicts",
+      "0034_bookmark_cache_outbox",
+      "0035_local_export_notification_receipts",
     ]);
     expect(
       database
@@ -1043,6 +1063,11 @@ describe("local migrations", () => {
       "0028_desktop_setup_and_validated_components",
       "0029_verified_transcript_cache_authorizations",
       "0030_export_source_rights_and_terminal_reconciliation",
+      "0031_attested_empty_subtitle_sidecars",
+      "0032_platform_neutral_source_identity",
+      "0033_comment_outbox_conflicts",
+      "0034_bookmark_cache_outbox",
+      "0035_local_export_notification_receipts",
     ]);
     expect(
       database.prepare("SELECT * FROM export_final_artifacts").all(),
@@ -1183,6 +1208,11 @@ describe("local migrations", () => {
       "0028_desktop_setup_and_validated_components",
       "0029_verified_transcript_cache_authorizations",
       "0030_export_source_rights_and_terminal_reconciliation",
+      "0031_attested_empty_subtitle_sidecars",
+      "0032_platform_neutral_source_identity",
+      "0033_comment_outbox_conflicts",
+      "0034_bookmark_cache_outbox",
+      "0035_local_export_notification_receipts",
     ]);
     expect(
       database
@@ -1274,6 +1304,127 @@ describe("local migrations", () => {
       expect.objectContaining({ role: "thumbnail_jpg", byteSize: 256 }),
       expect.objectContaining({ role: "video_mp4", byteSize: 2_048 }),
     ]);
+    database.close();
+  });
+});
+
+describe("local export notification receipts", () => {
+  it("keeps account-scoped terminal receipts stable and body-free", () => {
+    const directory = mkdtempSync(
+      join(tmpdir(), "research-video-local-notifications-"),
+    );
+    temporaryDirectories.add(directory);
+    const database = openLocalDatabase(join(directory, "notifications.sqlite"));
+    runLocalMigrations(database);
+    let now = new Date("2026-08-24T12:00:00.000Z");
+    const queue = new LocalExportQueue(database, () => now);
+    const accountScope = "a".repeat(64);
+    const otherAccountScope = "b".repeat(64);
+    const request = queue.createExportOnly(
+      {
+        ...fixtureExportInput,
+        idempotencyKey: "notification-export-only",
+        video: {
+          ...fixtureExportInput.video,
+          title: "Safe fixture source",
+        },
+      },
+      undefined,
+      accountScope,
+    );
+
+    now = new Date("2026-08-24T12:01:00.000Z");
+    queue.recordSourceNotStartedFailure(
+      request.id,
+      "provider_failed",
+      "private /Users/researcher/source.mp4 token=secret provider output",
+    );
+
+    const first = queue.listNotificationFeed(accountScope, { limit: 25 });
+    expect(first.events).toEqual([
+      expect.objectContaining({
+        kind: "local_export_terminal",
+        status: "action_needed",
+        sourceLabel: "Safe fixture source",
+        createdAt: "2026-08-24T12:01:00.000Z",
+        navigation: { kind: "local_export", requestId: request.id },
+      }),
+    ]);
+    expect(JSON.stringify(first)).not.toMatch(
+      /provider_failed|Users|source\.mp4|secret|provider output/iu,
+    );
+    expect(
+      queue.listNotificationFeed(accountScope, { limit: 25 }).events,
+    ).toEqual(first.events);
+    expect(
+      queue.listNotificationFeed(otherAccountScope, { limit: 25 }).events,
+    ).toEqual([]);
+    expect(
+      queue.listNotificationFeed(accountScope, {
+        limit: 25,
+        since: "2026-08-24T12:01:00.001Z",
+      }).events,
+    ).toEqual([]);
+
+    now = new Date("2026-08-24T12:02:00.000Z");
+    const retriedBeforeRead = queue.createExportOnly(
+      {
+        ...fixtureExportInput,
+        idempotencyKey: "notification-failure-before-feed-read",
+        video: {
+          ...fixtureExportInput.video,
+          title: "Retried source",
+        },
+      },
+      undefined,
+      accountScope,
+    );
+    queue.recordSourceNotStartedFailure(
+      retriedBeforeRead.id,
+      "provider_failed",
+      "Failure must survive a retry before polling.",
+    );
+    queue.beginSourceAcquisition(retriedBeforeRead.id);
+    const scopedAfterRetry = queue.listNotificationFeed(accountScope, {
+      limit: 25,
+    }).events;
+    expect(
+      scopedAfterRetry.some(
+        (event) =>
+          event.kind === "local_export_terminal" &&
+          event.navigation.requestId === retriedBeforeRead.id &&
+          event.status === "action_needed",
+      ),
+    ).toBe(true);
+
+    const unscoped = queue.createExportOnly({
+      ...fixtureExportInput,
+      idempotencyKey: "pre-notification-export-only",
+    });
+    queue.recordSourceNotStartedFailure(
+      unscoped.id,
+      "provider_failed",
+      "No notification scope existed at creation.",
+    );
+    expect(
+      queue.listNotificationFeed(accountScope, { limit: 25 }).events,
+    ).toEqual(scopedAfterRetry);
+    expect(() =>
+      queue.createExportOnly(
+        {
+          ...fixtureExportInput,
+          idempotencyKey: "notification-export-only",
+          video: {
+            ...fixtureExportInput.video,
+            title: "Safe fixture source",
+          },
+        },
+        undefined,
+        otherAccountScope,
+      ),
+    ).toThrowError(
+      expect.objectContaining({ code: "export_notification_account_conflict" }),
+    );
     database.close();
   });
 });
@@ -1551,6 +1702,9 @@ describe("logged export delivery import", () => {
       width: 640,
       height: 360,
     });
+    if (pending.selection.selectionType === "player_time_range") {
+      throw new Error("This fixture requires a transcript selection.");
+    }
     queue.recordEnglishSubtitleValidation(pending.jobId, attempt, {
       trackId: pending.selection.trackId,
       trackVersion: pending.selection.transcriptVersion,
@@ -2399,6 +2553,11 @@ describe("logged export delivery import", () => {
       "0028_desktop_setup_and_validated_components",
       "0029_verified_transcript_cache_authorizations",
       "0030_export_source_rights_and_terminal_reconciliation",
+      "0031_attested_empty_subtitle_sidecars",
+      "0032_platform_neutral_source_identity",
+      "0033_comment_outbox_conflicts",
+      "0034_bookmark_cache_outbox",
+      "0035_local_export_notification_receipts",
     ]);
     const after = new LocalExportQueue(database).get(before.id);
     expect(after).toEqual(before);
@@ -2476,6 +2635,11 @@ describe("logged export delivery import", () => {
       "0028_desktop_setup_and_validated_components",
       "0029_verified_transcript_cache_authorizations",
       "0030_export_source_rights_and_terminal_reconciliation",
+      "0031_attested_empty_subtitle_sidecars",
+      "0032_platform_neutral_source_identity",
+      "0033_comment_outbox_conflicts",
+      "0034_bookmark_cache_outbox",
+      "0035_local_export_notification_receipts",
     ]);
     expect(
       new LocalExportQueue(database).getAcceptedLoggedDelivery(

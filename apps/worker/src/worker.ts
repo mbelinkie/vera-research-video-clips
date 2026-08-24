@@ -5,13 +5,17 @@ import {
   WorkerClaimRequestSchema,
   WorkerFailureRequestSchema,
   WorkerHeartbeatRequestSchema,
-  WorkerLeaseSchema,
+  WorkerHeartbeatResponseSchema,
+  WorkerObserveLanguageEvidenceRequestSchema,
+  WorkerObserveLanguageEvidenceResponseSchema,
   WorkerSourcePlanRequestSchema,
   type ClaimedTranscriptionJob,
   type Job,
   type TranscriptSourcePlan,
   type WorkerFailureRequest,
   type WorkerLease,
+  type WorkerObserveLanguageEvidenceRequest,
+  type WorkerObserveLanguageEvidenceResponse,
   type WorkerProgressStage,
 } from "@research-video/contracts";
 import type { JobQueue } from "@research-video/sync";
@@ -81,6 +85,10 @@ export interface TranscriptionWorkerControlPlane {
     attempt: number,
     plan: TranscriptSourcePlan,
   ): Promise<void>;
+  observeLanguageEvidence(
+    jobId: string,
+    request: WorkerObserveLanguageEvidenceRequest,
+  ): Promise<WorkerObserveLanguageEvidenceResponse>;
   fail(jobId: string, failure: WorkerFailureRequest): Promise<void>;
 }
 
@@ -96,7 +104,18 @@ export type TranscriptionExecutionContext = {
   signal: AbortSignal;
   setStage(stage: WorkerProgressStage): Promise<void>;
   recordSourcePlan(plan: TranscriptSourcePlan): Promise<void>;
+  observeLanguageEvidence(
+    request: WorkerObserveLanguageEvidenceRequest,
+  ): Promise<WorkerObserveLanguageEvidenceResponse>;
 };
+
+/** The catalog has persisted an actionable language state and released the lease. */
+export class ActionableLanguageGateError extends Error {
+  readonly code = "language_gate_actionable";
+  constructor() {
+    super("Language evidence requires researcher action before provider work.");
+  }
+}
 
 export type TranscriptionJobExecutor = (
   claimed: ClaimedTranscriptionJob,
@@ -122,7 +141,9 @@ export class ClaimingTranscriptionWorker {
     this.#visibilitySeconds = options.visibilitySeconds ?? 120;
   }
 
-  async runOnce(): Promise<"idle" | "processed" | "failed" | "lease-lost"> {
+  async runOnce(): Promise<
+    "idle" | "processed" | "actionable" | "failed" | "lease-lost"
+  > {
     const claimed = await this.controlPlane.claim();
     if (!claimed) return "idle";
 
@@ -132,9 +153,12 @@ export class ClaimingTranscriptionWorker {
     let stage: WorkerProgressStage = "resolving";
     let heartbeatFailure: unknown;
     let heartbeat: Promise<void> | undefined;
+    let observingLanguageEvidence = false;
+    let actionable = false;
 
     const renew = () => {
-      if (heartbeat || heartbeatFailure) return heartbeat;
+      if (heartbeat || heartbeatFailure || observingLanguageEvidence)
+        return heartbeat;
       heartbeat = (async () => {
         try {
           await this.controlPlane.heartbeat(jobId, attempt, stage);
@@ -163,6 +187,19 @@ export class ClaimingTranscriptionWorker {
       recordSourcePlan: async (plan) => {
         await this.controlPlane.recordSourcePlan(jobId, attempt, plan);
       },
+      observeLanguageEvidence: async (request) => {
+        observingLanguageEvidence = true;
+        try {
+          const observed = await this.controlPlane.observeLanguageEvidence(
+            jobId,
+            request,
+          );
+          actionable = observed.gate.state !== "ready";
+          return observed;
+        } finally {
+          observingLanguageEvidence = false;
+        }
+      },
     };
 
     try {
@@ -175,6 +212,9 @@ export class ClaimingTranscriptionWorker {
     } catch (error) {
       clearInterval(timer);
       await heartbeat;
+      if (error instanceof ActionableLanguageGateError || actionable) {
+        return "actionable";
+      }
       try {
         await this.controlPlane.fail(jobId, failureFrom(error, attempt));
         return "failed";
@@ -203,6 +243,7 @@ export type TranscriptionWorkerServiceOptions = {
 
 export type TranscriptionWorkerServiceSummary = {
   processed: number;
+  actionable: number;
   failed: number;
   leaseLost: number;
   unexpectedErrors: number;
@@ -248,6 +289,7 @@ export class TranscriptionWorkerService {
   async run(signal: AbortSignal): Promise<TranscriptionWorkerServiceSummary> {
     const summary: TranscriptionWorkerServiceSummary = {
       processed: 0,
+      actionable: 0,
       failed: 0,
       leaseLost: 0,
       unexpectedErrors: 0,
@@ -268,6 +310,7 @@ export class TranscriptionWorkerService {
       try {
         const result = await this.worker.runOnce();
         if (result === "processed") summary.processed += 1;
+        if (result === "actionable") summary.actionable += 1;
         if (result === "failed") summary.failed += 1;
         if (result === "lease-lost") summary.leaseLost += 1;
         if (signal.aborted) return;
@@ -345,12 +388,21 @@ export class HttpTranscriptionWorkerControlPlane implements TranscriptionWorkerC
       leaseSeconds: this.#leaseSeconds,
       stage,
     });
-    return WorkerLeaseSchema.parse(
+    const response = WorkerHeartbeatResponseSchema.parse(
       await this.request(
         `/api/transcription-jobs/${encodeURIComponent(jobId)}/heartbeat`,
         body,
       ),
     );
+    if (response.status === "cancellation_requested") {
+      throw new WorkerControlPlaneError(
+        "Transcription cancellation was requested.",
+        409,
+        "transcription_cancellation_requested",
+        false,
+      );
+    }
+    return response.lease;
   }
 
   async recordSourcePlan(
@@ -365,6 +417,19 @@ export class HttpTranscriptionWorkerControlPlane implements TranscriptionWorkerC
     await this.request(
       `/api/transcription-jobs/${encodeURIComponent(jobId)}/source-plan`,
       body,
+    );
+  }
+
+  async observeLanguageEvidence(
+    jobId: string,
+    request: WorkerObserveLanguageEvidenceRequest,
+  ): Promise<WorkerObserveLanguageEvidenceResponse> {
+    const body = WorkerObserveLanguageEvidenceRequestSchema.parse(request);
+    return WorkerObserveLanguageEvidenceResponseSchema.parse(
+      await this.request(
+        `/api/transcription-jobs/${encodeURIComponent(jobId)}/language-evidence`,
+        body,
+      ),
     );
   }
 

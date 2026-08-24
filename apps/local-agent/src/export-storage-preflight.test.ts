@@ -359,6 +359,10 @@ describe("Clip Library export storage preflight", () => {
   it("rechecks remaining bytes after acquisition without double-counting the source", async () => {
     const projectId = randomUUID();
     const candidate = clip(projectId, "source-a", 1);
+    if (candidate.selection.selectionType === "player_time_range") {
+      throw new Error("This storage fixture requires a transcript selection.");
+    }
+    const selection = candidate.selection;
     const snapshot = preview("confirmed_english").snapshot;
     const output = estimateOutputPackageBytes(
       candidate.selection.exportEndMs - candidate.selection.exportStartMs,
@@ -377,7 +381,7 @@ describe("Clip Library export storage preflight", () => {
       projectId,
       clipId: candidate.id,
       video: candidate.video,
-      selection: candidate.selection,
+      selection,
       sourceLanguageClass: "confirmed_english" as const,
       preset: {
         presetVersion: 1,
@@ -403,7 +407,7 @@ describe("Clip Library export storage preflight", () => {
     const largeRequest = {
       ...request,
       selection: {
-        ...request.selection,
+        ...selection,
         transcriptEndMs: 3_599_000,
         exportEndMs: 3_600_000,
       },

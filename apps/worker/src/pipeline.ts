@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { access, mkdir, mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 
@@ -18,16 +18,22 @@ import {
   type DerivedTranslation,
   type DerivedTranslationIdentity,
   type FinalizedObject,
+  type LanguageCapabilityResult,
+  type ProviderLanguageEvidence,
   type NormalizedTranscript,
   type TranscriptArtifact,
   type TranscriptManifest,
   type TranscriptUploadGrant,
   type WorkerTranslateTranscriptResponse,
 } from "@research-video/contracts";
-import { languagesEquivalent } from "@research-video/contracts";
+import {
+  languagesEquivalent,
+  normalizeLanguageTag,
+} from "@research-video/contracts";
 import type { MediaAcquisitionProvider } from "@research-video/media";
 import {
   TranscriptSourceResolver,
+  gateCaptionLanguage,
   translateCanonicalTranscript,
   type CaptionProvider,
   type SpeechToTextProvider,
@@ -36,9 +42,10 @@ import {
 import { normalizeAcquiredCaption } from "@research-video/providers/captions-local";
 import { transcriptToSrt } from "@research-video/transcript";
 
-import type {
-  TranscriptionExecutionContext,
-  TranscriptionJobExecutor,
+import {
+  ActionableLanguageGateError,
+  type TranscriptionExecutionContext,
+  type TranscriptionJobExecutor,
 } from "./worker.ts";
 
 type UploadArtifactType = Exclude<TranscriptArtifact["type"], "manifest">;
@@ -174,20 +181,29 @@ export function createTranscriptPipelineExecutor(
         "The current review workflow requires an English target transcript.",
       );
     }
+    if (
+      payload.languageDecision &&
+      !["confirmed", "unverified"].includes(payload.languageDecision.status)
+    ) {
+      throw new ActionableLanguageGateError();
+    }
     await mkdir(options.scratchRoot, { recursive: true, mode: 0o700 });
     const scratch = await mkdtemp(
       join(options.scratchRoot, `${claimed.job.id}-a${claimed.lease.attempt}-`),
     );
     let cleaned = false;
     try {
-      const source = await resolveSourceTranscript(
+      const resolvedSource = await resolveSourceTranscript(
         options,
+        claimed,
         payload,
         scratch,
         context,
+        now,
       );
+      const source = resolvedSource.transcript;
       const lineageId = await stableUuid(
-        `lineage:${claimed.job.projectId}:${payload.catalogVideoId}:${source.track.language}:${payload.targetLanguage}`,
+        `lineage:${claimed.job.projectId}:${payload.catalogVideoId}:${source.track.language}:${payload.targetLanguage}:${languageDecisionIdentity(payload.languageDecision)}`,
       );
       const version = 1;
       const requiresTranslation =
@@ -261,7 +277,7 @@ export function createTranscriptPipelineExecutor(
         );
       }
       const transcriptVersionId = await stableUuid(
-        `transcript-version:${claimed.job.id}:${source.track.contentSha256}:${english.track.contentSha256}`,
+        `transcript-version:${claimed.job.id}:${source.track.contentSha256}:${english.track.contentSha256}:${languageDecisionIdentity(payload.languageDecision)}`,
       );
       const manifest = TranscriptManifestSchema.parse({
         schemaVersion: 1,
@@ -280,6 +296,9 @@ export function createTranscriptPipelineExecutor(
         jobId: claimed.job.id,
         createdBy: claimed.lease.workerId,
         createdAt: now().toISOString(),
+        ...(payload.languageDecision
+          ? { languageDecision: payload.languageDecision }
+          : {}),
         artifacts: finalizedArtifacts,
       });
       const manifestBytes = encodeJson(manifest);
@@ -310,9 +329,11 @@ export function createTranscriptPipelineExecutor(
 
 async function resolveSourceTranscript(
   options: TranscriptPipelineOptions,
+  claimed: ClaimedTranscriptionJob,
   payload: ReturnType<typeof TranscriptionJobPayloadSchema.parse>,
   scratch: string,
   context: TranscriptionExecutionContext,
+  now: () => Date,
 ) {
   await context.setStage("resolving");
   const resolver = new TranscriptSourceResolver(
@@ -328,6 +349,43 @@ async function resolveSourceTranscript(
   );
 
   if (plan.strategy === "caption" && options.captions) {
+    const captionGate = gateCaptionLanguage({
+      track: plan.track,
+      ...(payload.creatorReportedLanguage
+        ? { creatorLanguage: payload.creatorReportedLanguage }
+        : {}),
+      ...(payload.languageDecision
+        ? { confirmedDecision: payload.languageDecision }
+        : {}),
+    });
+    const translationCapability = translationCapabilityFor(
+      options,
+      plan.sourceLanguage,
+      payload.targetLanguage,
+      payload.languageDecision,
+    );
+    await context.recordSourcePlan(plan);
+    const observed = await observeLanguageEvidence(
+      context,
+      claimed,
+      payload,
+      {
+        source: "caption",
+        provider: "caption-discovery",
+        reportedLanguage: normalizeLanguageTag(plan.sourceLanguage),
+        trackFingerprint: trackFingerprint(plan.track),
+        captionKind: plan.track.kind,
+      },
+      translationCapability,
+      now,
+    );
+    if (
+      captionGate.state !== "accepted" ||
+      (translationCapability && translationCapability.state !== "supported") ||
+      observed.gate.state !== "ready"
+    ) {
+      throw new ActionableLanguageGateError();
+    }
     try {
       await context.setStage("acquiring");
       const caption = await options.captions.acquire(
@@ -337,8 +395,7 @@ async function resolveSourceTranscript(
         context.signal,
       );
       const transcript = await normalizeAcquiredCaption(caption);
-      await context.recordSourcePlan(plan);
-      return transcript;
+      return { transcript };
     } catch (error) {
       if (context.signal.aborted) throw context.signal.reason;
       plan = TranscriptSourcePlanSchema.parse({
@@ -351,6 +408,44 @@ async function resolveSourceTranscript(
   }
 
   await context.recordSourcePlan(plan);
+  const confirmedLanguage = confirmedLanguageFrom(payload);
+  if (!confirmedLanguage) {
+    await observeLanguageEvidence(
+      context,
+      claimed,
+      payload,
+      {
+        source: "speech_detection",
+        provider: "speech-to-text",
+      },
+      undefined,
+      now,
+    );
+    throw new ActionableLanguageGateError();
+  } else {
+    const speechCapability = speechCapabilityFor(
+      options.speechToText,
+      confirmedLanguage,
+    );
+    const observed = await observeLanguageEvidence(
+      context,
+      claimed,
+      payload,
+      {
+        source: "speech_detection",
+        provider: speechCapability.provider,
+      },
+      undefined,
+      now,
+      speechCapability,
+    );
+    if (
+      speechCapability.state !== "supported" ||
+      observed.gate.state !== "ready"
+    ) {
+      throw new ActionableLanguageGateError();
+    }
+  }
   await context.setStage("acquiring");
   const media = await options.media.acquireAuthorizedSource(
     payload.youtubeVideoId,
@@ -358,11 +453,38 @@ async function resolveSourceTranscript(
     context.signal,
   );
   await context.setStage("transcribing");
-  return options.speechToText.transcribe({
+  const transcript = await options.speechToText.transcribe({
     videoId: payload.youtubeVideoId,
     inputPath: media.scratchPath,
+    ...(confirmedLanguage ? { language: confirmedLanguage } : {}),
     signal: context.signal,
   });
+  const translationCapability = translationCapabilityFor(
+    options,
+    transcript.track.language,
+    payload.targetLanguage,
+    payload.languageDecision,
+  );
+  const observed = await observeLanguageEvidence(
+    context,
+    claimed,
+    payload,
+    {
+      source: "speech_detection",
+      provider: transcript.track.provider,
+      reportedLanguage: normalizeLanguageTag(transcript.track.language),
+      trackFingerprint: transcript.track.contentSha256,
+    },
+    translationCapability,
+    now,
+  );
+  if (
+    (translationCapability && translationCapability.state !== "supported") ||
+    observed.gate.state !== "ready"
+  ) {
+    throw new ActionableLanguageGateError();
+  }
+  return { transcript };
 }
 
 async function resolveEnglishTranscript(
@@ -425,6 +547,114 @@ async function resolveEnglishTranscript(
     ),
     serverArtifacts: [],
   };
+}
+
+function confirmedLanguageFrom(
+  payload: ReturnType<typeof TranscriptionJobPayloadSchema.parse>,
+) {
+  return payload.languageDecision?.status === "confirmed"
+    ? payload.languageDecision.resolvedLanguage
+    : undefined;
+}
+
+function speechCapabilityFor(
+  provider: SpeechToTextProvider,
+  language: string,
+): LanguageCapabilityResult {
+  if (provider.checkLanguageSupport) {
+    return provider.checkLanguageSupport(language);
+  }
+  return {
+    state: "unknown",
+    provider: "speech-to-text",
+    operation: "speech_to_text",
+    sourceLanguage: normalizeLanguageTag(language),
+    reason: "capability_not_advertised",
+  };
+}
+
+function translationCapabilityFor(
+  options: TranscriptPipelineOptions,
+  sourceLanguage: string,
+  targetLanguage: string,
+  decision: ReturnType<
+    typeof TranscriptionJobPayloadSchema.parse
+  >["languageDecision"],
+): LanguageCapabilityResult | undefined {
+  if (languagesEquivalent(sourceLanguage, targetLanguage)) return undefined;
+  if (options.translation?.checkLanguagePair) {
+    return options.translation.checkLanguagePair(
+      sourceLanguage,
+      targetLanguage,
+    );
+  }
+  if (!decision || decision.status !== "confirmed") return undefined;
+  return {
+    state: "unknown",
+    provider: options.claimedTranslation
+      ? "amazon-translate"
+      : "translation-provider",
+    operation: "translation",
+    sourceLanguage: normalizeLanguageTag(sourceLanguage),
+    targetLanguage: normalizeLanguageTag(targetLanguage),
+    reason: "capability_not_advertised",
+  };
+}
+
+async function observeLanguageEvidence(
+  context: TranscriptionExecutionContext,
+  claimed: ClaimedTranscriptionJob,
+  payload: ReturnType<typeof TranscriptionJobPayloadSchema.parse>,
+  evidence: Omit<
+    ProviderLanguageEvidence,
+    "id" | "projectId" | "videoId" | "jobId" | "attempt" | "createdAt"
+  >,
+  translationCapability: LanguageCapabilityResult | undefined,
+  now: () => Date,
+  speechCapability?: LanguageCapabilityResult,
+) {
+  return context.observeLanguageEvidence({
+    attempt: claimed.lease.attempt,
+    evidence: {
+      id: randomUUID(),
+      projectId: claimed.job.projectId!,
+      videoId: payload.catalogVideoId,
+      ...evidence,
+      jobId: claimed.job.id,
+      attempt: claimed.lease.attempt,
+      createdAt: now().toISOString(),
+    },
+    ...(speechCapability ? { speechCapability } : {}),
+    ...(translationCapability ? { translationCapability } : {}),
+  });
+}
+
+function trackFingerprint(track: {
+  id: string;
+  language: string;
+  kind: "manual" | "automatic";
+  translatable: boolean;
+  downloadAccess: "available" | "authorization-required" | "unavailable";
+}) {
+  return createHash("sha256")
+    .update(
+      JSON.stringify({
+        id: track.id,
+        language: track.language,
+        kind: track.kind,
+        translatable: track.translatable,
+        downloadAccess: track.downloadAccess,
+      }),
+    )
+    .digest("hex");
+}
+
+function languageDecisionIdentity(
+  decision: ReturnType<
+    typeof TranscriptionJobPayloadSchema.parse
+  >["languageDecision"],
+) {
+  return JSON.stringify(decision ?? null);
 }
 
 function artifactPayloads(

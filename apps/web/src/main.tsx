@@ -4,20 +4,26 @@ import ReactDOM from "react-dom/client";
 import {
   ApiErrorSchema,
   ClipCandidateSchema,
+  ClipSelectionSchema,
+  CreateClipCandidateRequestSchema,
   ExportPresetSnapshotSchema,
   ExportSettingsPreviewSchema,
   PersonalExportPresetCatalogSchema,
   ProjectExportPresetCatalogSchema,
   ExportRequestSchema,
   ProjectSchema,
+  ProjectSummarySchema,
   ExportSourceRightsSnapshotSchema,
+  PlayerTimeRangeSelectionSchema,
   TranscriptSelectionSchema,
   TranscriptWorkspaceResponseSchema,
   UserSchema,
   VideoSchema,
   languagesEquivalent,
   type ClipCandidate,
+  type ClipSelection,
   type DesktopAuthStatus,
+  type DesktopNotificationNavigationTarget,
   type ExportPresetCatalogEntry,
   type ExportPresetDefault,
   type ExportPresetSnapshot,
@@ -25,7 +31,8 @@ import {
   type ExportSettingsPreview,
   type ExportSettingsSelection,
   type NormalizedTranscript,
-  type Project,
+  type ProjectSummary,
+  type NoSpeechAttestation,
   type TranscriptSelection,
   type TranscriptWorkspaceResponse,
   type User,
@@ -34,6 +41,7 @@ import {
 import { normalizeYouTubeUrl } from "@research-video/providers";
 import {
   deriveTranscriptSelection,
+  derivePlayerRangeTranscriptAttachment,
   buildClipLanguageEvidence,
   searchTranscript,
   segmentAtTime,
@@ -51,8 +59,21 @@ import {
 } from "./api-client.ts";
 import { BatchWorkspace } from "./batch-workspace.tsx";
 import { DesktopSetup } from "./desktop-setup.tsx";
-import { YouTubePlayer, type YouTubePlayerHandle } from "./youtube-player.tsx";
-import { VirtualTranscript } from "./virtual-transcript.tsx";
+import { NotificationPreferencesPanel } from "./notification-preferences.tsx";
+import { resolveNotificationNavigation } from "./notification-navigation.ts";
+import { PlayerPanel } from "./player-panel.tsx";
+import { BookmarksPanel } from "./bookmarks-panel.tsx";
+import { SelectionCommandPanel } from "./selection-command-panel.tsx";
+import { SelectionEditor } from "./selection-editor.tsx";
+import { SourceIngestPanel } from "./source-ingest-panel.tsx";
+import { TranscriptNavigationPanel } from "./transcript-navigation-panel.tsx";
+import type { YouTubePlayerHandle } from "./youtube-player.tsx";
+import {
+  AccountLanguagePanel,
+  ResearchWorkspaceLayout,
+  WorkspaceShell,
+  type ProjectDestination,
+} from "./workspace-shell.tsx";
 
 const builtInPresetKey = "built-in:editing-mp4:v1";
 
@@ -62,7 +83,89 @@ type WorkspaceVideoTarget = Readonly<{
   youtubeVideoId: string;
   canonicalUrl: string;
   title?: string;
+  keywordEvidence?: Readonly<{
+    seekMs: number;
+    timingPrecision: "word" | "cue" | "estimated";
+    trackId: string;
+    aliasPhrase: string;
+  }>;
+  bookmarkSource?: Readonly<{ sourceTimeMs: number }>;
+  clipSource?: Readonly<{
+    clipId: string;
+    selection: ClipSelection;
+    fallbackNotice?: string;
+    sourceTimeMs?: number;
+  }>;
 }>;
+
+type NavigationSnapshot = Readonly<{
+  schemaVersion: 1;
+  projectId: string;
+  catalogVideoId: string;
+  youtubeVideoId: string;
+  canonicalUrl: string;
+  title?: string;
+  transcriptVersionId: string;
+  currentMs: number;
+  transcriptView: "preferred" | "english" | "original";
+  query: string;
+  matchIndex: number;
+  selection?: TranscriptSelection;
+}>;
+
+const navigationHistoryLimit = 20;
+
+function parseNavigationSnapshot(
+  value: unknown,
+): NavigationSnapshot | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const candidate = value as Record<string, unknown>;
+  if (
+    candidate.schemaVersion !== 1 ||
+    typeof candidate.projectId !== "string" ||
+    typeof candidate.catalogVideoId !== "string" ||
+    typeof candidate.youtubeVideoId !== "string" ||
+    typeof candidate.canonicalUrl !== "string" ||
+    typeof candidate.transcriptVersionId !== "string" ||
+    typeof candidate.currentMs !== "number" ||
+    !Number.isFinite(candidate.currentMs) ||
+    candidate.currentMs < 0 ||
+    !["preferred", "english", "original"].includes(
+      String(candidate.transcriptView),
+    ) ||
+    typeof candidate.query !== "string" ||
+    candidate.query.length > 500 ||
+    typeof candidate.matchIndex !== "number" ||
+    !Number.isInteger(candidate.matchIndex) ||
+    candidate.matchIndex < 0 ||
+    (candidate.title !== undefined &&
+      (typeof candidate.title !== "string" || candidate.title.length > 500))
+  )
+    return undefined;
+  const parsedSelection = candidate.selection
+    ? TranscriptSelectionSchema.safeParse(candidate.selection)
+    : undefined;
+  if (parsedSelection && !parsedSelection.success) return undefined;
+  return {
+    schemaVersion: 1,
+    projectId: candidate.projectId,
+    catalogVideoId: candidate.catalogVideoId,
+    youtubeVideoId: candidate.youtubeVideoId,
+    canonicalUrl: candidate.canonicalUrl,
+    ...(typeof candidate.title === "string" ? { title: candidate.title } : {}),
+    transcriptVersionId: candidate.transcriptVersionId,
+    currentMs: candidate.currentMs,
+    transcriptView:
+      candidate.transcriptView as NavigationSnapshot["transcriptView"],
+    query: candidate.query,
+    matchIndex: candidate.matchIndex,
+    ...(parsedSelection?.success ? { selection: parsedSelection.data } : {}),
+  };
+}
+
+function navigationStorageKey(userId: string, projectId: string) {
+  return `vera:navigation:v1:${userId}:${projectId}`;
+}
 
 type WorkspaceLoadState = "idle" | "loading" | "unavailable" | "failed";
 
@@ -83,17 +186,6 @@ function catalogEntrySnapshot(
     settings: entry.current.settings,
   });
   return { ...snapshot, presetId: entry.id };
-}
-
-function formatTime(milliseconds: number) {
-  const totalSeconds = Math.floor(milliseconds / 1_000);
-  const minutes = Math.floor(totalSeconds / 60);
-  const seconds = totalSeconds % 60;
-  return `${minutes}:${String(seconds).padStart(2, "0")}`;
-}
-
-function formatPreciseTime(milliseconds: number) {
-  return `${(milliseconds / 1_000).toFixed(3)}s`;
 }
 
 function mapSelectionToTranscript(
@@ -128,6 +220,109 @@ function mapSelectionToTranscript(
   });
 }
 
+function transcriptForView(
+  workspace: TranscriptWorkspaceResponse,
+  view: "preferred" | "english" | "original",
+) {
+  if (view === "original") return workspace.original;
+  if (view === "english") return workspace.english;
+  return workspace.preferred.state === "ready"
+    ? workspace.preferred.transcript
+    : undefined;
+}
+
+function exactRestorableSelection(
+  candidate: TranscriptSelection | undefined,
+  transcript: NormalizedTranscript | undefined,
+) {
+  if (!candidate || !transcript) return undefined;
+  const orderedSegments = transcript.segments.toSorted(
+    (left, right) => left.ordinal - right.ordinal,
+  );
+  const firstSegmentIndex = orderedSegments.findIndex(
+    (segment) => segment.id === candidate.firstSegmentId,
+  );
+  const lastSegmentIndex = orderedSegments.findIndex(
+    (segment) => segment.id === candidate.lastSegmentId,
+  );
+  if (
+    candidate.trackId !== transcript.track.id ||
+    candidate.transcriptVersion !== transcript.track.version ||
+    firstSegmentIndex < 0 ||
+    lastSegmentIndex < firstSegmentIndex ||
+    Boolean(candidate.firstTokenId) !== Boolean(candidate.lastTokenId)
+  )
+    return undefined;
+  if (candidate.firstTokenId && candidate.lastTokenId) {
+    const segmentOrder = new Map(
+      orderedSegments.map((segment, index) => [segment.id, index]),
+    );
+    const orderedTokens = transcript.tokens.toSorted(
+      (left, right) =>
+        (segmentOrder.get(left.segmentId) ?? Number.MAX_SAFE_INTEGER) -
+          (segmentOrder.get(right.segmentId) ?? Number.MAX_SAFE_INTEGER) ||
+        left.ordinal - right.ordinal,
+    );
+    const firstTokenIndex = orderedTokens.findIndex(
+      (token) => token.id === candidate.firstTokenId,
+    );
+    const lastTokenIndex = orderedTokens.findIndex(
+      (token) => token.id === candidate.lastTokenId,
+    );
+    const firstToken = orderedTokens[firstTokenIndex];
+    const lastToken = orderedTokens[lastTokenIndex];
+    if (
+      firstTokenIndex < 0 ||
+      lastTokenIndex < firstTokenIndex ||
+      !firstToken ||
+      !lastToken ||
+      firstToken.segmentId !== candidate.firstSegmentId ||
+      lastToken.segmentId !== candidate.lastSegmentId ||
+      firstToken.startMs !== candidate.transcriptStartMs ||
+      lastToken.endMs !== candidate.transcriptEndMs ||
+      orderedTokens
+        .slice(firstTokenIndex, lastTokenIndex + 1)
+        .map((token) => token.text)
+        .join(" ") !== candidate.text
+    )
+      return undefined;
+  } else if (
+    transcriptTextForTimeRange(
+      transcript,
+      candidate.transcriptStartMs,
+      candidate.transcriptEndMs,
+    ) !== candidate.text
+  ) {
+    return undefined;
+  }
+  return candidate;
+}
+
+function transcriptEvidenceSelection(
+  selection: ClipSelection | undefined,
+): TranscriptSelection | undefined {
+  if (!selection) return undefined;
+  return selection.selectionType === "player_time_range"
+    ? selection.transcriptAttachment
+    : selection;
+}
+
+function directNavigationSelection(
+  selection: ClipSelection | undefined,
+): TranscriptSelection | undefined {
+  return selection?.selectionType === "player_time_range"
+    ? undefined
+    : selection;
+}
+
+function playerSpeechLabel(
+  status: "speech" | "no_speech" | "transcript_unavailable",
+) {
+  if (status === "no_speech") return "No speech";
+  if (status === "transcript_unavailable") return "Transcript unavailable";
+  return "Speech";
+}
+
 function App() {
   const [url, setUrl] = useState("");
   const [workspaceTarget, setWorkspaceTarget] =
@@ -138,15 +333,40 @@ function App() {
   const [workspaceMessage, setWorkspaceMessage] = useState<string>();
   const [workspaceReload, setWorkspaceReload] = useState(0);
   const workspaceGeneration = useRef(0);
+  const handledKeywordEvidence = useRef<string | undefined>(undefined);
+  const recentProjectValidation = useRef<string | undefined>(undefined);
+  const [recentProjectReadyIdentity, setRecentProjectReadyIdentity] =
+    useState<string>();
   const [projectVideos, setProjectVideos] = useState<Video[]>();
   const [error, setError] = useState<string>();
   const [query, setQuery] = useState("");
   const [matchIndex, setMatchIndex] = useState(0);
   const [currentMs, setCurrentMs] = useState(0);
   const [lastSeekMs, setLastSeekMs] = useState<number>();
+  const [clipLoopRange, setClipLoopRange] = useState<{
+    startMs: number;
+    endMs: number;
+  }>();
+  const [navigationBackStack, setNavigationBackStack] = useState<
+    NavigationSnapshot[]
+  >([]);
+  const pendingNavigationRestore = useRef<NavigationSnapshot | undefined>(
+    undefined,
+  );
+  const pendingMatchIndexRestore = useRef<number | undefined>(undefined);
+  const hydratedNavigationIdentity = useRef<string | undefined>(undefined);
   const [follow, setFollow] = useState(true);
-  const [selection, setSelection] = useState<TranscriptSelection>();
+  const [selection, setSelection] = useState<ClipSelection>();
   const [selectionError, setSelectionError] = useState<string>();
+  const [sourceDurationMs, setSourceDurationMs] = useState<number>();
+  const [playerRangeStartMs, setPlayerRangeStartMs] = useState<number>();
+  const [playerRangeEndMs, setPlayerRangeEndMs] = useState<number>();
+  const [playerSpeechStatus, setPlayerSpeechStatus] = useState<
+    "speech" | "no_speech" | "transcript_unavailable"
+  >();
+  const [playerRangeMessage, setPlayerRangeMessage] = useState<string>();
+  const [playerNoSpeechAttestation, setPlayerNoSpeechAttestation] =
+    useState<NoSpeechAttestation>();
   const [previewingSelection, setPreviewingSelection] = useState(false);
   const [authorization, setAuthorization] = useState("");
   const [desktopAuthStatus, setDesktopAuthStatus] =
@@ -159,14 +379,31 @@ function App() {
   const [transcriptView, setTranscriptView] = useState<
     "preferred" | "english" | "original"
   >("preferred");
-  const [projects, setProjects] = useState<Project[]>([]);
+  const [projects, setProjects] = useState<ProjectSummary[]>([]);
+  const [projectsLoaded, setProjectsLoaded] = useState(false);
   const [projectId, setProjectId] = useState("");
+  const [destination, setDestination] =
+    useState<ProjectDestination>("workbench");
+  const [notificationTarget, setNotificationTarget] =
+    useState<DesktopNotificationNavigationTarget>();
+  const [pendingNotificationTarget, setPendingNotificationTarget] =
+    useState<DesktopNotificationNavigationTarget>();
+  const [bulkAddRequest, setBulkAddRequest] = useState(0);
+  const [searchBatchRequest, setSearchBatchRequest] = useState<{
+    generation: number;
+    inputs: string[];
+  }>();
+  const [unreadActivityCount, setUnreadActivityCount] = useState(0);
   const [creatingProject, setCreatingProject] = useState(false);
   const [newProjectName, setNewProjectName] = useState("");
   const [newProjectDescription, setNewProjectDescription] = useState("");
+  const [newProjectKind, setNewProjectKind] = useState<"personal" | "shared">(
+    "shared",
+  );
   const [projectBusy, setProjectBusy] = useState(false);
   const [projectMessage, setProjectMessage] = useState<string>();
   const [clipNotes, setClipNotes] = useState("");
+  const [clipFirstComment, setClipFirstComment] = useState("");
   const [clipTags, setClipTags] = useState("");
   const [selectionCommandId, setSelectionCommandId] = useState(() =>
     crypto.randomUUID(),
@@ -239,13 +476,22 @@ function App() {
     setWorkspaceLoadState("idle");
     setWorkspaceMessage(undefined);
     setCurrentMs(0);
+    setSourceDurationMs(undefined);
     setLastSeekMs(undefined);
+    setClipLoopRange(undefined);
     setQuery("");
+    pendingMatchIndexRestore.current = undefined;
     setTranscriptView("preferred");
     setSelection(undefined);
     setSelectionError(undefined);
+    setPlayerRangeStartMs(undefined);
+    setPlayerRangeEndMs(undefined);
+    setPlayerSpeechStatus(undefined);
+    setPlayerRangeMessage(undefined);
+    setPlayerNoSpeechAttestation(undefined);
     setPreviewingSelection(false);
     setClipNotes("");
+    setClipFirstComment("");
     setClipTags("");
     setSelectionCommandId(crypto.randomUUID());
     setClipActionMessage(undefined);
@@ -253,6 +499,7 @@ function App() {
     setLoggedExportRequestId(undefined);
     setExportOnlyRequestId(undefined);
     setSourceRightsConfirmed(false);
+    handledKeywordEvidence.current = undefined;
   }
 
   async function refreshDesktopStatus() {
@@ -280,8 +527,11 @@ function App() {
     await bridge.signOut();
     await refreshDesktopStatus();
     setProjects([]);
+    setProjectsLoaded(false);
     selectProject("");
     setProjectMessage(undefined);
+    recentProjectValidation.current = undefined;
+    setRecentProjectReadyIdentity(undefined);
   }
 
   useEffect(() => {
@@ -305,6 +555,42 @@ function App() {
     }, 1_000);
     return () => window.clearInterval(timer);
   }, [desktopAuthStatus?.state]);
+
+  useEffect(() => {
+    const bridge = desktopBridge();
+    if (!bridge) return;
+    return bridge.onNotificationNavigation((target) => {
+      if (target.kind === "local_export") {
+        setDestination("workbench");
+        setExportOnlyRequestId(target.requestId);
+        setClipActionMessage(
+          "Opened the local export status from a desktop notification.",
+        );
+        setNotificationTarget(target);
+        return;
+      }
+      setPendingNotificationTarget(target);
+    });
+  }, []);
+
+  useEffect(() => {
+    const target = pendingNotificationTarget;
+    if (!target || target.kind === "local_export" || !projectsLoaded) return;
+    setPendingNotificationTarget(undefined);
+    const resolution = resolveNotificationNavigation(
+      target,
+      new Set(projects.map((project) => project.id)),
+    );
+    if (resolution.state === "project_unavailable") {
+      setProjectMessage(
+        "This notification belongs to a project that is no longer available to this account.",
+      );
+      return;
+    }
+    selectProject(resolution.projectId!);
+    setDestination(resolution.destination);
+    setNotificationTarget(target);
+  }, [pendingNotificationTarget, projects, projectsLoaded]);
   const transcriptTracks = useMemo(
     () =>
       workspace
@@ -489,6 +775,18 @@ function App() {
           sourceLanguage: workspace.original.track.language,
         }
       : undefined;
+  const selectedEvidence = transcriptEvidenceSelection(selection);
+  const selectionExportBlockReason = !selection
+    ? "Select a transcript passage or complete a player range."
+    : selection.selectionType !== "player_time_range"
+      ? undefined
+      : selection.speechStatus === "transcript_unavailable"
+        ? "Transcript-unavailable player ranges can be logged but cannot be exported."
+        : selection.speechStatus === "speech" && !selection.transcriptAttachment
+          ? "Attach verified overlapping transcript evidence before exporting this speech range."
+          : selection.speechStatus === "no_speech" && embedEnglishSubtitles
+            ? "Attested no-speech exports use explicit empty sidecars and cannot embed subtitles."
+            : undefined;
   const sourceRights = useMemo(
     () =>
       selectedVideoSnapshot
@@ -542,16 +840,21 @@ function App() {
     exportOnlyPresetSelectionKey,
     exportOnlyExportPreset,
   );
+  const activeTranscriptSelection = transcriptEvidenceSelection(selection);
   const selectedTokenIds = useMemo(() => {
     const ids = new Set<string>();
-    if (!transcript || !selection?.firstTokenId || !selection.lastTokenId) {
+    if (
+      !transcript ||
+      !activeTranscriptSelection?.firstTokenId ||
+      !activeTranscriptSelection.lastTokenId
+    ) {
       return ids;
     }
     const firstIndex = transcript.tokens.findIndex(
-      (token) => token.id === selection.firstTokenId,
+      (token) => token.id === activeTranscriptSelection.firstTokenId,
     );
     const lastIndex = transcript.tokens.findIndex(
-      (token) => token.id === selection.lastTokenId,
+      (token) => token.id === activeTranscriptSelection.lastTokenId,
     );
     if (firstIndex < 0 || lastIndex < 0) return ids;
     for (
@@ -562,9 +865,13 @@ function App() {
       ids.add(transcript.tokens[index]!.id);
     }
     return ids;
-  }, [selection, transcript]);
+  }, [activeTranscriptSelection, transcript]);
 
-  useEffect(() => setMatchIndex(0), [query, videoId]);
+  useEffect(() => {
+    const restoredIndex = pendingMatchIndexRestore.current;
+    pendingMatchIndexRestore.current = undefined;
+    setMatchIndex(restoredIndex ?? 0);
+  }, [query, videoId]);
 
   useEffect(() => {
     setSourceRightsConfirmed(false);
@@ -572,8 +879,8 @@ function App() {
     projectId,
     selection?.exportEndMs,
     selection?.exportStartMs,
-    selection?.firstSegmentId,
-    selection?.lastSegmentId,
+    activeTranscriptSelection?.firstSegmentId,
+    activeTranscriptSelection?.lastSegmentId,
     selectedVideoSnapshot?.youtubeVideoId,
   ]);
 
@@ -583,13 +890,21 @@ function App() {
       setPreferredLanguageDraft("en");
       return;
     }
-    void apiFetch("cloud", "/api/session/profile", {}, authorization)
+    setUser(undefined);
+    const controller = new AbortController();
+    void apiFetch(
+      "cloud",
+      "/api/session/profile",
+      { signal: controller.signal },
+      authorization,
+    )
       .then(async (response) => {
         const payload = await response.json();
         if (!response.ok) throw new Error("Unable to load account settings.");
         return UserSchema.parse(payload);
       })
       .then((profile) => {
+        if (controller.signal.aborted) return;
         setUser(profile);
         setPreferredLanguageDraft(profile.preferredLanguage);
         setPreferenceMessage(
@@ -597,6 +912,7 @@ function App() {
         );
       })
       .catch((caught: unknown) => {
+        if (controller.signal.aborted) return;
         setUser(undefined);
         setPreferenceMessage(
           caught instanceof Error
@@ -604,7 +920,61 @@ function App() {
             : "Unable to load account settings.",
         );
       });
+    return () => controller.abort();
   }, [authorization]);
+
+  useEffect(() => {
+    if (!user || !projects.length) return;
+    const key = `vera:recent-project:${user.id}`;
+    const validationIdentity = `${user.id}:${projects
+      .map((project) => project.id)
+      .sort()
+      .join(",")}`;
+    if (recentProjectValidation.current === validationIdentity) return;
+    recentProjectValidation.current = validationIdentity;
+    let recentProjectId: string | null = null;
+    try {
+      recentProjectId = localStorage.getItem(key);
+    } catch {
+      // Private recency is optional when install storage is unavailable.
+    }
+    if (
+      recentProjectId &&
+      projects.some((project) => project.id === recentProjectId)
+    ) {
+      selectProject(recentProjectId);
+      setRecentProjectReadyIdentity(validationIdentity);
+      return;
+    }
+    if (recentProjectId) {
+      try {
+        localStorage.removeItem(key);
+      } catch {
+        // The invalid identity is still ignored in memory.
+      }
+      selectProject("");
+      setRecentProjectReadyIdentity(validationIdentity);
+      return;
+    }
+    if (!projects.some((project) => project.id === projectId))
+      selectProject(projects[0]!.id);
+    setRecentProjectReadyIdentity(validationIdentity);
+  }, [projectId, projects, user]);
+
+  useEffect(() => {
+    if (!user || !projectId) return;
+    if (!projects.some((project) => project.id === projectId)) return;
+    const validationIdentity = `${user.id}:${projects
+      .map((project) => project.id)
+      .sort()
+      .join(",")}`;
+    if (recentProjectReadyIdentity !== validationIdentity) return;
+    try {
+      localStorage.setItem(`vera:recent-project:${user.id}`, projectId);
+    } catch {
+      // Private recency is optional when install storage is unavailable.
+    }
+  }, [projectId, projects, recentProjectReadyIdentity, user]);
 
   useEffect(() => {
     if (!authorization || !projectId) {
@@ -639,6 +1009,125 @@ function App() {
       });
     return () => controller.abort();
   }, [authorization, projectId]);
+
+  useEffect(() => {
+    if (!user || !projectId || !projectVideos) return;
+    const identity = `${user.id}:${projectId}:${projectVideos
+      .map((video) => `${video.id}:${video.youtubeVideoId}`)
+      .sort()
+      .join(",")}`;
+    if (hydratedNavigationIdentity.current === identity) return;
+    hydratedNavigationIdentity.current = identity;
+    let stored: unknown;
+    let hadStoredValue = false;
+    try {
+      const raw = localStorage.getItem(
+        navigationStorageKey(user.id, projectId),
+      );
+      hadStoredValue = raw !== null;
+      stored = raw ? JSON.parse(raw) : undefined;
+    } catch {
+      stored = undefined;
+      hadStoredValue = true;
+    }
+    if (!stored || typeof stored !== "object") {
+      if (hadStoredValue) {
+        try {
+          localStorage.removeItem(navigationStorageKey(user.id, projectId));
+        } catch {
+          // Invalid private navigation remains ignored in memory.
+        }
+      }
+      return;
+    }
+    const record = stored as { current?: unknown; backStack?: unknown };
+    const isAuthorizedVideo = (snapshot: NavigationSnapshot) =>
+      snapshot.projectId === projectId &&
+      projectVideos.some(
+        (video) =>
+          video.id === snapshot.catalogVideoId &&
+          video.youtubeVideoId === snapshot.youtubeVideoId &&
+          video.canonicalUrl === snapshot.canonicalUrl,
+      );
+    const restoredBackStack = Array.isArray(record.backStack)
+      ? record.backStack
+          .map(parseNavigationSnapshot)
+          .filter((snapshot): snapshot is NavigationSnapshot =>
+            Boolean(snapshot && isAuthorizedVideo(snapshot)),
+          )
+          .slice(-navigationHistoryLimit)
+      : [];
+    const restoredCurrent = parseNavigationSnapshot(record.current);
+    const authorizedCurrent =
+      restoredCurrent && isAuthorizedVideo(restoredCurrent)
+        ? restoredCurrent
+        : undefined;
+    setNavigationBackStack(restoredBackStack);
+    try {
+      if (authorizedCurrent || restoredBackStack.length) {
+        localStorage.setItem(
+          navigationStorageKey(user.id, projectId),
+          JSON.stringify({
+            schemaVersion: 1,
+            ...(authorizedCurrent ? { current: authorizedCurrent } : {}),
+            backStack: restoredBackStack,
+          }),
+        );
+      } else {
+        localStorage.removeItem(navigationStorageKey(user.id, projectId));
+      }
+    } catch {
+      // Sanitization is best effort; unauthorized state remains ignored.
+    }
+    if (!workspaceTarget && authorizedCurrent) {
+      restoreNavigationSnapshot(authorizedCurrent);
+      return;
+    }
+  }, [projectId, projectVideos, user, workspaceTarget]);
+
+  useEffect(() => {
+    if (!user || !workspace || !workspaceTarget) return;
+    const timer = window.setTimeout(() => {
+      const navigationSelection = directNavigationSelection(selection);
+      const current: NavigationSnapshot = {
+        schemaVersion: 1,
+        projectId: workspaceTarget.projectId,
+        catalogVideoId: workspaceTarget.catalogVideoId,
+        youtubeVideoId: workspaceTarget.youtubeVideoId,
+        canonicalUrl: workspaceTarget.canonicalUrl,
+        ...(workspaceTarget.title ? { title: workspaceTarget.title } : {}),
+        transcriptVersionId: workspace.transcriptVersionId,
+        currentMs,
+        transcriptView,
+        query,
+        matchIndex,
+        ...(navigationSelection ? { selection: navigationSelection } : {}),
+      };
+      try {
+        localStorage.setItem(
+          navigationStorageKey(user.id, workspaceTarget.projectId),
+          JSON.stringify({
+            schemaVersion: 1,
+            current,
+            backStack: navigationBackStack.slice(-navigationHistoryLimit),
+          }),
+        );
+      } catch {
+        // Navigation persistence is optional private install state.
+      }
+    }, 250);
+    return () => window.clearTimeout(timer);
+  }, [
+    currentMs,
+    matchIndex,
+    navigationBackStack,
+    query,
+    selection,
+    transcriptView,
+    user,
+    workspace,
+    workspaceTarget,
+  ]);
 
   useEffect(() => {
     const target = workspaceTarget;
@@ -727,6 +1216,156 @@ function App() {
     workspaceReload,
     workspaceTarget,
   ]);
+
+  useEffect(() => {
+    const intent = workspaceTarget?.keywordEvidence;
+    if (!workspace || !workspaceTarget || !intent) return;
+    const intentKey = [
+      workspaceTarget.projectId,
+      workspaceTarget.catalogVideoId,
+      intent.trackId,
+      intent.seekMs,
+      intent.aliasPhrase,
+    ].join(":");
+    if (handledKeywordEvidence.current === intentKey) return;
+    const preferredTrack =
+      workspace.preferred.state === "ready"
+        ? workspace.preferred.transcript.track
+        : undefined;
+    if (workspace.original.track.id === intent.trackId) {
+      setTranscriptView("original");
+    } else if (workspace.english.track.id === intent.trackId) {
+      setTranscriptView("english");
+    } else if (preferredTrack?.id === intent.trackId) {
+      setTranscriptView("preferred");
+    } else {
+      setWorkspaceMessage(
+        "The matched evidence track is not available in this exact hydrated transcript version.",
+      );
+      handledKeywordEvidence.current = intentKey;
+      return;
+    }
+    setQuery(intent.aliasPhrase);
+    setMatchIndex(0);
+    seekTo(intent.seekMs, intent.timingPrecision === "word" ? "word" : "cue");
+    setWorkspaceMessage(
+      `Opened verified keyword evidence at ${Math.round(intent.seekMs / 1_000)}s with ${intent.timingPrecision} timing.`,
+    );
+    handledKeywordEvidence.current = intentKey;
+  }, [workspace, workspaceTarget]);
+
+  useEffect(() => {
+    if (!workspace || !workspaceTarget?.bookmarkSource) return;
+    seekTo(workspaceTarget.bookmarkSource.sourceTimeMs, "cue");
+  }, [workspace, workspaceTarget]);
+
+  useEffect(() => {
+    if (!workspace || !workspaceTarget) return;
+    const restore = pendingNavigationRestore.current;
+    if (restore) {
+      pendingNavigationRestore.current = undefined;
+      const restoredTranscript = transcriptForView(
+        workspace,
+        restore.transcriptView,
+      );
+      const transcriptVersionMatches =
+        restore.transcriptVersionId === workspace.transcriptVersionId;
+      const restoredSelection = transcriptVersionMatches
+        ? exactRestorableSelection(restore.selection, restoredTranscript)
+        : undefined;
+      setTranscriptView(
+        restoredTranscript ? restore.transcriptView : "english",
+      );
+      setQuery(restore.query);
+      const restoredMatches = searchTranscript(
+        restoredTranscript?.segments ?? [],
+        restore.query,
+      );
+      const restoredMatchIndex = Math.min(
+        restore.matchIndex,
+        Math.max(0, restoredMatches.length - 1),
+      );
+      pendingMatchIndexRestore.current = restoredMatchIndex;
+      setMatchIndex(restoredMatchIndex);
+      setSelection(restoredSelection);
+      seekTo(restore.currentMs, "cue");
+      setWorkspaceMessage(
+        !transcriptVersionMatches
+          ? "Restored the authorized source, playhead, view, and search, but discarded its selection because the active transcript version changed."
+          : restoredSelection || !restore.selection
+            ? "Restored private source navigation after exact authorization and transcript validation."
+            : "Restored the source navigation, but discarded a stale transcript selection.",
+      );
+      return;
+    }
+
+    const clipSource = workspaceTarget.clipSource;
+    if (!clipSource) return;
+    const tracks: Array<{
+      view: "preferred" | "english" | "original";
+      transcript: NormalizedTranscript | undefined;
+    }> = [
+      { view: "original", transcript: workspace.original },
+      { view: "english", transcript: workspace.english },
+      {
+        view: "preferred",
+        transcript:
+          workspace.preferred.state === "ready"
+            ? workspace.preferred.transcript
+            : undefined,
+      },
+    ];
+    const clipTranscriptSelection = transcriptEvidenceSelection(
+      clipSource.selection,
+    );
+    const exactTrack = tracks.find(({ transcript }) =>
+      Boolean(
+        transcript &&
+        clipTranscriptSelection &&
+        transcript.track.id === clipTranscriptSelection.trackId &&
+        transcript.track.version === clipTranscriptSelection.transcriptVersion,
+      ),
+    );
+    const restoredSelection = exactRestorableSelection(
+      clipTranscriptSelection,
+      exactTrack?.transcript,
+    );
+    if (exactTrack) setTranscriptView(exactTrack.view);
+    if (clipSource.selection.selectionType === "player_time_range") {
+      setPlayerRangeStartMs(clipSource.selection.sourceStartMs);
+      setPlayerRangeEndMs(clipSource.selection.sourceEndMs);
+      setPlayerSpeechStatus(clipSource.selection.speechStatus);
+      setPlayerNoSpeechAttestation(clipSource.selection.noSpeechAttestation);
+      setSelection(
+        restoredSelection
+          ? PlayerTimeRangeSelectionSchema.parse({
+              ...clipSource.selection,
+              transcriptAttachment: restoredSelection,
+            })
+          : clipSource.selection,
+      );
+    } else {
+      setSelection(restoredSelection);
+    }
+    setClipLoopRange({
+      startMs: clipSource.selection.exportStartMs,
+      endMs: clipSource.selection.exportEndMs,
+    });
+    seekTo(
+      clipSource.sourceTimeMs ?? clipSource.selection.exportStartMs,
+      "cue",
+    );
+    playerRef.current?.play();
+    setWorkspaceMessage(
+      `${clipSource.fallbackNotice ? `${clipSource.fallbackNotice} ` : ""}${
+        clipSource.selection.selectionType === "player_time_range"
+          ? `Opened the authorized player range (${playerSpeechLabel(clipSource.selection.speechStatus)}) and enabled looping.${restoredSelection ? " Its exact transcript attachment is highlighted." : " No transcript selection was fabricated."}`
+          : restoredSelection
+            ? "Opened the authorized source at the exact logged clip range and enabled looping."
+            : "Opened the authorized source range and enabled looping; exact transcript selection is unavailable in the active version."
+      }`,
+    );
+  }, [workspace, workspaceTarget]);
 
   useEffect(() => {
     if (workspaceTarget && workspaceTarget.projectId !== projectId) {
@@ -955,6 +1594,7 @@ function App() {
     previousTranscriptTrackId.current = transcript?.track.id;
     if (
       !selection ||
+      selection.selectionType === "player_time_range" ||
       !transcript ||
       !previous ||
       previous === transcript.track.id
@@ -1034,8 +1674,6 @@ function App() {
   function loadVideoUrl(nextUrl: string) {
     try {
       const normalized = normalizeYouTubeUrl(nextUrl);
-      clearWorkspaceInteraction();
-      setWorkspaceTarget(undefined);
       setUrl(normalized.canonicalUrl);
       if (!authorization || !projectId) {
         setError("Choose a project before loading a project-authorized video.");
@@ -1072,33 +1710,348 @@ function App() {
     }
   }
 
-  function openProjectVideo(target: WorkspaceVideoTarget) {
+  function currentNavigationSnapshot(): NavigationSnapshot | undefined {
+    if (!workspaceTarget || !workspace) return undefined;
+    const navigationSelection = directNavigationSelection(selection);
+    return {
+      schemaVersion: 1,
+      projectId: workspaceTarget.projectId,
+      catalogVideoId: workspaceTarget.catalogVideoId,
+      youtubeVideoId: workspaceTarget.youtubeVideoId,
+      canonicalUrl: workspaceTarget.canonicalUrl,
+      ...(workspaceTarget.title ? { title: workspaceTarget.title } : {}),
+      transcriptVersionId: workspace.transcriptVersionId,
+      currentMs,
+      transcriptView,
+      query,
+      matchIndex,
+      ...(navigationSelection ? { selection: navigationSelection } : {}),
+    };
+  }
+
+  function pushNavigationSnapshot(snapshot: NavigationSnapshot) {
+    setNavigationBackStack((current) =>
+      [
+        ...current.filter(
+          (entry) =>
+            entry.catalogVideoId !== snapshot.catalogVideoId ||
+            entry.transcriptVersionId !== snapshot.transcriptVersionId,
+        ),
+        snapshot,
+      ].slice(-navigationHistoryLimit),
+    );
+  }
+
+  function openProjectVideo(
+    target: WorkspaceVideoTarget,
+    options: { pushCurrent?: boolean; restore?: NavigationSnapshot } = {},
+  ) {
+    const authorizedVideo = projectVideos?.some(
+      (video) =>
+        video.id === target.catalogVideoId &&
+        video.youtubeVideoId === target.youtubeVideoId &&
+        video.canonicalUrl === target.canonicalUrl,
+    );
+    if (target.projectId !== projectId || !authorizedVideo) {
+      setDestination("workbench");
+      setError(
+        "This source is no longer an authorized video in the active project. Refresh the project before trying again.",
+      );
+      return;
+    }
+    const currentSnapshot = currentNavigationSnapshot();
+    const openingDifferentClip =
+      target.clipSource?.clipId !== workspaceTarget?.clipSource?.clipId;
+    if (
+      options.pushCurrent !== false &&
+      currentSnapshot &&
+      (currentSnapshot.projectId !== target.projectId ||
+        currentSnapshot.catalogVideoId !== target.catalogVideoId ||
+        openingDifferentClip)
+    )
+      pushNavigationSnapshot(currentSnapshot);
+    pendingNavigationRestore.current = options.restore;
     clearWorkspaceInteraction();
     setProjectId(target.projectId);
     setWorkspaceTarget(target);
+    setDestination("workbench");
     setUrl(target.canonicalUrl);
     setError(undefined);
+  }
+
+  function restoreNavigationSnapshot(
+    snapshot: NavigationSnapshot,
+    pushCurrent = false,
+  ) {
+    const video = projectVideos?.find(
+      (candidate) =>
+        candidate.id === snapshot.catalogVideoId &&
+        candidate.youtubeVideoId === snapshot.youtubeVideoId &&
+        candidate.canonicalUrl === snapshot.canonicalUrl,
+    );
+    if (!video || snapshot.projectId !== projectId) return;
+    openProjectVideo(
+      {
+        projectId: snapshot.projectId,
+        catalogVideoId: snapshot.catalogVideoId,
+        youtubeVideoId: snapshot.youtubeVideoId,
+        canonicalUrl: snapshot.canonicalUrl,
+        title: video.title ?? snapshot.title,
+      },
+      { pushCurrent, restore: snapshot },
+    );
+  }
+
+  function navigateBack() {
+    const snapshot = navigationBackStack.at(-1);
+    if (!snapshot) return;
+    setNavigationBackStack((current) => current.slice(0, -1));
+    restoreNavigationSnapshot(snapshot);
   }
 
   function selectProject(nextProjectId: string) {
     if (nextProjectId !== projectId) {
       clearWorkspaceInteraction();
       setWorkspaceTarget(undefined);
+      setDestination("workbench");
+      setUnreadActivityCount(0);
+      setNavigationBackStack([]);
+      pendingNavigationRestore.current = undefined;
+      hydratedNavigationIdentity.current = undefined;
     }
     setProjectId(nextProjectId);
+  }
+
+  function signOutFromShell() {
+    if (desktopBridge()) {
+      void completeDesktopSignOut();
+      return;
+    }
+    clearWorkspaceInteraction();
+    setWorkspaceTarget(undefined);
+    setAuthorization("");
+    setProjects([]);
+    setProjectsLoaded(false);
+    setProjectId("");
+    setDestination("workbench");
+    setUnreadActivityCount(0);
+    setProjectMessage(undefined);
+    setNavigationBackStack([]);
+    pendingNavigationRestore.current = undefined;
+    hydratedNavigationIdentity.current = undefined;
+    recentProjectValidation.current = undefined;
+    setRecentProjectReadyIdentity(undefined);
+  }
+
+  function resetSelectionCommandOutcome(
+    options: {
+      clearResearchContext?: boolean;
+    } = {},
+  ) {
+    if (options.clearResearchContext) {
+      setClipNotes("");
+      setClipFirstComment("");
+      setClipTags("");
+    }
+    setSelectionCommandId(crypto.randomUUID());
+    setClipActionMessage(undefined);
+    setLoggedClipId(undefined);
+    setLoggedExportRequestId(undefined);
+    setExportOnlyRequestId(undefined);
+    setSourceRightsConfirmed(false);
+  }
+
+  function setPlayerRangeBound(bound: "in" | "out") {
+    if (sourceDurationMs === undefined) {
+      setPlayerRangeMessage(
+        "Wait for the player to report the exact source duration before setting bounds.",
+      );
+      playerRef.current?.requestDuration();
+      return;
+    }
+    if (currentMs < 0 || currentMs > sourceDurationMs) {
+      setPlayerRangeMessage(
+        "The playhead is outside the known source duration.",
+      );
+      return;
+    }
+    if (bound === "in") {
+      if (currentMs >= sourceDurationMs) {
+        setPlayerRangeMessage(
+          "The in-point must be before the end of the source.",
+        );
+        return;
+      }
+      playerRef.current?.pause();
+      setPreviewingSelection(false);
+      setClipLoopRange(undefined);
+      setSelection(undefined);
+      setSelectionError(undefined);
+      setPlayerRangeStartMs(currentMs);
+      setPlayerRangeEndMs(undefined);
+      setPlayerSpeechStatus(undefined);
+      setPlayerNoSpeechAttestation(undefined);
+      setPlayerRangeMessage(
+        `Set in at ${(currentMs / 1_000).toFixed(3)}s. Move to a later playhead and set out.`,
+      );
+      resetSelectionCommandOutcome({ clearResearchContext: true });
+      return;
+    }
+    if (playerRangeStartMs === undefined) {
+      setPlayerRangeMessage("Set an in-point before setting the out-point.");
+      return;
+    }
+    if (currentMs <= playerRangeStartMs) {
+      setPlayerRangeMessage(
+        "The out-point must be strictly after the in-point.",
+      );
+      return;
+    }
+    setPlayerRangeEndMs(currentMs);
+    setPlayerSpeechStatus(undefined);
+    setPlayerNoSpeechAttestation(undefined);
+    setSelection(undefined);
+    setSelectionError(undefined);
+    setPlayerRangeMessage(
+      `Set out at ${(currentMs / 1_000).toFixed(3)}s. Choose the required speech status.`,
+    );
+    resetSelectionCommandOutcome();
+  }
+
+  function changePlayerSpeechStatus(
+    status: "speech" | "no_speech" | "transcript_unavailable",
+  ) {
+    if (playerRangeStartMs === undefined || playerRangeEndMs === undefined)
+      return;
+    let attestation = playerNoSpeechAttestation;
+    if (status === "no_speech" && !attestation) {
+      if (!user) {
+        setPlayerRangeMessage(
+          "Sign in and load the current account before attesting that this range has no speech.",
+        );
+        return;
+      }
+      attestation = {
+        schemaVersion: 1,
+        actor: {
+          id: user.id,
+          handle: user.handle,
+          displayName: user.displayName,
+        },
+        attestedAt: new Date().toISOString(),
+      };
+      setPlayerNoSpeechAttestation(attestation);
+    }
+    try {
+      const nextSelection = PlayerTimeRangeSelectionSchema.parse({
+        selectionType: "player_time_range",
+        sourceStartMs: playerRangeStartMs,
+        sourceEndMs: playerRangeEndMs,
+        exportStartMs: playerRangeStartMs,
+        exportEndMs: playerRangeEndMs,
+        origin: "manual_player",
+        speechStatus: status,
+        ...(status === "no_speech" ? { noSpeechAttestation: attestation } : {}),
+      });
+      setPlayerSpeechStatus(status);
+      setSelection(nextSelection);
+      setSelectionError(undefined);
+      setPlayerRangeMessage(
+        `${playerSpeechLabel(status)} recorded. ${status === "speech" ? "Attach overlapping transcript evidence before export, or log the range without it." : status === "no_speech" ? "The current actor and UTC time are now immutable for this selection command." : "This range can be logged with context but cannot be exported."}`,
+      );
+      resetSelectionCommandOutcome();
+    } catch (caught) {
+      setPlayerRangeMessage(
+        caught instanceof Error
+          ? caught.message
+          : "Unable to record this player range.",
+      );
+    }
+  }
+
+  function attachOverlappingTranscript() {
+    if (
+      !selection ||
+      selection.selectionType !== "player_time_range" ||
+      selection.speechStatus !== "speech" ||
+      !transcript
+    )
+      return;
+    try {
+      const attachment = derivePlayerRangeTranscriptAttachment({
+        transcript,
+        sourceStartMs: selection.sourceStartMs,
+        sourceEndMs: selection.sourceEndMs,
+        exportStartMs: selection.exportStartMs,
+        exportEndMs: selection.exportEndMs,
+      });
+      if (!attachment) {
+        setPlayerRangeMessage(
+          "No verified transcript overlaps this exact player range in the current language view. Adjust the range or switch transcript views; speech status was not changed.",
+        );
+        return;
+      }
+      setSelection(
+        PlayerTimeRangeSelectionSchema.parse({
+          ...selection,
+          transcriptAttachment: attachment,
+        }),
+      );
+      setPlayerRangeMessage(
+        `Attached verified ${transcript.track.language} transcript evidence with ${attachment.timingPrecision} precision. The selection remains player-originated.`,
+      );
+      setSelectionError(undefined);
+      resetSelectionCommandOutcome();
+    } catch (caught) {
+      setPlayerRangeMessage(
+        caught instanceof Error
+          ? caught.message
+          : "Unable to attach overlapping transcript evidence.",
+      );
+    }
+  }
+
+  function clearPlayerRange() {
+    playerRef.current?.pause();
+    setPreviewingSelection(false);
+    if (selection?.selectionType === "player_time_range")
+      setSelection(undefined);
+    setPlayerRangeStartMs(undefined);
+    setPlayerRangeEndMs(undefined);
+    setPlayerSpeechStatus(undefined);
+    setPlayerNoSpeechAttestation(undefined);
+    setPlayerRangeMessage(undefined);
+    setSelectionError(undefined);
+    resetSelectionCommandOutcome({ clearResearchContext: true });
   }
 
   function changeExportBound(bound: "start" | "end", secondsText: string) {
     if (!selection || secondsText.trim() === "") return;
     const milliseconds = Math.round(Number(secondsText) * 1_000);
     try {
+      const bounds = {
+        startMs: bound === "start" ? milliseconds : selection.exportStartMs,
+        endMs: bound === "end" ? milliseconds : selection.exportEndMs,
+      };
       setSelection(
-        updateTranscriptSelectionExportBounds(selection, {
-          startMs: bound === "start" ? milliseconds : selection.exportStartMs,
-          endMs: bound === "end" ? milliseconds : selection.exportEndMs,
-        }),
+        selection.selectionType === "player_time_range"
+          ? PlayerTimeRangeSelectionSchema.parse({
+              ...selection,
+              exportStartMs: bounds.startMs,
+              exportEndMs: bounds.endMs,
+              ...(selection.transcriptAttachment
+                ? {
+                    transcriptAttachment: updateTranscriptSelectionExportBounds(
+                      selection.transcriptAttachment,
+                      bounds,
+                    ),
+                  }
+                : {}),
+            })
+          : updateTranscriptSelectionExportBounds(selection, bounds),
       );
       setSelectionError(undefined);
+      resetSelectionCommandOutcome();
     } catch (caught) {
       setSelectionError(
         caught instanceof Error ? caught.message : "Invalid export bounds.",
@@ -1108,13 +2061,32 @@ function App() {
 
   function addExportHandles() {
     if (!selection) return;
+    const bounds = {
+      startMs: Math.max(0, selection.exportStartMs - 500),
+      endMs: Math.min(
+        sourceDurationMs ?? Number.MAX_SAFE_INTEGER,
+        selection.exportEndMs + 500,
+      ),
+    };
     setSelection(
-      updateTranscriptSelectionExportBounds(selection, {
-        startMs: Math.max(0, selection.exportStartMs - 500),
-        endMs: selection.exportEndMs + 500,
-      }),
+      selection.selectionType === "player_time_range"
+        ? PlayerTimeRangeSelectionSchema.parse({
+            ...selection,
+            exportStartMs: bounds.startMs,
+            exportEndMs: bounds.endMs,
+            ...(selection.transcriptAttachment
+              ? {
+                  transcriptAttachment: updateTranscriptSelectionExportBounds(
+                    selection.transcriptAttachment,
+                    bounds,
+                  ),
+                }
+              : {}),
+          })
+        : updateTranscriptSelectionExportBounds(selection, bounds),
     );
     setSelectionError(undefined);
+    resetSelectionCommandOutcome();
   }
 
   function toggleSelectionPreview() {
@@ -1150,6 +2122,7 @@ function App() {
           body: JSON.stringify({
             name: newProjectName,
             description: newProjectDescription,
+            kind: newProjectKind,
           }),
         },
         authorization,
@@ -1164,13 +2137,26 @@ function App() {
         );
       }
       const project = ProjectSchema.parse(payload);
+      const projectSummary = ProjectSummarySchema.parse({
+        ...project,
+        currentUserRole: "owner",
+        memberCount: 1,
+      });
+      if (user) {
+        try {
+          localStorage.setItem(`vera:recent-project:${user.id}`, project.id);
+        } catch {
+          // The explicit in-memory selection remains authoritative this run.
+        }
+      }
       setProjects((current) => [
         ...current.filter((candidate) => candidate.id !== project.id),
-        project,
+        projectSummary,
       ]);
       selectProject(project.id);
       setNewProjectName("");
       setNewProjectDescription("");
+      setNewProjectKind("shared");
       setCreatingProject(false);
       setProjectMessage(`Created and selected “${project.name}”.`);
     } catch (caught) {
@@ -1191,35 +2177,46 @@ function App() {
       !transcriptTracks ||
       !selectedVideoSnapshot ||
       !user ||
-      !languageEvidenceReady ||
+      (Boolean(selectedEvidence) && !languageEvidenceReady) ||
       offlineCachedWorkspace
     )
       return undefined;
-    const languageEvidence = buildClipLanguageEvidence({
-      original: transcriptTracks.original,
-      english: transcriptTracks.english,
-      ...(preferredTranscript ? { preferred: preferredTranscript } : {}),
-      startMs: selection.transcriptStartMs,
-      endMs: selection.transcriptEndMs,
-    });
+    const languageEvidence = selectedEvidence
+      ? buildClipLanguageEvidence({
+          original: transcriptTracks.original,
+          english: transcriptTracks.english,
+          ...(preferredTranscript ? { preferred: preferredTranscript } : {}),
+          startMs: selectedEvidence.transcriptStartMs,
+          endMs: selectedEvidence.transcriptEndMs,
+        })
+      : undefined;
     setClipActionBusy(true);
     try {
+      const command = CreateClipCandidateRequestSchema.safeParse({
+        idempotencyKey: `queue:${selectionCommandId}`,
+        video: selectedVideoSnapshot,
+        selection,
+        ...(languageEvidence ? { languageEvidence } : {}),
+        notes: clipNotes,
+        ...(clipFirstComment.trim()
+          ? { firstComment: { body: clipFirstComment } }
+          : {}),
+        tags: clipTags
+          .split(/[,\n]/u)
+          .map((tag) => tag.trim())
+          .filter(Boolean),
+      });
+      if (!command.success) {
+        throw new Error(
+          command.error.issues[0]?.message ?? "Unable to validate clip.",
+        );
+      }
       const response = await apiFetch(
         "cloud",
         `/api/projects/${projectId}/clips`,
         {
           method: "POST",
-          body: JSON.stringify({
-            idempotencyKey: `queue:${selectionCommandId}`,
-            video: selectedVideoSnapshot,
-            selection,
-            languageEvidence,
-            notes: clipNotes,
-            tags: clipTags
-              .split(/[,\n]/u)
-              .map((tag) => tag.trim())
-              .filter(Boolean),
-          }),
+          body: JSON.stringify(command.data),
         },
         authorization,
       );
@@ -1252,6 +2249,7 @@ function App() {
       !projectId ||
       !selection ||
       !transcriptTracks ||
+      selectionExportBlockReason ||
       offlineCachedWorkspace ||
       !sourceRightsConfirmed ||
       !sourceRights ||
@@ -1281,16 +2279,21 @@ function App() {
               )
                 ? "confirmed_english"
                 : "foreign",
-            subtitleTracks: {
-              original: {
-                trackId: transcriptTracks.original.track.id,
-                trackVersion: transcriptTracks.original.track.version,
-              },
-              english: {
-                trackId: transcriptTracks.english.track.id,
-                trackVersion: transcriptTracks.english.track.version,
-              },
-            },
+            ...(selection.selectionType === "player_time_range" &&
+            selection.speechStatus === "no_speech"
+              ? { noSpeechAttestation: selection.noSpeechAttestation }
+              : {
+                  subtitleTracks: {
+                    original: {
+                      trackId: transcriptTracks.original.track.id,
+                      trackVersion: transcriptTracks.original.track.version,
+                    },
+                    english: {
+                      trackId: transcriptTracks.english.track.id,
+                      trackVersion: transcriptTracks.english.track.version,
+                    },
+                  },
+                }),
             settingsSelection: loggedSettingsSelection,
             expectedResolutionFingerprint:
               loggedSettingsPreview.snapshot.resolutionFingerprint,
@@ -1336,6 +2339,7 @@ function App() {
       !selection ||
       !transcriptTracks ||
       !selectedVideoSnapshot ||
+      selectionExportBlockReason ||
       !sourceRightsConfirmed ||
       !sourceRights ||
       exportOnlySettingsState !== "ready" ||
@@ -1362,16 +2366,21 @@ function App() {
               )
                 ? "confirmed_english"
                 : "foreign",
-            subtitleTracks: {
-              original: {
-                trackId: transcriptTracks.original.track.id,
-                trackVersion: transcriptTracks.original.track.version,
-              },
-              english: {
-                trackId: transcriptTracks.english.track.id,
-                trackVersion: transcriptTracks.english.track.version,
-              },
-            },
+            ...(selection.selectionType === "player_time_range" &&
+            selection.speechStatus === "no_speech"
+              ? { noSpeechAttestation: selection.noSpeechAttestation }
+              : {
+                  subtitleTracks: {
+                    original: {
+                      trackId: transcriptTracks.original.track.id,
+                      trackVersion: transcriptTracks.original.track.version,
+                    },
+                    english: {
+                      trackId: transcriptTracks.english.track.id,
+                      trackVersion: transcriptTracks.english.track.version,
+                    },
+                  },
+                }),
             settingsSelection: exportOnlySettingsSelection,
             expectedResolutionFingerprint:
               exportOnlySettingsPreview.snapshot.resolutionFingerprint,
@@ -1413,8 +2422,15 @@ function App() {
 
   async function copySelectionText() {
     if (!selection) return;
+    const copyText = transcriptEvidenceSelection(selection)?.text;
+    if (!copyText) {
+      setClipActionMessage(
+        "This player range has no attached transcript text to copy.",
+      );
+      return;
+    }
     try {
-      await navigator.clipboard.writeText(selection.text);
+      await navigator.clipboard.writeText(copyText);
       setClipActionMessage("Copied the selected transcript text.");
     } catch {
       setClipActionMessage("The browser could not copy the selection.");
@@ -1426,6 +2442,14 @@ function App() {
     setCurrentMs(startMs);
     setLastSeekMs(startMs);
     setLastSeekPrecision(precision);
+  }
+
+  function handlePlayerTimeChange(milliseconds: number) {
+    setCurrentMs(milliseconds);
+    if (clipLoopRange && milliseconds >= clipLoopRange.endMs) {
+      playerRef.current?.seekTo(clipLoopRange.startMs);
+      playerRef.current?.play();
+    }
   }
 
   const [lastSeekPrecision, setLastSeekPrecision] = useState<"word" | "cue">(
@@ -1442,1020 +2466,389 @@ function App() {
   }
 
   return (
-    <main className="shell">
-      <header className="topbar">
-        <div>
-          <p className="eyebrow">Research video workspace</p>
-          <h1>Navigate video by transcript</h1>
-        </div>
-        <span className="status">Multilingual clip logging</span>
-      </header>
-
-      <DesktopSetup
-        authorization={authorization}
-        {...(desktopAuthStatus ? { authStatus: desktopAuthStatus } : {})}
-        projects={projects}
-        projectId={projectId}
-        onProjectsChange={setProjects}
-        onProjectChange={selectProject}
-        onSignIn={beginDesktopSignIn}
-        onSignOut={completeDesktopSignOut}
-      />
-
-      <form
-        className="loader"
-        onSubmit={(event) => {
-          event.preventDefault();
-          loadVideo();
-        }}
-      >
-        <label htmlFor="video-url">YouTube URL or video ID</label>
-        <div className="loader-row">
-          <input
-            id="video-url"
-            value={url}
-            onChange={(event) => setUrl(event.target.value)}
-            aria-invalid={Boolean(error)}
-          />
-          <button type="submit">Load video</button>
-        </div>
-        <p className={error ? "form-message error" : "form-message"}>
-          {error ??
-            "Open a project video from Ready for review to resolve its verified transcript."}
-        </p>
-      </form>
-
-      <section
-        className="loader account-settings"
-        aria-label="Account settings"
-      >
-        <label htmlFor="preferred-language">
-          Preferred transcript language
-        </label>
-        <div className="loader-row">
-          <input
-            id="preferred-language"
-            value={preferredLanguageDraft}
-            maxLength={35}
+    <WorkspaceShell
+      projects={projects}
+      projectId={projectId}
+      destination={destination}
+      {...(user ? { user } : {})}
+      unreadCount={unreadActivityCount}
+      {...(workspaceTarget
+        ? {
+            navigationTitle:
+              workspaceTarget.title ?? workspaceTarget.youtubeVideoId,
+          }
+        : {})}
+      navigationHistory={navigationBackStack.map((entry, index) => ({
+        id: String(index),
+        label: entry.title ?? entry.youtubeVideoId,
+      }))}
+      onProjectChange={selectProject}
+      onDestinationChange={setDestination}
+      onBack={navigateBack}
+      onNavigationHistorySelect={(id) => {
+        const snapshot = navigationBackStack[Number(id)];
+        if (snapshot) restoreNavigationSnapshot(snapshot, true);
+      }}
+      onSignOut={signOutFromShell}
+      setup={
+        <DesktopSetup
+          authorization={authorization}
+          {...(desktopAuthStatus ? { authStatus: desktopAuthStatus } : {})}
+          projects={projects}
+          projectId={projectId}
+          onProjectsChange={(nextProjects) => {
+            setProjects(nextProjects);
+            setProjectsLoaded(Boolean(authorization));
+          }}
+          onProjectChange={selectProject}
+          onSignIn={beginDesktopSignIn}
+          onSignOut={completeDesktopSignOut}
+        />
+      }
+      ingest={
+        <SourceIngestPanel
+          projectId={projectId}
+          authorization={authorization}
+          url={url}
+          {...(error ? { error } : {})}
+          onUrlChange={setUrl}
+          onSubmit={loadVideo}
+          onBulkAdd={() => {
+            setDestination("workbench");
+            setBulkAddRequest((request) => request + 1);
+          }}
+          onSearchCandidatesSelected={(inputs) => {
+            setDestination("workbench");
+            setSearchBatchRequest((current) => ({
+              generation: (current?.generation ?? 0) + 1,
+              inputs,
+            }));
+          }}
+        />
+      }
+      accountSettings={
+        <>
+          <AccountLanguagePanel
+            preferredLanguage={preferredLanguageDraft}
             disabled={!authorization}
-            onChange={(event) => setPreferredLanguageDraft(event.target.value)}
-            placeholder="en, fr-CA, zh-Hant…"
+            message={preferenceMessage}
+            onPreferredLanguageChange={setPreferredLanguageDraft}
+            onSave={() => void savePreferredLanguage()}
           />
-          <button
-            type="button"
-            disabled={!authorization || !preferredLanguageDraft.trim()}
-            onClick={() => void savePreferredLanguage()}
-          >
-            Save preference
-          </button>
-        </div>
-        <p className="form-message" role="status">
-          {preferenceMessage}
-        </p>
-      </section>
-
-      <section className="workspace" aria-label="Research workspace">
-        <article className="panel transcript-panel">
-          <div className="panel-heading">
-            <div>
-              <span>
-                {transcript
-                  ? `${transcript.track.language} transcript`
-                  : "Transcript"}
-              </span>
-              {transcript ? (
-                <span className="precision">
-                  {transcript.track.timingPrecision} timing
-                </span>
-              ) : null}
-            </div>
-            {transcriptTracks ? (
-              <label className="transcript-view-picker">
-                Language view
-                <select
-                  value={transcriptView}
-                  onChange={(event) =>
-                    setTranscriptView(
-                      event.target.value as
-                        "preferred" | "english" | "original",
-                    )
-                  }
-                >
-                  <option
-                    value="preferred"
-                    disabled={preferredEvidenceRequired && !preferredTranscript}
-                  >
-                    Preferred{user ? ` (${user.preferredLanguage})` : ""}
-                  </option>
-                  <option value="english">English</option>
-                  {!languagesEquivalent(
-                    transcriptTracks.original.track.language,
-                    "en",
-                  ) ? (
-                    <option value="original">
-                      Original ({transcriptTracks.original.track.language})
-                    </option>
-                  ) : null}
-                </select>
-              </label>
-            ) : null}
-            <button
-              className="quiet-button"
-              type="button"
-              onClick={() => setFollow((value) => !value)}
-              aria-pressed={follow}
-            >
-              {follow ? "Following" : "Resume follow"}
-            </button>
-          </div>
-
-          {transcript ? (
-            <>
-              <p className="form-message" role="status">
-                {workspaceMessage}
-              </p>
-              {preferredEvidenceRequired && !preferredTranscript ? (
-                <p className="form-message error" role="status">
-                  Preferred translation unavailable for{" "}
-                  {user?.preferredLanguage}. Original and English remain
-                  available; logging waits for the required preferred evidence.
-                </p>
-              ) : null}
-              {offlineCachedWorkspace ? (
-                <p className="form-message" role="status">
-                  This is verified offline cache review. Reconnect to confirm
-                  the current project transcript; Queue / log only and Export +
-                  log are unavailable until then.
-                </p>
-              ) : null}
-              <div className="search-field">
-                <label htmlFor="transcript-search">Search transcript</label>
-                <input
-                  id="transcript-search"
-                  type="search"
-                  value={query}
-                  onChange={(event) => setQuery(event.target.value)}
-                  placeholder="Find exact text"
-                />
-                <span className="search-navigation">
-                  <span>
-                    {visibleSegments.length === 0
-                      ? "0 matches"
-                      : `${matchIndex + 1} of ${visibleSegments.length}`}
-                  </span>
-                  <button
-                    type="button"
-                    disabled={visibleSegments.length === 0}
-                    onClick={() => moveMatch(-1)}
-                  >
-                    Previous match
-                  </button>
-                  <button
-                    type="button"
-                    disabled={visibleSegments.length === 0}
-                    onClick={() => moveMatch(1)}
-                  >
-                    Next match
-                  </button>
-                </span>
-              </div>
-              {visibleSegments.length > 0 ? (
-                <VirtualTranscript
-                  segments={visibleSegments}
-                  tokens={transcript.tokens}
-                  {...(activeSegment
-                    ? { activeSegmentId: activeSegment.id }
-                    : {})}
-                  {...(activeToken ? { activeTokenId: activeToken.id } : {})}
-                  selectedTokenIds={selectedTokenIds}
-                  follow={follow}
-                  onFollowSuspended={() => setFollow(false)}
-                  onSeek={seekTo}
-                  onSelect={(anchor, focus) => {
-                    playerRef.current?.pause();
-                    setPreviewingSelection(false);
-                    setSelection(
-                      deriveTranscriptSelection({
-                        transcript,
-                        anchor,
-                        focus,
-                      }),
-                    );
-                    setClipNotes("");
-                    setClipTags("");
-                    setSelectionCommandId(crypto.randomUUID());
-                    setClipActionMessage(undefined);
-                    setLoggedClipId(undefined);
-                    setLoggedExportRequestId(undefined);
-                    setExportOnlyRequestId(undefined);
-                    setSelectionError(undefined);
-                  }}
-                />
-              ) : (
-                <p className="no-results">No transcript matches.</p>
-              )}
-            </>
-          ) : (
-            <div className="empty-state">
-              <span className="step">01</span>
-              <h2>
-                {workspaceLoadState === "loading"
-                  ? "Loading verified transcript"
-                  : workspaceLoadState === "unavailable"
-                    ? "No active project transcript"
-                    : workspaceLoadState === "failed"
-                      ? "Transcript unavailable"
-                      : "Open a project video"}
-              </h2>
-              <p>
-                {workspaceMessage ??
-                  "Open a Ready for review project video. The app never substitutes fixture text when real resolution is unavailable."}
-              </p>
-              {workspaceTarget && workspaceLoadState !== "loading" ? (
-                <button
-                  type="button"
-                  onClick={() => setWorkspaceReload((value) => value + 1)}
-                >
-                  Retry transcript
-                </button>
-              ) : null}
-            </div>
-          )}
-        </article>
-
-        <aside className="panel video-panel">
-          {videoId ? (
-            <YouTubePlayer
-              ref={playerRef}
-              videoId={videoId}
-              onTimeChange={setCurrentMs}
+          <NotificationPreferencesPanel signedIn={Boolean(authorization)} />
+        </>
+      }
+      workspace={
+        <ResearchWorkspaceLayout
+          transcript={
+            <TranscriptNavigationPanel
+              transcript={transcript}
+              originalTranscript={transcriptTracks?.original}
+              preferredTranscript={preferredTranscript}
+              preferredLanguage={user?.preferredLanguage}
+              transcriptView={transcriptView}
+              preferredEvidenceRequired={preferredEvidenceRequired}
+              offlineCachedWorkspace={Boolean(offlineCachedWorkspace)}
+              workspaceMessage={workspaceMessage}
+              workspaceLoadState={workspaceLoadState}
+              hasWorkspaceTarget={Boolean(workspaceTarget)}
+              query={query}
+              matchIndex={matchIndex}
+              visibleSegments={visibleSegments}
+              activeSegmentId={activeSegment?.id}
+              activeTokenId={activeToken?.id}
+              selectedTokenIds={selectedTokenIds}
+              follow={follow}
+              onTranscriptViewChange={setTranscriptView}
+              onFollowChange={setFollow}
+              onQueryChange={setQuery}
+              onMoveMatch={moveMatch}
+              onFollowSuspended={() => setFollow(false)}
+              onSeek={seekTo}
+              onSelect={(anchor, focus) => {
+                playerRef.current?.pause();
+                setPreviewingSelection(false);
+                setSelection(
+                  deriveTranscriptSelection({
+                    transcript: transcript!,
+                    anchor,
+                    focus,
+                  }),
+                );
+                setPlayerRangeStartMs(undefined);
+                setPlayerRangeEndMs(undefined);
+                setPlayerSpeechStatus(undefined);
+                setPlayerRangeMessage(undefined);
+                setPlayerNoSpeechAttestation(undefined);
+                setClipNotes("");
+                setClipFirstComment("");
+                setClipTags("");
+                setSelectionCommandId(crypto.randomUUID());
+                setClipActionMessage(undefined);
+                setLoggedClipId(undefined);
+                setLoggedExportRequestId(undefined);
+                setExportOnlyRequestId(undefined);
+                setSelectionError(undefined);
+              }}
+              onRetry={() => setWorkspaceReload((value) => value + 1)}
             />
-          ) : (
-            <div className="video-placeholder">16:9 YouTube player</div>
-          )}
-          <div className="video-details">
-            <p className="eyebrow">Playback position</p>
-            <strong>{formatTime(currentMs)}</strong>
-            <p className="muted">
-              {lastSeekMs === undefined
-                ? "Click a timed word or cue to seek."
-                : `${lastSeekPrecision === "word" ? "Word" : "Cue"} requested ${formatTime(lastSeekMs)}.`}
-            </p>
-          </div>
-          {selection ? (
-            <section className="selection-panel" aria-label="Clip selection">
-              <div className="selection-heading">
-                <div>
-                  <p className="eyebrow">Selected passage</p>
-                  <strong>{selection.timingPrecision} bounds</strong>
-                </div>
-                <button
-                  type="button"
-                  className="quiet-button"
-                  onClick={() => {
-                    playerRef.current?.pause();
-                    setPreviewingSelection(false);
-                    setSelection(undefined);
-                    setSelectionError(undefined);
-                    setClipNotes("");
-                    setClipTags("");
-                    setClipActionMessage(undefined);
-                    setLoggedClipId(undefined);
-                    setLoggedExportRequestId(undefined);
-                    setExportOnlyRequestId(undefined);
-                  }}
-                >
-                  Clear
-                </button>
-              </div>
-              <blockquote>{selection.text}</blockquote>
-              <div className="selection-project">
-                <div className="selection-project-heading">
-                  <label htmlFor="selection-project">Logging project</label>
-                  <button
-                    type="button"
-                    className="quiet-button"
-                    disabled={!authorization || Boolean(loggedClipId)}
-                    onClick={() => setCreatingProject((current) => !current)}
-                  >
-                    {creatingProject ? "Cancel new project" : "New project"}
-                  </button>
-                </div>
-                <select
-                  id="selection-project"
-                  value={projectId}
-                  disabled={projects.length === 0 || Boolean(loggedClipId)}
-                  onChange={(event) => selectProject(event.target.value)}
-                >
-                  <option value="">Choose a project</option>
-                  {projects.map((project) => (
-                    <option key={project.id} value={project.id}>
-                      {project.name}
-                    </option>
-                  ))}
-                </select>
-                {creatingProject ? (
-                  <div className="quick-project-form">
-                    <label>
-                      Project name
-                      <input
-                        value={newProjectName}
-                        maxLength={160}
-                        onChange={(event) =>
-                          setNewProjectName(event.target.value)
-                        }
+          }
+          player={
+            <PlayerPanel
+              playerRef={playerRef}
+              videoId={videoId}
+              currentMs={currentMs}
+              lastSeekMs={lastSeekMs}
+              lastSeekPrecision={lastSeekPrecision}
+              sourceDurationMs={sourceDurationMs}
+              playerRangeStartMs={playerRangeStartMs}
+              playerRangeEndMs={playerRangeEndMs}
+              playerSpeechStatus={playerSpeechStatus}
+              playerRangeMessage={playerRangeMessage}
+              {...(clipLoopRange ? { clipLoopRange } : {})}
+              onTimeChange={handlePlayerTimeChange}
+              onDurationChange={setSourceDurationMs}
+              onSetPlayerRangeBound={setPlayerRangeBound}
+              onPlayerSpeechStatusChange={changePlayerSpeechStatus}
+              onClearPlayerRange={clearPlayerRange}
+              {...(authorization &&
+              projectId &&
+              selectedVideoSnapshot &&
+              workspaceTarget
+                ? {
+                    bookmarks: (
+                      <BookmarksPanel
+                        authorization={authorization}
+                        projectId={projectId}
+                        videoId={workspaceTarget.catalogVideoId}
+                        currentMs={currentMs}
+                        {...(user ? { currentUserId: user.id } : {})}
+                        {...(projects.find(
+                          (project) => project.id === projectId,
+                        )?.currentUserRole
+                          ? {
+                              currentRole: projects.find(
+                                (project) => project.id === projectId,
+                              )!.currentUserRole,
+                            }
+                          : {})}
+                        onSeek={(milliseconds) => {
+                          playerRef.current?.seekTo(milliseconds);
+                          setLastSeekMs(milliseconds);
+                        }}
+                        onOpen={(bookmark) => {
+                          if (!bookmark.source) return;
+                          openProjectVideo({
+                            projectId,
+                            catalogVideoId: bookmark.videoId,
+                            youtubeVideoId: bookmark.source.youtubeVideoId,
+                            canonicalUrl: bookmark.source.canonicalUrl,
+                            title: bookmark.source.title,
+                            bookmarkSource: {
+                              sourceTimeMs: bookmark.sourceTimeMs,
+                            },
+                          });
+                        }}
                       />
-                    </label>
-                    <label>
-                      Description (optional)
-                      <textarea
-                        value={newProjectDescription}
-                        maxLength={2_000}
-                        rows={2}
-                        onChange={(event) =>
-                          setNewProjectDescription(event.target.value)
+                    ),
+                  }
+                : {})}
+              selectionEditor={
+                selection ? (
+                  <SelectionEditor
+                    selection={selection}
+                    currentMs={currentMs}
+                    authorizationAvailable={Boolean(authorization)}
+                    projects={projects}
+                    projectId={projectId}
+                    creatingProject={creatingProject}
+                    newProjectName={newProjectName}
+                    newProjectDescription={newProjectDescription}
+                    newProjectKind={newProjectKind}
+                    projectBusy={projectBusy}
+                    projectMessage={projectMessage}
+                    clipNotes={clipNotes}
+                    clipFirstComment={clipFirstComment}
+                    clipTags={clipTags}
+                    logged={Boolean(loggedClipId)}
+                    previewingSelection={previewingSelection}
+                    onClear={() => {
+                      playerRef.current?.pause();
+                      setPreviewingSelection(false);
+                      if (selection.selectionType === "player_time_range") {
+                        setPlayerRangeStartMs(undefined);
+                        setPlayerRangeEndMs(undefined);
+                        setPlayerSpeechStatus(undefined);
+                        setPlayerRangeMessage(undefined);
+                        setPlayerNoSpeechAttestation(undefined);
+                      }
+                      setSelection(undefined);
+                      setSelectionError(undefined);
+                      setClipNotes("");
+                      setClipFirstComment("");
+                      setClipTags("");
+                      setClipActionMessage(undefined);
+                      setLoggedClipId(undefined);
+                      setLoggedExportRequestId(undefined);
+                      setExportOnlyRequestId(undefined);
+                    }}
+                    onCreatingProjectChange={setCreatingProject}
+                    onProjectChange={selectProject}
+                    onNewProjectNameChange={setNewProjectName}
+                    onNewProjectDescriptionChange={setNewProjectDescription}
+                    onNewProjectKindChange={setNewProjectKind}
+                    onCreateProject={() => void createProjectFromSelection()}
+                    onClipNotesChange={setClipNotes}
+                    onClipFirstCommentChange={setClipFirstComment}
+                    onClipTagsChange={setClipTags}
+                    transcriptLanguage={transcript?.track.language}
+                    onAttachOverlappingTranscript={attachOverlappingTranscript}
+                    onExportBoundChange={changeExportBound}
+                    onTogglePreview={toggleSelectionPreview}
+                    onAddExportHandles={addExportHandles}
+                    onSetExportBoundFromPlayhead={setExportBoundFromPlayhead}
+                    commandPanel={
+                      <SelectionCommandPanel
+                        loggedPresetSelectionKey={loggedPresetSelectionKey}
+                        exportOnlyPresetSelectionKey={
+                          exportOnlyPresetSelectionKey
                         }
+                        projectPresetOptions={projectPresetOptions}
+                        personalPresetOptions={personalPresetOptions}
+                        presetDiscoveryMessage={presetDiscoveryMessage}
+                        loggedSettingsState={loggedSettingsState}
+                        exportOnlySettingsState={exportOnlySettingsState}
+                        loggedSettingsPreview={loggedSettingsPreview}
+                        exportOnlySettingsPreview={exportOnlySettingsPreview}
+                        overrideFields={overrideFields}
+                        selectedRendererCapabilityId={
+                          selectedRendererCapabilityId
+                        }
+                        installedRendererIds={installedRendererIds}
+                        exportVideoCodec={exportVideoCodec}
+                        exportRateControlMode={exportRateControlMode}
+                        exportVideoBitrate={exportVideoBitrate}
+                        exportCrf={exportCrf}
+                        exportMaxWidth={exportMaxWidth}
+                        exportFrameRate={exportFrameRate}
+                        exportAudioCodec={exportAudioCodec}
+                        exportAudioBitrate={exportAudioBitrate}
+                        exportAudioSampleRate={exportAudioSampleRate}
+                        exportAudioChannels={exportAudioChannels}
+                        omitEnglishSubtitles={omitEnglishSubtitles}
+                        embedEnglishSubtitles={embedEnglishSubtitles}
+                        sourceLanguageClass={sourceLanguageClass}
+                        sourceRights={sourceRights}
+                        sourceRightsConfirmed={sourceRightsConfirmed}
+                        selectedVideoSnapshot={Boolean(selectedVideoSnapshot)}
+                        clipActionBusy={clipActionBusy}
+                        loggedClipId={loggedClipId}
+                        loggedExportRequestId={loggedExportRequestId}
+                        exportOnlyRequestId={exportOnlyRequestId}
+                        authorization={Boolean(authorization)}
+                        projectId={projectId}
+                        user={Boolean(user)}
+                        languageEvidenceReady={languageEvidenceReady}
+                        selectionHasTranscriptEvidence={Boolean(
+                          selectedEvidence,
+                        )}
+                        selectionExportBlockReason={selectionExportBlockReason}
+                        attestedNoSpeech={
+                          selection?.selectionType === "player_time_range" &&
+                          selection.speechStatus === "no_speech"
+                        }
+                        offlineCachedWorkspace={Boolean(offlineCachedWorkspace)}
+                        clipActionMessage={clipActionMessage}
+                        selectionError={selectionError}
+                        setLoggedPresetKey={setLoggedPresetKey}
+                        setExportOnlyPresetKey={setExportOnlyPresetKey}
+                        setOverrideFields={setOverrideFields}
+                        setExportContainer={setExportContainer}
+                        setExportVideoCodec={setExportVideoCodec}
+                        setExportAudioCodec={setExportAudioCodec}
+                        setExportRateControlMode={setExportRateControlMode}
+                        setExportVideoBitrate={setExportVideoBitrate}
+                        setExportCrf={setExportCrf}
+                        setExportMaxWidth={setExportMaxWidth}
+                        setExportFrameRate={setExportFrameRate}
+                        setExportAudioBitrate={setExportAudioBitrate}
+                        setExportAudioSampleRate={setExportAudioSampleRate}
+                        setExportAudioChannels={setExportAudioChannels}
+                        setOmitEnglishSubtitles={setOmitEnglishSubtitles}
+                        setEmbedEnglishSubtitles={setEmbedEnglishSubtitles}
+                        setSourceRightsConfirmed={setSourceRightsConfirmed}
+                        queueClipOnly={queueClipOnly}
+                        requestLoggedExport={requestLoggedExport}
+                        requestExportOnly={requestExportOnly}
+                        copySelectionText={copySelectionText}
                       />
-                    </label>
-                    <button
-                      type="button"
-                      className="handle-button"
-                      disabled={projectBusy || !newProjectName.trim()}
-                      onClick={() => void createProjectFromSelection()}
-                    >
-                      Create and select project
-                    </button>
-                  </div>
-                ) : null}
-                <p className="form-message" role="status">
-                  {projectMessage ??
-                    (authorization
-                      ? projects.length
-                        ? "Logging actions will show this destination explicitly."
-                        : "Connect below to load projects, or create one here."
-                      : "Connect a development session below to choose or create a logging project.")}
-                </p>
-              </div>
-              <div className="clip-research-fields">
-                <label>
-                  Notes / intended use
-                  <textarea
-                    rows={3}
-                    maxLength={20_000}
-                    value={clipNotes}
-                    disabled={Boolean(loggedClipId)}
-                    onChange={(event) => setClipNotes(event.target.value)}
-                    placeholder="How might this clip support the essay?"
-                  />
-                </label>
-                <label>
-                  Clip tags
-                  <input
-                    value={clipTags}
-                    disabled={Boolean(loggedClipId)}
-                    onChange={(event) => setClipTags(event.target.value)}
-                    placeholder="topic, person, argument"
-                  />
-                  <span>Separate reusable project tags with commas.</span>
-                </label>
-              </div>
-              <p className="immutable-bounds">
-                Transcript selection:{" "}
-                {formatPreciseTime(selection.transcriptStartMs)}–
-                {formatPreciseTime(selection.transcriptEndMs)}
-              </p>
-              <div className="export-bounds">
-                <label>
-                  Export start (seconds)
-                  <input
-                    type="number"
-                    min="0"
-                    step="0.1"
-                    disabled={Boolean(loggedClipId)}
-                    value={(selection.exportStartMs / 1_000).toFixed(3)}
-                    onChange={(event) =>
-                      changeExportBound("start", event.target.value)
                     }
                   />
-                </label>
-                <label>
-                  Export end (seconds)
-                  <input
-                    type="number"
-                    min="0.001"
-                    step="0.1"
-                    disabled={Boolean(loggedClipId)}
-                    value={(selection.exportEndMs / 1_000).toFixed(3)}
-                    onChange={(event) =>
-                      changeExportBound("end", event.target.value)
-                    }
-                  />
-                </label>
-              </div>
-              <div className="selection-controls">
-                <button
-                  type="button"
-                  className="handle-button"
-                  onClick={toggleSelectionPreview}
-                >
-                  {previewingSelection ? "Stop preview" : "Loop preview"}
-                </button>
-                <button
-                  type="button"
-                  className="handle-button"
-                  disabled={Boolean(loggedClipId)}
-                  onClick={addExportHandles}
-                >
-                  Add 0.5s handles
-                </button>
-                <button
-                  type="button"
-                  className="handle-button"
-                  disabled={
-                    Boolean(loggedClipId) ||
-                    currentMs > selection.transcriptStartMs ||
-                    currentMs >= selection.exportEndMs
-                  }
-                  onClick={() => setExportBoundFromPlayhead("start")}
-                >
-                  Set start from playhead
-                </button>
-                <button
-                  type="button"
-                  className="handle-button"
-                  disabled={
-                    Boolean(loggedClipId) ||
-                    currentMs < selection.transcriptEndMs ||
-                    currentMs <= selection.exportStartMs
-                  }
-                  onClick={() => setExportBoundFromPlayhead("end")}
-                >
-                  Set end from playhead
-                </button>
-              </div>
-              <section
-                className="preset-picker"
-                aria-label="Conversion preset picker"
-              >
-                <div className="export-settings-grid">
-                  <label>
-                    Logged export preset
-                    <select
-                      value={loggedPresetSelectionKey}
-                      onChange={(event) =>
-                        setLoggedPresetKey(event.target.value)
-                      }
-                    >
-                      {projectPresetOptions.length ? (
-                        <optgroup label="Project presets">
-                          {projectPresetOptions.map((option) => (
-                            <option key={option.key} value={option.key}>
-                              {option.snapshot.name} v
-                              {option.snapshot.presetVersion}
-                              {option.isDefault ? " — project default" : ""}
-                            </option>
-                          ))}
-                        </optgroup>
-                      ) : null}
-                      {personalPresetOptions.length ? (
-                        <optgroup label="Personal presets">
-                          {personalPresetOptions.map((option) => (
-                            <option key={option.key} value={option.key}>
-                              {option.snapshot.name} v
-                              {option.snapshot.presetVersion}
-                              {option.isDefault ? " — personal default" : ""}
-                            </option>
-                          ))}
-                        </optgroup>
-                      ) : null}
-                      <option value={builtInPresetKey}>
-                        Editing MP4 v1 — built-in fallback
-                      </option>
-                    </select>
-                  </label>
-                  <label>
-                    Export-only preset
-                    <select
-                      value={exportOnlyPresetSelectionKey}
-                      onChange={(event) =>
-                        setExportOnlyPresetKey(event.target.value)
-                      }
-                    >
-                      {personalPresetOptions.length ? (
-                        <optgroup label="Personal presets">
-                          {personalPresetOptions.map((option) => (
-                            <option key={option.key} value={option.key}>
-                              {option.snapshot.name} v
-                              {option.snapshot.presetVersion}
-                              {option.isDefault ? " — personal default" : ""}
-                            </option>
-                          ))}
-                        </optgroup>
-                      ) : null}
-                      <option value={builtInPresetKey}>
-                        Editing MP4 v1 — built-in fallback
-                      </option>
-                    </select>
-                  </label>
-                </div>
-                <p className="form-message" role="status">
-                  {presetDiscoveryMessage}
-                </p>
-                <p className="muted">
-                  Logged settings: {loggedSettingsState}. Export-only settings:{" "}
-                  {exportOnlySettingsState}. Preset versions are resolved by the
-                  authoritative service and creation must match this preview.
-                </p>
-                {loggedSettingsPreview ? (
-                  <p className="muted" data-testid="logged-settings-summary">
-                    Logged provenance: Editing application v1
-                    {loggedSettingsPreview.snapshot.base ===
-                    "application_default"
-                      ? " → application base selected"
-                      : loggedSettingsPreview.snapshot.contextDefault
-                        ? ` → project default ${loggedSettingsPreview.snapshot.contextDefault.name} v${loggedSettingsPreview.snapshot.contextDefault.presetVersion}`
-                        : " → no project default"}
-                    {loggedSettingsPreview.snapshot.selectedPreset
-                      ? ` → selected ${loggedSettingsPreview.snapshot.selectedPresetScope} ${loggedSettingsPreview.snapshot.selectedPreset.name} v${loggedSettingsPreview.snapshot.selectedPreset.presetVersion}`
-                      : " → no explicit preset"}
-                    {loggedSettingsPreview.snapshot.overrideFields.length
-                      ? ` → overrides ${loggedSettingsPreview.snapshot.overrideFields.join(", ")}`
-                      : " → no overrides"}
-                    . Effective:{" "}
-                    {loggedSettingsPreview.snapshot.settings.container.toUpperCase()}{" "}
-                    /{" "}
-                    {loggedSettingsPreview.snapshot.settings.videoCodec.toUpperCase()}{" "}
-                    / {loggedSettingsPreview.snapshot.settings.frameRate} fps.
-                    Sidecars:{" "}
-                    {loggedSettingsPreview.effectiveSubtitlePolicy.requiredSidecars.join(
-                      " + ",
-                    ) || "omitted for confidently English"}
-                    .
-                  </p>
-                ) : null}
-                {exportOnlySettingsPreview ? (
-                  <p
-                    className="muted"
-                    data-testid="export-only-settings-summary"
-                  >
-                    Export-only provenance: Editing application v1
-                    {exportOnlySettingsPreview.snapshot.base ===
-                    "application_default"
-                      ? " → application base selected"
-                      : exportOnlySettingsPreview.snapshot.contextDefault
-                        ? ` → personal default ${exportOnlySettingsPreview.snapshot.contextDefault.name} v${exportOnlySettingsPreview.snapshot.contextDefault.presetVersion}`
-                        : " → no personal default"}
-                    {exportOnlySettingsPreview.snapshot.selectedPreset
-                      ? ` → selected personal ${exportOnlySettingsPreview.snapshot.selectedPreset.name} v${exportOnlySettingsPreview.snapshot.selectedPreset.presetVersion}`
-                      : " → no explicit preset"}
-                    {exportOnlySettingsPreview.snapshot.overrideFields.length
-                      ? ` → overrides ${exportOnlySettingsPreview.snapshot.overrideFields.join(", ")}`
-                      : " → no overrides"}
-                    . Effective:{" "}
-                    {exportOnlySettingsPreview.snapshot.settings.container.toUpperCase()}{" "}
-                    /{" "}
-                    {exportOnlySettingsPreview.snapshot.settings.videoCodec.toUpperCase()}{" "}
-                    / {exportOnlySettingsPreview.snapshot.settings.frameRate}{" "}
-                    fps. Sidecars:{" "}
-                    {exportOnlySettingsPreview.effectiveSubtitlePolicy.requiredSidecars.join(
-                      " + ",
-                    ) || "omitted for confidently English"}
-                    .
-                  </p>
-                ) : null}
-                {[
-                  ...(loggedSettingsPreview?.issues ?? []),
-                  ...(exportOnlySettingsPreview?.issues ?? []),
-                ].map((issue, index) => (
-                  <p
-                    className="form-message error"
-                    key={`${issue.field}:${issue.code}:${index}`}
-                  >
-                    {issue.field}: {issue.message}
-                  </p>
-                ))}
-              </section>
-              <details className="export-settings-panel">
-                <summary>Per-export overrides</summary>
-                <p className="muted">
-                  {overrideFields.size
-                    ? `Overrides: ${[...overrideFields].join(", ")}`
-                    : "No overrides; the resolved base is used unchanged."}
-                  {overrideFields.size ? (
-                    <button
-                      type="button"
-                      className="handle-button"
-                      onClick={() => setOverrideFields(new Set())}
-                    >
-                      Reset all overrides
-                    </button>
-                  ) : null}
-                </p>
-                <div className="export-settings-grid">
-                  <label>
-                    Rendering family
-                    <select
-                      value={selectedRendererCapabilityId}
-                      onChange={(event) => {
-                        const rendererCapabilityId = event.target.value;
-                        setOverrideFields(
-                          (current) =>
-                            new Set([
-                              ...current,
-                              "container",
-                              "videoCodec",
-                              "videoRateControl",
-                              "audioCodec",
-                              "audioKilobitsPerSecond",
-                            ]),
-                        );
-                        if (rendererCapabilityId === "h264_mp4") {
-                          setExportContainer("mp4");
-                          setExportVideoCodec("h264");
-                          setExportAudioCodec("aac");
-                          if (exportRateControlMode === "codec_default")
-                            setExportRateControlMode("crf");
-                          return;
-                        }
-                        if (rendererCapabilityId === "hevc_mkv") {
-                          setExportContainer("mkv");
-                          setExportVideoCodec("hevc");
-                          setExportAudioCodec("aac");
-                          if (exportRateControlMode === "codec_default")
-                            setExportRateControlMode("crf");
-                          return;
-                        }
-                        setExportContainer("mov");
-                        setExportVideoCodec("prores");
-                        setExportAudioCodec("pcm_s16le");
-                        setExportRateControlMode("codec_default");
-                        setExportAudioBitrate(undefined);
-                      }}
-                    >
-                      <option value="h264_mp4">
-                        MP4 · H.264 High · AAC
-                        {installedRendererIds &&
-                        !installedRendererIds.has("h264_mp4")
-                          ? " — unavailable for local export-only"
-                          : ""}
-                      </option>
-                      <option value="hevc_mkv">
-                        MKV · HEVC Main · AAC
-                        {installedRendererIds &&
-                        !installedRendererIds.has("hevc_mkv")
-                          ? " — unavailable for local export-only"
-                          : ""}
-                      </option>
-                      <option value="prores_mov">
-                        MOV · ProRes 422 · PCM
-                        {installedRendererIds &&
-                        !installedRendererIds.has("prores_mov")
-                          ? " — unavailable for local export-only"
-                          : ""}
-                      </option>
-                    </select>
-                  </label>
-                  <label>
-                    Rate control
-                    <select
-                      value={exportRateControlMode}
-                      disabled={exportVideoCodec === "prores"}
-                      onChange={(event) => {
-                        setOverrideFields((current) =>
-                          new Set(current).add("videoRateControl"),
-                        );
-                        setExportRateControlMode(
-                          event.target.value as "crf" | "bitrate",
-                        );
-                      }}
-                    >
-                      {exportVideoCodec === "prores" ? (
-                        <option value="codec_default">Codec fixed</option>
-                      ) : (
-                        <>
-                          <option value="crf">CRF</option>
-                          <option value="bitrate">Target bitrate</option>
-                        </>
-                      )}
-                    </select>
-                  </label>
-                  <label>
-                    {exportRateControlMode === "bitrate"
-                      ? "Video bitrate (kbps)"
-                      : exportRateControlMode === "crf"
-                        ? "Quality (CRF)"
-                        : "Codec profile"}
-                    <input
-                      type="number"
-                      min={exportRateControlMode === "bitrate" ? 500 : 0}
-                      max={exportRateControlMode === "bitrate" ? 200_000 : 51}
-                      disabled={exportRateControlMode === "codec_default"}
-                      value={
-                        exportRateControlMode === "bitrate"
-                          ? exportVideoBitrate
-                          : exportRateControlMode === "crf"
-                            ? exportCrf
-                            : ""
-                      }
-                      placeholder="ProRes 422"
-                      onChange={(event) => {
-                        const value = Number(event.target.value);
-                        if (!Number.isInteger(value)) return;
-                        if (
-                          exportRateControlMode === "crf" &&
-                          value >= 0 &&
-                          value <= 51
-                        )
-                          setExportCrf(value);
-                        if (
-                          exportRateControlMode === "bitrate" &&
-                          value >= 500 &&
-                          value <= 200_000
-                        )
-                          setExportVideoBitrate(value);
-                        setOverrideFields((current) =>
-                          new Set(current).add("videoRateControl"),
-                        );
-                      }}
-                    />
-                  </label>
-                  <label>
-                    Maximum width
-                    <select
-                      value={exportMaxWidth ?? "source"}
-                      onChange={(event) => {
-                        setOverrideFields((current) =>
-                          new Set(current).add("maxWidth"),
-                        );
-                        if (event.target.value === "source") {
-                          setExportMaxWidth(undefined);
-                          return;
-                        }
-                        setExportMaxWidth(Number(event.target.value));
-                      }}
-                    >
-                      <option value="source">Source</option>
-                      <option value="640">640</option>
-                      <option value="1280">1280</option>
-                      <option value="1920">1920</option>
-                      <option value="3840">3840</option>
-                    </select>
-                  </label>
-                  <label>
-                    Frame rate
-                    <select
-                      value={exportFrameRate}
-                      onChange={(event) => (
-                        setOverrideFields((current) =>
-                          new Set(current).add("frameRate"),
-                        ),
-                        setExportFrameRate(
-                          event.target.value as
-                            "source" | "23.976" | "24" | "25" | "29.97" | "30",
-                        )
-                      )}
-                    >
-                      <option value="source">Source</option>
-                      <option value="23.976">23.976</option>
-                      <option value="24">24</option>
-                      <option value="25">25</option>
-                      <option value="29.97">29.97</option>
-                      <option value="30">30</option>
-                    </select>
-                  </label>
-                  <label>
-                    {exportAudioCodec === "aac"
-                      ? "AAC audio (kbps)"
-                      : "PCM audio bitrate"}
-                    <select
-                      value={exportAudioBitrate ?? "default"}
-                      disabled={exportAudioCodec !== "aac"}
-                      onChange={(event) => {
-                        setOverrideFields((current) =>
-                          new Set(current).add("audioKilobitsPerSecond"),
-                        );
-                        if (event.target.value === "default") {
-                          setExportAudioBitrate(undefined);
-                          return;
-                        }
-                        setExportAudioBitrate(Number(event.target.value));
-                      }}
-                    >
-                      {exportAudioCodec === "aac" ? (
-                        <>
-                          <option value="default">Adapter default</option>
-                          <option value="96">96</option>
-                          <option value="128">128</option>
-                          <option value="192">192</option>
-                          <option value="256">256</option>
-                          <option value="320">320</option>
-                        </>
-                      ) : (
-                        <option value="default">Not applicable</option>
-                      )}
-                    </select>
-                  </label>
-                  <label>
-                    Audio sample rate
-                    <select
-                      value={exportAudioSampleRate}
-                      onChange={(event) => {
-                        setOverrideFields((current) =>
-                          new Set(current).add("audioSampleRate"),
-                        );
-                        setExportAudioSampleRate(
-                          event.target.value as "source" | "44100" | "48000",
-                        );
-                      }}
-                    >
-                      <option value="source">Source</option>
-                      <option value="44100">44.1 kHz</option>
-                      <option value="48000">48 kHz</option>
-                    </select>
-                  </label>
-                  <label>
-                    Audio channels
-                    <select
-                      value={exportAudioChannels}
-                      onChange={(event) => {
-                        setOverrideFields((current) =>
-                          new Set(current).add("audioChannels"),
-                        );
-                        setExportAudioChannels(
-                          event.target.value as "source" | "1" | "2",
-                        );
-                      }}
-                    >
-                      <option value="source">Source</option>
-                      <option value="1">Mono</option>
-                      <option value="2">Stereo</option>
-                    </select>
-                  </label>
-                </div>
-                {installedRendererIds ? (
-                  <p className="muted">
-                    Export-only availability reflects this local worker. Logged
-                    export availability remains canonical until a worker is
-                    registered for delivery.
-                  </p>
-                ) : null}
-                <label className="export-checkbox">
-                  <input
-                    type="checkbox"
-                    checked={omitEnglishSubtitles}
-                    disabled={sourceLanguageClass !== "confirmed_english"}
-                    onChange={(event) => {
-                      setOverrideFields((current) =>
-                        new Set(current).add(
-                          "omitSubtitleFilesForConfirmedEnglish",
-                        ),
-                      );
-                      setOmitEnglishSubtitles(event.target.checked);
-                    }}
-                  />
-                  Omit subtitle files for confirmed-English videos
-                </label>
-                {sourceLanguageClass !== "confirmed_english" ? (
-                  <p className="muted">
-                    Omission is ineligible here: foreign, mixed, and unknown
-                    sources always require original + English sidecars. A saved
-                    true preference remains inert in the immutable settings.
-                  </p>
-                ) : null}
-                <label className="export-checkbox">
-                  <input
-                    type="checkbox"
-                    checked={embedEnglishSubtitles}
-                    disabled={exportOnlySettingsState !== "ready"}
-                    onChange={(event) => {
-                      setOverrideFields((current) =>
-                        new Set(current).add("embedEnglishSubtitleTrack"),
-                      );
-                      setEmbedEnglishSubtitles(event.target.checked);
-                    }}
-                  />
-                  Embed an English soft-subtitle track
-                </label>
-                {exportOnlySettingsState !== "ready" ? (
-                  <p className="muted">
-                    Resolve an eligible local renderer before enabling English
-                    soft subtitles.
-                  </p>
-                ) : null}
-              </details>
-              <p className="muted">
-                Export source: YouTube video ID{" "}
-                {sourceRights?.youtubeVideoId ?? "unavailable"}
-              </p>
-              <label className="export-checkbox">
-                <input
-                  type="checkbox"
-                  checked={sourceRightsConfirmed}
-                  disabled={!selectedVideoSnapshot}
-                  onChange={(event) =>
-                    setSourceRightsConfirmed(event.target.checked)
-                  }
-                />
-                I confirm I am authorized to process this exact YouTube source
-                for export.
-              </label>
-              <div className="selection-actions">
-                <button
-                  type="button"
-                  className="primary-action"
-                  disabled={
-                    clipActionBusy ||
-                    Boolean(loggedClipId) ||
-                    !authorization ||
-                    !projectId ||
-                    !user ||
-                    !selectedVideoSnapshot ||
-                    !languageEvidenceReady ||
-                    offlineCachedWorkspace
-                  }
-                  onClick={() => void queueClipOnly()}
-                >
-                  {loggedClipId ? "Logged" : "Queue / log only"}
-                </button>
-                <button
-                  type="button"
-                  disabled={
-                    clipActionBusy ||
-                    Boolean(loggedExportRequestId) ||
-                    !authorization ||
-                    !projectId ||
-                    !user ||
-                    !selectedVideoSnapshot ||
-                    !languageEvidenceReady ||
-                    offlineCachedWorkspace ||
-                    !sourceRightsConfirmed ||
-                    loggedSettingsState !== "ready"
-                  }
-                  onClick={() => void requestLoggedExport()}
-                >
-                  {loggedExportRequestId ? "Export queued" : "Export + log"}
-                </button>
-                <button
-                  type="button"
-                  disabled={
-                    clipActionBusy ||
-                    Boolean(exportOnlyRequestId) ||
-                    !selectedVideoSnapshot ||
-                    !sourceRightsConfirmed ||
-                    exportOnlySettingsState !== "ready"
-                  }
-                  onClick={() => void requestExportOnly()}
-                >
-                  {exportOnlyRequestId ? "Export-only queued" : "Export only"}
-                </button>
-                <button type="button" onClick={() => void copySelectionText()}>
-                  Copy
-                </button>
-              </div>
-              <span className="selection-action-help">
-                Queue-only starts no media work. Export-only creates no project
-                research record.
-              </span>
-              <p className="form-message" role="status">
-                {clipActionMessage ??
-                  (!projectId
-                    ? "Choose a visible project before logging this selection."
-                    : "Ready to log this selection without exporting it.")}
-              </p>
-              <p
-                className={
-                  selectionError ? "form-message error" : "form-message"
-                }
-              >
-                {selectionError ??
-                  "Export padding is adjustable; the transcript selection remains unchanged."}
-              </p>
-            </section>
-          ) : null}
-        </aside>
-      </section>
-      <BatchWorkspace
-        authorization={authorization}
-        {...(desktopAuthStatus ? { desktopAuthStatus } : {})}
-        onDesktopSignIn={beginDesktopSignIn}
-        onDesktopSignOut={completeDesktopSignOut}
-        onAuthorizationChange={(value) => {
-          setAuthorization(value);
-          setProjects([]);
-          selectProject("");
-          setProjectMessage(undefined);
-        }}
-        onOpenVideo={loadVideoUrl}
-        onOpenReadyVideo={(target) => {
-          openProjectVideo(target);
-          window.scrollTo({ top: 0, behavior: "smooth" });
-        }}
-        onProjectChange={selectProject}
-        onProjectsChange={setProjects}
-        projectId={projectId}
-        projects={projects}
-      />
-    </main>
+                ) : null
+              }
+            />
+          }
+        />
+      }
+      projectContent={
+        <BatchWorkspace
+          authorization={authorization}
+          {...(user ? { currentUserId: user.id } : {})}
+          {...(desktopAuthStatus ? { desktopAuthStatus } : {})}
+          onDesktopSignIn={beginDesktopSignIn}
+          onDesktopSignOut={completeDesktopSignOut}
+          onAuthorizationChange={(value) => {
+            recentProjectValidation.current = undefined;
+            setRecentProjectReadyIdentity(undefined);
+            setNavigationBackStack([]);
+            pendingNavigationRestore.current = undefined;
+            hydratedNavigationIdentity.current = undefined;
+            setAuthorization(value);
+            setProjects([]);
+            setProjectsLoaded(false);
+            selectProject("");
+            setProjectMessage(undefined);
+          }}
+          onOpenSourceClip={(target) =>
+            openProjectVideo({
+              projectId: target.projectId,
+              catalogVideoId: target.catalogVideoId,
+              youtubeVideoId: target.youtubeVideoId,
+              canonicalUrl: target.canonicalUrl,
+              title: target.title,
+              clipSource: {
+                clipId: target.clipId,
+                selection: target.selection,
+                ...(target.fallbackNotice
+                  ? { fallbackNotice: target.fallbackNotice }
+                  : {}),
+                ...(target.sourceTimeMs === undefined
+                  ? {}
+                  : { sourceTimeMs: target.sourceTimeMs }),
+              },
+            })
+          }
+          onOpenReadyVideo={(target) => {
+            openProjectVideo(target);
+            window.scrollTo({ top: 0, behavior: "smooth" });
+          }}
+          onProjectChange={selectProject}
+          onProjectsChange={(nextProjects) => {
+            setProjects(nextProjects);
+            setProjectsLoaded(Boolean(authorization));
+          }}
+          onUnreadActivityChange={setUnreadActivityCount}
+          projectId={projectId}
+          projects={projects}
+          destination={destination}
+          {...(notificationTarget ? { notificationTarget } : {})}
+          bulkAddRequest={bulkAddRequest}
+          {...(searchBatchRequest
+            ? { externalInputsRequest: searchBatchRequest }
+            : {})}
+        />
+      }
+    />
   );
 }
 

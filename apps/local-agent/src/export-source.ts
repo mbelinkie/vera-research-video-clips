@@ -38,6 +38,8 @@ import {
   type ExportClipManifest,
   type ExportClipMetadata,
   type ExportRequest,
+  type NoSpeechAttestation,
+  type SubtitleSidecarProvenance,
   type LoggedExportProgressStage,
   type NormalizedTranscript,
   type RenderedExportMediaProvenance,
@@ -55,6 +57,7 @@ import {
   deriveClipRelativeSrtCues,
   parseSrt,
   serializeSrtCues,
+  SrtValidationError,
   validateClipRelativeSrtCues,
 } from "@research-video/transcript";
 
@@ -381,7 +384,21 @@ export class LocalExportSourceProcessor {
           },
         );
         this.recordProgress(started.request, "building_subtitles", 7_500);
-        if (subtitlePlan.policy === "confirmed_english_omission") {
+        if (subtitlePlan.policy === "attested_no_speech") {
+          const sidecars = await stageAndValidateEmptySidecars({
+            stagingDirectory: scratchDirectory,
+            renderedOutputPath: outputPath,
+            renderedDurationMs: outputInspection.durationMs,
+            sidecars: subtitlePlan.emptySidecars!,
+            noSpeechAttestation: subtitlePlan.noSpeechAttestation!,
+            ...(input.signal ? { signal: input.signal } : {}),
+          });
+          this.queue.recordNoSpeechSubtitleValidation(
+            started.request.jobId,
+            started.attempt,
+            sidecars,
+          );
+        } else if (subtitlePlan.policy === "confirmed_english_omission") {
           await assertNoStagedSrtFiles(scratchDirectory);
           this.queue.recordConfirmedEnglishSubtitleOmission(
             started.request.jobId,
@@ -408,7 +425,10 @@ export class LocalExportSourceProcessor {
             this.queue.recordBilingualSubtitleValidation(
               started.request.jobId,
               started.attempt,
-              sidecars as [SidecarValidation, SidecarValidation],
+              sidecars as [
+                TranscriptSidecarValidation,
+                TranscriptSidecarValidation,
+              ],
             );
           }
         }
@@ -583,14 +603,25 @@ function abortReason(
 }
 
 type RequiredSubtitlePlan = {
-  policy: "confirmed_english" | "confirmed_english_omission" | "bilingual";
+  policy:
+    | "confirmed_english"
+    | "confirmed_english_omission"
+    | "bilingual"
+    | "attested_no_speech";
   sidecars: readonly RequiredSidecar[];
+  emptySidecars?: readonly EmptyRequiredSidecar[];
+  noSpeechAttestation?: NoSpeechAttestation;
   english?: NormalizedTranscript;
 };
 
 type RequiredSidecar = {
   role: "original" | "english";
   transcript: NormalizedTranscript;
+};
+
+type EmptyRequiredSidecar = {
+  role: "original" | "english";
+  language: string;
 };
 
 type FinalArtifact = {
@@ -614,7 +645,7 @@ type StagedArtifactDigest = { byteSize: number; contentSha256: string };
 
 const ClipManifestName = "manifest.json";
 
-type SidecarValidation = {
+type TranscriptSidecarValidation = {
   role: "original" | "english";
   language: string;
   trackId: string;
@@ -626,11 +657,74 @@ type SidecarValidation = {
   endMs: number;
 };
 
+type EmptySidecarValidation = {
+  role: "original" | "english";
+  language: string;
+  emptyReason: "attested_no_speech";
+  noSpeechAttestation: NoSpeechAttestation;
+  cueCount: 0;
+  byteSize: number;
+  contentSha256: string;
+  startMs: 0;
+  endMs: 0;
+};
+
+type SidecarValidation = TranscriptSidecarValidation | EmptySidecarValidation;
+
 function resolveRequiredSubtitlePlan(
   queue: LocalExportQueue,
   request: ExportRequest,
   settings: ExportRequest["preset"]["settings"],
 ): RequiredSubtitlePlan {
+  if (request.noSpeechAttestation) {
+    if (
+      request.selection.selectionType !== "player_time_range" ||
+      request.selection.speechStatus !== "no_speech" ||
+      sha256Fingerprint(request.selection.noSpeechAttestation) !==
+        sha256Fingerprint(request.noSpeechAttestation)
+    ) {
+      throw new ExportSourceAcquisitionError(
+        "The no-speech attestation does not match the immutable player selection. Recreate the export request.",
+        { code: "no_speech_attestation_mismatched", retryable: false },
+      );
+    }
+    if (settings.embedEnglishSubtitleTrack) {
+      throw new ExportSourceAcquisitionError(
+        "An attested no-speech export cannot embed an empty subtitle stream. Disable embedded subtitles and retry.",
+        { code: "no_speech_embedded_subtitle_unsupported", retryable: false },
+      );
+    }
+    const originalLanguage =
+      request.video.sourceLanguage &&
+      request.video.sourceLanguage.trim().length >= 2
+        ? request.video.sourceLanguage
+        : "und";
+    return {
+      policy: "attested_no_speech",
+      sidecars: [],
+      emptySidecars:
+        request.sourceLanguageClass === "confirmed_english"
+          ? [{ role: "english", language: "en" }]
+          : [
+              { role: "original", language: originalLanguage },
+              { role: "english", language: "en" },
+            ],
+      noSpeechAttestation: request.noSpeechAttestation,
+    };
+  }
+  const transcriptSelection =
+    request.selection.selectionType === "player_time_range"
+      ? request.selection.transcriptAttachment
+      : request.selection;
+  if (!transcriptSelection) {
+    throw new ExportSourceAcquisitionError(
+      request.selection.selectionType === "player_time_range" &&
+        request.selection.speechStatus === "transcript_unavailable"
+        ? "Transcript-unavailable ranges can be logged, but export requires a new selection with exact transcript evidence."
+        : "This speech range requires exact attached transcript evidence before export.",
+      { code: "export_transcript_evidence_missing", retryable: false },
+    );
+  }
   if (request.sourceLanguageClass === "confirmed_english") {
     if (
       settings.embedEnglishSubtitleTrack &&
@@ -656,8 +750,8 @@ function resolveRequiredSubtitlePlan(
         )
       : resolveExactEnglishTranscript(
           queue,
-          request.selection.trackId,
-          request.selection.transcriptVersion,
+          transcriptSelection.trackId,
+          transcriptSelection.transcriptVersion,
           request.video.youtubeVideoId,
         );
     if (settings.omitSubtitleFilesForConfirmedEnglish) {
@@ -880,21 +974,17 @@ async function promoteVerifiedFinalPackage(input: {
   }
 }
 
+type PackageSubtitleSidecar = SubtitleSidecarProvenance extends infer Sidecar
+  ? Sidecar extends unknown
+    ? Omit<Sidecar, "validatedAt">
+    : never
+  : never;
+
 type VerifiedPackageArtifact = {
   role: FinalArtifact["role"];
   stagedName: string;
   finalName: string;
-  sidecar?: {
-    language: string;
-    trackId: string;
-    trackVersion: number;
-    cueCount: number;
-    byteSize: number;
-    contentSha256: string;
-    startMs: number;
-    endMs: number;
-    sourceAttempt: number;
-  };
+  sidecar?: PackageSubtitleSidecar;
   thumbnail?: {
     extractionTimeMs: number;
     width: number;
@@ -968,6 +1058,51 @@ function resolveVerifiedPackagePolicy(
     finalName: `clip-${request.id}.jpg`,
     thumbnail,
   };
+  if (request.noSpeechAttestation) {
+    const sidecars = request.subtitleSidecars;
+    const expectedRoles: readonly ("english" | "original")[] =
+      request.sourceLanguageClass === "confirmed_english"
+        ? ["english"]
+        : ["english", "original"];
+    const actualRoles = sidecars?.map((sidecar) => sidecar.role).sort() ?? [];
+    if (
+      !sidecars ||
+      sidecars.length !== expectedRoles.length ||
+      expectedRoles.some((role, index) => actualRoles[index] !== role) ||
+      sidecars.some(
+        (sidecar) =>
+          sidecar.sourceAttempt !== attempt ||
+          !("emptyReason" in sidecar) ||
+          sidecar.emptyReason !== "attested_no_speech" ||
+          sha256Fingerprint(sidecar.noSpeechAttestation) !==
+            sha256Fingerprint(request.noSpeechAttestation),
+      )
+    ) {
+      throw new ExportSourceAcquisitionError(
+        "The attested empty subtitle provenance is unavailable for this source attempt. Retry this export.",
+        { code: "no_speech_subtitle_provenance_missing", retryable: true },
+      );
+    }
+    const artifacts = sidecars.map((sidecar) => ({
+      role:
+        sidecar.role === "english"
+          ? ("english_srt" as const)
+          : ("original_srt" as const),
+      stagedName: `${sidecar.role}.srt`,
+      finalName:
+        sidecar.role === "english"
+          ? `clip-${request.id}.en.srt`
+          : `clip-${request.id}.original.srt`,
+      sidecar,
+    }));
+    return {
+      rendered,
+      bounds,
+      thumbnail,
+      requiredSidecars: expectedRoles,
+      artifacts: [video, ...artifacts, metadata, thumbnailArtifact, manifest],
+    };
+  }
   if (request.sourceLanguageClass === "confirmed_english") {
     if (
       request.resolvedSettingsSnapshot!.settings
@@ -1012,7 +1147,7 @@ function resolveVerifiedPackagePolicy(
           finalName: `clip-${request.id}.en.srt`,
           // A confirmed-English request snapshots no sidecar language because
           // its verified track is already proven English before derivation.
-          sidecar: { ...english, language: "en" },
+          sidecar: { ...english, role: "english", language: "en" },
         },
         metadata,
         thumbnailArtifact,
@@ -1125,6 +1260,9 @@ function buildVerifiedClipManifest(input: {
       ...(policy.omittedReason
         ? { subtitleSidecarsOmittedReason: policy.omittedReason }
         : {}),
+      ...(request.noSpeechAttestation
+        ? { noSpeechAttestation: request.noSpeechAttestation }
+        : {}),
     },
     toolVersions: {
       ffprobeVersion: policy.rendered.ffprobeVersion,
@@ -1158,17 +1296,33 @@ function buildVerifiedClipManifest(input: {
           contentSha256: digest.contentSha256,
           ...(artifact.sidecar
             ? {
-                subtitle: {
-                  language: artifact.sidecar.language,
-                  trackId: artifact.sidecar.trackId,
-                  trackVersion: artifact.sidecar.trackVersion,
-                  // The snapshotted selection carries the only honest timing
-                  // precision this slice persists; it is never upgraded here.
-                  timingPrecision: request.selection.timingPrecision,
-                  cueCount: artifact.sidecar.cueCount,
-                  startMs: artifact.sidecar.startMs,
-                  endMs: artifact.sidecar.endMs,
-                },
+                subtitle:
+                  "emptyReason" in artifact.sidecar
+                    ? {
+                        language: artifact.sidecar.language,
+                        emptyReason: artifact.sidecar.emptyReason,
+                        noSpeechAttestation:
+                          artifact.sidecar.noSpeechAttestation,
+                        cueCount: 0 as const,
+                        startMs: 0 as const,
+                        endMs: 0 as const,
+                      }
+                    : {
+                        language: artifact.sidecar.language,
+                        trackId: artifact.sidecar.trackId,
+                        trackVersion: artifact.sidecar.trackVersion,
+                        // Player selections retain their exact attached
+                        // transcript precision without changing origin.
+                        timingPrecision:
+                          request.selection.selectionType ===
+                          "player_time_range"
+                            ? request.selection.transcriptAttachment!
+                                .timingPrecision
+                            : request.selection.timingPrecision,
+                        cueCount: artifact.sidecar.cueCount,
+                        startMs: artifact.sidecar.startMs,
+                        endMs: artifact.sidecar.endMs,
+                      },
               }
             : {}),
           ...(artifact.thumbnail
@@ -1228,6 +1382,9 @@ function buildVerifiedClipMetadata(input: {
     video: request.video,
     sourceLanguageClass: request.sourceLanguageClass,
     selection: request.selection,
+    ...(request.noSpeechAttestation
+      ? { noSpeechAttestation: request.noSpeechAttestation }
+      : {}),
     resolvedExportBounds: {
       startMs: policy.bounds.startMs,
       endMs: policy.bounds.endMs,
@@ -1267,6 +1424,9 @@ function buildVerifiedClipMetadata(input: {
       requiredSidecars: [...policy.requiredSidecars],
       ...(policy.omittedReason
         ? { subtitleSidecarsOmittedReason: policy.omittedReason }
+        : {}),
+      ...(request.noSpeechAttestation
+        ? { noSpeechAttestation: request.noSpeechAttestation }
         : {}),
     },
     ...(request.subtitleTracks
@@ -1449,10 +1609,15 @@ async function validateStagedPackage(input: {
     const contentSha256 = createHash("sha256").update(contents).digest("hex");
     if (artifact.sidecar) {
       try {
-        validateClipRelativeSrtCues(
-          parseSrt(contents),
-          input.policy.rendered.durationMs,
-        );
+        if ("emptyReason" in artifact.sidecar) {
+          if (parseAttestedEmptySrtCueCount(contents) !== 0)
+            throw new Error("empty sidecar contains cues");
+        } else {
+          validateClipRelativeSrtCues(
+            parseSrt(contents),
+            input.policy.rendered.durationMs,
+          );
+        }
       } catch {
         throw new ExportSourceAcquisitionError(
           "Validated subtitle staging is malformed. Retry this export.",
@@ -1651,14 +1816,14 @@ async function stageAndValidateRequiredSidecars(input: {
   resolvedStartMs: number;
   resolvedEndMs: number;
   signal?: AbortSignal;
-}): Promise<SidecarValidation[]> {
+}): Promise<TranscriptSidecarValidation[]> {
   throwIfSubtitleCanceled(input.signal);
   await regularNonemptyStagedFile(
     input.renderedOutputPath,
     "Rendered output",
     "render_output_invalid",
   );
-  const validations: SidecarValidation[] = [];
+  const validations: TranscriptSidecarValidation[] = [];
   for (const sidecar of input.sidecars) {
     validations.push(
       await stageAndValidateSidecar({
@@ -1678,7 +1843,7 @@ async function stageAndValidateSidecar(input: {
   resolvedStartMs: number;
   resolvedEndMs: number;
   signal?: AbortSignal;
-}): Promise<SidecarValidation> {
+}): Promise<TranscriptSidecarValidation> {
   const label = input.sidecar.role === "english" ? "English" : "Original";
   const cues = deriveClipRelativeSrtCues({
     transcript: input.sidecar.transcript,
@@ -1761,6 +1926,95 @@ async function stageAndValidateSidecar(input: {
     startMs: Math.min(...parsed.map((cue) => cue.startMs)),
     endMs: Math.max(...parsed.map((cue) => cue.endMs)),
   };
+}
+
+async function stageAndValidateEmptySidecars(input: {
+  stagingDirectory: string;
+  renderedOutputPath: string;
+  renderedDurationMs: number;
+  sidecars: readonly EmptyRequiredSidecar[];
+  noSpeechAttestation: NoSpeechAttestation;
+  signal?: AbortSignal;
+}): Promise<EmptySidecarValidation[]> {
+  throwIfSubtitleCanceled(input.signal);
+  await regularNonemptyStagedFile(
+    input.renderedOutputPath,
+    "Rendered output",
+    "render_output_invalid",
+  );
+  if (input.renderedDurationMs <= 0) {
+    throw new ExportSourceAcquisitionError(
+      "The rendered no-speech range has invalid duration.",
+      { code: "render_output_invalid", retryable: false },
+    );
+  }
+  const validations: EmptySidecarValidation[] = [];
+  for (const sidecar of input.sidecars) {
+    throwIfSubtitleCanceled(input.signal);
+    const label = sidecar.role === "english" ? "English" : "Original";
+    const sidecarPath = join(input.stagingDirectory, `${sidecar.role}.srt`);
+    if (!isInsideStaging(input.stagingDirectory, sidecarPath)) {
+      throw new ExportSourceAcquisitionError(
+        `${label} empty subtitle staging is invalid.`,
+        {
+          code: `${sidecar.role}_subtitle_staging_invalid`,
+          retryable: false,
+        },
+      );
+    }
+    const bytes = Buffer.from("\n", "utf8");
+    try {
+      await writeFile(sidecarPath, bytes, { flag: "wx", mode: 0o600 });
+    } catch {
+      throw new ExportSourceAcquisitionError(
+        `The ${label.toLocaleLowerCase()} empty subtitle sidecar could not be staged.`,
+        {
+          code: `${sidecar.role}_subtitle_staging_failed`,
+          retryable: true,
+        },
+      );
+    }
+    const staged = await regularNonemptyStagedFile(
+      sidecarPath,
+      `${label} empty subtitle sidecar`,
+      `${sidecar.role}_subtitle_file_invalid`,
+    );
+    const persisted = await readFile(sidecarPath);
+    const cueCount = parseAttestedEmptySrtCueCount(persisted);
+    if (cueCount !== 0) {
+      throw new ExportSourceAcquisitionError(
+        `${label} no-speech subtitle sidecar unexpectedly contains cues.`,
+        {
+          code: `${sidecar.role}_empty_subtitle_not_empty`,
+          retryable: false,
+        },
+      );
+    }
+    validations.push({
+      role: sidecar.role,
+      language: sidecar.language,
+      emptyReason: "attested_no_speech",
+      noSpeechAttestation: input.noSpeechAttestation,
+      cueCount: 0,
+      byteSize: staged.size,
+      contentSha256: createHash("sha256").update(persisted).digest("hex"),
+      startMs: 0,
+      endMs: 0,
+    });
+  }
+  throwIfSubtitleCanceled(input.signal);
+  return validations;
+}
+
+function parseAttestedEmptySrtCueCount(contents: Uint8Array): number {
+  try {
+    return parseSrt(contents).length;
+  } catch (error) {
+    if (error instanceof SrtValidationError && error.code === "srt_empty") {
+      return 0;
+    }
+    throw error;
+  }
 }
 
 async function regularNonemptyStagedFile(

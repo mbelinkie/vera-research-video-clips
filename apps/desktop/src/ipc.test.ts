@@ -44,6 +44,11 @@ describe("desktop IPC channel vocabulary", () => {
       "desktop:start-model-download",
       "desktop:cancel-model-download",
       "desktop:model-download-progress",
+      "desktop:timed-transcript-upload",
+      "desktop:get-notification-preferences",
+      "desktop:update-notification-preferences",
+      "desktop:get-notification-support",
+      "desktop:notification-navigation",
       "desktop:request",
     ]);
   });

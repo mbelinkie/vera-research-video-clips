@@ -274,6 +274,87 @@ afterEach(async () => {
 });
 
 describe("local agent", () => {
+  it("routes bookmark cache reads and queued mutations through the local boundary", async () => {
+    const projectId = crypto.randomUUID();
+    const videoId = crypto.randomUUID();
+    const bookmarkId = crypto.randomUUID();
+    const outboxId = crypto.randomUUID();
+    const at = "2026-08-24T12:00:00.000Z";
+    const listProjectBookmarks = vi.fn(async () => ({
+      projectId,
+      items: [],
+      freshness: "fresh" as const,
+      cachedAt: at,
+      outbox: [],
+    }));
+    const createProjectBookmark = vi.fn(async () => ({
+      state: "queued" as const,
+      outboxId,
+      command: {
+        outboxId,
+        commandType: "bookmark.create.v1" as const,
+        videoId,
+        sourceTimeMs: 500,
+        note: "Persist this",
+        state: "queued" as const,
+        createdAt: at,
+      },
+    }));
+    const replayProjectBookmarks = vi.fn(async () => ({
+      applied: 0,
+      queued: 1,
+      conflicts: 0,
+    }));
+    const app = createLocalAgent({
+      listProjectBookmarks,
+      createProjectBookmark,
+      replayProjectBookmarks,
+      listProjectBookmarkOutbox: () => [],
+    });
+    const headers = { authorization: "Bearer fixture" };
+    const list = await app.inject({
+      method: "GET",
+      url: `/api/projects/${projectId}/bookmarks?scope=video&videoId=${videoId}&state=active&limit=25`,
+      headers,
+    });
+    expect(list.statusCode).toBe(200);
+    expect(list.json()).toMatchObject({ freshness: "fresh", outbox: [] });
+    const create = await app.inject({
+      method: "POST",
+      url: `/api/projects/${projectId}/bookmarks`,
+      headers,
+      payload: {
+        videoId,
+        sourceTimeMs: 500,
+        note: "Persist this",
+        idempotencyKey: "local-bookmark-create",
+      },
+    });
+    expect(create.statusCode).toBe(202);
+    expect(create.json()).toMatchObject({ state: "queued", outboxId });
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: `/api/projects/${projectId}/bookmark-outbox/replay`,
+          headers,
+        })
+      ).json(),
+    ).toEqual({ applied: 0, queued: 1, conflicts: 0 });
+    expect(listProjectBookmarks).toHaveBeenCalledWith(
+      expect.objectContaining({
+        projectId,
+        authorization: "Bearer fixture",
+        query: expect.objectContaining({ videoId, limit: 25 }),
+      }),
+    );
+    expect(createProjectBookmark).toHaveBeenCalledWith(
+      expect.objectContaining({ projectId, authorization: "Bearer fixture" }),
+    );
+    expect(bookmarkId).not.toBe(outboxId);
+    await app.close();
+  });
+
   it("reports a contract-valid health response", async () => {
     const app = createLocalAgent();
     apps.add(app);
@@ -1002,6 +1083,110 @@ describe("local agent", () => {
     expect(response.json()).not.toHaveProperty("clipId");
   });
 
+  it("forwards only a validated main-process account scope to export creation", async () => {
+    const now = "2026-08-24T12:00:00.000Z";
+    const accountScope = "a".repeat(64);
+    const createExportOnly = vi.fn((input) => ({
+      id: "019fbb95-cd76-7920-93fa-e23ba755ee481",
+      jobId: "019fbb95-cd76-7920-93fa-e23ba755ee482",
+      mode: "export_only",
+      video: input.video,
+      selection: input.selection,
+      sourceLanguageClass: input.sourceLanguageClass,
+      preset: input.preset,
+      state: "queued",
+      createdAt: now,
+      updatedAt: now,
+    }));
+    const app = createLocalAgent({ createExportOnly });
+    apps.add(app);
+
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: "/api/exports",
+          headers: { "x-research-video-account-scope": "not-a-hash" },
+          payload: {
+            ...exportOnlyFixture(),
+            idempotencyKey: "malformed-account-scope",
+          },
+        })
+      ).statusCode,
+    ).toBe(401);
+    expect(createExportOnly).not.toHaveBeenCalled();
+
+    const payload = {
+      ...exportOnlyFixture(),
+      idempotencyKey: "scoped-export-only",
+    };
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: "/api/exports",
+          headers: { "x-research-video-account-scope": accountScope },
+          payload,
+        })
+      ).statusCode,
+    ).toBe(201);
+    expect(createExportOnly).toHaveBeenCalledWith(
+      payload,
+      undefined,
+      accountScope,
+    );
+  });
+
+  it("requires an account scope and validates bounded local notification queries", async () => {
+    const accountScope = "a".repeat(64);
+    const listLocalNotificationFeed = vi.fn(() => ({
+      events: [],
+      fetchedAt: "2026-08-24T12:00:00.000Z",
+    }));
+    const app = createLocalAgent({ listLocalNotificationFeed });
+    apps.add(app);
+
+    for (const headers of [
+      {},
+      { "x-research-video-account-scope": "A".repeat(64) },
+      { "x-research-video-account-scope": "a".repeat(63) },
+    ]) {
+      expect(
+        (
+          await app.inject({
+            method: "GET",
+            url: "/api/notifications",
+            headers,
+          })
+        ).statusCode,
+      ).toBe(401);
+    }
+    expect(listLocalNotificationFeed).not.toHaveBeenCalled();
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/notifications?limit=10&cursor=abcdefghij&since=2026-08-24T12%3A00%3A00.000Z",
+      headers: { "x-research-video-account-scope": accountScope },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(listLocalNotificationFeed).toHaveBeenCalledWith(accountScope, {
+      limit: 10,
+      cursor: "abcdefghij",
+      since: "2026-08-24T12:00:00.000Z",
+    });
+
+    expect(
+      (
+        await app.inject({
+          method: "GET",
+          url: "/api/notifications?limit=51",
+          headers: { "x-research-video-account-scope": accountScope },
+        })
+      ).statusCode,
+    ).toBe(400);
+    expect(listLocalNotificationFeed).toHaveBeenCalledTimes(1);
+  });
+
   it("requires an authoritative ready preview and forwards its immutable snapshot", async () => {
     const snapshotPreview = resolveExportSettings({
       context: "export_only",
@@ -1041,6 +1226,7 @@ describe("local agent", () => {
     expect(createExportOnly).toHaveBeenCalledWith(
       expect.objectContaining({ settingsSelection: payload.settingsSelection }),
       snapshotPreview.snapshot,
+      undefined,
     );
     expect(
       (
@@ -2630,6 +2816,10 @@ function acceptedLoggedDeliveryFixture(): LoggedExportDelivery {
 function localSuccessResultFixture(
   delivery: LoggedExportDelivery,
 ): LoggedExportSuccessResult {
+  if (delivery.request.selection.selectionType === "player_time_range") {
+    throw new Error("This fixture requires a transcript selection.");
+  }
+  const selection = delivery.request.selection;
   const at = "2026-08-20T12:00:10.000Z";
   const packageIdentity = `clip-${delivery.request.id}`;
   const artifact = (
@@ -2715,8 +2905,8 @@ function localSuccessResultFixture(
       validatedAt: at,
     },
     englishSubtitleProvenance: {
-      trackId: delivery.request.selection.trackId,
-      trackVersion: delivery.request.selection.transcriptVersion,
+      trackId: selection.trackId,
+      trackVersion: selection.transcriptVersion,
       cueCount: 1,
       byteSize: 64,
       contentSha256: "e".repeat(64),

@@ -14,7 +14,10 @@ import {
   runCloudMigrations,
   type CloudDatabase,
 } from "@research-video/db-cloud";
-import { YouTubeOEmbedMetadataProvider } from "@research-video/providers";
+import {
+  YouTubeDataApiSearchProvider,
+  YouTubeOEmbedMetadataProvider,
+} from "@research-video/providers";
 import { createTranslationProvider } from "@research-video/providers/translation-aws";
 import {
   MemoryStagedUploadUrlIssuer,
@@ -96,6 +99,13 @@ const app = createCloudApi({
         }).authenticate
       : authenticateDevBearer,
   videoMetadataProvider: new YouTubeOEmbedMetadataProvider(),
+  ...(config.youtubeApiKey
+    ? {
+        sourceSearchProviders: {
+          youtube: new YouTubeDataApiSearchProvider(config.youtubeApiKey),
+        },
+      }
+    : {}),
   queueDeliveryRequired: Boolean(jobQueue),
   ...(() => {
     const translationProvider = createTranslationProvider({

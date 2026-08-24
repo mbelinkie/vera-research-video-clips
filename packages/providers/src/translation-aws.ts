@@ -6,6 +6,13 @@ import {
 } from "@aws-sdk/client-translate";
 
 import {
+  LanguageCapabilityResultSchema,
+  normalizeLanguageTag,
+  primaryLanguage,
+  type LanguageCapabilityResult,
+} from "@research-video/contracts";
+
+import {
   ProviderExecutionError,
   type TranslationProvider,
   type TranslationRequest,
@@ -27,6 +34,90 @@ export type AwsTranslationProviderOptions = {
 const maximumRequestBytes = 10_000;
 const safeRequestBytes = 9_500;
 
+/**
+ * Pinned to Amazon Translate's supported-language table recorded in
+ * docs/research/PUNCH-001-provider-language-capabilities-2026-08-23.md.
+ * Keep it isolated here so an AWS capability-table change is deliberate.
+ */
+export const awsTranslateLanguageCapabilityVersion =
+  "amazon-translate-supported-languages-2026-08-23";
+
+const awsTranslateLanguageCodes = new Set([
+  "af",
+  "am",
+  "ar",
+  "az",
+  "be",
+  "bg",
+  "bn",
+  "bs",
+  "ca",
+  "cs",
+  "cy",
+  "da",
+  "de",
+  "el",
+  "en",
+  "es",
+  "et",
+  "fa",
+  "fi",
+  "fr",
+  "ga",
+  "gu",
+  "ha",
+  "he",
+  "hi",
+  "hr",
+  "ht",
+  "hu",
+  "hy",
+  "id",
+  "is",
+  "it",
+  "ja",
+  "ka",
+  "kk",
+  "km",
+  "kn",
+  "ko",
+  "lt",
+  "lv",
+  "mk",
+  "ml",
+  "mn",
+  "mr",
+  "ms",
+  "mt",
+  "ne",
+  "nl",
+  "no",
+  "pa",
+  "pl",
+  "ps",
+  "pt",
+  "ro",
+  "ru",
+  "si",
+  "sk",
+  "sl",
+  "so",
+  "sq",
+  "sr",
+  "sv",
+  "sw",
+  "ta",
+  "te",
+  "th",
+  "tl",
+  "tr",
+  "uk",
+  "ur",
+  "uz",
+  "vi",
+  "zh",
+]);
+
 export class AwsTranslationProvider implements TranslationProvider {
   readonly #send: AwsTranslateSender;
   readonly #terminologyName: string | undefined;
@@ -46,7 +137,35 @@ export class AwsTranslationProvider implements TranslationProvider {
     }
   }
 
+  checkLanguagePair(
+    sourceLanguage: string,
+    targetLanguage: string,
+  ): LanguageCapabilityResult {
+    const source = normalizeLanguageTag(sourceLanguage);
+    const target = normalizeLanguageTag(targetLanguage);
+    const supported =
+      awsTranslateLanguageCodes.has(primaryLanguage(source)) &&
+      awsTranslateLanguageCodes.has(primaryLanguage(target));
+    return LanguageCapabilityResultSchema.parse({
+      state: supported ? "supported" : "unsupported",
+      provider: "amazon-translate",
+      operation: "translation",
+      sourceLanguage: source,
+      targetLanguage: target,
+      version: awsTranslateLanguageCapabilityVersion,
+      ...(supported ? {} : { reason: "language_not_supported" }),
+    });
+  }
+
   async translate(input: TranslationRequest): Promise<TranslationResult> {
+    if (
+      this.checkLanguagePair(input.sourceLanguage, input.targetLanguage)
+        .state !== "supported"
+    ) {
+      throw new ProviderExecutionError(
+        "Amazon Translate does not support the requested source and target language pair.",
+      );
+    }
     const results = new Array<{ sourceSegmentId: string; text: string }>(
       input.segments.length,
     );

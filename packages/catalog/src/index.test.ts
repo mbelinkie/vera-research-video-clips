@@ -3,25 +3,30 @@ import { createHash, randomUUID } from "node:crypto";
 import { PGlite } from "@electric-sql/pglite";
 import { afterEach, describe, expect, it } from "vitest";
 
-import type {
-  ArtifactCompatibilityRequirements,
-  ArtifactVersionSummary,
-  AuthenticatedActor,
-  ExportRequest,
-  LoggedExportFailureResult,
-  LoggedExportSuccessResult,
-  NormalizedTranscript,
-  TranscriptManifest,
+import {
+  TranscriptionJobPayloadSchema,
+  type ArtifactCompatibilityRequirements,
+  type ArtifactVersionSummary,
+  type AuthenticatedActor,
+  type ExportRequest,
+  type LoggedExportFailureResult,
+  type LoggedExportSuccessResult,
+  type NormalizedTranscript,
+  type TranscriptManifest,
 } from "@research-video/contracts";
 import { runCloudMigrations } from "@research-video/db-cloud";
 import {
+  canonicalJson,
   currentExportWorkerAdvertisement,
   exportWorkerAdvertisementFingerprint,
   sha256Fingerprint,
 } from "@research-video/export-settings";
-import { MemoryTranscriptObjectStore } from "@research-video/storage";
+import {
+  MemoryTranscriptObjectStore,
+  type TranscriptObjectStore,
+} from "@research-video/storage";
 
-import { SharedProjectCatalog } from "./index.ts";
+import { CatalogConflictError, SharedProjectCatalog } from "./index.ts";
 
 const databases = new Set<PGlite>();
 
@@ -42,6 +47,6706 @@ function sourceRightsForVideo(youtubeVideoId: string) {
     disclosureVersion: 1,
   };
 }
+
+async function authorityCatalog(now: () => Date = () => new Date()) {
+  const database = new PGlite();
+  const store = new MemoryTranscriptObjectStore();
+  databases.add(database);
+  await runCloudMigrations(database);
+  return {
+    database,
+    store,
+    catalog: new SharedProjectCatalog(database, store, now),
+  };
+}
+
+function authorityActor(name: string): AuthenticatedActor {
+  return {
+    userId: randomUUID(),
+    externalSubject: `fixture:authority:${name}`,
+  };
+}
+
+describe("identity and project authority foundation", () => {
+  it("normalizes requested handles, rejects case-equivalent collisions, and preserves an omitted handle", async () => {
+    const { database, catalog } = await authorityCatalog();
+    const first = authorityActor("first");
+    const second = authorityActor("second");
+
+    await expect(
+      catalog.registerUser(first, "First Researcher", " @Research_Team "),
+    ).resolves.toMatchObject({
+      id: first.userId,
+      handle: "research_team",
+      displayName: "First Researcher",
+    });
+    await expect(
+      catalog.registerUser(first, "Renamed Researcher"),
+    ).resolves.toMatchObject({
+      id: first.userId,
+      handle: "research_team",
+      displayName: "Renamed Researcher",
+    });
+    await expect(
+      catalog.registerUser(second, "Second Researcher", "RESEARCH_TEAM"),
+    ).rejects.toBeInstanceOf(CatalogConflictError);
+    await expect(catalog.getCurrentUser(first)).resolves.toMatchObject({
+      handle: "research_team",
+      displayName: "Renamed Researcher",
+    });
+
+    const concurrent = await Promise.allSettled([
+      catalog.registerUser(
+        authorityActor("concurrent-a"),
+        "Concurrent A",
+        "Concurrent_Handle",
+      ),
+      catalog.registerUser(
+        authorityActor("concurrent-b"),
+        "Concurrent B",
+        "concurrent_handle",
+      ),
+    ]);
+    expect(
+      concurrent.filter((result) => result.status === "fulfilled"),
+    ).toHaveLength(1);
+    expect(
+      concurrent.filter((result) => result.status === "rejected"),
+    ).toHaveLength(1);
+    expect(
+      (
+        concurrent.find(
+          (result) => result.status === "rejected",
+        ) as PromiseRejectedResult
+      ).reason,
+    ).toBeInstanceOf(CatalogConflictError);
+  });
+
+  it("creates valid personal/shared projects and returns membership-bounded summaries", async () => {
+    const { catalog } = await authorityCatalog();
+    const owner = authorityActor("summary-owner");
+    const researcher = authorityActor("summary-researcher");
+    const outsider = authorityActor("summary-outsider");
+    await Promise.all([
+      catalog.registerUser(owner, "Summary Owner", "summary_owner"),
+      catalog.registerUser(
+        researcher,
+        "Summary Researcher",
+        "summary_researcher",
+      ),
+      catalog.registerUser(outsider, "Summary Outsider", "summary_outsider"),
+    ]);
+
+    const personal = await catalog.createProject(owner, {
+      name: "Personal research",
+      kind: "personal",
+    });
+    const shared = await catalog.createProject(owner, {
+      name: "Open shared research",
+      kind: "shared",
+      visibility: "open_to_join",
+    });
+    await catalog.addMember(owner, shared.id, researcher.userId, "researcher");
+
+    expect(personal).toMatchObject({ kind: "personal", visibility: "private" });
+    expect(shared).toMatchObject({
+      kind: "shared",
+      visibility: "open_to_join",
+    });
+    expect(await catalog.listProjects(owner)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: personal.id,
+          currentUserRole: "owner",
+          memberCount: 1,
+        }),
+        expect.objectContaining({
+          id: shared.id,
+          currentUserRole: "owner",
+          memberCount: 2,
+        }),
+      ]),
+    );
+    expect(await catalog.listProjects(researcher)).toEqual([
+      expect.objectContaining({
+        id: shared.id,
+        currentUserRole: "researcher",
+        memberCount: 2,
+      }),
+    ]);
+    await expect(catalog.listProjects(outsider)).resolves.toEqual([]);
+    await expect(catalog.getProject(outsider, shared.id)).rejects.toMatchObject(
+      {
+        code: "project_access_denied",
+      },
+    );
+    await expect(
+      catalog.addMember(owner, personal.id, researcher.userId, "researcher"),
+    ).rejects.toBeInstanceOf(CatalogConflictError);
+  });
+
+  it("enforces target-role authority plus idempotent replay and conflicting-role denial", async () => {
+    const { catalog } = await authorityCatalog();
+    const actors = Object.fromEntries(
+      [
+        "owner",
+        "administrator",
+        "researcher",
+        "viewer",
+        "ownerResearcherTarget",
+        "administratorResearcherTarget",
+        "administratorTarget",
+        "deniedTarget",
+      ].map((name) => [name, authorityActor(name)]),
+    ) as Record<string, AuthenticatedActor>;
+    await Promise.all(
+      Object.entries(actors).map(([name, actor]) =>
+        catalog.registerUser(
+          actor,
+          name,
+          `auth_${name.toLowerCase().slice(0, 26)}`,
+        ),
+      ),
+    );
+    const project = await catalog.createProject(actors.owner!, {
+      name: "Authority matrix",
+    });
+
+    await catalog.addMember(
+      actors.owner!,
+      project.id,
+      actors.administrator!.userId,
+      "administrator",
+    );
+    await catalog.addMember(
+      actors.owner!,
+      project.id,
+      actors.researcher!.userId,
+      "researcher",
+    );
+    await catalog.addMember(
+      actors.owner!,
+      project.id,
+      actors.viewer!.userId,
+      "viewer",
+    );
+    await catalog.addMember(
+      actors.owner!,
+      project.id,
+      actors.ownerResearcherTarget!.userId,
+      "researcher",
+    );
+    await expect(
+      catalog.addMember(
+        actors.owner!,
+        project.id,
+        actors.ownerResearcherTarget!.userId,
+        "researcher",
+      ),
+    ).resolves.toBeUndefined();
+    await expect(
+      catalog.addMember(
+        actors.owner!,
+        project.id,
+        actors.ownerResearcherTarget!.userId,
+        "administrator",
+      ),
+    ).rejects.toBeInstanceOf(CatalogConflictError);
+
+    await expect(
+      catalog.addMember(
+        actors.administrator!,
+        project.id,
+        actors.administratorResearcherTarget!.userId,
+        "researcher",
+      ),
+    ).resolves.toBeUndefined();
+    await expect(
+      catalog.addMember(
+        actors.administrator!,
+        project.id,
+        actors.administratorTarget!.userId,
+        "administrator",
+      ),
+    ).rejects.toMatchObject({ code: "project_access_denied" });
+    for (const actor of [actors.researcher!, actors.viewer!]) {
+      await expect(
+        catalog.addMember(
+          actor,
+          project.id,
+          actors.deniedTarget!.userId,
+          "researcher",
+        ),
+      ).rejects.toMatchObject({ code: "project_access_denied" });
+    }
+  });
+
+  it("allows an Administrator to claim project transcription work", async () => {
+    const { catalog } = await authorityCatalog();
+    const owner = authorityActor("claim-owner");
+    const administrator = authorityActor("claim-administrator");
+    await Promise.all([
+      catalog.registerUser(owner, "Claim Owner", "claim_owner"),
+      catalog.registerUser(
+        administrator,
+        "Claim Administrator",
+        "claim_administrator",
+      ),
+    ]);
+    const project = await catalog.createProject(owner, {
+      name: "Administrator claim project",
+    });
+    await catalog.addMember(
+      owner,
+      project.id,
+      administrator.userId,
+      "administrator",
+    );
+    const created = await catalog.createTranscriptionBatch(owner, {
+      projectId: project.id,
+      name: "Administrator claim batch",
+      options: {
+        targetLanguage: "en",
+        transcriptionProfile: "default",
+        sourcePolicy: "prefer-existing",
+        executionLocation: "local",
+        priority: "normal",
+      },
+      items: [
+        {
+          inputIndex: 0,
+          input: "https://youtu.be/AdminClaim1",
+          status: "ready",
+          processingNeed: "transcription",
+          youtubeVideoId: "AdminClaim1",
+          canonicalUrl: "https://www.youtube.com/watch?v=AdminClaim1",
+          title: "Administrator claim fixture",
+          sourceLanguage: "en",
+        },
+      ],
+    });
+
+    await expect(
+      catalog.claimTranscriptionJob(administrator, "local", 120),
+    ).resolves.toMatchObject({ job: { id: created.items[0]!.jobId } });
+  });
+
+  it("emits one redacted action-needed event to the batch creator and active flaggers plus one first terminal summary", async () => {
+    const now = new Date("2026-08-24T15:00:00.000Z");
+    const { database, catalog } = await authorityCatalog(() => now);
+    const owner = authorityActor("notification-owner");
+    const researcher = authorityActor("notification-researcher");
+    await Promise.all([
+      catalog.registerUser(owner, "Notification Owner", "notification_owner"),
+      catalog.registerUser(
+        researcher,
+        "Notification Researcher",
+        "notification_researcher",
+      ),
+    ]);
+    const project = await catalog.createProject(owner, {
+      name: "Notification project",
+    });
+    await catalog.addMember(owner, project.id, researcher.userId, "researcher");
+    const batch = await catalog.createTranscriptionBatch(researcher, {
+      projectId: project.id,
+      name: "Notification batch",
+      options: {
+        targetLanguage: "en",
+        transcriptionProfile: "default",
+        sourcePolicy: "prefer-existing",
+        executionLocation: "local",
+        priority: "normal",
+      },
+      items: [
+        {
+          inputIndex: 0,
+          input: "https://youtu.be/NotifyFailure1",
+          status: "ready",
+          processingNeed: "transcription",
+          youtubeVideoId: "NotifyFailure1",
+          canonicalUrl: "https://www.youtube.com/watch?v=NotifyFailure1",
+          title: "Safe source label",
+          sourceLanguage: "en",
+        },
+      ],
+    });
+    await database.query(
+      `INSERT INTO project_video_flags
+         (project_id, video_id, user_id, active, version, created_at, updated_at)
+       VALUES ($1, $2, $3, true, 1, $4, $4)
+       ON CONFLICT (project_id, video_id, user_id) DO UPDATE
+       SET active = true, deactivated_at = NULL, updated_at = EXCLUDED.updated_at`,
+      [
+        project.id,
+        batch.items[0]!.catalogVideoId,
+        owner.userId,
+        now.toISOString(),
+      ],
+    );
+    const claim = await catalog.claimTranscriptionJob(owner, "local", 120);
+    await catalog.failTranscriptionJob(owner, claim!.job.id, {
+      attempt: claim!.lease.attempt,
+      code: "provider_secret_failure",
+      message: "PRIVATE provider details must never enter notifications",
+      retryable: true,
+    });
+
+    const creatorFeed = await catalog.listNotificationFeed(researcher, {
+      limit: 25,
+    });
+    expect(creatorFeed.events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          kind: "transcription_action_needed",
+          status: "failed",
+          sourceLabel: "Safe source label",
+        }),
+        expect.objectContaining({
+          kind: "transcription_batch_terminal",
+          status: "action_needed",
+        }),
+      ]),
+    );
+    expect(JSON.stringify(creatorFeed)).not.toContain(
+      "PRIVATE provider details",
+    );
+    expect(
+      (await catalog.listNotificationFeed(owner, { limit: 25 })).events,
+    ).toEqual([
+      expect.objectContaining({ kind: "transcription_action_needed" }),
+    ]);
+    expect(
+      (
+        await database.query<{ count: string }>(
+          "SELECT count(*)::text AS count FROM workflow_notification_events",
+        )
+      ).rows[0]?.count,
+    ).toBe("3");
+  });
+});
+
+describe("hosted transcription approval", () => {
+  it("gates dispatch and claims on current Administrator approval with exact replay", async () => {
+    const { database, catalog } = await authorityCatalog();
+    const owner = authorityActor("hosted-owner");
+    const administrator = authorityActor("hosted-administrator");
+    const researcher = authorityActor("hosted-researcher");
+    await Promise.all([
+      catalog.registerUser(owner, "Hosted Owner", "hosted_owner"),
+      catalog.registerUser(
+        administrator,
+        "Hosted Administrator",
+        "hosted_administrator",
+      ),
+      catalog.registerUser(
+        researcher,
+        "Hosted Researcher",
+        "hosted_researcher",
+      ),
+    ]);
+    const project = await catalog.createProject(owner, {
+      name: "Hosted approval project",
+    });
+    const otherProject = await catalog.createProject(owner, {
+      name: "Other hosted approval project",
+    });
+    await catalog.addMember(
+      owner,
+      project.id,
+      administrator.userId,
+      "administrator",
+    );
+    await catalog.addMember(owner, project.id, researcher.userId, "researcher");
+
+    const createBatch = (
+      executionLocation: "local" | "hosted",
+      youtubeVideoId: string,
+    ) =>
+      catalog.createTranscriptionBatch(researcher, {
+        projectId: project.id,
+        name: `${executionLocation} approval fixture`,
+        options: {
+          targetLanguage: "en",
+          transcriptionProfile: "default",
+          sourcePolicy: "prefer-existing",
+          executionLocation,
+          priority: "normal",
+        },
+        items: [
+          {
+            inputIndex: 0,
+            input: `https://youtu.be/${youtubeVideoId}`,
+            status: "ready",
+            processingNeed: "transcription",
+            youtubeVideoId,
+            canonicalUrl: `https://www.youtube.com/watch?v=${youtubeVideoId}`,
+            title: `${executionLocation} approval fixture`,
+            sourceLanguage: "en",
+          },
+        ],
+      });
+    const local = await createBatch("local", "HostedGateLocal1");
+    const hosted = await createBatch("hosted", "HostedGatePaid1");
+    const localJobId = local.items[0]!.jobId!;
+    const hostedJobId = hosted.items[0]!.jobId!;
+    expect(local.batch.hostedApproval).toBeUndefined();
+    expect(hosted.batch.hostedApproval).toEqual({
+      state: "pending",
+      version: 1,
+    });
+
+    await expect(catalog.listUndispatchedTranscriptionJobs()).resolves.toEqual([
+      { jobId: localJobId, executionLocation: "local" },
+    ]);
+    await expect(
+      catalog.claimTranscriptionJob(researcher, "local", 120),
+    ).resolves.toMatchObject({ job: { id: localJobId } });
+    await catalog.markTranscriptionJobDispatched(hostedJobId);
+    expect(
+      (
+        await database.query<{ dispatched_at: string | null }>(
+          `SELECT payload->>'queueDispatchedAt' AS dispatched_at
+           FROM jobs WHERE id = $1`,
+          [hostedJobId],
+        )
+      ).rows[0]!.dispatched_at,
+    ).toBeNull();
+    await expect(
+      catalog.markTranscriptionJobQueueDelivered(hostedJobId, "hosted"),
+    ).resolves.toBe(false);
+    await expect(
+      catalog.claimTranscriptionJob(administrator, "hosted", 120),
+    ).resolves.toBeUndefined();
+    await expect(
+      catalog.updateHostedTranscriptionApproval(
+        researcher,
+        project.id,
+        hosted.batch.id,
+        {
+          action: "approve",
+          idempotencyKey: "researcher-cannot-approve",
+          expectedVersion: 1,
+        },
+      ),
+    ).rejects.toMatchObject({ code: "project_access_denied" });
+
+    const approve = {
+      action: "approve" as const,
+      idempotencyKey: "approve-hosted-v1",
+      expectedVersion: 1,
+    };
+    const approved = await catalog.updateHostedTranscriptionApproval(
+      administrator,
+      project.id,
+      hosted.batch.id,
+      approve,
+    );
+    expect(approved).toMatchObject({
+      projectId: project.id,
+      batchId: hosted.batch.id,
+      approval: {
+        state: "approved",
+        version: 2,
+        decidedBy: {
+          userId: administrator.userId,
+          handle: "hosted_administrator",
+        },
+      },
+    });
+    await expect(
+      catalog.updateHostedTranscriptionApproval(
+        administrator,
+        project.id,
+        hosted.batch.id,
+        approve,
+      ),
+    ).resolves.toEqual(approved);
+    await expect(
+      catalog.updateHostedTranscriptionApproval(
+        administrator,
+        project.id,
+        hosted.batch.id,
+        {
+          action: "revoke",
+          idempotencyKey: approve.idempotencyKey,
+          expectedVersion: 2,
+        },
+      ),
+    ).rejects.toMatchObject({ code: "idempotency_conflict" });
+    await expect(
+      catalog.updateHostedTranscriptionApproval(
+        owner,
+        otherProject.id,
+        hosted.batch.id,
+        {
+          action: "approve",
+          idempotencyKey: "wrong-project",
+          expectedVersion: 2,
+        },
+      ),
+    ).rejects.toMatchObject({ statusCode: 404 });
+    await expect(catalog.listUndispatchedTranscriptionJobs()).resolves.toEqual([
+      { jobId: hostedJobId, executionLocation: "hosted" },
+    ]);
+    await catalog.markTranscriptionJobDispatched(hostedJobId);
+
+    const revoked = await catalog.updateHostedTranscriptionApproval(
+      administrator,
+      project.id,
+      hosted.batch.id,
+      {
+        action: "revoke",
+        idempotencyKey: "revoke-hosted-v2",
+        expectedVersion: 2,
+      },
+    );
+    expect(revoked.approval).toMatchObject({ state: "revoked", version: 3 });
+    await expect(
+      catalog.markTranscriptionJobQueueDelivered(hostedJobId, "hosted"),
+    ).resolves.toBe(false);
+    await expect(
+      catalog.claimTranscriptionJob(administrator, "hosted", 120),
+    ).resolves.toBeUndefined();
+    await expect(
+      catalog.updateHostedTranscriptionApproval(
+        administrator,
+        project.id,
+        hosted.batch.id,
+        {
+          action: "approve",
+          idempotencyKey: "stale-hosted-v2",
+          expectedVersion: 2,
+        },
+      ),
+    ).rejects.toBeInstanceOf(CatalogConflictError);
+
+    const reapproved = await catalog.updateHostedTranscriptionApproval(
+      administrator,
+      project.id,
+      hosted.batch.id,
+      {
+        action: "approve",
+        idempotencyKey: "reapprove-hosted-v3",
+        expectedVersion: 3,
+      },
+    );
+    expect(reapproved.approval).toMatchObject({
+      state: "approved",
+      version: 4,
+    });
+    await catalog.markTranscriptionJobDispatched(hostedJobId);
+    await expect(
+      catalog.markTranscriptionJobQueueDelivered(hostedJobId, "hosted"),
+    ).resolves.toBe(true);
+    await expect(
+      catalog.claimTranscriptionJob(administrator, "hosted", 120, true),
+    ).resolves.toMatchObject({ job: { id: hostedJobId } });
+
+    await database.query(
+      "DELETE FROM project_members WHERE project_id = $1 AND user_id = $2",
+      [project.id, administrator.userId],
+    );
+    await expect(
+      catalog.updateHostedTranscriptionApproval(
+        administrator,
+        project.id,
+        hosted.batch.id,
+        {
+          action: "revoke",
+          idempotencyKey: "removed-administrator",
+          expectedVersion: 4,
+        },
+      ),
+    ).rejects.toMatchObject({ code: "project_access_denied" });
+    await expect(
+      catalog.getTranscriptionBatch(owner, project.id, hosted.batch.id),
+    ).resolves.toMatchObject({
+      batch: {
+        hostedApproval: {
+          state: "approved",
+          version: 4,
+          decidedBy: {
+            userId: administrator.userId,
+            handle: "former_member",
+            displayName: "Former project member",
+          },
+        },
+      },
+    });
+    expect(
+      (
+        await database.query<{ count: string }>(
+          `SELECT count(*)::text AS count
+           FROM hosted_transcription_approval_commands
+           WHERE batch_id = $1`,
+          [hosted.batch.id],
+        )
+      ).rows[0]!.count,
+    ).toBe("3");
+  });
+});
+
+describe("project local processing policy", () => {
+  it("automates direct ingest, gates local starts, and replays Administrator policy commands", async () => {
+    const { database, catalog } = await authorityCatalog();
+    const owner = authorityActor("local-policy-owner");
+    const administrator = authorityActor("local-policy-administrator");
+    const researcher = authorityActor("local-policy-researcher");
+    const viewer = authorityActor("local-policy-viewer");
+    const outsider = authorityActor("local-policy-outsider");
+    await Promise.all([
+      catalog.registerUser(owner, "Local Policy Owner", "local_policy_owner"),
+      catalog.registerUser(
+        administrator,
+        "Local Policy Administrator",
+        "local_policy_administrator",
+      ),
+      catalog.registerUser(
+        researcher,
+        "Local Policy Researcher",
+        "local_policy_researcher",
+      ),
+      catalog.registerUser(
+        viewer,
+        "Local Policy Viewer",
+        "local_policy_viewer",
+      ),
+      catalog.registerUser(
+        outsider,
+        "Local Policy Outsider",
+        "local_policy_outsider",
+      ),
+    ]);
+    const project = await catalog.createProject(owner, {
+      name: "Automatic local processing",
+    });
+    const otherProject = await catalog.createProject(outsider, {
+      name: "Other local processing",
+    });
+    await catalog.addMember(
+      owner,
+      project.id,
+      administrator.userId,
+      "administrator",
+    );
+    await catalog.addMember(owner, project.id, researcher.userId, "researcher");
+    await catalog.addMember(owner, project.id, viewer.userId, "viewer");
+    await expect(
+      catalog.getProjectLocalProcessingStatus(owner, project.id),
+    ).resolves.toMatchObject({
+      projectId: project.id,
+      policy: { state: "automatic", version: 1 },
+      workload: { queuedJobs: 0, activeJobs: 0 },
+    });
+
+    const firstMetadata = {
+      youtubeVideoId: "AutomaticLocal1",
+      canonicalUrl: "https://www.youtube.com/watch?v=AutomaticLocal1",
+      title: "Automatic local fixture",
+      durationMs: 60_000,
+      sourceLanguage: "en",
+    };
+    const [first, replayed] = await Promise.all([
+      catalog.addVideo(owner, project.id, firstMetadata, {
+        automaticLocalProcessing: true,
+      }),
+      catalog.addVideo(owner, project.id, firstMetadata, {
+        automaticLocalProcessing: true,
+      }),
+    ]);
+    expect(replayed.id).toBe(first.id);
+    const automaticRows = await database.query<{
+      batch_count: string;
+      item_count: string;
+      job_count: string;
+    }>(
+      `SELECT
+         (SELECT count(*) FROM transcription_batches
+          WHERE project_id = $1 AND processing_origin = 'project_local')::text
+            AS batch_count,
+         (SELECT count(*) FROM transcription_batch_items bi
+          JOIN transcription_batches b ON b.id = bi.batch_id
+          WHERE b.project_id = $1 AND b.processing_origin = 'project_local')::text
+            AS item_count,
+         (SELECT count(*) FROM jobs
+          WHERE project_id = $1 AND kind = 'transcription')::text AS job_count`,
+      [project.id],
+    );
+    expect(automaticRows.rows[0]).toEqual({
+      batch_count: "1",
+      item_count: "1",
+      job_count: "1",
+    });
+    const automaticItem = (
+      await database.query<{ batch_id: string; job_id: string }>(
+        `SELECT bi.batch_id, bi.job_id
+         FROM transcription_batch_items bi
+         JOIN transcription_batches b ON b.id = bi.batch_id
+         WHERE b.project_id = $1 AND b.processing_origin = 'project_local'`,
+        [project.id],
+      )
+    ).rows[0]!;
+    await expect(
+      catalog.listTranscriptionBatches(owner, project.id),
+    ).resolves.toEqual({ batches: [] });
+    await expect(
+      catalog.controlTranscriptionBatch(
+        owner,
+        project.id,
+        automaticItem.batch_id,
+        {
+          action: "pause_pending",
+          expectedVersion: 1,
+        },
+      ),
+    ).rejects.toMatchObject({ code: "conflict" });
+    await expect(
+      catalog.getProjectLocalProcessingStatus(researcher, project.id),
+    ).resolves.toMatchObject({
+      workload: {
+        queuedJobs: 1,
+        activeJobs: 0,
+        queuedKnownDurationMs: 60_000,
+        queuedUnknownDurationCount: 0,
+      },
+    });
+    await expect(
+      catalog.updateProjectLocalProcessing(researcher, project.id, {
+        state: "paused",
+        expectedVersion: 1,
+        idempotencyKey: "researcher-cannot-pause",
+      }),
+    ).rejects.toMatchObject({ code: "project_access_denied" });
+
+    const pauseCommand = {
+      state: "paused" as const,
+      expectedVersion: 1,
+      idempotencyKey: "pause-local-v1",
+    };
+    const paused = await catalog.updateProjectLocalProcessing(
+      administrator,
+      project.id,
+      pauseCommand,
+    );
+    expect(paused).toMatchObject({
+      policy: {
+        state: "paused",
+        version: 2,
+        updatedBy: { userId: administrator.userId },
+      },
+      enqueuedCount: 0,
+      remainingUnprocessedCount: 0,
+    });
+    await expect(
+      catalog.updateProjectLocalProcessing(
+        administrator,
+        project.id,
+        pauseCommand,
+      ),
+    ).resolves.toEqual(paused);
+    await expect(
+      catalog.updateProjectLocalProcessing(administrator, project.id, {
+        state: "automatic",
+        expectedVersion: 2,
+        idempotencyKey: pauseCommand.idempotencyKey,
+      }),
+    ).rejects.toMatchObject({ code: "idempotency_conflict" });
+    await expect(catalog.listUndispatchedTranscriptionJobs()).resolves.toEqual(
+      [],
+    );
+    await expect(
+      catalog.markTranscriptionJobDispatched(automaticItem.job_id),
+    ).resolves.toBe(false);
+    await expect(
+      catalog.claimTranscriptionJob(researcher, "local", 120),
+    ).resolves.toBeUndefined();
+
+    const pausedVideo = await catalog.addVideo(
+      researcher,
+      project.id,
+      {
+        youtubeVideoId: "AutomaticLocalPaused2",
+        canonicalUrl: "https://www.youtube.com/watch?v=AutomaticLocalPaused2",
+        title: "Paused automatic local fixture",
+        sourceLanguage: "en",
+      },
+      { automaticLocalProcessing: true },
+    );
+    expect(pausedVideo.id).toBeTruthy();
+    await expect(
+      catalog.getProjectLocalProcessingStatus(owner, project.id),
+    ).resolves.toMatchObject({
+      policy: { state: "paused", version: 2 },
+      workload: { queuedJobs: 1, unprocessedActiveVideoCount: 1 },
+    });
+    const resumed = await catalog.updateProjectLocalProcessing(
+      owner,
+      project.id,
+      {
+        state: "automatic",
+        expectedVersion: 2,
+        idempotencyKey: "resume-local-v2",
+      },
+    );
+    expect(resumed).toMatchObject({
+      policy: { state: "automatic", version: 3 },
+      enqueuedCount: 1,
+      remainingUnprocessedCount: 0,
+      workload: {
+        queuedJobs: 2,
+        queuedKnownDurationMs: 60_000,
+        queuedUnknownDurationCount: 1,
+      },
+    });
+    await expect(
+      catalog.updateProjectLocalProcessing(owner, otherProject.id, {
+        state: "paused",
+        expectedVersion: 3,
+        idempotencyKey: "wrong-project-policy",
+      }),
+    ).rejects.toMatchObject({ code: "project_access_denied" });
+    await expect(
+      catalog.claimTranscriptionJob(researcher, "local", 120),
+    ).resolves.toMatchObject({ job: { id: automaticItem.job_id } });
+    await expect(
+      catalog.getProjectLocalProcessingStatus(owner, project.id),
+    ).resolves.toMatchObject({
+      workload: { queuedJobs: 1, activeJobs: 1 },
+    });
+    await database.query(
+      "DELETE FROM project_members WHERE project_id = $1 AND user_id = $2",
+      [project.id, administrator.userId],
+    );
+    await expect(
+      catalog.updateProjectLocalProcessing(administrator, project.id, {
+        state: "paused",
+        expectedVersion: 3,
+        idempotencyKey: "removed-administrator",
+      }),
+    ).rejects.toMatchObject({ code: "project_access_denied" });
+    await expect(
+      catalog.getProjectLocalProcessingStatus(owner, project.id),
+    ).resolves.toMatchObject({
+      policy: {
+        updatedBy: {
+          userId: owner.userId,
+          handle: "local_policy_owner",
+        },
+      },
+    });
+    await expect(
+      catalog.getProjectLocalProcessingStatus(outsider, project.id),
+    ).rejects.toMatchObject({ code: "project_access_denied" });
+    expect(
+      (
+        await database.query<{ count: string }>(
+          `SELECT count(*)::text AS count
+           FROM project_local_processing_commands WHERE project_id = $1`,
+          [project.id],
+        )
+      ).rows[0]!.count,
+    ).toBe("2");
+  });
+
+  it("bounds resume catch-up to fifty active unprocessed videos", async () => {
+    const { catalog } = await authorityCatalog();
+    const owner = authorityActor("bounded-local-owner");
+    await catalog.registerUser(
+      owner,
+      "Bounded Local Owner",
+      "bounded_local_owner",
+    );
+    const project = await catalog.createProject(owner, {
+      name: "Bounded local catch-up",
+    });
+    await catalog.updateProjectLocalProcessing(owner, project.id, {
+      state: "paused",
+      expectedVersion: 1,
+      idempotencyKey: "pause-before-backlog",
+    });
+    for (let index = 0; index < 51; index += 1) {
+      await catalog.addVideo(
+        owner,
+        project.id,
+        {
+          youtubeVideoId: `BoundedLocal${String(index).padStart(2, "0")}`,
+          canonicalUrl: `https://www.youtube.com/watch?v=BoundedLocal${String(index).padStart(2, "0")}`,
+          title: `Bounded local ${index}`,
+          sourceLanguage: "en",
+        },
+        { automaticLocalProcessing: true },
+      );
+    }
+    const firstResume = await catalog.updateProjectLocalProcessing(
+      owner,
+      project.id,
+      {
+        state: "automatic",
+        expectedVersion: 2,
+        idempotencyKey: "resume-first-fifty",
+      },
+    );
+    expect(firstResume).toMatchObject({
+      enqueuedCount: 50,
+      remainingUnprocessedCount: 1,
+      workload: { queuedJobs: 50, unprocessedActiveVideoCount: 1 },
+    });
+    const secondResume = await catalog.updateProjectLocalProcessing(
+      owner,
+      project.id,
+      {
+        state: "automatic",
+        expectedVersion: 3,
+        idempotencyKey: "resume-final-one",
+      },
+    );
+    expect(secondResume).toMatchObject({
+      enqueuedCount: 1,
+      remainingUnprocessedCount: 0,
+      workload: { queuedJobs: 51, unprocessedActiveVideoCount: 0 },
+    });
+  });
+
+  it("governs normalized project keyword and alias suggestions with exact approval replay", async () => {
+    const { catalog, database } = await authorityCatalog();
+    const owner = authorityActor("keyword-owner");
+    const administrator = authorityActor("keyword-administrator");
+    const researcher = authorityActor("keyword-researcher");
+    const viewer = authorityActor("keyword-viewer");
+    const outsider = authorityActor("keyword-outsider");
+    await Promise.all([
+      catalog.registerUser(owner, "Keyword Owner", "keyword_owner"),
+      catalog.registerUser(
+        administrator,
+        "Keyword Administrator",
+        "keyword_administrator",
+      ),
+      catalog.registerUser(
+        researcher,
+        "Keyword Researcher",
+        "keyword_researcher",
+      ),
+      catalog.registerUser(viewer, "Keyword Viewer", "keyword_viewer"),
+      catalog.registerUser(outsider, "Keyword Outsider", "keyword_outsider"),
+    ]);
+    const project = await catalog.createProject(owner, {
+      name: "Keyword governance",
+    });
+    await catalog.addMember(
+      owner,
+      project.id,
+      administrator.userId,
+      "administrator",
+    );
+    await catalog.addMember(owner, project.id, researcher.userId, "researcher");
+    await catalog.addMember(owner, project.id, viewer.userId, "viewer");
+    await expect(
+      catalog.listProjectKeywords(researcher, project.id),
+    ).resolves.toEqual({
+      projectId: project.id,
+      currentUserId: researcher.userId,
+      keywordSetVersion: 1,
+      keywords: [],
+      suggestions: [],
+    });
+
+    const suggested = await catalog.suggestProjectKeyword(
+      researcher,
+      project.id,
+      {
+        proposedLabel: "Climate change",
+        proposedDescription: "Positive literal research phrase",
+        language: "en",
+        phrase: " Climate   CHANGE ",
+        rationale: "Core research vocabulary",
+        idempotencyKey: "suggest-climate-v1",
+      },
+    );
+    expect(suggested).toMatchObject({
+      resolution: "created",
+      suggestion: {
+        normalizedPhrase: "climate change",
+        state: "pending",
+        proposedBy: { userId: researcher.userId },
+      },
+    });
+    if (suggested.resolution === "already_approved") {
+      throw new Error("Expected a pending suggestion.");
+    }
+    const suggestionId = suggested.suggestion.id;
+    await expect(
+      catalog.suggestProjectKeyword(researcher, project.id, {
+        proposedLabel: "Climate change",
+        proposedDescription: "Positive literal research phrase",
+        language: "en",
+        phrase: " Climate   CHANGE ",
+        rationale: "Core research vocabulary",
+        idempotencyKey: "suggest-climate-v1",
+      }),
+    ).resolves.toEqual(suggested);
+    await expect(
+      catalog.suggestProjectKeyword(administrator, project.id, {
+        proposedLabel: "Duplicate label is ignored",
+        language: "EN",
+        phrase: "Ｃｌｉｍａｔｅ change",
+        idempotencyKey: "equivalent-pending",
+      }),
+    ).resolves.toMatchObject({
+      resolution: "existing_pending",
+      suggestion: { id: suggestionId },
+    });
+    await expect(
+      catalog.reviewProjectKeywordSuggestion(
+        researcher,
+        project.id,
+        suggestionId,
+        {
+          action: "approve",
+          expectedSuggestionVersion: 1,
+          expectedKeywordSetVersion: 1,
+          idempotencyKey: "researcher-cannot-approve",
+        },
+      ),
+    ).rejects.toMatchObject({ code: "project_access_denied" });
+
+    const approvalCommand = {
+      action: "approve" as const,
+      expectedSuggestionVersion: 1,
+      expectedKeywordSetVersion: 1,
+      idempotencyKey: "approve-climate-v1",
+    };
+    const approved = await catalog.reviewProjectKeywordSuggestion(
+      administrator,
+      project.id,
+      suggestionId,
+      approvalCommand,
+    );
+    expect(approved).toMatchObject({
+      keywordSetVersion: 2,
+      suggestion: { state: "approved", version: 2 },
+      keyword: { label: "Climate change" },
+      alias: {
+        language: "en",
+        normalizedPhrase: "climate change",
+      },
+    });
+    await expect(
+      catalog.reviewProjectKeywordSuggestion(
+        administrator,
+        project.id,
+        suggestionId,
+        approvalCommand,
+      ),
+    ).resolves.toEqual(approved);
+    await expect(
+      catalog.reviewProjectKeywordSuggestion(
+        administrator,
+        project.id,
+        suggestionId,
+        { ...approvalCommand, action: "reject" },
+      ),
+    ).rejects.toMatchObject({ code: "idempotency_conflict" });
+
+    const keywordId = approved.keyword!.id;
+    const duplicateLabel = await catalog.suggestProjectKeyword(
+      researcher,
+      project.id,
+      {
+        proposedLabel: "Ｃｌｉｍａｔｅ   CHANGE",
+        language: "en",
+        phrase: "warming trend",
+        idempotencyKey: "duplicate-normalized-label",
+      },
+    );
+    if (duplicateLabel.resolution === "already_approved") {
+      throw new Error("Expected a distinct pending phrase.");
+    }
+    await expect(
+      catalog.reviewProjectKeywordSuggestion(
+        administrator,
+        project.id,
+        duplicateLabel.suggestion.id,
+        {
+          action: "approve",
+          expectedSuggestionVersion: 1,
+          expectedKeywordSetVersion: 2,
+          idempotencyKey: "reject-duplicate-normalized-label",
+        },
+      ),
+    ).rejects.toMatchObject({
+      code: "conflict",
+      message: expect.stringContaining("display label already exists"),
+    });
+    await expect(
+      catalog.suggestProjectKeyword(researcher, project.id, {
+        keywordId,
+        language: "en-US",
+        phrase: "climate change",
+        idempotencyKey: "approved-regional-alias-is-distinct",
+      }),
+    ).resolves.toMatchObject({ resolution: "created" });
+    const spanish = await catalog.suggestProjectKeyword(
+      researcher,
+      project.id,
+      {
+        keywordId,
+        language: "es",
+        phrase: "Cambio climático",
+        idempotencyKey: "suggest-spanish-alias",
+      },
+    );
+    expect(spanish).toMatchObject({ resolution: "created" });
+    if (spanish.resolution === "already_approved") {
+      throw new Error("Expected a pending Spanish alias.");
+    }
+    const rejected = await catalog.reviewProjectKeywordSuggestion(
+      owner,
+      project.id,
+      spanish.suggestion.id,
+      {
+        action: "reject",
+        expectedSuggestionVersion: 1,
+        expectedKeywordSetVersion: 1,
+        reason: "Use a more specific phrase",
+        idempotencyKey: "reject-spanish-v1",
+      },
+    );
+    expect(rejected).toMatchObject({
+      keywordSetVersion: 2,
+      suggestion: {
+        state: "rejected",
+        reviewReason: "Use a more specific phrase",
+      },
+    });
+    await expect(
+      catalog.reviewProjectKeywordSuggestion(
+        owner,
+        project.id,
+        spanish.suggestion.id,
+        {
+          action: "reject",
+          expectedSuggestionVersion: 1,
+          expectedKeywordSetVersion: 1,
+          reason: "Use a more specific phrase",
+          idempotencyKey: "reject-spanish-v1",
+        },
+      ),
+    ).resolves.toEqual(rejected);
+    const otherProject = await catalog.createProject(owner, {
+      name: "Other keyword project",
+    });
+    await expect(
+      catalog.reviewProjectKeywordSuggestion(
+        owner,
+        otherProject.id,
+        suggestionId,
+        {
+          action: "reject",
+          expectedSuggestionVersion: 2,
+          expectedKeywordSetVersion: 1,
+          idempotencyKey: "wrong-project-suggestion",
+        },
+      ),
+    ).rejects.toMatchObject({ code: "not_found" });
+    await expect(
+      catalog.suggestProjectKeyword(viewer, project.id, {
+        keywordId,
+        language: "fr",
+        phrase: "changement climatique",
+        idempotencyKey: "viewer-cannot-suggest",
+      }),
+    ).rejects.toMatchObject({ code: "project_access_denied" });
+    await expect(
+      catalog.listProjectKeywords(outsider, project.id),
+    ).rejects.toMatchObject({
+      code: "project_access_denied",
+    });
+    await database.query(
+      "DELETE FROM project_members WHERE project_id = $1 AND user_id = $2",
+      [project.id, administrator.userId],
+    );
+    await expect(
+      catalog.reviewProjectKeywordSuggestion(
+        administrator,
+        project.id,
+        spanish.suggestion.id,
+        {
+          action: "reject",
+          expectedSuggestionVersion: 2,
+          expectedKeywordSetVersion: 2,
+          idempotencyKey: "removed-admin-review",
+        },
+      ),
+    ).rejects.toMatchObject({ code: "project_access_denied" });
+    expect(
+      (
+        await database.query<{ count: string }>(
+          "SELECT count(*)::text AS count FROM project_keywords WHERE project_id = $1",
+          [project.id],
+        )
+      ).rows[0]!.count,
+    ).toBe("1");
+  });
+
+  it("withdraws own suggestions and maintains disabled keyword vocabulary with optimistic receipts", async () => {
+    const { catalog, database } = await authorityCatalog();
+    const owner = authorityActor("maintenance-owner");
+    const researcher = authorityActor("maintenance-researcher");
+    const other = authorityActor("maintenance-other");
+    await Promise.all([
+      catalog.registerUser(owner, "Maintenance Owner", "maintenance_owner"),
+      catalog.registerUser(
+        researcher,
+        "Maintenance Researcher",
+        "maintenance_researcher",
+      ),
+      catalog.registerUser(other, "Maintenance Other", "maintenance_other"),
+    ]);
+    const project = await catalog.createProject(owner, {
+      name: "Keyword maintenance",
+    });
+    await catalog.addMember(owner, project.id, researcher.userId, "researcher");
+    await catalog.addMember(owner, project.id, other.userId, "researcher");
+
+    const pending = await catalog.suggestProjectKeyword(
+      researcher,
+      project.id,
+      {
+        proposedLabel: "Withdraw me",
+        language: "en",
+        phrase: "withdraw me",
+        idempotencyKey: "suggest-withdraw-me",
+      },
+    );
+    if (pending.resolution === "already_approved") throw new Error("pending");
+    await expect(
+      catalog.withdrawProjectKeywordSuggestion(
+        other,
+        project.id,
+        pending.suggestion.id,
+        {
+          expectedSuggestionVersion: 1,
+          idempotencyKey: "other-withdraw",
+        },
+      ),
+    ).rejects.toMatchObject({ code: "project_access_denied" });
+    const withdrawalCommand = {
+      expectedSuggestionVersion: 1,
+      reason: "Research direction changed",
+      idempotencyKey: "withdraw-own",
+    };
+    const withdrawn = await catalog.withdrawProjectKeywordSuggestion(
+      researcher,
+      project.id,
+      pending.suggestion.id,
+      withdrawalCommand,
+    );
+    expect(withdrawn).toMatchObject({
+      keywordSetVersion: 1,
+      suggestion: {
+        state: "withdrawn",
+        version: 2,
+        withdrawnBy: { userId: researcher.userId },
+        withdrawReason: "Research direction changed",
+      },
+    });
+    await expect(
+      catalog.withdrawProjectKeywordSuggestion(
+        researcher,
+        project.id,
+        pending.suggestion.id,
+        withdrawalCommand,
+      ),
+    ).resolves.toEqual(withdrawn);
+    await expect(
+      catalog.withdrawProjectKeywordSuggestion(
+        researcher,
+        project.id,
+        pending.suggestion.id,
+        { ...withdrawalCommand, reason: "Divergent" },
+      ),
+    ).rejects.toMatchObject({ code: "idempotency_conflict" });
+
+    const proposed = await catalog.suggestProjectKeyword(owner, project.id, {
+      proposedLabel: "Public health",
+      proposedDescription: "Original description",
+      language: "en",
+      phrase: "public health",
+      idempotencyKey: "suggest-maintained",
+    });
+    if (proposed.resolution === "already_approved") throw new Error("pending");
+    const approved = await catalog.reviewProjectKeywordSuggestion(
+      owner,
+      project.id,
+      proposed.suggestion.id,
+      {
+        action: "approve",
+        expectedSuggestionVersion: 1,
+        expectedKeywordSetVersion: 1,
+        idempotencyKey: "approve-maintained",
+      },
+    );
+    const keyword = approved.keyword!;
+    const alias = approved.alias!;
+    const updated = await catalog.updateProjectKeyword(
+      owner,
+      project.id,
+      keyword.id,
+      {
+        label: "Public Health",
+        description: "Updated description",
+        expectedKeywordVersion: 1,
+        expectedKeywordSetVersion: 2,
+        idempotencyKey: "update-keyword-display",
+      },
+    );
+    expect(updated).toMatchObject({
+      keywordSetVersion: 3,
+      keyword: {
+        label: "Public Health",
+        description: "Updated description",
+        version: 2,
+        updatedBy: { userId: owner.userId },
+      },
+    });
+    await expect(
+      catalog.updateProjectKeyword(owner, project.id, keyword.id, {
+        label: "Public Health",
+        description: "Updated description",
+        expectedKeywordVersion: 1,
+        expectedKeywordSetVersion: 2,
+        idempotencyKey: "update-keyword-display",
+      }),
+    ).resolves.toEqual(updated);
+    await expect(
+      catalog.updateProjectKeywordAlias(
+        owner,
+        project.id,
+        keyword.id,
+        alias.id,
+        {
+          enabled: false,
+          expectedAliasVersion: 1,
+          expectedKeywordSetVersion: 3,
+          idempotencyKey: "disable-last-alias-too-early",
+        },
+      ),
+    ).rejects.toMatchObject({
+      code: "conflict",
+      message: expect.stringContaining("last enabled alias"),
+    });
+    const disabledKeyword = await catalog.updateProjectKeyword(
+      owner,
+      project.id,
+      keyword.id,
+      {
+        enabled: false,
+        expectedKeywordVersion: 2,
+        expectedKeywordSetVersion: 3,
+        idempotencyKey: "disable-keyword",
+      },
+    );
+    expect(disabledKeyword).toMatchObject({
+      keywordSetVersion: 4,
+      keyword: { enabled: false, version: 3 },
+    });
+    const disabledAlias = await catalog.updateProjectKeywordAlias(
+      owner,
+      project.id,
+      keyword.id,
+      alias.id,
+      {
+        enabled: false,
+        expectedAliasVersion: 1,
+        expectedKeywordSetVersion: 4,
+        idempotencyKey: "disable-alias-after-keyword",
+      },
+    );
+    expect(disabledAlias).toMatchObject({
+      keywordSetVersion: 5,
+      keyword: { enabled: false },
+      alias: { enabled: false, version: 2 },
+    });
+    await expect(
+      catalog.updateProjectKeyword(owner, project.id, keyword.id, {
+        enabled: true,
+        expectedKeywordVersion: 3,
+        expectedKeywordSetVersion: 5,
+        idempotencyKey: "enable-without-alias",
+      }),
+    ).rejects.toMatchObject({ code: "conflict" });
+    const enabledAlias = await catalog.updateProjectKeywordAlias(
+      owner,
+      project.id,
+      keyword.id,
+      alias.id,
+      {
+        language: "EN_us",
+        phrase: "Community health",
+        enabled: true,
+        expectedAliasVersion: 2,
+        expectedKeywordSetVersion: 5,
+        idempotencyKey: "restore-and-edit-alias",
+      },
+    );
+    expect(enabledAlias).toMatchObject({
+      keywordSetVersion: 6,
+      keyword: { enabled: false },
+      alias: {
+        language: "en-US",
+        normalizedPhrase: "community health",
+        enabled: true,
+      },
+    });
+    const disabledTargetSuggestion = await catalog.suggestProjectKeyword(
+      researcher,
+      project.id,
+      {
+        keywordId: keyword.id,
+        language: "es",
+        phrase: "salud pública",
+        idempotencyKey: "suggest-disabled-target-alias",
+      },
+    );
+    if (disabledTargetSuggestion.resolution === "already_approved") {
+      throw new Error("Expected a pending alias suggestion.");
+    }
+    const disabledTargetApproval = await catalog.reviewProjectKeywordSuggestion(
+      owner,
+      project.id,
+      disabledTargetSuggestion.suggestion.id,
+      {
+        action: "approve",
+        expectedSuggestionVersion: 1,
+        expectedKeywordSetVersion: 6,
+        idempotencyKey: "approve-disabled-target-alias",
+      },
+    );
+    expect(disabledTargetApproval).toMatchObject({
+      keywordSetVersion: 7,
+      keyword: { id: keyword.id, enabled: false },
+      alias: { language: "es", normalizedPhrase: "salud pública" },
+    });
+    await expect(
+      catalog.updateProjectKeywordAlias(
+        researcher,
+        project.id,
+        keyword.id,
+        alias.id,
+        {
+          phrase: "Unauthorized rewrite",
+          expectedAliasVersion: 3,
+          expectedKeywordSetVersion: 7,
+          idempotencyKey: "researcher-maintenance-denied",
+        },
+      ),
+    ).rejects.toMatchObject({ code: "project_access_denied" });
+    expect(
+      (
+        await database.query<{ command_kind: string }>(
+          `SELECT command_kind FROM project_keyword_commands
+           WHERE project_id = $1 ORDER BY created_at, command_kind`,
+          [project.id],
+        )
+      ).rows.map((row) => row.command_kind),
+    ).toEqual(
+      expect.arrayContaining(["withdraw", "keyword_update", "alias_update"]),
+    );
+  });
+
+  it("serializes suggestion withdrawal against owner review", async () => {
+    const { catalog } = await authorityCatalog();
+    const owner = authorityActor("withdraw-review-owner");
+    const researcher = authorityActor("withdraw-review-researcher");
+    await Promise.all([
+      catalog.registerUser(
+        owner,
+        "Withdraw Review Owner",
+        "withdraw_review_owner",
+      ),
+      catalog.registerUser(
+        researcher,
+        "Withdraw Review Researcher",
+        "withdraw_review_researcher",
+      ),
+    ]);
+    const project = await catalog.createProject(owner, {
+      name: "Withdrawal review race",
+    });
+    await catalog.addMember(owner, project.id, researcher.userId, "researcher");
+    const proposed = await catalog.suggestProjectKeyword(
+      researcher,
+      project.id,
+      {
+        proposedLabel: "Race phrase",
+        language: "en",
+        phrase: "race phrase",
+        idempotencyKey: "suggest-race-phrase",
+      },
+    );
+    if (proposed.resolution === "already_approved") throw new Error("pending");
+    const results = await Promise.allSettled([
+      catalog.withdrawProjectKeywordSuggestion(
+        researcher,
+        project.id,
+        proposed.suggestion.id,
+        {
+          expectedSuggestionVersion: 1,
+          idempotencyKey: "withdraw-race-phrase",
+        },
+      ),
+      catalog.reviewProjectKeywordSuggestion(
+        owner,
+        project.id,
+        proposed.suggestion.id,
+        {
+          action: "reject",
+          expectedSuggestionVersion: 1,
+          expectedKeywordSetVersion: 1,
+          idempotencyKey: "reject-race-phrase",
+        },
+      ),
+    ]);
+    expect(
+      results.filter((result) => result.status === "fulfilled"),
+    ).toHaveLength(1);
+    expect(
+      results.filter((result) => result.status === "rejected"),
+    ).toHaveLength(1);
+    expect(
+      (
+        results.find(
+          (result) => result.status === "rejected",
+        ) as PromiseRejectedResult
+      ).reason,
+    ).toMatchObject({ code: "conflict" });
+    const catalogAfter = await catalog.listProjectKeywords(owner, project.id);
+    expect(["withdrawn", "rejected"]).toContain(
+      catalogAfter.suggestions[0]?.state,
+    );
+  });
+
+  it("shares bounded point bookmarks with creator edits and administrator archive authority", async () => {
+    const { database, catalog } = await authorityCatalog();
+    const owner = authorityActor("bookmark-owner");
+    const researcher = authorityActor("bookmark-researcher");
+    const other = authorityActor("bookmark-other");
+    await Promise.all([
+      catalog.registerUser(owner, "Bookmark Owner", "bookmark_owner"),
+      catalog.registerUser(
+        researcher,
+        "Bookmark Researcher",
+        "bookmark_researcher",
+      ),
+      catalog.registerUser(other, "Bookmark Other", "bookmark_other"),
+    ]);
+    const project = await catalog.createProject(owner, { name: "Bookmarks" });
+    await catalog.addMember(owner, project.id, researcher.userId, "researcher");
+    await catalog.addMember(owner, project.id, other.userId, "researcher");
+    const video = await catalog.addVideo(owner, project.id, {
+      youtubeVideoId: "bookmark-video",
+      canonicalUrl: "https://www.youtube.com/watch?v=bookmark-video",
+      title: "Bookmark source",
+      durationMs: 60_000,
+    });
+    const bareCommand = {
+      videoId: video.id,
+      sourceTimeMs: 12_000,
+      idempotencyKey: "create-bare-bookmark",
+    };
+    const bare = await catalog.createProjectBookmark(
+      researcher,
+      project.id,
+      bareCommand,
+    );
+    expect(bare.bookmark).toMatchObject({
+      sourceTimeMs: 12_000,
+      state: "active",
+      version: 1,
+    });
+    await expect(
+      catalog.createProjectBookmark(researcher, project.id, bareCommand),
+    ).resolves.toEqual(bare);
+    await expect(
+      catalog.createProjectBookmark(researcher, project.id, {
+        ...bareCommand,
+        sourceTimeMs: 13_000,
+      }),
+    ).rejects.toMatchObject({ code: "idempotency_conflict" });
+    await expect(
+      catalog.createProjectBookmark(researcher, project.id, {
+        ...bareCommand,
+        sourceTimeMs: 60_001,
+        idempotencyKey: "past-duration",
+      }),
+    ).rejects.toMatchObject({ code: "invalid_language_evidence" });
+    const noted = await catalog.createProjectBookmark(researcher, project.id, {
+      videoId: video.id,
+      sourceTimeMs: 22_000,
+      title: "Café evidence",
+      note: "Résumé of the claim",
+      idempotencyKey: "create-noted-bookmark",
+    });
+    const page = await catalog.listProjectBookmarks(other, project.id, {
+      scope: "video",
+      videoId: video.id,
+      state: "active",
+      search: "ＲÉSUMÉ",
+      limit: 1,
+    });
+    expect(page.items).toHaveLength(1);
+    expect(page.items[0]?.id).toBe(noted.bookmark.id);
+    expect(page.items[0]?.source).toEqual({
+      youtubeVideoId: "bookmark-video",
+      canonicalUrl: "https://www.youtube.com/watch?v=bookmark-video",
+      title: "Bookmark source",
+    });
+    await expect(
+      catalog.updateProjectBookmark(owner, project.id, noted.bookmark.id, {
+        note: "Unauthorized rewrite",
+        expectedVersion: 1,
+        idempotencyKey: "other-edit",
+      }),
+    ).rejects.toMatchObject({ code: "project_access_denied" });
+    const edited = await catalog.updateProjectBookmark(
+      researcher,
+      project.id,
+      noted.bookmark.id,
+      {
+        title: null,
+        note: "Preserved creator text",
+        expectedVersion: 1,
+        idempotencyKey: "creator-edit",
+      },
+    );
+    expect(edited.bookmark).toMatchObject({
+      note: "Preserved creator text",
+      version: 2,
+    });
+    const archived = await catalog.archiveProjectBookmark(
+      owner,
+      project.id,
+      noted.bookmark.id,
+      {
+        expectedVersion: 2,
+        idempotencyKey: "owner-archive",
+      },
+    );
+    expect(archived.bookmark).toMatchObject({ state: "archived", version: 3 });
+    await expect(
+      catalog.restoreProjectBookmark(
+        researcher,
+        project.id,
+        noted.bookmark.id,
+        {
+          expectedVersion: 2,
+          idempotencyKey: "stale-restore",
+        },
+      ),
+    ).rejects.toMatchObject({ code: "conflict" });
+    const restored = await catalog.restoreProjectBookmark(
+      researcher,
+      project.id,
+      noted.bookmark.id,
+      { expectedVersion: 3, idempotencyKey: "creator-restore" },
+    );
+    expect(restored.bookmark.state).toBe("active");
+
+    const firstPage = await catalog.listProjectBookmarks(other, project.id, {
+      scope: "project",
+      state: "active",
+      limit: 1,
+    });
+    expect(firstPage.items.map((bookmark) => bookmark.id)).toEqual([
+      bare.bookmark.id,
+    ]);
+    expect(firstPage.nextCursor).toBeDefined();
+    const secondPage = await catalog.listProjectBookmarks(other, project.id, {
+      scope: "project",
+      state: "active",
+      limit: 1,
+      cursor: firstPage.nextCursor!,
+    });
+    expect(secondPage.items.map((bookmark) => bookmark.id)).toEqual([
+      noted.bookmark.id,
+    ]);
+
+    const racing = await catalog.createProjectBookmark(researcher, project.id, {
+      videoId: video.id,
+      sourceTimeMs: 30_000,
+      title: "Concurrent command",
+      idempotencyKey: "create-racing-bookmark",
+    });
+    const concurrent = await Promise.allSettled([
+      catalog.updateProjectBookmark(
+        researcher,
+        project.id,
+        racing.bookmark.id,
+        {
+          note: "Winning creator edit",
+          expectedVersion: 1,
+          idempotencyKey: "race-edit",
+        },
+      ),
+      catalog.archiveProjectBookmark(owner, project.id, racing.bookmark.id, {
+        expectedVersion: 1,
+        idempotencyKey: "race-archive",
+      }),
+    ]);
+    expect(
+      concurrent.filter((result) => result.status === "fulfilled"),
+    ).toHaveLength(1);
+    expect(
+      concurrent.filter((result) => result.status === "rejected"),
+    ).toHaveLength(1);
+
+    const isolatedProject = await catalog.createProject(owner, {
+      name: "Other bookmarks",
+    });
+    const isolatedVideo = await catalog.addVideo(owner, isolatedProject.id, {
+      youtubeVideoId: "isolated-bookmark-video",
+      canonicalUrl: "https://www.youtube.com/watch?v=isolated-bookmark-video",
+      title: "Isolated bookmark source",
+      durationMs: 40_000,
+    });
+    await catalog.createProjectBookmark(owner, isolatedProject.id, {
+      videoId: isolatedVideo.id,
+      sourceTimeMs: 1_000,
+      idempotencyKey: "isolated-bookmark",
+    });
+    await expect(
+      catalog.listProjectBookmarks(researcher, isolatedProject.id, {
+        scope: "project",
+        state: "all",
+        limit: 50,
+      }),
+    ).rejects.toMatchObject({ code: "project_access_denied" });
+
+    await database.query(
+      "DELETE FROM project_members WHERE project_id = $1 AND user_id = $2",
+      [project.id, researcher.userId],
+    );
+    await expect(
+      catalog.listProjectBookmarks(researcher, project.id, {
+        scope: "project",
+        state: "all",
+        limit: 50,
+      }),
+    ).rejects.toMatchObject({ code: "project_access_denied" });
+    await expect(
+      catalog.createProjectBookmark(researcher, project.id, bareCommand),
+    ).rejects.toMatchObject({ code: "project_access_denied" });
+  });
+
+  it("serializes competing keyword approvals without duplicate aliases or version advances", async () => {
+    const { database, catalog } = await authorityCatalog();
+    const owner = authorityActor("keyword-race-owner");
+    const administratorA = authorityActor("keyword-race-admin-a");
+    const administratorB = authorityActor("keyword-race-admin-b");
+    const researcher = authorityActor("keyword-race-researcher");
+    await Promise.all([
+      catalog.registerUser(owner, "Keyword Race Owner", "keyword_race_owner"),
+      catalog.registerUser(
+        administratorA,
+        "Keyword Race Admin A",
+        "keyword_race_admin_a",
+      ),
+      catalog.registerUser(
+        administratorB,
+        "Keyword Race Admin B",
+        "keyword_race_admin_b",
+      ),
+      catalog.registerUser(
+        researcher,
+        "Keyword Race Researcher",
+        "keyword_race_researcher",
+      ),
+    ]);
+    const project = await catalog.createProject(owner, {
+      name: "Keyword approval race",
+    });
+    await catalog.addMember(
+      owner,
+      project.id,
+      administratorA.userId,
+      "administrator",
+    );
+    await catalog.addMember(
+      owner,
+      project.id,
+      administratorB.userId,
+      "administrator",
+    );
+    await catalog.addMember(owner, project.id, researcher.userId, "researcher");
+    const suggested = await catalog.suggestProjectKeyword(
+      researcher,
+      project.id,
+      {
+        proposedLabel: "Public health",
+        language: "en",
+        phrase: "public health",
+        idempotencyKey: "suggest-public-health",
+      },
+    );
+    if (suggested.resolution === "already_approved") {
+      throw new Error("Expected a pending suggestion.");
+    }
+    const commands = [
+      {
+        actor: administratorA,
+        idempotencyKey: "approve-public-health-a",
+      },
+      {
+        actor: administratorB,
+        idempotencyKey: "approve-public-health-b",
+      },
+    ];
+    const results = await Promise.allSettled(
+      commands.map(({ actor, idempotencyKey }) =>
+        catalog.reviewProjectKeywordSuggestion(
+          actor,
+          project.id,
+          suggested.suggestion.id,
+          {
+            action: "approve",
+            expectedSuggestionVersion: 1,
+            expectedKeywordSetVersion: 1,
+            idempotencyKey,
+          },
+        ),
+      ),
+    );
+    expect(
+      results.filter((result) => result.status === "fulfilled"),
+    ).toHaveLength(1);
+    expect(
+      results.filter((result) => result.status === "rejected"),
+    ).toHaveLength(1);
+    expect(
+      (
+        results.find(
+          (result) => result.status === "rejected",
+        ) as PromiseRejectedResult
+      ).reason,
+    ).toMatchObject({ code: "conflict" });
+    const winnerIndex = results.findIndex(
+      (result) => result.status === "fulfilled",
+    );
+    const winner = results[winnerIndex] as PromiseFulfilledResult<unknown>;
+    await expect(
+      catalog.reviewProjectKeywordSuggestion(
+        commands[winnerIndex]!.actor,
+        project.id,
+        suggested.suggestion.id,
+        {
+          action: "approve",
+          expectedSuggestionVersion: 1,
+          expectedKeywordSetVersion: 1,
+          idempotencyKey: commands[winnerIndex]!.idempotencyKey,
+        },
+      ),
+    ).resolves.toEqual(winner.value);
+    expect(
+      (
+        await database.query<{ keyword_set_version: number }>(
+          "SELECT keyword_set_version FROM projects WHERE id = $1",
+          [project.id],
+        )
+      ).rows[0],
+    ).toEqual({ keyword_set_version: 2 });
+    expect(
+      (
+        await database.query<{
+          keywords: number;
+          aliases: number;
+          receipts: number;
+        }>(
+          `SELECT
+             (SELECT count(*)::integer FROM project_keywords WHERE project_id = $1) AS keywords,
+             (SELECT count(*)::integer FROM project_keyword_aliases WHERE project_id = $1) AS aliases,
+             (SELECT count(*)::integer FROM project_keyword_commands
+              WHERE project_id = $1 AND command_kind = 'review') AS receipts`,
+          [project.id],
+        )
+      ).rows[0],
+    ).toEqual({ keywords: 1, aliases: 1, receipts: 1 });
+  });
+
+  it("rejects approval of alias 101 without partial review evidence", async () => {
+    const { database, catalog } = await authorityCatalog();
+    const createdAt = "2026-08-24T12:00:00.000Z";
+    const owner = authorityActor("keyword-bound-owner");
+    const administrator = authorityActor("keyword-bound-admin");
+    const researcher = authorityActor("keyword-bound-researcher");
+    await Promise.all([
+      catalog.registerUser(owner, "Keyword Bound Owner", "keyword_bound_owner"),
+      catalog.registerUser(
+        administrator,
+        "Keyword Bound Admin",
+        "keyword_bound_admin",
+      ),
+      catalog.registerUser(
+        researcher,
+        "Keyword Bound Researcher",
+        "keyword_bound_researcher",
+      ),
+    ]);
+    const project = await catalog.createProject(owner, {
+      name: "Keyword alias bound",
+    });
+    await catalog.addMember(
+      owner,
+      project.id,
+      administrator.userId,
+      "administrator",
+    );
+    await catalog.addMember(owner, project.id, researcher.userId, "researcher");
+    const initial = await catalog.suggestProjectKeyword(
+      researcher,
+      project.id,
+      {
+        proposedLabel: "Energy",
+        language: "en",
+        phrase: "energy",
+        idempotencyKey: "suggest-energy",
+      },
+    );
+    if (initial.resolution === "already_approved") {
+      throw new Error("Expected a pending suggestion.");
+    }
+    const approved = await catalog.reviewProjectKeywordSuggestion(
+      administrator,
+      project.id,
+      initial.suggestion.id,
+      {
+        action: "approve",
+        expectedSuggestionVersion: 1,
+        expectedKeywordSetVersion: 1,
+        idempotencyKey: "approve-energy",
+      },
+    );
+    await database.query(
+      `INSERT INTO project_keyword_aliases
+         (id, project_id, keyword_id, language, phrase, normalized_phrase,
+          enabled, version, created_by, updated_by, created_at, updated_at)
+       SELECT gen_random_uuid(), $1, $2, 'en', 'Energy alias ' || ordinal,
+              'energy alias ' || ordinal, true, 1, $3, $3, $4, $4
+       FROM generate_series(1, 99) AS ordinal`,
+      [project.id, approved.keyword!.id, owner.userId, createdAt],
+    );
+    const overflow = await catalog.suggestProjectKeyword(
+      researcher,
+      project.id,
+      {
+        keywordId: approved.keyword!.id,
+        language: "en",
+        phrase: "Energy alias 100",
+        idempotencyKey: "suggest-energy-alias-101",
+      },
+    );
+    if (overflow.resolution === "already_approved") {
+      throw new Error("Expected the overflow alias to remain pending.");
+    }
+    await expect(
+      catalog.reviewProjectKeywordSuggestion(
+        administrator,
+        project.id,
+        overflow.suggestion.id,
+        {
+          action: "approve",
+          expectedSuggestionVersion: 1,
+          expectedKeywordSetVersion: 2,
+          idempotencyKey: "approve-energy-alias-101",
+        },
+      ),
+    ).rejects.toMatchObject({
+      code: "conflict",
+      message: expect.stringContaining("maximum 100 aliases"),
+    });
+    expect(
+      (
+        await database.query<{
+          aliases: number;
+          state: string;
+          version: number;
+        }>(
+          `SELECT
+             (SELECT count(*)::integer FROM project_keyword_aliases
+              WHERE project_id = $1 AND keyword_id = $2) AS aliases,
+             state,
+             version
+           FROM project_keyword_suggestions WHERE id = $3`,
+          [project.id, approved.keyword!.id, overflow.suggestion.id],
+        )
+      ).rows[0],
+    ).toEqual({ aliases: 100, state: "pending", version: 1 });
+  });
+
+  it("runs an authorized lease-safe keyword scan lifecycle with exact finalize replay", async () => {
+    const { database, catalog, store } = await authorityCatalog();
+    const owner = authorityActor("keyword-scan-owner");
+    const worker = authorityActor("keyword-scan-worker");
+    const outsider = authorityActor("keyword-scan-outsider");
+    await Promise.all([
+      catalog.registerUser(owner, "Keyword Scan Owner", "keyword_scan_owner"),
+      catalog.registerUser(
+        worker,
+        "Keyword Scan Worker",
+        "keyword_scan_worker",
+      ),
+      catalog.registerUser(
+        outsider,
+        "Keyword Scan Outsider",
+        "keyword_scan_outsider",
+      ),
+    ]);
+    const project = await catalog.createProject(owner, {
+      name: "Keyword scan lifecycle",
+    });
+    await catalog.addMember(owner, project.id, worker.userId, "researcher");
+    const video = await catalog.addVideo(
+      owner,
+      project.id,
+      {
+        youtubeVideoId: "KeywordScan01",
+        canonicalUrl: "https://www.youtube.com/watch?v=KeywordScan01",
+        title: "Keyword scan fixture",
+        durationMs: 60_000,
+        sourceLanguage: "en",
+      },
+      { automaticLocalProcessing: false },
+    );
+    const transcriptVersionId = randomUUID();
+    await database.query(
+      `INSERT INTO transcript_versions
+         (id, project_id, video_id, lineage_id, version, schema_version,
+          source_language, target_language, timing_precision,
+          manifest_object_key, manifest_object_version_id, manifest_sha256,
+          finalized_at)
+       VALUES ($1, $2, $3, $4, 1, 1, 'en', 'en', 'word',
+               'fixtures/keyword-scan.json', 'fixture-version', $5, now())`,
+      [transcriptVersionId, project.id, video.id, randomUUID(), "c".repeat(64)],
+    );
+    await database.query(
+      `UPDATE project_videos SET active_transcript_version_id = $1
+       WHERE project_id = $2 AND video_id = $3`,
+      [transcriptVersionId, project.id, video.id],
+    );
+    const suggestion = await catalog.suggestProjectKeyword(owner, project.id, {
+      proposedLabel: "Climate",
+      language: "en",
+      phrase: "climate change",
+      idempotencyKey: "suggest-keyword-scan-climate",
+    });
+    if (suggestion.resolution === "already_approved") {
+      throw new Error("Expected a pending scan keyword.");
+    }
+    const approvedKeyword = await catalog.reviewProjectKeywordSuggestion(
+      owner,
+      project.id,
+      suggestion.suggestion.id,
+      {
+        action: "approve",
+        expectedSuggestionVersion: 1,
+        expectedKeywordSetVersion: 1,
+        idempotencyKey: "approve-keyword-scan-climate",
+      },
+    );
+
+    expect(
+      await catalog.getProjectKeywordScanSummary(owner, project.id, video.id),
+    ).toMatchObject({ status: "queued", keywordSetVersion: 2 });
+    const queued = await catalog.scheduleProjectKeywordScan(
+      worker,
+      project.id,
+      video.id,
+    );
+    expect(queued).toMatchObject({
+      status: "queued",
+      transcriptVersionId,
+      keywordSetVersion: 2,
+      approvedKeywordCount: 1,
+    });
+    await expect(
+      catalog.scheduleProjectKeywordScan(worker, project.id, video.id),
+    ).resolves.toEqual(queued);
+    const claim = await catalog.claimProjectKeywordScan(worker, project.id, {
+      leaseSeconds: 60,
+    });
+    expect(claim).toMatchObject({
+      job: { state: "scanning", transcriptVersionId, attempt: 1 },
+      workerId: worker.userId,
+      attempt: 1,
+    });
+    if (!claim) throw new Error("Expected a keyword scan claim.");
+    await expect(
+      catalog.heartbeatProjectKeywordScan(outsider, project.id, claim.job.id, {
+        attempt: 1,
+        leaseSeconds: 60,
+      }),
+    ).rejects.toMatchObject({ statusCode: 403 });
+    await database.query(
+      `UPDATE project_keyword_scans
+       SET heartbeat_at = now() - interval '2 minutes',
+           expires_at = now() - interval '1 minute'
+       WHERE id = $1`,
+      [claim.job.id],
+    );
+    await expect(
+      catalog.createProjectKeywordScanArtifactUpload(
+        worker,
+        project.id,
+        claim.job.id,
+        { attempt: 1 },
+      ),
+    ).rejects.toMatchObject({ statusCode: 403 });
+    const activeClaim = await catalog.claimProjectKeywordScan(
+      worker,
+      project.id,
+      { leaseSeconds: 60 },
+    );
+    expect(activeClaim).toMatchObject({
+      job: { id: claim.job.id, attempt: 2 },
+      attempt: 2,
+    });
+    if (!activeClaim) throw new Error("Expected an expired scan reclaim.");
+    const artifactObject = {
+      schemaVersion: 1 as const,
+      projectId: project.id,
+      projectVideoId: video.id,
+      transcriptVersionId,
+      keywordSetVersion: 2,
+      scannerSchemaVersion: 1 as const,
+      occurrences: [],
+    };
+    const upload = await catalog.createProjectKeywordScanArtifactUpload(
+      worker,
+      project.id,
+      activeClaim.job.id,
+      { attempt: 2 },
+    );
+    expect(upload).toMatchObject({
+      scanId: activeClaim.job.id,
+      objectKey: `keyword-scans/${project.id}/${video.id}/${activeClaim.job.id}/matches.json`,
+    });
+    const artifactBytes = new TextEncoder().encode(
+      JSON.stringify(artifactObject),
+    );
+    const artifactKey = upload.objectKey;
+    const storedArtifact = await store.put({
+      key: artifactKey,
+      bytes: artifactBytes,
+      contentType: "application/json",
+      sha256: digest(artifactBytes),
+    });
+    const artifact = {
+      objectKey: artifactKey,
+      objectVersionId: storedArtifact.versionId,
+      sha256: digest(artifactBytes),
+      sizeBytes: artifactBytes.byteLength,
+      schemaVersion: 1 as const,
+    };
+    await expect(
+      catalog.finalizeProjectKeywordScan(
+        worker,
+        project.id,
+        activeClaim.job.id,
+        {
+          attempt: 2,
+          artifact: {
+            ...artifact,
+            objectKey: `${artifact.objectKey}.alternate`,
+          },
+          occurrenceCount: 0,
+          matchedKeywordCount: 0,
+          keywordCounts: [],
+          durationMs: 60_000,
+        },
+      ),
+    ).rejects.toMatchObject({ statusCode: 422 });
+    await expect(
+      catalog.finalizeProjectKeywordScan(worker, project.id, claim.job.id, {
+        attempt: 1,
+        artifact,
+        occurrenceCount: 0,
+        matchedKeywordCount: 0,
+        keywordCounts: [],
+        durationMs: 60_000,
+      }),
+    ).rejects.toMatchObject({ statusCode: 409 });
+    await expect(
+      catalog.failProjectKeywordScan(worker, project.id, claim.job.id, {
+        attempt: 1,
+        error: { code: "stale_attempt", message: "Stale worker failure" },
+      }),
+    ).rejects.toMatchObject({ statusCode: 409 });
+    const finalizeCommand = {
+      attempt: 2,
+      artifact,
+      occurrenceCount: 0,
+      matchedKeywordCount: 0,
+      keywordCounts: [],
+      durationMs: 60_000,
+    };
+    const [finalized, concurrentReplay] = await Promise.all([
+      catalog.finalizeProjectKeywordScan(
+        worker,
+        project.id,
+        activeClaim.job.id,
+        finalizeCommand,
+      ),
+      catalog.finalizeProjectKeywordScan(
+        worker,
+        project.id,
+        activeClaim.job.id,
+        finalizeCommand,
+      ),
+    ]);
+    expect(concurrentReplay).toEqual(finalized);
+    expect(finalized).toMatchObject({
+      status: "current",
+      occurrenceCount: 0,
+      matchedKeywordCount: 0,
+      matchesPerMinute: 0,
+      artifact,
+    });
+    await expect(
+      catalog.getProjectKeywordScanArtifactDownload(
+        owner,
+        project.id,
+        activeClaim.job.id,
+      ),
+    ).resolves.toMatchObject({
+      scanId: activeClaim.job.id,
+      artifact,
+      downloadUrl: expect.stringContaining("memory-download://"),
+    });
+    await expect(
+      catalog.finalizeProjectKeywordScan(
+        worker,
+        project.id,
+        activeClaim.job.id,
+        {
+          attempt: 2,
+          artifact,
+          occurrenceCount: 0,
+          matchedKeywordCount: 0,
+          keywordCounts: [],
+          durationMs: 60_000,
+        },
+      ),
+    ).resolves.toEqual(finalized);
+    await expect(
+      catalog.finalizeProjectKeywordScan(
+        worker,
+        project.id,
+        activeClaim.job.id,
+        {
+          attempt: 2,
+          artifact: { ...artifact, sha256: "e".repeat(64) },
+          occurrenceCount: 0,
+          matchedKeywordCount: 0,
+          keywordCounts: [],
+          durationMs: 60_000,
+        },
+      ),
+    ).rejects.toMatchObject({ statusCode: 409 });
+    const ownerActivity = await catalog.listProjectVideoActivity(
+      owner,
+      project.id,
+      { limit: 25, state: "unread" },
+    );
+    expect(ownerActivity).toMatchObject({ unreadCount: 1 });
+    expect(ownerActivity.items[0]).toMatchObject({
+      videoId: video.id,
+      eventType: "keyword_scan_completed",
+      state: "unread",
+      actor: { userId: worker.userId },
+    });
+    expect(
+      (
+        await database.query<{ count: string }>(
+          `SELECT count(*)::text AS count
+           FROM project_video_activity_events
+           WHERE project_id = $1 AND event_type = 'keyword_scan_completed'`,
+          [project.id],
+        )
+      ).rows[0]!.count,
+    ).toBe("1");
+    const seen = await catalog.markProjectVideoActivitySeen(owner, project.id, {
+      items: [
+        {
+          eventId: ownerActivity.items[0]!.eventId,
+          expectedVersion: ownerActivity.items[0]!.version,
+        },
+      ],
+    });
+    await expect(
+      catalog.markProjectVideoActivitySeen(owner, project.id, {
+        items: [
+          {
+            eventId: ownerActivity.items[0]!.eventId,
+            expectedVersion: ownerActivity.items[0]!.version,
+          },
+        ],
+      }),
+    ).resolves.toEqual(seen);
+    await expect(
+      catalog.getProjectKeywordScanSummary(outsider, project.id, video.id),
+    ).rejects.toMatchObject({ statusCode: 403 });
+    await expect(
+      catalog.getProjectKeywordScanArtifactDownload(
+        outsider,
+        project.id,
+        activeClaim.job.id,
+      ),
+    ).rejects.toMatchObject({ statusCode: 403 });
+    const aliasSuggestion = await catalog.suggestProjectKeyword(
+      worker,
+      project.id,
+      {
+        keywordId: approvedKeyword.keyword!.id,
+        language: "es",
+        phrase: "cambio climático",
+        idempotencyKey: "suggest-scan-rescan-alias",
+      },
+    );
+    if (aliasSuggestion.resolution === "already_approved") {
+      throw new Error("Expected a pending rescan alias.");
+    }
+    await catalog.reviewProjectKeywordSuggestion(
+      owner,
+      project.id,
+      aliasSuggestion.suggestion.id,
+      {
+        action: "approve",
+        expectedSuggestionVersion: 1,
+        expectedKeywordSetVersion: 2,
+        idempotencyKey: "approve-scan-rescan-alias",
+      },
+    );
+    await expect(
+      catalog.getProjectKeywordScanSummary(owner, project.id, video.id),
+    ).resolves.toMatchObject({
+      status: "queued",
+      keywordSetVersion: 3,
+      priorResult: {
+        scanId: activeClaim.job.id,
+        keywordSetVersion: 2,
+        occurrenceCount: 0,
+        artifact,
+      },
+    });
+    const replacementClaim = await catalog.claimProjectKeywordScan(
+      worker,
+      project.id,
+      { leaseSeconds: 60 },
+    );
+    if (!replacementClaim)
+      throw new Error("Expected a replacement scan claim.");
+    await expect(
+      catalog.failProjectKeywordScan(
+        worker,
+        project.id,
+        replacementClaim.job.id,
+        {
+          attempt: replacementClaim.attempt,
+          error: {
+            code: "scan_input_unavailable",
+            message: "Keyword scan input is temporarily unavailable.",
+          },
+        },
+      ),
+    ).resolves.toMatchObject({
+      status: "failed",
+      priorResult: { scanId: activeClaim.job.id, artifact },
+    });
+    await expect(
+      catalog.getProjectKeywordScanArtifactDownload(
+        owner,
+        project.id,
+        claim.job.id,
+      ),
+    ).resolves.toMatchObject({ artifact });
+    expect(
+      (
+        await database.query<{ count: string }>(
+          "SELECT count(*)::text AS count FROM project_keyword_scans WHERE project_id = $1",
+          [project.id],
+        )
+      ).rows[0]!.count,
+    ).toBe("2");
+    await database.query(
+      "DELETE FROM project_members WHERE project_id = $1 AND user_id = $2",
+      [project.id, worker.userId],
+    );
+    await expect(
+      catalog.getProjectKeywordScanSummary(worker, project.id, video.id),
+    ).rejects.toMatchObject({ statusCode: 403 });
+    await expect(
+      catalog.getProjectKeywordScanArtifactDownload(
+        worker,
+        project.id,
+        activeClaim.job.id,
+      ),
+    ).rejects.toMatchObject({ statusCode: 403 });
+  });
+});
+
+describe("canonical project-video worklist flags", () => {
+  it("converges direct and batch ingest, preserves evidence, and isolates own flag changes", async () => {
+    const { database, catalog } = await authorityCatalog();
+    const owner = authorityActor("worklist-owner");
+    const researcher = authorityActor("worklist-researcher");
+    const outsider = authorityActor("worklist-outsider");
+    await Promise.all([
+      catalog.registerUser(owner, "Worklist Owner", "worklist_owner"),
+      catalog.registerUser(
+        researcher,
+        "Worklist Researcher",
+        "worklist_researcher",
+      ),
+      catalog.registerUser(outsider, "Worklist Outsider", "worklist_outsider"),
+    ]);
+    const project = await catalog.createProject(owner, {
+      name: "Canonical worklist",
+    });
+    const otherProject = await catalog.createProject(outsider, {
+      name: "Other canonical worklist",
+    });
+    await catalog.addMember(owner, project.id, researcher.userId, "researcher");
+    const metadata = {
+      youtubeVideoId: "CanonicalWorklist1",
+      canonicalUrl: "https://www.youtube.com/watch?v=CanonicalWorklist1",
+      title: "Canonical worklist fixture",
+      channel: "Fixture channel",
+      durationMs: 60_000,
+      sourceLanguage: "en",
+    };
+    const [direct, replay] = await Promise.all([
+      catalog.addVideo(owner, project.id, metadata),
+      catalog.addVideo(owner, project.id, metadata),
+    ]);
+    expect(replay.id).toBe(direct.id);
+    const batch = await catalog.createTranscriptionBatch(researcher, {
+      projectId: project.id,
+      name: "Converged batch",
+      options: {
+        targetLanguage: "en",
+        transcriptionProfile: "default",
+        sourcePolicy: "prefer-existing",
+        executionLocation: "local",
+        priority: "normal",
+      },
+      items: [
+        {
+          inputIndex: 0,
+          input: metadata.canonicalUrl,
+          status: "ready",
+          processingNeed: "transcription",
+          ...metadata,
+        },
+      ],
+    });
+    expect(batch.items[0]).toMatchObject({ catalogVideoId: direct.id });
+    await catalog.addVideo(outsider, otherProject.id, metadata);
+
+    const trackId = randomUUID();
+    const clip = await catalog.createClipCandidate(owner, project.id, {
+      idempotencyKey: "worklist-preserved-clip",
+      video: metadata,
+      selection: {
+        trackId,
+        transcriptVersion: 1,
+        firstSegmentId: randomUUID(),
+        lastSegmentId: randomUUID(),
+        transcriptStartMs: 1_000,
+        transcriptEndMs: 2_000,
+        exportStartMs: 900,
+        exportEndMs: 2_100,
+        text: "Preserved worklist clip",
+        timingPrecision: "cue",
+      },
+      languageEvidence: {
+        schemaVersion: 2,
+        native: {
+          role: "native",
+          language: "en",
+          text: "Preserved worklist clip",
+          trackId,
+          trackVersion: 1,
+          timingPrecision: "cue",
+        },
+        english: {
+          role: "english",
+          language: "en",
+          text: "Preserved worklist clip",
+          trackId,
+          trackVersion: 1,
+          timingPrecision: "cue",
+        },
+      },
+      notes: "",
+      tags: [],
+    });
+    const transcriptVersionId = randomUUID();
+    await database.query(
+      `INSERT INTO transcript_versions
+         (id, project_id, video_id, lineage_id, version, schema_version,
+          source_language, target_language, timing_precision,
+          manifest_object_key, manifest_object_version_id, manifest_sha256,
+          finalized_at)
+       VALUES ($1, $2, $3, $4, 1, 1, 'en', 'en', 'cue', $5, 'fixture-v1',
+               $6, now())`,
+      [
+        transcriptVersionId,
+        project.id,
+        direct.id,
+        randomUUID(),
+        "fixtures/worklist-manifest.json",
+        "a".repeat(64),
+      ],
+    );
+    await database.query(
+      `UPDATE project_videos SET active_transcript_version_id = $1
+       WHERE project_id = $2 AND video_id = $3`,
+      [transcriptVersionId, project.id, direct.id],
+    );
+
+    const listed = await catalog.listProjectVideoWorklist(owner, project.id, {
+      limit: 25,
+    });
+    expect(listed).toMatchObject({ total: 1 });
+    expect(listed.items[0]).toMatchObject({
+      projectId: project.id,
+      video: { id: direct.id, youtubeVideoId: metadata.youtubeVideoId },
+      activeTranscriptVersionId: transcriptVersionId,
+      activeFlagCount: 2,
+      flaggersTruncated: false,
+      ownFlag: { active: true, version: 1 },
+      processing: {
+        state: "queued",
+        batchId: batch.batch.id,
+        batchItemId: batch.items[0]!.id,
+        jobId: batch.items[0]!.jobId,
+        attempt: 0,
+      },
+      clipCount: 1,
+    });
+    expect(listed.items[0]!.flaggers.map((flagger) => flagger.handle)).toEqual(
+      expect.arrayContaining(["worklist_owner", "worklist_researcher"]),
+    );
+
+    const deactivated = await catalog.updateOwnProjectVideoFlag(
+      owner,
+      project.id,
+      direct.id,
+      { active: false, expectedVersion: 1 },
+    );
+    expect(deactivated.flag).toMatchObject({ active: false, version: 2 });
+    const replayedDeactivation = await catalog.updateOwnProjectVideoFlag(
+      owner,
+      project.id,
+      direct.id,
+      { active: false, expectedVersion: 2 },
+    );
+    expect(replayedDeactivation).toEqual(deactivated);
+    const afterDeactivation = await catalog.listProjectVideoWorklist(
+      owner,
+      project.id,
+      { limit: 25 },
+    );
+    expect(afterDeactivation.items[0]).toMatchObject({
+      activeFlagCount: 1,
+      ownFlag: { active: false, version: 2 },
+      activeTranscriptVersionId: transcriptVersionId,
+      clipCount: 1,
+      processing: { jobId: batch.items[0]!.jobId },
+    });
+    expect(afterDeactivation.items[0]!.flaggers).toHaveLength(1);
+    expect(afterDeactivation.items[0]!.flaggers[0]!.userId).toBe(
+      researcher.userId,
+    );
+    expect(
+      (
+        await database.query<{ count: string }>(
+          `SELECT count(*)::text AS count FROM clip_candidates
+           WHERE project_id = $1 AND id = $2`,
+          [project.id, clip.id],
+        )
+      ).rows[0]?.count,
+    ).toBe("1");
+    expect(
+      (
+        await database.query<{ count: string }>(
+          `SELECT count(*)::text AS count FROM jobs WHERE id = $1`,
+          [batch.items[0]!.jobId],
+        )
+      ).rows[0]?.count,
+    ).toBe("1");
+
+    await catalog.addVideo(owner, project.id, metadata);
+    const replayedBatch = await catalog.createTranscriptionBatch(researcher, {
+      projectId: project.id,
+      name: "Converged batch replay",
+      options: batch.batch,
+      items: [
+        {
+          inputIndex: 0,
+          input: metadata.canonicalUrl,
+          status: "ready",
+          processingNeed: "transcription",
+          ...metadata,
+        },
+      ],
+    });
+    expect(replayedBatch.items[0]).toMatchObject({
+      catalogVideoId: direct.id,
+      status: "existing-transcript",
+      processingNeed: "reuse-shared",
+      state: "ready_for_review",
+    });
+    expect(replayedBatch.items[0]!.jobId).toBeUndefined();
+    const restored = await catalog.listProjectVideoWorklist(owner, project.id, {
+      limit: 25,
+    });
+    expect(restored.items[0]).toMatchObject({
+      activeFlagCount: 2,
+      ownFlag: { active: true, version: 3 },
+      clipCount: 1,
+    });
+    expect(
+      (
+        await database.query<{ count: string }>(
+          `SELECT count(*)::text AS count FROM project_videos
+           WHERE video_id = $1`,
+          [direct.id],
+        )
+      ).rows[0]?.count,
+    ).toBe("2");
+    expect(
+      (
+        await database.query<{ count: string }>(
+          `SELECT count(*)::text AS count FROM project_video_flags
+           WHERE video_id = $1`,
+          [direct.id],
+        )
+      ).rows[0]?.count,
+    ).toBe("3");
+    expect(
+      (
+        await database.query<{ count: string }>(
+          `SELECT count(*)::text AS count FROM jobs
+           WHERE project_id = $1 AND kind = 'transcription'`,
+          [project.id],
+        )
+      ).rows[0]?.count,
+    ).toBe("1");
+    await expect(
+      catalog.listProjectVideoWorklist(outsider, project.id, { limit: 25 }),
+    ).rejects.toMatchObject({ code: "project_access_denied" });
+    await expect(
+      catalog.updateOwnProjectVideoFlag(outsider, project.id, direct.id, {
+        active: false,
+        expectedVersion: 0,
+      }),
+    ).rejects.toMatchObject({ code: "project_access_denied" });
+  });
+
+  it("paginates stable canonical rows and rejects cross-project cursors", async () => {
+    const { catalog } = await authorityCatalog();
+    const actor = authorityActor("worklist-pagination");
+    await catalog.registerUser(actor, "Worklist Pagination", "worklist_pages");
+    const firstProject = await catalog.createProject(actor, {
+      name: "First worklist pages",
+    });
+    const secondProject = await catalog.createProject(actor, {
+      name: "Second worklist pages",
+    });
+    for (const suffix of ["A", "B", "C"]) {
+      await catalog.addVideo(actor, firstProject.id, {
+        youtubeVideoId: `WorklistPage${suffix}`,
+        canonicalUrl: `https://www.youtube.com/watch?v=WorklistPage${suffix}`,
+        title: `Worklist page ${suffix}`,
+      });
+    }
+    await catalog.addVideo(actor, secondProject.id, {
+      youtubeVideoId: "WorklistOtherPage",
+      canonicalUrl: "https://www.youtube.com/watch?v=WorklistOtherPage",
+      title: "Other project page",
+    });
+
+    const seen = new Set<string>();
+    let cursor: string | undefined;
+    do {
+      const page = await catalog.listProjectVideoWorklist(
+        actor,
+        firstProject.id,
+        { limit: 1, ...(cursor ? { cursor } : {}) },
+      );
+      expect(page.total).toBe(3);
+      expect(page.items).toHaveLength(1);
+      seen.add(page.items[0]!.video.youtubeVideoId);
+      cursor = page.nextCursor;
+    } while (cursor);
+    expect(seen).toEqual(
+      new Set(["WorklistPageA", "WorklistPageB", "WorklistPageC"]),
+    );
+    const firstPage = await catalog.listProjectVideoWorklist(
+      actor,
+      firstProject.id,
+      { limit: 1 },
+    );
+    await expect(
+      catalog.listProjectVideoWorklist(actor, secondProject.id, {
+        limit: 1,
+        cursor: firstPage.nextCursor!,
+      }),
+    ).rejects.toMatchObject({ code: "invalid_request" });
+  });
+});
+
+describe("project governance lifecycle", () => {
+  it("converts, invites, joins, transfers ownership, and audits without pre-membership reads", async () => {
+    const { catalog } = await authorityCatalog();
+    const owner = authorityActor("governance-owner");
+    const administrator = authorityActor("governance-administrator");
+    const researcher = authorityActor("governance-researcher");
+    const outsider = authorityActor("governance-outsider");
+    const secondOutsider = authorityActor("governance-second-outsider");
+    await Promise.all([
+      catalog.registerUser(owner, "Governance Owner", "governance_owner"),
+      catalog.registerUser(
+        administrator,
+        "Governance Administrator",
+        "governance_admin",
+      ),
+      catalog.registerUser(
+        researcher,
+        "Governance Researcher",
+        "governance_researcher",
+      ),
+      catalog.registerUser(
+        outsider,
+        "Governance Outsider",
+        "governance_outsider",
+      ),
+      catalog.registerUser(
+        secondOutsider,
+        "Second Governance Outsider",
+        "governance_second_outsider",
+      ),
+    ]);
+    const personal = await catalog.createProject(owner, {
+      name: "Governance fixture",
+      kind: "personal",
+    });
+    await expect(
+      catalog.createProjectInvitation(owner, personal.id, {
+        idempotencyKey: "invite-before-convert",
+        handle: "governance_admin",
+        role: "administrator",
+        expiresInDays: 7,
+      }),
+    ).rejects.toMatchObject({ code: "conflict" });
+    await expect(
+      catalog.getProject(outsider, personal.id),
+    ).rejects.toMatchObject({ code: "project_access_denied" });
+
+    const converted = await catalog.updateProjectGovernance(
+      owner,
+      personal.id,
+      {
+        idempotencyKey: "convert-personal",
+        expectedVersion: personal.version,
+        action: { type: "convert_to_shared", visibility: "invitation_only" },
+      },
+    );
+    expect(converted).toMatchObject({ kind: "shared", version: 2 });
+    const invitation = await catalog.createProjectInvitation(
+      owner,
+      personal.id,
+      {
+        idempotencyKey: "invite-administrator",
+        handle: "@GOVERNANCE_ADMIN",
+        role: "administrator",
+        expiresInDays: 7,
+      },
+    );
+    expect(await catalog.listMyProjectInvitations(administrator)).toMatchObject(
+      [{ id: invitation.id, state: "pending", role: "administrator" }],
+    );
+    const accepted = await catalog.decideProjectInvitation(
+      administrator,
+      invitation.id,
+      {
+        idempotencyKey: "accept-administrator",
+        expectedVersion: invitation.version,
+        decision: "accept",
+      },
+    );
+    expect(accepted.state).toBe("accepted");
+    await expect(
+      catalog.decideProjectInvitation(administrator, invitation.id, {
+        idempotencyKey: "accept-administrator",
+        expectedVersion: invitation.version,
+        decision: "accept",
+      }),
+    ).resolves.toEqual(accepted);
+
+    const opened = await catalog.updateProjectGovernance(owner, personal.id, {
+      idempotencyKey: "open-project",
+      expectedVersion: 2,
+      action: { type: "set_visibility", visibility: "open_to_join" },
+    });
+    expect(opened).toMatchObject({ visibility: "open_to_join", version: 3 });
+    expect(await catalog.discoverOpenProjects(outsider)).toMatchObject([
+      { id: personal.id, name: "Governance fixture" },
+    ]);
+    await expect(
+      catalog.getProject(outsider, personal.id),
+    ).rejects.toMatchObject({ code: "project_access_denied" });
+    await catalog.joinOpenProject(outsider, personal.id, {
+      idempotencyKey: "join-open-project",
+    });
+    await catalog.joinOpenProject(secondOutsider, personal.id, {
+      idempotencyKey: "join-open-project",
+    });
+    await expect(
+      catalog.getProject(outsider, personal.id),
+    ).resolves.toMatchObject({ id: personal.id });
+
+    const researcherInvitation = await catalog.createProjectInvitation(
+      administrator,
+      personal.id,
+      {
+        idempotencyKey: "admin-invite-researcher",
+        handle: "governance_researcher",
+        role: "researcher",
+        expiresInDays: 7,
+      },
+    );
+    await catalog.decideProjectInvitation(researcher, researcherInvitation.id, {
+      idempotencyKey: "accept-researcher",
+      expectedVersion: 1,
+      decision: "accept",
+    });
+    await expect(
+      catalog.createProjectInvitation(administrator, personal.id, {
+        idempotencyKey: "admin-cannot-invite-admin",
+        handle: "governance_researcher",
+        role: "administrator",
+        expiresInDays: 7,
+      }),
+    ).rejects.toMatchObject({ code: "project_access_denied" });
+
+    const transferred = await catalog.updateProjectGovernance(
+      owner,
+      personal.id,
+      {
+        idempotencyKey: "transfer-owner",
+        expectedVersion: 3,
+        action: { type: "transfer_ownership", userId: administrator.userId },
+      },
+    );
+    expect(transferred).toMatchObject({
+      id: personal.id,
+      currentUserRole: "administrator",
+      version: 4,
+    });
+    const members = await catalog.listProjectMembers(
+      administrator,
+      personal.id,
+    );
+    expect(members.filter((member) => member.role === "owner")).toHaveLength(1);
+    expect(members.find((member) => member.userId === owner.userId)?.role).toBe(
+      "administrator",
+    );
+    expect(
+      await catalog.listGovernanceEvents(administrator, personal.id),
+    ).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ eventType: "project_converted" }),
+        expect.objectContaining({ eventType: "invitation_accepted" }),
+        expect.objectContaining({ eventType: "open_joined" }),
+        expect.objectContaining({ eventType: "ownership_transferred" }),
+      ]),
+    );
+  });
+
+  it("rejects, revokes, expires, and removes access with stale-safe replay", async () => {
+    let now = new Date("2026-08-24T12:00:00.000Z");
+    const { catalog } = await authorityCatalog(() => now);
+    const owner = authorityActor("governance-lifecycle-owner");
+    const rejectedUser = authorityActor("governance-rejected");
+    const revokedUser = authorityActor("governance-revoked");
+    const expiredUser = authorityActor("governance-expired");
+    const removedUser = authorityActor("governance-removed");
+    await Promise.all([
+      catalog.registerUser(owner, "Lifecycle Owner", "lifecycle_owner"),
+      catalog.registerUser(rejectedUser, "Rejected User", "lifecycle_rejected"),
+      catalog.registerUser(revokedUser, "Revoked User", "lifecycle_revoked"),
+      catalog.registerUser(expiredUser, "Expired User", "lifecycle_expired"),
+      catalog.registerUser(removedUser, "Removed User", "lifecycle_removed"),
+    ]);
+    const project = await catalog.createProject(owner, {
+      name: "Governance lifecycle",
+    });
+
+    const rejectedInvitation = await catalog.createProjectInvitation(
+      owner,
+      project.id,
+      {
+        idempotencyKey: "reject-invitation-create",
+        handle: "lifecycle_rejected",
+        role: "researcher",
+        expiresInDays: 7,
+      },
+    );
+    const rejected = await catalog.decideProjectInvitation(
+      rejectedUser,
+      rejectedInvitation.id,
+      {
+        idempotencyKey: "reject-invitation",
+        expectedVersion: 1,
+        decision: "reject",
+      },
+    );
+    expect(rejected.state).toBe("rejected");
+    await expect(
+      catalog.decideProjectInvitation(rejectedUser, rejectedInvitation.id, {
+        idempotencyKey: "reject-invitation",
+        expectedVersion: 1,
+        decision: "reject",
+      }),
+    ).resolves.toEqual(rejected);
+    await expect(
+      catalog.decideProjectInvitation(rejectedUser, rejectedInvitation.id, {
+        idempotencyKey: "reject-invitation",
+        expectedVersion: 2,
+        decision: "reject",
+      }),
+    ).rejects.toMatchObject({ code: "idempotency_conflict" });
+
+    const revokedInvitation = await catalog.createProjectInvitation(
+      owner,
+      project.id,
+      {
+        idempotencyKey: "revoke-invitation-create",
+        handle: "lifecycle_revoked",
+        role: "researcher",
+        expiresInDays: 7,
+      },
+    );
+    const revoked = await catalog.revokeProjectInvitation(
+      owner,
+      project.id,
+      revokedInvitation.id,
+      {
+        idempotencyKey: "revoke-invitation",
+        expectedVersion: 1,
+      },
+    );
+    expect(revoked.state).toBe("revoked");
+    await expect(
+      catalog.revokeProjectInvitation(owner, project.id, revokedInvitation.id, {
+        idempotencyKey: "revoke-invitation",
+        expectedVersion: 1,
+      }),
+    ).resolves.toEqual(revoked);
+
+    const expiredInvitation = await catalog.createProjectInvitation(
+      owner,
+      project.id,
+      {
+        idempotencyKey: "expire-invitation-create",
+        handle: "lifecycle_expired",
+        role: "researcher",
+        expiresInDays: 1,
+      },
+    );
+    now = new Date("2026-08-26T12:00:00.000Z");
+    expect(await catalog.listMyProjectInvitations(expiredUser)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: expiredInvitation.id,
+          state: "expired",
+          version: 2,
+        }),
+      ]),
+    );
+    await expect(
+      catalog.decideProjectInvitation(expiredUser, expiredInvitation.id, {
+        idempotencyKey: "accept-expired",
+        expectedVersion: 2,
+        decision: "accept",
+      }),
+    ).rejects.toMatchObject({ code: "conflict" });
+
+    await catalog.addMember(
+      owner,
+      project.id,
+      removedUser.userId,
+      "researcher",
+    );
+    const clip = await catalog.createClipCandidate(owner, project.id, {
+      ...clipCandidateFixtureInput("governance-removed-clip"),
+    });
+    const removedMember = (
+      await catalog.listProjectMembers(owner, project.id)
+    ).find((member) => member.userId === removedUser.userId)!;
+    const updated = await catalog.updateProjectGovernance(owner, project.id, {
+      idempotencyKey: "remove-researcher",
+      expectedVersion: project.version,
+      action: {
+        type: "remove_member",
+        userId: removedUser.userId,
+        expectedMemberVersion: removedMember.version,
+      },
+    });
+    expect(updated).toMatchObject({ id: project.id, version: 2 });
+    await expect(
+      catalog.getProject(removedUser, project.id),
+    ).rejects.toMatchObject({ code: "project_access_denied" });
+    await expect(
+      catalog.listProjectVideoWorklist(removedUser, project.id, { limit: 25 }),
+    ).rejects.toMatchObject({ code: "project_access_denied" });
+    await expect(
+      catalog.listClipComments(removedUser, project.id, clip.id, { limit: 25 }),
+    ).rejects.toMatchObject({ code: "project_access_denied" });
+    await expect(
+      catalog.listProjectVideoActivity(removedUser, project.id, {
+        limit: 25,
+        state: "all",
+      }),
+    ).rejects.toMatchObject({ code: "project_access_denied" });
+    await expect(
+      catalog.getProjectLocalProcessingStatus(removedUser, project.id),
+    ).rejects.toMatchObject({ code: "project_access_denied" });
+  });
+
+  it("serializes ownership transfer and preserves exactly one current Owner", async () => {
+    const { catalog } = await authorityCatalog();
+    const owner = authorityActor("governance-concurrent-owner");
+    const first = authorityActor("governance-concurrent-first");
+    const second = authorityActor("governance-concurrent-second");
+    await Promise.all([
+      catalog.registerUser(owner, "Concurrent Owner", "concurrent_owner"),
+      catalog.registerUser(first, "First Successor", "first_successor"),
+      catalog.registerUser(second, "Second Successor", "second_successor"),
+    ]);
+    const project = await catalog.createProject(owner, {
+      name: "Concurrent ownership",
+    });
+    await Promise.all([
+      catalog.addMember(owner, project.id, first.userId, "researcher"),
+      catalog.addMember(owner, project.id, second.userId, "researcher"),
+    ]);
+
+    const transfers = await Promise.allSettled([
+      catalog.updateProjectGovernance(owner, project.id, {
+        idempotencyKey: "concurrent-transfer-first",
+        expectedVersion: project.version,
+        action: { type: "transfer_ownership", userId: first.userId },
+      }),
+      catalog.updateProjectGovernance(owner, project.id, {
+        idempotencyKey: "concurrent-transfer-second",
+        expectedVersion: project.version,
+        action: { type: "transfer_ownership", userId: second.userId },
+      }),
+    ]);
+    expect(
+      transfers.filter((result) => result.status === "fulfilled"),
+    ).toHaveLength(1);
+    const currentOwner = transfers[0].status === "fulfilled" ? first : second;
+    const members = await catalog.listProjectMembers(currentOwner, project.id);
+    expect(members.filter((member) => member.role === "owner")).toHaveLength(1);
+    await expect(
+      catalog.updateProjectGovernance(owner, project.id, {
+        idempotencyKey: "concurrent-transfer-first",
+        expectedVersion: project.version,
+        action: { type: "transfer_ownership", userId: first.userId },
+      }),
+    ).rejects.toMatchObject({ code: "project_access_denied" });
+  });
+});
+
+describe("clip comment authority and atomic first comment", () => {
+  it("resolves member mentions, follows safely, searches comments and Topics, and freezes authoring snapshots", async () => {
+    const { catalog } = await authorityCatalog();
+    const owner = authorityActor("collaboration-owner");
+    const alice = authorityActor("collaboration-alice");
+    const bob = authorityActor("collaboration-bob");
+    const outsider = authorityActor("collaboration-outsider");
+    await Promise.all([
+      catalog.registerUser(owner, "Collaboration Owner", "collab_owner"),
+      catalog.registerUser(alice, "Alice", "collab_alice"),
+      catalog.registerUser(bob, "Bob", "collab_bob"),
+      catalog.registerUser(outsider, "Outsider", "collab_outsider"),
+    ]);
+    const project = await catalog.createProject(owner, {
+      name: "Collaboration and Topics",
+    });
+    await Promise.all([
+      catalog.addMember(owner, project.id, alice.userId, "researcher"),
+      catalog.addMember(owner, project.id, bob.userId, "researcher"),
+    ]);
+    const clip = await catalog.createClipCandidate(owner, project.id, {
+      ...clipCandidateFixtureInput("collaboration-topic-clip"),
+      tags: ["Policy", "History"],
+    });
+    await catalog.createClipCandidate(owner, project.id, {
+      ...clipCandidateFixtureInput("collaboration-other-clip"),
+      tags: ["Policy"],
+    });
+    await catalog.createClipCandidate(owner, project.id, {
+      ...clipCandidateFixtureInput("collaboration-untagged-clip"),
+      tags: [],
+    });
+
+    expect(
+      (
+        await catalog.listClipLibrary(owner, project.id, {
+          limit: 25,
+          completed: "any",
+        })
+      ).entries,
+    ).toHaveLength(3);
+
+    await expect(
+      catalog.createClipComment(alice, project.id, clip.id, {
+        idempotencyKey: "reject-nonmember-mention",
+        body: "Ask @collab_outsider to review.",
+      }),
+    ).rejects.toMatchObject({ code: "invalid_request" });
+
+    const promoted = await catalog.createClipComment(
+      alice,
+      project.id,
+      clip.id,
+      {
+        idempotencyKey: "member-mention",
+        body: "The policy transition matters, @collab_owner.",
+        sourceTimeMs: 500,
+      },
+    );
+    expect(promoted).toMatchObject({
+      mentions: [{ id: owner.userId, handle: "collab_owner" }],
+    });
+    const ownerNotices = await catalog.listClipCommentNotices(owner);
+    expect(ownerNotices).toMatchObject({
+      unreadCount: 1,
+      notices: [
+        {
+          commentId: promoted.id,
+          reason: "mention",
+          sourceTimeMs: 500,
+        },
+      ],
+    });
+    const mentionFeed = await catalog.listNotificationFeed(owner, {
+      limit: 25,
+    });
+    expect(mentionFeed.events).toEqual([
+      expect.objectContaining({
+        id: ownerNotices.notices[0]!.id,
+        kind: "mention",
+        actorLabel: "Alice",
+        navigation: {
+          kind: "mention",
+          projectId: project.id,
+          clipId: clip.id,
+          commentId: promoted.id,
+          sourceTimeMs: 500,
+        },
+      }),
+    ]);
+    expect(JSON.stringify(mentionFeed)).not.toContain(
+      "The policy transition matters",
+    );
+    await expect(
+      catalog.readClipComment(owner, project.id, clip.id, promoted.id),
+    ).resolves.toEqual(promoted);
+    await expect(
+      catalog.readClipComment(outsider, project.id, clip.id, promoted.id),
+    ).rejects.toMatchObject({ code: "project_access_denied" });
+    await catalog.markClipCommentNoticeSeen(
+      owner,
+      ownerNotices.notices[0]!.id,
+      { expectedVersion: 1 },
+    );
+    expect((await catalog.listClipCommentNotices(owner)).unreadCount).toBe(0);
+
+    await catalog.createClipComment(bob, project.id, clip.id, {
+      idempotencyKey: "follower-fanout",
+      body: "A second collaborator confirms the edit point.",
+    });
+    expect(
+      (await catalog.listClipCommentNotices(alice)).notices[0],
+    ).toMatchObject({ reason: "followed_comment" });
+    expect(
+      (await catalog.listNotificationFeed(alice, { limit: 25 })).events,
+    ).toEqual([]);
+    await catalog.updateClipFollow(owner, project.id, clip.id, {
+      idempotencyKey: "owner-unfollow",
+      following: false,
+    });
+
+    const commentSearch = await catalog.listClipLibrary(owner, project.id, {
+      limit: 25,
+      query: "policy transition",
+      completed: "any",
+    });
+    expect(commentSearch.entries).toHaveLength(1);
+    expect(commentSearch.entries[0]).toMatchObject({
+      commentCount: 2,
+      matchingComment: { commentId: promoted.id, sourceTimeMs: 500 },
+    });
+    expect(
+      (
+        await catalog.listClipLibrary(owner, project.id, {
+          limit: 25,
+          topics: ["policy", "history"],
+          topicMatch: "all",
+          completed: "any",
+        })
+      ).entries,
+    ).toHaveLength(1);
+    expect(
+      (
+        await catalog.listClipLibrary(owner, project.id, {
+          limit: 25,
+          topics: ["policy", "history"],
+          topicMatch: "any",
+          completed: "any",
+        })
+      ).entries,
+    ).toHaveLength(2);
+
+    const snapshot = await catalog.createAuthoringBuildSnapshot(
+      owner,
+      project.id,
+      {
+        idempotencyKey: "authoring-snapshot",
+        clips: [
+          {
+            clipId: clip.id,
+            expectedClipVersion: clip.version,
+            promotedComments: [
+              { commentId: promoted.id, expectedVersion: promoted.version },
+            ],
+          },
+        ],
+      },
+    );
+    expect(snapshot.clips[0]).toMatchObject({
+      clipId: clip.id,
+      clipVersion: clip.version,
+      topics: ["History", "Policy"],
+      promotedComments: [
+        {
+          commentId: promoted.id,
+          version: 1,
+          text: "The policy transition matters, @collab_owner.",
+        },
+      ],
+    });
+    await catalog.updateClipComment(alice, project.id, clip.id, promoted.id, {
+      idempotencyKey: "later-comment-edit",
+      expectedVersion: 1,
+      body: "Later mutable wording, @collab_owner.",
+    });
+    await catalog.updateClipCandidate(owner, project.id, clip.id, {
+      expectedVersion: clip.version,
+      notes: clip.notes,
+      tags: ["Changed later"],
+    });
+    expect(
+      await catalog.createAuthoringBuildSnapshot(owner, project.id, {
+        idempotencyKey: "authoring-snapshot",
+        clips: [
+          {
+            clipId: clip.id,
+            expectedClipVersion: clip.version,
+            promotedComments: [
+              { commentId: promoted.id, expectedVersion: promoted.version },
+            ],
+          },
+        ],
+      }),
+    ).toEqual(snapshot);
+    expect(await catalog.exportClipCommentsCsv(owner, project.id)).toContain(
+      promoted.id,
+    );
+  });
+
+  it("keeps flat comments ordered, independently versioned, attributable, idempotent, and safely moderated", async () => {
+    const clock = { now: new Date("2026-08-24T12:00:00.000Z") };
+    const { database, catalog } = await authorityCatalog(() => clock.now);
+    const owner = authorityActor("comment-owner");
+    const administrator = authorityActor("comment-administrator");
+    const alice = authorityActor("comment-alice");
+    const bob = authorityActor("comment-bob");
+    const viewer = authorityActor("comment-viewer");
+    await Promise.all([
+      catalog.registerUser(owner, "Comment Owner", "comment_owner"),
+      catalog.registerUser(
+        administrator,
+        "Comment Administrator",
+        "comment_admin",
+      ),
+      catalog.registerUser(alice, "Alice Original", "alice_original"),
+      catalog.registerUser(bob, "Bob Researcher", "bob_researcher"),
+      catalog.registerUser(viewer, "Read Only Viewer", "comment_viewer"),
+    ]);
+    const project = await catalog.createProject(owner, {
+      name: "Comment authority fixture",
+    });
+    await Promise.all([
+      catalog.addMember(
+        owner,
+        project.id,
+        administrator.userId,
+        "administrator",
+      ),
+      catalog.addMember(owner, project.id, alice.userId, "researcher"),
+      catalog.addMember(owner, project.id, bob.userId, "researcher"),
+      catalog.addMember(owner, project.id, viewer.userId, "viewer"),
+    ]);
+    const clip = await catalog.createClipCandidate(
+      owner,
+      project.id,
+      clipCandidateFixtureInput("comment-authority"),
+    );
+    const originalClip = await catalog.getClipCandidate(
+      owner,
+      project.id,
+      clip.id,
+    );
+
+    clock.now = new Date("2026-08-24T12:01:00.000Z");
+    const aliceCreate = {
+      idempotencyKey: "alice-create-1",
+      body: "Alice contributes distinct context.",
+      sourceTimeMs: 500,
+    };
+    const aliceComment = await catalog.createClipComment(
+      alice,
+      project.id,
+      clip.id,
+      aliceCreate,
+    );
+    await expect(
+      catalog.createClipComment(alice, project.id, clip.id, aliceCreate),
+    ).resolves.toEqual(aliceComment);
+    await expect(
+      catalog.createClipComment(alice, project.id, clip.id, {
+        ...aliceCreate,
+        body: "Divergent key reuse",
+      }),
+    ).rejects.toMatchObject({ code: "idempotency_conflict" });
+    await expect(
+      catalog.createClipComment(alice, project.id, clip.id, {
+        idempotencyKey: "alice-anchor-outside",
+        body: "Outside",
+        sourceTimeMs: 3_501,
+      }),
+    ).rejects.toMatchObject({ code: "invalid_request" });
+    await expect(
+      catalog.createClipComment(viewer, project.id, clip.id, {
+        idempotencyKey: "viewer-create",
+        body: "Viewer cannot write",
+      }),
+    ).rejects.toMatchObject({ code: "project_access_denied" });
+
+    clock.now = new Date("2026-08-24T12:02:00.000Z");
+    const bobComment = await catalog.createClipComment(
+      bob,
+      project.id,
+      clip.id,
+      {
+        idempotencyKey: "bob-create-1",
+        body: "Bob adds a later contribution.",
+        sourceTimeMs: 3_500,
+      },
+    );
+    const firstPage = await catalog.listClipComments(
+      owner,
+      project.id,
+      clip.id,
+      { limit: 1 },
+    );
+    expect(firstPage.comments).toEqual([aliceComment]);
+    expect(firstPage.nextCursor).toBeTruthy();
+    const secondPage = await catalog.listClipComments(
+      owner,
+      project.id,
+      clip.id,
+      { limit: 1, cursor: firstPage.nextCursor },
+    );
+    expect(secondPage.comments).toEqual([bobComment]);
+    const otherClip = await catalog.createClipCandidate(
+      owner,
+      project.id,
+      clipCandidateFixtureInput("comment-cursor-target"),
+    );
+    await expect(
+      catalog.listClipComments(owner, project.id, otherClip.id, {
+        limit: 1,
+        cursor: firstPage.nextCursor,
+      }),
+    ).rejects.toMatchObject({ code: "invalid_request" });
+
+    clock.now = new Date("2026-08-24T12:03:00.000Z");
+    const aliceUpdate = {
+      idempotencyKey: "alice-update-1",
+      expectedVersion: 1,
+      body: "Alice revises her context.",
+      sourceTimeMs: null,
+    };
+    const updatedAlice = await catalog.updateClipComment(
+      alice,
+      project.id,
+      clip.id,
+      aliceComment.id,
+      aliceUpdate,
+    );
+    expect(updatedAlice).toMatchObject({
+      status: "active",
+      body: aliceUpdate.body,
+      version: 2,
+    });
+    expect(updatedAlice).not.toHaveProperty("sourceTimeMs");
+    await expect(
+      catalog.updateClipComment(
+        alice,
+        project.id,
+        clip.id,
+        aliceComment.id,
+        aliceUpdate,
+      ),
+    ).resolves.toEqual(updatedAlice);
+    await expect(
+      catalog.updateClipComment(alice, project.id, clip.id, aliceComment.id, {
+        ...aliceUpdate,
+        body: "Divergent update",
+      }),
+    ).rejects.toMatchObject({ code: "idempotency_conflict" });
+    await expect(
+      catalog.updateClipComment(alice, project.id, clip.id, aliceComment.id, {
+        idempotencyKey: "alice-stale-update",
+        expectedVersion: 1,
+        body: "Stale update",
+      }),
+    ).rejects.toMatchObject({ code: "conflict" });
+    await expect(
+      catalog.updateClipComment(bob, project.id, clip.id, aliceComment.id, {
+        idempotencyKey: "bob-edits-alice",
+        expectedVersion: 2,
+        body: "Not Bob's comment",
+      }),
+    ).rejects.toMatchObject({ code: "project_access_denied" });
+    await expect(
+      catalog.deleteOwnClipComment(bob, project.id, clip.id, aliceComment.id, {
+        idempotencyKey: "bob-deletes-alice",
+        expectedVersion: 2,
+      }),
+    ).rejects.toMatchObject({ code: "project_access_denied" });
+
+    clock.now = new Date("2026-08-24T12:04:00.000Z");
+    const moderatedBob = await catalog.moderateClipComment(
+      owner,
+      project.id,
+      clip.id,
+      bobComment.id,
+      { idempotencyKey: "owner-moderates-bob", expectedVersion: 1 },
+    );
+    expect(moderatedBob).toMatchObject({
+      status: "deleted",
+      deletionKind: "moderation",
+      version: 2,
+      deletedBy: { id: owner.userId },
+    });
+    expect(moderatedBob).not.toHaveProperty("body");
+    await expect(
+      catalog.moderateClipComment(bob, project.id, clip.id, aliceComment.id, {
+        idempotencyKey: "researcher-moderates",
+        expectedVersion: 2,
+      }),
+    ).rejects.toMatchObject({ code: "project_access_denied" });
+
+    const administratorTarget = await catalog.createClipComment(
+      alice,
+      project.id,
+      clip.id,
+      {
+        idempotencyKey: "admin-target",
+        body: "Administrator moderation target",
+      },
+    );
+    await expect(
+      catalog.moderateClipComment(
+        administrator,
+        project.id,
+        clip.id,
+        administratorTarget.id,
+        { idempotencyKey: "admin-moderates", expectedVersion: 1 },
+      ),
+    ).resolves.toMatchObject({
+      status: "deleted",
+      deletionKind: "moderation",
+      deletedBy: { id: administrator.userId },
+    });
+
+    clock.now = new Date("2026-08-24T12:05:00.000Z");
+    const aliceDelete = {
+      idempotencyKey: "alice-delete-1",
+      expectedVersion: 2,
+    };
+    const deletedAlice = await catalog.deleteOwnClipComment(
+      alice,
+      project.id,
+      clip.id,
+      aliceComment.id,
+      aliceDelete,
+    );
+    expect(deletedAlice).toMatchObject({
+      status: "deleted",
+      deletionKind: "author",
+      version: 3,
+    });
+    expect(deletedAlice).not.toHaveProperty("body");
+    await expect(
+      catalog.deleteOwnClipComment(
+        alice,
+        project.id,
+        clip.id,
+        aliceComment.id,
+        aliceDelete,
+      ),
+    ).resolves.toEqual(deletedAlice);
+
+    await catalog.registerUser(alice, "Alice Renamed", "alice_renamed");
+    await database.query(
+      `DELETE FROM project_members WHERE project_id = $1 AND user_id = $2`,
+      [project.id, alice.userId],
+    );
+    const safelyAttributed = await catalog.listClipComments(
+      owner,
+      project.id,
+      clip.id,
+      { limit: 50 },
+    );
+    expect(
+      safelyAttributed.comments.find(
+        (comment) => comment.id === aliceComment.id,
+      ),
+    ).toMatchObject({
+      author: {
+        id: alice.userId,
+        handle: "alice_original",
+        displayName: "Alice Original",
+      },
+    });
+
+    expect(await catalog.getClipCandidate(owner, project.id, clip.id)).toEqual(
+      originalClip,
+    );
+    const events = await database.query<{ payload: unknown }>(
+      `SELECT payload FROM sync_events
+       WHERE project_id = $1 AND event_type LIKE 'clip_comment.%'`,
+      [project.id],
+    );
+    expect(events.rows.length).toBeGreaterThanOrEqual(7);
+    expect(JSON.stringify(events.rows)).not.toContain(
+      "Alice contributes distinct context.",
+    );
+    expect(JSON.stringify(events.rows)).not.toContain(
+      "Bob adds a later contribution.",
+    );
+  });
+
+  it("commits and replays an optional first comment with its clip atomically", async () => {
+    const { database, catalog } = await authorityCatalog();
+    const owner = authorityActor("atomic-first-comment-owner");
+    await catalog.registerUser(
+      owner,
+      "Atomic Comment Owner",
+      "atomic_comment_owner",
+    );
+    const project = await catalog.createProject(owner, {
+      name: "Atomic first comment fixture",
+    });
+    const command = clipCandidateFixtureInput("atomic-first-comment", {
+      body: "This comment must commit with the clip.",
+      sourceTimeMs: 500,
+    });
+    const created = await catalog.createClipCandidate(
+      owner,
+      project.id,
+      command,
+    );
+    expect(created.firstComment).toMatchObject({
+      projectId: project.id,
+      clipId: created.id,
+      status: "active",
+      body: command.firstComment!.body,
+      sourceTimeMs: 500,
+      version: 1,
+    });
+    await expect(
+      catalog.createClipCandidate(owner, project.id, command),
+    ).resolves.toEqual(created);
+    await expect(
+      catalog.createClipCandidate(owner, project.id, {
+        ...command,
+        firstComment: {
+          ...command.firstComment,
+          body: "Divergent first comment",
+        },
+      }),
+    ).rejects.toMatchObject({ code: "idempotency_conflict" });
+
+    const invalid = clipCandidateFixtureInput("atomic-invalid-anchor", {
+      body: "This invalid anchor must roll everything back.",
+      sourceTimeMs: 3_501,
+    });
+    await expect(
+      catalog.createClipCandidate(owner, project.id, invalid),
+    ).rejects.toMatchObject({ code: "invalid_request" });
+    expect(
+      (
+        await database.query<{ count: string }>(
+          `SELECT count(*)::text AS count FROM clip_candidates
+           WHERE project_id = $1 AND idempotency_key = $2`,
+          [project.id, invalid.idempotencyKey],
+        )
+      ).rows[0]?.count,
+    ).toBe("0");
+
+    const concurrent = clipCandidateFixtureInput("atomic-concurrent", {
+      body: "Only one concurrent first comment",
+      sourceTimeMs: 3_500,
+    });
+    const [first, second] = await Promise.all([
+      catalog.createClipCandidate(owner, project.id, concurrent),
+      catalog.createClipCandidate(owner, project.id, concurrent),
+    ]);
+    expect(second).toEqual(first);
+    expect(
+      (
+        await database.query<{ count: string }>(
+          `SELECT count(*)::text AS count FROM clip_comments
+           WHERE project_id = $1 AND clip_id = $2 AND initial_comment`,
+          [project.id, first.id],
+        )
+      ).rows[0]?.count,
+    ).toBe("1");
+  });
+});
+
+describe("player-range clip authority and export eligibility", () => {
+  it("persists attested no-speech without transcript sentinels and replays exact commands", async () => {
+    const clock = { now: new Date("2026-08-24T12:00:00.000Z") };
+    const { database, catalog } = await authorityCatalog(() => clock.now);
+    const owner = authorityActor("player-range-owner");
+    await catalog.registerUser(
+      owner,
+      "Player Range Owner",
+      "player_range_owner",
+    );
+    const project = await catalog.createProject(owner, {
+      name: "Player range fixture",
+    });
+    const noSpeechAttestation = {
+      schemaVersion: 1 as const,
+      actor: {
+        id: owner.userId,
+        handle: "player_range_owner",
+        displayName: "Player Range Owner",
+      },
+      attestedAt: clock.now.toISOString(),
+    };
+    const command = {
+      idempotencyKey: "player-no-speech-log",
+      video: {
+        youtubeVideoId: "PlayerRangeNoSpeech1",
+        canonicalUrl: "https://www.youtube.com/watch?v=PlayerRangeNoSpeech1",
+        title: "Player no-speech fixture",
+        sourceLanguage: "en",
+      },
+      selection: {
+        selectionType: "player_time_range" as const,
+        sourceStartMs: 10_000,
+        sourceEndMs: 12_000,
+        exportStartMs: 9_500,
+        exportEndMs: 12_500,
+        origin: "manual_player" as const,
+        speechStatus: "no_speech" as const,
+        noSpeechAttestation,
+      },
+      notes: "",
+      tags: ["Visual context"],
+      firstComment: { body: "A silent source range for the opening montage." },
+    };
+    const created = await catalog.createClipCandidate(
+      owner,
+      project.id,
+      command,
+    );
+    expect(created).toMatchObject({
+      selection: command.selection,
+      notes: "",
+      tags: ["Visual context"],
+      firstComment: { body: command.firstComment.body },
+    });
+    expect(created).not.toHaveProperty("englishText");
+    expect(created).not.toHaveProperty("originalText");
+    expect(created.languageEvidence).toEqual({
+      schemaVersion: 3,
+      state: "unavailable",
+      reason: "no_speech",
+    });
+    await expect(
+      catalog.createClipCandidate(owner, project.id, command),
+    ).resolves.toEqual(created);
+    await expect(
+      catalog.createClipCandidate(owner, project.id, {
+        ...command,
+        firstComment: { body: "Divergent replay" },
+      }),
+    ).rejects.toMatchObject({ code: "idempotency_conflict" });
+    await expect(
+      catalog.createClipCandidate(owner, project.id, {
+        ...command,
+        idempotencyKey: "player-no-context",
+        notes: "",
+        firstComment: undefined,
+      }),
+    ).rejects.toThrow(
+      "No-speech and transcript-unavailable clips require a description or first comment.",
+    );
+    await expect(
+      catalog.createClipCandidate(owner, project.id, {
+        ...command,
+        idempotencyKey: "player-wrong-attestor",
+        selection: {
+          ...command.selection,
+          noSpeechAttestation: {
+            ...noSpeechAttestation,
+            actor: {
+              ...noSpeechAttestation.actor,
+              handle: "different_actor",
+            },
+          },
+        },
+      }),
+    ).rejects.toMatchObject({ code: "invalid_language_evidence" });
+
+    const concurrentCommand = {
+      ...command,
+      idempotencyKey: "player-no-speech-concurrent",
+      firstComment: {
+        body: "One atomic no-speech first comment.",
+        sourceTimeMs: 11_000,
+      },
+    };
+    const [concurrentFirst, concurrentSecond] = await Promise.all([
+      catalog.createClipCandidate(owner, project.id, concurrentCommand),
+      catalog.createClipCandidate(owner, project.id, concurrentCommand),
+    ]);
+    expect(concurrentSecond).toEqual(concurrentFirst);
+    expect(
+      (
+        await database.query<{ count: string }>(
+          `SELECT count(*)::text AS count FROM clip_comments
+           WHERE project_id = $1 AND clip_id = $2 AND initial_comment`,
+          [project.id, concurrentFirst.id],
+        )
+      ).rows[0]!.count,
+    ).toBe("1");
+    const invalidAnchorCommand = {
+      ...command,
+      idempotencyKey: "player-no-speech-invalid-anchor",
+      firstComment: {
+        body: "This clip and comment must roll back together.",
+        sourceTimeMs: 12_501,
+      },
+    };
+    await expect(
+      catalog.createClipCandidate(owner, project.id, invalidAnchorCommand),
+    ).rejects.toMatchObject({ code: "invalid_request" });
+    expect(
+      (
+        await database.query<{ count: string }>(
+          `SELECT count(*)::text AS count FROM clip_candidates
+           WHERE project_id = $1 AND idempotency_key = $2`,
+          [project.id, invalidAnchorCommand.idempotencyKey],
+        )
+      ).rows[0]!.count,
+    ).toBe("0");
+
+    const row = (
+      await database.query<{
+        selection_kind: string;
+        speech_status: string;
+        transcript_track_id: string | null;
+        transcript_version: number | null;
+        selection_text: string | null;
+        english_text: string | null;
+        no_speech_attested_by: string | null;
+        no_speech_attested_handle: string | null;
+        no_speech_attested_display_name: string | null;
+        no_speech_attested_at: Date | string | null;
+        no_speech_attestation_version: number | null;
+      }>(
+        `SELECT selection_kind, speech_status, transcript_track_id,
+                transcript_version, selection_text, english_text,
+                no_speech_attested_by, no_speech_attested_handle,
+                no_speech_attested_display_name, no_speech_attested_at,
+                no_speech_attestation_version
+         FROM clip_candidates WHERE id = $1`,
+        [created.id],
+      )
+    ).rows[0]!;
+    expect(row).toMatchObject({
+      selection_kind: "player_time_range",
+      speech_status: "no_speech",
+      transcript_track_id: null,
+      transcript_version: null,
+      selection_text: null,
+      english_text: null,
+      no_speech_attested_by: noSpeechAttestation.actor.id,
+      no_speech_attested_handle: noSpeechAttestation.actor.handle,
+      no_speech_attested_display_name: noSpeechAttestation.actor.displayName,
+      no_speech_attestation_version: noSpeechAttestation.schemaVersion,
+    });
+    expect(new Date(row.no_speech_attested_at!).toISOString()).toBe(
+      noSpeechAttestation.attestedAt,
+    );
+    expect(
+      await catalog.getClipCandidate(owner, project.id, created.id),
+    ).toMatchObject({ selection: command.selection });
+    const listed = await catalog.listClipCandidates(owner, project.id);
+    expect(listed).toHaveLength(2);
+    expect(listed).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: created.id,
+          selection: command.selection,
+        }),
+      ]),
+    );
+    const csv = await catalog.exportClipCandidatesCsv(owner, project.id);
+    expect(csv).toContain(
+      '"player_time_range","no_speech","10000","12000","","","","","9500","12500"',
+    );
+    expect(csv).not.toContain(noSpeechAttestation.actor.id);
+
+    const settingsSelection = {
+      base: "application_default" as const,
+      overrides: {},
+    };
+    const preview = await catalog.previewProjectExportSettings(
+      owner,
+      project.id,
+      {
+        sourceLanguageClass: "confirmed_english",
+        selection: settingsSelection,
+      },
+    );
+    const exportCommand = {
+      idempotencyKey: "player-no-speech-export",
+      requestOrigin: "selection_action" as const,
+      sourceLanguageClass: "confirmed_english" as const,
+      noSpeechAttestation,
+      settingsSelection,
+      expectedResolutionFingerprint: preview.snapshot.resolutionFingerprint!,
+      sourceRights: sourceRightsForVideo(command.video.youtubeVideoId),
+    };
+    const requested = await catalog.createClipExport(
+      owner,
+      project.id,
+      created.id,
+      exportCommand,
+    );
+    expect(requested).toMatchObject({
+      selection: command.selection,
+      noSpeechAttestation,
+      state: "queued",
+    });
+    expect(requested).not.toHaveProperty("subtitleTracks");
+    await expect(
+      catalog.createClipExport(owner, project.id, created.id, exportCommand),
+    ).resolves.toEqual(requested);
+    await expect(
+      catalog.createClipExport(owner, project.id, created.id, {
+        ...exportCommand,
+        noSpeechAttestation: {
+          ...noSpeechAttestation,
+          attestedAt: "2026-08-24T12:00:01.000Z",
+        },
+      }),
+    ).rejects.toMatchObject({ code: "invalid_language_evidence" });
+
+    const advertisement = currentExportWorkerAdvertisement({
+      ffmpegVersion: "8.1.2",
+      encoders: ["libx264", "mov_text"],
+      muxers: ["mp4"],
+      filters: ["scale", "fps"],
+    });
+    const worker = { workerId: randomUUID(), epoch: 1, ...advertisement };
+    await catalog.registerExportWorker(owner, worker);
+    const reserved = (
+      await catalog.claimLoggedExportDelivery(owner, {
+        workerId: worker.workerId,
+        workerEpoch: worker.epoch,
+      })
+    ).delivery!;
+    const accepted = await catalog.acceptLoggedExportDelivery(owner, {
+      workerId: worker.workerId,
+      workerEpoch: worker.epoch,
+      deliveryId: reserved.deliveryId,
+      generation: reserved.generation,
+      reservationToken: reserved.reservationToken,
+    });
+    expect(accepted.request).toMatchObject({
+      selection: command.selection,
+      noSpeechAttestation,
+    });
+    const successResult = loggedNoSpeechExportSuccessFixture(
+      accepted.request,
+      clock.now.toISOString(),
+    );
+    expect(successResult.subtitleSidecars).toEqual([
+      expect.objectContaining({
+        role: "english",
+        emptyReason: "attested_no_speech",
+        noSpeechAttestation,
+        cueCount: 0,
+        byteSize: 1,
+        contentSha256: digest(new TextEncoder().encode("\n")),
+        startMs: 0,
+        endMs: 0,
+      }),
+    ]);
+    const reconcileCommand = {
+      workerId: accepted.workerId,
+      workerEpoch: accepted.workerEpoch,
+      deliveryId: accepted.deliveryId,
+      generation: accepted.generation,
+      reservationToken: accepted.reservationToken,
+      result: successResult,
+    };
+    const completed = await catalog.reconcileLoggedExportSuccess(
+      owner,
+      reconcileCommand,
+    );
+    await expect(
+      catalog.reconcileLoggedExportSuccess(owner, reconcileCommand),
+    ).resolves.toEqual(completed);
+    const exportNotifications = await catalog.listNotificationFeed(owner, {
+      limit: 25,
+    });
+    expect(
+      exportNotifications.events.filter(
+        (event) => event.kind === "logged_export_terminal",
+      ),
+    ).toEqual([
+      expect.objectContaining({
+        kind: "logged_export_terminal",
+        status: "completed",
+        navigation: {
+          kind: "logged_export",
+          projectId: project.id,
+          clipId: created.id,
+          requestId: requested.id,
+        },
+      }),
+    ]);
+    expect(JSON.stringify(exportNotifications)).not.toContain("lastError");
+    await expect(
+      catalog.getLoggedExportRequest(owner, project.id, requested.id),
+    ).resolves.toMatchObject({
+      state: "complete",
+      selection: command.selection,
+      noSpeechAttestation,
+      subtitleSidecars: successResult.subtitleSidecars,
+      finalArtifacts: successResult.artifacts,
+    });
+    await expect(
+      catalog.listArtifactVersionHistory(owner, project.id, created.id, {
+        limit: 10,
+      }),
+    ).resolves.toMatchObject({
+      versions: [
+        {
+          artifactVersionId: completed.id,
+          selection: command.selection,
+          noSpeechAttestation,
+          subtitleSidecars: successResult.subtitleSidecars,
+          artifacts: successResult.artifacts,
+        },
+      ],
+    });
+    const divergentAttestation = {
+      ...noSpeechAttestation,
+      attestedAt: "2026-08-24T12:00:01.000Z",
+    };
+    await expect(
+      catalog.reconcileLoggedExportSuccess(owner, {
+        ...reconcileCommand,
+        result: {
+          ...successResult,
+          noSpeechAttestation: divergentAttestation,
+          subtitleSidecars: successResult.subtitleSidecars!.map((sidecar) => ({
+            ...sidecar,
+            noSpeechAttestation: divergentAttestation,
+          })),
+        },
+      }),
+    ).rejects.toMatchObject({ statusCode: 409 });
+  });
+
+  it("keeps attached speech player-originated while persisting exact transcript evidence", async () => {
+    const { database, catalog } = await authorityCatalog();
+    const owner = authorityActor("player-attached-owner");
+    await catalog.registerUser(
+      owner,
+      "Player Attached Owner",
+      "player_attached_owner",
+    );
+    const project = await catalog.createProject(owner, {
+      name: "Player attached fixture",
+    });
+    const transcript = clipCandidateFixtureInput("player-attached-speech");
+    const transcriptAttachment = {
+      ...transcript.selection,
+      selectionType: "transcript_range" as const,
+    };
+    const command = {
+      ...transcript,
+      selection: {
+        selectionType: "player_time_range" as const,
+        sourceStartMs: transcript.selection.transcriptStartMs,
+        sourceEndMs: transcript.selection.transcriptEndMs,
+        exportStartMs: transcript.selection.exportStartMs,
+        exportEndMs: transcript.selection.exportEndMs,
+        origin: "manual_player" as const,
+        speechStatus: "speech" as const,
+        transcriptAttachment,
+      },
+    };
+    const created = await catalog.createClipCandidate(
+      owner,
+      project.id,
+      command,
+    );
+    expect(created).toMatchObject({
+      selection: command.selection,
+      languageEvidence: command.languageEvidence,
+      englishText: command.languageEvidence.english.text,
+    });
+    expect(
+      (
+        await database.query<{
+          selection_kind: string;
+          speech_status: string;
+          transcript_track_id: string | null;
+          transcript_version: number | null;
+          selection_snapshot: unknown;
+        }>(
+          `SELECT selection_kind, speech_status, transcript_track_id,
+                  transcript_version, selection_snapshot
+           FROM clip_candidates WHERE id = $1`,
+          [created.id],
+        )
+      ).rows[0],
+    ).toEqual({
+      selection_kind: "player_time_range",
+      speech_status: "speech",
+      transcript_track_id: null,
+      transcript_version: null,
+      selection_snapshot: command.selection,
+    });
+    expect(
+      (
+        await database.query<{ count: string }>(
+          `SELECT count(*)::text AS count FROM clip_language_evidence
+           WHERE clip_id = $1`,
+          [created.id],
+        )
+      ).rows[0]!.count,
+    ).toBe("2");
+
+    const settingsSelection = {
+      base: "application_default" as const,
+      overrides: {},
+    };
+    const preview = await catalog.previewProjectExportSettings(
+      owner,
+      project.id,
+      {
+        sourceLanguageClass: "confirmed_english",
+        selection: settingsSelection,
+      },
+    );
+    await expect(
+      catalog.createClipExport(owner, project.id, created.id, {
+        idempotencyKey: "player-attached-export",
+        sourceLanguageClass: "confirmed_english",
+        settingsSelection,
+        expectedResolutionFingerprint: preview.snapshot.resolutionFingerprint!,
+        sourceRights: sourceRightsForVideo(command.video.youtubeVideoId),
+      }),
+    ).resolves.toMatchObject({ selection: command.selection, state: "queued" });
+  });
+
+  it("logs unattached speech and transcript-unavailable ranges but blocks their exports", async () => {
+    const { catalog } = await authorityCatalog();
+    const owner = authorityActor("player-unattached-owner");
+    await catalog.registerUser(
+      owner,
+      "Player Unattached Owner",
+      "player_unattached_owner",
+    );
+    const project = await catalog.createProject(owner, {
+      name: "Player unattached fixture",
+    });
+    const video = {
+      youtubeVideoId: "PlayerRangeUnattached1",
+      canonicalUrl: "https://www.youtube.com/watch?v=PlayerRangeUnattached1",
+      title: "Player unattached fixture",
+      sourceLanguage: "en",
+    };
+    const playerBase = {
+      selectionType: "player_time_range" as const,
+      sourceStartMs: 1_000,
+      sourceEndMs: 2_000,
+      exportStartMs: 1_000,
+      exportEndMs: 2_000,
+      origin: "manual_player" as const,
+    };
+    const speech = await catalog.createClipCandidate(owner, project.id, {
+      idempotencyKey: "unattached-speech-log",
+      video,
+      selection: { ...playerBase, speechStatus: "speech" as const },
+      notes: "Speech heard while the verified transcript has no overlap.",
+      tags: [],
+    });
+    const unavailable = await catalog.createClipCandidate(owner, project.id, {
+      idempotencyKey: "transcript-unavailable-log",
+      video,
+      selection: {
+        ...playerBase,
+        sourceStartMs: 3_000,
+        sourceEndMs: 4_000,
+        exportStartMs: 3_000,
+        exportEndMs: 4_000,
+        speechStatus: "transcript_unavailable" as const,
+      },
+      notes: "Transcript unavailable for this exact range.",
+      tags: [],
+    });
+    const settingsSelection = {
+      base: "application_default" as const,
+      overrides: {},
+    };
+    const preview = await catalog.previewProjectExportSettings(
+      owner,
+      project.id,
+      {
+        sourceLanguageClass: "confirmed_english",
+        selection: settingsSelection,
+      },
+    );
+    const exportInput = {
+      idempotencyKey: "blocked-player-export",
+      sourceLanguageClass: "confirmed_english" as const,
+      settingsSelection,
+      expectedResolutionFingerprint: preview.snapshot.resolutionFingerprint!,
+      sourceRights: sourceRightsForVideo(video.youtubeVideoId),
+    };
+    await expect(
+      catalog.createClipExport(owner, project.id, speech.id, exportInput),
+    ).rejects.toMatchObject({ code: "invalid_language_evidence" });
+    await expect(
+      catalog.createClipExport(owner, project.id, unavailable.id, {
+        ...exportInput,
+        idempotencyKey: "blocked-unavailable-export",
+      }),
+    ).rejects.toMatchObject({ code: "invalid_language_evidence" });
+  });
+});
+
+describe("project-video review coordination", () => {
+  it("creates the initial review cycle when clip logging first introduces a video", async () => {
+    const { catalog } = await authorityCatalog();
+    const owner = authorityActor("review-clip-first-owner");
+    await catalog.registerUser(
+      owner,
+      "Review Clip First Owner",
+      "review_clip_first",
+    );
+    const project = await catalog.createProject(owner, {
+      name: "Clip-first review coordination",
+    });
+    await createBatchClips(catalog, owner, project.id, 1);
+    const listed = await catalog.listProjectVideoWorklist(owner, project.id, {
+      limit: 25,
+    });
+    expect(listed.items).toHaveLength(1);
+    expect(listed.items[0]!.review).toMatchObject({
+      cycleNumber: 1,
+      status: "open",
+      version: 1,
+      openedBy: { userId: owner.userId },
+    });
+  });
+
+  it("renews, explicitly takes over, expires, releases, and replays soft claims", async () => {
+    const database = new PGlite();
+    databases.add(database);
+    await runCloudMigrations(database);
+    const clock = { now: new Date("2026-08-24T12:00:00.000Z") };
+    const catalog = new SharedProjectCatalog(
+      database,
+      new MemoryTranscriptObjectStore(),
+      () => clock.now,
+    );
+    const owner = authorityActor("claim-owner");
+    const researcher = authorityActor("claim-researcher");
+    const viewer = authorityActor("claim-viewer");
+    const outsider = authorityActor("claim-outsider");
+    await Promise.all([
+      catalog.registerUser(owner, "Claim Owner", "claim_owner"),
+      catalog.registerUser(researcher, "Claim Researcher", "claim_researcher"),
+      catalog.registerUser(viewer, "Claim Viewer", "claim_viewer"),
+      catalog.registerUser(outsider, "Claim Outsider", "claim_outsider"),
+    ]);
+    const project = await catalog.createProject(owner, {
+      name: "Claim coordination",
+    });
+    await catalog.addMember(owner, project.id, researcher.userId, "researcher");
+    await database.query(
+      `INSERT INTO project_members
+         (project_id, user_id, role, created_at, updated_at)
+       VALUES ($1, $2, 'viewer', now(), now())`,
+      [project.id, viewer.userId],
+    );
+    const video = await catalog.addVideo(owner, project.id, {
+      youtubeVideoId: "ClaimCoordination1",
+      canonicalUrl: "https://www.youtube.com/watch?v=ClaimCoordination1",
+      title: "Claim coordination fixture",
+    });
+    const firstCommand = {
+      action: "claim" as const,
+      idempotencyKey: "researcher-claim-1",
+      expectedClaimVersion: 0,
+      leaseSeconds: 300,
+      takeoverConfirmed: false,
+    };
+    const first = await catalog.updateProjectVideoClaim(
+      researcher,
+      project.id,
+      video.id,
+      firstCommand,
+    );
+    expect(first.claim).toMatchObject({
+      claimant: { userId: researcher.userId, handle: "claim_researcher" },
+      generation: 1,
+      version: 1,
+      expiresAt: "2026-08-24T12:05:00.000Z",
+    });
+    await expect(
+      catalog.updateProjectVideoClaim(
+        researcher,
+        project.id,
+        video.id,
+        firstCommand,
+      ),
+    ).resolves.toEqual(first);
+    await expect(
+      catalog.updateProjectVideoClaim(researcher, project.id, video.id, {
+        ...firstCommand,
+        leaseSeconds: 301,
+      }),
+    ).rejects.toMatchObject({ statusCode: 409, code: "idempotency_conflict" });
+    await expect(
+      catalog.updateProjectVideoClaim(owner, project.id, video.id, {
+        action: "claim",
+        idempotencyKey: "owner-unconfirmed-takeover",
+        expectedClaimVersion: 1,
+        leaseSeconds: 300,
+        takeoverConfirmed: false,
+      }),
+    ).rejects.toMatchObject({ statusCode: 409 });
+
+    clock.now = new Date("2026-08-24T12:01:00.000Z");
+    const renewed = await catalog.updateProjectVideoClaim(
+      researcher,
+      project.id,
+      video.id,
+      {
+        action: "renew",
+        idempotencyKey: "researcher-renew-1",
+        expectedClaimVersion: 1,
+        leaseSeconds: 600,
+      },
+    );
+    expect(renewed.claim).toMatchObject({
+      generation: 1,
+      version: 2,
+      expiresAt: "2026-08-24T12:11:00.000Z",
+    });
+    const takeover = await catalog.updateProjectVideoClaim(
+      owner,
+      project.id,
+      video.id,
+      {
+        action: "claim",
+        idempotencyKey: "owner-confirmed-takeover",
+        expectedClaimVersion: 2,
+        leaseSeconds: 120,
+        takeoverConfirmed: true,
+      },
+    );
+    expect(takeover.claim).toMatchObject({
+      claimant: { userId: owner.userId },
+      generation: 2,
+      version: 3,
+    });
+    await expect(
+      catalog.updateProjectVideoClaim(researcher, project.id, video.id, {
+        action: "release",
+        idempotencyKey: "researcher-cannot-release-owner",
+        expectedClaimVersion: 3,
+      }),
+    ).rejects.toMatchObject({ statusCode: 409 });
+
+    clock.now = new Date("2026-08-24T12:04:00.000Z");
+    expect(
+      (await catalog.listProjectVideoWorklist(owner, project.id, { limit: 25 }))
+        .items[0]!.claim,
+    ).toMatchObject({
+      claimant: { userId: owner.userId },
+      version: 3,
+      active: false,
+    });
+    await expect(
+      catalog.updateProjectVideoClaim(researcher, project.id, video.id, {
+        action: "claim",
+        idempotencyKey: "expired-unconfirmed-takeover",
+        expectedClaimVersion: 0,
+        leaseSeconds: 300,
+        takeoverConfirmed: false,
+      }),
+    ).rejects.toMatchObject({ statusCode: 409 });
+    const expiredTakeover = await catalog.updateProjectVideoClaim(
+      researcher,
+      project.id,
+      video.id,
+      {
+        action: "claim",
+        idempotencyKey: "expired-confirmed-takeover",
+        expectedClaimVersion: 0,
+        leaseSeconds: 300,
+        takeoverConfirmed: true,
+      },
+    );
+    expect(expiredTakeover.claim).toMatchObject({ generation: 3, version: 4 });
+    const released = await catalog.updateProjectVideoClaim(
+      researcher,
+      project.id,
+      video.id,
+      {
+        action: "release",
+        idempotencyKey: "researcher-release",
+        expectedClaimVersion: 4,
+      },
+    );
+    expect(released.claim).toBeUndefined();
+    await expect(
+      catalog.updateProjectVideoClaim(researcher, project.id, video.id, {
+        action: "release",
+        idempotencyKey: "researcher-release",
+        expectedClaimVersion: 4,
+      }),
+    ).resolves.toEqual(released);
+    const concurrentFirstClaims = await Promise.allSettled([
+      catalog.updateProjectVideoClaim(owner, project.id, video.id, {
+        action: "claim",
+        idempotencyKey: "owner-claim-after-release",
+        expectedClaimVersion: 0,
+        leaseSeconds: 300,
+        takeoverConfirmed: false,
+      }),
+      catalog.updateProjectVideoClaim(researcher, project.id, video.id, {
+        action: "claim",
+        idempotencyKey: "researcher-claim-after-release",
+        expectedClaimVersion: 0,
+        leaseSeconds: 300,
+        takeoverConfirmed: false,
+      }),
+    ]);
+    expect(
+      concurrentFirstClaims.filter((result) => result.status === "fulfilled"),
+    ).toHaveLength(1);
+    expect(
+      concurrentFirstClaims.filter((result) => result.status === "rejected"),
+    ).toHaveLength(1);
+    const afterRelease = (
+      concurrentFirstClaims.find(
+        (result) => result.status === "fulfilled",
+      ) as PromiseFulfilledResult<
+        Awaited<ReturnType<typeof catalog.updateProjectVideoClaim>>
+      >
+    ).value;
+    expect(afterRelease.claim).toMatchObject({ generation: 4, version: 5 });
+    expect(
+      (
+        await database.query<{ event_type: string }>(
+          `SELECT event_type FROM project_video_claim_events
+           WHERE project_id = $1 AND video_id = $2
+           ORDER BY created_at, id`,
+          [project.id, video.id],
+        )
+      ).rows.map((row) => row.event_type),
+    ).toEqual(
+      expect.arrayContaining(["claimed", "renewed", "taken_over", "released"]),
+    );
+    await expect(
+      catalog.updateProjectVideoClaim(viewer, project.id, video.id, {
+        action: "claim",
+        idempotencyKey: "viewer-claim",
+        expectedClaimVersion: 5,
+        leaseSeconds: 300,
+      }),
+    ).rejects.toMatchObject({ statusCode: 403 });
+    await expect(
+      catalog.updateProjectVideoClaim(outsider, project.id, video.id, {
+        action: "claim",
+        idempotencyKey: "outsider-claim",
+        expectedClaimVersion: 5,
+        leaseSeconds: 300,
+      }),
+    ).rejects.toMatchObject({ statusCode: 403 });
+  });
+
+  it("keeps governance and append-only review cycles independent from processing", async () => {
+    const { database, catalog } = await authorityCatalog();
+    const owner = authorityActor("review-owner");
+    const administrator = authorityActor("review-administrator");
+    const researcher = authorityActor("review-researcher");
+    const viewer = authorityActor("review-viewer");
+    await Promise.all([
+      catalog.registerUser(owner, "Review Owner", "review_owner"),
+      catalog.registerUser(
+        administrator,
+        "Review Administrator",
+        "review_administrator",
+      ),
+      catalog.registerUser(
+        researcher,
+        "Review Researcher",
+        "review_researcher",
+      ),
+      catalog.registerUser(viewer, "Review Viewer", "review_viewer"),
+    ]);
+    const project = await catalog.createProject(owner, {
+      name: "Review coordination",
+    });
+    await catalog.addMember(
+      owner,
+      project.id,
+      administrator.userId,
+      "administrator",
+    );
+    await catalog.addMember(owner, project.id, researcher.userId, "researcher");
+    await catalog.addMember(owner, project.id, viewer.userId, "viewer");
+    const video = await catalog.addVideo(owner, project.id, {
+      youtubeVideoId: "ReviewCoordination1",
+      canonicalUrl: "https://www.youtube.com/watch?v=ReviewCoordination1",
+      title: "Review coordination fixture",
+    });
+    const initial = (
+      await catalog.listProjectVideoWorklist(owner, project.id, { limit: 25 })
+    ).items[0]!;
+    expect(initial).toMatchObject({
+      priority: "normal",
+      completionPolicy: "researcher_or_administrator",
+      review: { cycleNumber: 1, status: "open", version: 1 },
+      processing: { state: "not_requested" },
+      activeFlagCount: 1,
+    });
+    const governanceCommand = {
+      idempotencyKey: "administrator-only-high",
+      expectedProjectVideoVersion: initial.projectVideoVersion,
+      priority: "high" as const,
+      completionPolicy: "administrator_only" as const,
+    };
+    const governed = await catalog.updateProjectVideoGovernance(
+      administrator,
+      project.id,
+      video.id,
+      governanceCommand,
+    );
+    expect(governed).toMatchObject({
+      priority: "high",
+      completionPolicy: "administrator_only",
+      projectVideoVersion: initial.projectVideoVersion + 1,
+    });
+    await expect(
+      catalog.updateProjectVideoGovernance(
+        administrator,
+        project.id,
+        video.id,
+        governanceCommand,
+      ),
+    ).resolves.toEqual(governed);
+    await expect(
+      catalog.updateProjectVideoGovernance(
+        administrator,
+        project.id,
+        video.id,
+        {
+          ...governanceCommand,
+          priority: "low",
+        },
+      ),
+    ).rejects.toMatchObject({ statusCode: 409, code: "idempotency_conflict" });
+    await expect(
+      catalog.updateProjectVideoGovernance(researcher, project.id, video.id, {
+        idempotencyKey: "researcher-governance",
+        expectedProjectVideoVersion: governed.projectVideoVersion,
+        priority: "low",
+      }),
+    ).rejects.toMatchObject({ statusCode: 403 });
+    await expect(
+      catalog.updateProjectVideoGovernance(owner, project.id, video.id, {
+        idempotencyKey: "stale-governance",
+        expectedProjectVideoVersion: initial.projectVideoVersion,
+        priority: "normal",
+      }),
+    ).rejects.toMatchObject({ statusCode: 409 });
+
+    await expect(
+      catalog.updateProjectVideoReview(researcher, project.id, video.id, {
+        action: "complete",
+        idempotencyKey: "researcher-blocked-complete",
+        expectedCycleId: initial.review.id,
+        expectedCycleVersion: initial.review.version,
+        acknowledgeTranscriptUnavailable: true,
+      }),
+    ).rejects.toMatchObject({ statusCode: 403 });
+    await expect(
+      catalog.updateProjectVideoReview(administrator, project.id, video.id, {
+        action: "complete",
+        idempotencyKey: "administrator-missing-ack",
+        expectedCycleId: initial.review.id,
+        expectedCycleVersion: initial.review.version,
+        acknowledgeTranscriptUnavailable: false,
+      }),
+    ).rejects.toMatchObject({ statusCode: 409 });
+    const completeWithoutTranscriptCommand = {
+      action: "complete" as const,
+      idempotencyKey: "administrator-complete-without-transcript",
+      expectedCycleId: initial.review.id,
+      expectedCycleVersion: initial.review.version,
+      acknowledgeTranscriptUnavailable: true,
+    };
+    const completedFirst = await catalog.updateProjectVideoReview(
+      administrator,
+      project.id,
+      video.id,
+      completeWithoutTranscriptCommand,
+    );
+    expect(completedFirst.review).toMatchObject({
+      id: initial.review.id,
+      status: "completed",
+      version: 2,
+      completionPolicy: "administrator_only",
+      completedBy: { userId: administrator.userId },
+      completionBasis: "without_ready_transcript_acknowledged",
+    });
+    await expect(
+      catalog.updateProjectVideoReview(
+        administrator,
+        project.id,
+        video.id,
+        completeWithoutTranscriptCommand,
+      ),
+    ).resolves.toEqual(completedFirst);
+    const reopened = await catalog.updateProjectVideoReview(
+      researcher,
+      project.id,
+      video.id,
+      {
+        action: "reopen",
+        idempotencyKey: "reopen-for-new-evidence",
+        expectedCycleId: completedFirst.review.id,
+        expectedCycleVersion: completedFirst.review.version,
+        reason: "A second source needs review.",
+      },
+    );
+    expect(reopened.review).toMatchObject({
+      cycleNumber: 2,
+      status: "open",
+      version: 1,
+      openedBy: { userId: researcher.userId },
+      reopenReason: "A second source needs review.",
+    });
+    const ordinaryPolicy = await catalog.updateProjectVideoGovernance(
+      owner,
+      project.id,
+      video.id,
+      {
+        idempotencyKey: "ordinary-completion-policy",
+        expectedProjectVideoVersion: governed.projectVideoVersion,
+        completionPolicy: "researcher_or_administrator",
+      },
+    );
+    const transcriptVersionId = randomUUID();
+    await database.query(
+      `INSERT INTO transcript_versions
+         (id, project_id, video_id, lineage_id, version, schema_version,
+          source_language, target_language, timing_precision,
+          manifest_object_key, manifest_object_version_id, manifest_sha256,
+          finalized_at)
+       VALUES ($1, $2, $3, $4, 1, 1, 'en', 'en', 'cue', $5, 'review-v1',
+               $6, now())`,
+      [
+        transcriptVersionId,
+        project.id,
+        video.id,
+        randomUUID(),
+        "fixtures/review-manifest.json",
+        "b".repeat(64),
+      ],
+    );
+    await database.query(
+      `UPDATE project_videos SET active_transcript_version_id = $1
+       WHERE project_id = $2 AND video_id = $3`,
+      [transcriptVersionId, project.id, video.id],
+    );
+    const completedSecond = await catalog.updateProjectVideoReview(
+      researcher,
+      project.id,
+      video.id,
+      {
+        action: "complete",
+        idempotencyKey: "researcher-complete-ready-transcript",
+        expectedCycleId: reopened.review.id,
+        expectedCycleVersion: reopened.review.version,
+        acknowledgeTranscriptUnavailable: false,
+      },
+    );
+    expect(completedSecond.review).toMatchObject({
+      status: "completed",
+      completionPolicy: "researcher_or_administrator",
+      completionBasis: "ready_transcript",
+      transcriptVersionId,
+      completedBy: { userId: researcher.userId },
+    });
+    expect(
+      (
+        await database.query<{ count: string }>(
+          `SELECT count(*)::text AS count
+           FROM project_video_review_cycles
+           WHERE project_id = $1 AND video_id = $2`,
+          [project.id, video.id],
+        )
+      ).rows[0]!.count,
+    ).toBe("2");
+    expect(
+      (
+        await database.query<{
+          status: string;
+          completion_basis: string;
+        }>(
+          `SELECT status, completion_basis
+           FROM project_video_review_cycles
+           WHERE id = $1`,
+          [initial.review.id],
+        )
+      ).rows[0],
+    ).toEqual({
+      status: "completed",
+      completion_basis: "without_ready_transcript_acknowledged",
+    });
+    const final = (
+      await catalog.listProjectVideoWorklist(owner, project.id, { limit: 25 })
+    ).items[0]!;
+    expect(final).toMatchObject({
+      priority: "high",
+      completionPolicy: "researcher_or_administrator",
+      projectVideoVersion: ordinaryPolicy.projectVideoVersion,
+      activeTranscriptVersionId: transcriptVersionId,
+      activeFlagCount: 1,
+      processing: { state: "not_requested" },
+      review: {
+        id: completedSecond.review.id,
+        cycleNumber: 2,
+        status: "completed",
+      },
+    });
+    expect(
+      await catalog.listProjectVideoActivity(owner, project.id, {
+        limit: 25,
+        state: "unread",
+      }),
+    ).toMatchObject({ unreadCount: 3 });
+    expect(
+      await catalog.listProjectVideoActivity(administrator, project.id, {
+        limit: 25,
+        state: "unread",
+      }),
+    ).toMatchObject({
+      unreadCount: 1,
+      items: [{ eventType: "review_reopened" }],
+    });
+    const concurrentVideo = await catalog.addVideo(owner, project.id, {
+      youtubeVideoId: "ConcurrentReviewCoordination1",
+      canonicalUrl:
+        "https://www.youtube.com/watch?v=ConcurrentReviewCoordination1",
+      title: "Concurrent review coordination fixture",
+    });
+    const concurrentItem = (
+      await catalog.listProjectVideoWorklist(owner, project.id, { limit: 25 })
+    ).items.find((item) => item.video.id === concurrentVideo.id)!;
+    const concurrentCompletions = await Promise.allSettled([
+      catalog.updateProjectVideoReview(owner, project.id, concurrentVideo.id, {
+        action: "complete",
+        idempotencyKey: "concurrent-owner-complete",
+        expectedCycleId: concurrentItem.review.id,
+        expectedCycleVersion: concurrentItem.review.version,
+        acknowledgeTranscriptUnavailable: true,
+      }),
+      catalog.updateProjectVideoReview(
+        administrator,
+        project.id,
+        concurrentVideo.id,
+        {
+          action: "complete",
+          idempotencyKey: "concurrent-administrator-complete",
+          expectedCycleId: concurrentItem.review.id,
+          expectedCycleVersion: concurrentItem.review.version,
+          acknowledgeTranscriptUnavailable: true,
+        },
+      ),
+    ]);
+    expect(
+      concurrentCompletions.filter((result) => result.status === "fulfilled"),
+    ).toHaveLength(1);
+    expect(
+      concurrentCompletions.filter((result) => result.status === "rejected"),
+    ).toHaveLength(1);
+    expect(
+      (
+        await database.query<{ count: string }>(
+          `SELECT count(*)::text AS count FROM project_video_review_events
+           WHERE project_id = $1 AND video_id = $2`,
+          [project.id, concurrentVideo.id],
+        )
+      ).rows[0]!.count,
+    ).toBe("1");
+    await expect(
+      catalog.updateProjectVideoReview(viewer, project.id, video.id, {
+        action: "reopen",
+        idempotencyKey: "viewer-reopen",
+        expectedCycleId: completedSecond.review.id,
+        expectedCycleVersion: completedSecond.review.version,
+        reason: "Viewer must not reopen.",
+      }),
+    ).rejects.toMatchObject({ statusCode: 403 });
+  });
+
+  it("updates selected priorities atomically with administrator authority and exact replay", async () => {
+    const { catalog } = await authorityCatalog();
+    const owner = authorityActor("bulk-priority-owner");
+    const administrator = authorityActor("bulk-priority-administrator");
+    const researcher = authorityActor("bulk-priority-researcher");
+    await Promise.all([
+      catalog.registerUser(owner, "Bulk Priority Owner", "bulk_priority_owner"),
+      catalog.registerUser(
+        administrator,
+        "Bulk Priority Administrator",
+        "bulk_priority_admin",
+      ),
+      catalog.registerUser(
+        researcher,
+        "Bulk Priority Researcher",
+        "bulk_priority_researcher",
+      ),
+    ]);
+    const project = await catalog.createProject(owner, {
+      name: "Bulk priority authority",
+    });
+    await catalog.addMember(
+      owner,
+      project.id,
+      administrator.userId,
+      "administrator",
+    );
+    await catalog.addMember(owner, project.id, researcher.userId, "researcher");
+    for (const suffix of ["A", "B"]) {
+      await catalog.addVideo(owner, project.id, {
+        youtubeVideoId: `BulkPriority${suffix}`,
+        canonicalUrl: `https://www.youtube.com/watch?v=BulkPriority${suffix}`,
+        title: `Bulk priority ${suffix}`,
+      });
+    }
+    const initial = await catalog.listProjectVideoWorklist(owner, project.id, {
+      limit: 25,
+    });
+    expect(initial.items).toHaveLength(2);
+    const first = initial.items[0]!;
+    const second = initial.items[1]!;
+    const individuallyUpdated = await catalog.updateProjectVideoGovernance(
+      owner,
+      project.id,
+      first.video.id,
+      {
+        idempotencyKey: "bump-one-before-bulk",
+        expectedProjectVideoVersion: first.projectVideoVersion,
+        priority: "low",
+      },
+    );
+    await expect(
+      catalog.bulkUpdateProjectVideoPriority(administrator, project.id, {
+        priority: "high",
+        idempotencyKey: "stale-bulk-priority",
+        items: initial.items.map((item) => ({
+          videoId: item.video.id,
+          expectedProjectVideoVersion: item.projectVideoVersion,
+        })),
+      }),
+    ).rejects.toMatchObject({ statusCode: 409 });
+    const afterConflict = await catalog.listProjectVideoWorklist(
+      owner,
+      project.id,
+      { limit: 25 },
+    );
+    expect(
+      afterConflict.items.find((item) => item.video.id === first.video.id),
+    ).toMatchObject({
+      priority: "low",
+      projectVideoVersion: individuallyUpdated.projectVideoVersion,
+    });
+    expect(
+      afterConflict.items.find((item) => item.video.id === second.video.id),
+    ).toMatchObject({
+      priority: "normal",
+      projectVideoVersion: second.projectVideoVersion,
+    });
+
+    await expect(
+      catalog.bulkUpdateProjectVideoPriority(researcher, project.id, {
+        priority: "high",
+        idempotencyKey: "researcher-bulk-priority",
+        items: afterConflict.items.map((item) => ({
+          videoId: item.video.id,
+          expectedProjectVideoVersion: item.projectVideoVersion,
+        })),
+      }),
+    ).rejects.toMatchObject({ statusCode: 403 });
+    const command = {
+      priority: "high" as const,
+      idempotencyKey: "administrator-bulk-priority",
+      items: afterConflict.items.map((item) => ({
+        videoId: item.video.id,
+        expectedProjectVideoVersion: item.projectVideoVersion,
+      })),
+    };
+    const updated = await catalog.bulkUpdateProjectVideoPriority(
+      administrator,
+      project.id,
+      command,
+    );
+    expect(updated.items).toHaveLength(2);
+    expect(updated.items.map((item) => item.priority)).toEqual([
+      "high",
+      "high",
+    ]);
+    expect(updated.items.map((item) => item.videoId)).toEqual(
+      [...updated.items.map((item) => item.videoId)].sort(),
+    );
+    await expect(
+      catalog.bulkUpdateProjectVideoPriority(
+        administrator,
+        project.id,
+        command,
+      ),
+    ).resolves.toEqual(updated);
+    await expect(
+      catalog.bulkUpdateProjectVideoPriority(administrator, project.id, {
+        ...command,
+        priority: "normal",
+      }),
+    ).rejects.toMatchObject({
+      statusCode: 409,
+      code: "idempotency_conflict",
+    });
+  });
+
+  it("bulk dismisses/restores with dependency-aware cancellation and durable receipts", async () => {
+    const { database, catalog } = await authorityCatalog();
+    const owner = authorityActor("triage-owner");
+    const administrator = authorityActor("triage-administrator");
+    const researcher = authorityActor("triage-researcher");
+    await Promise.all([
+      catalog.registerUser(owner, "Triage Owner", "triage_owner"),
+      catalog.registerUser(
+        administrator,
+        "Triage Administrator",
+        "triage_administrator",
+      ),
+      catalog.registerUser(
+        researcher,
+        "Triage Researcher",
+        "triage_researcher",
+      ),
+    ]);
+    const project = await catalog.createProject(owner, {
+      name: "Bulk triage coordination",
+    });
+    await catalog.addMember(
+      owner,
+      project.id,
+      administrator.userId,
+      "administrator",
+    );
+    await catalog.addMember(owner, project.id, researcher.userId, "researcher");
+    const inputs = ["A", "B"].map((suffix, inputIndex) => ({
+      inputIndex,
+      input: `https://youtu.be/Triage${suffix}`,
+      status: "ready" as const,
+      processingNeed: "transcription" as const,
+      youtubeVideoId: `Triage${suffix}`,
+      canonicalUrl: `https://www.youtube.com/watch?v=Triage${suffix}`,
+      title: `Triage fixture ${suffix}`,
+      sourceLanguage: "en",
+    }));
+    const batch = await catalog.createTranscriptionBatch(researcher, {
+      projectId: project.id,
+      name: "Bulk triage batch",
+      options: {
+        targetLanguage: "en",
+        transcriptionProfile: "default",
+        sourcePolicy: "prefer-existing",
+        executionLocation: "local",
+        priority: "normal",
+      },
+      items: inputs,
+    });
+    for (const input of inputs)
+      await catalog.addVideo(owner, project.id, input);
+    const claimed = await catalog.claimTranscriptionJob(owner, "local", 120);
+    expect(claimed).toBeDefined();
+    const claimedItem = batch.items.find(
+      (item) => item.jobId === claimed!.job.id,
+    )!;
+    const queuedItem = batch.items.find(
+      (item) => item.jobId !== claimed!.job.id,
+    )!;
+    const initial = await catalog.listProjectVideoWorklist(owner, project.id, {
+      limit: 25,
+      view: "all",
+    });
+    await expect(
+      catalog.updateProjectVideoTriage(researcher, project.id, {
+        action: "dismiss",
+        idempotencyKey: "researcher-cannot-dismiss",
+        items: [
+          {
+            videoId: claimedItem.catalogVideoId!,
+            expectedProjectVideoVersion: initial.items.find(
+              (item) => item.video.id === claimedItem.catalogVideoId,
+            )!.projectVideoVersion,
+          },
+        ],
+      }),
+    ).rejects.toMatchObject({ statusCode: 403 });
+    const dismissCommand = {
+      action: "dismiss" as const,
+      idempotencyKey: "administrator-dismiss-bulk",
+      items: initial.items.map((item) => ({
+        videoId: item.video.id,
+        expectedProjectVideoVersion: item.projectVideoVersion,
+      })),
+      reason: "Not relevant to the current research question.",
+    };
+    const dismissed = await catalog.updateProjectVideoTriage(
+      administrator,
+      project.id,
+      dismissCommand,
+    );
+    expect(dismissed.cancellation).toEqual({
+      queuedJobsCanceled: 1,
+      activeJobsRequested: 1,
+      requestsRevoked: 0,
+    });
+    await expect(
+      catalog.updateProjectVideoTriage(
+        administrator,
+        project.id,
+        dismissCommand,
+      ),
+    ).resolves.toEqual(dismissed);
+    expect(
+      await catalog.listProjectVideoWorklist(owner, project.id, {
+        limit: 25,
+        view: "queue",
+      }),
+    ).toMatchObject({ total: 0, items: [] });
+    expect(
+      await catalog.listProjectVideoWorklist(owner, project.id, {
+        limit: 25,
+        view: "dismissed",
+      }),
+    ).toMatchObject({ total: 2 });
+    expect(
+      (
+        await database.query<{ state: string }>(
+          "SELECT state FROM jobs WHERE id = $1",
+          [queuedItem.jobId],
+        )
+      ).rows[0]!.state,
+    ).toBe("canceled");
+
+    const ownerActivity = await catalog.listProjectVideoActivity(
+      owner,
+      project.id,
+      { limit: 25, state: "unread" },
+    );
+    expect(ownerActivity).toMatchObject({ unreadCount: 2 });
+    expect(ownerActivity.items).toHaveLength(2);
+    const firstUnreadPage = await catalog.listProjectVideoActivity(
+      owner,
+      project.id,
+      { limit: 1, state: "unread" },
+    );
+    expect(firstUnreadPage.nextCursor).toBeDefined();
+    await expect(
+      catalog.listProjectVideoActivity(owner, project.id, {
+        limit: 1,
+        state: "seen",
+        cursor: firstUnreadPage.nextCursor,
+      }),
+    ).rejects.toMatchObject({ statusCode: 400 });
+    await expect(
+      catalog.listProjectVideoActivity(owner, project.id, {
+        limit: 1,
+        state: "unread",
+        cursor: firstUnreadPage.nextCursor,
+      }),
+    ).resolves.toMatchObject({ items: [expect.any(Object)] });
+    const seen = await catalog.markProjectVideoActivitySeen(owner, project.id, {
+      items: [
+        {
+          eventId: ownerActivity.items[0]!.eventId,
+          expectedVersion: ownerActivity.items[0]!.version,
+        },
+      ],
+    });
+    expect(seen.items[0]).toMatchObject({ state: "seen", version: 2 });
+    await expect(
+      catalog.markProjectVideoActivitySeen(owner, project.id, {
+        items: [
+          {
+            eventId: ownerActivity.items[0]!.eventId,
+            expectedVersion: ownerActivity.items[0]!.version,
+          },
+        ],
+      }),
+    ).resolves.toEqual(seen);
+
+    const claimedDismissed = dismissed.items.find(
+      (item) => item.videoId === claimedItem.catalogVideoId,
+    )!;
+    const restored = await catalog.updateProjectVideoTriage(
+      administrator,
+      project.id,
+      {
+        action: "restore",
+        idempotencyKey: "administrator-restore-active-job",
+        items: [
+          {
+            videoId: claimedDismissed.videoId,
+            expectedProjectVideoVersion: claimedDismissed.projectVideoVersion,
+          },
+        ],
+      },
+    );
+    expect(restored.cancellation.requestsRevoked).toBe(1);
+    await expect(
+      catalog.heartbeatTranscriptionJob(
+        owner,
+        claimed!.job.id,
+        claimed!.lease.attempt,
+        120,
+        "resolving",
+      ),
+    ).resolves.toMatchObject({ status: "active" });
+
+    const dismissedAgain = await catalog.updateProjectVideoTriage(
+      administrator,
+      project.id,
+      {
+        action: "dismiss",
+        idempotencyKey: "administrator-dismiss-active-job-again",
+        items: [
+          {
+            videoId: claimedDismissed.videoId,
+            expectedProjectVideoVersion: restored.items[0]!.projectVideoVersion,
+          },
+        ],
+      },
+    );
+    expect(dismissedAgain.cancellation.activeJobsRequested).toBe(1);
+    await expect(
+      catalog.heartbeatTranscriptionJob(
+        owner,
+        claimed!.job.id,
+        claimed!.lease.attempt,
+        120,
+        "resolving",
+      ),
+    ).resolves.toMatchObject({ status: "cancellation_requested" });
+    expect(
+      (
+        await database.query<{ state: string }>(
+          "SELECT state FROM jobs WHERE id = $1",
+          [claimed!.job.id],
+        )
+      ).rows[0]!.state,
+    ).toBe("canceled");
+    expect(
+      (
+        await database.query<{ count: string }>(
+          `SELECT count(*)::text AS count FROM project_video_flags
+           WHERE project_id = $1 AND video_id = ANY($2::uuid[])`,
+          [project.id, batch.items.map((item) => item.catalogVideoId)],
+        )
+      ).rows[0]!.count,
+    ).toBe("4");
+    const durableActivityCount = Number(
+      (
+        await database.query<{ count: string }>(
+          `SELECT count(*)::text AS count
+           FROM project_video_activity_events WHERE project_id = $1`,
+          [project.id],
+        )
+      ).rows[0]!.count,
+    );
+    expect(durableActivityCount).toBeGreaterThan(0);
+    await database.query(
+      "DELETE FROM project_members WHERE project_id = $1 AND user_id = $2",
+      [project.id, administrator.userId],
+    );
+    const afterAdministratorRemoval = await catalog.listProjectVideoWorklist(
+      owner,
+      project.id,
+      { limit: 25, view: "dismissed" },
+    );
+    expect(afterAdministratorRemoval.items).toHaveLength(2);
+    expect(
+      afterAdministratorRemoval.items.map(
+        (item) => item.triage.dismissedBy?.handle,
+      ),
+    ).toEqual(["former_member", "former_member"]);
+    expect(
+      afterAdministratorRemoval.items.map((item) => item.unreadActivityCount),
+    ).toEqual([0, 0]);
+    await expect(
+      catalog.listProjectVideoActivity(owner, project.id, {
+        limit: 25,
+        state: "all",
+      }),
+    ).resolves.toMatchObject({ items: [], unreadCount: 0 });
+    expect(
+      Number(
+        (
+          await database.query<{ count: string }>(
+            `SELECT count(*)::text AS count
+             FROM project_video_activity_events WHERE project_id = $1`,
+            [project.id],
+          )
+        ).rows[0]!.count,
+      ),
+    ).toBe(durableActivityCount);
+  });
+});
+
+describe("project-video language decisions", () => {
+  it("finalizes a timed-import candidate without moving the active transcript pointer", async () => {
+    const database = new PGlite();
+    databases.add(database);
+    await runCloudMigrations(database);
+    const store = new MemoryTranscriptObjectStore();
+    const catalog = new SharedProjectCatalog(database, store);
+    const actor: AuthenticatedActor = {
+      userId: randomUUID(),
+      externalSubject: "fixture:timed-importer",
+    };
+    await catalog.registerUser(actor, "Timed importer");
+    const project = await catalog.createProject(actor, {
+      name: "Timed import",
+    });
+    const created = await catalog.createTranscriptionBatch(actor, {
+      projectId: project.id,
+      name: "Timed import batch",
+      options: {
+        targetLanguage: "en",
+        transcriptionProfile: "default",
+        sourcePolicy: "prefer-existing",
+        executionLocation: "local",
+        priority: "normal",
+      },
+      items: [
+        {
+          inputIndex: 0,
+          input: "https://youtu.be/TimedImport1",
+          status: "ready",
+          processingNeed: "transcription",
+          youtubeVideoId: "TimedImport1",
+          canonicalUrl: "https://www.youtube.com/watch?v=TimedImport1",
+          title: "Timed import fixture",
+          durationMs: 60_000,
+          sourceLanguage: "dz",
+        },
+      ],
+    });
+    const item = created.items[0]!;
+    const initialGate = await catalog.getProjectVideoLanguageGate(
+      actor,
+      project.id,
+      item.catalogVideoId!,
+    );
+    const decision = await catalog.confirmProjectVideoLanguageDecision(
+      actor,
+      project.id,
+      item.catalogVideoId!,
+      {
+        idempotencyKey: "confirm-dz",
+        expectedDecisionVersion: initialGate.decision?.decisionVersion ?? 0,
+        resolvedLanguage: "dz",
+        basis: "user_confirmation",
+      },
+    );
+    await database.query(
+      `UPDATE transcription_batch_items
+       SET state = 'needs_language_confirmation' WHERE id = $1`,
+      [item.id],
+    );
+    const previousTranscriptId = randomUUID();
+    await database.query(
+      `INSERT INTO transcript_versions
+         (id, project_id, video_id, lineage_id, version, schema_version,
+          source_language, target_language, timing_precision,
+          manifest_object_key, manifest_object_version_id, manifest_sha256,
+          finalized_at)
+       VALUES ($1, $2, $3, $4, 1, 1, 'dz', 'en', 'cue', $5, 'fixture-v1', $6, now())`,
+      [
+        previousTranscriptId,
+        project.id,
+        item.catalogVideoId,
+        randomUUID(),
+        "fixtures/previous-manifest.json",
+        "c".repeat(64),
+      ],
+    );
+    await database.query(
+      `UPDATE project_videos SET active_transcript_version_id = $1
+       WHERE project_id = $2 AND video_id = $3`,
+      [previousTranscriptId, project.id, item.catalogVideoId],
+    );
+    const originalBytes = new TextEncoder().encode(
+      "1\n00:00:00,000 --> 00:00:01,000\nབཀྲ་ཤིས།\n",
+    );
+    const englishBytes = new TextEncoder().encode(
+      "1\n00:00:00,000 --> 00:00:01,000\nHello\n",
+    );
+    const command = {
+      idempotencyKey: "timed-import-v1",
+      languageDecisionId: decision.decision.id,
+      expectedDecisionVersion: decision.decision.decisionVersion,
+      batchItemId: item.id,
+      expectedBatchItemVersion: 1,
+      original: {
+        format: "srt" as const,
+        byteSize: originalBytes.byteLength,
+        sha256: digest(originalBytes),
+      },
+      english: {
+        format: "srt" as const,
+        byteSize: englishBytes.byteLength,
+        sha256: digest(englishBytes),
+      },
+    };
+    const secondConnectionCatalog = new SharedProjectCatalog(database, store);
+    const [createdByFirstConnection, createdBySecondConnection] =
+      await Promise.all([
+        catalog.createManualTimedTranscriptImport(
+          actor,
+          project.id,
+          item.catalogVideoId!,
+          { ...command, idempotencyKey: "timed-import-concurrent-create" },
+        ),
+        secondConnectionCatalog.createManualTimedTranscriptImport(
+          actor,
+          project.id,
+          item.catalogVideoId!,
+          { ...command, idempotencyKey: "timed-import-concurrent-create" },
+        ),
+      ]);
+    expect(createdByFirstConnection.importId).toBe(
+      createdBySecondConnection.importId,
+    );
+    const grant = await catalog.createManualTimedTranscriptImport(
+      actor,
+      project.id,
+      item.catalogVideoId!,
+      command,
+    );
+    expect(
+      await catalog.createManualTimedTranscriptImport(
+        actor,
+        project.id,
+        item.catalogVideoId!,
+        command,
+      ),
+    ).toMatchObject({ importId: grant.importId });
+    await expect(
+      catalog.createManualTimedTranscriptImport(
+        actor,
+        project.id,
+        item.catalogVideoId!,
+        {
+          ...command,
+          original: { ...command.original, sha256: "d".repeat(64) },
+        },
+      ),
+    ).rejects.toMatchObject({ statusCode: 409 });
+    const viewer: AuthenticatedActor = {
+      userId: randomUUID(),
+      externalSubject: "fixture:timed-import-viewer",
+    };
+    const outsider: AuthenticatedActor = {
+      userId: randomUUID(),
+      externalSubject: "fixture:timed-import-outsider",
+    };
+    await catalog.registerUser(viewer, "Timed viewer");
+    await catalog.registerUser(outsider, "Timed outsider");
+    await catalog.addMember(actor, project.id, viewer.userId, "viewer");
+    await expect(
+      catalog.createManualTimedTranscriptImport(
+        viewer,
+        project.id,
+        item.catalogVideoId!,
+        { ...command, idempotencyKey: "viewer-import" },
+      ),
+    ).rejects.toMatchObject({ statusCode: 403 });
+    await expect(
+      catalog.getManualTimedTranscriptImportForBatchItem(
+        viewer,
+        project.id,
+        item.catalogVideoId!,
+        item.id,
+      ),
+    ).rejects.toMatchObject({ statusCode: 403 });
+    await expect(
+      catalog.getManualTimedTranscriptImportForBatchItem(
+        outsider,
+        project.id,
+        item.catalogVideoId!,
+        item.id,
+      ),
+    ).rejects.toMatchObject({ statusCode: 403 });
+    const originalTarget = grant.targets.find(
+      (target) => target.role === "original",
+    )!;
+    const englishTarget = grant.targets.find(
+      (target) => target.role === "english",
+    )!;
+    const storedOriginal = await store.put({
+      key: originalTarget.objectKey,
+      bytes: originalBytes,
+      contentType: "application/x-subrip",
+      sha256: digest(originalBytes),
+    });
+    const storedEnglish = await store.put({
+      key: englishTarget.objectKey,
+      bytes: englishBytes,
+      contentType: "application/x-subrip",
+      sha256: digest(englishBytes),
+    });
+    const before = await database.query<{
+      active_transcript_version_id: string | null;
+    }>(
+      `SELECT active_transcript_version_id FROM project_videos
+       WHERE project_id = $1 AND video_id = $2`,
+      [project.id, item.catalogVideoId!],
+    );
+    const finalizeCommand = {
+      idempotencyKey: "timed-finalize-v1",
+      original: {
+        objectVersionId: storedOriginal.versionId,
+        byteSize: storedOriginal.bytes.byteLength,
+        sha256: storedOriginal.sha256,
+      },
+      english: {
+        objectVersionId: storedEnglish.versionId,
+        byteSize: storedEnglish.bytes.byteLength,
+        sha256: storedEnglish.sha256,
+      },
+    };
+    await expect(
+      catalog.finalizeManualTimedTranscriptImport(
+        viewer,
+        project.id,
+        item.catalogVideoId!,
+        grant.importId,
+        finalizeCommand,
+      ),
+    ).rejects.toMatchObject({ statusCode: 403 });
+    const [finalized, concurrent] = await Promise.all([
+      catalog.finalizeManualTimedTranscriptImport(
+        actor,
+        project.id,
+        item.catalogVideoId!,
+        grant.importId,
+        finalizeCommand,
+      ),
+      catalog.finalizeManualTimedTranscriptImport(
+        actor,
+        project.id,
+        item.catalogVideoId!,
+        grant.importId,
+        finalizeCommand,
+      ),
+    ]);
+    expect([finalized.state, concurrent.state]).toContain("finalized");
+    const winner = [finalized, concurrent].find(
+      (status) => status.state === "finalized",
+    )!;
+    expect(winner).toMatchObject({
+      state: "finalized",
+      candidate: { timingPrecision: "cue" },
+    });
+    expect(
+      (
+        await database.query<{
+          original_object_version_id: string;
+          english_object_version_id: string;
+        }>(
+          `SELECT original_object_version_id, english_object_version_id
+           FROM manual_timed_transcript_imports WHERE id = $1`,
+          [grant.importId],
+        )
+      ).rows[0],
+    ).toEqual({
+      original_object_version_id: storedOriginal.versionId,
+      english_object_version_id: storedEnglish.versionId,
+    });
+    expect(
+      await catalog.finalizeManualTimedTranscriptImport(
+        actor,
+        project.id,
+        item.catalogVideoId!,
+        grant.importId,
+        finalizeCommand,
+      ),
+    ).toEqual(winner);
+    await expect(
+      catalog.finalizeManualTimedTranscriptImport(
+        actor,
+        project.id,
+        item.catalogVideoId!,
+        grant.importId,
+        {
+          ...finalizeCommand,
+          english: { ...finalizeCommand.english, sha256: "e".repeat(64) },
+        },
+      ),
+    ).rejects.toMatchObject({ statusCode: 409 });
+    expect(
+      (
+        await database.query<{ active_transcript_version_id: string | null }>(
+          `SELECT active_transcript_version_id FROM project_videos
+           WHERE project_id = $1 AND video_id = $2`,
+          [project.id, item.catalogVideoId!],
+        )
+      ).rows[0],
+    ).toEqual(before.rows[0]);
+    expect(before.rows[0]).toEqual({
+      active_transcript_version_id: previousTranscriptId,
+    });
+    expect(
+      (
+        await database.query<{ count: string }>(
+          `SELECT count(*)::text AS count FROM manual_timed_transcript_candidates
+           WHERE import_id = $1`,
+          [grant.importId],
+        )
+      ).rows[0]?.count,
+    ).toBe("1");
+    expect(
+      (
+        await database.query<{ count: string }>(
+          `SELECT count(*)::text AS count FROM sync_events
+           WHERE project_id = $1 AND event_type = 'transcript.activated'`,
+          [project.id],
+        )
+      ).rows[0]?.count,
+    ).toBe("0");
+
+    await expect(
+      catalog.reviewManualTimedTranscriptCandidate(
+        viewer,
+        project.id,
+        item.catalogVideoId!,
+        winner.candidate!.candidateId,
+        { offset: 0, limit: 25 },
+      ),
+    ).rejects.toMatchObject({ statusCode: 403 });
+    await expect(
+      catalog.reviewManualTimedTranscriptCandidate(
+        outsider,
+        project.id,
+        item.catalogVideoId!,
+        winner.candidate!.candidateId,
+        { offset: 0, limit: 25 },
+      ),
+    ).rejects.toMatchObject({ statusCode: 403 });
+    const review = await catalog.reviewManualTimedTranscriptCandidate(
+      actor,
+      project.id,
+      item.catalogVideoId!,
+      winner.candidate!.candidateId,
+      { offset: 0, limit: 1 },
+    );
+    expect(review).toMatchObject({
+      candidateId: winner.candidate!.candidateId,
+      importId: grant.importId,
+      transcriptVersionId: winner.candidate!.transcriptVersionId,
+      languageDecisionId: decision.decision.id,
+      languageDecisionVersion: decision.decision.decisionVersion,
+      offset: 0,
+      limit: 1,
+      hasMore: false,
+      original: {
+        language: "dz",
+        kind: "original",
+        source: "manual-import",
+        timingPrecision: "cue",
+        totalCues: 1,
+        cues: [{ startMs: 0, endMs: 1_000, text: "བཀྲ་ཤིས།" }],
+      },
+      english: {
+        language: "en",
+        kind: "english",
+        source: "manual-import",
+        timingPrecision: "cue",
+        totalCues: 1,
+        cues: [{ startMs: 0, endMs: 1_000, text: "Hello" }],
+      },
+    });
+    expect(review.english.sourceTrackId).toBe(review.original.trackId);
+    expect(review).not.toHaveProperty("objectKey");
+
+    const corruptedStore: TranscriptObjectStore = {
+      put: (input) => store.put(input),
+      get: (key, versionId) => store.get(key, versionId),
+      getBounded: async (key, versionId, maxBytes) => {
+        const stored = await store.getBounded(key, versionId, maxBytes);
+        return stored && key.endsWith("original.normalized.json")
+          ? { ...stored, bytes: new TextEncoder().encode("corrupt") }
+          : stored;
+      },
+      deleteVersion: (key, versionId) => store.deleteVersion(key, versionId),
+      delete: (key) => store.delete(key),
+      list: (prefix) => store.list(prefix),
+    };
+    const corruptedCatalog = new SharedProjectCatalog(database, corruptedStore);
+    await expect(
+      corruptedCatalog.reviewManualTimedTranscriptCandidate(
+        actor,
+        project.id,
+        item.catalogVideoId!,
+        winner.candidate!.candidateId,
+        { offset: 0, limit: 1 },
+      ),
+    ).rejects.toMatchObject({ statusCode: 422 });
+
+    const activationBase = {
+      importId: review.importId,
+      candidateId: review.candidateId,
+      transcriptVersionId: review.transcriptVersionId,
+      expectedProjectVideoVersion: review.projectVideoVersion,
+      languageDecisionId: review.languageDecisionId,
+      expectedLanguageDecisionVersion: review.languageDecisionVersion,
+    };
+    await expect(
+      catalog.activateManualTimedTranscriptCandidate(
+        viewer,
+        project.id,
+        item.catalogVideoId!,
+        { ...activationBase, idempotencyKey: "viewer-activation" },
+      ),
+    ).rejects.toMatchObject({ statusCode: 403 });
+    await expect(
+      corruptedCatalog.activateManualTimedTranscriptCandidate(
+        actor,
+        project.id,
+        item.catalogVideoId!,
+        { ...activationBase, idempotencyKey: "corrupt-activation" },
+      ),
+    ).rejects.toMatchObject({ statusCode: 422 });
+    const concurrentActivationCatalog = new SharedProjectCatalog(
+      database,
+      store,
+    );
+    const activationResults = await Promise.allSettled([
+      catalog.activateManualTimedTranscriptCandidate(
+        actor,
+        project.id,
+        item.catalogVideoId!,
+        { ...activationBase, idempotencyKey: "activate-corrected-first" },
+      ),
+      concurrentActivationCatalog.activateManualTimedTranscriptCandidate(
+        actor,
+        project.id,
+        item.catalogVideoId!,
+        { ...activationBase, idempotencyKey: "activate-corrected-second" },
+      ),
+    ]);
+    const activationWinner = activationResults.find(
+      (result) => result.status === "fulfilled",
+    );
+    expect(
+      activationResults.filter((result) => result.status === "fulfilled"),
+    ).toHaveLength(1);
+    expect(
+      activationResults.filter((result) => result.status === "rejected"),
+    ).toHaveLength(1);
+    expect(activationWinner).toBeDefined();
+    if (!activationWinner || activationWinner.status !== "fulfilled") {
+      throw new Error("Activation race did not produce a winner.");
+    }
+    const winningKey =
+      activationWinner.value.activationId ===
+      (activationResults[0].status === "fulfilled"
+        ? activationResults[0].value.activationId
+        : undefined)
+        ? "activate-corrected-first"
+        : "activate-corrected-second";
+    expect(activationWinner.value).toMatchObject({
+      state: "activated",
+      candidateId: review.candidateId,
+      transcriptVersionId: review.transcriptVersionId,
+      projectVideoVersion: review.projectVideoVersion + 1,
+    });
+    expect(
+      await catalog.activateManualTimedTranscriptCandidate(
+        actor,
+        project.id,
+        item.catalogVideoId!,
+        { ...activationBase, idempotencyKey: winningKey },
+      ),
+    ).toEqual(activationWinner.value);
+    await expect(
+      catalog.activateManualTimedTranscriptCandidate(
+        actor,
+        project.id,
+        item.catalogVideoId!,
+        {
+          ...activationBase,
+          transcriptVersionId: randomUUID(),
+          idempotencyKey: winningKey,
+        },
+      ),
+    ).rejects.toMatchObject({ statusCode: 409, code: "idempotency_conflict" });
+    expect(
+      (
+        await database.query<{ count: string }>(
+          `SELECT count(*)::text AS count
+           FROM manual_timed_transcript_activations WHERE candidate_id = $1`,
+          [review.candidateId],
+        )
+      ).rows[0]?.count,
+    ).toBe("1");
+    expect(
+      (
+        await database.query<{ count: string }>(
+          `SELECT count(*)::text AS count FROM sync_events
+           WHERE project_id = $1 AND event_type = 'transcript.activated'
+             AND entity_id = $2`,
+          [project.id, review.transcriptVersionId],
+        )
+      ).rows[0]?.count,
+    ).toBe("1");
+    expect(
+      await catalog.getActiveTranscript(
+        actor,
+        project.id,
+        item.catalogVideoId!,
+      ),
+    ).toMatchObject({ transcriptVersionId: review.transcriptVersionId });
+    await database.query(
+      `UPDATE project_videos
+       SET active_transcript_version_id = $1, version = version + 1
+       WHERE project_id = $2 AND video_id = $3`,
+      [previousTranscriptId, project.id, item.catalogVideoId!],
+    );
+    expect(
+      await catalog.activateManualTimedTranscriptCandidate(
+        actor,
+        project.id,
+        item.catalogVideoId!,
+        { ...activationBase, idempotencyKey: winningKey },
+      ),
+    ).toMatchObject({ state: "superseded" });
+    expect(
+      (
+        await database.query<{ active_transcript_version_id: string }>(
+          `SELECT active_transcript_version_id FROM project_videos
+           WHERE project_id = $1 AND video_id = $2`,
+          [project.id, item.catalogVideoId!],
+        )
+      ).rows[0]?.active_transcript_version_id,
+    ).toBe(previousTranscriptId);
+    const preparePendingImport = async (idempotencyKey: string) => {
+      const itemSnapshot = await database.query<{ version: number }>(
+        `UPDATE transcription_batch_items
+         SET state = 'needs_language_confirmation',
+             manual_timed_transcript_candidate_id = NULL,
+             version = version + 1
+         WHERE id = $1
+         RETURNING version`,
+        [item.id],
+      );
+      const decisionSnapshot = await database.query<{
+        id: string;
+        decision_version: number;
+      }>(
+        `SELECT d.id, d.decision_version
+         FROM project_videos pv
+         JOIN project_video_language_decisions d
+           ON d.id = pv.current_language_decision_id
+         WHERE pv.project_id = $1 AND pv.video_id = $2`,
+        [project.id, item.catalogVideoId!],
+      );
+      const pendingGrant = await catalog.createManualTimedTranscriptImport(
+        actor,
+        project.id,
+        item.catalogVideoId!,
+        {
+          ...command,
+          idempotencyKey,
+          languageDecisionId: decisionSnapshot.rows[0]!.id,
+          expectedDecisionVersion: decisionSnapshot.rows[0]!.decision_version,
+          expectedBatchItemVersion: itemSnapshot.rows[0]!.version,
+        },
+      );
+      const pendingOriginal = pendingGrant.targets.find(
+        (target) => target.role === "original",
+      )!;
+      const pendingEnglish = pendingGrant.targets.find(
+        (target) => target.role === "english",
+      )!;
+      const pendingStoredOriginal = await store.put({
+        key: pendingOriginal.objectKey,
+        bytes: originalBytes,
+        contentType: "application/x-subrip",
+        sha256: digest(originalBytes),
+      });
+      const pendingStoredEnglish = await store.put({
+        key: pendingEnglish.objectKey,
+        bytes: englishBytes,
+        contentType: "application/x-subrip",
+        sha256: digest(englishBytes),
+      });
+      return {
+        grant: pendingGrant,
+        originalTarget: pendingOriginal,
+        englishTarget: pendingEnglish,
+        storedOriginal: pendingStoredOriginal,
+        storedEnglish: pendingStoredEnglish,
+        finalize: {
+          idempotencyKey: `${idempotencyKey}-finalize`,
+          original: {
+            objectVersionId: pendingStoredOriginal.versionId,
+            byteSize: pendingStoredOriginal.bytes.byteLength,
+            sha256: pendingStoredOriginal.sha256,
+          },
+          english: {
+            objectVersionId: pendingStoredEnglish.versionId,
+            byteSize: pendingStoredEnglish.bytes.byteLength,
+            sha256: pendingStoredEnglish.sha256,
+          },
+        },
+      };
+    };
+    const invalid = await preparePendingImport("timed-import-invalid-object");
+    await expect(
+      catalog.finalizeManualTimedTranscriptImport(
+        actor,
+        project.id,
+        item.catalogVideoId!,
+        invalid.grant.importId,
+        {
+          ...invalid.finalize,
+          original: {
+            ...invalid.finalize.original,
+            objectVersionId: randomUUID(),
+          },
+        },
+      ),
+    ).rejects.toMatchObject({
+      statusCode: 422,
+      code: "manual_import_object_invalid",
+    });
+    await expect(
+      catalog.finalizeManualTimedTranscriptImport(
+        actor,
+        project.id,
+        item.catalogVideoId!,
+        invalid.grant.importId,
+        {
+          ...invalid.finalize,
+          english: { ...invalid.finalize.english, sha256: "f".repeat(64) },
+        },
+      ),
+    ).rejects.toMatchObject({
+      statusCode: 422,
+      code: "manual_import_object_invalid",
+    });
+    const oversized = await store.put({
+      key: invalid.originalTarget.objectKey,
+      bytes: new Uint8Array(21 * 1024 * 1024),
+      contentType: "application/x-subrip",
+      // Simulates a compromised staged object whose metadata claims the
+      // original declared digest; bounded retrieval must reject it first.
+      sha256: invalid.finalize.original.sha256,
+    });
+    await expect(
+      catalog.finalizeManualTimedTranscriptImport(
+        actor,
+        project.id,
+        item.catalogVideoId!,
+        invalid.grant.importId,
+        {
+          ...invalid.finalize,
+          original: {
+            ...invalid.finalize.original,
+            objectVersionId: oversized.versionId,
+          },
+        },
+      ),
+    ).rejects.toMatchObject({
+      statusCode: 422,
+      code: "manual_import_object_invalid",
+    });
+    expect(
+      (
+        await database.query<{ count: string }>(
+          `SELECT count(*)::text AS count FROM manual_timed_transcript_candidates
+           WHERE import_id = $1`,
+          [invalid.grant.importId],
+        )
+      ).rows[0]?.count,
+    ).toBe("0");
+
+    const staleDecision = await preparePendingImport(
+      "timed-import-stale-decision",
+    );
+    const currentGate = await catalog.getProjectVideoLanguageGate(
+      actor,
+      project.id,
+      item.catalogVideoId!,
+    );
+    await catalog.confirmProjectVideoLanguageDecision(
+      actor,
+      project.id,
+      item.catalogVideoId!,
+      {
+        idempotencyKey: "confirm-dz-v2",
+        expectedDecisionVersion: currentGate.decision!.decisionVersion,
+        resolvedLanguage: "dz",
+        basis: "user_confirmation",
+      },
+    );
+    await expect(
+      catalog.finalizeManualTimedTranscriptImport(
+        actor,
+        project.id,
+        item.catalogVideoId!,
+        staleDecision.grant.importId,
+        staleDecision.finalize,
+      ),
+    ).rejects.toMatchObject({ statusCode: 409 });
+
+    const staleItem = await preparePendingImport("timed-import-stale-item");
+    await database.query(
+      `UPDATE transcription_batch_items SET version = version + 1 WHERE id = $1`,
+      [item.id],
+    );
+    await expect(
+      catalog.finalizeManualTimedTranscriptImport(
+        actor,
+        project.id,
+        item.catalogVideoId!,
+        staleItem.grant.importId,
+        staleItem.finalize,
+      ),
+    ).rejects.toMatchObject({ statusCode: 409 });
+
+    const staleDuration = await preparePendingImport(
+      "timed-import-stale-duration",
+    );
+    await database.query(
+      `UPDATE videos SET duration_ms = duration_ms + 1, updated_at = now()
+       WHERE id = $1`,
+      [item.catalogVideoId!],
+    );
+    await expect(
+      catalog.finalizeManualTimedTranscriptImport(
+        actor,
+        project.id,
+        item.catalogVideoId!,
+        staleDuration.grant.importId,
+        staleDuration.finalize,
+      ),
+    ).rejects.toMatchObject({ statusCode: 409 });
+    expect(
+      (
+        await database.query<{ count: string }>(
+          `SELECT count(*)::text AS count FROM manual_timed_transcript_candidates
+           WHERE import_id IN ($1, $2, $3)`,
+          [
+            staleDecision.grant.importId,
+            staleItem.grant.importId,
+            staleDuration.grant.importId,
+          ],
+        )
+      ).rows[0]?.count,
+    ).toBe("0");
+
+    const partialArtifactFailure = await preparePendingImport(
+      "timed-import-partial-artifact-failure",
+    );
+    let candidatePutCount = 0;
+    const partialFailureStore: TranscriptObjectStore = {
+      put: async (input) => {
+        if (
+          input.key.includes(
+            `/${partialArtifactFailure.grant.importId}/candidate/`,
+          )
+        ) {
+          candidatePutCount += 1;
+          if (candidatePutCount === 2) {
+            throw new Error("fixture candidate artifact failure");
+          }
+        }
+        return store.put(input);
+      },
+      get: (key, versionId) => store.get(key, versionId),
+      getBounded: (key, versionId, maxBytes) =>
+        store.getBounded(key, versionId, maxBytes),
+      deleteVersion: (key, versionId) => store.deleteVersion(key, versionId),
+      delete: (key) => store.delete(key),
+      list: (prefix) => store.list(prefix),
+    };
+    const partialFailureCatalog = new SharedProjectCatalog(
+      database,
+      partialFailureStore,
+    );
+    await expect(
+      partialFailureCatalog.finalizeManualTimedTranscriptImport(
+        actor,
+        project.id,
+        item.catalogVideoId!,
+        partialArtifactFailure.grant.importId,
+        partialArtifactFailure.finalize,
+      ),
+    ).rejects.toThrow("fixture candidate artifact failure");
+    expect(
+      await store.list(
+        `projects/${project.id}/videos/${item.catalogVideoId}/manual-imports/${partialArtifactFailure.grant.importId}/candidate`,
+      ),
+    ).toEqual([]);
+    expect(
+      (
+        await database.query<{ state: string }>(
+          `SELECT state FROM manual_timed_transcript_imports WHERE id = $1`,
+          [partialArtifactFailure.grant.importId],
+        )
+      ).rows[0],
+    ).toEqual({ state: "staged" });
+    expect(
+      await catalog.getManualTimedTranscriptImportForBatchItem(
+        actor,
+        project.id,
+        item.catalogVideoId!,
+        item.id,
+      ),
+    ).toEqual(winner);
+    const resumed = await preparePendingImport("timed-import-resume");
+    const resumeRequestSha256 = digest(
+      new TextEncoder().encode(canonicalJson(resumed.finalize)),
+    );
+    await database.query(
+      `UPDATE manual_timed_transcript_imports
+       SET state = 'finalizing', finalize_idempotency_key = $1,
+           finalize_request_sha256 = $2, finalization_token = $3,
+           finalization_started_at = '2000-01-01T00:00:00.000Z',
+           original_object_version_id = $4, english_object_version_id = $5
+       WHERE id = $6`,
+      [
+        resumed.finalize.idempotencyKey,
+        resumeRequestSha256,
+        randomUUID(),
+        resumed.storedOriginal.versionId,
+        resumed.storedEnglish.versionId,
+        resumed.grant.importId,
+      ],
+    );
+    await expect(
+      catalog.finalizeManualTimedTranscriptImport(
+        actor,
+        project.id,
+        item.catalogVideoId!,
+        resumed.grant.importId,
+        resumed.finalize,
+      ),
+    ).resolves.toMatchObject({
+      importId: resumed.grant.importId,
+      state: "finalized",
+    });
+
+    const expiring = await preparePendingImport("timed-import-expiring");
+    await database.query(
+      `UPDATE manual_timed_transcript_imports
+       SET original_object_version_id = $1, english_object_version_id = $2,
+           expires_at = '2000-01-01T00:00:00.000Z'
+       WHERE id = $3`,
+      [
+        expiring.storedOriginal.versionId,
+        expiring.storedEnglish.versionId,
+        expiring.grant.importId,
+      ],
+    );
+    await expect(
+      catalog.finalizeManualTimedTranscriptImport(
+        actor,
+        project.id,
+        item.catalogVideoId!,
+        expiring.grant.importId,
+        expiring.finalize,
+      ),
+    ).rejects.toMatchObject({ statusCode: 409 });
+    expect(
+      (
+        await database.query<{ state: string }>(
+          `SELECT state FROM manual_timed_transcript_imports WHERE id = $1`,
+          [expiring.grant.importId],
+        )
+      ).rows[0],
+    ).toEqual({ state: "expired" });
+    expect(
+      await store.get(
+        expiring.originalTarget.objectKey,
+        expiring.storedOriginal.versionId,
+      ),
+    ).toBeUndefined();
+    expect(
+      await store.get(
+        expiring.englishTarget.objectKey,
+        expiring.storedEnglish.versionId,
+      ),
+    ).toBeUndefined();
+
+    const expiringFinalization = await preparePendingImport(
+      "timed-import-expiring-finalization",
+    );
+    await database.query(
+      `UPDATE manual_timed_transcript_imports
+       SET state = 'finalizing', finalize_idempotency_key = $1,
+           finalize_request_sha256 = $2, finalization_token = $3,
+           finalization_started_at = '2000-01-01T00:00:00.000Z',
+           original_object_version_id = $4, english_object_version_id = $5,
+           expires_at = '2000-01-01T00:00:01.000Z'
+       WHERE id = $6`,
+      [
+        expiringFinalization.finalize.idempotencyKey,
+        digest(
+          new TextEncoder().encode(
+            canonicalJson(expiringFinalization.finalize),
+          ),
+        ),
+        randomUUID(),
+        expiringFinalization.storedOriginal.versionId,
+        expiringFinalization.storedEnglish.versionId,
+        expiringFinalization.grant.importId,
+      ],
+    );
+    await expect(
+      catalog.finalizeManualTimedTranscriptImport(
+        actor,
+        project.id,
+        item.catalogVideoId!,
+        expiringFinalization.grant.importId,
+        expiringFinalization.finalize,
+      ),
+    ).rejects.toMatchObject({ statusCode: 409 });
+    expect(
+      (
+        await database.query<{ state: string }>(
+          `SELECT state FROM manual_timed_transcript_imports WHERE id = $1`,
+          [expiringFinalization.grant.importId],
+        )
+      ).rows[0],
+    ).toEqual({ state: "expired" });
+    expect(
+      await store.get(
+        expiringFinalization.originalTarget.objectKey,
+        expiringFinalization.storedOriginal.versionId,
+      ),
+    ).toBeUndefined();
+    expect(
+      await store.get(
+        expiringFinalization.englishTarget.objectKey,
+        expiringFinalization.storedEnglish.versionId,
+      ),
+    ).toBeUndefined();
+
+    const reservationRace = await preparePendingImport(
+      "timed-import-expiry-reservation-race",
+    );
+    let boundedReads = 0;
+    const reservationRaceStore: TranscriptObjectStore = {
+      put: (input) => store.put(input),
+      get: (key, versionId) => store.get(key, versionId),
+      getBounded: async (key, versionId, maxBytes) => {
+        const value = await store.getBounded(key, versionId, maxBytes);
+        boundedReads += 1;
+        if (boundedReads === 2) {
+          await database.query(
+            `UPDATE manual_timed_transcript_imports
+             SET state = 'expired', version = version + 1
+             WHERE id = $1`,
+            [reservationRace.grant.importId],
+          );
+        }
+        return value;
+      },
+      deleteVersion: (key, versionId) => store.deleteVersion(key, versionId),
+      delete: (key) => store.delete(key),
+      list: (prefix) => store.list(prefix),
+    };
+    const reservationRaceCatalog = new SharedProjectCatalog(
+      database,
+      reservationRaceStore,
+    );
+    await expect(
+      reservationRaceCatalog.finalizeManualTimedTranscriptImport(
+        actor,
+        project.id,
+        item.catalogVideoId!,
+        reservationRace.grant.importId,
+        reservationRace.finalize,
+      ),
+    ).resolves.toMatchObject({ state: "expired" });
+    expect(
+      (
+        await database.query<{ count: string }>(
+          `SELECT count(*)::text AS count
+           FROM manual_timed_transcript_candidates WHERE import_id = $1`,
+          [reservationRace.grant.importId],
+        )
+      ).rows[0]?.count,
+    ).toBe("0");
+
+    const publishRace = await preparePendingImport(
+      "timed-import-expiry-publish-race",
+    );
+    let expiredDuringPublish = false;
+    const publishRaceStore: TranscriptObjectStore = {
+      put: async (input) => {
+        const value = await store.put(input);
+        if (
+          !expiredDuringPublish &&
+          input.key.includes(`/${publishRace.grant.importId}/candidate/`)
+        ) {
+          expiredDuringPublish = true;
+          await database.query(
+            `UPDATE manual_timed_transcript_imports
+             SET expires_at = '2000-01-01T00:00:00.000Z'
+             WHERE id = $1`,
+            [publishRace.grant.importId],
+          );
+        }
+        return value;
+      },
+      get: (key, versionId) => store.get(key, versionId),
+      getBounded: (key, versionId, maxBytes) =>
+        store.getBounded(key, versionId, maxBytes),
+      deleteVersion: (key, versionId) => store.deleteVersion(key, versionId),
+      delete: (key) => store.delete(key),
+      list: (prefix) => store.list(prefix),
+    };
+    const publishRaceCatalog = new SharedProjectCatalog(
+      database,
+      publishRaceStore,
+    );
+    await expect(
+      publishRaceCatalog.finalizeManualTimedTranscriptImport(
+        actor,
+        project.id,
+        item.catalogVideoId!,
+        publishRace.grant.importId,
+        publishRace.finalize,
+      ),
+    ).rejects.toMatchObject({ statusCode: 409 });
+    expect(
+      (
+        await database.query<{ state: string }>(
+          `SELECT state FROM manual_timed_transcript_imports WHERE id = $1`,
+          [publishRace.grant.importId],
+        )
+      ).rows[0],
+    ).toEqual({ state: "expired" });
+    expect(
+      await store.list(
+        `projects/${project.id}/videos/${item.catalogVideoId}/manual-imports/${publishRace.grant.importId}/candidate`,
+      ),
+    ).toEqual([]);
+    expect(
+      (
+        await database.query<{ count: string }>(
+          `SELECT count(*)::text AS count
+           FROM manual_timed_transcript_candidates WHERE import_id = $1`,
+          [publishRace.grant.importId],
+        )
+      ).rows[0]?.count,
+    ).toBe("0");
+    expect(
+      await catalog.getManualTimedTranscriptImportForBatchItem(
+        actor,
+        project.id,
+        item.catalogVideoId!,
+        item.id,
+      ),
+    ).toMatchObject({
+      importId: resumed.grant.importId,
+      state: "finalized",
+    });
+  });
+
+  it("blocks unknown language, preserves exact confirmation replays, and exposes the current gate", async () => {
+    const database = new PGlite();
+    databases.add(database);
+    await runCloudMigrations(database);
+    const catalog = new SharedProjectCatalog(
+      database,
+      new MemoryTranscriptObjectStore(),
+    );
+    const actor: AuthenticatedActor = {
+      userId: randomUUID(),
+      externalSubject: "fixture:language-owner",
+    };
+    await catalog.registerUser(actor, "Language owner");
+    const project = await catalog.createProject(actor, {
+      name: "Language project",
+    });
+    const unknown = await catalog.createTranscriptionBatch(actor, {
+      projectId: project.id,
+      name: "Unknown-language batch",
+      options: {
+        targetLanguage: "en",
+        transcriptionProfile: "default",
+        sourcePolicy: "prefer-existing",
+        executionLocation: "local",
+        priority: "normal",
+      },
+      items: [
+        {
+          inputIndex: 0,
+          input: "https://youtu.be/M7lc1UVf-VE",
+          status: "ready",
+          processingNeed: "transcription",
+          youtubeVideoId: "M7lc1UVf-VE",
+          canonicalUrl: "https://www.youtube.com/watch?v=M7lc1UVf-VE",
+          title: "Unknown fixture video",
+        },
+      ],
+    });
+    expect(unknown.items[0]).toMatchObject({
+      state: "needs_language_confirmation",
+    });
+    expect(unknown.items[0]?.jobId).toBeUndefined();
+    const videoId = unknown.items[0]!.catalogVideoId!;
+    expect(
+      await catalog.getProjectVideoLanguageGate(actor, project.id, videoId),
+    ).toMatchObject({
+      state: "needs_language_confirmation",
+      status: "unverified",
+      remediationReason: "confirm_language",
+    });
+
+    const command = {
+      idempotencyKey: "confirm-dz-v1",
+      expectedDecisionVersion: 0,
+      resolvedLanguage: "dz",
+      basis: "user_confirmation" as const,
+    };
+    const viewer: AuthenticatedActor = {
+      userId: randomUUID(),
+      externalSubject: "fixture:language-viewer",
+    };
+    const outsider: AuthenticatedActor = {
+      userId: randomUUID(),
+      externalSubject: "fixture:language-outsider",
+    };
+    await catalog.registerUser(viewer, "Language viewer");
+    await catalog.registerUser(outsider, "Language outsider");
+    await database.query(
+      `INSERT INTO project_members
+         (project_id, user_id, role, created_at, updated_at)
+       VALUES ($1, $2, 'viewer', now(), now())`,
+      [project.id, viewer.userId],
+    );
+    await expect(
+      catalog.getProjectVideoLanguageGate(viewer, project.id, videoId),
+    ).resolves.toMatchObject({ state: "needs_language_confirmation" });
+    await expect(
+      catalog.confirmProjectVideoLanguageDecision(
+        viewer,
+        project.id,
+        videoId,
+        command,
+      ),
+    ).rejects.toMatchObject({ statusCode: 403 });
+    await expect(
+      catalog.confirmProjectVideoLanguageDecision(
+        outsider,
+        project.id,
+        videoId,
+        command,
+      ),
+    ).rejects.toMatchObject({ statusCode: 403 });
+    const confirmed = await catalog.confirmProjectVideoLanguageDecision(
+      actor,
+      project.id,
+      videoId,
+      command,
+    );
+    const replay = await catalog.confirmProjectVideoLanguageDecision(
+      actor,
+      project.id,
+      videoId,
+      command,
+    );
+    expect(replay).toEqual(confirmed);
+    expect(confirmed).toMatchObject({
+      decision: {
+        decisionVersion: 1,
+        status: "confirmed",
+        resolvedLanguage: "dz",
+      },
+      gate: { state: "ready", status: "confirmed" },
+    });
+    await expect(
+      catalog.confirmProjectVideoLanguageDecision(actor, project.id, videoId, {
+        ...command,
+        resolvedLanguage: "ko",
+      }),
+    ).rejects.toMatchObject({ statusCode: 409 });
+    await expect(
+      catalog.confirmProjectVideoLanguageDecision(actor, project.id, videoId, {
+        ...command,
+        idempotencyKey: "stale-decision-version",
+      }),
+    ).rejects.toMatchObject({ statusCode: 409 });
+  });
+
+  it("blocks unknown worker evidence and lets a confirmed decision supersede stale creator metadata", async () => {
+    const database = new PGlite();
+    databases.add(database);
+    await runCloudMigrations(database);
+    const catalog = new SharedProjectCatalog(
+      database,
+      new MemoryTranscriptObjectStore(),
+    );
+    const actor: AuthenticatedActor = {
+      userId: randomUUID(),
+      externalSubject: "fixture:language-worker",
+    };
+    await catalog.registerUser(actor, "Language worker");
+    const project = await catalog.createProject(actor, {
+      name: "Worker language project",
+    });
+    const unconfirmed = await catalog.createTranscriptionBatch(actor, {
+      projectId: project.id,
+      name: "Unconfirmed worker evidence",
+      options: {
+        targetLanguage: "en",
+        transcriptionProfile: "default",
+        sourcePolicy: "prefer-existing",
+        executionLocation: "local",
+        priority: "normal",
+      },
+      items: [
+        {
+          inputIndex: 0,
+          input: "https://youtu.be/M7lc1UVf-VE",
+          status: "ready",
+          processingNeed: "transcription",
+          youtubeVideoId: "M7lc1UVf-VE",
+          canonicalUrl: "https://www.youtube.com/watch?v=M7lc1UVf-VE",
+          title: "Creator Korean fixture",
+          sourceLanguage: "ko",
+        },
+      ],
+    });
+    await catalog.markTranscriptionJobQueueDelivered(
+      unconfirmed.items[0]!.jobId!,
+      "local",
+    );
+    const unconfirmedJob = (await catalog.claimTranscriptionJob(
+      actor,
+      "local",
+      120,
+      true,
+    ))!;
+    expect(unconfirmedJob.job.payload.languageDecision).toMatchObject({
+      status: "unverified",
+      basis: "creator_metadata",
+      resolvedLanguage: "ko",
+    });
+    expect(unconfirmed.items[0]?.jobId).toBeDefined();
+    const noLanguage = await catalog.observeWorkerLanguageEvidence(
+      actor,
+      unconfirmedJob.job.id,
+      {
+        attempt: unconfirmedJob.lease.attempt,
+        evidence: {
+          id: randomUUID(),
+          projectId: project.id,
+          videoId: unconfirmed.items[0]!.catalogVideoId!,
+          source: "speech_detection",
+          provider: "fixture",
+          jobId: unconfirmedJob.job.id,
+          attempt: unconfirmedJob.lease.attempt,
+          createdAt: "2024-01-01T00:00:00.000Z",
+        },
+      },
+    );
+    expect(noLanguage.gate).toMatchObject({
+      state: "needs_language_confirmation",
+      remediationReason: "confirm_language",
+    });
+    expect(
+      await catalog.getTranscriptionBatch(
+        actor,
+        project.id,
+        unconfirmed.batch.id,
+      ),
+    ).toMatchObject({
+      items: [{ state: "needs_language_confirmation" }],
+    });
+    await expect(
+      catalog.heartbeatTranscriptionJob(
+        actor,
+        unconfirmedJob.job.id,
+        unconfirmedJob.lease.attempt,
+        120,
+        "acquiring",
+      ),
+    ).rejects.toMatchObject({ statusCode: 403 });
+    expect(
+      await catalog.getTranscriptionBatch(
+        actor,
+        project.id,
+        unconfirmed.batch.id,
+      ),
+    ).toMatchObject({
+      items: [{ state: "needs_language_confirmation" }],
+    });
+
+    const confirmedProject = await catalog.createProject(actor, {
+      name: "Confirmed language project",
+    });
+    const seeded = await catalog.createTranscriptionBatch(actor, {
+      projectId: confirmedProject.id,
+      name: "Seed language decision",
+      options: {
+        targetLanguage: "en",
+        transcriptionProfile: "default",
+        sourcePolicy: "prefer-existing",
+        executionLocation: "local",
+        priority: "normal",
+      },
+      items: [
+        {
+          inputIndex: 0,
+          input: "https://youtu.be/dQw4w9WgXcQ",
+          status: "ready",
+          processingNeed: "transcription",
+          youtubeVideoId: "dQw4w9WgXcQ",
+          canonicalUrl: "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+          title: "Decision fixture",
+        },
+      ],
+    });
+    const videoId = seeded.items[0]!.catalogVideoId!;
+    await catalog.confirmProjectVideoLanguageDecision(
+      actor,
+      confirmedProject.id,
+      videoId,
+      {
+        idempotencyKey: "confirm-dz-v1",
+        expectedDecisionVersion: 0,
+        resolvedLanguage: "dz",
+        basis: "user_confirmation",
+      },
+    );
+    const staleCreator = await catalog.createTranscriptionBatch(actor, {
+      projectId: confirmedProject.id,
+      name: "Stale creator metadata",
+      options: {
+        targetLanguage: "en",
+        transcriptionProfile: "default",
+        sourcePolicy: "prefer-existing",
+        executionLocation: "local",
+        priority: "normal",
+      },
+      items: [
+        {
+          inputIndex: 0,
+          input: "https://youtu.be/dQw4w9WgXcQ",
+          status: "ready",
+          processingNeed: "transcription",
+          youtubeVideoId: "dQw4w9WgXcQ",
+          canonicalUrl: "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+          title: "Stale Korean creator metadata",
+          sourceLanguage: "ko",
+        },
+      ],
+    });
+    await catalog.markTranscriptionJobQueueDelivered(
+      staleCreator.items[0]!.jobId!,
+      "local",
+    );
+    const confirmedJob = (await catalog.claimTranscriptionJob(
+      actor,
+      "local",
+      120,
+      true,
+    ))!;
+    await catalog.confirmProjectVideoLanguageDecision(
+      actor,
+      confirmedProject.id,
+      videoId,
+      {
+        idempotencyKey: "confirm-ko-v2",
+        expectedDecisionVersion: 1,
+        resolvedLanguage: "ko",
+        basis: "user_confirmation",
+      },
+    );
+    const confirmedEvidence = await catalog.observeWorkerLanguageEvidence(
+      actor,
+      confirmedJob.job.id,
+      {
+        attempt: confirmedJob.lease.attempt,
+        evidence: {
+          id: randomUUID(),
+          projectId: confirmedProject.id,
+          videoId,
+          source: "caption",
+          provider: "fixture",
+          reportedLanguage: "dz",
+          captionKind: "automatic",
+          jobId: confirmedJob.job.id,
+          attempt: confirmedJob.lease.attempt,
+          createdAt: "2024-01-01T00:00:00.000Z",
+        },
+      },
+    );
+    expect(staleCreator.items[0]?.jobId).toBe(confirmedJob.job.id);
+    expect(confirmedEvidence.gate).toMatchObject({
+      state: "ready",
+      status: "confirmed",
+      remediationReason: "none",
+    });
+    expect(
+      await catalog.getProjectVideoLanguageGate(
+        actor,
+        confirmedProject.id,
+        videoId,
+      ),
+    ).toMatchObject({
+      state: "ready",
+      status: "confirmed",
+      decision: { decisionVersion: 2, resolvedLanguage: "ko" },
+    });
+    expect(
+      (
+        await catalog.getProjectVideoLanguageGate(
+          actor,
+          confirmedProject.id,
+          videoId,
+        )
+      ).providerEvidence,
+    ).toBeUndefined();
+    const unknownCapability = await catalog.observeWorkerLanguageEvidence(
+      actor,
+      confirmedJob.job.id,
+      {
+        attempt: confirmedJob.lease.attempt,
+        evidence: {
+          id: randomUUID(),
+          projectId: confirmedProject.id,
+          videoId,
+          source: "speech_detection",
+          provider: "fixture",
+          reportedLanguage: "dz",
+          jobId: confirmedJob.job.id,
+          attempt: confirmedJob.lease.attempt,
+          createdAt: "2024-01-01T00:00:01.000Z",
+        },
+        speechCapability: {
+          state: "unknown",
+          provider: "fixture",
+          operation: "speech_to_text",
+          sourceLanguage: "dz",
+          reason: "configuration_unknown",
+        },
+      },
+    );
+    expect(unknownCapability.gate).toMatchObject({
+      state: "needs_transcript",
+      remediationReason: "select_supported_provider",
+    });
+    await expect(
+      database.query("SELECT state FROM jobs WHERE id = $1", [
+        confirmedJob.job.id,
+      ]),
+    ).resolves.toMatchObject({ rows: [{ state: "needs_user_action" }] });
+    await expect(
+      catalog.heartbeatTranscriptionJob(
+        actor,
+        confirmedJob.job.id,
+        confirmedJob.lease.attempt,
+        120,
+        "transcribing",
+      ),
+    ).rejects.toMatchObject({ statusCode: 403 });
+  });
+});
 
 describe("claimed transcript finalization", () => {
   it("atomically activates the version, completes the claimed job, and readies linked items", async () => {
@@ -77,6 +6782,7 @@ describe("claimed transcript finalization", () => {
           youtubeVideoId: "M7lc1UVf-VE",
           canonicalUrl: "https://www.youtube.com/watch?v=M7lc1UVf-VE",
           title: "Fixture video",
+          sourceLanguage: "en",
         },
       ],
     });
@@ -113,6 +6819,9 @@ describe("claimed transcript finalization", () => {
       true,
     );
     expect(claimed?.job.id).toBe(item.jobId);
+    const claimedPayload = TranscriptionJobPayloadSchema.parse(
+      claimed!.job.payload,
+    );
 
     const lineageId = randomUUID();
     const [grant, replayedGrant] = await Promise.all([
@@ -180,6 +6889,9 @@ describe("claimed transcript finalization", () => {
       jobId: claimed!.job.id,
       createdBy: actor.userId,
       createdAt: new Date().toISOString(),
+      ...(claimedPayload.languageDecision
+        ? { languageDecision: claimedPayload.languageDecision }
+        : {}),
       artifacts: storedArtifacts,
     };
     const manifestBytes = new TextEncoder().encode(JSON.stringify(manifest));
@@ -249,6 +6961,23 @@ describe("claimed cloud translation source", () => {
     const project = await catalog.createProject(actor, {
       name: "Translation project",
     });
+    const projectVideo = await catalog.addVideo(actor, project.id, {
+      youtubeVideoId: "Romanian001",
+      canonicalUrl: "https://www.youtube.com/watch?v=Romanian001",
+      title: "Romanian fixture",
+      sourceLanguage: "ro",
+    });
+    await catalog.confirmProjectVideoLanguageDecision(
+      actor,
+      project.id,
+      projectVideo.id,
+      {
+        idempotencyKey: "confirm-ro-v1",
+        expectedDecisionVersion: 0,
+        resolvedLanguage: "ro",
+        basis: "user_confirmation",
+      },
+    );
     const consent = {
       provider: "amazon-translate" as const,
       disclosureVersion: 1 as const,
@@ -274,11 +7003,15 @@ describe("claimed cloud translation source", () => {
           youtubeVideoId: "Romanian001",
           canonicalUrl: "https://www.youtube.com/watch?v=Romanian001",
           title: "Romanian fixture",
+          sourceLanguage: "ro",
         },
       ],
     });
     expect(created.batch.translationConsent).toEqual(consent);
     const claimed = (await catalog.claimTranscriptionJob(actor, "local", 120))!;
+    const claimedPayload = TranscriptionJobPayloadSchema.parse(
+      claimed.job.payload,
+    );
     expect(claimed.job.payload).toMatchObject({ translationConsent: consent });
     const grant = await catalog.createClaimedTranscriptUpload(
       actor,
@@ -443,6 +7176,9 @@ describe("claimed cloud translation source", () => {
       jobId: claimed.job.id,
       createdBy: actor.userId,
       createdAt: new Date().toISOString(),
+      ...(claimedPayload.languageDecision
+        ? { languageDecision: claimedPayload.languageDecision }
+        : {}),
       artifacts: [
         descriptor,
         originalSrtArtifact,
@@ -477,6 +7213,20 @@ describe("claimed cloud translation source", () => {
           : artifact,
       ),
     } satisfies TranscriptManifest;
+    await expect(
+      catalog.finalizeTranscript(
+        actor,
+        {
+          uploadId: grant.uploadId,
+          idempotencyKey: `finalize:${manifestBase.id}`,
+          manifest: await putManifest({
+            ...manifestBase,
+            sourceLanguage: "ko",
+          }),
+        },
+        { jobId: claimed.job.id, attempt: claimed.lease.attempt },
+      ),
+    ).rejects.toThrow("confirmed job decision");
     await expect(
       catalog.finalizeTranscript(
         actor,
@@ -1103,7 +7853,12 @@ describe("logged export delivery", () => {
       owner,
       "single",
     );
-    await catalog.addMember(owner, projectId, collaborator.userId, "editor");
+    await catalog.addMember(
+      owner,
+      projectId,
+      collaborator.userId,
+      "researcher",
+    );
     const advertisement = currentExportWorkerAdvertisement({
       ffmpegVersion: "8.1.2",
       encoders: ["libx264", "mov_text"],
@@ -1252,7 +8007,7 @@ describe("logged export delivery", () => {
       owner,
       "redelivery",
     );
-    await catalog.addMember(owner, projectId, other.userId, "editor");
+    await catalog.addMember(owner, projectId, other.userId, "researcher");
     const advertisement = currentExportWorkerAdvertisement({
       encoders: ["libx264", "mov_text"],
       muxers: ["mp4"],
@@ -1306,7 +8061,7 @@ describe("logged export delivery", () => {
         workerEpoch: second.workerEpoch,
       }),
     ).toEqual({});
-    await catalog.addMember(owner, projectId, other.userId, "editor");
+    await catalog.addMember(owner, projectId, other.userId, "researcher");
     expect(
       (
         await catalog.acceptLoggedExportDelivery(other, {
@@ -2205,6 +8960,23 @@ describe("logged export delivery", () => {
         ).rows[0]!.version,
       ),
     ).toBe(failedVersion);
+    const notificationFeed = await fixture.catalog.listNotificationFeed(
+      fixture.owner,
+      { limit: 25 },
+    );
+    expect(notificationFeed.events).toEqual([
+      expect.objectContaining({
+        kind: "logged_export_terminal",
+        status: "action_needed",
+        navigation: {
+          kind: "logged_export",
+          projectId: fixture.accepted.request.projectId,
+          clipId: fixture.accepted.request.clipId,
+          requestId: fixture.accepted.request.id,
+        },
+      }),
+    ]);
+    expect(JSON.stringify(notificationFeed)).not.toMatch(forbidden);
     await expect(
       fixture.catalog.reconcileLoggedExportSuccess(
         fixture.owner,
@@ -2318,7 +9090,7 @@ describe("logged export delivery", () => {
     await fixture.catalog.registerUser(other, "Failure other");
     await fixture.database.query(
       `INSERT INTO project_members (project_id, user_id, role, created_at)
-       VALUES ($1, $2, 'editor', $3)`,
+       VALUES ($1, $2, 'researcher', $3)`,
       [
         fixture.accepted.request.projectId,
         other.userId,
@@ -2456,7 +9228,7 @@ describe("logged export delivery", () => {
         ...fixture.result,
         subtitleSidecars: fixture.result.subtitleSidecars!.map(
           (sidecar, index) =>
-            index === englishIndex
+            index === englishIndex && !("emptyReason" in sidecar)
               ? { ...sidecar, trackId: randomUUID() }
               : sidecar,
         ),
@@ -2465,7 +9237,7 @@ describe("logged export delivery", () => {
         ...fixture.result,
         subtitleSidecars: fixture.result.subtitleSidecars!.map(
           (sidecar, index) =>
-            index === englishIndex
+            index === englishIndex && !("emptyReason" in sidecar)
               ? { ...sidecar, trackVersion: sidecar.trackVersion + 1 }
               : sidecar,
         ),
@@ -2474,7 +9246,9 @@ describe("logged export delivery", () => {
         ...fixture.result,
         subtitleSidecars: fixture.result.subtitleSidecars!.map(
           (sidecar, index) =>
-            index === englishIndex ? { ...sidecar, language: "fr" } : sidecar,
+            index === englishIndex && !("emptyReason" in sidecar)
+              ? { ...sidecar, language: "fr" }
+              : sidecar,
         ),
       },
     ];
@@ -2548,7 +9322,7 @@ describe("logged export delivery", () => {
     await fixture.catalog.registerUser(nonOwner, "Result non-owner");
     await fixture.database.query(
       `INSERT INTO project_members (project_id, user_id, role, created_at)
-       VALUES ($1, $2, 'editor', $3)`,
+       VALUES ($1, $2, 'researcher', $3)`,
       [
         fixture.accepted.request.projectId,
         nonOwner.userId,
@@ -3708,6 +10482,198 @@ describe("logged export batches", () => {
     ).toMatchObject({ id: retried.request.id, state: "queued" });
     expect(afterRetry.summary).toMatchObject({ queued: 2, status: "active" });
   });
+
+  it("batches and retries attested no-speech requests without changing selection evidence", async () => {
+    const database = new PGlite();
+    databases.add(database);
+    await runCloudMigrations(database);
+    const catalog = new SharedProjectCatalog(
+      database,
+      new MemoryTranscriptObjectStore(),
+      () => new Date("2026-08-24T12:00:00.000Z"),
+    );
+    const owner = fixtureActor("batch-no-speech-owner");
+    const user = await catalog.registerUser(
+      owner,
+      "Batch No Speech Owner",
+      "batch_no_speech_owner",
+    );
+    const project = await catalog.createProject(owner, {
+      name: "No-speech batch project",
+    });
+    const noSpeechAttestation = {
+      schemaVersion: 1 as const,
+      actor: {
+        id: user.id,
+        handle: user.handle,
+        displayName: user.displayName,
+      },
+      attestedAt: "2026-08-24T12:00:00.000Z",
+    };
+    const clips = await Promise.all(
+      [0, 1].map((index) =>
+        catalog.createClipCandidate(owner, project.id, {
+          idempotencyKey: `batch-no-speech-clip-${index}`,
+          video: {
+            youtubeVideoId: `BatchNoSpeech${index}`,
+            canonicalUrl: `https://www.youtube.com/watch?v=BatchNoSpeech${index}`,
+            title: `Batch no-speech ${index}`,
+            sourceLanguage: "en",
+          },
+          selection: {
+            selectionType: "player_time_range",
+            sourceStartMs: 1_000 + index * 2_000,
+            sourceEndMs: 2_000 + index * 2_000,
+            exportStartMs: 500 + index * 2_000,
+            exportEndMs: 2_500 + index * 2_000,
+            origin: "manual_player",
+            speechStatus: "no_speech",
+            noSpeechAttestation,
+          },
+          notes: `Silent batch range ${index}.`,
+          tags: [],
+        }),
+      ),
+    );
+    const settingsSelection = {
+      base: "application_default" as const,
+      overrides: {},
+    };
+    const preview = await catalog.previewProjectExportSettings(
+      owner,
+      project.id,
+      {
+        sourceLanguageClass: "confirmed_english",
+        selection: settingsSelection,
+      },
+    );
+    const items = clips.map((clip, index) => ({
+      clipId: clip.id,
+      export: {
+        idempotencyKey: `batch-no-speech-export-${index}`,
+        sourceLanguageClass: "confirmed_english" as const,
+        noSpeechAttestation,
+        settingsSelection,
+        expectedResolutionFingerprint: preview.snapshot.resolutionFingerprint!,
+        sourceRights: sourceRightsForVideo(clip.video.youtubeVideoId),
+      },
+    }));
+    await expect(
+      catalog.createLoggedExportBatch(owner, project.id, {
+        idempotencyKey: "invalid-no-speech-batch",
+        items: [
+          {
+            ...items[0]!,
+            export: {
+              ...items[0]!.export,
+              noSpeechAttestation: undefined,
+            },
+          },
+          items[1]!,
+        ],
+      }),
+    ).rejects.toMatchObject({ code: "invalid_language_evidence" });
+    expect(
+      (
+        await database.query<{ count: string }>(
+          "SELECT count(*)::text AS count FROM logged_export_batches",
+        )
+      ).rows[0]!.count,
+    ).toBe("0");
+    expect(await countOrphanExportJobs(database, project.id)).toBe(0);
+
+    const batch = await catalog.createLoggedExportBatch(owner, project.id, {
+      idempotencyKey: "valid-no-speech-batch",
+      items,
+    });
+    expect(batch.summary).toMatchObject({ total: 2, queued: 2 });
+    const persisted = await database.query<{
+      selection_snapshot: unknown;
+      payload_attestation: unknown;
+    }>(
+      `SELECT request.selection_snapshot,
+              job.payload->'noSpeechAttestation' AS payload_attestation
+       FROM export_requests request
+       JOIN jobs job ON job.id = request.job_id
+       ORDER BY request.created_at, request.id`,
+    );
+    expect(persisted.rows).toHaveLength(2);
+    const persistedAttestations = persisted.rows.map((row) => {
+      const selection =
+        typeof row.selection_snapshot === "string"
+          ? (JSON.parse(row.selection_snapshot) as {
+              noSpeechAttestation?: unknown;
+            })
+          : (row.selection_snapshot as {
+              noSpeechAttestation?: unknown;
+            });
+      const payloadAttestation =
+        typeof row.payload_attestation === "string"
+          ? JSON.parse(row.payload_attestation)
+          : row.payload_attestation;
+      return {
+        selectionAttestation: selection.noSpeechAttestation,
+        payloadAttestation,
+      };
+    });
+    expect(persistedAttestations).toEqual(
+      Array.from({ length: 2 }, () => ({
+        selectionAttestation: noSpeechAttestation,
+        payloadAttestation: noSpeechAttestation,
+      })),
+    );
+
+    const advertisement = currentExportWorkerAdvertisement({
+      ffmpegVersion: "8.1.2",
+      encoders: ["libx264", "mov_text"],
+      muxers: ["mp4"],
+      filters: ["scale", "fps"],
+    });
+    const worker = { workerId: randomUUID(), epoch: 1, ...advertisement };
+    await catalog.registerExportWorker(owner, worker);
+    const reserved = (
+      await catalog.claimLoggedExportDelivery(owner, {
+        workerId: worker.workerId,
+        workerEpoch: worker.epoch,
+      })
+    ).delivery!;
+    const accepted = await catalog.acceptLoggedExportDelivery(owner, {
+      workerId: worker.workerId,
+      workerEpoch: worker.epoch,
+      deliveryId: reserved.deliveryId,
+      generation: reserved.generation,
+      reservationToken: reserved.reservationToken,
+    });
+    expect(accepted.request).toMatchObject({
+      selection: clips.find((clip) => clip.id === accepted.request.clipId)!
+        .selection,
+      noSpeechAttestation,
+    });
+    await catalog.reconcileLoggedExportFailure(owner, {
+      workerId: accepted.workerId,
+      workerEpoch: accepted.workerEpoch,
+      deliveryId: accepted.deliveryId,
+      generation: accepted.generation,
+      reservationToken: accepted.reservationToken,
+      result: loggedExportFailureFixture(accepted.request),
+    });
+    const retried = await catalog.retryLoggedExport(
+      owner,
+      project.id,
+      accepted.request.id,
+      { idempotencyKey: "retry-no-speech-batch-item" },
+    );
+    expect(retried.request).toMatchObject({
+      retryOfRequestId: accepted.request.id,
+      retryOrdinal: 1,
+      selection: accepted.request.selection,
+      noSpeechAttestation,
+      sourceRights: accepted.request.sourceRights,
+    });
+    expect(retrySnapshot(retried.request)).toEqual(
+      retrySnapshot(accepted.request),
+    );
+  });
 });
 
 function fixtureActor(name: string): AuthenticatedActor {
@@ -3768,6 +10734,59 @@ async function createBatchClips(
       });
     }),
   );
+}
+
+function clipCandidateFixtureInput(
+  idempotencyKey: string,
+  firstComment?: { body: string; sourceTimeMs?: number },
+) {
+  const trackId = randomUUID();
+  return {
+    idempotencyKey,
+    video: {
+      youtubeVideoId: `clip-${idempotencyKey}`.slice(0, 64),
+      canonicalUrl: `https://www.youtube.com/watch?v=${encodeURIComponent(
+        `clip-${idempotencyKey}`,
+      )}`,
+      title: `Clip ${idempotencyKey}`,
+    },
+    selection: {
+      trackId,
+      transcriptVersion: 1,
+      firstSegmentId: randomUUID(),
+      lastSegmentId: randomUUID(),
+      firstTokenId: randomUUID(),
+      lastTokenId: randomUUID(),
+      transcriptStartMs: 1_000,
+      transcriptEndMs: 3_000,
+      exportStartMs: 500,
+      exportEndMs: 3_500,
+      text: `Selection ${idempotencyKey}`,
+      timingPrecision: "word" as const,
+    },
+    languageEvidence: {
+      schemaVersion: 2 as const,
+      native: {
+        role: "native" as const,
+        language: "en",
+        text: `Selection ${idempotencyKey}`,
+        trackId,
+        trackVersion: 1,
+        timingPrecision: "word" as const,
+      },
+      english: {
+        role: "english" as const,
+        language: "en",
+        text: `Selection ${idempotencyKey}`,
+        trackId,
+        trackVersion: 1,
+        timingPrecision: "word" as const,
+      },
+    },
+    notes: "Immutable clip description",
+    tags: ["Context"],
+    ...(firstComment ? { firstComment } : {}),
+  };
 }
 
 async function createBatchCommand(
@@ -4038,6 +11057,13 @@ function loggedExportSuccessFixture(
   request: ExportRequest,
   validatedAt: string,
 ): LoggedExportSuccessResult {
+  const transcriptSelection =
+    request.selection.selectionType === "player_time_range"
+      ? request.selection.transcriptAttachment
+      : request.selection;
+  if (!transcriptSelection) {
+    throw new Error("This success fixture requires transcript evidence.");
+  }
   const packageIdentity = `clip-${request.id}`;
   const sourceAttempt = 1;
   const artifact = (
@@ -4130,15 +11156,15 @@ function loggedExportSuccessFixture(
           englishSubtitleProvenance: {
             trackId:
               request.subtitleTracks?.english.trackId ??
-              request.selection.trackId,
+              transcriptSelection.trackId,
             trackVersion:
               request.subtitleTracks?.english.trackVersion ??
-              request.selection.transcriptVersion,
+              transcriptSelection.transcriptVersion,
             cueCount: 1,
             byteSize: 64,
             contentSha256: "e".repeat(64),
             startMs: 0,
-            endMs: request.selection.transcriptEndMs,
+            endMs: transcriptSelection.transcriptEndMs,
             sourceAttempt,
             validatedAt,
           },
@@ -4161,7 +11187,7 @@ function loggedExportSuccessFixture(
               byteSize: 64,
               contentSha256: "e".repeat(64),
               startMs: 0,
-              endMs: request.selection.transcriptEndMs,
+              endMs: transcriptSelection.transcriptEndMs,
               sourceAttempt,
               validatedAt,
             },
@@ -4174,7 +11200,7 @@ function loggedExportSuccessFixture(
               byteSize: 64,
               contentSha256: "d".repeat(64),
               startMs: 0,
-              endMs: request.selection.transcriptEndMs,
+              endMs: transcriptSelection.transcriptEndMs,
               sourceAttempt,
               validatedAt,
             },
@@ -4191,9 +11217,141 @@ function loggedExportSuccessFixture(
   };
 }
 
+function loggedNoSpeechExportSuccessFixture(
+  request: ExportRequest,
+  validatedAt: string,
+): LoggedExportSuccessResult {
+  if (!request.noSpeechAttestation) {
+    throw new Error("This success fixture requires no-speech attestation.");
+  }
+  const packageIdentity = `clip-${request.id}`;
+  const sourceAttempt = 1;
+  const artifact = (
+    role:
+      | "clip_metadata_json"
+      | "english_srt"
+      | "manifest_json"
+      | "original_srt"
+      | "thumbnail_jpg"
+      | "video_mp4",
+    digit: string,
+  ) => ({
+    role,
+    packageIdentity,
+    byteSize: 128,
+    contentSha256: digit.repeat(64),
+    sourceAttempt,
+    validatedAt,
+  });
+  const sidecar = (role: "english" | "original") => ({
+    role,
+    language:
+      role === "english"
+        ? "en"
+        : request.video.sourceLanguage && request.video.sourceLanguage !== "en"
+          ? request.video.sourceLanguage
+          : "und",
+    emptyReason: "attested_no_speech" as const,
+    noSpeechAttestation: request.noSpeechAttestation!,
+    cueCount: 0 as const,
+    byteSize: 1,
+    contentSha256: digest(new TextEncoder().encode("\n")),
+    startMs: 0 as const,
+    endMs: 0 as const,
+    sourceAttempt,
+    validatedAt,
+  });
+  const includesOriginal = request.sourceLanguageClass !== "confirmed_english";
+  return {
+    schemaVersion: 1,
+    requestId: request.id,
+    jobId: request.jobId,
+    projectId: request.projectId!,
+    clipId: request.clipId!,
+    sourceLanguageClass: request.sourceLanguageClass,
+    noSpeechAttestation: request.noSpeechAttestation,
+    resolvedExportBounds: {
+      startMs: request.selection.exportStartMs,
+      endMs: request.selection.exportEndMs,
+      sourceAttempt,
+      resolvedAt: validatedAt,
+    },
+    renderedMediaProvenance: {
+      durationMs:
+        request.selection.exportEndMs - request.selection.exportStartMs,
+      containerFormat: "mp4",
+      videoCodec: "h264",
+      audioCodec: "aac",
+      ffprobeVersion: "8.1.2",
+      ffmpegVersion: "8.1.2",
+      verificationSchemaVersion: 1,
+      settingsSha256: sha256Fingerprint(
+        request.resolvedSettingsSnapshot!.settings,
+      ),
+      observedProperties: {
+        schemaVersion: 1,
+        container: { formatNames: ["mp4"] },
+        streamCounts: {
+          total: 2,
+          video: 1,
+          audio: 1,
+          subtitle: 0,
+          data: 0,
+          other: 0,
+        },
+        video: {
+          codec: "h264",
+          profile: "High",
+          pixelFormat: "yuv420p",
+          width: 1_920,
+          height: 1_080,
+          sampleAspectRatio: { numerator: 1, denominator: 1 },
+          displayAspectRatio: { numerator: 16, denominator: 9 },
+          averageFrameRate: { numerator: 30, denominator: 1 },
+        },
+        audio: {
+          codec: "aac",
+          sampleRate: 48_000,
+          channels: 2,
+          channelLayout: "stereo",
+        },
+        durationMs:
+          request.selection.exportEndMs - request.selection.exportStartMs,
+        ffprobeVersion: "8.1.2",
+      },
+      sourceAttempt,
+      validatedAt,
+    },
+    thumbnailProvenance: {
+      extractionTimeMs: Math.floor(
+        (request.selection.exportEndMs - request.selection.exportStartMs) / 2,
+      ),
+      width: 640,
+      height: 360,
+      sourceAttempt,
+      validatedAt,
+    },
+    subtitleSidecars: [
+      sidecar("english"),
+      ...(includesOriginal ? [sidecar("original")] : []),
+    ],
+    artifacts: [
+      artifact("clip_metadata_json", "1"),
+      artifact("english_srt", "2"),
+      artifact("manifest_json", "3"),
+      ...(includesOriginal ? [artifact("original_srt", "4")] : []),
+      artifact("thumbnail_jpg", "5"),
+      artifact("video_mp4", "6"),
+    ],
+  };
+}
+
 function compatibilityRequirementsForVersion(
   summary: ArtifactVersionSummary,
 ): ArtifactCompatibilityRequirements {
+  if (summary.selection.selectionType === "player_time_range") {
+    throw new Error("This compatibility fixture requires transcript evidence.");
+  }
   const { text: _text, ...selection } = summary.selection;
   return {
     clipId: summary.clipId,

@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+
 import {
   ChangeMessageVisibilityCommand,
   DeleteMessageCommand,
@@ -28,7 +30,7 @@ describe("pumpJobQueueOnce", () => {
       listUndispatchedTranscriptionJobs: vi.fn(async () => [
         { jobId: delivery.jobId, executionLocation: "local" as const },
       ]),
-      markTranscriptionJobDispatched: vi.fn(async () => undefined),
+      markTranscriptionJobDispatched: vi.fn(async () => true),
       markTranscriptionJobQueueDelivered: vi.fn(async () => true),
     };
 
@@ -44,6 +46,28 @@ describe("pumpJobQueueOnce", () => {
       "local",
     );
     expect(queue.delete).toHaveBeenCalledWith("receipt-1");
+  });
+
+  it("does not publish a project-local job when pause wins the dispatch reservation race", async () => {
+    const jobId = randomUUID();
+    const queue: JobQueue = {
+      publish: vi.fn(),
+      receive: vi.fn(async () => undefined),
+      changeVisibility: vi.fn(),
+      delete: vi.fn(),
+    };
+    const catalog = {
+      listUndispatchedTranscriptionJobs: vi.fn(async () => [
+        { jobId, executionLocation: "local" as const },
+      ]),
+      markTranscriptionJobDispatched: vi.fn(async () => false),
+      markTranscriptionJobQueueDelivered: vi.fn(async () => false),
+    };
+
+    await pumpJobQueueOnce(queue, catalog);
+
+    expect(catalog.markTranscriptionJobDispatched).toHaveBeenCalledWith(jobId);
+    expect(queue.publish).not.toHaveBeenCalled();
   });
 });
 

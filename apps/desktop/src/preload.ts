@@ -3,7 +3,13 @@ import { contextBridge, ipcRenderer } from "electron";
 import {
   DesktopApiRequestSchema,
   DesktopApiResponseSchema,
+  DesktopTimedTranscriptUploadRequestSchema,
+  DesktopTimedTranscriptUploadResponseSchema,
   DesktopAuthStatusSchema,
+  DesktopNotificationNavigationTargetSchema,
+  DesktopNotificationPreferencesSchema,
+  DesktopNotificationSupportStatusSchema,
+  UpdateDesktopNotificationPreferencesSchema,
   DesktopStatusSchema,
   ModelDownloadProgressSchema,
   ReadinessReportSchema,
@@ -76,4 +82,36 @@ contextBridge.exposeInMainWorld("researchVideoDesktop", {
         DesktopApiRequestSchema.parse(input),
       ),
     ),
+  uploadTimedTranscript: async (input: unknown) =>
+    DesktopTimedTranscriptUploadResponseSchema.parse(
+      await ipcRenderer.invoke(
+        desktopIpcChannels.timedTranscriptUpload,
+        DesktopTimedTranscriptUploadRequestSchema.parse(input),
+      ),
+    ),
+  getNotificationPreferences: async () =>
+    DesktopNotificationPreferencesSchema.parse(
+      await ipcRenderer.invoke(desktopIpcChannels.getNotificationPreferences),
+    ),
+  updateNotificationPreferences: async (input: unknown) =>
+    DesktopNotificationPreferencesSchema.parse(
+      await ipcRenderer.invoke(
+        desktopIpcChannels.updateNotificationPreferences,
+        UpdateDesktopNotificationPreferencesSchema.parse(input),
+      ),
+    ),
+  getNotificationSupport: async () =>
+    DesktopNotificationSupportStatusSchema.parse(
+      await ipcRenderer.invoke(desktopIpcChannels.getNotificationSupport),
+    ),
+  onNotificationNavigation: (listener: (target: unknown) => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, target: unknown) =>
+      listener(DesktopNotificationNavigationTargetSchema.parse(target));
+    ipcRenderer.on(desktopIpcChannels.notificationNavigation, handler);
+    return () =>
+      ipcRenderer.removeListener(
+        desktopIpcChannels.notificationNavigation,
+        handler,
+      );
+  },
 });

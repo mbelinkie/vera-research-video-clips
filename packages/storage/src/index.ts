@@ -13,8 +13,23 @@ export type PutObjectInput = Omit<StoredObject, "bytes" | "versionId"> & {
 export interface TranscriptObjectStore {
   put(input: PutObjectInput): Promise<StoredObject>;
   get(key: string, versionId?: string): Promise<StoredObject | undefined>;
+  getBounded(
+    key: string,
+    versionId: string,
+    maxBytes: number,
+  ): Promise<StoredObject | undefined>;
+  deleteVersion(key: string, versionId: string): Promise<boolean>;
   delete(key: string): Promise<boolean>;
   list(prefix: string): Promise<string[]>;
+}
+
+export class ObjectStoreSizeLimitError extends Error {
+  readonly code = "object_too_large";
+
+  constructor() {
+    super("The staged object exceeds its allowed size.");
+    this.name = "ObjectStoreSizeLimitError";
+  }
 }
 
 export interface StagedUploadUrlIssuer {
@@ -72,8 +87,33 @@ export class MemoryTranscriptObjectStore implements TranscriptObjectStore {
     return value ? { ...value, bytes: value.bytes.slice() } : undefined;
   }
 
+  async getBounded(
+    key: string,
+    versionId: string,
+    maxBytes: number,
+  ): Promise<StoredObject | undefined> {
+    assertPositiveByteLimit(maxBytes);
+    const value = await this.get(key, versionId);
+    if (value && value.bytes.byteLength > maxBytes) {
+      throw new ObjectStoreSizeLimitError();
+    }
+    return value;
+  }
+
   async delete(key: string): Promise<boolean> {
     return this.#objects.delete(key);
+  }
+
+  async deleteVersion(key: string, versionId: string): Promise<boolean> {
+    const versions = this.#objects.get(key);
+    if (!versions) return false;
+    const index = versions.findIndex(
+      (candidate) => candidate.versionId === versionId,
+    );
+    if (index < 0) return false;
+    versions.splice(index, 1);
+    if (versions.length === 0) this.#objects.delete(key);
+    return true;
   }
 
   async list(prefix: string): Promise<string[]> {
@@ -116,6 +156,23 @@ export class S3TranscriptObjectStore implements TranscriptObjectStore {
     key: string,
     versionId?: string,
   ): Promise<StoredObject | undefined> {
+    return this.load(key, versionId);
+  }
+
+  async getBounded(
+    key: string,
+    versionId: string,
+    maxBytes: number,
+  ): Promise<StoredObject | undefined> {
+    assertPositiveByteLimit(maxBytes);
+    return this.load(key, versionId, maxBytes);
+  }
+
+  private async load(
+    key: string,
+    versionId?: string,
+    maxBytes?: number,
+  ): Promise<StoredObject | undefined> {
     try {
       const response = await this.client.send(
         new GetObjectCommand({
@@ -125,7 +182,17 @@ export class S3TranscriptObjectStore implements TranscriptObjectStore {
         }),
       );
       if (!response.Body) return undefined;
-      const bytes = await response.Body.transformToByteArray();
+      if (
+        maxBytes !== undefined &&
+        response.ContentLength !== undefined &&
+        response.ContentLength > maxBytes
+      ) {
+        throw new ObjectStoreSizeLimitError();
+      }
+      const bytes =
+        maxBytes === undefined
+          ? await response.Body.transformToByteArray()
+          : await readS3BodyBounded(response.Body, maxBytes);
       return {
         key,
         versionId: response.VersionId ?? versionId ?? "unversioned",
@@ -146,6 +213,17 @@ export class S3TranscriptObjectStore implements TranscriptObjectStore {
   async delete(key: string): Promise<boolean> {
     await this.client.send(
       new DeleteObjectCommand({ Bucket: this.bucket, Key: key }),
+    );
+    return true;
+  }
+
+  async deleteVersion(key: string, versionId: string): Promise<boolean> {
+    await this.client.send(
+      new DeleteObjectCommand({
+        Bucket: this.bucket,
+        Key: key,
+        VersionId: versionId,
+      }),
     );
     return true;
   }
@@ -172,6 +250,45 @@ export class S3TranscriptObjectStore implements TranscriptObjectStore {
     } while (continuationToken);
     return keys.sort();
   }
+}
+
+function assertPositiveByteLimit(maxBytes: number) {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0) {
+    throw new TypeError("Object byte limit must be a positive safe integer.");
+  }
+}
+
+async function readS3BodyBounded(
+  body: { transformToByteArray(): Promise<Uint8Array> } & {
+    [Symbol.asyncIterator]?: () => AsyncIterator<unknown>;
+  },
+  maxBytes: number,
+): Promise<Uint8Array> {
+  if (!body[Symbol.asyncIterator]) {
+    const bytes = await body.transformToByteArray();
+    if (bytes.byteLength > maxBytes) throw new ObjectStoreSizeLimitError();
+    return bytes;
+  }
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for await (const rawChunk of body as AsyncIterable<unknown>) {
+    const chunk =
+      rawChunk instanceof Uint8Array
+        ? rawChunk
+        : typeof rawChunk === "string"
+          ? new TextEncoder().encode(rawChunk)
+          : Uint8Array.from(rawChunk as ArrayLike<number>);
+    total += chunk.byteLength;
+    if (total > maxBytes) throw new ObjectStoreSizeLimitError();
+    chunks.push(chunk);
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return bytes;
 }
 
 export class S3StagedUploadUrlIssuer implements StagedUploadUrlIssuer {

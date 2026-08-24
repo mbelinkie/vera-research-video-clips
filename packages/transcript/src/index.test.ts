@@ -11,12 +11,15 @@ import {
   deriveClipRelativeSrtCues,
   buildClipLanguageEvidence,
   deriveTranscriptSelection,
+  derivePlayerRangeTranscriptAttachment,
   normalizeTranscriptFixture,
   normalizeGeneratedTranscript,
+  normalizeManualTimedBilingualImport,
   normalizeTranslatedTranscript,
   normalizeWebVttCaption,
   parseSrt,
   resolvePreferredTranscript,
+  scanProjectKeywords,
   searchTranscript,
   segmentAtTime,
   timedTranscriptTokens,
@@ -27,6 +30,209 @@ import {
   updateTranscriptSelectionExportBounds,
   type TranscriptSegment,
 } from "./index.ts";
+
+describe("deterministic project keyword scanning", () => {
+  const ids = {
+    project: "019fbb95-cd76-7920-93fa-e23ba755ee01",
+    projectVideo: "019fbb95-cd76-7920-93fa-e23ba755ee02",
+    transcriptVersion: "019fbb95-cd76-7920-93fa-e23ba755ee03",
+    keyword: "019fbb95-cd76-7920-93fa-e23ba755ee04",
+    englishAlias: "019fbb95-cd76-7920-93fa-e23ba755ee05",
+    spanishAlias: "019fbb95-cd76-7920-93fa-e23ba755ee06",
+    regionalAlias: "019fbb95-cd76-7920-93fa-e23ba755ee07",
+    englishTrack: "019fbb95-cd76-7920-93fa-e23ba755ee08",
+    spanishTrack: "019fbb95-cd76-7920-93fa-e23ba755ee09",
+    englishSegment: "019fbb95-cd76-7920-93fa-e23ba755ee10",
+    spanishSegment: "019fbb95-cd76-7920-93fa-e23ba755ee11",
+    token1: "019fbb95-cd76-7920-93fa-e23ba755ee12",
+    token2: "019fbb95-cd76-7920-93fa-e23ba755ee13",
+  };
+
+  const baseInput = {
+    projectId: ids.project,
+    projectVideoId: ids.projectVideo,
+    transcriptVersionId: ids.transcriptVersion,
+    keywordSetVersion: 2,
+    aliases: [
+      {
+        keywordId: ids.keyword,
+        aliasId: ids.englishAlias,
+        language: "en",
+        phrase: "CLIMATE—change",
+      },
+      {
+        keywordId: ids.keyword,
+        aliasId: ids.spanishAlias,
+        language: "es",
+        phrase: "cambio climático",
+      },
+      {
+        keywordId: ids.keyword,
+        aliasId: ids.regionalAlias,
+        language: "en-US",
+        phrase: "ignored regional alias",
+      },
+    ],
+    tracks: [
+      {
+        track: {
+          id: ids.englishTrack,
+          videoId: "keyword-fixture",
+          language: "en",
+          kind: "english" as const,
+          source: "fixture" as const,
+          provider: "fixture",
+          timingPrecision: "word" as const,
+          schemaVersion: 1,
+          contentSha256: "a".repeat(64),
+          version: 1,
+        },
+        segments: [
+          {
+            id: ids.englishSegment,
+            trackId: ids.englishTrack,
+            ordinal: 0,
+            startMs: 1_000,
+            endMs: 3_000,
+            text: "Climate,   change matters; not climatic changes.",
+          },
+        ],
+        tokens: [
+          {
+            id: ids.token1,
+            segmentId: ids.englishSegment,
+            ordinal: 0,
+            text: "Climate,",
+            startMs: 1_100,
+            endMs: 1_500,
+          },
+          {
+            id: ids.token2,
+            segmentId: ids.englishSegment,
+            ordinal: 1,
+            text: "change",
+            startMs: 1_500,
+            endMs: 1_900,
+          },
+          ...["matters;", "not", "climatic", "changes."].map((text, index) => ({
+            id: `019fbb95-cd76-7920-93fa-e23ba755ee${14 + index}`,
+            segmentId: ids.englishSegment,
+            ordinal: index + 2,
+            text,
+          })),
+        ],
+      },
+      {
+        track: {
+          id: ids.spanishTrack,
+          videoId: "keyword-fixture",
+          language: "es",
+          kind: "original" as const,
+          source: "fixture" as const,
+          provider: "fixture",
+          timingPrecision: "cue" as const,
+          schemaVersion: 1,
+          contentSha256: "b".repeat(64),
+          version: 1,
+        },
+        segments: [
+          {
+            id: ids.spanishSegment,
+            trackId: ids.spanishTrack,
+            ordinal: 0,
+            startMs: 1_000,
+            endMs: 3_000,
+            text: "El cambio climático importa.",
+          },
+        ],
+        tokens: [],
+      },
+    ],
+  };
+
+  it("deduplicates linked-language overlap while preserving exact and cue evidence", async () => {
+    const result = await scanProjectKeywords(baseInput);
+    const replay = await scanProjectKeywords({
+      ...baseInput,
+      tracks: [...baseInput.tracks].reverse(),
+      aliases: [...baseInput.aliases].reverse(),
+    });
+
+    expect(replay).toEqual(result);
+    expect(result.occurrenceCount).toBe(1);
+    expect(result.matchedKeywordCount).toBe(1);
+    expect(result.artifact.occurrences[0]).toMatchObject({
+      keywordId: ids.keyword,
+      startMs: 1_000,
+      endMs: 3_000,
+      timingPrecision: "cue",
+    });
+    expect(result.artifact.occurrences[0]!.evidence).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          aliasId: ids.englishAlias,
+          startMs: 1_100,
+          endMs: 1_900,
+          timingPrecision: "word",
+        }),
+        expect.objectContaining({
+          aliasId: ids.spanishAlias,
+          startMs: 1_000,
+          endMs: 3_000,
+          timingPrecision: "cue",
+        }),
+      ]),
+    );
+    expect(result.sha256).toMatch(/^[a-f0-9]{64}$/u);
+  });
+
+  it("uses Unicode term boundaries and exact normalized language tags", async () => {
+    const result = await scanProjectKeywords({
+      ...baseInput,
+      aliases: [
+        {
+          keywordId: ids.keyword,
+          aliasId: ids.englishAlias,
+          language: "en",
+          phrase: "climatic change",
+        },
+        {
+          keywordId: ids.keyword,
+          aliasId: ids.regionalAlias,
+          language: "en-US",
+          phrase: "climate change",
+        },
+      ],
+      tracks: [baseInput.tracks[0]!],
+    });
+
+    expect(result.occurrenceCount).toBe(0);
+  });
+
+  it("preserves repeated literal occurrences inside one cue", async () => {
+    const spanish = baseInput.tracks[1]!;
+    const result = await scanProjectKeywords({
+      ...baseInput,
+      aliases: [baseInput.aliases[1]!],
+      tracks: [
+        {
+          ...spanish,
+          segments: [
+            {
+              ...spanish.segments[0]!,
+              text: "Cambio climático y cambio climático.",
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(result.occurrenceCount).toBe(2);
+    expect(
+      result.artifact.occurrences.map((entry) => entry.timingPrecision),
+    ).toEqual(["cue", "cue"]);
+  });
+});
 
 describe("transcript range selection", () => {
   it("normalizes reverse DOM selection into stable word-timed bounds", () => {
@@ -44,6 +250,7 @@ describe("transcript range selection", () => {
     });
 
     expect(selection).toMatchObject({
+      selectionType: "transcript_range",
       firstSegmentId: transcript.segments[0]!.id,
       lastSegmentId: transcript.segments[1]!.id,
       firstTokenId: transcript.tokens[1]!.id,
@@ -55,6 +262,43 @@ describe("transcript range selection", () => {
       text: "fixture has accurate word timing. Click any word",
       timingPrecision: "word",
     });
+  });
+
+  it("derives strict, clipped player-range transcript evidence without inference", () => {
+    const transcript = normalizeTranscriptFixture(fixture);
+    const attachment = derivePlayerRangeTranscriptAttachment({
+      transcript,
+      sourceStartMs: 1_000,
+      sourceEndMs: 3_000,
+      exportStartMs: 500,
+      exportEndMs: 3_500,
+    });
+
+    expect(attachment).toMatchObject({
+      selectionType: "transcript_range",
+      trackId: transcript.track.id,
+      transcriptVersion: transcript.track.version,
+      firstSegmentId: transcript.segments[0]!.id,
+      lastSegmentId: transcript.segments[1]!.id,
+      transcriptStartMs: 1_000,
+      transcriptEndMs: 3_000,
+      exportStartMs: 500,
+      exportEndMs: 3_500,
+      timingPrecision: "cue",
+    });
+  });
+
+  it("returns no player attachment when strict time overlap is absent", () => {
+    const transcript = normalizeTranscriptFixture(fixture);
+    expect(
+      derivePlayerRangeTranscriptAttachment({
+        transcript,
+        sourceStartMs: 4_000,
+        sourceEndMs: 5_000,
+        exportStartMs: 4_000,
+        exportEndMs: 5_000,
+      }),
+    ).toBeUndefined();
   });
 
   it("uses honest cue bounds when word timing is unavailable", () => {
@@ -627,5 +871,96 @@ describe("WebVTT normalization", () => {
         provider: "yt-dlp",
       }),
     ).rejects.toMatchObject({ code: "invalid_webvtt", retryable: false });
+  });
+});
+
+describe("manual timed bilingual import", () => {
+  const originalSrt = new TextEncoder().encode(
+    "1\n00:00:00,000 --> 00:00:01,000\nའབྲུག\n\n2\n00:00:01,250 --> 00:00:02,000\nསྐད་ཡིག\n",
+  );
+  const englishVtt = new TextEncoder().encode(
+    "WEBVTT\n\n00:00.000 --> 00:00.800\nBhutan\n\n00:00.900 --> 00:02.000\nLanguage\n",
+  );
+
+  it("normalizes distinct valid cue segmentation into directly linked deterministic tracks", async () => {
+    const input = {
+      importId: "019fbb95-cd76-7920-93fa-e23ba755ee61",
+      videoId: "fixture-dzongkha",
+      sourceLanguage: "dz",
+      durationMs: 2_500,
+      original: { format: "srt" as const, bytes: originalSrt },
+      english: { format: "vtt" as const, bytes: englishVtt },
+    };
+    const first = await normalizeManualTimedBilingualImport(input);
+    const second = await normalizeManualTimedBilingualImport(input);
+
+    expect(second).toEqual(first);
+    expect(first.original.track).toMatchObject({
+      language: "dz",
+      kind: "original",
+      source: "manual-import",
+      provider: "researcher-timed-import",
+      timingPrecision: "cue",
+    });
+    expect(first.english.track).toMatchObject({
+      language: "en",
+      kind: "english",
+      source: "manual-import",
+      sourceTrackId: first.original.track.id,
+    });
+    expect(first.original.segments).toHaveLength(2);
+    expect(first.english.segments).toHaveLength(2);
+    expect(first.originalSrt).toContain("00:00:01,250");
+  });
+
+  it.each([
+    [
+      "invalid UTF-8",
+      new Uint8Array([0xc3, 0x28]),
+      "manual_import_invalid_utf8",
+    ],
+    [
+      "unordered cues",
+      new TextEncoder().encode(
+        "1\n00:00:01,000 --> 00:00:01,500\nLater\n\n2\n00:00:00,000 --> 00:00:00,500\nEarlier\n",
+      ),
+      "manual_import_cue_order_invalid",
+    ],
+    [
+      "overlap",
+      new TextEncoder().encode(
+        "1\n00:00:00,000 --> 00:00:01,500\nFirst\n\n2\n00:00:01,000 --> 00:00:02,000\nSecond\n",
+      ),
+      "manual_import_cue_overlap",
+    ],
+    [
+      "duration overflow",
+      new TextEncoder().encode("1\n00:00:00,000 --> 00:00:03,000\nToo long\n"),
+      "manual_import_cue_out_of_bounds",
+    ],
+  ])("rejects %s with a closed safe code", async (_label, bytes, code) => {
+    await expect(
+      normalizeManualTimedBilingualImport({
+        importId: "019fbb95-cd76-7920-93fa-e23ba755ee61",
+        videoId: "fixture-dzongkha",
+        sourceLanguage: "dz",
+        durationMs: 2_500,
+        original: { format: "srt", bytes },
+        english: { format: "vtt", bytes: englishVtt },
+      }),
+    ).rejects.toMatchObject({ code, retryable: false });
+  });
+
+  it("rejects English and unresolved source languages", async () => {
+    await expect(
+      normalizeManualTimedBilingualImport({
+        importId: "019fbb95-cd76-7920-93fa-e23ba755ee61",
+        videoId: "fixture-english",
+        sourceLanguage: "en",
+        durationMs: 2_500,
+        original: { format: "srt", bytes: originalSrt },
+        english: { format: "vtt", bytes: englishVtt },
+      }),
+    ).rejects.toMatchObject({ code: "manual_import_invalid_language" });
   });
 });

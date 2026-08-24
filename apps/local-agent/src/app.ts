@@ -14,6 +14,14 @@ import {
   SubmitClipLibraryExportRequestSchema,
   VerifyLocalArtifactVersionRequestSchema,
   UpdateLocalClipLibrarySelectionSchema,
+  CreateClipCommentRequestSchema,
+  UpdateClipCommentRequestSchema,
+  DeleteClipCommentRequestSchema,
+  ChangeProjectBookmarkStateRequestSchema,
+  CreateProjectBookmarkRequestSchema,
+  ProjectBookmarkQuerySchema,
+  NotificationFeedQuerySchema,
+  UpdateProjectBookmarkRequestSchema,
   ClaimLoggedExportDeliveryResponseSchema,
   ExportSettingsPreviewRequestSchema,
   ProcessAcceptedLoggedExportRequestSchema,
@@ -40,6 +48,21 @@ import {
   type PrepareClipLibraryExportRequest,
   type SubmitClipLibraryExportRequest,
   type UpdateLocalClipLibrarySelection,
+  type CreateClipCommentRequest,
+  type UpdateClipCommentRequest,
+  type DeleteClipCommentRequest,
+  type ChangeProjectBookmarkStateRequest,
+  type CreateProjectBookmarkRequest,
+  type LocalProjectBookmarkPage,
+  type OfflineProjectBookmarkCommand,
+  type OfflineProjectBookmarkMutationResult,
+  type OfflineProjectBookmarkReplayResult,
+  type ProjectBookmarkQuery,
+  type NotificationFeedPage,
+  type NotificationFeedQuery,
+  type UpdateProjectBookmarkRequest,
+  type OfflineClipCommentMutationResult,
+  type OfflineClipCommentReplayResult,
   type AcceptLoggedExportDeliveryRequest,
   type ClaimLoggedExportDeliveryRequest,
   type ClaimLoggedExportDeliveryResponse,
@@ -200,6 +223,62 @@ export interface LocalAgentDependencies {
     authorization: string;
     command: UpdateLocalClipLibrarySelection;
   }): string[];
+  createClipComment?(input: {
+    projectId: string;
+    clipId: string;
+    authorization: string;
+    request: CreateClipCommentRequest;
+  }): Promise<OfflineClipCommentMutationResult>;
+  updateClipComment?(input: {
+    projectId: string;
+    clipId: string;
+    commentId: string;
+    authorization: string;
+    request: UpdateClipCommentRequest;
+  }): Promise<OfflineClipCommentMutationResult>;
+  deleteClipComment?(input: {
+    projectId: string;
+    clipId: string;
+    commentId: string;
+    authorization: string;
+    request: DeleteClipCommentRequest;
+  }): Promise<OfflineClipCommentMutationResult>;
+  replayClipComments?(input: {
+    projectId: string;
+    authorization: string;
+  }): Promise<OfflineClipCommentReplayResult>;
+  listClipCommentConflicts?(input: { projectId: string }): unknown[];
+  listProjectBookmarks?(input: {
+    projectId: string;
+    authorization: string;
+    query: ProjectBookmarkQuery;
+  }): Promise<LocalProjectBookmarkPage>;
+  createProjectBookmark?(input: {
+    projectId: string;
+    authorization: string;
+    request: CreateProjectBookmarkRequest;
+  }): Promise<OfflineProjectBookmarkMutationResult>;
+  updateProjectBookmark?(input: {
+    projectId: string;
+    bookmarkId: string;
+    authorization: string;
+    request: UpdateProjectBookmarkRequest;
+  }): Promise<OfflineProjectBookmarkMutationResult>;
+  changeProjectBookmarkState?(input: {
+    projectId: string;
+    bookmarkId: string;
+    action: "archive" | "restore";
+    authorization: string;
+    request: ChangeProjectBookmarkStateRequest;
+  }): Promise<OfflineProjectBookmarkMutationResult>;
+  replayProjectBookmarks?(input: {
+    projectId: string;
+    authorization: string;
+  }): Promise<OfflineProjectBookmarkReplayResult>;
+  listProjectBookmarkOutbox?(input: {
+    projectId: string;
+    authorization: string;
+  }): OfflineProjectBookmarkCommand[];
   prepareClipLibraryExport?(input: {
     projectId: string;
     authorization: string;
@@ -268,11 +347,16 @@ export interface LocalAgentDependencies {
   createExportOnly?(
     input: CreateExportOnlyRequest,
     snapshot?: ResolvedExportSettingsSnapshot,
+    notificationAccountScopeSha256?: string,
   ): unknown;
   findExportOnlyByIdempotencyKey?(
     idempotencyKey: string,
   ): ExportRequest | undefined;
   listExportRequests?(): ExportRequest[];
+  listLocalNotificationFeed?(
+    accountScopeSha256: string,
+    query: NotificationFeedQuery,
+  ): NotificationFeedPage;
   workerIdentity?: Pick<
     LocalExportWorkerIdentityRepository,
     "get" | "prepareRegistration"
@@ -370,6 +454,12 @@ const LocalProjectParamsSchema = z.object({ projectId: z.uuid() });
 const LocalClipParamsSchema = z.object({
   projectId: z.uuid(),
   clipId: z.uuid(),
+});
+const LocalClipCommentParamsSchema = LocalClipParamsSchema.extend({
+  commentId: z.uuid(),
+});
+const LocalProjectBookmarkParamsSchema = LocalProjectParamsSchema.extend({
+  bookmarkId: z.uuid(),
 });
 const ArtifactLocatorParamsSchema = z.object({ locatorId: z.uuid() });
 
@@ -724,6 +814,223 @@ export function createLocalAgent(
     );
   }
 
+  if (dependencies?.createClipComment) {
+    app.post(
+      "/api/projects/:projectId/clips/:clipId/comments",
+      async (request, reply) => {
+        const { projectId, clipId } = LocalClipParamsSchema.parse(
+          request.params,
+        );
+        const authorization = requireLocalAuthorization(
+          request.headers.authorization,
+          "Authentication is required to add a clip comment.",
+        );
+        const result = await dependencies.createClipComment!({
+          projectId,
+          clipId,
+          authorization,
+          request: CreateClipCommentRequestSchema.parse(request.body),
+        });
+        return reply
+          .status(result.state === "applied" ? 201 : 202)
+          .send(result);
+      },
+    );
+  }
+
+  if (dependencies?.updateClipComment) {
+    app.patch(
+      "/api/projects/:projectId/clips/:clipId/comments/:commentId",
+      async (request, reply) => {
+        const { projectId, clipId, commentId } =
+          LocalClipCommentParamsSchema.parse(request.params);
+        const authorization = requireLocalAuthorization(
+          request.headers.authorization,
+          "Authentication is required to edit a clip comment.",
+        );
+        const result = await dependencies.updateClipComment!({
+          projectId,
+          clipId,
+          commentId,
+          authorization,
+          request: UpdateClipCommentRequestSchema.parse(request.body),
+        });
+        return reply
+          .status(result.state === "applied" ? 200 : 202)
+          .send(result);
+      },
+    );
+  }
+
+  if (dependencies?.deleteClipComment) {
+    app.delete(
+      "/api/projects/:projectId/clips/:clipId/comments/:commentId",
+      async (request, reply) => {
+        const { projectId, clipId, commentId } =
+          LocalClipCommentParamsSchema.parse(request.params);
+        const authorization = requireLocalAuthorization(
+          request.headers.authorization,
+          "Authentication is required to delete a clip comment.",
+        );
+        const result = await dependencies.deleteClipComment!({
+          projectId,
+          clipId,
+          commentId,
+          authorization,
+          request: DeleteClipCommentRequestSchema.parse(request.body),
+        });
+        return reply
+          .status(result.state === "applied" ? 200 : 202)
+          .send(result);
+      },
+    );
+  }
+
+  if (dependencies?.replayClipComments) {
+    app.post(
+      "/api/projects/:projectId/clip-comment-outbox/replay",
+      async (request) => {
+        const { projectId } = LocalProjectParamsSchema.parse(request.params);
+        const authorization = requireLocalAuthorization(
+          request.headers.authorization,
+          "Authentication is required to replay clip comments.",
+        );
+        return dependencies.replayClipComments!({ projectId, authorization });
+      },
+    );
+  }
+
+  if (dependencies?.listClipCommentConflicts) {
+    app.get(
+      "/api/projects/:projectId/clip-comment-outbox/conflicts",
+      async (request) => {
+        const { projectId } = LocalProjectParamsSchema.parse(request.params);
+        requireLocalAuthorization(
+          request.headers.authorization,
+          "Authentication is required to read clip-comment conflicts.",
+        );
+        return {
+          conflicts: dependencies.listClipCommentConflicts!({ projectId }),
+        };
+      },
+    );
+  }
+
+  if (dependencies?.listProjectBookmarks) {
+    app.get("/api/projects/:projectId/bookmarks", async (request) => {
+      const { projectId } = LocalProjectParamsSchema.parse(request.params);
+      const authorization = requireLocalAuthorization(
+        request.headers.authorization,
+        "Authentication is required to read project bookmarks.",
+      );
+      return dependencies.listProjectBookmarks!({
+        projectId,
+        authorization,
+        query: ProjectBookmarkQuerySchema.parse(request.query),
+      });
+    });
+  }
+
+  if (dependencies?.createProjectBookmark) {
+    app.post("/api/projects/:projectId/bookmarks", async (request, reply) => {
+      const { projectId } = LocalProjectParamsSchema.parse(request.params);
+      const authorization = requireLocalAuthorization(
+        request.headers.authorization,
+        "Authentication is required to create a project bookmark.",
+      );
+      const result = await dependencies.createProjectBookmark!({
+        projectId,
+        authorization,
+        request: CreateProjectBookmarkRequestSchema.parse(request.body),
+      });
+      return reply.status(result.state === "applied" ? 201 : 202).send(result);
+    });
+  }
+
+  if (dependencies?.updateProjectBookmark) {
+    app.patch(
+      "/api/projects/:projectId/bookmarks/:bookmarkId",
+      async (request, reply) => {
+        const { projectId, bookmarkId } =
+          LocalProjectBookmarkParamsSchema.parse(request.params);
+        const authorization = requireLocalAuthorization(
+          request.headers.authorization,
+          "Authentication is required to edit a project bookmark.",
+        );
+        const result = await dependencies.updateProjectBookmark!({
+          projectId,
+          bookmarkId,
+          authorization,
+          request: UpdateProjectBookmarkRequestSchema.parse(request.body),
+        });
+        return reply
+          .status(result.state === "applied" ? 200 : 202)
+          .send(result);
+      },
+    );
+  }
+
+  if (dependencies?.changeProjectBookmarkState) {
+    for (const action of ["archive", "restore"] as const) {
+      app.post(
+        `/api/projects/:projectId/bookmarks/:bookmarkId/${action}`,
+        async (request, reply) => {
+          const { projectId, bookmarkId } =
+            LocalProjectBookmarkParamsSchema.parse(request.params);
+          const authorization = requireLocalAuthorization(
+            request.headers.authorization,
+            `Authentication is required to ${action} a project bookmark.`,
+          );
+          const result = await dependencies.changeProjectBookmarkState!({
+            projectId,
+            bookmarkId,
+            action,
+            authorization,
+            request: ChangeProjectBookmarkStateRequestSchema.parse(
+              request.body,
+            ),
+          });
+          return reply
+            .status(result.state === "applied" ? 200 : 202)
+            .send(result);
+        },
+      );
+    }
+  }
+
+  if (dependencies?.replayProjectBookmarks) {
+    app.post(
+      "/api/projects/:projectId/bookmark-outbox/replay",
+      async (request) => {
+        const { projectId } = LocalProjectParamsSchema.parse(request.params);
+        const authorization = requireLocalAuthorization(
+          request.headers.authorization,
+          "Authentication is required to replay project bookmarks.",
+        );
+        return dependencies.replayProjectBookmarks!({
+          projectId,
+          authorization,
+        });
+      },
+    );
+  }
+
+  if (dependencies?.listProjectBookmarkOutbox) {
+    app.get("/api/projects/:projectId/bookmark-outbox", async (request) => {
+      const { projectId } = LocalProjectParamsSchema.parse(request.params);
+      const authorization = requireLocalAuthorization(
+        request.headers.authorization,
+        "Authentication is required to read the bookmark outbox.",
+      );
+      return {
+        outbox: dependencies.listProjectBookmarkOutbox!({
+          projectId,
+          authorization,
+        }),
+      };
+    });
+  }
+
   if (dependencies?.prepareClipLibraryExport) {
     app.post(
       "/api/projects/:projectId/clip-library/export-preflight",
@@ -1067,7 +1374,13 @@ export function createLocalAgent(
         }
         resolved = preview.snapshot;
       }
-      const created = dependencies.createExportOnly!(parsed, resolved);
+      const created = dependencies.createExportOnly!(
+        parsed,
+        resolved,
+        optionalNotificationAccountScope(
+          request.headers["x-research-video-account-scope"],
+        ),
+      );
       return reply.status(201).send(created);
     });
   }
@@ -1735,6 +2048,17 @@ export function createLocalAgent(
     app.get("/api/exports", async () => dependencies.listExportRequests!());
   }
 
+  if (dependencies?.listLocalNotificationFeed) {
+    app.get("/api/notifications", async (request) =>
+      dependencies.listLocalNotificationFeed!(
+        requireNotificationAccountScope(
+          request.headers["x-research-video-account-scope"],
+        ),
+        NotificationFeedQuerySchema.parse(request.query),
+      ),
+    );
+  }
+
   return app;
 }
 
@@ -1757,6 +2081,32 @@ function requireRuntimeAuthorization(
       "Authentication is required to inspect or drain the local runtime.",
     );
   }
+  return authorization;
+}
+
+function optionalNotificationAccountScope(
+  value: string | string[] | undefined,
+): string | undefined {
+  if (value === undefined) return undefined;
+  return requireNotificationAccountScope(value);
+}
+
+function requireNotificationAccountScope(
+  value: string | string[] | undefined,
+): string {
+  if (typeof value !== "string" || !/^[a-f0-9]{64}$/u.test(value)) {
+    throw new LocalAuthenticationError(
+      "A signed-in desktop account is required for local notifications.",
+    );
+  }
+  return value;
+}
+
+function requireLocalAuthorization(
+  authorization: string | undefined,
+  message: string,
+): string {
+  if (!authorization) throw new LocalAuthenticationError(message);
   return authorization;
 }
 

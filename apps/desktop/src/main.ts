@@ -8,6 +8,7 @@ import {
   dialog,
   ipcMain,
   net,
+  Notification,
   protocol,
   utilityProcess,
   type OpenDialogOptions,
@@ -18,7 +19,15 @@ import { CognitoOAuthClient } from "@research-video/auth";
 import {
   DesktopApiRequestSchema,
   DesktopApiResponseSchema,
+  DesktopTimedTranscriptUploadRequestSchema,
+  CreateManualTimedTranscriptImportRequestSchema,
+  ManualTimedTranscriptImportUploadGrantSchema,
   DesktopAuthStatusSchema,
+  DesktopNotificationNavigationTargetSchema,
+  DesktopNotificationPreferencesSchema,
+  DesktopNotificationSupportStatusSchema,
+  NotificationFeedPageSchema,
+  UpdateDesktopNotificationPreferencesSchema,
   DesktopServiceStatusSchema,
   DesktopStatusSchema,
   HealthResponseSchema,
@@ -65,6 +74,15 @@ import {
 } from "./desktop-setup-policy.ts";
 import { LocalAgentEndpointRegistry } from "./local-agent-endpoint.ts";
 import {
+  DesktopNotificationCoordinator,
+  FileDesktopNotificationStore,
+  type NotificationSession,
+} from "./notification-coordinator.ts";
+import {
+  TimedTranscriptUploadGrantRegistry,
+  uploadTimedTranscript,
+} from "./timed-transcript-upload.ts";
+import {
   ModelDownloadCanceledError,
   downloadPinnedModel,
 } from "./model-download.ts";
@@ -105,6 +123,7 @@ if (!app.requestSingleInstanceLock()) {
   let cloudProxy: LoopbackCloudCredentialProxy | undefined;
   let supervisor: LocalServiceSupervisor | undefined;
   let mainWindow: BrowserWindow | undefined;
+  let notificationCoordinator: DesktopNotificationCoordinator | undefined;
   const localAgentEndpoint = new LocalAgentEndpointRegistry();
   let publicApiOrigin: string | undefined;
   let quitAllowed = false;
@@ -135,6 +154,7 @@ if (!app.requestSingleInstanceLock()) {
   });
 
   app.on("before-quit", (event) => {
+    notificationCoordinator?.stop();
     if (quitAllowed || !supervisor) return;
     event.preventDefault();
     if (quitInProgress) return;
@@ -150,6 +170,30 @@ if (!app.requestSingleInstanceLock()) {
 
   void app.whenReady().then(async () => {
     const userData = app.getPath("userData");
+    notificationCoordinator = new DesktopNotificationCoordinator(
+      new FileDesktopNotificationStore(userData),
+      {
+        supported: () => Notification.isSupported(),
+        show: ({ title, body, onClick }) => {
+          const notification = new Notification({ title, body });
+          notification.once("click", onClick);
+          notification.show();
+        },
+      },
+      {
+        focus: () => {
+          if (!mainWindow) return;
+          if (mainWindow.isMinimized()) mainWindow.restore();
+          mainWindow.show();
+          mainWindow.focus();
+        },
+        open: (target) =>
+          mainWindow?.webContents.send(
+            desktopIpcChannels.notificationNavigation,
+            DesktopNotificationNavigationTargetSchema.parse(target),
+          ),
+      },
+    );
     const configuration = await loadDesktopRuntimeConfiguration(userData);
     publicApiOrigin = configuration?.publicApiOrigin;
 
@@ -231,9 +275,18 @@ if (!app.requestSingleInstanceLock()) {
       sessionSecret,
       nativeActionSecret,
       getMainWindow: () => mainWindow,
+      getNotificationCoordinator: () => notificationCoordinator,
     });
     mainWindow = createMainWindow();
     await mainWindow.loadURL("rvc://app/index.html");
+    await notificationCoordinator.setSession(
+      createNotificationSession({
+        broker,
+        publicApiOrigin,
+        localAgentPort: localAgentEndpoint.currentPort() ?? 0,
+        sessionSecret,
+      }),
+    );
 
     app.on("activate", () => {
       if (BrowserWindow.getAllWindows().length === 0) {
@@ -278,7 +331,7 @@ if (!app.requestSingleInstanceLock()) {
 
 function createMainWindow(): BrowserWindow {
   const window = new BrowserWindow({
-    title: "Research Video Clips",
+    title: "VERA — Research Video Clips",
     width: 1_440,
     height: 960,
     minWidth: 960,
@@ -367,11 +420,13 @@ function installIpcHandlers(options: {
     | undefined;
   getModelsDirectory(): string;
   getMainWindow(): BrowserWindow | undefined;
+  getNotificationCoordinator(): DesktopNotificationCoordinator | undefined;
   getStartupAuthIssue():
     "configuration_required" | "protected_storage_unavailable";
   sessionSecret: string;
   nativeActionSecret: string;
 }) {
+  const timedTranscriptUploadGrants = new TimedTranscriptUploadGrantRegistry();
   let activeModelDownload:
     | {
         controller: AbortController;
@@ -537,12 +592,25 @@ function installIpcHandlers(options: {
       external,
     });
   };
+  const reconcileNotificationSession = async () => {
+    const coordinator = options.getNotificationCoordinator();
+    if (!coordinator) return;
+    await coordinator.setSession(
+      createNotificationSession({
+        broker: options.getBroker(),
+        publicApiOrigin: options.getPublicApiOrigin(),
+        localAgentPort: options.getLocalAgentPort(),
+        sessionSecret: options.sessionSecret,
+      }),
+    );
+  };
 
   ipcMain.handle(desktopIpcChannels.getStatus, async (event) => {
     requireTrustedRenderer(event);
     const broker = options.getBroker();
     await broker?.drainNativeCallbacks();
     await reconcileLocalWorkers();
+    await reconcileNotificationSession();
     return DesktopStatusSchema.parse({
       auth: rendererAuthStatus(broker, options.getStartupAuthIssue()),
       services: rendererServiceStatus(options.getSupervisor()),
@@ -554,6 +622,7 @@ function installIpcHandlers(options: {
     if (!broker) return unavailableAuthStatus(options.getStartupAuthIssue());
     await broker.beginSignIn();
     await reconcileLocalWorkers();
+    await reconcileNotificationSession();
     return DesktopAuthStatusSchema.parse(
       rendererAuthStatus(broker, options.getStartupAuthIssue()),
     );
@@ -562,6 +631,7 @@ function installIpcHandlers(options: {
     requireTrustedRenderer(event);
     const broker = options.getBroker();
     if (!broker) return unavailableAuthStatus(options.getStartupAuthIssue());
+    await options.getNotificationCoordinator()?.setSession(undefined);
     await setLocalExportSupervisorEnabled({
       port: options.getLocalAgentPort(),
       sessionSecret: options.sessionSecret,
@@ -742,6 +812,48 @@ function installIpcHandlers(options: {
       }),
     );
   });
+  ipcMain.handle(
+    desktopIpcChannels.timedTranscriptUpload,
+    async (event, rawInput) => {
+      requireTrustedRenderer(event);
+      const input = DesktopTimedTranscriptUploadRequestSchema.parse(rawInput);
+      return uploadTimedTranscript(input, fetch, timedTranscriptUploadGrants);
+    },
+  );
+  ipcMain.handle(
+    desktopIpcChannels.getNotificationPreferences,
+    async (event) => {
+      requireTrustedRenderer(event);
+      const coordinator = options.getNotificationCoordinator();
+      if (!coordinator)
+        throw new Error("Desktop notifications are unavailable.");
+      return DesktopNotificationPreferencesSchema.parse(
+        await coordinator.preferences(),
+      );
+    },
+  );
+  ipcMain.handle(
+    desktopIpcChannels.updateNotificationPreferences,
+    async (event, rawInput) => {
+      requireTrustedRenderer(event);
+      const input = UpdateDesktopNotificationPreferencesSchema.parse(rawInput);
+      const coordinator = options.getNotificationCoordinator();
+      if (!coordinator)
+        throw new Error("Desktop notifications are unavailable.");
+      return DesktopNotificationPreferencesSchema.parse(
+        await coordinator.updatePreferences(input.enabled),
+      );
+    },
+  );
+  ipcMain.handle(desktopIpcChannels.getNotificationSupport, async (event) => {
+    requireTrustedRenderer(event);
+    return DesktopNotificationSupportStatusSchema.parse(
+      options.getNotificationCoordinator()?.supportStatus() ?? {
+        available: false,
+        reason: "unsupported_platform",
+      },
+    );
+  });
   ipcMain.handle(desktopIpcChannels.request, async (event, rawInput) => {
     requireTrustedRenderer(event);
     const input = DesktopApiRequestSchema.parse(rawInput);
@@ -760,6 +872,12 @@ function installIpcHandlers(options: {
     const broker = options.getBroker();
     let accessToken: string | undefined;
     let offlineReviewCapability: string | undefined;
+    let notificationAccountScope: string | undefined;
+    try {
+      notificationAccountScope = broker?.getNotificationAccountScope();
+    } catch {
+      notificationAccountScope = undefined;
+    }
     if (isLocalTranscriptWorkspaceRequest(input)) {
       try {
         offlineReviewCapability = broker?.getOfflineReviewCapability();
@@ -835,6 +953,11 @@ function installIpcHandlers(options: {
           ? {
               origin: trustedRendererOrigin,
               "x-research-video-session": options.sessionSecret,
+              ...(notificationAccountScope
+                ? {
+                    "x-research-video-account-scope": notificationAccountScope,
+                  }
+                : {}),
               ...(offlineReviewCapability
                 ? {
                     "x-research-video-offline-review": offlineReviewCapability,
@@ -846,14 +969,114 @@ function installIpcHandlers(options: {
       ...(input.body !== undefined ? { body: input.body } : {}),
       redirect: "error",
     });
+    const body = await response.text();
+    if (isTimedTranscriptCreateRequest(input) && response.ok) {
+      try {
+        timedTranscriptUploadGrants.register(
+          ManualTimedTranscriptImportUploadGrantSchema.parse(JSON.parse(body)),
+          CreateManualTimedTranscriptImportRequestSchema.parse(
+            JSON.parse(input.body ?? ""),
+          ),
+        );
+      } catch {
+        return DesktopApiResponseSchema.parse({
+          status: 502,
+          body: JSON.stringify({
+            error: {
+              code: "invalid_upload_grant",
+              message: "Timed transcript upload grant could not be verified.",
+            },
+          }),
+          contentType: "application/json",
+        });
+      }
+    }
     return DesktopApiResponseSchema.parse({
       status: response.status,
-      body: await response.text(),
+      body,
       ...(response.headers.get("content-type")
         ? { contentType: response.headers.get("content-type")! }
         : {}),
     });
   });
+}
+
+function isTimedTranscriptCreateRequest(input: {
+  target: "cloud" | "local";
+  method: string;
+  path: string;
+  contentType?: string | undefined;
+  body?: string | undefined;
+}) {
+  return (
+    input.target === "cloud" &&
+    input.method === "POST" &&
+    input.contentType === "application/json" &&
+    input.body !== undefined &&
+    /^\/api\/projects\/[0-9a-f-]+\/videos\/[0-9a-f-]+\/timed-transcript-imports$/iu.test(
+      input.path,
+    )
+  );
+}
+
+function createNotificationSession(input: {
+  broker: DesktopAuthenticationBroker | undefined;
+  publicApiOrigin: string | undefined;
+  localAgentPort: number;
+  sessionSecret: string;
+}): NotificationSession | undefined {
+  if (
+    input.broker?.getRendererStatus().state !== "signed_in" ||
+    !input.publicApiOrigin ||
+    input.localAgentPort === 0
+  ) {
+    return undefined;
+  }
+  let accountScope: string;
+  try {
+    accountScope = input.broker.getNotificationAccountScope();
+  } catch {
+    return undefined;
+  }
+  const read = async (
+    target: "cloud" | "local",
+    cursor: string | undefined,
+    since: string,
+  ) => {
+    const parameters = new URLSearchParams({ limit: "50", since });
+    if (cursor) parameters.set("cursor", cursor);
+    const base =
+      target === "cloud"
+        ? input.publicApiOrigin!
+        : `http://127.0.0.1:${input.localAgentPort}`;
+    const token =
+      target === "cloud"
+        ? await input.broker!.getAccessTokenForTrustedProxy()
+        : input.sessionSecret;
+    const response = await fetch(`${base}/api/notifications?${parameters}`, {
+      headers: {
+        accept: "application/json",
+        authorization: `Bearer ${token}`,
+        ...(target === "local"
+          ? {
+              origin: trustedRendererOrigin,
+              "x-research-video-session": input.sessionSecret,
+              "x-research-video-account-scope": accountScope,
+            }
+          : {}),
+      },
+      redirect: "error",
+    });
+    if (!response.ok) {
+      throw new Error("Notification feed is unavailable.");
+    }
+    return NotificationFeedPageSchema.parse(await response.json());
+  };
+  return {
+    accountScope,
+    readCloud: (cursor, since) => read("cloud", cursor, since),
+    readLocal: (cursor, since) => read("local", cursor, since),
+  };
 }
 
 function localModelPin(pin: {
