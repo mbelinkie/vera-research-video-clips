@@ -278,6 +278,9 @@ import {
   type ProjectVideoWorklistProcessingState,
   type ProjectVideoWorklistQuery,
   type ProjectVisibility,
+  type SourceFingerprintEvidence,
+  type SourceIdentityV1,
+  type SourceProvider,
   type PublishDerivedTranslationRequest,
   type RequestDerivedTranslation,
   type TranscriptArtifact,
@@ -2852,13 +2855,15 @@ export class SharedProjectCatalog {
       const videoResult = await this.database.query<DbRow>(
         `INSERT INTO videos
            (id, youtube_video_id, canonical_url, title, channel, source_language,
-            created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $7)
-         ON CONFLICT (youtube_video_id) DO UPDATE
+            created_at, updated_at, source_provider, provider_media_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $7, $8, $9)
+         ON CONFLICT (source_provider, provider_media_id) DO UPDATE
          SET canonical_url = EXCLUDED.canonical_url,
              title = EXCLUDED.title,
              channel = EXCLUDED.channel,
              source_language = COALESCE(EXCLUDED.source_language, videos.source_language),
+             source_provider = EXCLUDED.source_provider,
+             provider_media_id = EXCLUDED.provider_media_id,
              updated_at = EXCLUDED.updated_at
          RETURNING id`,
         [
@@ -2869,6 +2874,9 @@ export class SharedProjectCatalog {
           input.video.channel ?? null,
           input.video.sourceLanguage ?? null,
           now,
+          input.video.sourceIdentity?.provider ?? "youtube",
+          input.video.sourceIdentity?.providerMediaId ??
+            input.video.youtubeVideoId,
         ],
       );
       const catalogVideoId = String(videoResult.rows[0]!.id);
@@ -2900,10 +2908,10 @@ export class SharedProjectCatalog {
             export_end_ms, timing_precision, english_text, original_text,
             selection_text, language_evidence_schema_version, notes,
             research_status, export_status, created_by, version, created_at,
-            updated_at)
+            updated_at, source_provider, provider_media_id)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
                  $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, 2,
-                 $25, 'candidate', 'not_requested', $26, 1, $27, $27)
+                 $25, 'candidate', 'not_requested', $26, 1, $27, $27, $28, $29)
          ON CONFLICT (project_id, idempotency_key) DO NOTHING
          RETURNING id`,
         [
@@ -2936,6 +2944,9 @@ export class SharedProjectCatalog {
           input.notes,
           actor.userId,
           now,
+          input.video.sourceIdentity?.provider ?? "youtube",
+          input.video.sourceIdentity?.providerMediaId ??
+            input.video.youtubeVideoId,
         ],
       );
       const created = Boolean(inserted.rows[0]);
@@ -4400,6 +4411,8 @@ export class SharedProjectCatalog {
       channel?: string;
       durationMs?: number;
       sourceLanguage?: string;
+      sourceIdentity?: SourceIdentityV1;
+      sourceFingerprint?: SourceFingerprintEvidence;
     },
     options: { automaticLocalProcessing?: boolean } = {},
   ): Promise<Video> {
@@ -4433,7 +4446,8 @@ export class SharedProjectCatalog {
     });
     const result = await this.database.query<DbRow>(
       `SELECT id, youtube_video_id, canonical_url, title, channel, duration_ms,
-              source_language, created_at, updated_at
+              source_language, source_provider, provider_media_id,
+              source_fingerprint_evidence, created_at, updated_at
        FROM videos WHERE id = $1`,
       [id],
     );
@@ -4447,7 +4461,9 @@ export class SharedProjectCatalog {
     await this.authorize(actor, projectId, "read");
     const result = await this.database.query<DbRow>(
       `SELECT v.id, v.youtube_video_id, v.canonical_url, v.title, v.channel,
-              v.duration_ms, v.source_language, v.created_at, v.updated_at
+              v.duration_ms, v.source_language, v.source_provider,
+              v.provider_media_id, v.source_fingerprint_evidence,
+              v.created_at, v.updated_at
        FROM project_videos pv
        JOIN videos v ON v.id = pv.video_id
        WHERE pv.project_id = $1
@@ -7207,20 +7223,50 @@ export class SharedProjectCatalog {
     projectId: string,
     youtubeVideoIds: readonly string[],
   ): Promise<Map<string, ProjectVideoTranscriptState>> {
+    const sourceStates = await this.findProjectSourceTranscriptStates(
+      actor,
+      projectId,
+      [...new Set(youtubeVideoIds)].map((youtubeVideoId) => ({
+        schemaVersion: 1 as const,
+        provider: "youtube" as const,
+        providerMediaId: youtubeVideoId,
+        canonicalUrl: `https://www.youtube.com/watch?v=${youtubeVideoId}`,
+      })),
+    );
+    return new Map(
+      [...new Set(youtubeVideoIds)].flatMap((youtubeVideoId) => {
+        const state = sourceStates.get(`youtube:${youtubeVideoId}`);
+        return state ? [[youtubeVideoId, state] as const] : [];
+      }),
+    );
+  }
+
+  async findProjectSourceTranscriptStates(
+    actor: AuthenticatedActor,
+    projectId: string,
+    sources: readonly SourceIdentityV1[],
+  ): Promise<Map<string, ProjectVideoTranscriptState>> {
     await this.authorize(actor, projectId, "read");
     const states = new Map<string, ProjectVideoTranscriptState>();
-    for (const youtubeVideoId of new Set(youtubeVideoIds)) {
+    const uniqueSources = new Map(
+      sources.map((source) => [
+        `${source.provider}:${source.providerMediaId}`,
+        source,
+      ]),
+    );
+    for (const [identityKey, source] of uniqueSources) {
       const result = await this.database.query<DbRow>(
         `SELECT v.id, v.canonical_url, v.title, v.channel, v.duration_ms,
                 v.source_language, pv.active_transcript_version_id
          FROM project_videos pv
          JOIN videos v ON v.id = pv.video_id
-         WHERE pv.project_id = $1 AND v.youtube_video_id = $2`,
-        [projectId, youtubeVideoId],
+         WHERE pv.project_id = $1 AND v.source_provider = $2
+           AND v.provider_media_id = $3`,
+        [projectId, source.provider, source.providerMediaId],
       );
       const row = result.rows[0];
       if (row) {
-        states.set(youtubeVideoId, {
+        states.set(identityKey, {
           catalogVideoId: String(row.id),
           canonicalUrl: String(row.canonical_url),
           title: String(row.title),
@@ -11093,6 +11139,16 @@ export class SharedProjectCatalog {
       batchId: item.batch_id,
       catalogVideoId: item.catalog_video_id,
       youtubeVideoId: item.youtube_video_id,
+      ...(item.provider_media_id && item.canonical_url
+        ? {
+            sourceIdentity: {
+              schemaVersion: 1 as const,
+              provider: item.source_provider ?? "youtube",
+              providerMediaId: item.provider_media_id,
+              canonicalUrl: item.canonical_url,
+            },
+          }
+        : {}),
       targetLanguage: item.target_language,
       transcriptionProfile: item.transcription_profile,
       sourcePolicy: item.source_policy,
@@ -11563,7 +11619,8 @@ export class SharedProjectCatalog {
   ): Promise<number> {
     const candidates = await this.database.query<DbRow>(
       `SELECT v.id, v.youtube_video_id, v.canonical_url, v.title, v.channel,
-              v.duration_ms, v.source_language
+              v.duration_ms, v.source_language, v.source_provider,
+              v.provider_media_id
        FROM project_videos pv
        JOIN videos v ON v.id = pv.video_id
        WHERE pv.project_id = $1 AND pv.triage_state = 'active'
@@ -11628,6 +11685,14 @@ export class SharedProjectCatalog {
           catalogVideoId: String(candidate.id),
           youtubeVideoId: String(candidate.youtube_video_id),
           canonicalUrl: String(candidate.canonical_url),
+          sourceIdentity: {
+            schemaVersion: 1,
+            provider: sourceProviderFromRow(candidate.source_provider),
+            providerMediaId: String(
+              candidate.provider_media_id ?? candidate.youtube_video_id,
+            ),
+            canonicalUrl: String(candidate.canonical_url),
+          },
           title: String(candidate.title),
           ...(candidate.channel === null
             ? {}
@@ -11793,6 +11858,9 @@ export class SharedProjectCatalog {
           batchId,
           catalogVideoId,
           youtubeVideoId: persistedItem.youtubeVideoId,
+          ...(persistedItem.sourceIdentity
+            ? { sourceIdentity: persistedItem.sourceIdentity }
+            : {}),
           targetLanguage: options.targetLanguage,
           transcriptionProfile: options.transcriptionProfile,
           sourcePolicy: options.sourcePolicy,
@@ -11896,11 +11964,11 @@ export class SharedProjectCatalog {
           title, channel, duration_ms, source_language, preflight_status,
           processing_need, duplicate_of_input_index, state, review_status,
           job_id, idempotency_key, error_code, error_message, attempt,
-          language_gate, language_decision_id, language_decision_video_id,
-          version, created_at, updated_at)
+         language_gate, language_decision_id, language_decision_video_id,
+          version, created_at, updated_at, source_provider, provider_media_id)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
                $13, $14, $15, $16, 'unreviewed', $17, $18, $19, $20,
-               0, $21, $22, $23, 1, $24, $24)`,
+               0, $21, $22, $23, 1, $24, $24, $25, $26)`,
       [
         randomUUID(),
         batchId,
@@ -11926,6 +11994,11 @@ export class SharedProjectCatalog {
         languageDecision?.decisionId ?? null,
         languageDecision ? catalogVideoId : null,
         createdAt,
+        persistedItem.sourceIdentity?.provider ??
+          (persistedItem.youtubeVideoId ? "youtube" : null),
+        persistedItem.sourceIdentity?.providerMediaId ??
+          persistedItem.youtubeVideoId ??
+          null,
       ],
     );
   }
@@ -11940,6 +12013,8 @@ export class SharedProjectCatalog {
       channel?: string | undefined;
       durationMs?: number | undefined;
       sourceLanguage?: string | undefined;
+      sourceIdentity?: SourceIdentityV1 | undefined;
+      sourceFingerprint?: SourceFingerprintEvidence | undefined;
     },
     now: string,
   ): Promise<string> {
@@ -11951,14 +12026,21 @@ export class SharedProjectCatalog {
     const insertedVideo = await this.database.query<DbRow>(
       `INSERT INTO videos
          (id, youtube_video_id, canonical_url, title, channel, duration_ms,
-          source_language, created_at, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8)
-       ON CONFLICT (youtube_video_id) DO UPDATE
+          source_language, created_at, updated_at, source_provider,
+          provider_media_id, source_fingerprint_evidence)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8, $9, $10, $11)
+       ON CONFLICT (source_provider, provider_media_id) DO UPDATE
        SET canonical_url = EXCLUDED.canonical_url,
            title = EXCLUDED.title,
            channel = EXCLUDED.channel,
            duration_ms = EXCLUDED.duration_ms,
            source_language = EXCLUDED.source_language,
+           source_provider = EXCLUDED.source_provider,
+           provider_media_id = EXCLUDED.provider_media_id,
+           source_fingerprint_evidence = COALESCE(
+             EXCLUDED.source_fingerprint_evidence,
+             videos.source_fingerprint_evidence
+           ),
            updated_at = EXCLUDED.updated_at
        RETURNING id`,
       [
@@ -11970,6 +12052,9 @@ export class SharedProjectCatalog {
         item.durationMs ?? null,
         item.sourceLanguage ?? null,
         now,
+        item.sourceIdentity?.provider ?? "youtube",
+        item.sourceIdentity?.providerMediaId ?? item.youtubeVideoId,
+        item.sourceFingerprint ? JSON.stringify(item.sourceFingerprint) : null,
       ],
     );
     const id = String(insertedVideo.rows[0]!.id);
@@ -13469,6 +13554,12 @@ function mapClipCandidate(
     video: {
       youtubeVideoId: row.youtube_video_id,
       canonicalUrl: row.canonical_url,
+      sourceIdentity: {
+        schemaVersion: 1,
+        provider: row.source_provider ?? "youtube",
+        providerMediaId: row.provider_media_id ?? row.youtube_video_id,
+        canonicalUrl: row.canonical_url,
+      },
       title: row.video_title,
       ...(row.video_channel ? { channel: row.video_channel } : {}),
       ...(row.source_language ? { sourceLanguage: row.source_language } : {}),
@@ -13738,12 +13829,27 @@ function csvCell(value: string | number) {
   return `"${formulaSafe.replaceAll('"', '""')}"`;
 }
 
+function sourceProviderFromRow(value: unknown): SourceProvider {
+  return value === "tiktok" || value === "instagram" || value === "facebook"
+    ? value
+    : "youtube";
+}
+
 function mapVideo(row: DbRow | undefined): Video {
   if (!row) throw new CatalogNotFoundError("Video not found.");
   return VideoSchema.parse({
     id: row.id,
     youtubeVideoId: row.youtube_video_id,
     canonicalUrl: row.canonical_url,
+    sourceIdentity: {
+      schemaVersion: 1,
+      provider: row.source_provider ?? "youtube",
+      providerMediaId: row.provider_media_id ?? row.youtube_video_id,
+      canonicalUrl: row.canonical_url,
+    },
+    ...(row.source_fingerprint_evidence
+      ? { sourceFingerprint: row.source_fingerprint_evidence }
+      : {}),
     title: row.title,
     ...(row.channel === null ? {} : { channel: row.channel }),
     ...(row.duration_ms === null
@@ -14005,6 +14111,16 @@ function mapBatchItem(row: DbRow): TranscriptionBatchItem {
       ? {}
       : { youtubeVideoId: row.youtube_video_id }),
     ...(row.canonical_url === null ? {} : { canonicalUrl: row.canonical_url }),
+    ...(row.provider_media_id === null || row.canonical_url === null
+      ? {}
+      : {
+          sourceIdentity: {
+            schemaVersion: 1,
+            provider: row.source_provider ?? "youtube",
+            providerMediaId: row.provider_media_id,
+            canonicalUrl: row.canonical_url,
+          },
+        }),
     ...(row.title === null ? {} : { title: row.title }),
     ...(row.channel === null ? {} : { channel: row.channel }),
     ...(row.duration_ms === null

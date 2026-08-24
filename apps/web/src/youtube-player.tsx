@@ -7,11 +7,13 @@ import {
   useState,
 } from "react";
 
-export type YouTubePlayerHandle = {
+export type SourcePlayerHandle = {
   seekTo(milliseconds: number): boolean;
   play(): boolean;
   pause(): boolean;
 };
+
+export type YouTubePlayerHandle = SourcePlayerHandle;
 
 type YouTubePlayerProps = {
   videoId: string;

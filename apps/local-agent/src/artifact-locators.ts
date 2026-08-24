@@ -340,6 +340,15 @@ export class LocalArtifactLocatorService {
       locatorId: locator.id,
       packageIdentity: summary.packageIdentity,
       resultFingerprint: summary.resultFingerprint,
+      sourceReference: {
+        schemaVersion: 1,
+        sourceIdentity: summary.video.sourceIdentity ?? {
+          schemaVersion: 1,
+          provider: "youtube",
+          providerMediaId: summary.video.youtubeVideoId,
+          canonicalUrl: summary.video.canonicalUrl,
+        },
+      },
       manifest: {
         schemaVersion: verified.manifestSchemaVersion,
         contentSha256: summary.manifest.contentSha256,

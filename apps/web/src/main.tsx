@@ -55,12 +55,12 @@ import { DesktopSetup } from "./desktop-setup.tsx";
 import { PlayerPanel } from "./player-panel.tsx";
 import { SelectionCommandPanel } from "./selection-command-panel.tsx";
 import { SelectionEditor } from "./selection-editor.tsx";
+import { SourceIngestPanel } from "./source-ingest-panel.tsx";
 import { TranscriptNavigationPanel } from "./transcript-navigation-panel.tsx";
 import type { YouTubePlayerHandle } from "./youtube-player.tsx";
 import {
   AccountLanguagePanel,
   ResearchWorkspaceLayout,
-  VideoIngestPanel,
   WorkspaceShell,
   type ProjectDestination,
 } from "./workspace-shell.tsx";
@@ -338,6 +338,10 @@ function App() {
   const [destination, setDestination] =
     useState<ProjectDestination>("workbench");
   const [bulkAddRequest, setBulkAddRequest] = useState(0);
+  const [searchBatchRequest, setSearchBatchRequest] = useState<{
+    generation: number;
+    inputs: string[];
+  }>();
   const [unreadActivityCount, setUnreadActivityCount] = useState(0);
   const [creatingProject, setCreatingProject] = useState(false);
   const [newProjectName, setNewProjectName] = useState("");
@@ -2104,7 +2108,9 @@ function App() {
         />
       }
       ingest={
-        <VideoIngestPanel
+        <SourceIngestPanel
+          projectId={projectId}
+          authorization={authorization}
           url={url}
           {...(error ? { error } : {})}
           onUrlChange={setUrl}
@@ -2112,6 +2118,13 @@ function App() {
           onBulkAdd={() => {
             setDestination("workbench");
             setBulkAddRequest((request) => request + 1);
+          }}
+          onSearchCandidatesSelected={(inputs) => {
+            setDestination("workbench");
+            setSearchBatchRequest((current) => ({
+              generation: (current?.generation ?? 0) + 1,
+              inputs,
+            }));
           }}
         />
       }
@@ -2343,6 +2356,9 @@ function App() {
           projects={projects}
           destination={destination}
           bulkAddRequest={bulkAddRequest}
+          {...(searchBatchRequest
+            ? { externalInputsRequest: searchBatchRequest }
+            : {})}
         />
       }
     />

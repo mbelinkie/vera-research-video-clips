@@ -7,7 +7,10 @@ import { SharedProjectCatalog } from "@research-video/catalog";
 import { HealthResponseSchema } from "@research-video/contracts";
 import { runCloudMigrations } from "@research-video/db-cloud";
 import { currentExportWorkerAdvertisement } from "@research-video/export-settings";
-import type { VideoMetadataProvider } from "@research-video/providers";
+import type {
+  SourceSearchProvider,
+  VideoMetadataProvider,
+} from "@research-video/providers";
 import { MemoryTranscriptObjectStore } from "@research-video/storage";
 import {
   buildClipLanguageEvidence,
@@ -46,6 +49,129 @@ afterEach(async () => {
 });
 
 describe("cloud API", () => {
+  it("reports provider capabilities and searches without mutating project state", async () => {
+    const actor = {
+      userId: randomUUID(),
+      externalSubject: "fixture:source-search",
+    };
+    const projectId = randomUUID();
+    const getProject = vi.fn(async () => ({ id: projectId }));
+    const search = vi.fn<SourceSearchProvider["search"]>(async () => ({
+      candidates: [
+        {
+          sourceIdentity: {
+            schemaVersion: 1,
+            provider: "youtube",
+            providerMediaId: "M7lc1UVf-VE",
+            canonicalUrl: "https://www.youtube.com/watch?v=M7lc1UVf-VE",
+          },
+          title: "Fixture result",
+          availability: "available",
+          provenance: { provider: "youtube", resultPosition: 0 },
+        },
+      ],
+      nextCursor: "next-page",
+    }));
+    const app = createCloudApi({
+      catalog: { getProject } as unknown as SharedProjectCatalog,
+      authenticate: async () => actor,
+      sourceSearchProviders: {
+        youtube: { provider: "youtube", search },
+      },
+    });
+    apps.add(app);
+
+    const capabilityResponse = await app.inject({
+      method: "GET",
+      url: `/api/projects/${projectId}/source-capabilities`,
+    });
+    expect(capabilityResponse.statusCode).toBe(200);
+    expect(capabilityResponse.json()).toMatchObject({
+      providers: [
+        {
+          provider: "youtube",
+          operations: expect.arrayContaining([
+            expect.objectContaining({
+              operation: "search",
+              state: "available",
+            }),
+          ]),
+        },
+        {
+          provider: "tiktok",
+          operations: expect.arrayContaining([
+            expect.objectContaining({
+              operation: "search",
+              state: "unsupported",
+            }),
+          ]),
+        },
+        { provider: "instagram" },
+        {
+          provider: "facebook",
+          operations: expect.arrayContaining([
+            expect.objectContaining({
+              operation: "search",
+              state: "unsupported",
+            }),
+          ]),
+        },
+      ],
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/api/projects/${projectId}/source-search`,
+      payload: {
+        query: "fixture query",
+        providers: ["youtube", "tiktok"],
+        pageSize: 12,
+      },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      outcomes: [
+        {
+          provider: "youtube",
+          state: "success",
+          candidates: [
+            expect.objectContaining({
+              sourceIdentity: expect.objectContaining({
+                providerMediaId: "M7lc1UVf-VE",
+              }),
+            }),
+          ],
+          nextCursor: "next-page",
+        },
+        { provider: "tiktok", state: "unsupported", candidates: [] },
+      ],
+    });
+    expect(search).toHaveBeenCalledWith({
+      query: "fixture query",
+      pageSize: 12,
+    });
+    expect(getProject).toHaveBeenCalledTimes(2);
+
+    const unsupportedIngest = await app.inject({
+      method: "POST",
+      url: `/api/projects/${projectId}/videos`,
+      payload: {
+        youtubeVideoId: "legacy-facebook-id",
+        canonicalUrl: "https://www.facebook.com/watch/?v=123456789012345",
+        sourceIdentity: {
+          schemaVersion: 1,
+          provider: "facebook",
+          providerMediaId: "123456789012345",
+          canonicalUrl: "https://www.facebook.com/watch/?v=123456789012345",
+        },
+        title: "Not product-qualified",
+      },
+    });
+    expect(unsupportedIngest.statusCode).toBe(400);
+    expect(unsupportedIngest.json()).toMatchObject({
+      error: { code: "invalid_request" },
+    });
+  });
   it("routes strict project keyword catalog, suggestion, and review commands", async () => {
     const actor = {
       userId: randomUUID(),

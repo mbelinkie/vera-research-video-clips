@@ -111,14 +111,14 @@ describe("cloud migrations", () => {
 
     const applied = await runCloudMigrations(database);
 
-    expect(applied).toHaveLength(35);
-    expect(calls.filter((call) => call === "pool:connect")).toHaveLength(36);
-    expect(calls.filter((call) => call === "client:BEGIN")).toHaveLength(36);
+    expect(applied).toHaveLength(37);
+    expect(calls.filter((call) => call === "pool:connect")).toHaveLength(38);
+    expect(calls.filter((call) => call === "client:BEGIN")).toHaveLength(38);
     expect(
       calls.filter((call) =>
         call.startsWith("client:SELECT pg_advisory_xact_lock"),
       ),
-    ).toHaveLength(36);
+    ).toHaveLength(38);
     expect(
       calls.some((call) =>
         call.startsWith("pool:INSERT INTO schema_migrations"),
@@ -190,6 +190,8 @@ describe("cloud migrations", () => {
           "0033_project_keyword_governance",
           "0034_project_keyword_scans",
           "0035_keyword_scan_worklist_activity",
+          "0036_clip_comments",
+          "0037_platform_neutral_source_identity",
         ]);
         expect(
           (
@@ -227,8 +229,8 @@ describe("cloud migrations", () => {
           runCloudMigrations(first),
           runCloudMigrations(second),
         ]);
-        expect(results.flat()).toHaveLength(35);
-        expect(new Set(results.flat()).size).toBe(35);
+        expect(results.flat()).toHaveLength(37);
+        expect(new Set(results.flat()).size).toBe(37);
         expect(await runCloudMigrations(first)).toEqual([]);
       } finally {
         await Promise.all([first.close(), second.close()]);
@@ -278,6 +280,8 @@ describe("cloud migrations", () => {
       "0033_project_keyword_governance",
       "0034_project_keyword_scans",
       "0035_keyword_scan_worklist_activity",
+      "0036_clip_comments",
+      "0037_platform_neutral_source_identity",
     ]);
     expect(await runCloudMigrations(database)).toEqual([]);
     expect(

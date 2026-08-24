@@ -425,6 +425,177 @@ async function connectShellWorkspace(page: Page) {
   await page.getByRole("button", { name: "Connect" }).click();
 }
 
+test("searches YouTube with capability-gated providers and hands selection to preflight", async ({
+  page,
+}) => {
+  await mockShellWorkspace(page, 0);
+  let preflightCount = 0;
+  await page.route(
+    "**/cloud-api/api/projects/*/source-capabilities",
+    async (route) =>
+      route.fulfill({
+        json: {
+          providers: [
+            {
+              provider: "youtube",
+              operations: [
+                { operation: "search", state: "available", configured: true },
+                {
+                  operation: "embed-preview",
+                  state: "available",
+                  configured: true,
+                },
+              ],
+            },
+            {
+              provider: "tiktok",
+              operations: [
+                {
+                  operation: "search",
+                  state: "unsupported",
+                  configured: false,
+                  explanation:
+                    "TikTok search requires qualifying official API access.",
+                },
+              ],
+            },
+            {
+              provider: "instagram",
+              operations: [
+                {
+                  operation: "search",
+                  state: "unsupported",
+                  configured: false,
+                  explanation:
+                    "Instagram search requires qualifying official API access.",
+                },
+              ],
+            },
+            {
+              provider: "facebook",
+              operations: [
+                {
+                  operation: "search",
+                  state: "unsupported",
+                  configured: false,
+                  explanation:
+                    "Facebook search is limited to authorized assets and is not enabled.",
+                },
+              ],
+            },
+          ],
+        },
+      }),
+  );
+  await page.route("**/cloud-api/api/projects/*/source-search", async (route) =>
+    route.fulfill({
+      json: {
+        outcomes: [
+          {
+            provider: "youtube",
+            state: "success",
+            candidates: ["M7lc1UVf-VE", "Romanian001"].map(
+              (providerMediaId, resultPosition) => ({
+                sourceIdentity: {
+                  schemaVersion: 1,
+                  provider: "youtube",
+                  providerMediaId,
+                  canonicalUrl: `https://www.youtube.com/watch?v=${providerMediaId}`,
+                },
+                title: `Search result ${resultPosition + 1}`,
+                creator: "Fixture channel",
+                thumbnailUrl: `https://i.ytimg.com/vi/${providerMediaId}/hqdefault.jpg`,
+                availability: "available",
+                provenance: { provider: "youtube", resultPosition },
+              }),
+            ),
+          },
+        ],
+      },
+    }),
+  );
+  await page.route(
+    "**/cloud-api/api/projects/*/videos/preflight",
+    async (route) => {
+      preflightCount += 1;
+      const body = route.request().postDataJSON() as { inputs: string[] };
+      return route.fulfill({
+        json: {
+          projectId: shellPersonalProjectId,
+          options: {
+            targetLanguage: "en",
+            transcriptionProfile: "default",
+            sourcePolicy: "prefer-existing",
+            executionLocation: "local",
+            priority: "normal",
+          },
+          items: body.inputs.map((input, inputIndex) => ({
+            inputIndex,
+            input,
+            status: "ready",
+            processingNeed: "transcription",
+            youtubeVideoId: new URL(input).searchParams.get("v"),
+            canonicalUrl: input,
+            title: `Search result ${inputIndex + 1}`,
+          })),
+          summary: {
+            total: body.inputs.length,
+            ready: body.inputs.length,
+            existingTranscripts: 0,
+            duplicates: 0,
+            unsupported: 0,
+            metadataFailed: 0,
+          },
+        },
+      });
+    },
+  );
+
+  await page.goto("/");
+  await connectShellWorkspace(page);
+  await page.getByRole("tab", { name: "Search" }).click();
+
+  const providerOptions = page.locator(".source-provider-options");
+  await expect(providerOptions.getByLabel("YouTube")).toBeChecked();
+  await expect(providerOptions.getByLabel(/TikTok/)).toBeDisabled();
+  await expect(providerOptions.getByLabel(/Instagram/)).toBeDisabled();
+  await expect(providerOptions.getByLabel(/Facebook/)).toBeDisabled();
+
+  await page.getByLabel("Search videos").fill("fixture research");
+  await page.getByRole("button", { name: "Search", exact: true }).click();
+  await expect(page.locator(".source-result-card")).toHaveCount(2);
+  expect(preflightCount).toBe(0);
+
+  await page
+    .locator(".source-result-card")
+    .nth(0)
+    .getByRole("button", { name: "Preview" })
+    .click();
+  await expect(page.locator(".source-search-results iframe")).toHaveCount(1);
+  await page
+    .locator(".source-result-card")
+    .nth(1)
+    .getByRole("button", { name: "Preview" })
+    .click();
+  await expect(page.locator(".source-search-results iframe")).toHaveCount(1);
+
+  for (const checkbox of await page
+    .locator(".source-result-card input[type=checkbox]")
+    .all()) {
+    await checkbox.check();
+  }
+  await page.getByRole("button", { name: "Add selected to batch (2)" }).click();
+  await expect(
+    page.getByLabel("YouTube URLs or video IDs, one per line"),
+  ).toHaveValue(
+    "https://www.youtube.com/watch?v=M7lc1UVf-VE\nhttps://www.youtube.com/watch?v=Romanian001",
+  );
+  expect(preflightCount).toBe(0);
+  await page.getByRole("button", { name: "Preflight 2" }).click();
+  await expect(page.getByText("Preflight complete.")).toBeVisible();
+  expect(preflightCount).toBe(1);
+});
+
 const navigationUserId = "019fbb95-cd76-7920-93fa-e23ba755ee80";
 const navigationProjectId = "019fbb95-cd76-7920-93fa-e23ba755ee81";
 const navigationOtherProjectId = "019fbb95-cd76-7920-93fa-e23ba755ee82";

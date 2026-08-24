@@ -1673,6 +1673,91 @@ h1 {
   padding: 0 12px;
 }
 
+.source-ingest-panel,
+.source-search-form {
+  display: grid;
+  gap: 8px;
+}
+
+.ingest-mode-tabs,
+.source-provider-options,
+.source-search-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.ingest-mode-tabs button[aria-selected="true"] {
+  border-color: #7ca7ff;
+  background: #243752;
+}
+
+.source-search-form fieldset {
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.source-provider-options label:has(input:disabled) {
+  opacity: 0.58;
+}
+
+.source-provider-options label {
+  display: grid;
+  max-width: 300px;
+  gap: 2px;
+}
+
+.source-provider-options label > span {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.source-provider-options small {
+  color: #a9b0ba;
+  line-height: 1.25;
+}
+
+.source-search-results {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+  gap: 10px;
+  max-height: 36rem;
+  overflow: auto;
+  padding: 4px;
+}
+
+.source-result-card {
+  display: grid;
+  align-content: start;
+  gap: 7px;
+  padding: 10px;
+  border: 1px solid #343a44;
+  border-radius: 10px;
+  background: #171b20;
+}
+
+.source-result-card > img {
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  object-fit: cover;
+  border-radius: 6px;
+}
+
+.source-result-card .player-frame {
+  min-height: 0;
+  aspect-ratio: 16 / 9;
+}
+
+.source-search-actions {
+  grid-column: 1 / -1;
+  position: sticky;
+  bottom: 0;
+  padding: 8px;
+  background: #15181d;
+}
+
 .workbench-worklist-slot {
   overflow: auto;
   border: 1px solid #2c3038;

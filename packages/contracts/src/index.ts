@@ -704,26 +704,152 @@ export const ProjectMemberSchema = z.object({
   updatedAt: UtcTimestampSchema,
 });
 
-export const VideoSchema = z.object({
-  id: IdSchema,
-  youtubeVideoId: z.string().min(1).max(64),
-  canonicalUrl: z.url(),
-  title: z.string().trim().min(1).max(500),
-  channel: z.string().trim().min(1).max(300).optional(),
-  durationMs: z.number().int().nonnegative().optional(),
-  sourceLanguage: z.string().min(2).max(35).optional(),
-  createdAt: UtcTimestampSchema,
-  updatedAt: UtcTimestampSchema,
-});
+/** Stable provider identity. Mutable media revision evidence is deliberately
+ * stored separately so a provider replacing bytes does not create a new
+ * logical source. */
+export const SourceProviderSchema = z.enum([
+  "youtube",
+  "tiktok",
+  "instagram",
+  "facebook",
+]);
 
-export const AddProjectVideoRequestSchema = z.object({
-  youtubeVideoId: z.string().min(1).max(64),
-  canonicalUrl: z.url(),
-  title: z.string().trim().min(1).max(500),
-  channel: z.string().trim().min(1).max(300).optional(),
-  durationMs: z.number().int().nonnegative().optional(),
-  sourceLanguage: z.string().min(2).max(35).optional(),
-});
+export const SourceIdentityV1Schema = z
+  .object({
+    schemaVersion: z.literal(1),
+    provider: SourceProviderSchema,
+    providerMediaId: z.string().trim().min(1).max(256),
+    canonicalUrl: z.url(),
+  })
+  .strict();
+
+function validateSourceIdentityCompatibility(
+  value: {
+    youtubeVideoId: string;
+    canonicalUrl: string;
+    sourceIdentity?: z.infer<typeof SourceIdentityV1Schema> | undefined;
+  },
+  context: z.RefinementCtx,
+) {
+  if (!value.sourceIdentity) return;
+  if (value.sourceIdentity.canonicalUrl !== value.canonicalUrl) {
+    context.addIssue({
+      code: "custom",
+      path: ["sourceIdentity", "canonicalUrl"],
+      message: "The stable source identity must use the record canonical URL.",
+    });
+  }
+  if (
+    value.sourceIdentity.provider === "youtube" &&
+    value.sourceIdentity.providerMediaId !== value.youtubeVideoId
+  ) {
+    context.addIssue({
+      code: "custom",
+      path: ["sourceIdentity", "providerMediaId"],
+      message: "The YouTube source identity must match the legacy video ID.",
+    });
+  }
+}
+
+export const SourceFingerprintEvidenceSchema = z
+  .object({
+    schemaVersion: z.literal(1),
+    algorithm: z.literal("sha256"),
+    value: z.string().regex(/^[a-f0-9]{64}$/u),
+    observedAt: UtcTimestampSchema,
+    byteSize: z.number().int().positive().optional(),
+  })
+  .strict();
+
+export const SourceOperationSchema = z.enum([
+  "search",
+  "metadata",
+  "embed-preview",
+  "precise-navigation",
+  "captions",
+  "audio-acquisition",
+  "full-media-acquisition",
+  "availability",
+]);
+
+export const SourceCapabilityStateSchema = z.enum([
+  "available",
+  "unavailable",
+  "unsupported",
+  "auth-required",
+  "quota-limited",
+]);
+
+export const SourceOperationCapabilitySchema = z
+  .object({
+    operation: SourceOperationSchema,
+    state: SourceCapabilityStateSchema,
+    configured: z.boolean(),
+    explanation: z.string().trim().min(1).max(500).optional(),
+  })
+  .strict();
+
+export const SourceProviderCapabilitySchema = z
+  .object({
+    provider: SourceProviderSchema,
+    operations: z.array(SourceOperationCapabilitySchema).min(1),
+  })
+  .strict()
+  .superRefine((capability, context) => {
+    const operations = capability.operations.map((entry) => entry.operation);
+    if (new Set(operations).size !== operations.length) {
+      context.addIssue({
+        code: "custom",
+        path: ["operations"],
+        message: "Provider operations must be unique.",
+      });
+    }
+  });
+
+export const SourceProviderCapabilitiesResponseSchema = z
+  .object({
+    providers: z.array(SourceProviderCapabilitySchema).length(4),
+  })
+  .strict()
+  .superRefine((response, context) => {
+    const providers = response.providers.map((entry) => entry.provider);
+    if (new Set(providers).size !== providers.length) {
+      context.addIssue({
+        code: "custom",
+        path: ["providers"],
+        message: "Provider capability entries must be unique.",
+      });
+    }
+  });
+
+export const VideoSchema = z
+  .object({
+    id: IdSchema,
+    youtubeVideoId: z.string().min(1).max(64),
+    canonicalUrl: z.url(),
+    sourceIdentity: SourceIdentityV1Schema.optional(),
+    sourceFingerprint: SourceFingerprintEvidenceSchema.optional(),
+    title: z.string().trim().min(1).max(500),
+    channel: z.string().trim().min(1).max(300).optional(),
+    durationMs: z.number().int().nonnegative().optional(),
+    sourceLanguage: z.string().min(2).max(35).optional(),
+    createdAt: UtcTimestampSchema,
+    updatedAt: UtcTimestampSchema,
+  })
+  .superRefine(validateSourceIdentityCompatibility);
+
+export const AddProjectVideoRequestSchema = z
+  .object({
+    youtubeVideoId: z.string().min(1).max(64),
+    canonicalUrl: z.url(),
+    sourceIdentity: SourceIdentityV1Schema.optional(),
+    sourceFingerprint: SourceFingerprintEvidenceSchema.optional(),
+    title: z.string().trim().min(1).max(500),
+    channel: z.string().trim().min(1).max(300).optional(),
+    durationMs: z.number().int().nonnegative().optional(),
+    sourceLanguage: z.string().min(2).max(35).optional(),
+  })
+  .superRefine(validateSourceIdentityCompatibility);
 
 export const ProjectVideoSchema = z.object({
   projectId: IdSchema,
@@ -2131,6 +2257,7 @@ export const ClipTagNameSchema = z
 export const ClipVideoSnapshotSchema = z.object({
   youtubeVideoId: z.string().min(1).max(64),
   canonicalUrl: z.url(),
+  sourceIdentity: SourceIdentityV1Schema.optional(),
   title: z.string().trim().min(1).max(500),
   channel: z.string().trim().min(1).max(300).optional(),
   sourceLanguage: LanguageTagSchema.optional(),
@@ -2267,8 +2394,7 @@ export const DeleteClipCommentRequestSchema = z
     expectedVersion: z.number().int().positive(),
   })
   .strict();
-export const ModerateClipCommentRequestSchema =
-  DeleteClipCommentRequestSchema;
+export const ModerateClipCommentRequestSchema = DeleteClipCommentRequestSchema;
 export const ClipCommentListQuerySchema = z
   .object({
     limit: z.coerce.number().int().min(1).max(50).default(25),
@@ -2828,6 +2954,23 @@ export const ExportSourceRightsSnapshotSchema = z
     disclosureVersion: z.number().int().positive().max(1_000_000),
   })
   .strict();
+
+/** Provider-neutral rights evidence for future qualified source adapters.
+ * Existing export commands and immutable packages continue to use the legacy
+ * YouTube snapshot above until their full workflows are qualified. */
+export const SourceRightsSnapshotV2Schema = z
+  .object({
+    schemaVersion: z.literal(2),
+    sourceIdentity: SourceIdentityV1Schema,
+    confirmation: z.literal("authorized_to_process"),
+    disclosureVersion: z.number().int().positive().max(1_000_000),
+  })
+  .strict();
+
+export const SourceRightsSnapshotSchema = z.union([
+  ExportSourceRightsSnapshotSchema,
+  SourceRightsSnapshotV2Schema,
+]);
 const createExportRequestBaseSchema = z
   .object({
     idempotencyKey: z.string().trim().min(1).max(512),
@@ -3170,6 +3313,7 @@ export const TranscriptWorkspaceResponseSchema = z
     projectId: IdSchema,
     catalogVideoId: IdSchema,
     youtubeVideoId: z.string().min(1).max(64),
+    sourceIdentity: SourceIdentityV1Schema.optional(),
     transcriptVersionId: IdSchema,
     source: z.enum(["verified-local-cache", "shared-store"]),
     /** Whether the active catalog version was checked in this login session. */
@@ -3180,6 +3324,17 @@ export const TranscriptWorkspaceResponseSchema = z
   })
   .strict()
   .superRefine((workspace, context) => {
+    if (
+      workspace.sourceIdentity?.provider === "youtube" &&
+      workspace.sourceIdentity.providerMediaId !== workspace.youtubeVideoId
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["sourceIdentity", "providerMediaId"],
+        message:
+          "The workspace source identity must match its legacy YouTube ID.",
+      });
+    }
     const original = workspace.original.track;
     const english = workspace.english.track;
     const directEnglish = languagesEquivalent(original.language, "en");
@@ -3726,6 +3881,7 @@ export const BatchPreflightItemSchema = z.object({
   processingNeed: BatchProcessingNeedSchema,
   youtubeVideoId: z.string().min(1).max(64).optional(),
   canonicalUrl: z.url().optional(),
+  sourceIdentity: SourceIdentityV1Schema.optional(),
   title: z.string().trim().min(1).max(500).optional(),
   channel: z.string().trim().min(1).max(300).optional(),
   durationMs: z.number().int().nonnegative().optional(),
@@ -3756,6 +3912,106 @@ export const BatchPreflightResponseSchema = z.object({
   items: z.array(BatchPreflightItemSchema),
   summary: BatchPreflightSummarySchema,
 });
+
+export const SourceSearchRequestSchema = z
+  .object({
+    query: z.string().trim().min(1).max(500),
+    providers: z.array(SourceProviderSchema).min(1).max(4),
+    pageSize: z.number().int().min(1).max(25).default(12),
+    cursors: z
+      .partialRecord(SourceProviderSchema, z.string().trim().min(1).max(2_048))
+      .optional(),
+  })
+  .strict()
+  .superRefine((request, context) => {
+    if (new Set(request.providers).size !== request.providers.length) {
+      context.addIssue({
+        code: "custom",
+        path: ["providers"],
+        message: "Search providers must be unique.",
+      });
+    }
+    for (const provider of Object.keys(request.cursors ?? {})) {
+      if (!request.providers.includes(provider as never)) {
+        context.addIssue({
+          code: "custom",
+          path: ["cursors", provider],
+          message: "A cursor may only be supplied for a requested provider.",
+        });
+      }
+    }
+  });
+
+export const SourceSearchCandidateSchema = z
+  .object({
+    sourceIdentity: SourceIdentityV1Schema,
+    title: z.string().trim().min(1).max(500),
+    creator: z.string().trim().min(1).max(300).optional(),
+    thumbnailUrl: z.url().optional(),
+    durationMs: z.number().int().nonnegative().optional(),
+    publishedAt: UtcTimestampSchema.optional(),
+    availability: SourceCapabilityStateSchema,
+    provenance: z
+      .object({
+        provider: SourceProviderSchema,
+        resultPosition: z.number().int().nonnegative(),
+      })
+      .strict(),
+  })
+  .strict()
+  .superRefine((candidate, context) => {
+    if (candidate.provenance.provider !== candidate.sourceIdentity.provider) {
+      context.addIssue({
+        code: "custom",
+        path: ["provenance", "provider"],
+        message: "Search provenance must match the candidate source provider.",
+      });
+    }
+  });
+
+export const SourceSearchProviderOutcomeSchema = z
+  .object({
+    provider: SourceProviderSchema,
+    state: z.enum([
+      "success",
+      "unavailable",
+      "unsupported",
+      "auth-required",
+      "quota-limited",
+      "failed",
+    ]),
+    candidates: z.array(SourceSearchCandidateSchema).max(25),
+    nextCursor: z.string().trim().min(1).max(2_048).optional(),
+    explanation: z.string().trim().min(1).max(500).optional(),
+  })
+  .strict()
+  .superRefine((outcome, context) => {
+    outcome.candidates.forEach((candidate, index) => {
+      if (candidate.sourceIdentity.provider !== outcome.provider) {
+        context.addIssue({
+          code: "custom",
+          path: ["candidates", index, "sourceIdentity", "provider"],
+          message: "Every search result must belong to the outcome provider.",
+        });
+      }
+    });
+  });
+
+export const SourceSearchResponseSchema = z
+  .object({
+    outcomes: z.array(SourceSearchProviderOutcomeSchema).min(1).max(4),
+  })
+  .strict()
+  .superRefine((response, context) => {
+    const providers = response.outcomes.map((outcome) => outcome.provider);
+    if (new Set(providers).size !== providers.length) {
+      context.addIssue({
+        code: "custom",
+        path: ["outcomes"],
+        message: "Search outcomes must contain each provider at most once.",
+      });
+    }
+  });
 
 export const CreateTranscriptionBatchRequestSchema =
   BatchPreflightRequestSchema.extend({
@@ -5383,6 +5639,12 @@ export const AuthoringArtifactDescriptorRequestSchema = z
     requirements: ArtifactCompatibilityRequirementsSchema,
   })
   .strict();
+export const AuthoringSourceReferenceSchema = z
+  .object({
+    schemaVersion: z.literal(1),
+    sourceIdentity: SourceIdentityV1Schema,
+  })
+  .strict();
 export const LocalAuthoringArtifactDescriptorSchema = z
   .object({
     schemaVersion: z.literal(1),
@@ -5393,6 +5655,8 @@ export const LocalAuthoringArtifactDescriptorSchema = z
     locatorId: IdSchema,
     packageIdentity: z.string().regex(/^clip-[a-f0-9-]{36}$/),
     resultFingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+    // Optional so every historical YouTube-only descriptor remains readable.
+    sourceReference: AuthoringSourceReferenceSchema.optional(),
     manifest: z
       .object({
         schemaVersion: z.union([z.literal(1), z.literal(2)]),
@@ -6262,21 +6526,35 @@ export const WorkerTranslateTranscriptResponseSchema = z
   })
   .strict();
 
-export const TranscriptionJobPayloadSchema = z.object({
-  batchId: IdSchema,
-  catalogVideoId: IdSchema,
-  youtubeVideoId: z.string().min(1).max(64),
-  targetLanguage: z.string().min(2).max(35),
-  transcriptionProfile: z.string().trim().min(1).max(160),
-  sourcePolicy: BatchSourcePolicySchema,
-  executionLocation: z.enum(["local", "hosted"]),
-  priority: BatchPrioritySchema,
-  translationConsent: CloudTranslationConsentSchema.optional(),
-  creatorReportedLanguage: LanguageTagSchema.optional(),
-  /** Absent only for legacy queued work created before language gating. */
-  languageDecision: LanguageDecisionSnapshotSchema.optional(),
-  sourcePlan: TranscriptSourcePlanSchema.optional(),
-});
+export const TranscriptionJobPayloadSchema = z
+  .object({
+    batchId: IdSchema,
+    catalogVideoId: IdSchema,
+    youtubeVideoId: z.string().min(1).max(64),
+    sourceIdentity: SourceIdentityV1Schema.optional(),
+    targetLanguage: z.string().min(2).max(35),
+    transcriptionProfile: z.string().trim().min(1).max(160),
+    sourcePolicy: BatchSourcePolicySchema,
+    executionLocation: z.enum(["local", "hosted"]),
+    priority: BatchPrioritySchema,
+    translationConsent: CloudTranslationConsentSchema.optional(),
+    creatorReportedLanguage: LanguageTagSchema.optional(),
+    /** Absent only for legacy queued work created before language gating. */
+    languageDecision: LanguageDecisionSnapshotSchema.optional(),
+    sourcePlan: TranscriptSourcePlanSchema.optional(),
+  })
+  .superRefine((payload, context) => {
+    if (
+      payload.sourceIdentity?.provider === "youtube" &&
+      payload.sourceIdentity.providerMediaId !== payload.youtubeVideoId
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["sourceIdentity", "providerMediaId"],
+        message: "The job source identity must match its legacy YouTube ID.",
+      });
+    }
+  });
 
 export const WorkerFailureRequestSchema = z.object({
   attempt: z.number().int().positive(),
@@ -6335,6 +6613,32 @@ export type UpdatePreferredLanguageRequest = z.infer<
   typeof UpdatePreferredLanguageRequestSchema
 >;
 export type ProjectMember = z.infer<typeof ProjectMemberSchema>;
+export type SourceProvider = z.infer<typeof SourceProviderSchema>;
+export type SourceIdentityV1 = z.infer<typeof SourceIdentityV1Schema>;
+export type SourceFingerprintEvidence = z.infer<
+  typeof SourceFingerprintEvidenceSchema
+>;
+export type SourceRightsSnapshotV2 = z.infer<
+  typeof SourceRightsSnapshotV2Schema
+>;
+export type SourceRightsSnapshot = z.infer<typeof SourceRightsSnapshotSchema>;
+export type SourceOperation = z.infer<typeof SourceOperationSchema>;
+export type SourceCapabilityState = z.infer<typeof SourceCapabilityStateSchema>;
+export type SourceOperationCapability = z.infer<
+  typeof SourceOperationCapabilitySchema
+>;
+export type SourceProviderCapability = z.infer<
+  typeof SourceProviderCapabilitySchema
+>;
+export type SourceProviderCapabilitiesResponse = z.infer<
+  typeof SourceProviderCapabilitiesResponseSchema
+>;
+export type SourceSearchRequest = z.infer<typeof SourceSearchRequestSchema>;
+export type SourceSearchCandidate = z.infer<typeof SourceSearchCandidateSchema>;
+export type SourceSearchProviderOutcome = z.infer<
+  typeof SourceSearchProviderOutcomeSchema
+>;
+export type SourceSearchResponse = z.infer<typeof SourceSearchResponseSchema>;
 export type Video = z.infer<typeof VideoSchema>;
 export type ProjectVideo = z.infer<typeof ProjectVideoSchema>;
 export type LanguageDecisionStatus = z.infer<
@@ -6630,6 +6934,9 @@ export type ArtifactLocatorActionResult = z.infer<
 >;
 export type AuthoringArtifactDescriptorRequest = z.infer<
   typeof AuthoringArtifactDescriptorRequestSchema
+>;
+export type AuthoringSourceReference = z.infer<
+  typeof AuthoringSourceReferenceSchema
 >;
 export type LocalAuthoringArtifactDescriptor = z.infer<
   typeof LocalAuthoringArtifactDescriptorSchema

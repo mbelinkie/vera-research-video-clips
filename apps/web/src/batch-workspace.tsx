@@ -105,6 +105,10 @@ type BatchWorkspaceProps = {
   projects: readonly ProjectSummary[];
   destination: ProjectDestination;
   bulkAddRequest: number;
+  externalInputsRequest?: Readonly<{
+    generation: number;
+    inputs: readonly string[];
+  }>;
 };
 
 type WorklistView = "all" | "queue" | "reviewed" | "dismissed";
@@ -140,6 +144,7 @@ export function BatchWorkspace({
   projects,
   destination,
   bulkAddRequest,
+  externalInputsRequest,
 }: BatchWorkspaceProps) {
   const [batchName, setBatchName] = useState("Research batch");
   const [inputsText, setInputsText] = useState("");
@@ -250,6 +255,19 @@ export function BatchWorkspace({
     bulkInputsRef.current?.scrollIntoView({ block: "center" });
     bulkInputsRef.current?.focus();
   }, [bulkAddRequest]);
+
+  useEffect(() => {
+    if (!externalInputsRequest?.inputs.length) return;
+    setInputsText(externalInputsRequest.inputs.join("\n"));
+    setPreflight(undefined);
+    setMessage(
+      `${externalInputsRequest.inputs.length} selected search result${externalInputsRequest.inputs.length === 1 ? "" : "s"} loaded. Run preflight to check project duplicates before confirmation.`,
+    );
+    window.setTimeout(() => {
+      bulkInputsRef.current?.scrollIntoView({ block: "center" });
+      bulkInputsRef.current?.focus();
+    });
+  }, [externalInputsRequest?.generation]);
 
   const inputs = useMemo(
     () =>

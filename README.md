@@ -57,6 +57,19 @@ copies at most 500 nonempty values into the same editable preflight list. It
 does not submit automatically; duplicates and unsupported rows remain visible
 for the normal server preflight.
 
+The ingest Search tab uses the official YouTube Data API v3 and is enabled only
+when the cloud API has a backend-only key:
+
+```bash
+YOUTUBE_API_KEY=server-side-api-key
+```
+
+Search and preview do not add project records or enqueue processing. Selected
+results are copied into the existing editable batch preflight, where the user
+must explicitly confirm them. TikTok, Instagram, and Facebook remain visibly
+disabled unless a future deployment configures a qualifying official search
+adapter; they are not supported ingest platforms in this release.
+
 Caption acquisition is disabled by default. To opt into the local `yt-dlp`
 adapter for sources you are authorized to process, set:
 

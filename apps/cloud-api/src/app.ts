@@ -4,6 +4,7 @@ import { z, ZodError } from "zod";
 import { AuthenticationError } from "@research-video/auth";
 import {
   CatalogConflictError,
+  CatalogInvalidRequestError,
   type SharedProjectCatalog,
 } from "@research-video/catalog";
 import {
@@ -54,6 +55,9 @@ import {
   UpdateClipCandidateRequestSchema,
   ReviseExportPresetRequestSchema,
   SetExportPresetDefaultRequestSchema,
+  SourceProviderCapabilitiesResponseSchema,
+  SourceSearchRequestSchema,
+  SourceSearchResponseSchema,
   UpdatePreferredLanguageRequestSchema,
   FinalizeTranscriptRequestSchema,
   CreateManualTimedTranscriptImportRequestSchema,
@@ -86,10 +90,16 @@ import {
   type BatchOptions,
   type BatchPreflightItem,
   type BatchPreflightResponse,
+  type SourceOperationCapability,
+  type SourceProvider,
+  type SourceSearchProviderOutcome,
 } from "@research-video/contracts";
 import {
   normalizeYouTubeUrl,
+  SourceSearchProviderError,
   translateCanonicalTranscript,
+  youtubeSourceIdentity,
+  type SourceSearchProvider,
   type TranslationProvider,
   type VideoMetadataProvider,
 } from "@research-video/providers";
@@ -99,6 +109,7 @@ export interface CloudApiDependencies {
   catalog: SharedProjectCatalog;
   authenticate(request: FastifyRequest): Promise<AuthenticatedActor>;
   videoMetadataProvider?: VideoMetadataProvider;
+  sourceSearchProviders?: Partial<Record<SourceProvider, SourceSearchProvider>>;
   translationProvider?: TranslationProvider;
   queueDeliveryRequired?: boolean;
 }
@@ -543,12 +554,24 @@ export function createCloudApi(
   app.post("/api/projects/:projectId/videos", async (request, reply) => {
     const { projectId } = IdParamsSchema.parse(request.params);
     const body = AddProjectVideoRequestSchema.parse(request.body);
+    if (
+      body.sourceIdentity?.provider &&
+      body.sourceIdentity.provider !== "youtube"
+    ) {
+      throw new CatalogInvalidRequestError(
+        "Only YouTube sources are product-qualified for project ingest in this release.",
+      );
+    }
     const video = await catalog.addVideo(
       await authenticate(request),
       projectId,
       {
         youtubeVideoId: body.youtubeVideoId,
         canonicalUrl: body.canonicalUrl,
+        ...(body.sourceIdentity ? { sourceIdentity: body.sourceIdentity } : {}),
+        ...(body.sourceFingerprint
+          ? { sourceFingerprint: body.sourceFingerprint }
+          : {}),
         title: body.title,
         ...(body.durationMs === undefined
           ? {}
@@ -566,6 +589,73 @@ export function createCloudApi(
   app.get("/api/projects/:projectId/videos", async (request) => {
     const { projectId } = IdParamsSchema.parse(request.params);
     return catalog.listVideos(await authenticate(request), projectId);
+  });
+
+  app.get("/api/projects/:projectId/source-capabilities", async (request) => {
+    const { projectId } = IdParamsSchema.parse(request.params);
+    await catalog.getProject(await authenticate(request), projectId);
+    return SourceProviderCapabilitiesResponseSchema.parse(
+      buildSourceProviderCapabilities(
+        dependencies.sourceSearchProviders,
+        Boolean(dependencies.videoMetadataProvider),
+      ),
+    );
+  });
+
+  app.post("/api/projects/:projectId/source-search", async (request) => {
+    const { projectId } = IdParamsSchema.parse(request.params);
+    const actor = await authenticate(request);
+    await catalog.getProject(actor, projectId);
+    const body = SourceSearchRequestSchema.parse(request.body);
+    const outcomes = await Promise.all(
+      body.providers.map(
+        async (provider): Promise<SourceSearchProviderOutcome> => {
+          const adapter = dependencies.sourceSearchProviders?.[provider];
+          if (!adapter) {
+            return {
+              provider,
+              state: provider === "youtube" ? "unavailable" : "unsupported",
+              candidates: [],
+              explanation:
+                provider === "youtube"
+                  ? "YouTube search is not configured for this deployment."
+                  : `${providerDisplayName(provider)} official search is not available for this deployment.`,
+            };
+          }
+          try {
+            const page = await adapter.search({
+              query: body.query,
+              pageSize: body.pageSize,
+              ...(body.cursors?.[provider]
+                ? { cursor: body.cursors[provider] }
+                : {}),
+            });
+            return {
+              provider,
+              state: "success",
+              candidates: page.candidates,
+              ...(page.nextCursor ? { nextCursor: page.nextCursor } : {}),
+            };
+          } catch (error) {
+            if (error instanceof SourceSearchProviderError) {
+              return {
+                provider,
+                state: error.state,
+                candidates: [],
+                explanation: error.message,
+              };
+            }
+            return {
+              provider,
+              state: "failed",
+              candidates: [],
+              explanation: `${providerDisplayName(provider)} search failed. Try again.`,
+            };
+          }
+        },
+      ),
+    );
+    return SourceSearchResponseSchema.parse({ outcomes });
   });
 
   app.get("/api/projects/:projectId/worklist", async (request) => {
@@ -1131,6 +1221,7 @@ export function createCloudApi(
           {
             youtubeVideoId: normalized.videoId,
             canonicalUrl: normalized.canonicalUrl,
+            sourceIdentity: youtubeSourceIdentity(normalized.videoId),
             title: metadata.title,
             ...(metadata.channel ? { channel: metadata.channel } : {}),
             ...(metadata.durationMs === undefined
@@ -1540,6 +1631,90 @@ class CloudTranslationUnavailableError extends Error {
   }
 }
 
+const sourceOperations = [
+  "search",
+  "metadata",
+  "embed-preview",
+  "precise-navigation",
+  "captions",
+  "audio-acquisition",
+  "full-media-acquisition",
+  "availability",
+] as const;
+
+function buildSourceProviderCapabilities(
+  searchProviders:
+    Partial<Record<SourceProvider, SourceSearchProvider>> | undefined,
+  youtubeMetadataConfigured: boolean,
+) {
+  const providers: SourceProvider[] = [
+    "youtube",
+    "tiktok",
+    "instagram",
+    "facebook",
+  ];
+  return {
+    providers: providers.map((provider) => ({
+      provider,
+      operations: sourceOperations.map(
+        (operation): SourceOperationCapability => {
+          if (operation === "search") {
+            const configured = Boolean(searchProviders?.[provider]);
+            return {
+              operation,
+              state: configured
+                ? "available"
+                : provider === "youtube"
+                  ? "unavailable"
+                  : "unsupported",
+              configured,
+              ...(!configured
+                ? {
+                    explanation: providerSearchUnavailableExplanation(provider),
+                  }
+                : {}),
+            };
+          }
+          if (provider !== "youtube") {
+            return {
+              operation,
+              state: "unsupported",
+              configured: false,
+              explanation: `${providerDisplayName(provider)} is not product-qualified in this release.`,
+            };
+          }
+          if (operation === "metadata" && !youtubeMetadataConfigured) {
+            return {
+              operation,
+              state: "unavailable",
+              configured: false,
+              explanation: "YouTube metadata lookup is not configured.",
+            };
+          }
+          return { operation, state: "available", configured: true };
+        },
+      ),
+    })),
+  };
+}
+
+function providerDisplayName(provider: SourceProvider) {
+  if (provider === "youtube") return "YouTube";
+  if (provider === "tiktok") return "TikTok";
+  if (provider === "instagram") return "Instagram";
+  return "Facebook";
+}
+
+function providerSearchUnavailableExplanation(provider: SourceProvider) {
+  if (provider === "youtube") {
+    return "YouTube search requires a configured official Data API key.";
+  }
+  if (provider === "facebook") {
+    return "Facebook official search is limited to authorized Pages and assets and is not enabled.";
+  }
+  return `${providerDisplayName(provider)} search requires qualifying official API access and is not enabled.`;
+}
+
 export async function preflightTranscriptionBatch(
   catalog: SharedProjectCatalog,
   metadataProvider: VideoMetadataProvider,
@@ -1597,6 +1772,7 @@ export async function preflightTranscriptionBatch(
         processingNeed: "none",
         youtubeVideoId: entry.normalized.videoId,
         canonicalUrl: entry.normalized.canonicalUrl,
+        sourceIdentity: youtubeSourceIdentity(entry.normalized.videoId),
         duplicateOfInputIndex: firstIndex,
       });
       continue;
@@ -1613,6 +1789,7 @@ export async function preflightTranscriptionBatch(
         processingNeed: "reuse-shared",
         youtubeVideoId: entry.normalized.videoId,
         canonicalUrl: projectState.canonicalUrl,
+        sourceIdentity: youtubeSourceIdentity(entry.normalized.videoId),
         title: projectState.title,
         ...(projectState.channel ? { channel: projectState.channel } : {}),
         ...(projectState.durationMs === undefined
@@ -1635,6 +1812,7 @@ export async function preflightTranscriptionBatch(
         processingNeed: "transcription",
         youtubeVideoId: entry.normalized.videoId,
         canonicalUrl: entry.normalized.canonicalUrl,
+        sourceIdentity: youtubeSourceIdentity(entry.normalized.videoId),
         title: metadata.title,
         ...(metadata.channel ? { channel: metadata.channel } : {}),
         ...(metadata.durationMs === undefined

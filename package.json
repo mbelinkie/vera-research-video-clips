@@ -30,6 +30,7 @@
     "export:recover-source-scratch": "node --import tsx apps/local-agent/src/export-scratch-sweeper.ts",
     "export:live-smoke": "node --import tsx apps/local-agent/src/live-youtube-smoke.ts",
     "export:run-once": "node --import tsx apps/local-agent/src/export-run-once.ts",
+    "source:social-spike": "node --import tsx scripts/social-acquisition-spike.ts",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "fixture:media": "node --import tsx scripts/generate-media-fixture.ts",

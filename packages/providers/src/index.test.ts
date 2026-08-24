@@ -9,9 +9,12 @@ import {
   InvalidYouTubeUrlError,
   TranscriptSourceAcquirer,
   TranscriptSourceResolver,
+  YouTubeDataApiSearchProvider,
   YouTubeOEmbedMetadataProvider,
   normalizeYouTubeUrl,
   selectTranscriptSource,
+  SourceSearchProviderError,
+  youtubeSourceIdentity,
 } from "./index.ts";
 import {
   YtDlpCaptionProvider,
@@ -108,6 +111,93 @@ describe("normalizeYouTubeUrl", () => {
     expect(() =>
       normalizeYouTubeUrl("https://youtube.com/playlist?list=PL123"),
     ).toThrow(InvalidYouTubeUrlError);
+  });
+});
+
+describe("official YouTube search", () => {
+  it("normalizes bounded video-only results and preserves pagination", async () => {
+    const fetcher = vi.fn(
+      async (input: URL | RequestInfo) =>
+        new Response(
+          JSON.stringify({
+            nextPageToken: "next-page",
+            items: [
+              {
+                id: { videoId: "M7lc1UVf-VE" },
+                snippet: {
+                  title: "Research &amp; reporting",
+                  channelTitle: "Fixture Channel",
+                  publishedAt: "2026-08-24T12:00:00Z",
+                  thumbnails: {
+                    high: {
+                      url: "https://i.ytimg.com/vi/M7lc1UVf-VE/hqdefault.jpg",
+                    },
+                  },
+                },
+              },
+            ],
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+    );
+    const provider = new YouTubeDataApiSearchProvider(
+      "server-only-key",
+      fetcher as typeof fetch,
+      "https://youtube.test/search",
+    );
+
+    await expect(
+      provider.search({ query: "research workflow", pageSize: 100 }),
+    ).resolves.toEqual({
+      candidates: [
+        expect.objectContaining({
+          sourceIdentity: youtubeSourceIdentity("M7lc1UVf-VE"),
+          title: "Research & reporting",
+          creator: "Fixture Channel",
+          availability: "available",
+        }),
+      ],
+      nextCursor: "next-page",
+    });
+    const requested = new URL(String(fetcher.mock.calls[0]?.[0]));
+    expect(requested.searchParams.get("type")).toBe("video");
+    expect(requested.searchParams.get("videoEmbeddable")).toBe("true");
+    expect(requested.searchParams.get("videoSyndicated")).toBe("true");
+    expect(requested.searchParams.get("maxResults")).toBe("25");
+    expect(requested.searchParams.get("key")).toBe("server-only-key");
+  });
+
+  it("classifies quota and credential errors without exposing raw responses", async () => {
+    const quota = new YouTubeDataApiSearchProvider(
+      "secret",
+      (async () =>
+        new Response(
+          JSON.stringify({
+            error: { errors: [{ reason: "quotaExceeded" }] },
+          }),
+          { status: 403 },
+        )) as typeof fetch,
+    );
+    await expect(
+      quota.search({ query: "fixture", pageSize: 10 }),
+    ).rejects.toMatchObject({
+      state: "quota-limited",
+      message: expect.not.stringContaining("secret"),
+    } satisfies Partial<SourceSearchProviderError>);
+
+    const invalid = new YouTubeDataApiSearchProvider(
+      "secret",
+      (async () =>
+        new Response(
+          JSON.stringify({ error: { errors: [{ reason: "keyInvalid" }] } }),
+          { status: 403 },
+        )) as typeof fetch,
+    );
+    await expect(
+      invalid.search({ query: "fixture", pageSize: 10 }),
+    ).rejects.toMatchObject({
+      state: "auth-required",
+    });
   });
 });
 

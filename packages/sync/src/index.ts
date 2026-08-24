@@ -972,6 +972,12 @@ export class SharedTranscriptWorkspaceService {
       projectId,
       catalogVideoId,
       youtubeVideoId: resolution.bundle.manifest.videoId,
+      sourceIdentity: {
+        schemaVersion: 1,
+        provider: "youtube",
+        providerMediaId: resolution.bundle.manifest.videoId,
+        canonicalUrl: `https://www.youtube.com/watch?v=${resolution.bundle.manifest.videoId}`,
+      },
       transcriptVersionId: resolution.bundle.transcriptVersionId,
       source: resolution.source,
       catalogState: resolution.catalogState,

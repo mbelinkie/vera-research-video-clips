@@ -88,6 +88,9 @@ import {
   CreateProjectRequestSchema,
   ProjectSummarySchema,
   ProjectSchema,
+  SourceIdentityV1Schema,
+  SourceRightsSnapshotSchema,
+  SourceSearchRequestSchema,
   ProjectVideoWorklistPageSchema,
   ProjectVideoWorklistQuerySchema,
   ProjectLocalProcessingStatusSchema,
@@ -134,6 +137,44 @@ const now = "2026-08-01T12:00:00.000Z";
 const id = "019fbb95-cd76-7920-93fa-e23ba755ee3f";
 
 describe("shared contracts", () => {
+  it("keeps provider media identity composite and bounds mixed search requests", () => {
+    const youtube = SourceIdentityV1Schema.parse({
+      schemaVersion: 1,
+      provider: "youtube",
+      providerMediaId: "same-provider-id",
+      canonicalUrl: "https://www.youtube.com/watch?v=M7lc1UVf-VE",
+    });
+    const tiktok = SourceIdentityV1Schema.parse({
+      ...youtube,
+      provider: "tiktok",
+      canonicalUrl: "https://www.tiktok.com/@fixture/video/same-provider-id",
+    });
+    expect(`${youtube.provider}:${youtube.providerMediaId}`).not.toBe(
+      `${tiktok.provider}:${tiktok.providerMediaId}`,
+    );
+    expect(
+      SourceSearchRequestSchema.parse({
+        query: "research workflow",
+        providers: ["youtube", "tiktok"],
+        cursors: { youtube: "page-two" },
+      }),
+    ).toMatchObject({ pageSize: 12, providers: ["youtube", "tiktok"] });
+    expect(() =>
+      SourceSearchRequestSchema.parse({
+        query: "fixture",
+        providers: ["youtube", "youtube"],
+      }),
+    ).toThrow("unique");
+    expect(
+      SourceRightsSnapshotSchema.parse({
+        schemaVersion: 2,
+        sourceIdentity: tiktok,
+        confirmation: "authorized_to_process",
+        disclosureVersion: 1,
+      }),
+    ).toMatchObject({ schemaVersion: 2, sourceIdentity: tiktok });
+  });
+
   it("normalizes and bounds project keyword governance", () => {
     const actor = {
       userId: id,

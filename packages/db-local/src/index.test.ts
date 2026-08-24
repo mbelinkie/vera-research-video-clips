@@ -166,6 +166,7 @@ describe("local migrations", () => {
       "0028_desktop_setup_and_validated_components",
       "0029_verified_transcript_cache_authorizations",
       "0030_export_source_rights_and_terminal_reconciliation",
+      "0031_platform_neutral_source_identity",
     ]);
     expect(runLocalMigrations(database)).toEqual([]);
     expect(
@@ -500,6 +501,7 @@ describe("local migrations", () => {
       "0028_desktop_setup_and_validated_components",
       "0029_verified_transcript_cache_authorizations",
       "0030_export_source_rights_and_terminal_reconciliation",
+      "0031_platform_neutral_source_identity",
     ]);
     expect(
       database
@@ -551,6 +553,7 @@ describe("local migrations", () => {
     expect(runLocalMigrations(database)).toEqual([
       "0029_verified_transcript_cache_authorizations",
       "0030_export_source_rights_and_terminal_reconciliation",
+      "0031_platform_neutral_source_identity",
     ]);
     expect(
       database
@@ -859,6 +862,7 @@ describe("local migrations", () => {
       "0028_desktop_setup_and_validated_components",
       "0029_verified_transcript_cache_authorizations",
       "0030_export_source_rights_and_terminal_reconciliation",
+      "0031_platform_neutral_source_identity",
     ]);
     expect(
       database
@@ -1043,6 +1047,7 @@ describe("local migrations", () => {
       "0028_desktop_setup_and_validated_components",
       "0029_verified_transcript_cache_authorizations",
       "0030_export_source_rights_and_terminal_reconciliation",
+      "0031_platform_neutral_source_identity",
     ]);
     expect(
       database.prepare("SELECT * FROM export_final_artifacts").all(),
@@ -1183,6 +1188,7 @@ describe("local migrations", () => {
       "0028_desktop_setup_and_validated_components",
       "0029_verified_transcript_cache_authorizations",
       "0030_export_source_rights_and_terminal_reconciliation",
+      "0031_platform_neutral_source_identity",
     ]);
     expect(
       database
@@ -2399,6 +2405,7 @@ describe("logged export delivery import", () => {
       "0028_desktop_setup_and_validated_components",
       "0029_verified_transcript_cache_authorizations",
       "0030_export_source_rights_and_terminal_reconciliation",
+      "0031_platform_neutral_source_identity",
     ]);
     const after = new LocalExportQueue(database).get(before.id);
     expect(after).toEqual(before);
@@ -2476,6 +2483,7 @@ describe("logged export delivery import", () => {
       "0028_desktop_setup_and_validated_components",
       "0029_verified_transcript_cache_authorizations",
       "0030_export_source_rights_and_terminal_reconciliation",
+      "0031_platform_neutral_source_identity",
     ]);
     expect(
       new LocalExportQueue(database).getAcceptedLoggedDelivery(

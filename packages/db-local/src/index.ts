@@ -54,6 +54,7 @@ import {
   type LocalComponentReference,
   type SetupSelectionTarget,
   type SetupSnapshot,
+  type SourceIdentityV1,
 } from "@research-video/contracts";
 import {
   resolveExportSettings,
@@ -1736,9 +1737,10 @@ export class LocalExportQueue {
         .prepare(
           `INSERT INTO logged_export_source_groups
              (id, compatibility_key, project_id, batch_id, youtube_video_id,
+              source_provider, provider_media_id, canonical_url,
               acquisition_profile_fingerprint, worker_id, worker_epoch,
               lifecycle_state, created_at, expires_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'acquiring', ?, ?, ?)`,
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'acquiring', ?, ?, ?)`,
         )
         .run(
           input.groupId,
@@ -1746,6 +1748,9 @@ export class LocalExportQueue {
           first.request.projectId!,
           first.sourceGroup.batchId,
           first.request.video.youtubeVideoId,
+          "youtube",
+          first.request.video.youtubeVideoId,
+          first.request.video.canonicalUrl,
           input.acquisitionProfileFingerprint,
           first.workerId,
           first.workerEpoch,
@@ -3668,6 +3673,7 @@ export type LocalLoggedExportSourceGroup = {
   projectId: string;
   batchId: string;
   youtubeVideoId: string;
+  sourceIdentity: SourceIdentityV1;
   acquisitionProfileFingerprint: string;
   workerId: string;
   workerEpoch: number;
@@ -4862,6 +4868,20 @@ function mapLocalLoggedExportSourceGroup(
     projectId: String(row.project_id),
     batchId: String(row.batch_id),
     youtubeVideoId: String(row.youtube_video_id),
+    sourceIdentity: {
+      schemaVersion: 1,
+      provider:
+        row.source_provider === "tiktok" ||
+        row.source_provider === "instagram" ||
+        row.source_provider === "facebook"
+          ? row.source_provider
+          : "youtube",
+      providerMediaId: String(row.provider_media_id ?? row.youtube_video_id),
+      canonicalUrl: String(
+        row.canonical_url ??
+          `https://www.youtube.com/watch?v=${String(row.provider_media_id ?? row.youtube_video_id)}`,
+      ),
+    },
     acquisitionProfileFingerprint: String(row.acquisition_profile_fingerprint),
     workerId: String(row.worker_id),
     workerEpoch: Number(row.worker_epoch),
