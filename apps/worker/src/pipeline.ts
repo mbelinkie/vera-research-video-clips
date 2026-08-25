@@ -388,12 +388,25 @@ async function resolveSourceTranscript(
     }
     try {
       await context.setStage("acquiring");
-      const caption = await options.captions.acquire(
-        payload.youtubeVideoId,
-        plan.track,
-        scratch,
-        context.signal,
-      );
+      let caption: Awaited<
+        ReturnType<NonNullable<typeof options.captions>["acquire"]>
+      > | undefined;
+      let acquisitionError: unknown;
+      for (let attempt = 1; attempt <= 2; attempt += 1) {
+        try {
+          caption = await options.captions.acquire(
+            payload.youtubeVideoId,
+            plan.track,
+            scratch,
+            context.signal,
+          );
+          break;
+        } catch (error) {
+          if (context.signal.aborted) throw context.signal.reason;
+          acquisitionError = error;
+        }
+      }
+      if (!caption) throw acquisitionError;
       const transcript = await normalizeAcquiredCaption(caption);
       return { transcript };
     } catch (error) {

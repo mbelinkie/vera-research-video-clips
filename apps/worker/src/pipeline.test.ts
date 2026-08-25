@@ -407,6 +407,23 @@ describe("transcript pipeline", () => {
     const publication = publicationFixture();
     const media = { acquireAuthorizedSource: vi.fn() };
     const speechToText = { transcribe: vi.fn() };
+    const acquire = vi.fn(async (videoId, track, scratch) => {
+      if (acquire.mock.calls.length === 1) {
+        throw new Error("transient caption request failure");
+      }
+      const path = join(scratch, "caption.vtt");
+      const contents =
+        "WEBVTT\nKind: captions\nLanguage: es\n\n00:00.500 --> 00:02.500\nEste es un ejemplo breve.\n";
+      await writeFile(path, contents);
+      return {
+        videoId,
+        track,
+        path,
+        format: "vtt" as const,
+        byteSize: Buffer.byteLength(contents),
+        provider: "fixture",
+      };
+    });
     const executor = createTranscriptPipelineExecutor({
       scratchRoot,
       publication: publication.client,
@@ -420,20 +437,7 @@ describe("transcript pipeline", () => {
             downloadAccess: "available",
           },
         ],
-        acquire: async (videoId, track, scratch) => {
-          const path = join(scratch, "caption.vtt");
-          const contents =
-            "WEBVTT\nKind: captions\nLanguage: es\n\n00:00.500 --> 00:02.500\nEste es un ejemplo breve.\n";
-          await writeFile(path, contents);
-          return {
-            videoId,
-            track,
-            path,
-            format: "vtt",
-            byteSize: Buffer.byteLength(contents),
-            provider: "fixture",
-          };
-        },
+        acquire,
       },
       media,
       speechToText,
@@ -471,6 +475,7 @@ describe("transcript pipeline", () => {
 
     expect(media.acquireAuthorizedSource).not.toHaveBeenCalled();
     expect(speechToText.transcribe).not.toHaveBeenCalled();
+    expect(acquire).toHaveBeenCalledTimes(2);
     expect(stages).toEqual([
       "resolving",
       "acquiring",

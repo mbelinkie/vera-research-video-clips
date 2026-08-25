@@ -137,13 +137,25 @@ export class HttpArtifactDownloader implements TranscriptArtifactDownloader {
   ) {}
 
   async download(target: TranscriptDownloadTarget): Promise<Uint8Array> {
+    const targetUrl = new URL(target.downloadUrl);
+    const isAuthenticatedTranscriptArtifact =
+      /^\/api\/projects\/[0-9a-f-]+\/videos\/[0-9a-f-]+\/transcripts\/[0-9a-f-]+\/artifacts\/[a-z-]+$/iu.test(
+        targetUrl.pathname,
+      );
+    const requestUrl =
+      this.authenticatedRequest && isAuthenticatedTranscriptArtifact
+        ? new URL(
+            `${targetUrl.pathname}${targetUrl.search}`,
+            this.authenticatedRequest.origin,
+          ).toString()
+        : target.downloadUrl;
     const headers =
       this.authenticatedRequest &&
-      new URL(target.downloadUrl).origin ===
+      new URL(requestUrl).origin ===
         new URL(this.authenticatedRequest.origin).origin
         ? { authorization: this.authenticatedRequest.authorization }
         : undefined;
-    const response = await fetch(target.downloadUrl, {
+    const response = await fetch(requestUrl, {
       method: "GET",
       redirect: "error",
       ...(headers ? { headers } : {}),

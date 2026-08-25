@@ -65,7 +65,7 @@ describe("HTTP transcript artifact downloader", () => {
     const fetcher = vi.fn(async () => new Response("{}", { status: 200 }));
     vi.stubGlobal("fetch", fetcher);
     const downloader = new HttpArtifactDownloader({
-      origin: "https://api.example.test",
+      origin: "http://127.0.0.1:43123",
       authorization: "Bearer desktop-session",
     });
     const target = {
@@ -75,16 +75,19 @@ describe("HTTP transcript artifact downloader", () => {
       byteSize: 2,
       sha256: createHash("sha256").update("{}").digest("hex"),
       downloadUrl:
-        "https://api.example.test/api/projects/project/videos/video/transcripts/version/artifacts/manifest",
+        `https://api.example.test/api/projects/${randomUUID()}/videos/${randomUUID()}/transcripts/${randomUUID()}/artifacts/manifest`,
     };
 
     try {
       await downloader.download(target);
-      expect(fetcher).toHaveBeenLastCalledWith(target.downloadUrl, {
-        method: "GET",
-        redirect: "error",
-        headers: { authorization: "Bearer desktop-session" },
-      });
+      expect(fetcher).toHaveBeenLastCalledWith(
+        `http://127.0.0.1:43123${new URL(target.downloadUrl).pathname}`,
+        {
+          method: "GET",
+          redirect: "error",
+          headers: { authorization: "Bearer desktop-session" },
+        },
+      );
 
       const external = {
         ...target,

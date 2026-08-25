@@ -87,6 +87,7 @@ const jobQueue =
     : undefined;
 const app = createCloudApi({
   catalog,
+  verifyActiveTranscriptArtifacts: config.objectStoreMode === "memory",
   ...(config.publicApiOrigin
     ? { publicApiOrigin: config.publicApiOrigin }
     : {}),

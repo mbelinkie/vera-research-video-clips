@@ -137,6 +137,7 @@ export interface CloudApiDependencies {
   catalog: SharedProjectCatalog;
   authenticate(request: FastifyRequest): Promise<AuthenticatedActor>;
   publicApiOrigin?: string;
+  verifyActiveTranscriptArtifacts?: boolean;
   videoMetadataProvider?: VideoMetadataProvider;
   sourceSearchProviders?: Partial<Record<SourceProvider, SourceSearchProvider>>;
   translationProvider?: TranslationProvider;
@@ -1654,7 +1655,7 @@ export function createCloudApi(
         projectId,
         body.inputs,
         body,
-        Boolean(dependencies.publicApiOrigin),
+        Boolean(dependencies.verifyActiveTranscriptArtifacts),
       );
     });
 
@@ -1671,7 +1672,7 @@ export function createCloudApi(
           projectId,
           body.inputs,
           body,
-          Boolean(dependencies.publicApiOrigin),
+          Boolean(dependencies.verifyActiveTranscriptArtifacts),
         );
         const created = await catalog.createTranscriptionBatch(actor, {
           projectId,
