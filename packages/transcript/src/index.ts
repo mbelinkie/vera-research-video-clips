@@ -1820,44 +1820,45 @@ function parseWebVtt(input: string): ParsedCue[] {
       : lines;
   const blocks = bodyLines.join("\n").split(/\n{2,}/u);
   const cues: ParsedCue[] = [];
+  let parsedCueCount = 0;
   for (const rawBlock of blocks) {
     const block = rawBlock.trim();
     if (!block) continue;
     const blockLines = block.split("\n");
     const first = blockLines[0]!.trim();
     if (/^(?:NOTE(?:[\t ].*)?|STYLE|REGION)$/u.test(first)) continue;
+    const cueNumber = ++parsedCueCount;
+    if (parsedCueCount > maxWebVttCues) {
+      throw new WebVttNormalizationError(
+        "WebVTT input exceeds the 100,000 cue limit.",
+      );
+    }
     const timingIndex = first.includes("-->") ? 0 : 1;
     const timing = blockLines[timingIndex]?.trim();
     if (!timing || !timing.includes("-->")) {
       throw new WebVttNormalizationError(
-        `WebVTT cue ${cues.length + 1} has no timing line.`,
+        `WebVTT cue ${cueNumber} has no timing line.`,
       );
     }
     const match = /^(\S+)\s+-->\s+(\S+)(?:\s+.*)?$/u.exec(timing);
     if (!match?.[1] || !match[2]) {
       throw new WebVttNormalizationError(
-        `WebVTT cue ${cues.length + 1} has invalid timing.`,
+        `WebVTT cue ${cueNumber} has invalid timing.`,
       );
     }
     const startMs = parseWebVttTimestamp(match[1]);
     const endMs = parseWebVttTimestamp(match[2]);
     if (endMs <= startMs) {
       throw new WebVttNormalizationError(
-        `WebVTT cue ${cues.length + 1} must end after it starts.`,
+        `WebVTT cue ${cueNumber} must end after it starts.`,
       );
     }
     const text = normalizeCueText(blockLines.slice(timingIndex + 1));
-    if (!text) {
-      throw new WebVttNormalizationError(
-        `WebVTT cue ${cues.length + 1} has no readable text.`,
-      );
-    }
+    // YouTube automatic captions emit empty transition cues between rolling
+    // lines. They carry no transcript content, so ignore them while retaining
+    // strict validation for timing and for files with no usable cues at all.
+    if (!text) continue;
     cues.push({ inputOrdinal: cues.length, startMs, endMs, text });
-    if (cues.length > maxWebVttCues) {
-      throw new WebVttNormalizationError(
-        "WebVTT input exceeds the 100,000 cue limit.",
-      );
-    }
   }
   if (cues.length === 0) {
     throw new WebVttNormalizationError("WebVTT input contains no usable cues.");

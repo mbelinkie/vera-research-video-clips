@@ -894,6 +894,22 @@ describe("WebVTT normalization", () => {
     });
   });
 
+  it("ignores empty YouTube transition cues when readable cues remain", async () => {
+    const transcript = await normalizeWebVttCaption({
+      contents:
+        "WEBVTT\nKind: captions\nLanguage: en\n\n00:00.000 --> 00:01.000 align:start position:0%\nFirst line\n\n00:01.000 --> 00:01.010 align:start position:0%\n \n \n\n00:01.010 --> 00:02.000 align:start position:0%\nSecond line\n",
+      videoId: "M7lc1UVf-VE",
+      language: "en",
+      source: "youtube-auto",
+      provider: "yt-dlp",
+    });
+
+    expect(transcript.segments).toMatchObject([
+      { ordinal: 0, startMs: 0, endMs: 1_000, text: "First line" },
+      { ordinal: 1, startMs: 1_010, endMs: 2_000, text: "Second line" },
+    ]);
+  });
+
   it.each([
     ["missing header", "00:00.000 --> 00:01.000\nText"],
     ["invalid timestamp", "WEBVTT\n\n00:61.000 --> 00:62.000\nText"],
