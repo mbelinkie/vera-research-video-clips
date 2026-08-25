@@ -7103,6 +7103,52 @@ describe("claimed transcript finalization", () => {
         "uploading",
       ),
     ).rejects.toMatchObject({ statusCode: 403 });
+
+    const revisionBatch = await catalog.createTranscriptionBatch(actor, {
+      projectId: project.id,
+      name: "Worker caption revision",
+      options: {
+        targetLanguage: "en",
+        transcriptionProfile: "caption-revision",
+        sourcePolicy: "force-generate",
+        executionLocation: "local",
+        priority: "normal",
+      },
+      items: [
+        {
+          inputIndex: 0,
+          input: "https://youtu.be/M7lc1UVf-VE",
+          status: "ready",
+          processingNeed: "transcription",
+          youtubeVideoId: "M7lc1UVf-VE",
+          canonicalUrl: "https://www.youtube.com/watch?v=M7lc1UVf-VE",
+          title: "Fixture video",
+          sourceLanguage: "en",
+        },
+      ],
+    });
+    const revisionClaim = await catalog.claimTranscriptionJob(
+      actor,
+      "local",
+      120,
+    );
+    expect(revisionClaim?.job.id).toBe(revisionBatch.items[0]?.jobId);
+    const revisionGrant = await catalog.createClaimedTranscriptUpload(
+      actor,
+      revisionClaim!.job.id,
+      revisionClaim!.lease.attempt,
+      {
+        lineageId,
+        version: 1,
+        artifactTypes: ["english-normalized", "english-srt"],
+      },
+    );
+    expect(revisionGrant.version).toBe(2);
+    expect(
+      revisionGrant.targets.every((target) =>
+        target.objectKey.includes(`/v${revisionGrant.version}/`),
+      ),
+    ).toBe(true);
   });
 });
 

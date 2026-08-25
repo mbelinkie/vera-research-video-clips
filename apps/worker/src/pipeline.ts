@@ -205,7 +205,6 @@ export function createTranscriptPipelineExecutor(
       const lineageId = await stableUuid(
         `lineage:${claimed.job.projectId}:${payload.catalogVideoId}:${source.track.language}:${payload.targetLanguage}:${languageDecisionIdentity(payload.languageDecision)}`,
       );
-      const version = 1;
       const requiresTranslation =
         primaryLanguage(source.track.language) !==
         primaryLanguage(payload.targetLanguage);
@@ -220,9 +219,10 @@ export function createTranscriptPipelineExecutor(
       const grant = await options.publication.createUpload(claimed.job.id, {
         attempt: claimed.lease.attempt,
         lineageId,
-        version,
+        version: 1,
         artifactTypes,
       });
+      const version = grant.version;
       const finalizedArtifacts: FinalizedObject[] = [];
       let uploadedTranslationSource:
         (FinalizedObject & { type: "original-normalized" }) | undefined;

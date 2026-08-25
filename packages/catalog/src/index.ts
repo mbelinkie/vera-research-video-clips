@@ -12692,8 +12692,7 @@ export class SharedProjectCatalog {
       if (
         String(existing.project_id) !== projectId ||
         String(existing.video_id) !== catalogVideoId ||
-        String(existing.lineage_id) !== input.lineageId ||
-        Number(existing.version) !== input.version
+        String(existing.lineage_id) !== input.lineageId
       ) {
         throw new CatalogConflictError(
           "The claimed job already has a different transcript upload.",
@@ -12733,7 +12732,7 @@ export class SharedProjectCatalog {
         projectId,
         catalogVideoId,
         lineageId: input.lineageId,
-        version: input.version,
+        version: Number(existing.version),
         expiresAt: expiresAt.toISOString(),
         targets: await Promise.all(
           [...targets].map(async ([type, objectKey]) => ({
@@ -12748,10 +12747,20 @@ export class SharedProjectCatalog {
       });
     }
 
+    const latestVersion = await this.database.query<DbRow>(
+      `SELECT coalesce(max(version), 0)::integer AS version
+       FROM transcript_versions
+       WHERE project_id = $1 AND video_id = $2 AND lineage_id = $3`,
+      [projectId, catalogVideoId, input.lineageId],
+    );
+    const version = Math.max(
+      input.version,
+      Number(latestVersion.rows[0]?.version ?? 0) + 1,
+    );
     const uploadId = randomUUID();
     const createdAt = this.now();
     const allTypes: ArtifactType[] = ["manifest", ...artifactTypes];
-    const prefix = `projects/${projectId}/videos/${catalogVideoId}/transcripts/${input.lineageId}/v${input.version}/${uploadId}`;
+    const prefix = `projects/${projectId}/videos/${catalogVideoId}/transcripts/${input.lineageId}/v${version}/${uploadId}`;
     const targets = await Promise.all(
       allTypes.map(async (type) => {
         const objectKey = `${prefix}/${type}.json`;
@@ -12791,7 +12800,7 @@ export class SharedProjectCatalog {
           projectId,
           catalogVideoId,
           input.lineageId,
-          input.version,
+          version,
           expiresAt.toISOString(),
           actor.userId,
           createdAt.toISOString(),
@@ -12817,7 +12826,7 @@ export class SharedProjectCatalog {
       projectId,
       catalogVideoId,
       lineageId: input.lineageId,
-      version: input.version,
+      version,
       expiresAt: expiresAt.toISOString(),
       targets,
     });
