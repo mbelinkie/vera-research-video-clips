@@ -141,8 +141,16 @@ must explicitly confirm them. TikTok, Instagram, and Facebook remain visibly
 disabled unless a future deployment configures a qualifying official search
 adapter; they are not supported ingest platforms in this release.
 
-Caption acquisition is disabled by default. To opt into the local `yt-dlp`
-adapter for sources you are authorized to process, set:
+The normal transcript-acquisition order is: reuse the exact verified shared
+transcript when one exists; otherwise prefer a downloadable YouTube caption
+(manual before automatic, and the target language before another language);
+only then fall back to configured speech recognition. Local Whisper is a
+captionless-source recovery path, not the primary path. `Force generation` is
+the explicit exception.
+
+Caption acquisition is disabled by default in an unconfigured source checkout.
+To opt into the local `yt-dlp` adapter for sources you are authorized to
+process, set:
 
 ```bash
 CAPTION_PROVIDER=yt-dlp

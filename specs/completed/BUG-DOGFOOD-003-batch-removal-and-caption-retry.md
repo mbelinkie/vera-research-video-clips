@@ -76,3 +76,77 @@ draggable, keyboard-accessible divider.
 3. `npm test -- apps/web/src/transcription-action-batch.test.ts`
 4. `npm test -- apps/worker/src/pipeline.test.ts packages/transcript/src/index.test.ts`
 5. `npm run typecheck`
+
+## Completion record — 2026-08-25
+
+### Decisions
+
+- The default acquisition hierarchy remains verified shared transcript,
+  downloadable YouTube manual caption, downloadable YouTube automatic caption,
+  and only then configured local speech recognition. Whisper is the recovery
+  path for captionless or unusable-caption sources, not the ordinary path.
+- Batch removal is a soft archive. Audit records and direct-ID reads remain
+  intact, while archived batches disappear from the ordinary list.
+- A verified-artifact preflight result is authoritative through insertion so a
+  stale database pointer cannot silently turn queued recovery back into
+  `existing-transcript`.
+- Empty, timed YouTube WebVTT transition cues are ignored when the document has
+  readable cues; an entirely empty caption remains invalid.
+- Republished caption transcripts allocate the next lineage version instead of
+  colliding with an earlier Whisper transcript at version 1.
+
+### Implementation
+
+- Added versioned cancel-all/archive controls, exact-video transcript retry,
+  Logged-destination isolation, and a persisted accessible transcript divider
+  across the shared contracts/catalog/API and web workspace.
+- Added authenticated development upload/download proxying for transcript
+  artifacts and stale-pointer recovery for the memory-backed development
+  object store.
+- Hardened WebVTT normalization and transcript revision allocation, with
+  focused regressions in the cloud API, catalog, worker, sync, transcript, and
+  web suites.
+- Primary implementation files include `apps/cloud-api/src/app.ts`,
+  `apps/web/src/batch-workspace.tsx`, `apps/web/src/workspace-shell.tsx`,
+  `apps/worker/src/pipeline.ts`, `packages/catalog/src/index.ts`,
+  `packages/contracts/src/index.ts`, `packages/sync/src/index.ts`, and
+  `packages/transcript/src/index.ts`.
+
+### Verification
+
+- `npm run typecheck` passed.
+- The focused stale-pointer cloud API regression passed.
+- The focused catalog claimed-finalization/revision regression passed.
+- Worker and transcript suites passed: 49 tests.
+- Formatting and `git diff --check` passed.
+- The packaged macOS app loaded YouTube video `-78bl92WZHY` from the manual
+  `en-US` track (`manual-target-language`) and published transcript version
+  `f8e9c5c6-acc5-8998-aee7-65e0b24b4fef` without Whisper.
+- The packaged app also loaded `sJfHiHXGNE8` from the automatic `en-orig` track
+  (`automatic-target-language`) and published a review-ready transcript without
+  Whisper.
+- On the Lobsang transcript, exact-text search for `love` advanced to `2 of 13`;
+  clicking the visible `2:08` cue moved playback to `2:08` and reported
+  `Cue requested 2:08.`
+- The transcript panel was widened to 60% through the persisted resize control.
+- A disposable live batch was canceled with `cancel_all`, archived, and then
+  confirmed absent from the ordinary batch list.
+- The app was left open on the working Lobsang transcript after verification.
+
+### Remaining risk
+
+- The low-cost development backend uses an in-memory object store. Restarting
+  that backend discards artifact bytes while durable metadata remains; the new
+  recovery path requeues the transcript, but production should use the planned
+  durable S3 object store.
+
+### Commits
+
+- `29c55b5` — Fix transcript retry and batch workspace cleanup
+- `6ffb623` — Proxy development transcript artifact uploads
+- `ca74e6d` — Proxy development transcript artifact downloads
+- `93aae3a` — Reprocess unavailable active transcripts
+- `5b70ca7` — Route transcript downloads through desktop proxy
+- `efa93e2` — Queue recovery for stale transcript pointers
+- `10a0976` — Accept empty YouTube caption transition cues
+- `44ed5a9` — Version revised caption transcripts correctly
