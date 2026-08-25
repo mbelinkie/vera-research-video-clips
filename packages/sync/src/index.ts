@@ -129,10 +129,24 @@ export class ObjectStoreArtifactDownloader implements TranscriptArtifactDownload
 }
 
 export class HttpArtifactDownloader implements TranscriptArtifactDownloader {
+  constructor(
+    private readonly authenticatedRequest?: {
+      origin: string;
+      authorization: string;
+    },
+  ) {}
+
   async download(target: TranscriptDownloadTarget): Promise<Uint8Array> {
+    const headers =
+      this.authenticatedRequest &&
+      new URL(target.downloadUrl).origin ===
+        new URL(this.authenticatedRequest.origin).origin
+        ? { authorization: this.authenticatedRequest.authorization }
+        : undefined;
     const response = await fetch(target.downloadUrl, {
       method: "GET",
       redirect: "error",
+      ...(headers ? { headers } : {}),
     });
     if (!response.ok) {
       throw new LocalCacheIntegrityError(

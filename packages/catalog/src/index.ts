@@ -407,6 +407,7 @@ import {
 import {
   MemoryStagedUploadUrlIssuer,
   type StagedUploadUrlIssuer,
+  type StoredObject,
   type TranscriptObjectStore,
 } from "@research-video/storage";
 import { normalizeManualTimedBilingualImport } from "@research-video/transcript";
@@ -13486,6 +13487,43 @@ export class SharedProjectCatalog {
       catalogVideoId,
       String(row.active_transcript_version_id),
     );
+  }
+
+  async getActiveTranscriptArtifact(
+    actor: AuthenticatedActor,
+    projectId: string,
+    catalogVideoId: string,
+    transcriptVersionId: string,
+    artifactType: TranscriptArtifact["type"],
+  ): Promise<StoredObject> {
+    const bundle = await this.getActiveTranscript(
+      actor,
+      projectId,
+      catalogVideoId,
+    );
+    if (bundle.transcriptVersionId !== transcriptVersionId) {
+      throw new CatalogNotFoundError("Transcript version is not active.");
+    }
+    const descriptor = bundle.downloads.find(
+      (candidate) => candidate.type === artifactType,
+    );
+    if (!descriptor) {
+      throw new CatalogNotFoundError("Transcript artifact not found.");
+    }
+    const object = await this.store.get(
+      descriptor.objectKey,
+      descriptor.objectVersionId,
+    );
+    if (
+      !object ||
+      object.bytes.byteLength !== descriptor.byteSize ||
+      sha256(object.bytes) !== descriptor.sha256
+    ) {
+      throw new TranscriptIntegrityError(
+        "Transcript artifact does not match its active descriptor.",
+      );
+    }
+    return object;
   }
 
   private async loadTranscriptBundleByVersion(

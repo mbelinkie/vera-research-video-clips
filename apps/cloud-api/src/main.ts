@@ -87,6 +87,9 @@ const jobQueue =
     : undefined;
 const app = createCloudApi({
   catalog,
+  ...(config.publicApiOrigin
+    ? { publicApiOrigin: config.publicApiOrigin }
+    : {}),
   authenticate:
     config.cloudAuthMode === "cognito"
       ? createCognitoSessionProvider<FastifyRequest>({

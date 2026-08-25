@@ -84,6 +84,7 @@ import {
   SourceSearchResponseSchema,
   UpdatePreferredLanguageRequestSchema,
   FinalizeTranscriptRequestSchema,
+  TranscriptArtifactSchema,
   CreateManualTimedTranscriptImportRequestSchema,
   FinalizeManualTimedTranscriptImportRequestSchema,
   ManualTimedTranscriptImportStatusQuerySchema,
@@ -133,6 +134,7 @@ import { transcriptToSrt } from "@research-video/transcript";
 export interface CloudApiDependencies {
   catalog: SharedProjectCatalog;
   authenticate(request: FastifyRequest): Promise<AuthenticatedActor>;
+  publicApiOrigin?: string;
   videoMetadataProvider?: VideoMetadataProvider;
   sourceSearchProviders?: Partial<Record<SourceProvider, SourceSearchProvider>>;
   translationProvider?: TranslationProvider;
@@ -2093,11 +2095,49 @@ export function createCloudApi(
       const { projectId, videoId } = ProjectVideoParamsSchema.parse(
         request.params,
       );
-      return catalog.getActiveTranscript(
+      const bundle = await catalog.getActiveTranscript(
         await authenticate(request),
         projectId,
         videoId,
       );
+      if (!dependencies?.publicApiOrigin) return bundle;
+      const origin = dependencies.publicApiOrigin.replace(/\/$/, "");
+      return {
+        ...bundle,
+        downloads: bundle.downloads.map((artifact) =>
+          artifact.downloadUrl.startsWith("memory-download:")
+            ? {
+                ...artifact,
+                downloadUrl: `${origin}/api/projects/${encodeURIComponent(projectId)}/videos/${encodeURIComponent(videoId)}/transcripts/${encodeURIComponent(bundle.transcriptVersionId)}/artifacts/${encodeURIComponent(artifact.type)}`,
+              }
+            : artifact,
+        ),
+      };
+    },
+  );
+
+  app.get(
+    "/api/projects/:projectId/videos/:videoId/transcripts/:transcriptVersionId/artifacts/:artifactType",
+    async (request, reply) => {
+      const { projectId, videoId, transcriptVersionId, artifactType } = z
+        .object({
+          projectId: z.uuid(),
+          videoId: z.uuid(),
+          transcriptVersionId: z.uuid(),
+          artifactType: TranscriptArtifactSchema.shape.type,
+        })
+        .parse(request.params);
+      const object = await catalog.getActiveTranscriptArtifact(
+        await authenticate(request),
+        projectId,
+        videoId,
+        transcriptVersionId,
+        artifactType,
+      );
+      return reply
+        .header("cache-control", "private, max-age=900")
+        .type(object.contentType)
+        .send(Buffer.from(object.bytes));
     },
   );
 

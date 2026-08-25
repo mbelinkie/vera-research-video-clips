@@ -253,11 +253,6 @@ const sharedSourceCoordinator = sourceProvider
       managedExportRoot,
     )
   : undefined;
-const cache = new VerifiedTranscriptCache(
-  database,
-  new HttpArtifactDownloader(),
-  transcriptCacheRoot,
-);
 const transcriptIndex = new LocalTranscriptIndex(database);
 const reader = new CachedTranscriptDocumentReader(
   transcriptIndex,
@@ -819,7 +814,14 @@ app = createLocalAgent({
     new SharedTranscriptWorkspaceService(
       new SharedFirstTranscriptResolver(
         new HttpActiveTranscriptCatalogClient(cloudApiUrl, authorization),
-        cache,
+        new VerifiedTranscriptCache(
+          database,
+          new HttpArtifactDownloader({
+            origin: cloudApiUrl,
+            authorization,
+          }),
+          transcriptCacheRoot,
+        ),
       ),
       reader,
       {

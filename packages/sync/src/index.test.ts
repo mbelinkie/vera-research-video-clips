@@ -25,6 +25,7 @@ import { createHash, randomUUID } from "node:crypto";
 
 import {
   CachedTranscriptDocumentReader,
+  HttpArtifactDownloader,
   LocalCacheIntegrityError,
   OfflineTranscriptUnavailableError,
   MemoryJobQueue,
@@ -56,6 +57,47 @@ describe("memory job queue", () => {
     expect(second?.deliveryCount).toBe(2);
     expect(await queue.acknowledge(second!.receipt)).toBe(true);
     expect(await queue.receive()).toBeUndefined();
+  });
+});
+
+describe("HTTP transcript artifact downloader", () => {
+  it("authenticates only same-origin development artifact proxies", async () => {
+    const fetcher = vi.fn(async () => new Response("{}", { status: 200 }));
+    vi.stubGlobal("fetch", fetcher);
+    const downloader = new HttpArtifactDownloader({
+      origin: "https://api.example.test",
+      authorization: "Bearer desktop-session",
+    });
+    const target = {
+      type: "manifest" as const,
+      objectKey: "manifest.json",
+      objectVersionId: randomUUID(),
+      byteSize: 2,
+      sha256: createHash("sha256").update("{}").digest("hex"),
+      downloadUrl:
+        "https://api.example.test/api/projects/project/videos/video/transcripts/version/artifacts/manifest",
+    };
+
+    try {
+      await downloader.download(target);
+      expect(fetcher).toHaveBeenLastCalledWith(target.downloadUrl, {
+        method: "GET",
+        redirect: "error",
+        headers: { authorization: "Bearer desktop-session" },
+      });
+
+      const external = {
+        ...target,
+        downloadUrl: "https://bucket.example.test/presigned-object",
+      };
+      await downloader.download(external);
+      expect(fetcher).toHaveBeenLastCalledWith(external.downloadUrl, {
+        method: "GET",
+        redirect: "error",
+      });
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });
 

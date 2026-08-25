@@ -49,6 +49,82 @@ afterEach(async () => {
 });
 
 describe("cloud API", () => {
+  it("proxies authenticated development transcript artifact downloads", async () => {
+    const actor = {
+      userId: randomUUID(),
+      externalSubject: "fixture:memory-artifact-download",
+    };
+    const projectId = randomUUID();
+    const videoId = randomUUID();
+    const transcriptVersionId = randomUUID();
+    const objectKey = `projects/${projectId}/transcripts/${transcriptVersionId}/manifest.json`;
+    const objectVersionId = randomUUID();
+    const getActiveTranscript = vi.fn(async () => ({
+      transcriptVersionId,
+      manifest: { id: transcriptVersionId },
+      manifestObject: {
+        type: "manifest",
+        objectKey,
+        objectVersionId,
+        byteSize: 2,
+        sha256: "a".repeat(64),
+      },
+      downloads: [
+        {
+          type: "manifest",
+          objectKey,
+          objectVersionId,
+          byteSize: 2,
+          sha256: "a".repeat(64),
+          downloadUrl: `memory-download://${encodeURIComponent(objectKey)}`,
+        },
+      ],
+    }));
+    const getActiveTranscriptArtifact = vi.fn(async () => ({
+      key: objectKey,
+      versionId: objectVersionId,
+      bytes: new TextEncoder().encode("{}"),
+      contentType: "application/json",
+      sha256: "a".repeat(64),
+    }));
+    const app = createCloudApi({
+      catalog: {
+        getActiveTranscript,
+        getActiveTranscriptArtifact,
+      } as unknown as SharedProjectCatalog,
+      authenticate: authenticateDevBearer,
+      publicApiOrigin: "https://api.example.test",
+    });
+    apps.add(app);
+    const authorization = `Bearer ${actor.userId}|${actor.externalSubject}`;
+
+    const active = await app.inject({
+      method: "GET",
+      url: `/api/projects/${projectId}/videos/${videoId}/transcripts/active`,
+      headers: { authorization },
+    });
+    expect(active.statusCode).toBe(200);
+    expect(active.json().downloads[0].downloadUrl).toBe(
+      `https://api.example.test/api/projects/${projectId}/videos/${videoId}/transcripts/${transcriptVersionId}/artifacts/manifest`,
+    );
+
+    const artifact = await app.inject({
+      method: "GET",
+      url: `/api/projects/${projectId}/videos/${videoId}/transcripts/${transcriptVersionId}/artifacts/manifest`,
+      headers: { authorization },
+    });
+    expect(artifact.statusCode).toBe(200);
+    expect(artifact.headers["content-type"]).toContain("application/json");
+    expect(artifact.body).toBe("{}");
+    expect(getActiveTranscriptArtifact).toHaveBeenCalledWith(
+      actor,
+      projectId,
+      videoId,
+      transcriptVersionId,
+      "manifest",
+    );
+  });
+
   it("routes the authenticated bounded notification feed", async () => {
     const actor = {
       userId: randomUUID(),
