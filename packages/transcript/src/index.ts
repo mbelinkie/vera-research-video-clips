@@ -718,6 +718,110 @@ export function searchTranscript(
   );
 }
 
+export type TranscriptSearchRange = Readonly<{
+  segmentId: string;
+  startOffset: number;
+  endOffset: number;
+}>;
+
+export type TranscriptSearchOccurrence = Readonly<{
+  id: string;
+  startSegmentId: string;
+  startMs: number;
+  timingPrecision: "word" | "cue";
+  ranges: readonly TranscriptSearchRange[];
+}>;
+
+export function searchTranscriptOccurrences(
+  transcript: NormalizedTranscript | undefined,
+  query: string,
+): TranscriptSearchOccurrence[] {
+  if (!transcript) return [];
+  const normalizedQuery = query
+    .trim()
+    .replace(/\s+/gu, " ")
+    .toLocaleLowerCase();
+  if (!normalizedQuery) return [];
+
+  const characters: string[] = [];
+  const origins: Array<{ segmentIndex: number; offset: number }> = [];
+  let pendingWhitespace = false;
+  transcript.segments.forEach((segment, segmentIndex) => {
+    if (characters.length) pendingWhitespace = true;
+    for (let offset = 0; offset < segment.text.length; offset += 1) {
+      const character = segment.text[offset]!;
+      if (/\s/u.test(character)) {
+        pendingWhitespace = true;
+        continue;
+      }
+      if (pendingWhitespace && characters.length) {
+        characters.push(" ");
+        origins.push({ segmentIndex, offset });
+      }
+      pendingWhitespace = false;
+      for (const lowerCharacter of character.toLocaleLowerCase()) {
+        characters.push(lowerCharacter);
+        origins.push({ segmentIndex, offset });
+      }
+    }
+  });
+
+  const normalizedTranscript = characters.join("");
+  const occurrences: TranscriptSearchOccurrence[] = [];
+  let cursor = 0;
+  while (cursor <= normalizedTranscript.length - normalizedQuery.length) {
+    const matchStart = normalizedTranscript.indexOf(normalizedQuery, cursor);
+    if (matchStart < 0) break;
+    const matchEnd = matchStart + normalizedQuery.length;
+    const startOrigin = origins[matchStart];
+    const endOrigin = origins[matchEnd - 1];
+    if (!startOrigin || !endOrigin) break;
+
+    const ranges: TranscriptSearchRange[] = [];
+    for (
+      let segmentIndex = startOrigin.segmentIndex;
+      segmentIndex <= endOrigin.segmentIndex;
+      segmentIndex += 1
+    ) {
+      const segment = transcript.segments[segmentIndex]!;
+      ranges.push({
+        segmentId: segment.id,
+        startOffset:
+          segmentIndex === startOrigin.segmentIndex ? startOrigin.offset : 0,
+        endOffset:
+          segmentIndex === endOrigin.segmentIndex
+            ? endOrigin.offset + 1
+            : segment.text.length,
+      });
+    }
+
+    const firstSegment = transcript.segments[startOrigin.segmentIndex]!;
+    const segmentTokens = transcript.tokens.filter(
+      (token) => token.segmentId === firstSegment.id,
+    );
+    let tokenCursor = 0;
+    const timedToken = segmentTokens.find((token) => {
+      const tokenOffset = firstSegment.text.indexOf(token.text, tokenCursor);
+      if (tokenOffset < 0) return false;
+      tokenCursor = tokenOffset + token.text.length;
+      return (
+        token.startMs !== undefined &&
+        startOrigin.offset >= tokenOffset &&
+        startOrigin.offset < tokenOffset + token.text.length
+      );
+    });
+    occurrences.push({
+      id: `${matchStart}:${matchEnd}`,
+      startSegmentId: firstSegment.id,
+      startMs: timedToken?.startMs ?? firstSegment.startMs,
+      timingPrecision: timedToken?.startMs === undefined ? "cue" : "word",
+      ranges,
+    });
+    cursor = matchEnd;
+  }
+  return occurrences;
+}
+
 export function transcriptTextForTimeRange(
   transcript: NormalizedTranscript,
   startMs: number,
@@ -1707,7 +1811,14 @@ function parseWebVtt(input: string): ParsedCue[] {
   if (!header || !/^WEBVTT(?:[\t ].*)?$/.test(header)) {
     throw new WebVttNormalizationError("WebVTT header is missing or invalid.");
   }
-  const blocks = lines.join("\n").split(/\n{2,}/u);
+  const firstSeparator = lines.findIndex((line) => line.trim() === "");
+  const headerMetadata =
+    firstSeparator >= 0 ? lines.slice(0, firstSeparator) : [];
+  const bodyLines =
+    firstSeparator >= 0 && headerMetadata.every((line) => !line.includes("-->"))
+      ? lines.slice(firstSeparator + 1)
+      : lines;
+  const blocks = bodyLines.join("\n").split(/\n{2,}/u);
   const cues: ParsedCue[] = [];
   for (const rawBlock of blocks) {
     const block = rawBlock.trim();

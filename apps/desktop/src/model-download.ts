@@ -58,12 +58,11 @@ export async function downloadPinnedModel(
   );
   try {
     const fetch = options.fetch ?? globalThis.fetch.bind(globalThis);
-    const response = await fetch(options.pin.url, {
-      method: "GET",
-      redirect: "error",
-      signal: options.signal,
-      headers: { accept: "application/octet-stream" },
-    });
+    const response = await fetchPinnedResponse(
+      fetch,
+      options.pin.url,
+      options.signal,
+    );
     if (!response.ok || !response.body) {
       throw new Error("Pinned model download is unavailable.");
     }
@@ -143,6 +142,50 @@ const hasExpectedModel = async (path: string, pin: PinnedWhisperModel) => {
     return false;
   }
 };
+
+async function fetchPinnedResponse(
+  fetch: (input: string, init?: RequestInit) => Promise<Response>,
+  pinnedUrl: string,
+  signal: AbortSignal,
+): Promise<Response> {
+  const origin = new URL(pinnedUrl);
+  let current = origin;
+  for (let redirectCount = 0; redirectCount <= 5; redirectCount += 1) {
+    const response = await fetch(current.href, {
+      method: "GET",
+      redirect: "manual",
+      signal,
+      headers: { accept: "application/octet-stream" },
+    });
+    if (![301, 302, 303, 307, 308].includes(response.status)) return response;
+    const location = response.headers.get("location");
+    if (!location || redirectCount === 5) {
+      throw new Error("Pinned model redirect policy rejected the response.");
+    }
+    const next = new URL(location, current);
+    if (!approvedModelRedirect(origin, next)) {
+      throw new Error("Pinned model redirect policy rejected the response.");
+    }
+    current = next;
+  }
+  throw new Error("Pinned model redirect policy rejected the response.");
+}
+
+function approvedModelRedirect(origin: URL, candidate: URL): boolean {
+  if (
+    candidate.protocol !== "https:" ||
+    candidate.username ||
+    candidate.password
+  ) {
+    return false;
+  }
+  if (candidate.origin === origin.origin) return true;
+  return (
+    origin.hostname === "huggingface.co" &&
+    (candidate.hostname === "huggingface.co" ||
+      candidate.hostname.endsWith(".hf.co"))
+  );
+}
 
 const onceDrain = (
   stream: ReturnType<typeof createWriteStream>,

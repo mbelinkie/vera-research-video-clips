@@ -2,17 +2,21 @@ import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import {
   lstat,
+  mkdir,
   open,
   realpath,
   rm,
+  rmdir,
   statfs as nodeStatfs,
 } from "node:fs/promises";
-import { basename, isAbsolute, join } from "node:path";
+import { homedir } from "node:os";
+import { basename, isAbsolute, join, relative, sep } from "node:path";
 
 import {
   deriveReadinessReport,
   type ComponentHealth,
   type ComponentKind,
+  type RecommendedSetupPlan,
   type ReadinessReport,
   type SetupAction,
   type SetupSelectionTarget,
@@ -27,7 +31,7 @@ import {
   type MediaCommandRunner,
 } from "@research-video/media";
 
-const ProbeTimeoutMs = 5_000;
+const ProbeTimeoutMs = 20_000;
 const MaximumProbeOutputCharacters = 64 * 1_024;
 const MaximumPathLength = 4_096;
 const MaximumModelBytes = 100 * 1024 * 1024 * 1024;
@@ -35,6 +39,11 @@ const MaximumToolBytes = 2 * 1024 * 1024 * 1024;
 const Gibibyte = 1024 * 1024 * 1024;
 const StorageRecommendationBytes = 10 * Gibibyte;
 const StorageReserveBytes = 2 * Gibibyte;
+const ToolProbeEnvironment = Object.freeze({
+  PATH: "/usr/bin:/bin:/usr/sbin:/sbin",
+  LANG: "C",
+  LC_ALL: "C",
+});
 
 const componentForTarget: Record<SetupSelectionTarget, ComponentKind> = {
   output_root: "output_root",
@@ -108,6 +117,25 @@ export type TrustedDesktopRuntimeConfig = Readonly<{
   whisperModel: string | undefined;
 }>;
 
+type RecommendedToolTarget = "ffmpeg" | "ffprobe" | "yt_dlp" | "whisper_cli";
+
+export type RecommendedToolCandidate = Readonly<{
+  entrypoint: string;
+  allowedCanonicalRoots: readonly string[];
+}>;
+
+type InspectedTool = Readonly<{
+  target: RecommendedToolTarget;
+  canonicalPath: string;
+  displayName: string;
+  version?: string;
+  identity: string;
+  byteSize: number;
+  contentSha256: string;
+  probes: readonly (readonly string[])[];
+  outputFingerprint: string;
+}>;
+
 export class DesktopSetupValidationError extends Error {
   readonly statusCode = 400;
 
@@ -130,6 +158,12 @@ export class DesktopSetupValidationError extends Error {
  * for main-process runtime construction, never IPC or renderer use.
  */
 export class LocalDesktopSetupService {
+  private readonly validatedModelIdentities = new Map<string, string>();
+  private readonly modelRevalidations = new Map<
+    string,
+    Promise<string | undefined>
+  >();
+
   constructor(
     private readonly repository: LocalDesktopSetupRepository,
     private readonly dependencies: {
@@ -137,6 +171,13 @@ export class LocalDesktopSetupService {
       statfs?: DesktopSetupStatfs;
       now?: () => Date;
       measuredOperationBytes?: (target: "output_root" | "cache_root") => number;
+      recommendedRoots?: () => {
+        outputRoot: string;
+        cacheRoot: string;
+      };
+      recommendedToolCandidates?: (
+        target: RecommendedToolTarget,
+      ) => readonly RecommendedToolCandidate[];
       exportWorkerStatus?: () => {
         available: boolean;
         issue?:
@@ -170,49 +211,270 @@ export class LocalDesktopSetupService {
     absolutePath: string;
     displayName?: string;
   }): Promise<SetupSnapshot> {
-    const probes = toolProbes[input.target];
-    const inspected = await validateExecutable(input.absolutePath);
-    const runner =
-      this.dependencies.commandRunner ?? new SpawnMediaCommandRunner();
-    let results: { stdout: string; stderr: string }[];
-    try {
-      results = await Promise.all(
-        probes.map((probe) =>
-          runner.run(input.absolutePath, probe, { timeoutMs: ProbeTimeoutMs }),
-        ),
+    const inspected = await inspectTool(
+      input.target,
+      input.absolutePath,
+      this.dependencies.commandRunner,
+    );
+    return this.activateInspectedTool({
+      ...inspected,
+      displayName: input.displayName ?? safeDisplayName(input.absolutePath),
+    });
+  }
+
+  async checkRecommendedSetup(model: {
+    displayName: string;
+    byteSize: number;
+  }): Promise<RecommendedSetupPlan> {
+    const roots = this.recommendedRoots();
+    const rootPlans = await Promise.all([
+      this.inspectRecommendedRoot("output_root", roots.outputRoot),
+      this.inspectRecommendedRoot("cache_root", roots.cacheRoot),
+    ]);
+    const active = new Map(
+      this.repository
+        .listActiveComponentReferences()
+        .map((reference) => [reference.target, reference]),
+    );
+    const validActiveTargets = new Set<SetupSelectionTarget>();
+    await Promise.all(
+      [...active.keys()].map(async (target) => {
+        const trusted =
+          this.repository.getTrustedActiveComponentReference(target);
+        if (!trusted) return;
+        try {
+          await this.revalidateReference(trusted);
+          validActiveTargets.add(target);
+        } catch {
+          // Changed active references are never presented as active.
+        }
+      }),
+    );
+    const detected = await Promise.all(
+      (["ffmpeg", "ffprobe", "yt_dlp", "whisper_cli"] as const).map(
+        async (target) => ({
+          target,
+          inspected: validActiveTargets.has(target)
+            ? undefined
+            : await this.detectRecommendedTool(target),
+        }),
+      ),
+    );
+    const tools = detected.map(({ target, inspected }) => {
+      const current = active.get(target);
+      const currentIsValid = Boolean(current && validActiveTargets.has(target));
+      return {
+        target,
+        displayName: displayNameForTool(target),
+        state: currentIsValid
+          ? ("active" as const)
+          : inspected
+            ? ("detected" as const)
+            : ("missing" as const),
+        ...((currentIsValid ? current?.version : inspected?.version)
+          ? { version: currentIsValid ? current?.version : inspected?.version }
+          : {}),
+      };
+    });
+    const modelActive = validActiveTargets.has("whisper_model");
+    const unavailable =
+      rootPlans.some((root) => root.state === "unavailable") ||
+      tools.some((tool) => tool.state === "missing");
+    const complete =
+      rootPlans.every((root) => root.state === "active") &&
+      tools.every((tool) => tool.state === "active");
+    return {
+      state: complete
+        ? "completed"
+        : unavailable
+          ? "needs_action"
+          : "ready_to_setup",
+      roots: rootPlans,
+      tools,
+      model: {
+        displayName: model.displayName,
+        byteSize: model.byteSize,
+        state: modelActive ? "active" : "download_required",
+      },
+      enables: ["create_transcripts", "export_clips"],
+    };
+  }
+
+  async applyRecommendedSetup(model: {
+    displayName: string;
+    byteSize: number;
+  }): Promise<RecommendedSetupPlan> {
+    const targets = ["ffmpeg", "ffprobe", "yt_dlp", "whisper_cli"] as const;
+    const inspectedTools = await Promise.all(
+      targets.map(async (target) => {
+        const active =
+          this.repository.getTrustedActiveComponentReference(target);
+        const inspected = active
+          ? await inspectTool(
+              target,
+              active.absolutePath,
+              this.dependencies.commandRunner,
+            ).catch(() => this.detectRecommendedTool(target))
+          : await this.detectRecommendedTool(target);
+        if (!inspected) throw new DesktopSetupValidationError("invalid_tool");
+        return inspected;
+      }),
+    );
+    const roots = this.recommendedRoots();
+    if (!(await this.hasValidActiveRoot("output_root"))) {
+      await this.createAndActivateRecommendedRoot(
+        "output_root",
+        roots.outputRoot,
+        "Research Video Clips Exports",
       );
-    } catch {
-      throw new DesktopSetupValidationError("tool_probe_failed");
     }
-    if (!hasRequiredToolCapabilities(input.target, results)) {
-      throw new DesktopSetupValidationError("tool_probe_failed");
+    if (!(await this.hasValidActiveRoot("cache_root"))) {
+      await this.createAndActivateRecommendedRoot(
+        "cache_root",
+        roots.cacheRoot,
+        "Private transcript cache",
+      );
     }
-    const after = await validateExecutable(input.absolutePath);
+    for (const inspected of inspectedTools)
+      await this.activateInspectedTool(inspected);
+    const current = this.repository.getSetup() ?? defaultDesktopSetup();
+    this.repository.saveSetup({
+      ...current,
+      workerEnabled: true,
+      captionProvider: "yt_dlp",
+      mediaProvider: "yt_dlp_audio",
+      exportSourceProvider: "yt_dlp",
+      speechToTextProvider: "whisper_cpp",
+    });
+    return this.checkRecommendedSetup(model);
+  }
+
+  private async activateInspectedTool(
+    inspected: InspectedTool,
+  ): Promise<SetupSnapshot> {
+    const final = await validateExecutable(inspected.canonicalPath);
     if (
-      inspected.identity !== after.identity ||
-      inspected.contentSha256 !== after.contentSha256
+      final.identity !== inspected.identity ||
+      final.contentSha256 !== inspected.contentSha256
     ) {
       throw new DesktopSetupValidationError("invalid_tool");
     }
-    const version = probeVersion(input.target, results[0]!);
     const candidate = this.repository.recordValidatedCandidate({
-      target: input.target,
-      displayName: input.displayName ?? safeDisplayName(input.absolutePath),
-      absolutePath: input.absolutePath,
+      target: inspected.target,
+      displayName: inspected.displayName,
+      absolutePath: inspected.canonicalPath,
       filesystemIdentity: inspected.identity,
-      ...(version ? { version } : {}),
+      ...(inspected.version ? { version: inspected.version } : {}),
       byteSize: inspected.byteSize,
       contentSha256: inspected.contentSha256,
       validationEvidence: {
         kind: "tool",
         identity: inspected.identity,
-        probes: probes.map((probe) => [...probe]),
-        outputFingerprint: hashProbeOutput(results),
+        probes: inspected.probes.map((probe) => [...probe]),
+        outputFingerprint: inspected.outputFingerprint,
         contentSha256: inspected.contentSha256,
       },
     });
     this.repository.activateValidatedCandidate(candidate.id);
     return this.repository.getSetupSnapshot();
+  }
+
+  private recommendedRoots() {
+    return (this.dependencies.recommendedRoots ?? defaultRecommendedRoots)();
+  }
+
+  private async hasValidActiveRoot(
+    target: "output_root" | "cache_root",
+  ): Promise<boolean> {
+    const active = this.repository.getTrustedActiveComponentReference(target);
+    if (!active) return false;
+    try {
+      await this.revalidateReference(active);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private async inspectRecommendedRoot(
+    target: "output_root" | "cache_root",
+    path: string,
+  ): Promise<RecommendedSetupPlan["roots"][number]> {
+    const active = this.repository.getTrustedActiveComponentReference(target);
+    if (active) {
+      try {
+        await this.revalidateReference(active);
+        return {
+          target,
+          displayName:
+            target === "output_root"
+              ? "Movies exports folder"
+              : "Private transcript cache",
+          state: "active",
+        };
+      } catch {
+        // The recommended path remains independently inspectable below.
+      }
+    }
+    const entry = await lstat(path).catch(() => undefined);
+    return {
+      target,
+      displayName:
+        target === "output_root"
+          ? "Movies exports folder"
+          : "Private transcript cache",
+      state:
+        entry === undefined
+          ? "will_create"
+          : entry.isDirectory() && !entry.isSymbolicLink()
+            ? "will_use_existing"
+            : "unavailable",
+    };
+  }
+
+  private async createAndActivateRecommendedRoot(
+    target: "output_root" | "cache_root",
+    path: string,
+    displayName: string,
+  ) {
+    let created = false;
+    try {
+      await mkdir(path, { mode: 0o700 });
+      created = true;
+    } catch (error) {
+      const existing = await lstat(path).catch(() => undefined);
+      if (!existing?.isDirectory() || existing.isSymbolicLink()) {
+        throw new DesktopSetupValidationError("invalid_root");
+      }
+    }
+    try {
+      await this.selectRoot({ target, absolutePath: path, displayName });
+    } catch (error) {
+      if (created) await rmdir(path).catch(() => undefined);
+      throw error;
+    }
+  }
+
+  private async detectRecommendedTool(
+    target: RecommendedToolTarget,
+  ): Promise<InspectedTool | undefined> {
+    const candidates = (
+      this.dependencies.recommendedToolCandidates ?? recommendedToolCandidates
+    )(target);
+    for (const candidate of candidates) {
+      const canonicalPath = await resolveApprovedToolCandidate(candidate);
+      if (!canonicalPath) continue;
+      try {
+        return await inspectTool(
+          target,
+          canonicalPath,
+          this.dependencies.commandRunner,
+        );
+      } catch {
+        // Continue through the closed deterministic candidate list.
+      }
+    }
+    return undefined;
   }
 
   async activateWhisperModel(input: {
@@ -237,6 +499,7 @@ export class LocalDesktopSetupService {
       },
     });
     this.repository.activateValidatedCandidate(candidate.id);
+    this.validatedModelIdentities.set(candidate.id, inspected.identity);
     return this.repository.getSetupSnapshot();
   }
 
@@ -460,7 +723,7 @@ export class LocalDesktopSetupService {
       this.repository.getTrustedActiveComponentReference(target);
     if (!reference) return missingHealth(target, checkedAt);
     try {
-      const version = await revalidateReference(reference);
+      const version = await this.revalidateReference(reference);
       return {
         component: componentForTarget[target],
         state: "ready",
@@ -562,6 +825,37 @@ export class LocalDesktopSetupService {
     }
     return Number(available);
   }
+
+  private async revalidateReference(
+    reference: TrustedLocalComponentReference,
+  ): Promise<string | undefined> {
+    if (reference.target !== "whisper_model") {
+      return revalidateReference(reference);
+    }
+    if (!reference.byteSize || !reference.contentSha256 || !reference.version) {
+      throw new DesktopSetupValidationError("invalid_model");
+    }
+    const identity = await currentModelIdentity(
+      reference.absolutePath,
+      reference.byteSize,
+    );
+    if (identity !== reference.filesystemIdentity) {
+      throw new DesktopSetupValidationError("invalid_model");
+    }
+    if (this.validatedModelIdentities.get(reference.id) === identity) {
+      return reference.version;
+    }
+    const active = this.modelRevalidations.get(reference.id);
+    if (active) return active;
+    const validation = revalidateReference(reference)
+      .then((version) => {
+        this.validatedModelIdentities.set(reference.id, identity);
+        return version;
+      })
+      .finally(() => this.modelRevalidations.delete(reference.id));
+    this.modelRevalidations.set(reference.id, validation);
+    return validation;
+  }
 }
 
 async function revalidateReference(
@@ -631,6 +925,137 @@ function defaultDesktopSetup() {
     speechToTextProvider: "disabled" as const,
     translationProvider: "disabled" as const,
   };
+}
+
+function defaultRecommendedRoots() {
+  const home = homedir();
+  return {
+    outputRoot: join(home, "Movies", "Research Video Clips Exports"),
+    cacheRoot:
+      process.platform === "darwin"
+        ? join(home, "Library", "Caches", "Research Video Clips")
+        : join(home, ".cache", "Research Video Clips"),
+  };
+}
+
+export function recommendedToolCandidates(
+  target: RecommendedToolTarget,
+  appOwnedToolsDirectory = process.env.DESKTOP_APP_TOOLS_DIRECTORY,
+): readonly RecommendedToolCandidate[] {
+  const filename =
+    target === "yt_dlp"
+      ? "yt-dlp"
+      : target === "whisper_cli"
+        ? "whisper-cli"
+        : target;
+  const candidates: RecommendedToolCandidate[] = [
+    {
+      entrypoint: join("/usr/local/bin", filename),
+      allowedCanonicalRoots: ["/usr/local/bin", "/usr/local/Cellar"],
+    },
+    {
+      entrypoint: join("/opt/homebrew/bin", filename),
+      allowedCanonicalRoots: ["/opt/homebrew/bin", "/opt/homebrew/Cellar"],
+    },
+  ];
+  if (appOwnedToolsDirectory) {
+    candidates.push({
+      entrypoint: join(appOwnedToolsDirectory, filename),
+      allowedCanonicalRoots: [appOwnedToolsDirectory],
+    });
+  }
+  return candidates;
+}
+
+async function resolveApprovedToolCandidate(
+  candidate: RecommendedToolCandidate,
+): Promise<string | undefined> {
+  if (
+    !isAbsolute(candidate.entrypoint) ||
+    candidate.allowedCanonicalRoots.length === 0 ||
+    candidate.allowedCanonicalRoots.some((root) => !isAbsolute(root))
+  ) {
+    return undefined;
+  }
+  const entry = await lstat(candidate.entrypoint).catch(() => undefined);
+  if (!entry || (!entry.isFile() && !entry.isSymbolicLink())) return undefined;
+  const canonicalPath = await realpath(candidate.entrypoint).catch(
+    () => undefined,
+  );
+  if (!canonicalPath || canonicalPath !== canonicalPath.normalize("NFC")) {
+    return undefined;
+  }
+  if (
+    !candidate.allowedCanonicalRoots.some((root) =>
+      pathIsInside(root, canonicalPath),
+    )
+  ) {
+    return undefined;
+  }
+  return canonicalPath;
+}
+
+function pathIsInside(root: string, candidate: string): boolean {
+  const pathFromRoot = relative(root, candidate);
+  return (
+    pathFromRoot !== "" &&
+    pathFromRoot !== ".." &&
+    !pathFromRoot.startsWith(`..${sep}`) &&
+    !isAbsolute(pathFromRoot)
+  );
+}
+
+async function inspectTool(
+  target: RecommendedToolTarget,
+  canonicalPath: string,
+  commandRunner?: MediaCommandRunner,
+): Promise<InspectedTool> {
+  const probes = toolProbes[target];
+  const inspected = await validateExecutable(canonicalPath);
+  const runner = commandRunner ?? new SpawnMediaCommandRunner();
+  let results: { stdout: string; stderr: string }[];
+  try {
+    results = await Promise.all(
+      probes.map((probe) =>
+        runner.run(canonicalPath, probe, {
+          timeoutMs: ProbeTimeoutMs,
+          cwd: "/",
+          environment: ToolProbeEnvironment,
+        }),
+      ),
+    );
+  } catch {
+    throw new DesktopSetupValidationError("tool_probe_failed");
+  }
+  if (!hasRequiredToolCapabilities(target, results)) {
+    throw new DesktopSetupValidationError("tool_probe_failed");
+  }
+  const after = await validateExecutable(canonicalPath);
+  if (
+    inspected.identity !== after.identity ||
+    inspected.contentSha256 !== after.contentSha256
+  ) {
+    throw new DesktopSetupValidationError("invalid_tool");
+  }
+  const version = probeVersion(target, results[0]!);
+  return {
+    target,
+    canonicalPath,
+    displayName: displayNameForTool(target),
+    ...(version ? { version } : {}),
+    identity: inspected.identity,
+    byteSize: inspected.byteSize,
+    contentSha256: inspected.contentSha256,
+    probes,
+    outputFingerprint: hashProbeOutput(results),
+  };
+}
+
+function displayNameForTool(target: RecommendedToolTarget): string {
+  if (target === "ffmpeg") return "FFmpeg";
+  if (target === "ffprobe") return "FFprobe media inspector";
+  if (target === "yt_dlp") return "Authorized source helper";
+  return "whisper.cpp speech engine";
 }
 
 function providerHealth(input: {
@@ -952,6 +1377,18 @@ async function validateModelFile(
   }
 }
 
+async function currentModelIdentity(
+  path: string,
+  expectedBytes: number,
+): Promise<string> {
+  await assertExactAbsolutePath(path);
+  const model = await exactRegularFile(path, "invalid_model", false);
+  if (model.size !== expectedBytes) {
+    throw new DesktopSetupValidationError("invalid_model");
+  }
+  return fileIdentity(model);
+}
+
 async function assertExactAbsolutePath(path: string): Promise<void> {
   if (
     !isAbsolute(path) ||
@@ -1067,7 +1504,7 @@ function hasRequiredToolCapabilities(
       /--dump-single-json\b/u.test(results[1]?.stdout ?? "")
     );
   }
-  const help = results[0]?.stdout ?? "";
+  const help = `${results[0]?.stdout ?? ""}\n${results[0]?.stderr ?? ""}`;
   return (
     /(?:-m\s+FNAME|--model\s+FNAME)/u.test(help) &&
     /(?:-f\s+FNAME|--file\s+FNAME)/u.test(help)

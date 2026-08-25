@@ -3,7 +3,7 @@ import type { DesktopNotificationNavigationTarget } from "@research-video/contra
 export type NotificationNavigationResolution =
   | {
       state: "ready";
-      destination: "workbench" | "clips";
+      destination: "videos" | "workbench" | "clips";
       projectId?: string;
     }
   | { state: "project_unavailable" };
@@ -20,7 +20,7 @@ export function resolveNotificationNavigation(
   }
   return {
     state: "ready",
-    destination: target.kind === "transcription" ? "workbench" : "clips",
+    destination: target.kind === "transcription" ? "videos" : "clips",
     projectId: target.projectId,
   };
 }

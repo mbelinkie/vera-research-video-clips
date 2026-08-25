@@ -43,7 +43,7 @@ import {
   deriveTranscriptSelection,
   derivePlayerRangeTranscriptAttachment,
   buildClipLanguageEvidence,
-  searchTranscript,
+  searchTranscriptOccurrences,
   segmentAtTime,
   timedTranscriptTokens,
   transcriptTextForTimeRange,
@@ -58,7 +58,7 @@ import {
   DESKTOP_CONNECTED_SENTINEL,
 } from "./api-client.ts";
 import { BatchWorkspace } from "./batch-workspace.tsx";
-import { DesktopSetup } from "./desktop-setup.tsx";
+import { DesktopSetup, type DesktopProfileState } from "./desktop-setup.tsx";
 import { NotificationPreferencesPanel } from "./notification-preferences.tsx";
 import { resolveNotificationNavigation } from "./notification-navigation.ts";
 import { PlayerPanel } from "./player-panel.tsx";
@@ -339,6 +339,9 @@ function App() {
     useState<string>();
   const [projectVideos, setProjectVideos] = useState<Video[]>();
   const [error, setError] = useState<string>();
+  const [videoLoadBusy, setVideoLoadBusy] = useState(false);
+  const [videoLoadMessage, setVideoLoadMessage] = useState<string>();
+  const videoLoadGeneration = useRef(0);
   const [query, setQuery] = useState("");
   const [matchIndex, setMatchIndex] = useState(0);
   const [currentMs, setCurrentMs] = useState(0);
@@ -372,6 +375,7 @@ function App() {
   const [desktopAuthStatus, setDesktopAuthStatus] =
     useState<DesktopAuthStatus>();
   const [user, setUser] = useState<User>();
+  const [profileState, setProfileState] = useState<DesktopProfileState>("idle");
   const [preferredLanguageDraft, setPreferredLanguageDraft] = useState("en");
   const [preferenceMessage, setPreferenceMessage] = useState(
     "Connect a session to load your account preference.",
@@ -382,8 +386,7 @@ function App() {
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
   const [projectsLoaded, setProjectsLoaded] = useState(false);
   const [projectId, setProjectId] = useState("");
-  const [destination, setDestination] =
-    useState<ProjectDestination>("workbench");
+  const [destination, setDestination] = useState<ProjectDestination>("videos");
   const [notificationTarget, setNotificationTarget] =
     useState<DesktopNotificationNavigationTarget>();
   const [pendingNotificationTarget, setPendingNotificationTarget] =
@@ -515,8 +518,19 @@ function App() {
   async function beginDesktopSignIn() {
     const bridge = desktopBridge();
     if (!bridge) return;
-    await bridge.signIn();
-    await refreshDesktopStatus();
+    try {
+      const status = await bridge.signIn();
+      setDesktopAuthStatus(status);
+      setAuthorization(
+        status.state === "signed_in" ? DESKTOP_CONNECTED_SENTINEL : "",
+      );
+    } catch {
+      setDesktopAuthStatus({
+        state: "signed_out",
+        issue: "authentication_failed",
+      });
+      setAuthorization("");
+    }
   }
 
   async function completeDesktopSignOut() {
@@ -524,8 +538,9 @@ function App() {
     if (!bridge) return;
     clearWorkspaceInteraction();
     setWorkspaceTarget(undefined);
-    await bridge.signOut();
-    await refreshDesktopStatus();
+    const status = await bridge.signOut();
+    setDesktopAuthStatus(status);
+    setAuthorization("");
     setProjects([]);
     setProjectsLoaded(false);
     selectProject("");
@@ -624,8 +639,8 @@ function App() {
   );
   const languageEvidenceReady =
     !preferredEvidenceRequired || Boolean(preferredTranscript);
-  const visibleSegments = useMemo(
-    () => searchTranscript(transcript?.segments ?? [], query),
+  const transcriptMatches = useMemo(
+    () => searchTranscriptOccurrences(transcript, query),
     [query, transcript],
   );
   const activeSegment = transcript
@@ -871,7 +886,7 @@ function App() {
     const restoredIndex = pendingMatchIndexRestore.current;
     pendingMatchIndexRestore.current = undefined;
     setMatchIndex(restoredIndex ?? 0);
-  }, [query, videoId]);
+  }, [query, videoId, transcript?.track.id]);
 
   useEffect(() => {
     setSourceRightsConfirmed(false);
@@ -887,10 +902,12 @@ function App() {
   useEffect(() => {
     if (!authorization) {
       setUser(undefined);
+      setProfileState("idle");
       setPreferredLanguageDraft("en");
       return;
     }
     setUser(undefined);
+    setProfileState("loading");
     const controller = new AbortController();
     void apiFetch(
       "cloud",
@@ -899,13 +916,36 @@ function App() {
       authorization,
     )
       .then(async (response) => {
-        const payload = await response.json();
-        if (!response.ok) throw new Error("Unable to load account settings.");
-        return UserSchema.parse(payload);
+        const payload = await response.json().catch(() => undefined);
+        if (!response.ok) {
+          const parsed = ApiErrorSchema.safeParse(payload);
+          if (
+            response.status === 404 &&
+            parsed.success &&
+            parsed.data.error.code === "not_found"
+          ) {
+            return { state: "registration_required" as const };
+          }
+          throw new Error(
+            parsed.success
+              ? parsed.data.error.message
+              : "Unable to load account settings.",
+          );
+        }
+        return { state: "ready" as const, profile: UserSchema.parse(payload) };
       })
-      .then((profile) => {
+      .then((result) => {
         if (controller.signal.aborted) return;
+        if (result.state === "registration_required") {
+          setProfileState("registration_required");
+          setPreferenceMessage(
+            "Create your account profile to start using shared projects.",
+          );
+          return;
+        }
+        const profile = result.profile;
         setUser(profile);
+        setProfileState("ready");
         setPreferredLanguageDraft(profile.preferredLanguage);
         setPreferenceMessage(
           `Preferred transcript language: ${profile.preferredLanguage}.`,
@@ -914,6 +954,7 @@ function App() {
       .catch((caught: unknown) => {
         if (controller.signal.aborted) return;
         setUser(undefined);
+        setProfileState("error");
         setPreferenceMessage(
           caught instanceof Error
             ? caught.message
@@ -922,6 +963,50 @@ function App() {
       });
     return () => controller.abort();
   }, [authorization]);
+
+  useEffect(() => {
+    if (!desktopBridge() || !authorization || profileState !== "ready" || !user)
+      return;
+    const controller = new AbortController();
+    setProjectsLoaded(false);
+    void apiFetch(
+      "cloud",
+      "/api/projects",
+      { signal: controller.signal },
+      authorization,
+    )
+      .then(async (response) => {
+        const payload = await response.json().catch(() => undefined);
+        if (!response.ok) {
+          const parsed = ApiErrorSchema.safeParse(payload);
+          throw new Error(
+            parsed.success
+              ? parsed.data.error.message
+              : "Unable to load projects.",
+          );
+        }
+        return ProjectSummarySchema.array().parse(payload);
+      })
+      .then((loaded) => {
+        if (controller.signal.aborted) return;
+        setProjects(loaded);
+        setProjectsLoaded(true);
+        setProjectMessage(
+          loaded.length
+            ? undefined
+            : "Your account is ready. Create your first project to begin.",
+        );
+      })
+      .catch((caught: unknown) => {
+        if (controller.signal.aborted) return;
+        setProjects([]);
+        setProjectsLoaded(true);
+        setProjectMessage(
+          caught instanceof Error ? caught.message : "Unable to load projects.",
+        );
+      });
+    return () => controller.abort();
+  }, [authorization, profileState, user?.id]);
 
   useEffect(() => {
     if (!user || !projects.length) return;
@@ -1277,8 +1362,8 @@ function App() {
         restoredTranscript ? restore.transcriptView : "english",
       );
       setQuery(restore.query);
-      const restoredMatches = searchTranscript(
-        restoredTranscript?.segments ?? [],
+      const restoredMatches = searchTranscriptOccurrences(
+        restoredTranscript,
         restore.query,
       );
       const restoredMatchIndex = Math.min(
@@ -1629,7 +1714,7 @@ function App() {
   }, [currentMs, previewingSelection, selection]);
 
   function loadVideo() {
-    loadVideoUrl(url);
+    void loadVideoUrl(url);
   }
 
   async function savePreferredLanguage() {
@@ -1671,7 +1756,46 @@ function App() {
     }
   }
 
-  function loadVideoUrl(nextUrl: string) {
+  async function registerDesktopProfile(displayName: string) {
+    if (!authorization) throw new Error("Sign in before creating a profile.");
+    setProfileState("loading");
+    try {
+      const response = await apiFetch(
+        "cloud",
+        "/api/session/register",
+        {
+          method: "POST",
+          body: JSON.stringify({ displayName }),
+        },
+        authorization,
+      );
+      const payload = await response.json().catch(() => undefined);
+      if (!response.ok) {
+        const parsed = ApiErrorSchema.safeParse(payload);
+        throw new Error(
+          parsed.success
+            ? parsed.data.error.message
+            : "Unable to create the account profile.",
+        );
+      }
+      const profile = UserSchema.parse(payload);
+      setUser(profile);
+      setProfileState("ready");
+      setPreferredLanguageDraft(profile.preferredLanguage);
+      setPreferenceMessage(
+        `Account ready. Preferred transcript language: ${profile.preferredLanguage}.`,
+      );
+    } catch (caught) {
+      setUser(undefined);
+      setProfileState("registration_required");
+      throw caught;
+    }
+  }
+
+  async function loadVideoUrl(nextUrl: string) {
+    const generation = ++videoLoadGeneration.current;
+    setVideoLoadBusy(false);
+    setVideoLoadMessage(undefined);
     try {
       const normalized = normalizeYouTubeUrl(nextUrl);
       setUrl(normalized.canonicalUrl);
@@ -1691,6 +1815,7 @@ function App() {
           candidate.canonicalUrl === normalized.canonicalUrl,
       );
       if (projectVideo) {
+        setVideoLoadMessage(undefined);
         openProjectVideo({
           projectId,
           catalogVideoId: projectVideo.id,
@@ -1700,13 +1825,62 @@ function App() {
         });
         return;
       }
-      setError(
-        `“${normalized.videoId}” is not in this project yet. Add it through the transcription batch workflow, then open it from Ready for review.`,
+      setVideoLoadBusy(true);
+      setError(undefined);
+      setVideoLoadMessage(
+        "Adding this video to the project and checking its transcript…",
+      );
+      const targetProjectId = projectId;
+      const response = await apiFetch(
+        "cloud",
+        `/api/projects/${targetProjectId}/videos/resolve`,
+        {
+          method: "POST",
+          body: JSON.stringify({ url: normalized.canonicalUrl }),
+        },
+        authorization,
+      );
+      const payload = await response.json().catch(() => undefined);
+      if (!response.ok) {
+        const parsed = ApiErrorSchema.safeParse(payload);
+        throw new Error(
+          parsed.success
+            ? parsed.data.error.message
+            : "Unable to add this video to the project.",
+        );
+      }
+      const resolved = VideoSchema.parse(payload);
+      if (
+        resolved.youtubeVideoId !== normalized.videoId ||
+        resolved.canonicalUrl !== normalized.canonicalUrl
+      ) {
+        throw new Error("The resolved video did not match the requested URL.");
+      }
+      if (videoLoadGeneration.current !== generation) return;
+      setVideoLoadMessage(undefined);
+      const nextProjectVideos = [
+        ...projectVideos.filter((candidate) => candidate.id !== resolved.id),
+        resolved,
+      ];
+      setProjectVideos(nextProjectVideos);
+      openProjectVideo(
+        {
+          projectId: targetProjectId,
+          catalogVideoId: resolved.id,
+          youtubeVideoId: resolved.youtubeVideoId,
+          canonicalUrl: resolved.canonicalUrl,
+          title: resolved.title,
+        },
+        { authorizedVideos: nextProjectVideos },
       );
     } catch (caught) {
+      if (videoLoadGeneration.current !== generation) return;
+      setVideoLoadMessage(undefined);
       setError(
         caught instanceof Error ? caught.message : "Unable to load video.",
       );
+    } finally {
+      if (videoLoadGeneration.current === generation) setVideoLoadBusy(false);
     }
   }
 
@@ -1744,9 +1918,13 @@ function App() {
 
   function openProjectVideo(
     target: WorkspaceVideoTarget,
-    options: { pushCurrent?: boolean; restore?: NavigationSnapshot } = {},
+    options: {
+      pushCurrent?: boolean;
+      restore?: NavigationSnapshot;
+      authorizedVideos?: readonly Video[];
+    } = {},
   ) {
-    const authorizedVideo = projectVideos?.some(
+    const authorizedVideo = (options.authorizedVideos ?? projectVideos)?.some(
       (video) =>
         video.id === target.catalogVideoId &&
         video.youtubeVideoId === target.youtubeVideoId &&
@@ -1811,9 +1989,12 @@ function App() {
 
   function selectProject(nextProjectId: string) {
     if (nextProjectId !== projectId) {
+      videoLoadGeneration.current += 1;
+      setVideoLoadBusy(false);
+      setVideoLoadMessage(undefined);
       clearWorkspaceInteraction();
       setWorkspaceTarget(undefined);
-      setDestination("workbench");
+      setDestination("videos");
       setUnreadActivityCount(0);
       setNavigationBackStack([]);
       pendingNavigationRestore.current = undefined;
@@ -1833,7 +2014,7 @@ function App() {
     setProjects([]);
     setProjectsLoaded(false);
     setProjectId("");
-    setDestination("workbench");
+    setDestination("videos");
     setUnreadActivityCount(0);
     setProjectMessage(undefined);
     setNavigationBackStack([]);
@@ -2457,12 +2638,13 @@ function App() {
   );
 
   function moveMatch(direction: 1 | -1) {
-    if (visibleSegments.length === 0) return;
+    if (transcriptMatches.length === 0) return;
     const next =
-      (matchIndex + direction + visibleSegments.length) %
-      visibleSegments.length;
+      (matchIndex + direction + transcriptMatches.length) %
+      transcriptMatches.length;
     setMatchIndex(next);
-    seekTo(visibleSegments[next]!.startMs, "cue");
+    const match = transcriptMatches[next]!;
+    seekTo(match.startMs, match.timingPrecision);
   }
 
   return (
@@ -2494,6 +2676,7 @@ function App() {
         <DesktopSetup
           authorization={authorization}
           {...(desktopAuthStatus ? { authStatus: desktopAuthStatus } : {})}
+          profileState={profileState}
           projects={projects}
           projectId={projectId}
           onProjectsChange={(nextProjects) => {
@@ -2501,6 +2684,7 @@ function App() {
             setProjectsLoaded(Boolean(authorization));
           }}
           onProjectChange={selectProject}
+          onRegisterProfile={registerDesktopProfile}
           onSignIn={beginDesktopSignIn}
           onSignOut={completeDesktopSignOut}
         />
@@ -2511,14 +2695,20 @@ function App() {
           authorization={authorization}
           url={url}
           {...(error ? { error } : {})}
-          onUrlChange={setUrl}
+          {...(videoLoadMessage ? { pasteMessage: videoLoadMessage } : {})}
+          loading={videoLoadBusy}
+          onUrlChange={(nextUrl) => {
+            setUrl(nextUrl);
+            setError(undefined);
+            setVideoLoadMessage(undefined);
+          }}
           onSubmit={loadVideo}
           onBulkAdd={() => {
-            setDestination("workbench");
+            setDestination("videos");
             setBulkAddRequest((request) => request + 1);
           }}
           onSearchCandidatesSelected={(inputs) => {
-            setDestination("workbench");
+            setDestination("videos");
             setSearchBatchRequest((current) => ({
               generation: (current?.generation ?? 0) + 1,
               inputs,
@@ -2554,7 +2744,7 @@ function App() {
               hasWorkspaceTarget={Boolean(workspaceTarget)}
               query={query}
               matchIndex={matchIndex}
-              visibleSegments={visibleSegments}
+              matches={transcriptMatches}
               activeSegmentId={activeSegment?.id}
               activeTokenId={activeToken?.id}
               selectedTokenIds={selectedTokenIds}
@@ -2841,6 +3031,7 @@ function App() {
           projectId={projectId}
           projects={projects}
           destination={destination}
+          hasOpenReviewSource={Boolean(workspaceTarget)}
           {...(notificationTarget ? { notificationTarget } : {})}
           bulkAddRequest={bulkAddRequest}
           {...(searchBatchRequest

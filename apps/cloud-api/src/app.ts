@@ -62,6 +62,7 @@ import {
   CreateProjectKeywordScanArtifactUploadRequestSchema,
   LookupDerivedTranslationSchema,
   RequestDerivedTranslationSchema,
+  CancelTranscriptionBatchItemRequestSchema,
   TranscriptionBatchControlRequestSchema,
   UpdateHostedTranscriptionApprovalRequestSchema,
   UpdateReviewStatusRequestSchema,
@@ -159,6 +160,9 @@ const ProjectExportBatchParamsSchema = IdParamsSchema.extend({
   batchId: z.uuid(),
 });
 const ProjectBatchParamsSchema = IdParamsSchema.extend({ batchId: z.uuid() });
+const ProjectBatchItemParamsSchema = ProjectBatchParamsSchema.extend({
+  itemId: z.uuid(),
+});
 const ProjectReviewItemParamsSchema = IdParamsSchema.extend({
   itemId: z.uuid(),
 });
@@ -1709,6 +1713,22 @@ export function createCloudApi(
         projectId,
         itemId,
         UpdateReviewStatusRequestSchema.parse(request.body),
+      );
+    },
+  );
+
+  app.post(
+    "/api/projects/:projectId/transcription-batches/:batchId/items/:itemId/cancel",
+    async (request) => {
+      const { projectId, batchId, itemId } = ProjectBatchItemParamsSchema.parse(
+        request.params,
+      );
+      return catalog.cancelTranscriptionBatchItem(
+        await authenticate(request),
+        projectId,
+        batchId,
+        itemId,
+        CancelTranscriptionBatchItemRequestSchema.parse(request.body),
       );
     },
   );

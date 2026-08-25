@@ -36,6 +36,7 @@ import {
 } from "@research-video/export-settings";
 import {
   LocalArtifactLocatorRepository,
+  localFilesystemIdentitiesMatch,
   type LocalArtifactLocatorRecord,
   type LocalArtifactRootRecord,
 } from "@research-video/db-local";
@@ -558,7 +559,10 @@ async function verifyPackage(
   });
   if (
     rootEvidence.realPath !== root.absolutePath ||
-    rootEvidence.filesystemIdentity !== root.filesystemIdentity
+    !localFilesystemIdentitiesMatch(
+      root.filesystemIdentity,
+      rootEvidence.filesystemIdentity,
+    )
   ) {
     throw verificationError("root_changed");
   }
@@ -671,7 +675,10 @@ async function verifyPackage(
     throw verificationError("filesystem_untrusted");
   });
   if (
-    endingRoot.filesystemIdentity !== root.filesystemIdentity ||
+    !localFilesystemIdentitiesMatch(
+      root.filesystemIdentity,
+      endingRoot.filesystemIdentity,
+    ) ||
     endingPackage.dev !== packageInfo.dev ||
     endingPackage.ino !== packageInfo.ino ||
     endingPackage.mtimeNs !== packageInfo.mtimeNs
@@ -984,7 +991,7 @@ async function inspectRoot(path: string) {
   const resolvedPath = await realpath(path);
   return {
     realPath: resolvedPath,
-    filesystemIdentity: `${info.dev}:${info.ino}`,
+    filesystemIdentity: `v2:inode:${info.ino}:birth:${info.birthtimeNs}`,
   };
 }
 

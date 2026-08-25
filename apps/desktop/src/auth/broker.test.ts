@@ -184,7 +184,10 @@ describe("desktop authentication broker", () => {
     broker.acceptNativeCallback(callback.href);
     await broker.drainNativeCallbacks();
 
-    expect(broker.getRendererStatus()).toEqual({ state: "signed_out" });
+    expect(broker.getRendererStatus()).toEqual({
+      state: "signed_out",
+      issue: "authentication_failed",
+    });
     await expect(broker.getAccessTokenForTrustedProxy()).rejects.toMatchObject({
       code: "desktop_authentication_failed",
     });
@@ -222,7 +225,20 @@ describe("desktop authentication broker", () => {
     });
     await broker.drainNativeCallbacks();
 
-    expect(broker.getRendererStatus()).toEqual({ state: "signed_out" });
+    expect(broker.getRendererStatus()).toEqual({
+      state: "signed_out",
+      issue: "authentication_failed",
+    });
+  });
+
+  it("reports a retryable failure when managed login cannot open", async () => {
+    const { broker, browser } = makeBroker();
+    vi.mocked(browser.open).mockRejectedValueOnce(new Error("no browser"));
+
+    await expect(broker.beginSignIn()).resolves.toEqual({
+      state: "signed_out",
+      issue: "authentication_failed",
+    });
   });
 
   it("revokes remotely and clears protected persistence on sign-out", async () => {

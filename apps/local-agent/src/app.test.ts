@@ -132,6 +132,92 @@ describe("desktop launch session", () => {
           },
         }),
       ),
+      checkRecommendedSetup: vi.fn(async () => ({
+        state: "needs_action" as const,
+        roots: [
+          {
+            target: "output_root" as const,
+            displayName: "Exports",
+            state: "will_create" as const,
+          },
+          {
+            target: "cache_root" as const,
+            displayName: "Cache",
+            state: "will_create" as const,
+          },
+        ],
+        tools: [
+          {
+            target: "ffmpeg" as const,
+            displayName: "FFmpeg",
+            state: "missing" as const,
+          },
+          {
+            target: "ffprobe" as const,
+            displayName: "FFprobe",
+            state: "missing" as const,
+          },
+          {
+            target: "yt_dlp" as const,
+            displayName: "yt-dlp",
+            state: "missing" as const,
+          },
+          {
+            target: "whisper_cli" as const,
+            displayName: "whisper.cpp",
+            state: "missing" as const,
+          },
+        ],
+        model: {
+          displayName: "Whisper",
+          byteSize: 4,
+          state: "download_required" as const,
+        },
+        enables: ["create_transcripts" as const, "export_clips" as const],
+      })),
+      applyRecommendedSetup: vi.fn(async () => ({
+        state: "completed" as const,
+        roots: [
+          {
+            target: "output_root" as const,
+            displayName: "Exports",
+            state: "active" as const,
+          },
+          {
+            target: "cache_root" as const,
+            displayName: "Cache",
+            state: "active" as const,
+          },
+        ],
+        tools: [
+          {
+            target: "ffmpeg" as const,
+            displayName: "FFmpeg",
+            state: "active" as const,
+          },
+          {
+            target: "ffprobe" as const,
+            displayName: "FFprobe",
+            state: "active" as const,
+          },
+          {
+            target: "yt_dlp" as const,
+            displayName: "yt-dlp",
+            state: "active" as const,
+          },
+          {
+            target: "whisper_cli" as const,
+            displayName: "whisper.cpp",
+            state: "active" as const,
+          },
+        ],
+        model: {
+          displayName: "Whisper",
+          byteSize: 4,
+          state: "download_required" as const,
+        },
+        enables: ["create_transcripts" as const, "export_clips" as const],
+      })),
       selectRoot: vi.fn(async () => snapshot),
       selectTool,
       activateWhisperModel: vi.fn(async () => snapshot),
@@ -188,6 +274,30 @@ describe("desktop launch session", () => {
     });
     expect(deniedSelection.statusCode).toBe(401);
     expect(selectTool).not.toHaveBeenCalled();
+
+    const deniedRecommended = await app.inject({
+      method: "POST",
+      url: "/api/desktop-setup/recommended/check",
+      headers: sessionHeaders,
+      payload: { model: { displayName: "Whisper", byteSize: 4 } },
+    });
+    expect(deniedRecommended.statusCode).toBe(401);
+
+    const acceptedRecommended = await app.inject({
+      method: "POST",
+      url: "/api/desktop-setup/recommended/check",
+      headers: {
+        ...sessionHeaders,
+        "x-research-video-native-action": nativeSecret,
+      },
+      payload: { model: { displayName: "Whisper", byteSize: 4 } },
+    });
+    expect(acceptedRecommended.statusCode).toBe(200);
+    expect(desktopSetup.checkRecommendedSetup).toHaveBeenCalledWith({
+      displayName: "Whisper",
+      byteSize: 4,
+    });
+    expect(JSON.stringify(acceptedRecommended.json())).not.toContain("/");
 
     const acceptedSelection = await app.inject({
       method: "POST",
@@ -966,6 +1076,35 @@ describe("local agent", () => {
       },
     });
     expect(response.body).not.toMatch(/private|bucket|presigned|secret/i);
+  });
+
+  it("keeps a missing active transcript distinct from authorization denial", async () => {
+    const app = createLocalAgent({
+      resolveTranscript: async () => {
+        throw Object.assign(new Error("No active transcript found."), {
+          statusCode: 404,
+          code: "not_found",
+        });
+      },
+    });
+    apps.add(app);
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/projects/019fbb95-cd76-7920-93fa-e23ba755e391/videos/019fbb95-cd76-7920-93fa-e23ba755e392/transcript",
+      headers: { authorization: "Bearer fixture-session" },
+    });
+    expect(response.statusCode).toBe(404);
+    expect(response.json()).toMatchObject({
+      error: {
+        code: "not_found",
+        message:
+          "No active transcript exists yet. Local processing is queued. Open Project Videos to check progress or resolve required language confirmation.",
+      },
+      operationFailure: {
+        operation: "transcript",
+        failureClass: "conflict",
+      },
+    });
   });
 
   it("accepts an offline-review capability only on the trusted desktop transcript hop", async () => {

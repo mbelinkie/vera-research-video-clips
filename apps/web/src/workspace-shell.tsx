@@ -12,9 +12,9 @@ import {
   type User,
 } from "@research-video/contracts";
 
-export type ProjectDestination = "workbench" | "clips" | "project_settings";
+export type ProjectDestination =
+  "videos" | "workbench" | "clips" | "project_settings";
 
-const shelfStorageKey = "vera:layout:worklist-shelf-height";
 const splitStorageKey = "vera:layout:transcript-width";
 
 function storedNumber(key: string, fallback: number, min: number, max: number) {
@@ -69,9 +69,6 @@ export function WorkspaceShell({
   onNavigationHistorySelect,
   onSignOut,
 }: WorkspaceShellProps) {
-  const [shelfHeight, setShelfHeight] = useState(() =>
-    storedNumber(shelfStorageKey, 260, 180, 420),
-  );
   const [transcriptWidth, setTranscriptWidth] = useState(() =>
     storedNumber(splitStorageKey, 42, 30, 62),
   );
@@ -88,20 +85,18 @@ export function WorkspaceShell({
 
   useEffect(() => {
     try {
-      localStorage.setItem(shelfStorageKey, String(shelfHeight));
       localStorage.setItem(splitStorageKey, String(transcriptWidth));
     } catch {
       // Layout persistence is optional private install state.
     }
-  }, [shelfHeight, transcriptWidth]);
+  }, [transcriptWidth]);
 
   useEffect(() => {
     if (destination === "project_settings" && !canManageProject)
-      onDestinationChange("workbench");
+      onDestinationChange("videos");
   }, [canManageProject, destination, onDestinationChange]);
 
   const style = {
-    "--worklist-shelf-height": `${shelfHeight}px`,
     "--transcript-column-width": `${transcriptWidth}%`,
   } as CSSProperties;
 
@@ -197,10 +192,17 @@ export function WorkspaceShell({
       <nav className="vera-destinations" aria-label="Project destinations">
         <button
           type="button"
+          aria-current={destination === "videos" ? "page" : undefined}
+          onClick={() => onDestinationChange("videos")}
+        >
+          Add
+        </button>
+        <button
+          type="button"
           aria-current={destination === "workbench" ? "page" : undefined}
           onClick={() => onDestinationChange("workbench")}
         >
-          Workbench
+          Review
         </button>
         <button
           type="button"
@@ -208,7 +210,7 @@ export function WorkspaceShell({
           disabled={!activeProject}
           onClick={() => onDestinationChange("clips")}
         >
-          Clips
+          Logged
         </button>
         {canManageProject ? (
           <button
@@ -221,7 +223,11 @@ export function WorkspaceShell({
             Project Settings
           </button>
         ) : null}
-        <div className="vera-source-navigation" aria-label="Source navigation">
+        <div
+          className="vera-source-navigation"
+          aria-label="Source navigation"
+          hidden={destination !== "workbench"}
+        >
           <button
             type="button"
             disabled={!navigationHistory.length}
@@ -255,22 +261,18 @@ export function WorkspaceShell({
         </div>
       </nav>
 
-      {destination === "workbench" ? (
-        <div className="workbench-layout">
+      {destination === "videos" ? (
+        <div className="add-layout">
           <div className="workbench-ingest">{ingest}</div>
-          <section
-            className="workbench-worklist-slot"
-            aria-label="Workbench worklist shelf"
-          >
-            {projectContent}
-          </section>
+          <div className="workbench-project-session">{projectContent}</div>
+        </div>
+      ) : destination === "workbench" ? (
+        <div className="workbench-layout review-layout">
+          <div className="workbench-project-session">{projectContent}</div>
           <LayoutControls
-            shelfHeight={shelfHeight}
             transcriptWidth={transcriptWidth}
-            onShelfHeightChange={setShelfHeight}
             onTranscriptWidthChange={setTranscriptWidth}
             onReset={() => {
-              setShelfHeight(260);
               setTranscriptWidth(42);
             }}
           />
@@ -286,34 +288,17 @@ export function WorkspaceShell({
 }
 
 function LayoutControls({
-  shelfHeight,
   transcriptWidth,
-  onShelfHeightChange,
   onTranscriptWidthChange,
   onReset,
 }: {
-  shelfHeight: number;
   transcriptWidth: number;
-  onShelfHeightChange(value: number): void;
   onTranscriptWidthChange(value: number): void;
   onReset(): void;
 }) {
   return (
     <details className="layout-controls">
       <summary>Layout</summary>
-      <label>
-        Worklist shelf height
-        <input
-          type="range"
-          aria-label="Worklist shelf height"
-          min="180"
-          max="420"
-          step="20"
-          value={shelfHeight}
-          onChange={(event) => onShelfHeightChange(Number(event.target.value))}
-        />
-        <output>{shelfHeight}px</output>
-      </label>
       <label>
         Transcript width
         <input
@@ -337,9 +322,10 @@ function LayoutControls({
 }
 
 function destinationLabel(destination: ProjectDestination) {
-  if (destination === "clips") return "Clips";
+  if (destination === "videos") return "Add";
+  if (destination === "clips") return "Logged";
   if (destination === "project_settings") return "Project Settings";
-  return "Workbench";
+  return "Review";
 }
 
 function roleLabel(role: ProjectSummary["currentUserRole"]) {
@@ -387,7 +373,7 @@ export function VideoIngestPanel({
       </div>
       <p className={error ? "form-message error" : "form-message"}>
         {error ??
-          "Open a project video from the worklist to resolve its verified transcript."}
+          "Paste a YouTube URL, search for a source, or add several videos as a batch."}
       </p>
     </form>
   );

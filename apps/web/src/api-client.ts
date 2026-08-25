@@ -8,9 +8,11 @@ import {
   type DesktopNotificationNavigationTarget,
   type DesktopNotificationPreferences,
   type DesktopNotificationSupportStatus,
+  type DesktopAuthStatus,
   type DesktopStatus,
   type ModelDownloadProgress,
   type ReadinessReport,
+  type RecommendedSetupPlan,
   type SetupAction,
   type SetupSelectionTarget,
   type SetupSnapshot,
@@ -20,11 +22,13 @@ export const DESKTOP_CONNECTED_SENTINEL = "desktop-connected";
 
 export type DesktopBridge = Readonly<{
   getStatus(): Promise<DesktopStatus>;
-  signIn(): Promise<void>;
-  signOut(): Promise<void>;
+  signIn(): Promise<DesktopAuthStatus>;
+  signOut(): Promise<DesktopAuthStatus>;
   getSetup(): Promise<SetupSnapshot>;
   getReadiness(): Promise<ReadinessReport>;
   updateSetup(action: SetupAction): Promise<SetupSnapshot>;
+  checkRecommendedSetup(): Promise<RecommendedSetupPlan>;
+  applyRecommendedSetup(): Promise<RecommendedSetupPlan>;
   chooseSetupTarget(target: SetupSelectionTarget): Promise<SetupSnapshot>;
   startModelDownload(): Promise<ModelDownloadProgress>;
   cancelModelDownload(): Promise<ModelDownloadProgress>;

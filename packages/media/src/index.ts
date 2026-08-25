@@ -94,7 +94,12 @@ export interface MediaCommandRunner {
   run(
     executable: string,
     args: readonly string[],
-    options?: { signal?: AbortSignal; timeoutMs?: number },
+    options?: {
+      signal?: AbortSignal;
+      timeoutMs?: number;
+      cwd?: string;
+      environment?: Readonly<Record<string, string>>;
+    },
   ): Promise<MediaCommandResult>;
 }
 
@@ -102,7 +107,12 @@ export class SpawnMediaCommandRunner implements MediaCommandRunner {
   async run(
     executable: string,
     args: readonly string[],
-    options: { signal?: AbortSignal; timeoutMs?: number } = {},
+    options: {
+      signal?: AbortSignal;
+      timeoutMs?: number;
+      cwd?: string;
+      environment?: Readonly<Record<string, string>>;
+    } = {},
   ): Promise<MediaCommandResult> {
     validateExecutable(executable);
     if (options.signal?.aborted) {
@@ -114,6 +124,8 @@ export class SpawnMediaCommandRunner implements MediaCommandRunner {
       const child = spawn(executable, [...args], {
         shell: false,
         stdio: ["ignore", "pipe", "pipe"],
+        ...(options.cwd ? { cwd: options.cwd } : {}),
+        ...(options.environment ? { env: { ...options.environment } } : {}),
       });
       let stdout = "";
       let stderr = "";

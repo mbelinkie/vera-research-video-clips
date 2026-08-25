@@ -164,6 +164,56 @@ describe("pinned model download", () => {
     );
   });
 
+  it("allows only bounded HTTPS redirects for the immutable model host", async () => {
+    const root = await mkdtemp(join(tmpdir(), "rvc-model-"));
+    directories.add(root);
+    const pin = {
+      ...pinFor("model-data"),
+      url: "https://huggingface.co/owner/repo/resolve/revision/model.bin",
+    };
+    const calls: string[] = [];
+    await expect(
+      downloadPinnedModel({
+        modelsDirectory: join(root, "models"),
+        pin,
+        signal: new AbortController().signal,
+        fetch: async (url) => {
+          calls.push(url);
+          return calls.length === 1
+            ? new Response(undefined, {
+                status: 302,
+                headers: { location: "https://us.aws.cdn.hf.co/model" },
+              })
+            : new Response("model-data", { status: 200 });
+        },
+      }),
+    ).resolves.toContain(pin.sha256);
+    expect(calls).toHaveLength(2);
+  });
+
+  it("rejects cross-host, credentialed, and non-HTTPS model redirects", async () => {
+    for (const location of [
+      "https://attacker.example/model",
+      "https://user:secret@huggingface.co/model",
+      "http://huggingface.co/model",
+    ]) {
+      const root = await mkdtemp(join(tmpdir(), "rvc-model-"));
+      directories.add(root);
+      await expect(
+        downloadPinnedModel({
+          modelsDirectory: join(root, "models"),
+          pin: {
+            ...pinFor("model-data"),
+            url: "https://huggingface.co/owner/repo/resolve/revision/model.bin",
+          },
+          signal: new AbortController().signal,
+          fetch: async () =>
+            new Response(undefined, { status: 302, headers: { location } }),
+        }),
+      ).rejects.toThrow("redirect policy");
+    }
+  });
+
   it("preserves a promotion collision and removes only its staging candidate", async () => {
     const root = await mkdtemp(join(tmpdir(), "rvc-model-"));
     directories.add(root);

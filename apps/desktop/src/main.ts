@@ -7,9 +7,9 @@ import {
   BrowserWindow,
   dialog,
   ipcMain,
-  net,
   Notification,
   protocol,
+  session,
   utilityProcess,
   type OpenDialogOptions,
   type UtilityProcess,
@@ -33,6 +33,7 @@ import {
   HealthResponseSchema,
   ModelDownloadProgressSchema,
   ReadinessReportSchema,
+  RecommendedSetupPlanSchema,
   SetupActionSchema,
   SetupSelectionTargetSchema,
   SetupSnapshotSchema,
@@ -86,7 +87,11 @@ import {
   ModelDownloadCanceledError,
   downloadPinnedModel,
 } from "./model-download.ts";
-import { loadDesktopRuntimeConfiguration } from "./runtime-config.ts";
+import {
+  hasCloudDesktopRuntimeConfiguration,
+  loadDesktopRuntimeConfiguration,
+} from "./runtime-config.ts";
+import { desktopToolSearchPath } from "./tool-search-path.ts";
 import {
   LocalServiceSupervisor,
   type ProcessExit,
@@ -95,6 +100,7 @@ import {
   type SupervisedProcess,
   type SupervisedServiceName,
 } from "./supervision/index.ts";
+import { installYouTubePlayerIdentification } from "./youtube-player-identification.ts";
 
 const trustedRendererOrigin = "rvc://app";
 const desktopRoot = __dirname;
@@ -194,16 +200,24 @@ if (!app.requestSingleInstanceLock()) {
           ),
       },
     );
-    const configuration = await loadDesktopRuntimeConfiguration(userData);
+    const configuration = await loadDesktopRuntimeConfiguration(
+      userData,
+      process.env,
+      join(desktopRoot, "desktop-config.json"),
+    );
     publicApiOrigin = configuration?.publicApiOrigin;
+    const cloudConfiguration =
+      configuration && hasCloudDesktopRuntimeConfiguration(configuration)
+        ? configuration
+        : undefined;
 
     const protectedStorageAvailable = await electronSafeStorage
       .isEncryptionAvailable()
       .catch(() => false);
-    if (configuration && protectedStorageAvailable) {
+    if (cloudConfiguration && protectedStorageAvailable) {
       const oauth = new CognitoOAuthClient({
-        authority: configuration.cognitoAuthority,
-        clientId: configuration.cognitoClientId,
+        authority: cloudConfiguration.cognitoAuthority,
+        clientId: cloudConfiguration.cognitoClientId,
         callbackUri: DESKTOP_OAUTH_CALLBACK_URI,
         logoutUri: "research-video-clips://oauth/logout",
       });
@@ -221,11 +235,11 @@ if (!app.requestSingleInstanceLock()) {
       }
       await broker.drainNativeCallbacks();
       cloudProxy = await startLoopbackCloudCredentialProxy({
-        cloudOrigin: configuration.publicApiOrigin,
+        cloudOrigin: cloudConfiguration.publicApiOrigin,
         launchSecret: sessionSecret,
         tokenProvider: () => broker!.getAccessTokenForTrustedProxy(),
       });
-    } else if (configuration) {
+    } else if (cloudConfiguration) {
       startupAuthIssue = "protected_storage_unavailable";
     }
 
@@ -264,6 +278,7 @@ if (!app.requestSingleInstanceLock()) {
     }
 
     await protocol.handle("rvc", serveTrustedRenderer);
+    installYouTubePlayerIdentification(session.defaultSession);
     installIpcHandlers({
       getBroker: () => broker,
       getSupervisor: () => supervisor,
@@ -668,6 +683,36 @@ function installIpcHandlers(options: {
     }
     return snapshot;
   });
+  ipcMain.handle(desktopIpcChannels.checkRecommendedSetup, async (event) => {
+    requireTrustedRenderer(event);
+    const pin = options.getWhisperModelPin();
+    if (!pin) throw new Error("Approved model setup is unavailable.");
+    return RecommendedSetupPlanSchema.parse(
+      await requestSetup("/api/desktop-setup/recommended/check", {
+        method: "POST",
+        native: true,
+        body: {
+          model: { displayName: pin.name, byteSize: pin.byteSize },
+        },
+      }),
+    );
+  });
+  ipcMain.handle(desktopIpcChannels.applyRecommendedSetup, async (event) => {
+    requireTrustedRenderer(event);
+    const pin = options.getWhisperModelPin();
+    if (!pin) throw new Error("Approved model setup is unavailable.");
+    const plan = RecommendedSetupPlanSchema.parse(
+      await requestSetup("/api/desktop-setup/recommended/apply", {
+        method: "POST",
+        native: true,
+        body: {
+          model: { displayName: pin.name, byteSize: pin.byteSize },
+        },
+      }),
+    );
+    await restartConfiguredRuntime();
+    return plan;
+  });
   ipcMain.handle(
     desktopIpcChannels.chooseSetupTarget,
     async (event, rawTarget) => {
@@ -729,7 +774,6 @@ function installIpcHandlers(options: {
           modelsDirectory: options.getModelsDirectory(),
           pin,
           signal: controller.signal,
-          fetch: net.fetch,
           onProgress: (update) => {
             updateModelDownloadProgress(
               ModelDownloadProgressSchema.parse({
@@ -1315,6 +1359,7 @@ function createElectronProcessLauncher(input: {
         APP_RUNTIME_ROLE:
           service === "local-agent" ? "desktop-local" : "desktop-worker",
         DATA_DIR: join(input.userData, "data"),
+        DESKTOP_APP_TOOLS_DIRECTORY: join(input.userData, "tools"),
         PUBLIC_API_ORIGIN: input.workerCloudOrigin ?? "https://invalid.local",
       };
       let modulePath: string;
@@ -1348,6 +1393,15 @@ function createElectronProcessLauncher(input: {
         environment.WHISPER_CPP_MODEL_PATH = workerConfiguration.whisperModel;
         environment.WHISPER_CPP_MODEL_NAME =
           workerConfiguration.whisperModelName;
+        environment.PATH = desktopToolSearchPath(
+          [
+            workerConfiguration.ytDlp,
+            workerConfiguration.whisperCli,
+            workerConfiguration.ffmpeg,
+            workerConfiguration.ffprobe,
+          ],
+          process.env.PATH,
+        );
       }
       const child = utilityProcess.fork(modulePath, [], {
         env: environment,

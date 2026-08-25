@@ -2,8 +2,8 @@
 
 ## Project guide and implementation plan
 
-Status: Milestones 1–6 and M7-04 complete; M7-01 real AWS acceptance remains blocked
-Last updated: 2026-08-24
+Status: Milestones 1–6 and M7-04 complete; low-cost AWS dogfood live; M7-01 production acceptance remains blocked
+Last updated: 2026-08-25
 
 This document is the source of truth for product scope, architecture, sequencing, and acceptance criteria. Update it when a deliberate product or architectural decision changes. Use `outline.md` as the shorter execution checklist.
 
@@ -911,6 +911,11 @@ authority.
   development and production parameters. The M7 production control plane uses
   ECS Fargate behind HTTPS, private RDS, Cognito, S3, SQS/DLQs, Secrets Manager,
   backups, alarms, and least-privilege roles.
+- A separate low-cost personal-dogfood stack may use one encrypted ARM EC2
+  instance, automatic HTTPS, Cognito, disk-backed PGlite, and explicit memory
+  object/queue adapters. This approximately $11/month boundary exists to prove
+  Finder-launched sign-in and ordinary personal UI flows; it is not production,
+  does not provide durable shared transcript objects, and cannot close M7-01.
 - Cognito managed login with authorization-code grant, S256 PKCE, no client
   secret, and `research-video-clips://oauth/callback`. OAuth tokens stay in the
   desktop authentication broker and never enter React state.
@@ -1877,8 +1882,9 @@ Execute six bounded slices:
    callback handling, an authenticated dynamic loopback endpoint, a
    credential-injecting worker proxy, bounded service restart/drain, and a
    remote-code-isolated YouTube iframe. The unsigned package and launch smoke
-   passed on the current Intel Mac; real Cognito sign-in remains dependent on
-   the explicitly blocked M7-01 AWS acceptance values.
+   passed on the current Intel Mac. An approved low-cost development Cognito/API
+   boundary was deployed and embedded on 2026-08-25 for personal sign-in
+   dogfood; the full production M7-01 acceptance topology remains blocked.
 3. **Terminal-free first run and readiness:** guide login, project access,
    output/cache roots, rights/privacy acknowledgement, provider selection, and
    cloud-translation consent. Detect and validate the workstation's installed

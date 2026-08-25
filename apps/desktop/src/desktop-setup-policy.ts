@@ -238,6 +238,8 @@ export function resolveWorkerConfiguration(
     !setup?.workerEnabled ||
     setup.mediaProvider !== "yt_dlp_audio" ||
     setup.speechToTextProvider !== "whisper_cpp" ||
+    !paths.ffmpeg ||
+    !paths.ffprobe ||
     !paths.ytDlp ||
     !paths.whisperCli ||
     !paths.whisperModel ||
@@ -253,6 +255,8 @@ export function resolveWorkerConfiguration(
       setup.translationProvider === "aws_translate" && setup.translationConsent
         ? ("aws-translate" as const)
         : ("disabled" as const),
+    ffmpeg: paths.ffmpeg,
+    ffprobe: paths.ffprobe,
     ytDlp: paths.ytDlp,
     whisperCli: paths.whisperCli,
     whisperModel: paths.whisperModel,

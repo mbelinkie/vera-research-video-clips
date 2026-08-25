@@ -15,10 +15,10 @@ describe("desktop notification renderer navigation", () => {
   it("routes every supported target to its bounded destination", () => {
     const authorized = new Set([projectId]);
     const targets: Array<
-      [DesktopNotificationNavigationTarget, "workbench" | "clips"]
+      [DesktopNotificationNavigationTarget, "videos" | "workbench" | "clips"]
     > = [
-      [{ kind: "transcription", projectId, batchId }, "workbench"],
-      [{ kind: "transcription", projectId, batchId, videoId }, "workbench"],
+      [{ kind: "transcription", projectId, batchId }, "videos"],
+      [{ kind: "transcription", projectId, batchId, videoId }, "videos"],
       [{ kind: "logged_export", projectId, clipId, requestId }, "clips"],
       [
         { kind: "mention", projectId, clipId, commentId, sourceTimeMs: 42 },

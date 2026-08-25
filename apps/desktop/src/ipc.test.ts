@@ -40,6 +40,8 @@ describe("desktop IPC channel vocabulary", () => {
       "desktop:get-setup",
       "desktop:get-readiness",
       "desktop:update-setup",
+      "desktop:check-recommended-setup",
+      "desktop:apply-recommended-setup",
       "desktop:choose-setup-target",
       "desktop:start-model-download",
       "desktop:cancel-model-download",
@@ -59,6 +61,9 @@ describe("desktop private setup route policy", () => {
     expect(isPrivateDesktopSetupPath("/api/desktop-setup/runtime-config")).toBe(
       true,
     );
+    expect(
+      isPrivateDesktopSetupPath("/api/desktop-setup/recommended/apply"),
+    ).toBe(true);
     expect(
       isPrivateDesktopSetupPath(
         "/api/desktop-setup/public/../runtime-config?ignored=1",

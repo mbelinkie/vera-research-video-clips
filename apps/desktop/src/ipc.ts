@@ -7,6 +7,8 @@ export const desktopIpcChannels = {
   getSetup: "desktop:get-setup",
   getReadiness: "desktop:get-readiness",
   updateSetup: "desktop:update-setup",
+  checkRecommendedSetup: "desktop:check-recommended-setup",
+  applyRecommendedSetup: "desktop:apply-recommended-setup",
   chooseSetupTarget: "desktop:choose-setup-target",
   startModelDownload: "desktop:start-model-download",
   cancelModelDownload: "desktop:cancel-model-download",
@@ -50,6 +52,8 @@ export function isPrivateDesktopSetupPath(path: string): boolean {
   }
   return (
     pathname === "/api/desktop-setup/native-selection" ||
+    pathname === "/api/desktop-setup/recommended/check" ||
+    pathname === "/api/desktop-setup/recommended/apply" ||
     pathname === "/api/desktop-setup/model-download/activate" ||
     pathname === "/api/desktop-setup/runtime-config"
   );

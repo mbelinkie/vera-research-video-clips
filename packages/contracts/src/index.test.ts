@@ -49,6 +49,7 @@ import {
   DesktopStatusSchema,
   ComponentHealthSchema,
   ReadinessReportSchema,
+  RecommendedSetupPlanSchema,
   SetupActionSchema,
   SetupSnapshotSchema,
   ModelDownloadProgressSchema,
@@ -152,6 +153,7 @@ import {
   TranscriptManifestSchema,
   TranscriptTrackSchema,
   TranscriptWorkspaceResponseSchema,
+  CancelTranscriptionBatchItemRequestSchema,
   TranscriptionBatchControlRequestSchema,
   UpdateHostedTranscriptionApprovalRequestSchema,
   UpdateReviewStatusRequestSchema,
@@ -1739,6 +1741,53 @@ describe("shared contracts", () => {
         expectedBytes: 8,
       }).success,
     ).toBe(false);
+    const recommended = RecommendedSetupPlanSchema.parse({
+      state: "ready_to_setup",
+      roots: [
+        {
+          target: "output_root",
+          displayName: "Movies exports folder",
+          state: "will_create",
+        },
+        {
+          target: "cache_root",
+          displayName: "Private transcript cache",
+          state: "will_use_existing",
+        },
+      ],
+      tools: [
+        {
+          target: "ffmpeg",
+          displayName: "FFmpeg",
+          state: "detected",
+          version: "8.1",
+        },
+        {
+          target: "ffprobe",
+          displayName: "Media inspector",
+          state: "detected",
+        },
+        { target: "yt_dlp", displayName: "Source helper", state: "detected" },
+        {
+          target: "whisper_cli",
+          displayName: "Speech engine",
+          state: "detected",
+        },
+      ],
+      model: {
+        displayName: "Whisper large-v3-turbo",
+        byteSize: 1_624_555_275,
+        state: "download_required",
+      },
+      enables: ["create_transcripts", "export_clips"],
+    });
+    expect(JSON.stringify(recommended)).not.toMatch(/path|\/Users|Cellar/u);
+    expect(
+      RecommendedSetupPlanSchema.safeParse({
+        ...recommended,
+        roots: recommended.roots.map((root) => ({ ...root, path: "/private" })),
+      }).success,
+    ).toBe(false);
   });
 
   it("keeps runtime quiescence and operation diagnostics closed and content-free", () => {
@@ -3184,11 +3233,23 @@ describe("shared contracts", () => {
       }),
     ).toEqual({ action: "pause_pending", expectedVersion: 2 });
     expect(
+      TranscriptionBatchControlRequestSchema.parse({
+        action: "cancel_all",
+        expectedVersion: 3,
+      }),
+    ).toEqual({ action: "cancel_all", expectedVersion: 3 });
+    expect(
       TranscriptionBatchControlRequestSchema.safeParse({
         action: "retry_failed",
         expectedVersion: 0,
       }).success,
     ).toBe(false);
+    expect(
+      CancelTranscriptionBatchItemRequestSchema.parse({
+        idempotencyKey: "  cancel:item:1  ",
+        expectedVersion: 4,
+      }),
+    ).toEqual({ idempotencyKey: "cancel:item:1", expectedVersion: 4 });
   });
 
   it("keeps hosted transcription approval strict and evidence-consistent", () => {

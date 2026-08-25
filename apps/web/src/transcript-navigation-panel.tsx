@@ -1,4 +1,4 @@
-import type { ComponentProps } from "react";
+import { useEffect, useRef, type ComponentProps } from "react";
 
 import {
   formatLanguageLabel,
@@ -7,6 +7,7 @@ import {
 } from "@research-video/contracts";
 
 import { VirtualTranscript } from "./virtual-transcript.tsx";
+import type { TranscriptSearchOccurrence } from "@research-video/transcript";
 
 export type TranscriptView = "preferred" | "english" | "original";
 
@@ -23,7 +24,7 @@ type TranscriptNavigationPanelProps = Readonly<{
   hasWorkspaceTarget: boolean;
   query: string;
   matchIndex: number;
-  visibleSegments: NormalizedTranscript["segments"];
+  matches: readonly TranscriptSearchOccurrence[];
   activeSegmentId: string | undefined;
   activeTokenId: string | undefined;
   selectedTokenIds: ReadonlySet<string>;
@@ -51,7 +52,7 @@ export function TranscriptNavigationPanel({
   hasWorkspaceTarget,
   query,
   matchIndex,
-  visibleSegments,
+  matches,
   activeSegmentId,
   activeTokenId,
   selectedTokenIds,
@@ -65,8 +66,32 @@ export function TranscriptNavigationPanel({
   onSelect,
   onRetry,
 }: TranscriptNavigationPanelProps) {
+  const searchInputRef = useRef<HTMLInputElement>(null);
+  const panelRef = useRef<HTMLElement>(null);
+  const activeMatch = matches[matchIndex];
+
+  useEffect(() => {
+    if (!transcript) return;
+    function focusTranscriptFind(event: KeyboardEvent) {
+      if (
+        event.key.toLocaleLowerCase() !== "f" ||
+        (!event.ctrlKey && !event.metaKey) ||
+        event.altKey ||
+        document.querySelector(
+          'dialog[open], [role="dialog"][aria-modal="true"]',
+        )
+      )
+        return;
+      event.preventDefault();
+      searchInputRef.current?.focus();
+      searchInputRef.current?.select();
+    }
+    window.addEventListener("keydown", focusTranscriptFind);
+    return () => window.removeEventListener("keydown", focusTranscriptFind);
+  }, [transcript]);
+
   return (
-    <article className="panel transcript-panel">
+    <article ref={panelRef} className="panel transcript-panel" tabIndex={-1}>
       <div className="panel-heading">
         <div>
           <span>
@@ -143,49 +168,70 @@ export function TranscriptNavigationPanel({
           <div className="search-field">
             <label htmlFor="transcript-search">Search transcript</label>
             <input
+              ref={searchInputRef}
               id="transcript-search"
               type="search"
               value={query}
               onChange={(event) => onQueryChange(event.target.value)}
               placeholder="Find exact text"
+              onKeyDown={(event) => {
+                if (event.key === "Enter") {
+                  event.preventDefault();
+                  onMoveMatch(event.shiftKey ? -1 : 1);
+                } else if (event.key === "Escape") {
+                  event.preventDefault();
+                  panelRef.current?.focus();
+                }
+              }}
             />
+            {query ? (
+              <button
+                type="button"
+                className="quiet-button"
+                aria-label="Clear transcript search"
+                onClick={() => {
+                  onQueryChange("");
+                  searchInputRef.current?.focus();
+                }}
+              >
+                Clear
+              </button>
+            ) : null}
             <span className="search-navigation">
               <span>
-                {visibleSegments.length === 0
+                {matches.length === 0
                   ? "0 matches"
-                  : `${matchIndex + 1} of ${visibleSegments.length}`}
+                  : `${matchIndex + 1} of ${matches.length}`}
               </span>
               <button
                 type="button"
-                disabled={visibleSegments.length === 0}
+                disabled={matches.length === 0}
                 onClick={() => onMoveMatch(-1)}
               >
                 Previous match
               </button>
               <button
                 type="button"
-                disabled={visibleSegments.length === 0}
+                disabled={matches.length === 0}
                 onClick={() => onMoveMatch(1)}
               >
                 Next match
               </button>
             </span>
           </div>
-          {visibleSegments.length > 0 ? (
-            <VirtualTranscript
-              segments={visibleSegments}
-              tokens={transcript.tokens}
-              {...(activeSegmentId ? { activeSegmentId } : {})}
-              {...(activeTokenId ? { activeTokenId } : {})}
-              selectedTokenIds={selectedTokenIds}
-              follow={follow}
-              onFollowSuspended={onFollowSuspended}
-              onSeek={onSeek}
-              onSelect={onSelect}
-            />
-          ) : (
-            <p className="no-results">No transcript matches.</p>
-          )}
+          <VirtualTranscript
+            segments={transcript.segments}
+            tokens={transcript.tokens}
+            searchMatches={matches}
+            {...(activeMatch ? { activeSearchMatchId: activeMatch.id } : {})}
+            {...(activeSegmentId ? { activeSegmentId } : {})}
+            {...(activeTokenId ? { activeTokenId } : {})}
+            selectedTokenIds={selectedTokenIds}
+            follow={follow}
+            onFollowSuspended={onFollowSuspended}
+            onSeek={onSeek}
+            onSelect={onSelect}
+          />
         </>
       ) : (
         <div className="empty-state">

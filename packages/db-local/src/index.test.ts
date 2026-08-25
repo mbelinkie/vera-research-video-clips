@@ -29,6 +29,7 @@ import {
   LocalExportWorkerIdentityRepository,
   LocalTranscriptIndex,
   LocalTranscriptCacheAuthorizationRepository,
+  localFilesystemIdentitiesMatch,
   openLocalDatabase,
   runLocalMigrations,
   clipLibraryAuthorizationScope,
@@ -38,6 +39,28 @@ const localMigrationDirectory = fileURLToPath(
   new URL("../migrations", import.meta.url),
 );
 const temporaryDirectories = new Set<string>();
+
+describe("local artifact filesystem identity", () => {
+  it("permits only exact matches and the legacy-to-stable APFS transition", () => {
+    expect(localFilesystemIdentitiesMatch("7:42", "7:42")).toBe(true);
+    expect(
+      localFilesystemIdentitiesMatch(
+        "v2:inode:42:birth:123456789",
+        "v2:inode:42:birth:123456789",
+      ),
+    ).toBe(true);
+    expect(
+      localFilesystemIdentitiesMatch("7:42", "v2:inode:42:birth:123456789"),
+    ).toBe(true);
+    expect(
+      localFilesystemIdentitiesMatch("7:42", "v2:inode:43:birth:123456789"),
+    ).toBe(false);
+    expect(localFilesystemIdentitiesMatch("7:42", "8:42")).toBe(false);
+    expect(
+      localFilesystemIdentitiesMatch("v2:inode:42:birth:123456789", "7:42"),
+    ).toBe(false);
+  });
+});
 
 const fixtureExportInput = {
   idempotencyKey: "fixture-export-only",
@@ -401,6 +424,24 @@ describe("local migrations", () => {
         filesystemIdentity: "7:42",
       }),
     ).toEqual(root);
+    expect(
+      repository.configureRoot({
+        label: "Stable identity after an APFS remount",
+        platform: "posix",
+        absolutePath: "/private/local-only/exports",
+        pathFingerprint: "a".repeat(64),
+        filesystemIdentity: "v2:inode:42:birth:123456789",
+      }),
+    ).toEqual(root);
+    expect(() =>
+      repository.configureRoot({
+        label: "Replaced directory",
+        platform: "posix",
+        absolutePath: "/private/local-only/exports",
+        pathFingerprint: "a".repeat(64),
+        filesystemIdentity: "v2:inode:43:birth:123456790",
+      }),
+    ).toThrow("Configured artifact root identity conflicts");
     const requestId = randomUUID();
     const locatorIdentity = {
       artifactVersionId: randomUUID(),

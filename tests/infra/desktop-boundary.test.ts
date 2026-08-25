@@ -16,6 +16,14 @@ const player = readFileSync(
   "utf8",
 );
 const main = readFileSync(new URL("apps/desktop/src/main.ts", root), "utf8");
+const playerIdentification = readFileSync(
+  new URL("apps/desktop/src/youtube-player-identification.ts", root),
+  "utf8",
+);
+const forgeBundleId = forge.match(/appBundleId: "([^"]+)"/u)?.[1];
+const playerAppId = playerIdentification.match(
+  /youtubePlayerAppId = "([^"]+)"/u,
+)?.[1];
 
 describe("local Intel desktop package boundary", () => {
   it("pins the approved Electron/Forge toolchain and x64 package path", () => {
@@ -43,6 +51,18 @@ describe("local Intel desktop package boundary", () => {
     expect(player).toContain("event.origin !== playerOrigin");
     expect(main).toContain("script-src 'self';");
     expect(main).not.toMatch(/script-src[^;]*https:/u);
+  });
+
+  it("identifies bounded YouTube player requests with the installed app ID", () => {
+    expect(playerAppId).toBe(forgeBundleId);
+    expect(playerIdentification).toContain(
+      '"https://www.youtube-nocookie.com/*"',
+    );
+    expect(playerIdentification).toContain('"https://www.youtube.com/*"');
+    expect(playerIdentification).toContain("Referer = youtubePlayerReferer");
+    expect(main).toContain(
+      "installYouTubePlayerIdentification(session.defaultSession)",
+    );
   });
 
   it("hardens BrowserWindow and obtains the child-owned port over private IPC", () => {

@@ -14,7 +14,10 @@ import { EncryptedRefreshTokenStore } from "./refresh-token-store.ts";
 const REFRESH_SKEW_MS = 60_000;
 
 export type RendererAuthStatus =
-  | { readonly state: "signed_out" }
+  | {
+      readonly state: "signed_out";
+      readonly issue?: "authentication_failed" | "session_expired";
+    }
   | { readonly state: "signing_in" }
   | { readonly state: "signed_in"; readonly expiresAt: number };
 
@@ -73,7 +76,7 @@ export class DesktopAuthenticationBroker {
     } catch {
       await this.refreshTokens.clear();
       this.resetEphemeralSession();
-      this.status = { state: "signed_out" };
+      this.status = { state: "signed_out", issue: "session_expired" };
     }
     return this.status;
   }
@@ -96,7 +99,7 @@ export class DesktopAuthenticationBroker {
       await this.browser.open(attempt.authorizationUrl);
     } catch {
       this.resetEphemeralSession();
-      this.status = { state: "signed_out" };
+      this.status = { state: "signed_out", issue: "authentication_failed" };
     }
     return this.status;
   }
@@ -143,7 +146,7 @@ export class DesktopAuthenticationBroker {
       } catch {
         await this.refreshTokens.clear();
         this.resetEphemeralSession();
-        this.status = { state: "signed_out" };
+        this.status = { state: "signed_out", issue: "session_expired" };
         throw new DesktopAuthenticationError();
       }
     }
@@ -206,7 +209,7 @@ export class DesktopAuthenticationBroker {
         } catch {
           await this.refreshTokens.clear();
           this.resetEphemeralSession();
-          this.status = { state: "signed_out" };
+          this.status = { state: "signed_out", issue: "authentication_failed" };
         }
       }
     }

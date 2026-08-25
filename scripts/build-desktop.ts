@@ -1,7 +1,10 @@
-import { cp, mkdir, rm } from "node:fs/promises";
+import { cp, mkdir, rm, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 
 import { build, type BuildOptions } from "esbuild";
+
+import { DesktopRuntimeConfigurationSchema } from "../apps/desktop/src/runtime-config.ts";
+import { approvedWhisperModelPin } from "../apps/desktop/src/release-config.ts";
 
 const repositoryRoot = process.cwd();
 const outputRoot = resolve(repositoryRoot, "dist/desktop");
@@ -60,4 +63,31 @@ await cp(
   resolve(repositoryRoot, "packages/db-local/migrations"),
   resolve(outputRoot, "migrations"),
   { recursive: true },
+);
+
+const publicDesktopConfiguration = {
+  publicApiOrigin: process.env.PUBLIC_API_ORIGIN,
+  cognitoAuthority: process.env.COGNITO_DOMAIN,
+  cognitoClientId: process.env.COGNITO_CLIENT_ID,
+  whisperModelPin: approvedWhisperModelPin,
+};
+const configuredDesktopValues = [
+  publicDesktopConfiguration.publicApiOrigin,
+  publicDesktopConfiguration.cognitoAuthority,
+  publicDesktopConfiguration.cognitoClientId,
+].filter(Boolean).length;
+if (configuredDesktopValues > 0 && configuredDesktopValues < 3) {
+  throw new Error(
+    "Desktop cloud configuration is partial. Set PUBLIC_API_ORIGIN, COGNITO_DOMAIN, and COGNITO_CLIENT_ID together.",
+  );
+}
+const configuration = DesktopRuntimeConfigurationSchema.parse(
+  configuredDesktopValues === 3
+    ? publicDesktopConfiguration
+    : { whisperModelPin: approvedWhisperModelPin },
+);
+await writeFile(
+  resolve(outputRoot, "desktop-config.json"),
+  `${JSON.stringify(configuration, null, 2)}\n`,
+  { encoding: "utf8", mode: 0o600 },
 );

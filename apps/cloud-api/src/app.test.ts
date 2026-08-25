@@ -4404,6 +4404,10 @@ describe("cloud API", () => {
       payload: { executionLocation: "local", leaseSeconds: 30 },
     });
     expect(retryClaim.statusCode).toBe(200);
+    const retryClaimBody = retryClaim.json<{
+      job: { id: string };
+      lease: { attempt: number };
+    }>();
     const canceled = await app.inject({
       method: "POST",
       url: controlUrl,
@@ -4413,6 +4417,80 @@ describe("cloud API", () => {
     expect(canceled.json()).toMatchObject({
       batch: { dispatchStatus: "canceled", version: 5 },
       progress: { active: 1, failed: 1, canceled: 1, queued: 0 },
+    });
+    const canceledBody = canceled.json<{
+      batch: { version: number };
+      items: { id: string; state: string; version: number }[];
+    }>();
+    const activeItem = canceledBody.items.find((item) =>
+      [
+        "resolving",
+        "acquiring",
+        "transcribing",
+        "translating",
+        "aligning",
+        "uploading",
+      ].includes(item.state),
+    )!;
+    const itemCancelUrl = `/api/projects/${projectId}/transcription-batches/${createdBody.batch.id}/items/${activeItem.id}/cancel`;
+    const itemCancelCommand = {
+      idempotencyKey: "control-active-item-cancel",
+      expectedVersion: activeItem.version,
+    };
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: itemCancelUrl,
+          headers: { authorization: outsiderAuthorization },
+          payload: itemCancelCommand,
+        })
+      ).statusCode,
+    ).toBe(403);
+    const itemCanceled = await app.inject({
+      method: "POST",
+      url: itemCancelUrl,
+      headers: { authorization },
+      payload: itemCancelCommand,
+    });
+    expect(itemCanceled.statusCode).toBe(200);
+    expect(itemCanceled.json()).toMatchObject({
+      outcome: "canceling",
+      jobCancellationRequested: true,
+      item: { id: activeItem.id, state: "canceling" },
+    });
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: itemCancelUrl,
+          headers: { authorization },
+          payload: itemCancelCommand,
+        })
+      ).json(),
+    ).toEqual(itemCanceled.json());
+    const cancellationHeartbeat = await app.inject({
+      method: "POST",
+      url: `/api/transcription-jobs/${retryClaimBody.job.id}/heartbeat`,
+      headers: { authorization },
+      payload: {
+        attempt: retryClaimBody.lease.attempt,
+        leaseSeconds: 30,
+        stage: "acquiring",
+      },
+    });
+    expect(cancellationHeartbeat.json()).toMatchObject({
+      status: "cancellation_requested",
+    });
+    const cancelAll = await app.inject({
+      method: "POST",
+      url: controlUrl,
+      headers: { authorization },
+      payload: { action: "cancel_all", expectedVersion: 5 },
+    });
+    expect(cancelAll.json()).toMatchObject({
+      batch: { dispatchStatus: "canceled", version: 6 },
+      progress: { canceled: 3, queued: 0, active: 0, failed: 0 },
     });
     expect(
       (

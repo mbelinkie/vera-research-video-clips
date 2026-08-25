@@ -618,8 +618,12 @@ infra/aws        storage, API, database, queues, identity, monitoring
 ## Next action
 
 Milestones 1–6, M7-04, and the deterministic M7-05 export baseline are complete.
-M7-01's real AWS change-set and Cognito acceptance remain an explicit external
-prerequisite. PUNCH-001 completed on 2026-08-24: versioned language decisions,
+M7-01's real production AWS change-set and acceptance remain an explicit
+external prerequisite. On 2026-08-25, a separate approximately $11/month
+single-instance development stack supplied real Cognito managed login and an
+HTTPS PGlite API for personal dogfood. Its memory object-store/queue adapters
+are intentionally non-durable and do not complete M7-01. PUNCH-001 completed on
+2026-08-24: versioned language decisions,
 conflict/capability gates, strict immutable timed bilingual import, bounded
 side-by-side review, explicit activation, two-workstation verified-cache reuse,
 and corrected clip/export provenance are implemented and verified. PUNCH-006

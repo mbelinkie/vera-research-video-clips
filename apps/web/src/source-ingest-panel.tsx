@@ -17,6 +17,8 @@ type SourceIngestPanelProps = Readonly<{
   authorization: string;
   url: string;
   error?: string;
+  pasteMessage?: string;
+  loading?: boolean;
   onUrlChange(url: string): void;
   onSubmit(): void;
   onBulkAdd(): void;
@@ -35,6 +37,8 @@ export function SourceIngestPanel({
   authorization,
   url,
   error,
+  pasteMessage,
+  loading = false,
   onUrlChange,
   onSubmit,
   onBulkAdd,
@@ -222,27 +226,53 @@ export function SourceIngestPanel({
 
   return (
     <section className="source-ingest-panel" aria-label="Add source videos">
-      <div className="ingest-mode-tabs" role="tablist" aria-label="Ingest mode">
+      <div className="ingest-mode-tabs" role="tablist" aria-label="Add videos">
         <button
+          id="ingest-tab-paste"
           type="button"
           role="tab"
           aria-selected={mode === "paste"}
+          aria-controls="ingest-panel-paste"
+          tabIndex={mode === "paste" ? 0 : -1}
           onClick={() => setMode("paste")}
+          onKeyDown={(event) => {
+            if (event.key === "ArrowRight" || event.key === "End") {
+              event.preventDefault();
+              setMode("search");
+              document.getElementById("ingest-tab-search")?.focus();
+            }
+          }}
         >
           Paste URL
         </button>
         <button
+          id="ingest-tab-search"
           type="button"
           role="tab"
           aria-selected={mode === "search"}
+          aria-controls="ingest-panel-search"
+          tabIndex={mode === "search" ? 0 : -1}
           onClick={() => setMode("search")}
+          onKeyDown={(event) => {
+            if (event.key === "ArrowLeft" || event.key === "Home") {
+              event.preventDefault();
+              setMode("paste");
+              document.getElementById("ingest-tab-paste")?.focus();
+            }
+          }}
         >
           Search
         </button>
       </div>
 
       {mode === "paste" ? (
-        <form className="loader compact-ingest" onSubmit={submitPaste}>
+        <form
+          id="ingest-panel-paste"
+          className="loader compact-ingest ingest-tab-panel"
+          role="tabpanel"
+          aria-labelledby="ingest-tab-paste"
+          onSubmit={submitPaste}
+        >
           <label htmlFor="video-url">YouTube URL or video ID</label>
           <div className="loader-row">
             <input
@@ -251,18 +281,30 @@ export function SourceIngestPanel({
               onChange={(event) => onUrlChange(event.target.value)}
               aria-invalid={Boolean(error)}
             />
-            <button type="submit">Load video</button>
+            <button type="submit" disabled={loading}>
+              {loading ? "Adding video…" : "Load video"}
+            </button>
             <button type="button" onClick={onBulkAdd}>
               Bulk add
             </button>
           </div>
-          <p className={error ? "form-message error" : "form-message"}>
+          <p
+            className={error ? "form-message error" : "form-message"}
+            role="status"
+          >
             {error ??
+              pasteMessage ??
               "Open a project video from the worklist to resolve its verified transcript."}
           </p>
         </form>
       ) : (
-        <form className="source-search-form" onSubmit={submitSearch}>
+        <form
+          id="ingest-panel-search"
+          className="source-search-form ingest-tab-panel"
+          role="tabpanel"
+          aria-labelledby="ingest-tab-search"
+          onSubmit={submitSearch}
+        >
           <fieldset disabled={!projectId || !authorization || busy}>
             <legend>Search platforms</legend>
             <div className="source-provider-options">

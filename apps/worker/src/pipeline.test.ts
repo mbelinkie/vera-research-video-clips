@@ -313,7 +313,7 @@ describe("transcript pipeline", () => {
     expect(publication.finalize).toHaveBeenCalledOnce();
   });
 
-  it("publishes separate time-linked original and English caption tracks", async () => {
+  it("publishes YouTube-style WebVTT captions without falling back to ASR", async () => {
     const scratchRoot = await mkdtemp(join(tmpdir(), "pipeline-"));
     temporaryDirectories.add(scratchRoot);
     const publication = publicationFixture();
@@ -335,7 +335,7 @@ describe("transcript pipeline", () => {
         acquire: async (videoId, track, scratch) => {
           const path = join(scratch, "caption.vtt");
           const contents =
-            "WEBVTT\n\n00:00.500 --> 00:02.500\nEste es un ejemplo breve.\n";
+            "WEBVTT\nKind: captions\nLanguage: es\n\n00:00.500 --> 00:02.500\nEste es un ejemplo breve.\n";
           await writeFile(path, contents);
           return {
             videoId,

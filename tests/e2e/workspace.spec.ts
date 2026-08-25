@@ -24,6 +24,14 @@ const romanianVideo = {
   channel: "Fixture channel",
 };
 
+const immediateVideo = {
+  id: "019fbb95-cd76-7920-93fa-e23ba755ee93",
+  youtubeVideoId: "48CKtpjFvjs",
+  canonicalUrl: "https://www.youtube.com/watch?v=48CKtpjFvjs",
+  title: "New immediate-review video",
+  channel: "Fixture channel",
+};
+
 function projectVideoFixture(
   video: typeof directVideo | typeof romanianVideo,
   now: string,
@@ -292,7 +300,7 @@ test("does not hydrate fixture text for an arbitrary projectless URL", async ({
 }) => {
   await page.goto("/");
 
-  await expect(page.getByRole("heading", { name: "Workbench" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Add" })).toBeVisible();
   await page
     .getByLabel("YouTube URL or video ID")
     .fill(directVideo.canonicalUrl);
@@ -316,9 +324,7 @@ test("rejects a non-YouTube URL without replacing the workspace", async ({
   await page.getByRole("button", { name: "Load video" }).click();
 
   await expect(page.getByText(/Enter a YouTube watch/)).toBeVisible();
-  await expect(
-    page.getByRole("heading", { name: "Open a project video" }),
-  ).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Add" })).toBeVisible();
 });
 
 async function mockAuthenticatedWorkspace(
@@ -504,11 +510,335 @@ async function connectShellWorkspace(page: Page) {
   await page.getByRole("button", { name: "Connect" }).click();
 }
 
+test("onboards a first Cognito desktop user, creates a project, and persists setup", async ({
+  page,
+}) => {
+  const now = "2026-08-24T23:10:00.000Z";
+  const userId = "019fbb95-cd76-7920-93fa-e23ba755ee90";
+  const projectId = "019fbb95-cd76-7920-93fa-e23ba755ee91";
+  await page.addInitScript(
+    ({ now, userId, projectId }) => {
+      const profile = {
+        id: userId,
+        externalSubject: "cognito:fixture:first-user",
+        handle: "first_researcher",
+        displayName: "First Researcher",
+        preferredLanguage: "en",
+        createdAt: now,
+        updatedAt: now,
+      };
+      const readProjects = () =>
+        JSON.parse(localStorage.getItem("desktop-first-run-projects") ?? "[]");
+      const response = (status: number, value: unknown) => ({
+        status,
+        body: JSON.stringify(value),
+        contentType: "application/json",
+      });
+      const readSetup = () => ({
+        setup: {
+          schemaVersion: 1,
+          rightsAcknowledged:
+            localStorage.getItem("desktop-first-run-rights") === "true",
+          privacyAcknowledged: false,
+          workerEnabled: false,
+          translationConsent: false,
+          captionProvider: "disabled",
+          mediaProvider: "disabled",
+          exportSourceProvider: "disabled",
+          speechToTextProvider: "disabled",
+          translationProvider: "disabled",
+          updatedAt: now,
+        },
+        activeComponents: [],
+      });
+      Object.defineProperty(window, "researchVideoDesktop", {
+        configurable: true,
+        value: {
+          async getStatus() {
+            return {
+              auth: { state: "signed_in", expiresAt: now },
+              services: [
+                { service: "local_agent", state: "healthy", restartCount: 0 },
+                {
+                  service: "transcription_worker",
+                  state: "stopped",
+                  restartCount: 0,
+                },
+              ],
+            };
+          },
+          async signIn() {
+            return { state: "signed_in", expiresAt: now };
+          },
+          async signOut() {
+            return { state: "signed_out" };
+          },
+          async getSetup() {
+            return readSetup();
+          },
+          async getReadiness() {
+            return {
+              schemaVersion: 1,
+              generatedAt: now,
+              components: [
+                {
+                  component: "cloud_api",
+                  state: "ready",
+                  reason: "ready",
+                  remediation: "none",
+                  checkedAt: now,
+                },
+              ],
+              operations: [
+                "project_browsing",
+                "verified_cached_review",
+                "project_logging",
+                "transcript_processing",
+                "export_processing",
+              ].map((operation) => ({
+                operation,
+                state: "ready",
+                blockingComponents: [],
+              })),
+            };
+          },
+          async updateSetup(action: {
+            action: string;
+            acknowledged?: boolean;
+          }) {
+            if (action.action === "set_rights_acknowledgement") {
+              localStorage.setItem(
+                "desktop-first-run-rights",
+                String(action.acknowledged === true),
+              );
+            }
+            return readSetup();
+          },
+          async checkRecommendedSetup() {
+            return {
+              state: "ready_to_setup",
+              roots: [
+                {
+                  target: "output_root",
+                  displayName: "Movies exports folder",
+                  state: "will_create",
+                },
+                {
+                  target: "cache_root",
+                  displayName: "Private transcript cache",
+                  state: "will_create",
+                },
+              ],
+              tools: [
+                {
+                  target: "ffmpeg",
+                  displayName: "FFmpeg",
+                  state: "detected",
+                  version: "8.1.2",
+                },
+                {
+                  target: "ffprobe",
+                  displayName: "FFprobe media inspector",
+                  state: "detected",
+                  version: "8.1.2",
+                },
+                {
+                  target: "yt_dlp",
+                  displayName: "Authorized source helper",
+                  state: "detected",
+                  version: "2026.08.19",
+                },
+                {
+                  target: "whisper_cli",
+                  displayName: "whisper.cpp speech engine",
+                  state: "detected",
+                },
+              ],
+              model: {
+                displayName: "Whisper large-v3-turbo",
+                byteSize: 1624555275,
+                state: "download_required",
+              },
+              enables: ["create_transcripts", "export_clips"],
+            };
+          },
+          async applyRecommendedSetup() {
+            const plan = await this.checkRecommendedSetup();
+            localStorage.setItem("desktop-first-run-local-setup", "true");
+            return {
+              ...plan,
+              state: "completed",
+              roots: plan.roots.map(
+                (root: {
+                  target: string;
+                  displayName: string;
+                  state: string;
+                }) => ({
+                  ...root,
+                  state: "active",
+                }),
+              ),
+              tools: plan.tools.map(
+                (tool: {
+                  target: string;
+                  displayName: string;
+                  state: string;
+                  version?: string;
+                }) => ({ ...tool, state: "active" }),
+              ),
+            };
+          },
+          async chooseSetupTarget() {
+            return readSetup();
+          },
+          async startModelDownload() {
+            throw new Error("not configured");
+          },
+          async cancelModelDownload() {
+            throw new Error("not active");
+          },
+          onModelDownloadProgress() {
+            return () => undefined;
+          },
+          async request(request: {
+            method: string;
+            path: string;
+            body?: string;
+          }) {
+            if (request.path === "/api/session/profile") {
+              return localStorage.getItem("desktop-first-run-registered")
+                ? response(200, profile)
+                : response(404, {
+                    error: {
+                      code: "not_found",
+                      message: "User is not registered.",
+                      retryable: false,
+                    },
+                  });
+            }
+            if (
+              request.path === "/api/session/register" &&
+              request.method === "POST"
+            ) {
+              localStorage.setItem("desktop-first-run-registered", "true");
+              return response(200, profile);
+            }
+            if (request.path === "/api/projects" && request.method === "GET") {
+              return response(200, readProjects());
+            }
+            if (request.path === "/api/projects" && request.method === "POST") {
+              const input = JSON.parse(request.body ?? "{}") as {
+                name?: string;
+                description?: string;
+                kind?: "personal" | "shared";
+              };
+              const project = {
+                id: projectId,
+                name: input.name ?? "First project",
+                description: input.description ?? "",
+                kind: input.kind ?? "shared",
+                visibility:
+                  input.kind === "personal" ? "private" : "invitation_only",
+                version: 1,
+                createdAt: now,
+                updatedAt: now,
+              };
+              localStorage.setItem(
+                "desktop-first-run-projects",
+                JSON.stringify([
+                  { ...project, currentUserRole: "owner", memberCount: 1 },
+                ]),
+              );
+              return response(200, project);
+            }
+            return response(503, {
+              error: {
+                code: "unavailable",
+                message: "Fixture unavailable.",
+                retryable: true,
+              },
+            });
+          },
+          async uploadTimedTranscript() {
+            throw new Error("not configured");
+          },
+          async getNotificationPreferences() {
+            throw new Error("not configured");
+          },
+          async updateNotificationPreferences() {
+            throw new Error("not configured");
+          },
+          async getNotificationSupport() {
+            throw new Error("not configured");
+          },
+          onNotificationNavigation() {
+            return () => undefined;
+          },
+        },
+      });
+    },
+    { now, userId, projectId },
+  );
+
+  await page.goto("/");
+  await page.locator("details.account-menu > summary").click();
+  await page.locator("details.local-setup-menu > summary").click();
+  await expect(page.getByLabel("Account display name")).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "Create", exact: true }),
+  ).toBeDisabled();
+
+  await page.getByLabel("Account display name").fill("First Researcher");
+  await page.getByRole("button", { name: "Create account profile" }).click();
+  await expect(page.getByLabel("Account display name")).toHaveCount(0);
+  await page.getByLabel("New project name").fill("First research project");
+  await page.getByRole("button", { name: "Create", exact: true }).click();
+  const activeProject = page
+    .locator(".vera-project-control")
+    .getByLabel("Active project");
+  await expect(activeProject).toHaveValue(projectId);
+  await expect(activeProject).toContainText("First research project");
+
+  const rights = page.getByLabel(
+    "I will process only sources I am authorized to use.",
+  );
+  await rights.check();
+  await expect(rights).toBeChecked();
+
+  await page.getByRole("button", { name: "Set up this Mac" }).click();
+  await expect(
+    page.getByText("Ready to set up", { exact: true }),
+  ).toBeVisible();
+  await expect(page.getByText("Whisper large-v3-turbo")).toBeVisible();
+  await expect(page.getByText("1.5 GiB", { exact: false })).toBeVisible();
+  await page.getByRole("button", { name: "Confirm local setup" }).click();
+  await expect(page.getByText("Local setup active")).toBeVisible();
+  await expect(page.getByText("Advanced setup")).toBeVisible();
+
+  await page.reload();
+  await page.locator("details.account-menu > summary").click();
+  await page.locator("details.local-setup-menu > summary").click();
+  await expect(page.getByLabel("Account display name")).toHaveCount(0);
+  await expect(
+    page.getByLabel("I will process only sources I am authorized to use."),
+  ).toBeChecked();
+  await expect(
+    page.locator(".vera-project-control").getByLabel("Active project"),
+  ).toHaveValue(projectId);
+});
+
 test("searches YouTube with capability-gated providers and hands selection to preflight", async ({
   page,
 }) => {
   await mockShellWorkspace(page, 0);
   let preflightCount = 0;
+  let createAttempts = 0;
+  let createdBatch: Record<string, any> | undefined;
+  const createdBatchId = "019fbb95-cd76-7920-93fa-e23ba755eef1";
+  const createdItemIds = [
+    "019fbb95-cd76-7920-93fa-e23ba755eef2",
+    "019fbb95-cd76-7920-93fa-e23ba755eef3",
+  ];
   await page.route(
     "**/cloud-api/api/projects/*/source-capabilities",
     async (route) =>
@@ -597,16 +927,21 @@ test("searches YouTube with capability-gated providers and hands selection to pr
     "**/cloud-api/api/projects/*/videos/preflight",
     async (route) => {
       preflightCount += 1;
-      const body = route.request().postDataJSON() as { inputs: string[] };
+      const body = route.request().postDataJSON() as Record<string, any> & {
+        inputs: string[];
+      };
       return route.fulfill({
         json: {
           projectId: shellPersonalProjectId,
           options: {
             targetLanguage: "en",
             transcriptionProfile: "default",
-            sourcePolicy: "prefer-existing",
-            executionLocation: "local",
-            priority: "normal",
+            sourcePolicy: body.sourcePolicy,
+            executionLocation: body.executionLocation,
+            priority: body.priority,
+            ...(body.translationConsent
+              ? { translationConsent: body.translationConsent }
+              : {}),
           },
           items: body.inputs.map((input, inputIndex) => ({
             inputIndex,
@@ -629,9 +964,130 @@ test("searches YouTube with capability-gated providers and hands selection to pr
       });
     },
   );
+  await page.route(
+    "**/cloud-api/api/projects/*/transcription-batches",
+    async (route) => {
+      if (route.request().method() === "GET") {
+        return route.fulfill({
+          json: {
+            batches: createdBatch
+              ? [
+                  {
+                    batch: createdBatch.batch,
+                    progress: createdBatch.progress,
+                  },
+                ]
+              : [],
+          },
+        });
+      }
+      createAttempts += 1;
+      if (createAttempts === 1) {
+        return route.fulfill({
+          status: 409,
+          json: {
+            error: {
+              code: "creation_conflict",
+              message: "Correct the draft and retry.",
+              retryable: true,
+            },
+          },
+        });
+      }
+      const body = route.request().postDataJSON() as Record<string, any>;
+      expect(body).toMatchObject({
+        name: "Research batch",
+        executionLocation: "hosted",
+        priority: "high",
+        translationConsent: {
+          provider: "amazon-translate",
+          transcriptTextTransferAccepted: true,
+        },
+      });
+      const now = "2026-08-25T12:00:00.000Z";
+      const items = body.inputs.map((input: string, inputIndex: number) => ({
+        id: createdItemIds[inputIndex],
+        batchId: createdBatchId,
+        inputIndex,
+        input,
+        status: "ready",
+        processingNeed: "transcription",
+        youtubeVideoId: new URL(input).searchParams.get("v"),
+        canonicalUrl: input,
+        title: `Search result ${inputIndex + 1}`,
+        state: "queued",
+        reviewStatus: "unreviewed",
+        attempt: 0,
+        version: 1,
+        createdAt: now,
+        updatedAt: now,
+      }));
+      createdBatch = {
+        batch: {
+          id: createdBatchId,
+          projectId: shellPersonalProjectId,
+          name: body.name,
+          targetLanguage: "en",
+          transcriptionProfile: "default",
+          sourcePolicy: body.sourcePolicy,
+          executionLocation: body.executionLocation,
+          priority: body.priority,
+          translationConsent: body.translationConsent,
+          hostedApproval: { state: "pending", version: 1 },
+          dispatchStatus: "active",
+          createdBy: shellUserId,
+          version: 1,
+          createdAt: now,
+          updatedAt: now,
+        },
+        items,
+        summary: {
+          total: 2,
+          ready: 2,
+          existingTranscripts: 0,
+          duplicates: 0,
+          unsupported: 0,
+          metadataFailed: 0,
+        },
+        progress: {
+          total: 2,
+          queued: 2,
+          active: 0,
+          readyForReview: 0,
+          blocked: 0,
+          failed: 0,
+          retryableFailed: 0,
+          canceled: 0,
+          unreviewed: 0,
+          reviewing: 0,
+          reviewed: 0,
+          skipped: 0,
+        },
+      };
+      return route.fulfill({ status: 201, json: createdBatch });
+    },
+  );
+  await page.route(
+    `**/cloud-api/api/projects/*/transcription-batches/${createdBatchId}`,
+    async (route) =>
+      createdBatch
+        ? route.fulfill({ json: createdBatch })
+        : route.fulfill({ status: 404, json: { error: "not found" } }),
+  );
 
   await page.goto("/");
   await connectShellWorkspace(page);
+  await page.getByLabel("Worker").selectOption("hosted");
+  await page.getByLabel("Priority").selectOption("high");
+  await page.getByLabel(/Allow Amazon Translate/u).check();
+  const csvInput = page.getByLabel("Import CSV");
+  await csvInput.setInputFiles({
+    name: "draft.csv",
+    mimeType: "text/csv",
+    buffer: Buffer.from("Title,URL\nDraft,https://youtu.be/DraftVideo1\n"),
+  });
+  await page.getByLabel("YouTube URL column").selectOption("1");
+  await page.getByRole("button", { name: "Use CSV values" }).click();
   await page.getByRole("tab", { name: "Search" }).click();
 
   const providerOptions = page.locator(".source-provider-options");
@@ -673,6 +1129,162 @@ test("searches YouTube with capability-gated providers and hands selection to pr
   await page.getByRole("button", { name: "Preflight 2" }).click();
   await expect(page.getByText("Preflight complete.")).toBeVisible();
   expect(preflightCount).toBe(1);
+  await page
+    .getByRole("button", { name: "Create batch" })
+    .evaluate((button) => {
+      (button as HTMLButtonElement).click();
+      (button as HTMLButtonElement).click();
+    });
+  await expect(page.getByText("Correct the draft and retry.")).toBeVisible();
+  expect(createAttempts).toBe(1);
+  await expect(page.getByLabel("Batch name")).toHaveValue("Research batch");
+  await expect(
+    page.getByLabel("YouTube URLs or video IDs, one per line"),
+  ).not.toHaveValue("");
+  await expect(page.getByLabel("YouTube URL column")).toHaveValue("1");
+  await expect(page.locator(".batch-create-card .summary-line")).toHaveCount(1);
+  await page.getByRole("button", { name: "Create batch" }).click();
+  await expect(page.getByLabel("Batch name")).toHaveValue("");
+  await expect(page.getByLabel("Batch name")).toBeFocused();
+  await expect(
+    page.getByLabel("YouTube URLs or video IDs, one per line"),
+  ).toHaveValue("");
+  await expect(csvInput).toHaveValue("");
+  await expect(page.getByLabel("YouTube URL column")).toHaveCount(0);
+  await expect(page.locator(".batch-create-card .summary-line")).toHaveCount(0);
+  await expect(page.getByLabel("Worker")).toHaveValue("hosted");
+  await expect(page.getByLabel("Priority")).toHaveValue("high");
+  await expect(page.getByLabel(/Allow Amazon Translate/u)).toBeChecked();
+  await expect(page.getByText("Research batch", { exact: true })).toBeVisible();
+  expect(createAttempts).toBe(2);
+});
+
+test("adds an unknown pasted URL for immediate review and exposes keyboard tabs", async ({
+  page,
+}) => {
+  const now = "2026-08-25T12:00:00.000Z";
+  await mockShellWorkspace(page, 0);
+  let resolveCount = 0;
+  let resolvedProjectId: string | undefined;
+
+  await page.route("**/cloud-api/api/projects/*/videos", async (route) =>
+    route.fulfill({ json: [] }),
+  );
+  await page.route(
+    "**/cloud-api/api/projects/*/videos/resolve",
+    async (route) => {
+      resolveCount += 1;
+      const path = new URL(route.request().url()).pathname;
+      resolvedProjectId = path.split("/")[4];
+      expect(route.request().method()).toBe("POST");
+      expect(route.request().postDataJSON()).toEqual({
+        url: immediateVideo.canonicalUrl,
+      });
+      await route.fulfill({
+        status: 201,
+        json: {
+          ...immediateVideo,
+          version: 1,
+          createdAt: now,
+          updatedAt: now,
+        },
+      });
+    },
+  );
+  await page.route(
+    `**/local-agent/api/projects/*/videos/${immediateVideo.id}/transcript?*`,
+    async (route) =>
+      route.fulfill({
+        status: 404,
+        json: {
+          error: {
+            code: "not_found",
+            message:
+              "No active transcript exists yet. Local processing is queued.",
+            retryable: true,
+          },
+        },
+      }),
+  );
+
+  await page.goto("/");
+  await connectShellWorkspace(page);
+
+  const pasteTab = page.getByRole("tab", { name: "Paste URL" });
+  const searchTab = page.getByRole("tab", { name: "Search" });
+  await expect(pasteTab).toHaveAttribute("aria-selected", "true");
+  await pasteTab.focus();
+  await pasteTab.press("ArrowRight");
+  await expect(searchTab).toHaveAttribute("aria-selected", "true");
+  await expect(page.getByRole("tabpanel", { name: "Search" })).toBeVisible();
+  await searchTab.press("Home");
+  await expect(pasteTab).toHaveAttribute("aria-selected", "true");
+  await expect(page.getByRole("tabpanel", { name: "Paste URL" })).toBeVisible();
+
+  await page
+    .getByLabel("YouTube URL or video ID")
+    .fill(immediateVideo.youtubeVideoId);
+  await page.getByRole("button", { name: "Load video" }).click();
+
+  await expect(
+    page.locator(
+      `iframe[src*="youtube-nocookie.com/embed/${immediateVideo.youtubeVideoId}"]`,
+    ),
+  ).toBeVisible();
+  await expect(
+    page.getByText(
+      "No active transcript exists yet. Local processing is queued.",
+    ),
+  ).toBeVisible();
+  expect(resolveCount).toBe(1);
+  expect(resolvedProjectId).toBe(shellPersonalProjectId);
+  await expect(
+    page.getByText(/not in this project yet|batch workflow/u),
+  ).toHaveCount(0);
+
+  await page.getByRole("button", { name: "Add", exact: true }).click();
+  await page.getByRole("button", { name: "Load video" }).click();
+  await expect.poll(() => resolveCount).toBe(1);
+});
+
+test("keeps immediate URL resolve failures actionable without opening a video", async ({
+  page,
+}) => {
+  await mockShellWorkspace(page, 0);
+  await page.route("**/cloud-api/api/projects/*/videos", async (route) =>
+    route.fulfill({ json: [] }),
+  );
+  await page.route(
+    "**/cloud-api/api/projects/*/videos/resolve",
+    async (route) =>
+      route.fulfill({
+        status: 503,
+        json: {
+          error: {
+            code: "unavailable",
+            message: "YouTube metadata is temporarily unavailable. Try again.",
+            retryable: true,
+          },
+        },
+      }),
+  );
+
+  await page.goto("/");
+  await connectShellWorkspace(page);
+  await page
+    .getByLabel("YouTube URL or video ID")
+    .fill(immediateVideo.youtubeVideoId);
+  await page.getByRole("button", { name: "Load video" }).click();
+
+  await expect(
+    page.getByText("YouTube metadata is temporarily unavailable. Try again."),
+  ).toBeVisible();
+  await expect(
+    page.locator(
+      `iframe[src*="youtube-nocookie.com/embed/${immediateVideo.youtubeVideoId}"]`,
+    ),
+  ).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Load video" })).toBeEnabled();
 });
 
 const navigationUserId = "019fbb95-cd76-7920-93fa-e23ba755ee80";
@@ -1230,11 +1842,12 @@ test("creates, searches, seeks, and moderates project bookmarks with visible syn
   expect(geometry.panelScrollHeight).toBeGreaterThanOrEqual(
     geometry.panelClientHeight,
   );
+  await page.getByRole("button", { name: "Review", exact: true }).click();
   await page.setViewportSize({ width: 700, height: 900 });
   await expect(panel).toBeVisible();
 });
 
-test("renders the role-aware VERA shell and persists bounded layout controls", async ({
+test("separates Add, Review, and Logged workflow destinations", async ({
   page,
 }) => {
   await page.setViewportSize({ width: 1440, height: 900 });
@@ -1288,17 +1901,17 @@ test("renders the role-aware VERA shell and persists bounded layout controls", a
   await page.locator("details.account-menu > summary").click();
 
   await page.getByRole("button", { name: "Bulk add" }).click();
+  await expect(page.getByRole("heading", { name: "Add" })).toBeVisible();
   await expect(
     page.getByLabel("YouTube URLs or video IDs, one per line"),
   ).toBeFocused();
+  await page.getByRole("button", { name: "Review", exact: true }).click();
 
   const shellGeometry = await page.evaluate(() => ({
     documentHeight: document.documentElement.scrollHeight,
     viewportHeight: document.documentElement.clientHeight,
-    shelfHeight: Math.round(
-      document
-        .querySelector(".workbench-worklist-slot")!
-        .getBoundingClientRect().height,
+    hasWorklistShelf: Boolean(
+      document.querySelector(".workbench-worklist-slot"),
     ),
     researchHeight: Math.round(
       document.querySelector(".workbench-research")!.getBoundingClientRect()
@@ -1308,20 +1921,51 @@ test("renders the role-aware VERA shell and persists bounded layout controls", a
   expect(shellGeometry.documentHeight).toBeLessThanOrEqual(
     shellGeometry.viewportHeight,
   );
-  expect(shellGeometry.shelfHeight).toBe(260);
+  expect(shellGeometry.hasWorklistShelf).toBe(false);
   expect(shellGeometry.researchHeight).toBeGreaterThan(100);
 
   await page.getByText("Layout", { exact: true }).click();
-  await page.getByLabel("Worklist shelf height").fill("340");
+  await expect(page.getByLabel("Worklist shelf height")).toHaveCount(0);
   await page.getByLabel("Transcript width").fill("54");
-  await expect(page.getByLabel("Worklist shelf height")).toHaveValue("340");
   await page.reload();
+  await page.getByRole("button", { name: "Review", exact: true }).click();
   await page.getByText("Layout", { exact: true }).click();
-  await expect(page.getByLabel("Worklist shelf height")).toHaveValue("340");
   await expect(page.getByLabel("Transcript width")).toHaveValue("54");
   await page.getByRole("button", { name: "Reset layout" }).click();
-  await expect(page.getByLabel("Worklist shelf height")).toHaveValue("260");
   await expect(page.getByLabel("Transcript width")).toHaveValue("42");
+
+  await page.getByRole("button", { name: "Add", exact: true }).click();
+  await connectShellWorkspace(page);
+  await expect(page.getByRole("heading", { name: "Add" })).toBeVisible();
+  await expect(page.getByLabel("Project video worklist")).toBeVisible();
+  const projectVideosGeometry = await page.evaluate(() => ({
+    documentHeight: document.documentElement.scrollHeight,
+    viewportHeight: document.documentElement.clientHeight,
+    shellOverflow: getComputedStyle(
+      document.querySelector(".destination-videos")!,
+    ).overflow,
+    contentOverflow: getComputedStyle(document.querySelector(".add-layout")!)
+      .overflow,
+    ingestTop: document
+      .querySelector(".source-ingest-panel")!
+      .getBoundingClientRect().top,
+    batchesTop: document.querySelector(".batch-grid")!.getBoundingClientRect()
+      .top,
+    worklistTop: document
+      .querySelector(".canonical-worklist-card")!
+      .getBoundingClientRect().top,
+  }));
+  expect(projectVideosGeometry.documentHeight).toBeGreaterThan(
+    projectVideosGeometry.viewportHeight,
+  );
+  expect(projectVideosGeometry.shellOverflow).toBe("visible");
+  expect(projectVideosGeometry.contentOverflow).toBe("visible");
+  expect(projectVideosGeometry.ingestTop).toBeLessThan(
+    projectVideosGeometry.batchesTop,
+  );
+  expect(projectVideosGeometry.batchesTop).toBeLessThan(
+    projectVideosGeometry.worklistTop,
+  );
 });
 
 test("fails closed for removed recency and gates settings for researchers", async ({
@@ -1355,6 +1999,7 @@ test("fails closed for removed recency and gates settings for researchers", asyn
   ).toHaveCount(0);
   await expect(page.getByText("Shared research · Researcher")).toBeVisible();
 
+  await page.getByRole("button", { name: "Review", exact: true }).click();
   await page.setViewportSize({ width: 700, height: 900 });
   const panelOrder = await page.evaluate(() => {
     const player = document
@@ -1644,10 +2289,22 @@ test("opens verified artifacts first and restores bounded source navigation", as
   await page.getByRole("button", { name: "Load video" }).click();
   await expect(page.getByText("word timing", { exact: true })).toBeVisible();
   await page.getByLabel("Language view").selectOption("english");
-  await page.getByLabel("Search transcript").fill("i");
+  await page.keyboard.press("Control+f");
+  await expect(page.getByLabel("Search transcript")).toBeFocused();
+  await page.getByLabel("Search transcript").fill("word");
+  await expect(page.getByText("1 of 2", { exact: true })).toBeVisible();
+  await expect(page.getByTestId("transcript-window-row")).toHaveCount(2);
+  await expect(page.locator(".transcript-token.search-match")).toHaveCount(2);
+  await page.getByLabel("Search transcript").press("Enter");
+  await expect(page.getByText("2 of 2", { exact: true })).toBeVisible();
+  await page.getByLabel("Search transcript").press("Shift+Enter");
   await expect(page.getByText("1 of 2", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: "Next match" }).click();
-  await expect(page.getByText("2 of 2", { exact: true })).toBeVisible();
+  await page.getByLabel("Search transcript").press("Escape");
+  await expect(page.getByLabel("Search transcript")).toHaveValue("word");
+  await expect(page.getByLabel("Search transcript")).not.toBeFocused();
+  await page.keyboard.press("Meta+f");
+  await expect(page.getByLabel("Search transcript")).toBeFocused();
   await selectDirectFixturePassage(page);
 
   const directFrame = page
@@ -1666,7 +2323,10 @@ test("opens verified artifacts first and restores bounded source navigation", as
   );
   await expect(page.locator(".video-details strong")).toHaveText("0:01");
 
-  await page.getByRole("button", { name: "Clips", exact: true }).click();
+  await page
+    .getByLabel("Project destinations")
+    .getByRole("button", { name: "Logged" })
+    .click();
   const directCard = page.locator(".clip-card").filter({
     hasText: directVideo.title,
   });
@@ -1682,17 +2342,16 @@ test("opens verified artifacts first and restores bounded source navigation", as
     .poll(() => fixture.artifactOpenRequests)
     .toContain(navigationDirectLocatorId);
   await expect(
-    page.getByRole("button", { name: "Clips", exact: true }),
+    page.getByRole("button", { name: "Logged", exact: true }),
   ).toHaveAttribute("aria-current", "page");
 
   await romanianCard.getByRole("button", { name: "Open clip" }).click();
   await expect
     .poll(() => fixture.artifactOpenRequests)
     .toContain(navigationRomanianLocatorId);
-  await expect(page.getByRole("button", { name: "Workbench" })).toHaveAttribute(
-    "aria-current",
-    "page",
-  );
+  await expect(
+    page.getByRole("button", { name: "Review", exact: true }),
+  ).toHaveAttribute("aria-current", "page");
   await expect(
     page.getByText(/compatible local artifact could not be freshly verified/u),
   ).toBeVisible();
@@ -1774,7 +2433,7 @@ test("opens verified artifacts first and restores bounded source navigation", as
   await expect(page.getByLabel("Current source")).toContainText(
     directVideo.title,
   );
-  await expect(page.getByLabel("Search transcript")).toHaveValue("i");
+  await expect(page.getByLabel("Search transcript")).toHaveValue("word");
   await expect(page.getByText("2 of 2", { exact: true })).toBeVisible();
   await expect(page.getByLabel("Language view")).toHaveValue("english");
   await expect(page.getByLabel("Clip selection")).toContainText(
@@ -1797,12 +2456,15 @@ test("opens verified artifacts first and restores bounded source navigation", as
       /discarded its selection because the active transcript version changed/u,
     ),
   ).toBeVisible();
-  await expect(page.getByLabel("Search transcript")).toHaveValue("i");
+  await expect(page.getByLabel("Search transcript")).toHaveValue("word");
   await expect(page.getByLabel("Language view")).toHaveValue("english");
   await expect(page.locator(".video-details strong")).toHaveText("0:01");
   await expect(page.getByLabel("Clip selection")).toHaveCount(0);
 
-  await page.getByRole("button", { name: "Clips", exact: true }).click();
+  await page
+    .getByLabel("Project destinations")
+    .getByRole("button", { name: "Logged" })
+    .click();
   await page
     .locator(".clip-card")
     .filter({ hasText: romanianVideo.title })
@@ -2036,8 +2698,8 @@ test("marks guarded player ranges, attaches overlap explicitly, and logs atteste
   await expect(page.getByText(/Duration: 2:00/u)).toBeVisible();
 
   await postFixturePlayerInfo(page, { currentTime: 0.3, duration: 120 });
-  const urlInput = page.getByLabel("YouTube URL or video ID");
-  await urlInput.focus();
+  const transcriptSearchInput = page.getByLabel("Search transcript");
+  await transcriptSearchInput.focus();
   await page.keyboard.press("i");
   await expect(page.getByTestId("player-range-bounds")).toContainText(
     "In: not set",
@@ -2051,19 +2713,19 @@ test("marks guarded player ranges, attaches overlap explicitly, and logs atteste
   await expect(page.getByTestId("player-range-bounds")).toContainText(
     "In: not set",
   );
-  await page.getByRole("heading", { name: "Workbench" }).click();
+  await page.getByRole("heading", { name: "Review" }).click();
   await page.keyboard.press("i");
   await expect(page.getByTestId("player-range-bounds")).toContainText(
     "In: 0:00",
   );
 
   await postFixturePlayerInfo(page, { currentTime: 2.9 });
-  await urlInput.focus();
+  await transcriptSearchInput.focus();
   await page.keyboard.press("o");
   await expect(page.getByTestId("player-range-bounds")).toContainText(
     "Out: not set",
   );
-  await page.getByRole("heading", { name: "Workbench" }).click();
+  await page.getByRole("heading", { name: "Review" }).click();
   await page.keyboard.press("o");
   await expect(page.getByTestId("player-range-bounds")).toContainText(
     "Out: 0:02",
@@ -2093,7 +2755,9 @@ test("marks guarded player ranges, attaches overlap explicitly, and logs atteste
     .getByLabel("Clip description / intended use")
     .fill("Silent visual bridge for the opening montage.");
   await page.getByRole("button", { name: "Log clip" }).click();
-  await expect(page.getByRole("button", { name: "Logged" })).toBeDisabled();
+  await expect(
+    page.getByLabel("Clip selection").getByRole("button", { name: "Logged" }),
+  ).toBeDisabled();
   expect(clipPostCount).toBe(1);
   expect(postedClip?.selection).toMatchObject({
     selectionType: "player_time_range",
@@ -2118,6 +2782,7 @@ test("marks guarded player ranges, attaches overlap explicitly, and logs atteste
 test("maps transcript text selection to stable source and export bounds", async ({
   page,
 }) => {
+  test.setTimeout(60_000);
   const now = "2026-08-01T12:00:00.000Z";
   const existingProjectId = "019fbb95-cd76-7920-93fa-e23ba755ee40";
   const createdProjectId = "019fbb95-cd76-7920-93fa-e23ba755ee41";
@@ -3126,6 +3791,7 @@ test("maps transcript text selection to stable source and export bounds", async 
     .fill("Created without losing the selection");
   await page.getByRole("button", { name: "Create and select project" }).click();
   await expect(page.getByLabel("Active project")).toHaveValue(createdProjectId);
+  await page.getByRole("button", { name: "Add", exact: true }).click();
   await page
     .getByLabel("YouTube URL or video ID")
     .fill(directVideo.canonicalUrl);
@@ -3140,6 +3806,7 @@ test("maps transcript text selection to stable source and export bounds", async 
   ).resolves.not.toContain("Existing Project Edit v1 — project default");
   failExistingPresetDiscovery = true;
   await page.getByLabel("Logging project").selectOption(existingProjectId);
+  await page.getByRole("button", { name: "Add", exact: true }).click();
   await page
     .getByLabel("YouTube URL or video ID")
     .fill(directVideo.canonicalUrl);
@@ -3159,6 +3826,7 @@ test("maps transcript text selection to stable source and export bounds", async 
   await closeMoreClipActions(page);
   failExistingPresetDiscovery = false;
   await page.getByLabel("Logging project").selectOption(createdProjectId);
+  await page.getByRole("button", { name: "Add", exact: true }).click();
   await page
     .getByLabel("YouTube URL or video ID")
     .fill(directVideo.canonicalUrl);
@@ -3184,13 +3852,18 @@ test("maps transcript text selection to stable source and export bounds", async 
   await expect(panel).toContainText(
     "Logged to New essay. No export was requested.",
   );
-  await expect(page.getByRole("button", { name: "Logged" })).toBeDisabled();
+  await expect(
+    page.getByLabel("Clip selection").getByRole("button", { name: "Logged" }),
+  ).toBeDisabled();
   expect(clipPostCount).toBe(1);
   expect(lastClipBody?.firstComment).toEqual({
     body: "Verify the source attribution before authoring handoff.",
   });
 
-  await page.getByRole("button", { name: "Clips" }).click();
+  await page
+    .getByLabel("Project destinations")
+    .getByRole("button", { name: "Logged" })
+    .click();
   const clipQueue = page.getByRole("article", { name: /clip library/i });
   await clipQueue.getByRole("button", { name: "Refresh" }).click();
   await expect(clipQueue).toContainText(directVideo.title);
@@ -3232,7 +3905,7 @@ test("maps transcript text selection to stable source and export bounds", async 
   await expect(clipQueue).toContainText(
     "Downloaded the project clip log as CSV.",
   );
-  await page.getByRole("button", { name: "Workbench" }).click();
+  await page.getByRole("button", { name: "Review", exact: true }).click();
 
   await page.getByText("Per-export overrides").click();
   await expect(
@@ -3349,6 +4022,7 @@ test("maps transcript text selection to stable source and export bounds", async 
     "Saved es-MX. Existing logged clips are unchanged.",
   );
   await page.locator("details.account-menu > summary").click();
+  await page.getByRole("button", { name: "Add", exact: true }).click();
   await page.getByLabel("YouTube URL or video ID").fill("Romanian001");
   await page.getByRole("button", { name: "Load video" }).click();
   await expect(page.getByText("Spanish (es) transcript")).toBeVisible();
@@ -3400,7 +4074,10 @@ test("maps transcript text selection to stable source and export bounds", async 
     lastClipBody?.languageEvidence.preferred.trackId,
   );
   batchFixtureEnabled = true;
-  await page.getByRole("button", { name: "Clips" }).click();
+  await page
+    .getByLabel("Project destinations")
+    .getByRole("button", { name: "Logged" })
+    .click();
   await clipQueue.getByRole("button", { name: "Refresh" }).click();
   const clipSelectors = clipQueue.locator(
     '.clip-library-select input[type="checkbox"]',
@@ -3491,6 +4168,7 @@ test("maps transcript text selection to stable source and export bounds", async 
 test("connects an explicit project, controls a batch, and updates review state", async ({
   page,
 }) => {
+  test.setTimeout(60_000);
   const now = "2026-08-01T12:00:00.000Z";
   const projectId = "019fbb95-cd76-7920-93fa-e23ba755ee30";
   const batchId = "019fbb95-cd76-7920-93fa-e23ba755ee31";
@@ -3532,6 +4210,8 @@ test("connects an explicit project, controls a batch, and updates review state",
   let claimActive = false;
   let workspaceRequestPath: string | undefined;
   let workspaceRequests = 0;
+  let itemState = "ready_for_review";
+  let itemCancelCommand: Record<string, unknown> | undefined;
   const progress = {
     total: 1,
     queued: 0,
@@ -3588,7 +4268,7 @@ test("connects an explicit project, controls a batch, and updates review state",
     channel: "Fixture channel",
     catalogVideoId: "019fbb95-cd76-7920-93fa-e23ba755ee33",
     activeTranscriptVersionId: "019fbb95-cd76-7920-93fa-e23ba755ee34",
-    state: "ready_for_review",
+    state: itemState,
     reviewStatus,
     attempt: 0,
     version: reviewVersion,
@@ -3885,7 +4565,12 @@ test("connects an explicit project, controls a batch, and updates review state",
     }
     if (path === `/api/projects/${projectId}/review-inbox`) {
       return route.fulfill({
-        json: { items: [{ ...item(), batchName: "Interview research" }] },
+        json: {
+          items:
+            itemState === "ready_for_review"
+              ? [{ ...item(), batchName: "Interview research" }]
+              : [],
+        },
       });
     }
     if (path === `/api/projects/${projectId}/videos`) {
@@ -4279,6 +4964,33 @@ test("connects an explicit project, controls a batch, and updates review state",
     ) {
       return route.fulfill({ json: batchResponse() });
     }
+    if (
+      path.endsWith(
+        `/transcription-batches/${batchId}/items/019fbb95-cd76-7920-93fa-e23ba755ee32/cancel`,
+      ) &&
+      request.method() === "POST"
+    ) {
+      itemCancelCommand = request.postDataJSON();
+      expect(itemCancelCommand?.expectedVersion).toBe(reviewVersion);
+      expect(itemCancelCommand?.idempotencyKey).toMatch(
+        /^transcription-batch-item-cancel:[a-f0-9]{64}$/,
+      );
+      itemState = "canceled";
+      reviewVersion += 1;
+      progress.readyForReview = 0;
+      progress.canceled = 1;
+      progress.unreviewed = 0;
+      progress.reviewing = 0;
+      return route.fulfill({
+        json: {
+          projectId,
+          batchId,
+          item: item(),
+          outcome: "canceled",
+          jobCancellationRequested: false,
+        },
+      });
+    }
     if (path.endsWith(`/transcription-batches/${batchId}/control`)) {
       dispatchStatus = "paused";
       batchVersion += 1;
@@ -4385,6 +5097,11 @@ test("connects an explicit project, controls a batch, and updates review state",
   await expect(
     page.getByText("Interview research", { exact: true }),
   ).toBeVisible();
+  await expect(
+    page.getByRole("progressbar", {
+      name: /Ready, stage 8 of 8; time remaining unknown/u,
+    }),
+  ).toBeVisible();
   const canonicalWorklist = page.getByLabel("Project video worklist");
   await expect(canonicalWorklist).toContainText("Fixture review video");
   await expect(canonicalWorklist).toContainText("Flagged by @e2e_user");
@@ -4473,6 +5190,7 @@ test("connects an explicit project, controls a batch, and updates review state",
     .getByRole("button", { name: "Queue", exact: true })
     .click();
   await expect(canonicalWorklist).toContainText("Active in worklist");
+  await page.getByRole("button", { name: "Review", exact: true }).click();
   await expect(
     page.locator(".review-card").getByText("Fixture review video", {
       exact: true,
@@ -4496,6 +5214,7 @@ test("connects an explicit project, controls a batch, and updates review state",
     `/local-agent/api/projects/${projectId}/videos/${directVideo.id}/transcript?preferredLanguage=en`,
   );
 
+  await page.locator(".review-card > summary").click();
   await page
     .getByLabel("Review status for Fixture review video")
     .selectOption("reviewing");
@@ -4604,7 +5323,7 @@ test("connects an explicit project, controls a batch, and updates review state",
     .click();
   await expect(projectKeywordCard).toContainText("Enabled · version 4");
   await expect(projectKeywordCard).toContainText("v6");
-  await page.getByRole("button", { name: "Workbench" }).click();
+  await page.getByRole("button", { name: "Add", exact: true }).click();
   await expect(promisingGroup.getByRole("heading")).toHaveText("Promising 1");
   await expect(promisingGroup).toContainText("Current keyword evidence");
   await expect(promisingGroup).toContainText(
@@ -4637,6 +5356,7 @@ test("connects an explicit project, controls a batch, and updates review state",
     page.getByText("Opened verified keyword evidence at 1s with word timing."),
   ).toBeVisible();
 
+  await page.getByRole("button", { name: "Add", exact: true }).click();
   await canonicalWorklist.getByLabel("Select Fixture review video").check();
   page.once("dialog", (dialog) => dialog.accept());
   await canonicalWorklist
@@ -4698,7 +5418,7 @@ test("connects an explicit project, controls a batch, and updates review state",
     keywordReviewCommands.map((command) => command.expectedKeywordSetVersion),
   ).toEqual([1]);
 
-  await page.getByRole("button", { name: "Workbench" }).click();
+  await page.getByRole("button", { name: "Add", exact: true }).click();
 
   await expect(page.getByText("Hosted processing: Pending")).toBeVisible();
   await page.getByRole("button", { name: "Approve hosted processing" }).click();
@@ -4719,6 +5439,210 @@ test("connects an explicit project, controls a batch, and updates review state",
 
   await page.getByRole("button", { name: "Pause pending" }).click();
   await expect(page.getByText(/paused · 1 ready/)).toBeVisible();
+  await page.getByRole("button", { name: "Cancel", exact: true }).click();
+  await expect(
+    page.getByRole("button", { name: "Show batch history" }),
+  ).toBeVisible();
+  await expect(page.locator(".review-card")).not.toContainText(
+    "Fixture review video",
+  );
+  expect(itemCancelCommand).toBeDefined();
+});
+
+test("accepts an explicit language when provider and creator evidence are unknown", async ({
+  page,
+}) => {
+  const now = "2026-08-25T12:00:00.000Z";
+  const projectId = "029fbb95-cd76-7920-93fa-e23ba755ee70";
+  const batchId = "029fbb95-cd76-7920-93fa-e23ba755ee71";
+  const itemId = "029fbb95-cd76-7920-93fa-e23ba755ee72";
+  const videoId = "029fbb95-cd76-7920-93fa-e23ba755ee73";
+  let confirmed = false;
+  let decisionBody: Record<string, unknown> | undefined;
+  const gate = () =>
+    confirmed
+      ? {
+          state: "ready" as const,
+          status: "confirmed" as const,
+          decision: {
+            id: "029fbb95-cd76-7920-93fa-e23ba755ee74",
+            projectId,
+            videoId,
+            decisionVersion: 1,
+            status: "confirmed" as const,
+            basis: "user_confirmation" as const,
+            resolvedLanguage: "dz",
+            actorId: "019fbb95-cd76-7920-93fa-e23ba755ee36",
+            createdAt: now,
+          },
+          remediationReason: "none" as const,
+        }
+      : {
+          state: "needs_language_confirmation" as const,
+          status: "unverified" as const,
+          remediationReason: "confirm_language" as const,
+        };
+  const batch = {
+    id: batchId,
+    projectId,
+    name: "Unknown language gate batch",
+    targetLanguage: "en",
+    transcriptionProfile: "default",
+    sourcePolicy: "prefer-existing",
+    executionLocation: "local",
+    priority: "normal",
+    dispatchStatus: "active",
+    createdBy: "019fbb95-cd76-7920-93fa-e23ba755ee36",
+    version: 1,
+    createdAt: now,
+    updatedAt: now,
+  };
+  const progress = () => ({
+    total: 1,
+    queued: confirmed ? 1 : 0,
+    active: 0,
+    readyForReview: 0,
+    blocked: confirmed ? 0 : 1,
+    failed: 0,
+    retryableFailed: 0,
+    canceled: 0,
+    unreviewed: 1,
+    reviewing: 0,
+    reviewed: 0,
+    skipped: 0,
+  });
+  const batchResponse = () => ({
+    batch,
+    items: [
+      {
+        id: itemId,
+        batchId,
+        inputIndex: 0,
+        input: "UnknownLanguage001",
+        status: "ready",
+        processingNeed: "transcription",
+        youtubeVideoId: "UnknownLanguage001",
+        title: "Unknown-language fixture",
+        catalogVideoId: videoId,
+        state: confirmed ? "queued" : "needs_language_confirmation",
+        reviewStatus: "unreviewed",
+        attempt: 0,
+        version: 1,
+        languageGate: gate(),
+        createdAt: now,
+        updatedAt: now,
+      },
+    ],
+    summary: {
+      total: 1,
+      ready: 1,
+      existingTranscripts: 0,
+      duplicates: 0,
+      unsupported: 0,
+      metadataFailed: 0,
+    },
+    progress: progress(),
+  });
+  await page.route("**/cloud-api/**", async (route) => {
+    const request = route.request();
+    const path = new URL(request.url()).pathname.replace("/cloud-api", "");
+    if (path === "/api/projects") {
+      return route.fulfill({
+        json: [
+          {
+            id: projectId,
+            name: "Unknown language fixture project",
+            description: "",
+            kind: "shared",
+            visibility: "invitation_only",
+            currentUserRole: "owner",
+            memberCount: 1,
+            version: 1,
+            createdAt: now,
+            updatedAt: now,
+          },
+        ],
+      });
+    }
+    if (path === `/api/projects/${projectId}/transcription-batches`) {
+      return route.fulfill({
+        json: { batches: [{ batch, progress: progress() }] },
+      });
+    }
+    if (path === `/api/projects/${projectId}/review-inbox`) {
+      return route.fulfill({ json: { items: [] } });
+    }
+    if (
+      path === `/api/projects/${projectId}/transcription-batches/${batchId}`
+    ) {
+      return route.fulfill({ json: batchResponse() });
+    }
+    if (
+      path === `/api/projects/${projectId}/videos/${videoId}/language-decisions`
+    ) {
+      decisionBody = request.postDataJSON();
+      confirmed = true;
+      return route.fulfill({
+        json: { decision: gate().decision, gate: gate() },
+      });
+    }
+    const localProcessing = defaultLocalProcessingStatus(path);
+    if (localProcessing) return route.fulfill({ json: localProcessing });
+    const keywordCatalog = defaultProjectKeywordCatalog(path);
+    if (keywordCatalog) return route.fulfill({ json: keywordCatalog });
+    if (path.includes("/worklist")) {
+      return route.fulfill({ json: { items: [], total: 0 } });
+    }
+    return route.fulfill({ status: 404, json: { error: "not found" } });
+  });
+
+  await page.goto("/");
+  await page
+    .getByLabel("Development session credential")
+    .fill("Bearer 019fbb95-cd76-7920-93fa-e23ba755ee36|fixture:web");
+  await page.getByRole("button", { name: "Connect" }).click();
+  await page.getByRole("button", { name: "Add", exact: true }).click();
+  const fieldset = page.getByRole("group", {
+    name: "Language confirmation required",
+  });
+  const languageInput = fieldset.getByLabel(
+    "Confirmed spoken language for Unknown-language fixture",
+  );
+  const confirmButton = fieldset.getByRole("button", {
+    name: "Confirm language and retry",
+  });
+  await expect(fieldset).toContainText("Provider-reported language: Unknown");
+  await expect(fieldset).toContainText("Creator-reported language: Unknown");
+  await expect(languageInput).toBeEnabled();
+  await expect(languageInput).toHaveAttribute(
+    "placeholder",
+    "Choose or type a language code",
+  );
+  const suggestionsId = await languageInput.getAttribute("list");
+  expect(suggestionsId).toBeTruthy();
+  await expect(page.locator(`#${suggestionsId} option[value="dz"]`)).toHaveText(
+    "Dzongkha (dz)",
+  );
+  await expect(confirmButton).toBeDisabled();
+
+  await languageInput.fill("?");
+  await expect(fieldset.getByRole("alert")).toContainText(
+    "Enter a valid BCP-47 language tag",
+  );
+  await expect(confirmButton).toBeDisabled();
+
+  await languageInput.fill("dz");
+  await expect(fieldset).toContainText("Selected: Dzongkha (dz)");
+  await expect(confirmButton).toBeEnabled();
+  await confirmButton.click();
+  await expect(fieldset).toHaveCount(0);
+  expect(decisionBody).toMatchObject({
+    expectedDecisionVersion: 0,
+    resolvedLanguage: "dz",
+    basis: "user_confirmation",
+    batchItemId: itemId,
+    expectedBatchItemVersion: 1,
+  });
 });
 
 test("confirms a language-gated batch item through the catalog worklist", async ({
@@ -4948,6 +5872,7 @@ test("confirms a language-gated batch item through the catalog worklist", async 
     .getByLabel("Development session credential")
     .fill("Bearer 019fbb95-cd76-7920-93fa-e23ba755ee36|fixture:web");
   await page.getByRole("button", { name: "Connect" }).click();
+  await page.getByRole("button", { name: "Add", exact: true }).click();
   const fieldset = page.getByRole("group", {
     name: "Language confirmation required",
   });
@@ -5233,7 +6158,7 @@ test("does not leak a delayed language gate after changing projects", async ({
   await expect(page.getByLabel("Project keywords")).toContainText(
     "Project A only keyword",
   );
-  await page.getByRole("button", { name: "Workbench" }).click();
+  await page.getByRole("button", { name: "Add", exact: true }).click();
   await page.getByLabel("Keyword result group").selectOption("action_needed");
   await page.getByLabel("Keyword scan state").selectOption("failed");
   await page
@@ -5246,7 +6171,7 @@ test("does not leak a delayed language gate after changing projects", async ({
   await expect(page.getByLabel("Project keywords")).not.toContainText(
     "Project A only keyword",
   );
-  await page.getByRole("button", { name: "Workbench" }).click();
+  await page.getByRole("button", { name: "Add", exact: true }).click();
   await expect(page.getByLabel("Keyword result group")).toHaveValue("all");
   await expect(page.getByLabel("Keyword scan state")).toHaveValue("all");
   await expect(page.getByLabel("Approved keyword filter")).toHaveValue("");

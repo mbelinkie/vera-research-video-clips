@@ -27,9 +27,11 @@ import {
   ProcessAcceptedLoggedExportRequestSchema,
   ProcessAcceptedLoggedExportResponseSchema,
   ReadinessReportSchema,
+  RecommendedSetupPlanSchema,
   SetupActionSchema,
   SetupSnapshotSchema,
   type ReadinessReport,
+  type RecommendedSetupPlan,
   type SetupAction,
   type SetupSnapshot,
   type HeartbeatExportWorkerRequest,
@@ -157,6 +159,17 @@ const DesktopModelActivationSchema = z
   })
   .strict();
 
+const DesktopRecommendedSetupSchema = z
+  .object({
+    model: z
+      .object({
+        displayName: z.string().trim().min(1).max(160),
+        byteSize: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+      })
+      .strict(),
+  })
+  .strict();
+
 const DesktopExportSupervisorActionSchema = z
   .object({ enabled: z.boolean() })
   .strict();
@@ -175,6 +188,14 @@ export interface LocalAgentDependencies {
     getSnapshot(): SetupSnapshot;
     updateSetup(action: SetupAction): SetupSnapshot;
     getReadinessReport(): Promise<ReadinessReport>;
+    checkRecommendedSetup(model: {
+      displayName: string;
+      byteSize: number;
+    }): Promise<RecommendedSetupPlan>;
+    applyRecommendedSetup(model: {
+      displayName: string;
+      byteSize: number;
+    }): Promise<RecommendedSetupPlan>;
     selectRoot(input: {
       target: "output_root" | "cache_root";
       absolutePath: string;
@@ -604,6 +625,7 @@ export function createLocalAgent(
       failureClass: localFailureClass(
         error instanceof ZodError ? "invalid_request" : candidate.code,
         statusCode,
+        operation,
       ),
       retryable: statusCode >= 500,
     });
@@ -613,6 +635,7 @@ export function createLocalAgent(
         message: localFailureMessage(
           operationFailure.failureClass,
           candidate.code,
+          operation,
         ),
         retryable: statusCode >= 500,
       },
@@ -645,6 +668,24 @@ export function createLocalAgent(
         ),
       ),
     );
+    app.post("/api/desktop-setup/recommended/check", async (request, reply) => {
+      requireDesktopNativeAction(request, dependencies);
+      const { model } = DesktopRecommendedSetupSchema.parse(request.body);
+      return reply.send(
+        RecommendedSetupPlanSchema.parse(
+          await dependencies.desktopSetup!.checkRecommendedSetup(model),
+        ),
+      );
+    });
+    app.post("/api/desktop-setup/recommended/apply", async (request, reply) => {
+      requireDesktopNativeAction(request, dependencies);
+      const { model } = DesktopRecommendedSetupSchema.parse(request.body);
+      return reply.send(
+        RecommendedSetupPlanSchema.parse(
+          await dependencies.desktopSetup!.applyRecommendedSetup(model),
+        ),
+      );
+    });
     app.post("/api/desktop-setup/native-selection", async (request, reply) => {
       requireDesktopNativeAction(request, dependencies);
       const body = DesktopNativeSelectionSchema.parse(request.body);
@@ -2154,10 +2195,17 @@ function localOperationClass(url: string) {
   return "export" as const;
 }
 
-function localFailureClass(code: string | undefined, statusCode: number) {
+function localFailureClass(
+  code: string | undefined,
+  statusCode: number,
+  operation?: ReturnType<typeof localOperationClass>,
+) {
   if (statusCode === 401) return "authentication_required" as const;
-  if (statusCode === 403 || code === "not_found")
-    return "authorization_denied" as const;
+  if (statusCode === 403) return "authorization_denied" as const;
+  if (code === "not_found")
+    return operation === "transcript"
+      ? ("conflict" as const)
+      : ("authorization_denied" as const);
   if (statusCode === 400) return "invalid_request" as const;
   if (code === "runtime_draining") return "runtime_draining" as const;
   if (code?.includes("storage")) return "storage_insufficient" as const;
@@ -2179,9 +2227,13 @@ function localFailureClass(code: string | undefined, statusCode: number) {
 function localFailureMessage(
   failureClass: ReturnType<typeof localFailureClass>,
   candidateCode?: string,
+  operation?: ReturnType<typeof localOperationClass>,
 ): string {
   if (candidateCode === "offline_transcript_not_authorized") {
     return "Reconnect to verify project access before reviewing this cached transcript.";
+  }
+  if (candidateCode === "not_found" && operation === "transcript") {
+    return "No active transcript exists yet. Local processing is queued. Open Project Videos to check progress or resolve required language confirmation.";
   }
   switch (failureClass) {
     case "authentication_required":

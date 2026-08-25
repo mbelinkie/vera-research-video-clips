@@ -23,7 +23,9 @@ import type { MediaCommandRunner } from "@research-video/media";
 import {
   DesktopSetupValidationError,
   LocalDesktopSetupService,
+  recommendedToolCandidates,
   type DesktopSetupStatfs,
+  type RecommendedToolCandidate,
 } from "./desktop-setup.ts";
 
 const directories = new Set<string>();
@@ -40,6 +42,10 @@ function fixture(
     runner?: MediaCommandRunner;
     statfs?: DesktopSetupStatfs;
     measuredOperationBytes?: (target: "output_root" | "cache_root") => number;
+    recommendedRoots?: () => { outputRoot: string; cacheRoot: string };
+    recommendedToolCandidates?: (
+      target: "ffmpeg" | "ffprobe" | "yt_dlp" | "whisper_cli",
+    ) => readonly RecommendedToolCandidate[];
     exportWorkerStatus?: () => {
       available: boolean;
       issue?: "authentication_required" | "cloud_unavailable";
@@ -62,6 +68,12 @@ function fixture(
         (async () => ({ bavail: 32n * 1024n * 1024n, bsize: 1024n })),
       ...(options.measuredOperationBytes
         ? { measuredOperationBytes: options.measuredOperationBytes }
+        : {}),
+      ...(options.recommendedRoots
+        ? { recommendedRoots: options.recommendedRoots }
+        : {}),
+      ...(options.recommendedToolCandidates
+        ? { recommendedToolCandidates: options.recommendedToolCandidates }
         : {}),
       ...(options.exportWorkerStatus
         ? { exportWorkerStatus: options.exportWorkerStatus }
@@ -113,7 +125,293 @@ function capableRunner(): MediaCommandRunner {
   };
 }
 
+function recommendedToolFixture(root: string) {
+  mkdirSync(root, { recursive: true });
+  const bin = join(root, "bin");
+  const cellar = join(root, "Cellar");
+  mkdirSync(bin);
+  mkdirSync(cellar);
+  const names = {
+    ffmpeg: "ffmpeg",
+    ffprobe: "ffprobe",
+    yt_dlp: "yt-dlp",
+    whisper_cli: "whisper-cli",
+  } as const;
+  const canonical = {} as Record<keyof typeof names, string>;
+  const candidates = {} as Record<
+    keyof typeof names,
+    RecommendedToolCandidate[]
+  >;
+  for (const [target, name] of Object.entries(names) as Array<
+    [keyof typeof names, string]
+  >) {
+    const versionRoot = join(cellar, `${name}-version`, "bin");
+    mkdirSync(versionRoot, { recursive: true });
+    canonical[target] = executable(versionRoot, name);
+    const entrypoint = join(bin, name);
+    symlinkSync(canonical[target], entrypoint);
+    candidates[target] = [{ entrypoint, allowedCanonicalRoots: [cellar] }];
+  }
+  return {
+    canonical,
+    candidates: (target: keyof typeof names) => candidates[target],
+  };
+}
+
 describe("local desktop setup service", () => {
+  it("keeps Intel, Apple-Silicon, and app-owned entrypoints closed and deterministic", () => {
+    expect(
+      recommendedToolCandidates(
+        "yt_dlp",
+        "/Applications/Research Video Clips/tools",
+      ),
+    ).toEqual([
+      {
+        entrypoint: "/usr/local/bin/yt-dlp",
+        allowedCanonicalRoots: ["/usr/local/bin", "/usr/local/Cellar"],
+      },
+      {
+        entrypoint: "/opt/homebrew/bin/yt-dlp",
+        allowedCanonicalRoots: ["/opt/homebrew/bin", "/opt/homebrew/Cellar"],
+      },
+      {
+        entrypoint: "/Applications/Research Video Clips/tools/yt-dlp",
+        allowedCanonicalRoots: ["/Applications/Research Video Clips/tools"],
+      },
+    ]);
+  });
+
+  it("proposes and applies path-free recommended roots and canonical tool targets", async () => {
+    const base = realpathSync(
+      mkdtempSync(join(tmpdir(), "desktop-recommended-")),
+    );
+    directories.add(base);
+    const outputParent = join(base, "Movies");
+    const cacheParent = join(base, "Caches");
+    mkdirSync(outputParent);
+    mkdirSync(cacheParent);
+    const outputRoot = join(outputParent, "Research Video Clips Exports");
+    const cacheRoot = join(cacheParent, "Research Video Clips");
+    const tools = recommendedToolFixture(base);
+    const { service, repository } = fixture({
+      runner: capableRunner(),
+      recommendedRoots: () => ({ outputRoot, cacheRoot }),
+      recommendedToolCandidates: tools.candidates,
+    });
+    const model = { displayName: "Whisper large-v3-turbo", byteSize: 123 };
+
+    const proposed = await service.checkRecommendedSetup(model);
+    expect(proposed).toMatchObject({
+      state: "ready_to_setup",
+      roots: [
+        { target: "output_root", state: "will_create" },
+        { target: "cache_root", state: "will_create" },
+      ],
+      tools: [
+        { target: "ffmpeg", state: "detected" },
+        { target: "ffprobe", state: "detected" },
+        { target: "yt_dlp", state: "detected" },
+        { target: "whisper_cli", state: "detected" },
+      ],
+      model: { state: "download_required" },
+    });
+    expect(JSON.stringify(proposed)).not.toContain(base);
+
+    const completed = await service.applyRecommendedSetup(model);
+    expect(completed.state).toBe("completed");
+    expect(repository.getSetup()).toMatchObject({
+      workerEnabled: true,
+      captionProvider: "yt_dlp",
+      mediaProvider: "yt_dlp_audio",
+      exportSourceProvider: "yt_dlp",
+      speechToTextProvider: "whisper_cpp",
+      rightsAcknowledged: false,
+      privacyAcknowledged: false,
+    });
+    for (const target of [
+      "ffmpeg",
+      "ffprobe",
+      "yt_dlp",
+      "whisper_cli",
+    ] as const) {
+      expect(
+        repository.getTrustedActiveComponentReference(target)?.absolutePath,
+      ).toBe(tools.canonical[target]);
+    }
+    expect(
+      repository.getTrustedActiveComponentReference("output_root")
+        ?.absolutePath,
+    ).toBe(outputRoot);
+    expect(
+      repository.getTrustedActiveComponentReference("cache_root")?.absolutePath,
+    ).toBe(cacheRoot);
+    expect(JSON.stringify(service.getSnapshot())).not.toContain(base);
+  });
+
+  it("uses deterministic closed candidates and ignores broken, looping, and escaped links", async () => {
+    const base = realpathSync(
+      mkdtempSync(join(tmpdir(), "desktop-discovery-")),
+    );
+    directories.add(base);
+    const approved = join(base, "approved");
+    const outside = join(base, "outside");
+    const entries = join(base, "entries");
+    mkdirSync(approved);
+    mkdirSync(outside);
+    mkdirSync(entries);
+    const preferred = executable(approved, "preferred-ffmpeg");
+    const duplicate = executable(approved, "duplicate-ffmpeg");
+    const escaped = executable(outside, "escaped-ffmpeg");
+    const broken = join(entries, "broken");
+    const loopA = join(entries, "loop-a");
+    const loopB = join(entries, "loop-b");
+    const escapedLink = join(entries, "escaped");
+    const preferredLink = join(entries, "preferred");
+    const duplicateLink = join(entries, "duplicate");
+    symlinkSync(join(approved, "missing"), broken);
+    symlinkSync(loopB, loopA);
+    symlinkSync(loopA, loopB);
+    symlinkSync(escaped, escapedLink);
+    symlinkSync(preferred, preferredLink);
+    symlinkSync(duplicate, duplicateLink);
+    const toolSet = recommendedToolFixture(join(base, "other-tools"));
+    const outputParent = join(base, "Movies");
+    const cacheParent = join(base, "Caches");
+    mkdirSync(outputParent);
+    mkdirSync(cacheParent);
+    const candidates = (
+      target: "ffmpeg" | "ffprobe" | "yt_dlp" | "whisper_cli",
+    ) =>
+      target === "ffmpeg"
+        ? [broken, loopA, escapedLink, preferredLink, duplicateLink].map(
+            (entrypoint) => ({ entrypoint, allowedCanonicalRoots: [approved] }),
+          )
+        : toolSet.candidates(target);
+    const { service, repository } = fixture({
+      runner: capableRunner(),
+      recommendedRoots: () => ({
+        outputRoot: join(outputParent, "Exports"),
+        cacheRoot: join(cacheParent, "Cache"),
+      }),
+      recommendedToolCandidates: candidates,
+    });
+
+    await service.applyRecommendedSetup({
+      displayName: "Whisper",
+      byteSize: 4,
+    });
+    expect(
+      repository.getTrustedActiveComponentReference("ffmpeg")?.absolutePath,
+    ).toBe(preferred);
+  });
+
+  it("preserves prior tools and existing folder content when re-detection fails", async () => {
+    const base = realpathSync(mkdtempSync(join(tmpdir(), "desktop-preserve-")));
+    directories.add(base);
+    const { service, repository } = fixture({ runner: capableRunner() });
+    const prior = executable(base, "prior-ffmpeg");
+    await service.selectTool({ target: "ffmpeg", absolutePath: prior });
+    const priorId = repository.getTrustedActiveComponentReference("ffmpeg")?.id;
+    const outputRoot = join(base, "existing-output");
+    const cacheRoot = join(base, "existing-cache");
+    mkdirSync(outputRoot);
+    mkdirSync(cacheRoot);
+    writeFileSync(join(outputRoot, "keep.txt"), "preserve me");
+
+    const missingCandidate = join(base, "missing-ffmpeg");
+    const failing = new LocalDesktopSetupService(repository, {
+      commandRunner: capableRunner(),
+      recommendedRoots: () => ({ outputRoot, cacheRoot }),
+      recommendedToolCandidates: () => [
+        { entrypoint: missingCandidate, allowedCanonicalRoots: [base] },
+      ],
+      now,
+    });
+    await expect(
+      failing.applyRecommendedSetup({ displayName: "Whisper", byteSize: 4 }),
+    ).rejects.toMatchObject({ code: "invalid_tool" });
+    expect(repository.getTrustedActiveComponentReference("ffmpeg")?.id).toBe(
+      priorId,
+    );
+    expect(() =>
+      writeFileSync(join(outputRoot, "keep.txt"), "still here"),
+    ).not.toThrow();
+  });
+
+  it("keeps valid advanced roots and tools when completing missing recommended setup", async () => {
+    const base = realpathSync(mkdtempSync(join(tmpdir(), "desktop-mixed-")));
+    directories.add(base);
+    const customOutput = join(base, "custom-output");
+    const customFfmpeg = executable(base, "custom-ffmpeg");
+    mkdirSync(customOutput);
+    const toolSet = recommendedToolFixture(join(base, "recommended-tools"));
+    const { service, repository } = fixture({
+      runner: capableRunner(),
+      recommendedRoots: () => ({
+        outputRoot: join(base, "recommended-output"),
+        cacheRoot: join(base, "recommended-cache"),
+      }),
+      recommendedToolCandidates: toolSet.candidates,
+    });
+    await service.selectRoot({
+      target: "output_root",
+      absolutePath: customOutput,
+    });
+    await service.selectTool({
+      target: "ffmpeg",
+      absolutePath: customFfmpeg,
+    });
+    const outputId =
+      repository.getTrustedActiveComponentReference("output_root")?.id;
+
+    await service.applyRecommendedSetup({
+      displayName: "Whisper",
+      byteSize: 4,
+    });
+
+    expect(
+      repository.getTrustedActiveComponentReference("output_root")?.id,
+    ).toBe(outputId);
+    expect(
+      repository.getTrustedActiveComponentReference("ffmpeg")?.absolutePath,
+    ).toBe(customFfmpeg);
+    expect(
+      repository.getTrustedActiveComponentReference("cache_root")?.absolutePath,
+    ).toBe(join(base, "recommended-cache"));
+  });
+
+  it("rejects a canonical target replacement race and preserves the prior active reference", async () => {
+    const { root, service, repository } = fixture({ runner: capableRunner() });
+    const prior = executable(root, "ffmpeg-prior");
+    await service.selectTool({ target: "ffmpeg", absolutePath: prior });
+    const priorId = repository.getTrustedActiveComponentReference("ffmpeg")?.id;
+    const replacement = executable(root, "ffmpeg-replacement");
+    const base = capableRunner();
+    let changed = false;
+    const racing = new LocalDesktopSetupService(repository, {
+      commandRunner: {
+        run: vi.fn(async (path, args, options) => {
+          const result = await base.run(path, args, options);
+          if (!changed) {
+            changed = true;
+            writeFileSync(replacement, "#!/bin/sh\necho changed\n", {
+              mode: 0o700,
+            });
+          }
+          return result;
+        }),
+      },
+      now,
+    });
+
+    await expect(
+      racing.selectTool({ target: "ffmpeg", absolutePath: replacement }),
+    ).rejects.toMatchObject({ code: "invalid_tool" });
+    expect(repository.getTrustedActiveComponentReference("ffmpeg")?.id).toBe(
+      priorId,
+    );
+  });
+
   it("keeps cache and output capacity evidence operation-specific", async () => {
     let output = "";
     let cache = "";

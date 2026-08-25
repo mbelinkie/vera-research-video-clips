@@ -21,6 +21,7 @@ import {
   resolvePreferredTranscript,
   scanProjectKeywords,
   searchTranscript,
+  searchTranscriptOccurrences,
   segmentAtTime,
   timedTranscriptTokens,
   tokenAtTime,
@@ -772,9 +773,46 @@ describe("normalized transcript fixtures", () => {
     expect(searchTranscript(transcript.segments, "CUE-LEVEL")).toHaveLength(1);
     expect(searchTranscript(transcript.segments, "")).toHaveLength(2);
   });
+
+  it("returns stable cross-cue occurrences without filtering the transcript", () => {
+    const transcript = normalizeTranscriptFixture(wordFixture);
+
+    const matches = searchTranscriptOccurrences(transcript, "TIMING.   click");
+
+    expect(matches).toHaveLength(1);
+    expect(matches[0]?.ranges).toHaveLength(2);
+    expect(matches[0]?.startSegmentId).toBe(transcript.segments[0]?.id);
+    expect(matches[0]?.timingPrecision).toBe("word");
+    expect(matches[0]?.startMs).toBe(950);
+    expect(transcript.segments).toHaveLength(2);
+  });
 });
 
 describe("WebVTT normalization", () => {
+  it("ignores YouTube header metadata before the first cue", async () => {
+    const transcript = await normalizeWebVttCaption({
+      contents:
+        "WEBVTT\nKind: captions\nLanguage: en-US\n\n00:00:27.360 --> 00:00:28.400\nSynthetic caption.\n",
+      videoId: "M7lc1UVf-VE",
+      language: "en-US",
+      source: "youtube-manual",
+      provider: "yt-dlp",
+    });
+
+    expect(transcript.segments).toMatchObject([
+      {
+        ordinal: 0,
+        startMs: 27_360,
+        endMs: 28_400,
+        text: "Synthetic caption.",
+      },
+    ]);
+    expect(transcript.tokens.map((token) => token.text)).toEqual([
+      "Synthetic",
+      "caption.",
+    ]);
+  });
+
   it("normalizes metadata, cue settings, markup, entities, and overlap honestly", async () => {
     const contents = await readFile(webVttFixture);
     const transcript = await normalizeWebVttCaption({

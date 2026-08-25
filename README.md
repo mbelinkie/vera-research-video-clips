@@ -86,6 +86,18 @@ npm run desktop:package:x64
 open "out/Research Video Clips-darwin-x64/Research Video Clips.app"
 ```
 
+Managed sign-in requires the three approved public deployment values to be
+exported together when the package is built: `PUBLIC_API_ORIGIN`,
+`COGNITO_DOMAIN`, and `COGNITO_CLIENT_ID`. The desktop build embeds those public
+connection identifiers in `desktop-config.json`; it never embeds a client
+secret. Every build embeds the approved checksum-pinned Whisper model identity
+independently. If the cloud values are absent, the app remains usable for local
+setup and the approved model download but reports that cloud sign-in is not
+configured instead of opening a browser. The current package embeds the
+approved low-cost development deployment values. That
+single-instance/PGlite/memory-adapter environment enables personal dogfood but
+does not satisfy the separate M7-01 production acceptance gate.
+
 The current verified local package is:
 
 ```text
@@ -94,7 +106,7 @@ out/Research Video Clips-darwin-x64/Research Video Clips.app
 
 It is an unsigned, unnotarized x86_64 development/dogfood build, not a pilot
 release for remote distribution. The verified package's `app.asar` SHA-256 is
-`aabd886be1f53fff11761d272cd6de7b782f5ee6b6532c0c0962022b0ec2f0fe`;
+`ff1e09a0669bfaed15b9c0749800c792137929dbb29a3be8f41f81ee03e73ead`;
 rebuilding changes the package and requires recording a new hash.
 
 The default development ports are:

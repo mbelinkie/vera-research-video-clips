@@ -267,6 +267,8 @@ describe("desktop setup policy", () => {
 
   it("accepts only the fixed trusted path vocabulary and fails closed worker configuration", () => {
     const paths = parseTrustedRuntimePaths({
+      ffmpeg: "/tools/ffmpeg",
+      ffprobe: "/tools/ffprobe",
       ytDlp: "/tools/yt-dlp",
       whisperCli: "/tools/whisper-cli",
       whisperModel: "/models/fixture.bin",
@@ -276,6 +278,8 @@ describe("desktop setup policy", () => {
       captionProvider: "disabled",
       mediaProvider: "yt-dlp-audio",
       translationProvider: "disabled",
+      ffmpeg: "/tools/ffmpeg",
+      ffprobe: "/tools/ffprobe",
       whisperModelName: "fixture-v1",
       cacheRoot: "/workspace/cache",
     });

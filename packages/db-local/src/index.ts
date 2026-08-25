@@ -4442,6 +4442,31 @@ export type LocalArtifactLocatorRecord = ArtifactLocatorSummary & {
   resultFingerprint: string;
 };
 
+const LegacyFilesystemIdentityPattern = /^\d+:(\d+)$/u;
+const StableFilesystemIdentityPattern = /^v2:inode:(\d+):birth:(\d+)$/u;
+
+/**
+ * The first artifact-root format used `stat.dev:stat.ino`. APFS device numbers
+ * can change after a remount even when the same directory/inode remains in
+ * place. New roots therefore pin inode plus birth time. This compatibility
+ * check accepts only the one-way legacy-to-v2 transition with the same inode;
+ * two differing legacy identities or two differing v2 identities still fail
+ * closed.
+ */
+export function localFilesystemIdentitiesMatch(
+  stored: string,
+  observed: string,
+): boolean {
+  if (stored === observed) return true;
+  const storedLegacy = LegacyFilesystemIdentityPattern.exec(stored);
+  const observedStable = StableFilesystemIdentityPattern.exec(observed);
+  return Boolean(
+    storedLegacy?.[1] &&
+    observedStable?.[1] &&
+    storedLegacy[1] === observedStable[1],
+  );
+}
+
 export class LocalArtifactLocatorRepository {
   constructor(
     private readonly database: DatabaseSync,
@@ -4466,7 +4491,10 @@ export class LocalArtifactLocatorRepository {
       const root = mapLocalArtifactRoot(existing);
       if (
         root.absolutePath !== input.absolutePath ||
-        root.filesystemIdentity !== input.filesystemIdentity
+        !localFilesystemIdentitiesMatch(
+          root.filesystemIdentity,
+          input.filesystemIdentity,
+        )
       ) {
         throw new LocalArtifactCatalogError(
           "Configured artifact root identity conflicts with an existing root.",

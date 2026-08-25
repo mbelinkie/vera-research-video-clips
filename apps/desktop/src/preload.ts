@@ -13,6 +13,7 @@ import {
   DesktopStatusSchema,
   ModelDownloadProgressSchema,
   ReadinessReportSchema,
+  RecommendedSetupPlanSchema,
   SetupActionSchema,
   SetupSelectionTargetSchema,
   SetupSnapshotSchema,
@@ -25,16 +26,14 @@ contextBridge.exposeInMainWorld("researchVideoDesktop", {
     DesktopStatusSchema.parse(
       await ipcRenderer.invoke(desktopIpcChannels.getStatus),
     ),
-  signIn: async () => {
+  signIn: async () =>
     DesktopAuthStatusSchema.parse(
       await ipcRenderer.invoke(desktopIpcChannels.signIn),
-    );
-  },
-  signOut: async () => {
+    ),
+  signOut: async () =>
     DesktopAuthStatusSchema.parse(
       await ipcRenderer.invoke(desktopIpcChannels.signOut),
-    );
-  },
+    ),
   getSetup: async () =>
     SetupSnapshotSchema.parse(
       await ipcRenderer.invoke(desktopIpcChannels.getSetup),
@@ -49,6 +48,14 @@ contextBridge.exposeInMainWorld("researchVideoDesktop", {
         desktopIpcChannels.updateSetup,
         SetupActionSchema.parse(action),
       ),
+    ),
+  checkRecommendedSetup: async () =>
+    RecommendedSetupPlanSchema.parse(
+      await ipcRenderer.invoke(desktopIpcChannels.checkRecommendedSetup),
+    ),
+  applyRecommendedSetup: async () =>
+    RecommendedSetupPlanSchema.parse(
+      await ipcRenderer.invoke(desktopIpcChannels.applyRecommendedSetup),
     ),
   chooseSetupTarget: async (target: unknown) =>
     SetupSnapshotSchema.parse(

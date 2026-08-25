@@ -20,6 +20,8 @@ import {
   AcceptLoggedExportDeliveryRequestSchema,
   CancelLoggedExportRequestSchema,
   CancelLoggedExportResponseSchema,
+  CancelTranscriptionBatchItemRequestSchema,
+  CancelTranscriptionBatchItemResponseSchema,
   BatchPreflightSummarySchema,
   ClaimedTranscriptionJobSchema,
   ClipCandidateSchema,
@@ -197,6 +199,8 @@ import {
   type AcceptLoggedExportDeliveryRequest,
   type CancelLoggedExportRequest,
   type CancelLoggedExportResponse,
+  type CancelTranscriptionBatchItemRequest,
+  type CancelTranscriptionBatchItemResponse,
   type AuthenticatedActor,
   type BatchOptions,
   type BatchPreflightItem,
@@ -10184,7 +10188,8 @@ export class SharedProjectCatalog {
            SET state = $1, language_gate = $2::jsonb,
                language_decision_id = $3, language_decision_video_id = $4,
                version = version + 1, updated_at = $5
-           WHERE job_id = $6 AND attempt = $7 AND state <> 'canceled'`,
+           WHERE job_id = $6 AND attempt = $7
+             AND state NOT IN ('canceling', 'canceled')`,
           [
             gateState === "needs_language_confirmation"
               ? "needs_language_confirmation"
@@ -10431,6 +10436,226 @@ export class SharedProjectCatalog {
     return mapReviewInboxItem(updated!);
   }
 
+  private async hasLiveTranscriptionDependency(
+    jobId: string,
+    excludedItemIds: readonly string[] = [],
+  ): Promise<boolean> {
+    const result = await this.database.query(
+      `SELECT 1
+       FROM transcription_batch_items dependency
+       WHERE dependency.job_id = $1
+         AND dependency.state IN (
+           'queued', 'resolving', 'acquiring', 'transcribing', 'translating',
+           'aligning', 'uploading'
+         )
+         AND NOT (dependency.id = ANY($2::uuid[]))
+       LIMIT 1`,
+      [jobId, excludedItemIds],
+    );
+    return Boolean(result.rows[0]);
+  }
+
+  private async requestTranscriptionJobCancellation(
+    projectId: string,
+    jobId: string,
+    actorId: string,
+    requestedAt: string,
+  ): Promise<"requested" | "settled"> {
+    const selected = await this.database.query<DbRow>(
+      "SELECT state FROM jobs WHERE id = $1 FOR UPDATE",
+      [jobId],
+    );
+    const state = String(selected.rows[0]?.state ?? "");
+    if (state === "queued") {
+      await this.database.query(
+        `UPDATE jobs SET state = 'canceled', updated_at = $1
+         WHERE id = $2 AND state = 'queued'`,
+        [requestedAt, jobId],
+      );
+      await this.database.query(
+        `UPDATE transcription_batch_items
+         SET state = 'canceled', version = version + 1, updated_at = $1
+         WHERE job_id = $2 AND state = 'canceling'`,
+        [requestedAt, jobId],
+      );
+      return "settled";
+    }
+    if (!new Set(["claimed", "processing"]).has(state)) return "settled";
+
+    await this.database.query(
+      `INSERT INTO transcription_job_cancel_requests
+         (job_id, project_id, requested_by, requested_at, reason)
+       VALUES ($1, $2, $3, $4, 'batch_item')
+       ON CONFLICT (job_id) DO UPDATE
+       SET requested_by = EXCLUDED.requested_by,
+           requested_at = EXCLUDED.requested_at,
+           revoked_at = NULL, completed_at = NULL,
+           reason = 'batch_item'`,
+      [jobId, projectId, actorId, requestedAt],
+    );
+    return "requested";
+  }
+
+  async cancelTranscriptionBatchItem(
+    actor: AuthenticatedActor,
+    projectId: string,
+    batchId: string,
+    itemId: string,
+    input: CancelTranscriptionBatchItemRequest,
+  ): Promise<CancelTranscriptionBatchItemResponse> {
+    await this.authorize(actor, projectId, "write");
+    const command = CancelTranscriptionBatchItemRequestSchema.parse(input);
+    const requestSha256 = createHash("sha256")
+      .update(canonicalJson(command))
+      .digest("hex");
+    const canceledAt = this.now().toISOString();
+
+    return this.transaction(async () => {
+      const replay = await this.database.query<DbRow>(
+        `SELECT request_sha256, response_json
+         FROM transcription_batch_item_cancel_commands
+         WHERE project_id = $1 AND actor_id = $2 AND idempotency_key = $3`,
+        [projectId, actor.userId, command.idempotencyKey],
+      );
+      if (replay.rows[0]) {
+        if (String(replay.rows[0].request_sha256) !== requestSha256) {
+          throw new CatalogIdempotencyConflictError(
+            "This batch-item cancellation key was already used for another request.",
+          );
+        }
+        return CancelTranscriptionBatchItemResponseSchema.parse(
+          jsonRecord(replay.rows[0].response_json),
+        );
+      }
+
+      const selected = await this.database.query<DbRow>(
+        `SELECT bi.*
+         FROM transcription_batch_items bi
+         JOIN transcription_batches b ON b.id = bi.batch_id
+         WHERE bi.id = $1 AND bi.batch_id = $2 AND b.project_id = $3
+         FOR UPDATE OF bi`,
+        [itemId, batchId, projectId],
+      );
+      let item = selected.rows[0];
+      if (!item)
+        throw new CatalogNotFoundError("Transcription batch item not found.");
+
+      let outcome: "canceled" | "canceling" | "already_canceled";
+      let jobCancellationRequested = false;
+      if (String(item.state) === "canceled") {
+        outcome = "already_canceled";
+      } else {
+        if (Number(item.version) !== command.expectedVersion) {
+          throw new CatalogConflictError(
+            "The transcription batch item changed; reload it before canceling.",
+          );
+        }
+        const active = transcriptionActiveStates.has(
+          String(item.state) as TranscriptionBatchItem["state"],
+        );
+        if (active && item.job_id) {
+          item = (
+            await this.database.query<DbRow>(
+              `UPDATE transcription_batch_items
+               SET state = 'canceling', version = version + 1, updated_at = $1
+               WHERE id = $2 RETURNING *`,
+              [canceledAt, itemId],
+            )
+          ).rows[0]!;
+          const hasSibling = await this.hasLiveTranscriptionDependency(
+            String(item.job_id),
+            [itemId],
+          );
+          if (hasSibling) {
+            item = (
+              await this.database.query<DbRow>(
+                `UPDATE transcription_batch_items
+                 SET state = 'canceled', version = version + 1, updated_at = $1
+                 WHERE id = $2 RETURNING *`,
+                [canceledAt, itemId],
+              )
+            ).rows[0]!;
+            outcome = "canceled";
+          } else {
+            const disposition = await this.requestTranscriptionJobCancellation(
+              projectId,
+              String(item.job_id),
+              actor.userId,
+              canceledAt,
+            );
+            jobCancellationRequested = disposition === "requested";
+            if (disposition === "requested") {
+              outcome = "canceling";
+            } else {
+              item = (
+                await this.database.query<DbRow>(
+                  `UPDATE transcription_batch_items
+                   SET state = 'canceled', version = version + 1, updated_at = $1
+                   WHERE id = $2 RETURNING *`,
+                  [canceledAt, itemId],
+                )
+              ).rows[0]!;
+              outcome = "canceled";
+            }
+          }
+        } else if (String(item.state) === "canceling") {
+          outcome = "canceling";
+        } else {
+          const wasQueued = String(item.state) === "queued";
+          item = (
+            await this.database.query<DbRow>(
+              `UPDATE transcription_batch_items
+               SET state = 'canceled', version = version + 1, updated_at = $1
+               WHERE id = $2 RETURNING *`,
+              [canceledAt, itemId],
+            )
+          ).rows[0]!;
+          outcome = "canceled";
+          if (wasQueued && item.job_id) {
+            const hasSibling = await this.hasLiveTranscriptionDependency(
+              String(item.job_id),
+              [itemId],
+            );
+            if (!hasSibling) {
+              await this.requestTranscriptionJobCancellation(
+                projectId,
+                String(item.job_id),
+                actor.userId,
+                canceledAt,
+              );
+            }
+          }
+        }
+      }
+
+      const response = CancelTranscriptionBatchItemResponseSchema.parse({
+        projectId,
+        batchId,
+        item: mapBatchItem(item),
+        outcome,
+        jobCancellationRequested,
+      });
+      await this.database.query(
+        `INSERT INTO transcription_batch_item_cancel_commands
+           (id, project_id, batch_id, item_id, actor_id, idempotency_key,
+            request_sha256, response_json, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+        [
+          randomUUID(),
+          projectId,
+          batchId,
+          itemId,
+          actor.userId,
+          command.idempotencyKey,
+          requestSha256,
+          JSON.stringify(response),
+          canceledAt,
+        ],
+      );
+      return response;
+    });
+  }
+
   async controlTranscriptionBatch(
     actor: AuthenticatedActor,
     projectId: string,
@@ -10463,7 +10688,7 @@ export class SharedProjectCatalog {
       }
       if (
         batch.dispatch_status === "canceled" &&
-        command.action !== "cancel_unstarted"
+        !["cancel_unstarted", "cancel_all"].includes(command.action)
       ) {
         throw new CatalogConflictError(
           "Canceled batch dispatch cannot be resumed or retried.",
@@ -10512,6 +10737,61 @@ export class SharedProjectCatalog {
              )`,
           [updatedAt, projectId],
         );
+      } else if (command.action === "cancel_all") {
+        dispatchStatus = "canceled";
+        const canceling = await this.database.query<DbRow>(
+          `UPDATE transcription_batch_items
+           SET state = CASE
+                 WHEN state IN (
+                   'resolving', 'acquiring', 'transcribing', 'translating',
+                   'aligning', 'uploading'
+                 ) THEN 'canceling'
+                 ELSE 'canceled'
+               END,
+               version = version + 1, updated_at = $1
+           WHERE batch_id = $2 AND state NOT IN ('canceling', 'canceled')
+           RETURNING id, job_id, state`,
+          [updatedAt, batchId],
+        );
+        const jobIds = [
+          ...new Set(
+            canceling.rows
+              .filter((item) => item.job_id)
+              .map((item) => String(item.job_id)),
+          ),
+        ];
+        for (const jobId of jobIds) {
+          const canceledItemIds = canceling.rows
+            .filter((item) => String(item.job_id) === jobId)
+            .map((item) => String(item.id));
+          const hasSibling = await this.hasLiveTranscriptionDependency(
+            jobId,
+            canceledItemIds,
+          );
+          if (hasSibling) {
+            await this.database.query(
+              `UPDATE transcription_batch_items
+               SET state = 'canceled', version = version + 1, updated_at = $1
+               WHERE id = ANY($2::uuid[]) AND state = 'canceling'`,
+              [updatedAt, canceledItemIds],
+            );
+            continue;
+          }
+          const disposition = await this.requestTranscriptionJobCancellation(
+            projectId,
+            jobId,
+            actor.userId,
+            updatedAt,
+          );
+          if (disposition === "settled") {
+            await this.database.query(
+              `UPDATE transcription_batch_items
+               SET state = 'canceled', version = version + 1, updated_at = $1
+               WHERE id = ANY($2::uuid[]) AND state = 'canceling'`,
+              [updatedAt, canceledItemIds],
+            );
+          }
+        }
       } else if (command.action === "retry_failed") {
         dispatchStatus = "active";
         const retryJobs = await this.database.query<DbRow>(
@@ -10780,6 +11060,51 @@ export class SharedProjectCatalog {
     const claimedAt = this.now();
     const expiresAt = new Date(claimedAt.getTime() + leaseSeconds * 1_000);
     return this.transaction(async () => {
+      const expiredCancellations = await this.database.query<DbRow>(
+        `SELECT request.job_id
+         FROM transcription_job_cancel_requests request
+         JOIN jobs job ON job.id = request.job_id
+         LEFT JOIN worker_leases lease ON lease.job_id = request.job_id
+         WHERE request.reason = 'batch_item'
+           AND request.revoked_at IS NULL AND request.completed_at IS NULL
+           AND job.state IN ('claimed', 'processing')
+           AND (lease.job_id IS NULL OR lease.expires_at <= $1)
+         FOR UPDATE OF request, job`,
+        [claimedAt.toISOString()],
+      );
+      for (const cancellation of expiredCancellations.rows) {
+        const cancellationJobId = String(cancellation.job_id);
+        const activeDependency =
+          await this.hasLiveTranscriptionDependency(cancellationJobId);
+        if (activeDependency) {
+          await this.database.query(
+            `UPDATE transcription_job_cancel_requests SET revoked_at = $1
+             WHERE job_id = $2`,
+            [claimedAt.toISOString(), cancellationJobId],
+          );
+        } else {
+          await this.database.query(
+            `UPDATE jobs SET state = 'canceled', updated_at = $1
+             WHERE id = $2 AND state IN ('claimed', 'processing')`,
+            [claimedAt.toISOString(), cancellationJobId],
+          );
+          await this.database.query(
+            `UPDATE transcription_job_cancel_requests SET completed_at = $1
+             WHERE job_id = $2`,
+            [claimedAt.toISOString(), cancellationJobId],
+          );
+        }
+        await this.database.query(
+          `UPDATE transcription_batch_items
+           SET state = 'canceled', version = version + 1, updated_at = $1
+           WHERE job_id = $2 AND state = 'canceling'`,
+          [claimedAt.toISOString(), cancellationJobId],
+        );
+        await this.database.query(
+          "DELETE FROM worker_leases WHERE job_id = $1",
+          [cancellationJobId],
+        );
+      }
       const candidate = await this.database.query<DbRow>(
         `SELECT j.*
          FROM jobs j
@@ -10809,6 +11134,12 @@ export class SharedProjectCatalog {
            AND (
              j.state = 'queued'
              OR (j.state IN ('claimed', 'processing') AND wl.expires_at <= $3)
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM transcription_job_cancel_requests cancel_request
+             WHERE cancel_request.job_id = j.id
+               AND cancel_request.revoked_at IS NULL
+               AND cancel_request.completed_at IS NULL
            )
          ORDER BY
            CASE j.payload->>'priority'
@@ -10851,7 +11182,8 @@ export class SharedProjectCatalog {
         `UPDATE transcription_batch_items
          SET state = 'resolving', attempt = $1, version = version + 1,
              updated_at = $2
-         WHERE job_id = $3 AND state NOT IN ('ready_for_review', 'canceled')`,
+         WHERE job_id = $3
+           AND state NOT IN ('ready_for_review', 'canceling', 'canceled')`,
         [attempt, claimedAt.toISOString(), row.id],
       );
       return ClaimedTranscriptionJobSchema.parse({
@@ -10895,17 +11227,20 @@ export class SharedProjectCatalog {
       }
       const lease = await this.requireActiveWorkerLease(actor, jobId, attempt);
       const cancellation = await this.database.query<DbRow>(
-        `SELECT requested_at
+        `SELECT requested_at, reason
          FROM transcription_job_cancel_requests
          WHERE job_id = $1 AND revoked_at IS NULL AND completed_at IS NULL
          FOR UPDATE`,
         [jobId],
       );
       if (cancellation.rows[0]) {
-        const activeDependency = Boolean(
-          (
-            await this.database.query(
-              `SELECT 1
+        const activeDependency =
+          cancellation.rows[0].reason === "batch_item"
+            ? await this.hasLiveTranscriptionDependency(jobId)
+            : Boolean(
+                (
+                  await this.database.query(
+                    `SELECT 1
                FROM transcription_batch_items dependency
                JOIN transcription_batches dependency_batch
                  ON dependency_batch.id = dependency.batch_id
@@ -10915,10 +11250,10 @@ export class SharedProjectCatalog {
                WHERE dependency.job_id = $1
                  AND dependency_video.triage_state = 'active'
                LIMIT 1`,
-              [jobId],
-            )
-          ).rows[0],
-        );
+                    [jobId],
+                  )
+                ).rows[0],
+              );
         if (!activeDependency) {
           await this.database.query(
             `UPDATE jobs SET state = 'canceled', updated_at = $1
@@ -10952,6 +11287,14 @@ export class SharedProjectCatalog {
            WHERE job_id = $2`,
           [heartbeatAt.toISOString(), jobId],
         );
+        if (cancellation.rows[0].reason === "batch_item") {
+          await this.database.query(
+            `UPDATE transcription_batch_items
+             SET state = 'canceled', version = version + 1, updated_at = $1
+             WHERE job_id = $2 AND state = 'canceling'`,
+            [heartbeatAt.toISOString(), jobId],
+          );
+        }
       }
       const renewed = await this.database.query(
         `UPDATE worker_leases
@@ -10977,7 +11320,8 @@ export class SharedProjectCatalog {
       await this.database.query(
         `UPDATE transcription_batch_items
          SET state = $1, version = version + 1, updated_at = $2
-         WHERE job_id = $3 AND attempt = $4`,
+         WHERE job_id = $3 AND attempt = $4
+           AND state NOT IN ('ready_for_review', 'canceling', 'canceled')`,
         [stage, heartbeatAt.toISOString(), jobId, attempt],
       );
       return WorkerHeartbeatResponseSchema.parse({
@@ -11015,7 +11359,8 @@ export class SharedProjectCatalog {
         `UPDATE transcription_batch_items
          SET source_plan = $1::jsonb, source_resolved_at = $2,
              version = version + 1, updated_at = $2
-         WHERE job_id = $3 AND attempt = $4`,
+         WHERE job_id = $3 AND attempt = $4
+           AND state NOT IN ('canceling', 'canceled')`,
         [encoded, resolvedAt, jobId, attempt],
       );
     });
@@ -11049,7 +11394,7 @@ export class SharedProjectCatalog {
          SET state = 'failed', error_code = $1, error_message = $2,
              error_retryable = $3, version = version + 1, updated_at = $4
          WHERE job_id = $5 AND attempt = $6
-           AND state NOT IN ('ready_for_review', 'canceled')`,
+           AND state NOT IN ('ready_for_review', 'canceling', 'canceled')`,
         [
           failure.code,
           failure.message,
@@ -12759,8 +13104,20 @@ export class SharedProjectCatalog {
                active_transcript_version_id = $1,
                error_code = NULL, error_message = NULL,
                version = version + 1, updated_at = $2
-           WHERE job_id = $3 AND attempt = $4 AND state <> 'canceled'`,
+           WHERE job_id = $3 AND attempt = $4
+             AND state NOT IN ('canceling', 'canceled')`,
           [manifest.id, this.now().toISOString(), claim.jobId, claim.attempt],
+        );
+        await this.database.query(
+          `UPDATE transcription_batch_items
+           SET state = 'canceled', version = version + 1, updated_at = $1
+           WHERE job_id = $2 AND attempt = $3 AND state = 'canceling'`,
+          [this.now().toISOString(), claim.jobId, claim.attempt],
+        );
+        await this.database.query(
+          `UPDATE transcription_job_cancel_requests SET completed_at = $1
+           WHERE job_id = $2 AND revoked_at IS NULL AND completed_at IS NULL`,
+          [this.now().toISOString(), claim.jobId],
         );
         const completedBatches = await this.database.query<DbRow>(
           "SELECT DISTINCT batch_id FROM transcription_batch_items WHERE job_id = $1",
@@ -17757,14 +18114,6 @@ function summarizeProgress(items: readonly TranscriptionBatchItem[]): {
 } {
   const countState = (state: TranscriptionBatchItem["state"]) =>
     items.filter((item) => item.state === state).length;
-  const activeStates = new Set<TranscriptionBatchItem["state"]>([
-    "resolving",
-    "acquiring",
-    "transcribing",
-    "translating",
-    "aligning",
-    "uploading",
-  ]);
   const countReview = (status: TranscriptionBatchItem["reviewStatus"]) =>
     items.filter(
       (item) =>
@@ -17773,7 +18122,10 @@ function summarizeProgress(items: readonly TranscriptionBatchItem[]): {
   return {
     total: items.length,
     queued: countState("queued"),
-    active: items.filter((item) => activeStates.has(item.state)).length,
+    active: items.filter(
+      (item) =>
+        transcriptionActiveStates.has(item.state) || item.state === "canceling",
+    ).length,
     readyForReview: countState("ready_for_review"),
     blocked: countState("blocked"),
     failed: countState("failed"),
@@ -17787,6 +18139,15 @@ function summarizeProgress(items: readonly TranscriptionBatchItem[]): {
     skipped: countReview("skipped"),
   };
 }
+
+const transcriptionActiveStates = new Set<TranscriptionBatchItem["state"]>([
+  "resolving",
+  "acquiring",
+  "transcribing",
+  "translating",
+  "aligning",
+  "uploading",
+]);
 
 function mapJob(row: DbRow) {
   return JobSchema.parse({

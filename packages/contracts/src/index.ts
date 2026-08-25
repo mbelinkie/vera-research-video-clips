@@ -580,6 +580,58 @@ export const SetupSnapshotSchema = z
       targets.add(reference.target);
     }
   });
+
+const RecommendedSetupRootSchema = z
+  .object({
+    target: z.enum(["output_root", "cache_root"]),
+    displayName: z.string().trim().min(1).max(160),
+    state: z.enum([
+      "active",
+      "will_create",
+      "will_use_existing",
+      "unavailable",
+    ]),
+  })
+  .strict();
+const RecommendedSetupToolSchema = z
+  .object({
+    target: z.enum(["ffmpeg", "ffprobe", "yt_dlp", "whisper_cli"]),
+    displayName: z.string().trim().min(1).max(160),
+    state: z.enum(["active", "detected", "missing"]),
+    version: z.string().trim().min(1).max(160).optional(),
+  })
+  .strict();
+export const RecommendedSetupPlanSchema = z
+  .object({
+    state: z.enum(["ready_to_setup", "needs_action", "completed"]),
+    roots: z.array(RecommendedSetupRootSchema).length(2),
+    tools: z.array(RecommendedSetupToolSchema).length(4),
+    model: z
+      .object({
+        displayName: z.string().trim().min(1).max(160),
+        byteSize: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+        state: z.enum(["active", "download_required"]),
+      })
+      .strict(),
+    enables: z.array(z.enum(["create_transcripts", "export_clips"])).max(2),
+  })
+  .strict()
+  .superRefine((plan, context) => {
+    if (new Set(plan.roots.map((root) => root.target)).size !== 2) {
+      context.addIssue({
+        code: "custom",
+        path: ["roots"],
+        message: "Every recommended root must be reported once.",
+      });
+    }
+    if (new Set(plan.tools.map((tool) => tool.target)).size !== 4) {
+      context.addIssue({
+        code: "custom",
+        path: ["tools"],
+        message: "Every recommended tool must be reported once.",
+      });
+    }
+  });
 export const ModelDownloadProgressSchema = z
   .object({
     target: z.literal("whisper_model"),
@@ -4668,6 +4720,7 @@ export const TranscriptionItemStateSchema = z.enum([
   "translating",
   "aligning",
   "uploading",
+  "canceling",
   "ready_for_review",
   "blocked",
   "failed",
@@ -5012,10 +5065,28 @@ export const TranscriptionBatchControlRequestSchema = z.object({
     "pause_pending",
     "resume",
     "cancel_unstarted",
+    "cancel_all",
     "retry_failed",
   ]),
   expectedVersion: z.number().int().positive(),
 });
+
+export const CancelTranscriptionBatchItemRequestSchema = z
+  .object({
+    idempotencyKey: z.string().trim().min(1).max(512),
+    expectedVersion: z.number().int().positive(),
+  })
+  .strict();
+
+export const CancelTranscriptionBatchItemResponseSchema = z
+  .object({
+    projectId: IdSchema,
+    batchId: IdSchema,
+    item: TranscriptionBatchItemSchema,
+    outcome: z.enum(["canceled", "canceling", "already_canceled"]),
+    jobCancellationRequested: z.boolean(),
+  })
+  .strict();
 
 export const TranscriptionBatchListItemSchema = z.object({
   batch: TranscriptionBatchSchema,
@@ -8378,6 +8449,12 @@ export type TranscriptionBatchProgress = z.infer<
 export type TranscriptionBatchControlRequest = z.infer<
   typeof TranscriptionBatchControlRequestSchema
 >;
+export type CancelTranscriptionBatchItemRequest = z.infer<
+  typeof CancelTranscriptionBatchItemRequestSchema
+>;
+export type CancelTranscriptionBatchItemResponse = z.infer<
+  typeof CancelTranscriptionBatchItemResponseSchema
+>;
 export type TranscriptionBatchListResponse = z.infer<
   typeof TranscriptionBatchListResponseSchema
 >;
@@ -8446,6 +8523,7 @@ export type LocalComponentReference = z.infer<
   typeof LocalComponentReferenceSchema
 >;
 export type SetupSnapshot = z.infer<typeof SetupSnapshotSchema>;
+export type RecommendedSetupPlan = z.infer<typeof RecommendedSetupPlanSchema>;
 export type ModelDownloadProgress = z.infer<typeof ModelDownloadProgressSchema>;
 export type DesktopAuthStatus = z.infer<typeof DesktopAuthStatusSchema>;
 export type DesktopServiceStatus = z.infer<typeof DesktopServiceStatusSchema>;
