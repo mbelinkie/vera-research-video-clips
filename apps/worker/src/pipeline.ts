@@ -739,6 +739,10 @@ export class HttpTranscriptPublicationClient implements TranscriptPublicationCli
   readonly #baseUrl: URL;
   readonly #authorization: string;
   readonly #fetcher: typeof fetch;
+  readonly #memoryTargets = new Map<
+    string,
+    { jobId: string; attempt: number; uploadId: string }
+  >();
 
   constructor(options: {
     baseUrl: string;
@@ -764,7 +768,17 @@ export class HttpTranscriptPublicationClient implements TranscriptPublicationCli
       `/api/transcription-jobs/${encodeURIComponent(jobId)}/transcript-uploads`,
       body,
     );
-    return TranscriptUploadGrantSchema.parse(response);
+    const grant = TranscriptUploadGrantSchema.parse(response);
+    for (const target of grant.targets) {
+      if (new URL(target.uploadUrl).protocol === "memory-upload:") {
+        this.#memoryTargets.set(target.objectKey, {
+          jobId,
+          attempt: input.attempt,
+          uploadId: grant.uploadId,
+        });
+      }
+    }
+    return grant;
   }
 
   async upload(
@@ -772,6 +786,27 @@ export class HttpTranscriptPublicationClient implements TranscriptPublicationCli
     bytes: Uint8Array,
     contentType: string,
   ): Promise<FinalizedObject> {
+    if (new URL(target.uploadUrl).protocol === "memory-upload:") {
+      const context = this.#memoryTargets.get(target.objectKey);
+      if (!context) {
+        throw new TranscriptPipelineError(
+          "Memory transcript upload target is missing its claimed-job context.",
+        );
+      }
+      return FinalizedObjectSchema.parse(
+        await this.api(
+          `/api/transcription-jobs/${encodeURIComponent(context.jobId)}/transcript-uploads/${encodeURIComponent(context.uploadId)}/artifacts`,
+          {
+            attempt: context.attempt,
+            type: target.type,
+            objectKey: target.objectKey,
+            contentType,
+            bytesBase64: Buffer.from(bytes).toString("base64"),
+            sha256: createHash("sha256").update(bytes).digest("hex"),
+          },
+        ),
+      );
+    }
     const response = await this.#fetcher(target.uploadUrl, {
       method: "PUT",
       headers: { "content-type": contentType },
@@ -807,12 +842,17 @@ export class HttpTranscriptPublicationClient implements TranscriptPublicationCli
     },
   ) {
     const body = WorkerFinalizeTranscriptRequestSchema.parse(input);
-    return ActiveTranscriptBundleSchema.parse(
+    const finalized = ActiveTranscriptBundleSchema.parse(
       await this.api(
         `/api/transcription-jobs/${encodeURIComponent(jobId)}/finalize`,
         body,
       ),
     );
+    for (const [objectKey, context] of this.#memoryTargets) {
+      if (context.uploadId === input.uploadId)
+        this.#memoryTargets.delete(objectKey);
+    }
+    return finalized;
   }
 
   private async api(path: string, body: unknown) {

@@ -723,15 +723,10 @@ describe("transcription batch retry and archive", () => {
       ],
     });
     await expect(
-      catalog.archiveTranscriptionBatch(
-        owner,
-        project.id,
-        created.batch.id,
-        {
-          idempotencyKey: "archive-live-batch",
-          expectedVersion: 1,
-        },
-      ),
+      catalog.archiveTranscriptionBatch(owner, project.id, created.batch.id, {
+        idempotencyKey: "archive-live-batch",
+        expectedVersion: 1,
+      }),
     ).rejects.toMatchObject({ code: "conflict" });
 
     const claim = await catalog.claimTranscriptionJob(owner, "local", 120);
@@ -6995,20 +6990,47 @@ describe("claimed transcript finalization", () => {
           ? "1\n00:00:00,000 --> 00:00:01,000\nFixture\n"
           : JSON.stringify({ fixture: true }),
       );
-      const stored = await store.put({
-        key: target.objectKey,
-        bytes,
-        contentType:
-          type === "english-srt" ? "application/x-subrip" : "application/json",
-        sha256: digest(bytes),
-      });
+      const stored = await catalog.uploadClaimedTranscriptArtifact(
+        actor,
+        claimed!.job.id,
+        grant.uploadId,
+        {
+          attempt: claimed!.lease.attempt,
+          type,
+          objectKey: target.objectKey,
+          contentType:
+            type === "english-srt"
+              ? "application/x-subrip"
+              : "application/json",
+          bytes,
+          sha256: digest(bytes),
+        },
+      );
       storedArtifacts.push({
         type,
-        objectKey: stored.key,
-        objectVersionId: stored.versionId,
-        byteSize: bytes.byteLength,
+        objectKey: stored.objectKey,
+        objectVersionId: stored.objectVersionId,
+        byteSize: stored.byteSize,
         sha256: stored.sha256,
       });
+      await expect(
+        catalog.uploadClaimedTranscriptArtifact(
+          actor,
+          claimed!.job.id,
+          grant.uploadId,
+          {
+            attempt: claimed!.lease.attempt,
+            type,
+            objectKey: target.objectKey,
+            contentType:
+              type === "english-srt"
+                ? "application/x-subrip"
+                : "application/json",
+            bytes,
+            sha256: "0".repeat(64),
+          },
+        ),
+      ).rejects.toMatchObject({ statusCode: 400 });
     }
     const transcriptVersionId = randomUUID();
     const manifest: TranscriptManifest = {

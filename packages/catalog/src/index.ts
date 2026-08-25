@@ -12816,6 +12816,67 @@ export class SharedProjectCatalog {
     });
   }
 
+  async uploadClaimedTranscriptArtifact(
+    actor: AuthenticatedActor,
+    jobId: string,
+    uploadId: string,
+    input: {
+      attempt: number;
+      type: TranscriptArtifact["type"];
+      objectKey: string;
+      contentType: "application/json" | "application/x-subrip";
+      bytes: Uint8Array;
+      sha256: string;
+    },
+  ): Promise<FinalizedObject> {
+    await this.requireRegistered(actor);
+    const now = this.now().toISOString();
+    const target = await this.database.query<DbRow>(
+      `SELECT target.artifact_type, target.object_key
+       FROM transcript_uploads upload
+       JOIN transcript_upload_targets target ON target.upload_id = upload.id
+       JOIN worker_leases lease ON lease.job_id = upload.job_id
+       WHERE upload.id = $1 AND upload.job_id = $2
+         AND upload.state = 'staged' AND upload.expires_at > $3
+         AND target.artifact_type = $4 AND target.object_key = $5
+         AND lease.worker_id = $6 AND lease.attempt = $7
+         AND lease.expires_at > $3`,
+      [
+        uploadId,
+        jobId,
+        now,
+        input.type,
+        input.objectKey,
+        actor.userId,
+        input.attempt,
+      ],
+    );
+    if (!target.rows[0]) {
+      throw new CatalogConflictError(
+        "The claimed transcript upload target or worker lease is no longer active.",
+      );
+    }
+    const actualSha256 = createHash("sha256").update(input.bytes).digest("hex");
+    if (actualSha256 !== input.sha256) {
+      throw new CatalogInvalidRequestError(
+        "The transcript artifact checksum does not match its bytes.",
+      );
+    }
+    const stored = await this.store.put({
+      key: input.objectKey,
+      bytes: input.bytes,
+      contentType: input.contentType,
+      sha256: input.sha256,
+    });
+    return FinalizedObjectSchema.parse({
+      type: input.type,
+      objectKey: stored.key,
+      objectVersionId: stored.versionId,
+      byteSize: stored.bytes.byteLength,
+      sha256: stored.sha256,
+    });
+  }
+
   async loadClaimedTranscriptTranslationSource(
     actor: AuthenticatedActor,
     jobId: string,

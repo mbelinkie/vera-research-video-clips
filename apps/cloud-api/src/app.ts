@@ -93,6 +93,7 @@ import {
   WorkerClaimRequestSchema,
   WorkerFailureRequestSchema,
   WorkerCreateTranscriptUploadRequestSchema,
+  WorkerUploadTranscriptArtifactRequestSchema,
   WorkerFinalizeTranscriptRequestSchema,
   WorkerHeartbeatRequestSchema,
   WorkerSourcePlanRequestSchema,
@@ -1922,6 +1923,38 @@ export function createCloudApi(
         },
       );
       return reply.status(201).send(grant);
+    },
+  );
+
+  app.post(
+    "/api/transcription-jobs/:jobId/transcript-uploads/:uploadId/artifacts",
+    { bodyLimit: 18_000_000 },
+    async (request) => {
+      const { jobId, uploadId } = z
+        .object({ jobId: z.uuid(), uploadId: z.uuid() })
+        .parse(request.params);
+      const body = WorkerUploadTranscriptArtifactRequestSchema.parse(
+        request.body,
+      );
+      const bytes = Buffer.from(body.bytesBase64, "base64");
+      if (bytes.toString("base64") !== body.bytesBase64) {
+        throw new CatalogInvalidRequestError(
+          "Transcript artifact bytes must use canonical base64.",
+        );
+      }
+      return catalog.uploadClaimedTranscriptArtifact(
+        await authenticate(request),
+        jobId,
+        uploadId,
+        {
+          attempt: body.attempt,
+          type: body.type,
+          objectKey: body.objectKey,
+          contentType: body.contentType,
+          bytes,
+          sha256: body.sha256,
+        },
+      );
     },
   );
 

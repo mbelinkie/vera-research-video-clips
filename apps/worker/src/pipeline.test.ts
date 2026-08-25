@@ -25,6 +25,7 @@ import multilingualFixture from "../../../tests/fixtures/transcripts/romanian-mu
 import {
   createTranscriptPipelineExecutor,
   executeDerivedTranslation,
+  HttpTranscriptPublicationClient,
   type ClaimedTranslationClient,
   type TranscriptPublicationClient,
 } from "./pipeline.ts";
@@ -117,6 +118,93 @@ describe("supplemental preferred translation worker", () => {
       sourceTrackId: original.track.id,
     });
     expect(publish).toHaveBeenCalledOnce();
+  });
+});
+
+describe("HTTP transcript publication", () => {
+  it("proxies memory upload targets through the authenticated cloud API", async () => {
+    const jobId = randomUUID();
+    const uploadId = randomUUID();
+    const projectId = randomUUID();
+    const catalogVideoId = randomUUID();
+    const lineageId = randomUUID();
+    const objectKey = `projects/${projectId}/videos/${catalogVideoId}/transcripts/${lineageId}/v1/${uploadId}/english-normalized.json`;
+    const bytes = new TextEncoder().encode('{"fixture":true}');
+    const finalized = {
+      type: "english-normalized" as const,
+      objectKey,
+      objectVersionId: randomUUID(),
+      byteSize: bytes.byteLength,
+      sha256: createHash("sha256").update(bytes).digest("hex"),
+    };
+    const fetchMock = vi.fn(
+      async (input: string | URL | Request, _init?: RequestInit) => {
+        const url = String(input);
+        if (
+          url.endsWith(`/api/transcription-jobs/${jobId}/transcript-uploads`)
+        ) {
+          return new Response(
+            JSON.stringify({
+              uploadId,
+              jobId,
+              projectId,
+              catalogVideoId,
+              lineageId,
+              version: 1,
+              expiresAt: new Date(Date.now() + 60_000).toISOString(),
+              targets: [
+                {
+                  type: "manifest",
+                  objectKey: `${objectKey}.manifest`,
+                  uploadUrl: `memory-upload://${encodeURIComponent(`${objectKey}.manifest`)}`,
+                },
+                {
+                  type: "english-normalized",
+                  objectKey,
+                  uploadUrl: `memory-upload://${encodeURIComponent(objectKey)}`,
+                },
+              ],
+            }),
+            { status: 201, headers: { "content-type": "application/json" } },
+          );
+        }
+        return new Response(JSON.stringify(finalized), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      },
+    );
+    const client = new HttpTranscriptPublicationClient({
+      baseUrl: "https://api.example.test",
+      authorization: "Bearer fixture-worker",
+      fetcher: fetchMock as unknown as typeof fetch,
+    });
+
+    const grant = await client.createUpload(jobId, {
+      attempt: 2,
+      lineageId,
+      version: 1,
+      artifactTypes: ["english-normalized"],
+    });
+    await expect(
+      client.upload(grant.targets[1]!, bytes, "application/json"),
+    ).resolves.toEqual(finalized);
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(String(fetchMock.mock.calls[1]![0])).toBe(
+      `https://api.example.test/api/transcription-jobs/${jobId}/transcript-uploads/${uploadId}/artifacts`,
+    );
+    const uploadRequest = JSON.parse(
+      String((fetchMock.mock.calls[1]![1] as RequestInit).body),
+    );
+    expect(uploadRequest).toMatchObject({
+      attempt: 2,
+      type: "english-normalized",
+      objectKey,
+      contentType: "application/json",
+      bytesBase64: Buffer.from(bytes).toString("base64"),
+      sha256: finalized.sha256,
+    });
   });
 });
 

@@ -16,6 +16,8 @@ draggable, keyboard-accessible divider.
 - Batch list/detail controls and the selected-video transcript retry action.
 - Destination isolation and the persisted Review transcript-panel width.
 - Caption-first worker regression coverage and the packaged desktop runtime.
+- Authenticated transcript-artifact upload bridging for the development-only
+  memory object store used by external desktop workers.
 
 ## Focused evidence
 
@@ -58,6 +60,9 @@ draggable, keyboard-accessible divider.
   sends `retry_failed` with the current version, and shows queued progress.
 - The exact `-78bl92WZHY` retry selects and normalizes the downloadable YouTube
   caption and publishes an active English transcript without invoking Whisper.
+- A remote worker never attempts to fetch a `memory-upload://` URL directly;
+  it sends the exact claimed upload target through the authenticated API, which
+  verifies the lease, target, checksum, and bounded bytes before publication.
 - Focused catalog/API/UI/worker tests, migrations, type checking, formatting,
   desktop build, and a packaged-app smoke test pass.
 - Logged never renders transcription batch creation, history, or controls.

@@ -7598,6 +7598,21 @@ export const WorkerCreateTranscriptUploadRequestSchema = z.object({
   artifactTypes: z.array(WorkerTranscriptArtifactTypeSchema).min(1),
 });
 
+export const WorkerUploadTranscriptArtifactRequestSchema = z
+  .object({
+    attempt: z.number().int().positive(),
+    type: TranscriptArtifactSchema.shape.type,
+    objectKey: z.string().min(1).max(2_048),
+    contentType: z.enum(["application/json", "application/x-subrip"]),
+    bytesBase64: z
+      .string()
+      .min(1)
+      .max(16_000_000)
+      .regex(/^[A-Za-z0-9+/]+={0,2}$/),
+    sha256: z.string().regex(/^[a-f0-9]{64}$/),
+  })
+  .strict();
+
 export const WorkerFinalizeTranscriptRequestSchema =
   FinalizeTranscriptRequestSchema.extend({
     attempt: z.number().int().positive(),
@@ -8531,6 +8546,9 @@ export type WorkerProgressStage = z.infer<typeof WorkerProgressStageSchema>;
 export type WorkerFailureRequest = z.infer<typeof WorkerFailureRequestSchema>;
 export type WorkerCreateTranscriptUploadRequest = z.infer<
   typeof WorkerCreateTranscriptUploadRequestSchema
+>;
+export type WorkerUploadTranscriptArtifactRequest = z.infer<
+  typeof WorkerUploadTranscriptArtifactRequestSchema
 >;
 export type WorkerFinalizeTranscriptRequest = z.infer<
   typeof WorkerFinalizeTranscriptRequestSchema
