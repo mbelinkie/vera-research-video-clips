@@ -1679,6 +1679,9 @@ export function createCloudApi(
           name: body.name,
           options: preflight.options,
           items: preflight.items,
+          trustVerifiedPreflight: Boolean(
+            dependencies.verifyActiveTranscriptArtifacts,
+          ),
         });
         return reply.status(201).send(created);
       },

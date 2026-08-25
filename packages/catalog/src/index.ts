@@ -489,6 +489,11 @@ export interface CreateTranscriptionBatchInput {
   name: string;
   options: BatchOptions;
   items: BatchPreflightItem[];
+  /**
+   * The caller verified active transcript artifacts while producing `items`.
+   * Preserve a ready item instead of trusting a stale project-video pointer.
+   */
+  trustVerifiedPreflight?: boolean;
 }
 
 export type ProjectVideoTranscriptState = {
@@ -10260,6 +10265,7 @@ export class SharedProjectCatalog {
           item,
           createdAt,
           true,
+          Boolean(input.trustVerifiedPreflight),
         );
       }
       await this.emitTranscriptionNotificationsForBatch(batchId, createdAt);
@@ -15275,6 +15281,7 @@ export class SharedProjectCatalog {
     item: BatchPreflightItem,
     createdAt: string,
     upsertVideo: boolean,
+    trustVerifiedPreflight = false,
   ): Promise<void> {
     let catalogVideoId = item.catalogVideoId;
     if (
@@ -15296,6 +15303,7 @@ export class SharedProjectCatalog {
     if (
       item.status === "ready" &&
       catalogVideoId &&
+      !trustVerifiedPreflight &&
       options.sourcePolicy !== "force-generate"
     ) {
       const active = await this.database.query<DbRow>(

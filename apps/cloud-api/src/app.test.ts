@@ -4082,6 +4082,101 @@ describe("cloud API", () => {
     ).toBe(403);
   });
 
+  it("queues work when verified preflight rejects a stale active transcript pointer", async () => {
+    const database = new PGlite();
+    databases.add(database);
+    await runCloudMigrations(database);
+    const catalog = new SharedProjectCatalog(
+      database,
+      new MemoryTranscriptObjectStore(),
+    );
+    const app = createCloudApi({
+      catalog,
+      authenticate: authenticateDevBearer,
+      verifyActiveTranscriptArtifacts: true,
+      videoMetadataProvider: {
+        resolve: async (videoId) => ({
+          videoId,
+          title: "Fresh caption candidate",
+          channel: "Fixture channel",
+          sourceLanguage: "en",
+        }),
+      },
+    });
+    apps.add(app);
+    const userId = randomUUID();
+    const actor = {
+      userId,
+      externalSubject: "fixture:stale-transcript-owner",
+    };
+    const authorization = `Bearer ${userId}|${actor.externalSubject}`;
+    await app.inject({
+      method: "POST",
+      url: "/api/session/register",
+      headers: { authorization },
+      payload: { displayName: "Stale Transcript Owner" },
+    });
+    const project = await app.inject({
+      method: "POST",
+      url: "/api/projects",
+      headers: { authorization },
+      payload: { name: "Stale transcript project" },
+    });
+    const projectId = project.json<{ id: string }>().id;
+    const video = await catalog.addVideo(actor, projectId, {
+      youtubeVideoId: "StaleCap001",
+      canonicalUrl: "https://www.youtube.com/watch?v=StaleCap001",
+      title: "Stale caption candidate",
+    });
+    const staleTranscriptVersionId = randomUUID();
+    await database.query(
+      `INSERT INTO transcript_versions
+         (id, project_id, video_id, lineage_id, version, schema_version,
+          source_language, target_language, timing_precision,
+          manifest_object_key, manifest_sha256, finalized_at)
+       VALUES ($1, $2, $3, $4, 1, 1, 'en', 'en', 'cue', $5, $6, now())`,
+      [
+        staleTranscriptVersionId,
+        projectId,
+        video.id,
+        randomUUID(),
+        "fixture/missing-manifest.json",
+        "f".repeat(64),
+      ],
+    );
+    await database.query(
+      `UPDATE project_videos SET active_transcript_version_id = $1
+       WHERE project_id = $2 AND video_id = $3`,
+      [staleTranscriptVersionId, projectId, video.id],
+    );
+
+    const created = await app.inject({
+      method: "POST",
+      url: `/api/projects/${projectId}/transcription-batches`,
+      headers: { authorization },
+      payload: {
+        name: "Recover stale transcript",
+        inputs: ["StaleCap001"],
+        sourcePolicy: "captions-then-generate",
+        transcriptionProfile: "caption-recovery",
+      },
+    });
+
+    expect(created.statusCode).toBe(201);
+    expect(created.json()).toMatchObject({
+      summary: { ready: 1, existingTranscripts: 0 },
+      progress: { queued: 1, readyForReview: 0 },
+      items: [
+        {
+          status: "ready",
+          processingNeed: "transcription",
+          state: "queued",
+          catalogVideoId: video.id,
+        },
+      ],
+    });
+  });
+
   it("claims with an expiring lease, rejects stale workers, and persists the selected source plan", async () => {
     let currentTime = new Date("2026-08-01T12:00:00.000Z");
     const database = new PGlite();
