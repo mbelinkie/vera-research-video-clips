@@ -5,6 +5,8 @@ import { AuthenticationError } from "@research-video/auth";
 import {
   CatalogConflictError,
   CatalogInvalidRequestError,
+  CatalogNotFoundError,
+  TranscriptIntegrityError,
   type SharedProjectCatalog,
 } from "@research-video/catalog";
 import {
@@ -1652,6 +1654,7 @@ export function createCloudApi(
         projectId,
         body.inputs,
         body,
+        Boolean(dependencies.publicApiOrigin),
       );
     });
 
@@ -1668,6 +1671,7 @@ export function createCloudApi(
           projectId,
           body.inputs,
           body,
+          Boolean(dependencies.publicApiOrigin),
         );
         const created = await catalog.createTranscriptionBatch(actor, {
           projectId,
@@ -2243,6 +2247,7 @@ export async function preflightTranscriptionBatch(
   projectId: string,
   inputs: readonly string[],
   options: BatchOptions,
+  verifyActiveTranscriptArtifacts = false,
 ): Promise<BatchPreflightResponse> {
   const normalized = inputs.map((input, inputIndex) => {
     try {
@@ -2299,8 +2304,34 @@ export async function preflightTranscriptionBatch(
       continue;
     }
     const projectState = projectStates.get(entry.normalized.videoId);
+    let activeTranscriptAvailable = Boolean(
+      projectState?.activeTranscriptVersionId,
+    );
+    if (
+      verifyActiveTranscriptArtifacts &&
+      projectState?.activeTranscriptVersionId &&
+      options.sourcePolicy !== "force-generate"
+    ) {
+      activeTranscriptAvailable = false;
+      try {
+        await catalog.getActiveTranscript(
+          actor,
+          projectId,
+          projectState.catalogVideoId,
+        );
+        activeTranscriptAvailable = true;
+      } catch (error) {
+        if (
+          !(error instanceof CatalogNotFoundError) &&
+          !(error instanceof TranscriptIntegrityError)
+        ) {
+          throw error;
+        }
+      }
+    }
     if (
       projectState?.activeTranscriptVersionId &&
+      activeTranscriptAvailable &&
       options.sourcePolicy !== "force-generate"
     ) {
       items.push({
