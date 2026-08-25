@@ -48,3 +48,18 @@ parser treated those header metadata lines as the first cue and threw
 2. `npm test -- apps/worker/src/pipeline.test.ts`
 3. `npm test -- packages/providers/src/index.test.ts`
 4. `npm run typecheck`
+
+## Verification record
+
+- Implementation commit: `529ef92` (`Complete desktop dogfood and transcript workflows`).
+- The exact downloaded caption for YouTube video `-78bl92WZHY` normalized to
+  272 cue-timed segments and 4,278 tokens without media acquisition or Whisper.
+- Focused transcript, worker, and provider tests passed; the aggregate verified
+  worktree passed 691 unit/integration tests with four declared skips, 23/23
+  Playwright tests, local and cloud migration suites, type checking, formatting,
+  shell syntax checks, and the desktop production build.
+- A fresh x64 desktop package was built and launched from the implementation
+  commit. Its packaged local agent returned `status: ok`; the app bundle is at
+  `out/Research Video Clips-darwin-x64/Research Video Clips.app` and the packaged
+  `app.asar` SHA-256 is
+  `cd3554c000e4fe1b704bbd964237a4c3df5d6146a3b80a6fcb8400d763076c6d`.
