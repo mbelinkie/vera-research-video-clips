@@ -687,6 +687,144 @@ describe("hosted transcription approval", () => {
   });
 });
 
+describe("transcription batch retry and archive", () => {
+  it("retries one exact failed item and archives only after every item is canceled", async () => {
+    const { catalog } = await authorityCatalog();
+    const owner = authorityActor("batch-repair-owner");
+    await catalog.registerUser(
+      owner,
+      "Batch Repair Owner",
+      "batch_repair_owner",
+    );
+    const project = await catalog.createProject(owner, {
+      name: "Batch repair project",
+    });
+    const created = await catalog.createTranscriptionBatch(owner, {
+      projectId: project.id,
+      name: "Retry then archive",
+      options: {
+        targetLanguage: "en",
+        transcriptionProfile: "default",
+        sourcePolicy: "prefer-existing",
+        executionLocation: "local",
+        priority: "normal",
+      },
+      items: [
+        {
+          inputIndex: 0,
+          input: "https://www.youtube.com/watch?v=RetryItem01",
+          status: "ready",
+          processingNeed: "transcription",
+          youtubeVideoId: "RetryItem01",
+          canonicalUrl: "https://www.youtube.com/watch?v=RetryItem01",
+          title: "Retry item fixture",
+          sourceLanguage: "en",
+        },
+      ],
+    });
+    await expect(
+      catalog.archiveTranscriptionBatch(
+        owner,
+        project.id,
+        created.batch.id,
+        {
+          idempotencyKey: "archive-live-batch",
+          expectedVersion: 1,
+        },
+      ),
+    ).rejects.toMatchObject({ code: "conflict" });
+
+    const claim = await catalog.claimTranscriptionJob(owner, "local", 120);
+    await catalog.failTranscriptionJob(owner, claim!.job.id, {
+      attempt: claim!.lease.attempt,
+      code: "temporary_caption_failure",
+      message: "Caption provider is temporarily unavailable.",
+      retryable: true,
+    });
+    const failed = await catalog.getTranscriptionBatch(
+      owner,
+      project.id,
+      created.batch.id,
+    );
+    const failedItem = failed.items[0]!;
+    expect(failedItem).toMatchObject({
+      state: "failed",
+      error: { retryable: true },
+    });
+    const retryCommand = {
+      idempotencyKey: "retry-exact-item",
+      expectedVersion: failedItem.version,
+    };
+    const retried = await catalog.retryTranscriptionBatchItem(
+      owner,
+      project.id,
+      created.batch.id,
+      failedItem.id,
+      retryCommand,
+    );
+    expect(retried).toMatchObject({
+      outcome: "queued",
+      item: { id: failedItem.id, state: "queued" },
+    });
+    await expect(
+      catalog.retryTranscriptionBatchItem(
+        owner,
+        project.id,
+        created.batch.id,
+        failedItem.id,
+        retryCommand,
+      ),
+    ).resolves.toEqual(retried);
+
+    const canceled = await catalog.controlTranscriptionBatch(
+      owner,
+      project.id,
+      created.batch.id,
+      { action: "cancel_all", expectedVersion: 2 },
+    );
+    expect(canceled).toMatchObject({
+      batch: { dispatchStatus: "canceled", version: 3 },
+      progress: { canceled: 1 },
+    });
+    const archiveCommand = {
+      idempotencyKey: "archive-canceled-batch",
+      expectedVersion: 3,
+    };
+    const archived = await catalog.archiveTranscriptionBatch(
+      owner,
+      project.id,
+      created.batch.id,
+      archiveCommand,
+    );
+    expect(archived).toMatchObject({
+      outcome: "archived",
+      batch: {
+        id: created.batch.id,
+        archivedBy: owner.userId,
+        dispatchStatus: "canceled",
+        version: 4,
+      },
+    });
+    await expect(
+      catalog.archiveTranscriptionBatch(
+        owner,
+        project.id,
+        created.batch.id,
+        archiveCommand,
+      ),
+    ).resolves.toEqual(archived);
+    await expect(
+      catalog.listTranscriptionBatches(owner, project.id),
+    ).resolves.toEqual({ batches: [] });
+    await expect(
+      catalog.getTranscriptionBatch(owner, project.id, created.batch.id),
+    ).resolves.toMatchObject({
+      batch: { id: created.batch.id, archivedBy: owner.userId, version: 4 },
+      progress: { canceled: 1 },
+    });
+  });
+});
+
 describe("project local processing policy", () => {
   it("automates direct ingest, gates local starts, and replays Administrator policy commands", async () => {
     const { database, catalog } = await authorityCatalog();

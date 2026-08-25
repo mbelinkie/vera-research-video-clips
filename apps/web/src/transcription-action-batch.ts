@@ -7,6 +7,25 @@ type WorklistProcessing = Readonly<{
 
 type WorklistItem = Readonly<{ processing: WorklistProcessing }>;
 
+type RetryableBatchDetail = Readonly<{
+  batch: Readonly<{ id: string; version: number }>;
+  items: readonly Readonly<{
+    id: string;
+    catalogVideoId?: string | undefined;
+    youtubeVideoId?: string | undefined;
+    state: string;
+    version: number;
+    error?: Readonly<{ retryable?: boolean | undefined }> | undefined;
+  }>[];
+}>;
+
+export type RetryableTranscriptionItem = Readonly<{
+  batchId: string;
+  batchVersion: number;
+  itemId: string;
+  itemVersion: number;
+}>;
+
 /**
  * Project-local batches stay out of the ordinary batch list, but an exact
  * language gate in one of those batches must remain reachable for a person to
@@ -27,4 +46,33 @@ export function selectTranscriptionBatchId(
       item.processing.batchId,
   )?.processing.batchId;
   return actionRequired ?? listed[0]?.batch.id;
+}
+
+/**
+ * The transcript surface may retry only the exact selected project-video item.
+ * Batch order is newest first, so the first exact retryable failure wins.
+ */
+export function findRetryableTranscriptionItem(
+  batches: readonly RetryableBatchDetail[],
+  catalogVideoId: string,
+  youtubeVideoId: string,
+): RetryableTranscriptionItem | undefined {
+  for (const detail of batches) {
+    const item = detail.items.find(
+      (candidate) =>
+        candidate.catalogVideoId === catalogVideoId &&
+        candidate.youtubeVideoId === youtubeVideoId &&
+        candidate.state === "failed" &&
+        candidate.error?.retryable === true,
+    );
+    if (item) {
+      return {
+        batchId: detail.batch.id,
+        batchVersion: detail.batch.version,
+        itemId: item.id,
+        itemVersion: item.version,
+      };
+    }
+  }
+  return undefined;
 }

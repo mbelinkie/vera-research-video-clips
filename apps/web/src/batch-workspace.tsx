@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
   ApiErrorSchema,
+  ArchiveTranscriptionBatchResponseSchema,
   BatchPreflightResponseSchema,
   CancelTranscriptionBatchItemResponseSchema,
   CreateTranscriptionBatchResponseSchema,
@@ -680,9 +681,67 @@ export function BatchWorkspace({
           }),
         },
       );
-      setSelectedBatch(CreateTranscriptionBatchResponseSchema.parse(payload));
-      setMessage("Batch control applied.");
+      const controlled = CreateTranscriptionBatchResponseSchema.parse(payload);
+      if (
+        action === "cancel_all" &&
+        controlled.items.every((item) => item.state === "canceled")
+      ) {
+        await requestBatchArchive(controlled);
+        setSelectedBatch(undefined);
+        setSelectedBatchId("");
+        setMessage("Batch canceled and removed from the list.");
+        await refreshProject(projectId, "");
+      } else {
+        setSelectedBatch(controlled);
+        setMessage(
+          action === "cancel_all"
+            ? "Cancellation requested. Remove the batch after active work reaches a safe checkpoint."
+            : "Batch control applied.",
+        );
+        await refreshProject(projectId);
+      }
+    } catch (error) {
+      setMessage(errorMessage(error));
       await refreshProject(projectId);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function requestBatchArchive(target: CreateTranscriptionBatchResponse) {
+    const idempotencyKey = await payloadIdempotencyKey(
+      "transcription-batch-archive",
+      {
+        projectId,
+        batchId: target.batch.id,
+        expectedVersion: target.batch.version,
+      },
+    );
+    return ArchiveTranscriptionBatchResponseSchema.parse(
+      await request(
+        `/api/projects/${projectId}/transcription-batches/${target.batch.id}/archive`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            idempotencyKey,
+            expectedVersion: target.batch.version,
+          }),
+        },
+      ),
+    );
+  }
+
+  async function archiveSelectedBatch() {
+    if (!projectId || !selectedBatch) return;
+    setBusy(true);
+    try {
+      await requestBatchArchive(selectedBatch);
+      setSelectedBatch(undefined);
+      setSelectedBatchId("");
+      setMessage(
+        "Batch removed from the list. Its audit history is preserved.",
+      );
+      await refreshProject(projectId, "");
     } catch (error) {
       setMessage(errorMessage(error));
       await refreshProject(projectId);
@@ -2438,221 +2497,228 @@ export function BatchWorkspace({
             />
           </div>
 
-          <div className="batch-grid" hidden={destination !== "videos"}>
-            <article className="queue-card batch-create-card">
-              <h3>Create a transcription batch</h3>
-              <label>
-                Batch name
-                <input
-                  ref={batchNameRef}
-                  value={batchName}
-                  onChange={(event) => setBatchName(event.target.value)}
-                />
-              </label>
-              <label>
-                YouTube URLs or video IDs, one per line
-                <textarea
-                  ref={bulkInputsRef}
-                  value={inputsText}
-                  onChange={(event) => {
-                    setInputsText(event.target.value);
-                    setPreflight(undefined);
-                  }}
-                  rows={6}
-                />
-              </label>
-              <div className="csv-import-panel">
-                <label htmlFor="batch-csv">Import CSV</label>
-                <input
-                  ref={csvInputRef}
-                  id="batch-csv"
-                  type="file"
-                  accept=".csv,text/csv"
-                  onChange={(event) =>
-                    void loadCsv(event.currentTarget.files?.[0])
-                  }
-                />
-                {csvDocument ? (
-                  <div className="csv-column-row">
-                    <label htmlFor="csv-url-column">YouTube URL column</label>
-                    <select
-                      id="csv-url-column"
-                      value={csvColumnIndex}
-                      onChange={(event) =>
-                        setCsvColumnIndex(event.target.value)
-                      }
-                    >
-                      <option value="">Choose a column</option>
-                      {csvDocument.columns.map((column, index) => (
-                        <option key={`${column}-${index}`} value={index}>
-                          {column}
-                        </option>
-                      ))}
-                    </select>
-                    <button
-                      type="button"
-                      disabled={csvColumnIndex === ""}
-                      onClick={applyCsv}
-                    >
-                      Use CSV values
-                    </button>
-                  </div>
-                ) : null}
-              </div>
-              <div className="option-grid">
+          {destination === "videos" ? (
+            <div className="batch-grid">
+              <article className="queue-card batch-create-card">
+                <h3>Create a transcription batch</h3>
                 <label>
-                  Source policy
-                  <select
-                    value={sourcePolicy}
-                    onChange={(event) => {
-                      setSourcePolicy(event.target.value);
-                      setPreflight(undefined);
-                    }}
-                  >
-                    <option value="prefer-existing">Prefer existing</option>
-                    <option value="captions-then-generate">
-                      Captions, then generate
-                    </option>
-                    <option value="force-generate">Force generation</option>
-                  </select>
+                  Batch name
+                  <input
+                    ref={batchNameRef}
+                    value={batchName}
+                    onChange={(event) => setBatchName(event.target.value)}
+                  />
                 </label>
                 <label>
-                  Worker
-                  <select
-                    value={executionLocation}
+                  YouTube URLs or video IDs, one per line
+                  <textarea
+                    ref={bulkInputsRef}
+                    value={inputsText}
                     onChange={(event) => {
-                      setExecutionLocation(event.target.value);
+                      setInputsText(event.target.value);
                       setPreflight(undefined);
                     }}
-                  >
-                    <option value="local">Local</option>
-                    <option value="hosted">Hosted</option>
-                  </select>
+                    rows={6}
+                  />
                 </label>
-                <label>
-                  Priority
-                  <select
-                    value={priority}
-                    onChange={(event) => {
-                      setPriority(event.target.value);
-                      setPreflight(undefined);
-                    }}
-                  >
-                    <option value="low">Low</option>
-                    <option value="normal">Normal</option>
-                    <option value="high">High</option>
-                  </select>
-                </label>
-              </div>
-              <label className="cloud-translation-consent">
-                <input
-                  type="checkbox"
-                  checked={translationConsentAccepted}
-                  onChange={(event) => {
-                    setTranslationConsentAccepted(event.target.checked);
-                    setPreflight(undefined);
-                  }}
-                />
-                <span>
-                  Allow Amazon Translate when a source is not English. The
-                  version-pinned transcript text will be sent to Amazon only for
-                  this batch; no media or local AWS credentials are sent.
-                </span>
-              </label>
-              <div className="action-row">
-                <button
-                  type="button"
-                  disabled={busy || inputs.length === 0}
-                  onClick={runPreflight}
-                >
-                  Preflight {inputs.length || ""}
-                </button>
-                <button
-                  type="button"
-                  className="primary-action"
-                  disabled={busy || !preflight || !batchName.trim()}
-                  onClick={createBatch}
-                >
-                  Create batch
-                </button>
-              </div>
-              {preflight ? <PreflightTable preflight={preflight} /> : null}
-            </article>
-
-            <article className="queue-card">
-              <h3>Batches</h3>
-              {batchList?.batches.length ? (
-                <>
-                  <div className="batch-list">
-                    {batchList.batches
-                      .filter(
-                        (entry) =>
-                          showBatchHistory ||
-                          entry.progress.total === 0 ||
-                          entry.progress.canceled < entry.progress.total,
-                      )
-                      .map((entry) => (
-                        <button
-                          type="button"
-                          className={
-                            selectedBatch?.batch.id === entry.batch.id
-                              ? "batch-list-item selected"
-                              : "batch-list-item"
-                          }
-                          key={entry.batch.id}
-                          onClick={() =>
-                            void loadBatch(projectId, entry.batch.id)
-                          }
-                        >
-                          <strong>{entry.batch.name}</strong>
-                          <span>
-                            {entry.batch.dispatchStatus} ·{" "}
-                            {entry.progress.readyForReview} ready ·{" "}
-                            {entry.progress.active} active ·{" "}
-                            {entry.progress.queued} queued
-                          </span>
-                        </button>
-                      ))}
-                  </div>
-                  {batchList.batches.some(
-                    (entry) =>
-                      entry.progress.total > 0 &&
-                      entry.progress.canceled === entry.progress.total,
-                  ) ? (
-                    <button
-                      type="button"
-                      className="history-toggle"
-                      onClick={() => setShowBatchHistory((current) => !current)}
-                    >
-                      {showBatchHistory ? "Hide history" : "Show batch history"}
-                    </button>
+                <div className="csv-import-panel">
+                  <label htmlFor="batch-csv">Import CSV</label>
+                  <input
+                    ref={csvInputRef}
+                    id="batch-csv"
+                    type="file"
+                    accept=".csv,text/csv"
+                    onChange={(event) =>
+                      void loadCsv(event.currentTarget.files?.[0])
+                    }
+                  />
+                  {csvDocument ? (
+                    <div className="csv-column-row">
+                      <label htmlFor="csv-url-column">YouTube URL column</label>
+                      <select
+                        id="csv-url-column"
+                        value={csvColumnIndex}
+                        onChange={(event) =>
+                          setCsvColumnIndex(event.target.value)
+                        }
+                      >
+                        <option value="">Choose a column</option>
+                        {csvDocument.columns.map((column, index) => (
+                          <option key={`${column}-${index}`} value={index}>
+                            {column}
+                          </option>
+                        ))}
+                      </select>
+                      <button
+                        type="button"
+                        disabled={csvColumnIndex === ""}
+                        onClick={applyCsv}
+                      >
+                        Use CSV values
+                      </button>
+                    </div>
                   ) : null}
-                </>
-              ) : (
-                <p className="muted">No transcription batches yet.</p>
-              )}
-              {selectedBatch ? (
-                <BatchDetail
-                  batch={selectedBatch}
-                  busy={busy}
-                  onControl={controlBatch}
-                  onCancelItem={cancelBatchItem}
-                  showCanceledItems={showCanceledItems}
-                  onShowCanceledItemsChange={setShowCanceledItems}
-                  onHostedApproval={updateHostedApproval}
-                  projectId={projectId}
-                  languageDecisionDrafts={languageDecisionDrafts}
-                  onLanguageDraftChange={setLanguageDecisionDraft}
-                  onConfirmLanguage={confirmLanguage}
-                  timedImportDrafts={timedImportDrafts}
-                  onTimedImportFile={setTimedImportFile}
-                  onCreateTimedImport={createTimedImport}
-                  onReviewPage={loadTimedCandidateReviewPage}
-                  onActivateCandidate={activateTimedCandidate}
-                />
-              ) : null}
-            </article>
-          </div>
+                </div>
+                <div className="option-grid">
+                  <label>
+                    Source policy
+                    <select
+                      value={sourcePolicy}
+                      onChange={(event) => {
+                        setSourcePolicy(event.target.value);
+                        setPreflight(undefined);
+                      }}
+                    >
+                      <option value="prefer-existing">Prefer existing</option>
+                      <option value="captions-then-generate">
+                        Captions, then generate
+                      </option>
+                      <option value="force-generate">Force generation</option>
+                    </select>
+                  </label>
+                  <label>
+                    Worker
+                    <select
+                      value={executionLocation}
+                      onChange={(event) => {
+                        setExecutionLocation(event.target.value);
+                        setPreflight(undefined);
+                      }}
+                    >
+                      <option value="local">Local</option>
+                      <option value="hosted">Hosted</option>
+                    </select>
+                  </label>
+                  <label>
+                    Priority
+                    <select
+                      value={priority}
+                      onChange={(event) => {
+                        setPriority(event.target.value);
+                        setPreflight(undefined);
+                      }}
+                    >
+                      <option value="low">Low</option>
+                      <option value="normal">Normal</option>
+                      <option value="high">High</option>
+                    </select>
+                  </label>
+                </div>
+                <label className="cloud-translation-consent">
+                  <input
+                    type="checkbox"
+                    checked={translationConsentAccepted}
+                    onChange={(event) => {
+                      setTranslationConsentAccepted(event.target.checked);
+                      setPreflight(undefined);
+                    }}
+                  />
+                  <span>
+                    Allow Amazon Translate when a source is not English. The
+                    version-pinned transcript text will be sent to Amazon only
+                    for this batch; no media or local AWS credentials are sent.
+                  </span>
+                </label>
+                <div className="action-row">
+                  <button
+                    type="button"
+                    disabled={busy || inputs.length === 0}
+                    onClick={runPreflight}
+                  >
+                    Preflight {inputs.length || ""}
+                  </button>
+                  <button
+                    type="button"
+                    className="primary-action"
+                    disabled={busy || !preflight || !batchName.trim()}
+                    onClick={createBatch}
+                  >
+                    Create batch
+                  </button>
+                </div>
+                {preflight ? <PreflightTable preflight={preflight} /> : null}
+              </article>
+
+              <article className="queue-card">
+                <h3>Batches</h3>
+                {batchList?.batches.length ? (
+                  <>
+                    <div className="batch-list">
+                      {batchList.batches
+                        .filter(
+                          (entry) =>
+                            showBatchHistory ||
+                            entry.progress.total === 0 ||
+                            entry.progress.canceled < entry.progress.total,
+                        )
+                        .map((entry) => (
+                          <button
+                            type="button"
+                            className={
+                              selectedBatch?.batch.id === entry.batch.id
+                                ? "batch-list-item selected"
+                                : "batch-list-item"
+                            }
+                            key={entry.batch.id}
+                            onClick={() =>
+                              void loadBatch(projectId, entry.batch.id)
+                            }
+                          >
+                            <strong>{entry.batch.name}</strong>
+                            <span>
+                              {entry.batch.dispatchStatus} ·{" "}
+                              {entry.progress.readyForReview} ready ·{" "}
+                              {entry.progress.active} active ·{" "}
+                              {entry.progress.queued} queued
+                            </span>
+                          </button>
+                        ))}
+                    </div>
+                    {batchList.batches.some(
+                      (entry) =>
+                        entry.progress.total > 0 &&
+                        entry.progress.canceled === entry.progress.total,
+                    ) ? (
+                      <button
+                        type="button"
+                        className="history-toggle"
+                        onClick={() =>
+                          setShowBatchHistory((current) => !current)
+                        }
+                      >
+                        {showBatchHistory
+                          ? "Hide history"
+                          : "Show batch history"}
+                      </button>
+                    ) : null}
+                  </>
+                ) : (
+                  <p className="muted">No transcription batches yet.</p>
+                )}
+                {selectedBatch ? (
+                  <BatchDetail
+                    batch={selectedBatch}
+                    busy={busy}
+                    onControl={controlBatch}
+                    onArchive={archiveSelectedBatch}
+                    onCancelItem={cancelBatchItem}
+                    showCanceledItems={showCanceledItems}
+                    onShowCanceledItemsChange={setShowCanceledItems}
+                    onHostedApproval={updateHostedApproval}
+                    projectId={projectId}
+                    languageDecisionDrafts={languageDecisionDrafts}
+                    onLanguageDraftChange={setLanguageDecisionDraft}
+                    onConfirmLanguage={confirmLanguage}
+                    timedImportDrafts={timedImportDrafts}
+                    onTimedImportFile={setTimedImportFile}
+                    onCreateTimedImport={createTimedImport}
+                    onReviewPage={loadTimedCandidateReviewPage}
+                    onActivateCandidate={activateTimedCandidate}
+                  />
+                ) : null}
+              </article>
+            </div>
+          ) : null}
 
           <details
             className="queue-card review-card"
@@ -4145,6 +4211,7 @@ function BatchDetail({
   batch,
   busy,
   onControl,
+  onArchive,
   onCancelItem,
   showCanceledItems,
   onShowCanceledItemsChange,
@@ -4162,6 +4229,7 @@ function BatchDetail({
   batch: CreateTranscriptionBatchResponse;
   busy: boolean;
   onControl(action: TranscriptionBatchControlRequest["action"]): void;
+  onArchive(): void;
   onCancelItem(item: TranscriptionBatchItem): void;
   showCanceledItems: boolean;
   onShowCanceledItemsChange(value: boolean): void;
@@ -4290,6 +4358,16 @@ function BatchDetail({
             onClick={() => onControl("cancel_all")}
           >
             Cancel batch
+          </button>
+        ) : null}
+        {batch.items.every((item) => item.state === "canceled") ? (
+          <button
+            type="button"
+            className="danger-action"
+            disabled={busy}
+            onClick={onArchive}
+          >
+            Remove from list
           </button>
         ) : null}
         {hiddenHistoryCount ? (

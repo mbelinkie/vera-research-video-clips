@@ -4285,6 +4285,19 @@ describe("cloud API", () => {
       batch: { dispatchStatus: "active", version: 1 },
       progress: { total: 3, queued: 3, active: 0 },
     });
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: `/api/projects/${projectId}/transcription-batches/${createdBody.batch.id}/archive`,
+          headers: { authorization },
+          payload: {
+            idempotencyKey: "cannot-archive-live-batch",
+            expectedVersion: 1,
+          },
+        })
+      ).statusCode,
+    ).toBe(409);
 
     const paused = await app.inject({
       method: "POST",
@@ -4502,6 +4515,156 @@ describe("cloud API", () => {
         })
       ).statusCode,
     ).toBe(204);
+
+    const archiveUrl = `/api/projects/${projectId}/transcription-batches/${createdBody.batch.id}/archive`;
+    const archiveCommand = {
+      idempotencyKey: "archive-controlled-batch",
+      expectedVersion: 6,
+    };
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: archiveUrl,
+          headers: { authorization: outsiderAuthorization },
+          payload: archiveCommand,
+        })
+      ).statusCode,
+    ).toBe(403);
+    const archived = await app.inject({
+      method: "POST",
+      url: archiveUrl,
+      headers: { authorization },
+      payload: archiveCommand,
+    });
+    expect(archived.statusCode).toBe(200);
+    expect(archived.json()).toMatchObject({
+      projectId,
+      outcome: "archived",
+      batch: {
+        id: createdBody.batch.id,
+        dispatchStatus: "canceled",
+        archivedBy: ownerId,
+        version: 7,
+      },
+    });
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: archiveUrl,
+          headers: { authorization },
+          payload: archiveCommand,
+        })
+      ).json(),
+    ).toEqual(archived.json());
+    expect(
+      (
+        await app.inject({
+          method: "GET",
+          url: `/api/projects/${projectId}/transcription-batches`,
+          headers: { authorization },
+        })
+      )
+        .json<{ batches: { batch: { id: string } }[] }>()
+        .batches.some((entry) => entry.batch.id === createdBody.batch.id),
+    ).toBe(false);
+    expect(
+      (
+        await app.inject({
+          method: "GET",
+          url: `/api/projects/${projectId}/transcription-batches/${createdBody.batch.id}`,
+          headers: { authorization },
+        })
+      ).json(),
+    ).toMatchObject({
+      batch: { id: createdBody.batch.id, archivedBy: ownerId, version: 7 },
+      progress: { canceled: 3 },
+    });
+
+    const exactCreated = await app.inject({
+      method: "POST",
+      url: `/api/projects/${projectId}/transcription-batches`,
+      headers: { authorization },
+      payload: { name: "Exact retry batch", inputs: ["ExactRetry1"] },
+    });
+    const exactCreatedBody = exactCreated.json<{
+      batch: { id: string };
+      items: { id: string; version: number }[];
+    }>();
+    const exactClaim = await app.inject({
+      method: "POST",
+      url: "/api/transcription-jobs/claim",
+      headers: { authorization },
+      payload: { executionLocation: "local", leaseSeconds: 30 },
+    });
+    const exactClaimBody = exactClaim.json<{
+      job: { id: string };
+      lease: { attempt: number };
+    }>();
+    expect(exactClaim.statusCode).toBe(200);
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: `/api/transcription-jobs/${exactClaimBody.job.id}/fail`,
+          headers: { authorization },
+          payload: {
+            attempt: exactClaimBody.lease.attempt,
+            code: "temporary_caption_failure",
+            message: "Caption provider was temporarily unavailable.",
+            retryable: true,
+          },
+        })
+      ).statusCode,
+    ).toBe(204);
+    const exactDetail = await app.inject({
+      method: "GET",
+      url: `/api/projects/${projectId}/transcription-batches/${exactCreatedBody.batch.id}`,
+      headers: { authorization },
+    });
+    const failedExactItem = exactDetail.json<{
+      items: { id: string; state: string; version: number }[];
+    }>().items[0]!;
+    expect(failedExactItem.state).toBe("failed");
+    const exactRetryUrl = `/api/projects/${projectId}/transcription-batches/${exactCreatedBody.batch.id}/items/${failedExactItem.id}/retry`;
+    const exactRetryCommand = {
+      idempotencyKey: "retry-exact-caption-item",
+      expectedVersion: failedExactItem.version,
+    };
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: exactRetryUrl,
+          headers: { authorization: outsiderAuthorization },
+          payload: exactRetryCommand,
+        })
+      ).statusCode,
+    ).toBe(403);
+    const exactRetried = await app.inject({
+      method: "POST",
+      url: exactRetryUrl,
+      headers: { authorization },
+      payload: exactRetryCommand,
+    });
+    expect(exactRetried.statusCode).toBe(200);
+    expect(exactRetried.json()).toMatchObject({
+      projectId,
+      batchId: exactCreatedBody.batch.id,
+      outcome: "queued",
+      item: { id: failedExactItem.id, state: "queued" },
+    });
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: exactRetryUrl,
+          headers: { authorization },
+          payload: exactRetryCommand,
+        })
+      ).json(),
+    ).toEqual(exactRetried.json());
   });
 });
 

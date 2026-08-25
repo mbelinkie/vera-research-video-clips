@@ -1098,7 +1098,7 @@ describe("local agent", () => {
       error: {
         code: "not_found",
         message:
-          "No active transcript exists yet. Local processing is queued. Open Project Videos to check progress or resolve required language confirmation.",
+          "No active transcript exists yet. Retry this video or open Project Videos to inspect progress and resolve required language confirmation.",
       },
       operationFailure: {
         operation: "transcript",

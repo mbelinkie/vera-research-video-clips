@@ -22,6 +22,10 @@ import {
   CancelLoggedExportResponseSchema,
   CancelTranscriptionBatchItemRequestSchema,
   CancelTranscriptionBatchItemResponseSchema,
+  RetryTranscriptionBatchItemRequestSchema,
+  RetryTranscriptionBatchItemResponseSchema,
+  ArchiveTranscriptionBatchRequestSchema,
+  ArchiveTranscriptionBatchResponseSchema,
   BatchPreflightSummarySchema,
   ClaimedTranscriptionJobSchema,
   ClipCandidateSchema,
@@ -201,6 +205,10 @@ import {
   type CancelLoggedExportResponse,
   type CancelTranscriptionBatchItemRequest,
   type CancelTranscriptionBatchItemResponse,
+  type RetryTranscriptionBatchItemRequest,
+  type RetryTranscriptionBatchItemResponse,
+  type ArchiveTranscriptionBatchRequest,
+  type ArchiveTranscriptionBatchResponse,
   type AuthenticatedActor,
   type BatchOptions,
   type BatchPreflightItem,
@@ -10330,6 +10338,12 @@ export class SharedProjectCatalog {
             }),
         dispatchStatus: batch.dispatch_status,
         createdBy: batch.created_by,
+        ...(batch.archived_at === null
+          ? {}
+          : {
+              archivedBy: batch.archived_by,
+              archivedAt: iso(batch.archived_at),
+            }),
         version: batch.version,
         createdAt: iso(batch.created_at),
         updatedAt: iso(batch.updated_at),
@@ -10349,6 +10363,7 @@ export class SharedProjectCatalog {
       `SELECT id
        FROM transcription_batches
        WHERE project_id = $1 AND processing_origin = 'manual'
+         AND archived_at IS NULL
        ORDER BY updated_at DESC, id DESC
        LIMIT 200`,
       [projectId],
@@ -10650,6 +10665,242 @@ export class SharedProjectCatalog {
           requestSha256,
           JSON.stringify(response),
           canceledAt,
+        ],
+      );
+      return response;
+    });
+  }
+
+  async retryTranscriptionBatchItem(
+    actor: AuthenticatedActor,
+    projectId: string,
+    batchId: string,
+    itemId: string,
+    input: RetryTranscriptionBatchItemRequest,
+  ): Promise<RetryTranscriptionBatchItemResponse> {
+    await this.authorize(actor, projectId, "write");
+    const command = RetryTranscriptionBatchItemRequestSchema.parse(input);
+    const requestSha256 = createHash("sha256")
+      .update(canonicalJson(command))
+      .digest("hex");
+    const queuedAt = this.now().toISOString();
+
+    return this.transaction(async () => {
+      const replay = await this.database.query<DbRow>(
+        `SELECT request_sha256, response_json
+         FROM transcription_batch_item_retry_commands
+         WHERE project_id = $1 AND actor_id = $2 AND idempotency_key = $3`,
+        [projectId, actor.userId, command.idempotencyKey],
+      );
+      if (replay.rows[0]) {
+        if (String(replay.rows[0].request_sha256) !== requestSha256) {
+          throw new CatalogIdempotencyConflictError(
+            "This batch-item retry key was already used for another request.",
+          );
+        }
+        return RetryTranscriptionBatchItemResponseSchema.parse(
+          jsonRecord(replay.rows[0].response_json),
+        );
+      }
+
+      const selected = await this.database.query<DbRow>(
+        `SELECT bi.*, b.archived_at
+         FROM transcription_batch_items bi
+         JOIN transcription_batches b ON b.id = bi.batch_id
+         WHERE bi.id = $1 AND bi.batch_id = $2 AND b.project_id = $3
+         FOR UPDATE OF bi, b`,
+        [itemId, batchId, projectId],
+      );
+      let item = selected.rows[0];
+      if (!item)
+        throw new CatalogNotFoundError("Transcription batch item not found.");
+      if (item.archived_at !== null) {
+        throw new CatalogConflictError(
+          "Archived transcription batches cannot be retried.",
+        );
+      }
+
+      let outcome: "queued" | "already_queued";
+      if (String(item.state) === "queued") {
+        outcome = "already_queued";
+      } else {
+        if (Number(item.version) !== command.expectedVersion) {
+          throw new CatalogConflictError(
+            "The transcription batch item changed; reload it before retrying.",
+          );
+        }
+        if (
+          String(item.state) !== "failed" ||
+          item.error_retryable !== true ||
+          !item.job_id
+        ) {
+          throw new CatalogConflictError(
+            "Only retryable failed transcription items can be retried.",
+          );
+        }
+        const job = await this.database.query<DbRow>(
+          "SELECT state FROM jobs WHERE id = $1 FOR UPDATE",
+          [item.job_id],
+        );
+        if (String(job.rows[0]?.state) !== "failed") {
+          throw new CatalogConflictError(
+            "The transcription job is no longer failed; reload it before retrying.",
+          );
+        }
+        await this.database.query(
+          `UPDATE transcription_job_cancel_requests
+           SET revoked_at = $1
+           WHERE job_id = $2 AND revoked_at IS NULL AND completed_at IS NULL`,
+          [queuedAt, item.job_id],
+        );
+        await this.database.query(
+          `UPDATE jobs
+           SET state = 'queued',
+               payload = payload - 'lastError' - 'queueDispatchedAt' - 'queueDeliveredAt',
+               updated_at = $1
+           WHERE id = $2`,
+          [queuedAt, item.job_id],
+        );
+        item = (
+          await this.database.query<DbRow>(
+            `UPDATE transcription_batch_items
+             SET state = 'queued', error_code = NULL, error_message = NULL,
+                 error_retryable = NULL, version = version + 1, updated_at = $1
+             WHERE id = $2 RETURNING *`,
+            [queuedAt, itemId],
+          )
+        ).rows[0]!;
+        await this.database.query(
+          `UPDATE transcription_batches
+           SET dispatch_status = 'active', version = version + 1, updated_at = $1
+           WHERE id = $2`,
+          [queuedAt, batchId],
+        );
+        outcome = "queued";
+      }
+
+      const response = RetryTranscriptionBatchItemResponseSchema.parse({
+        projectId,
+        batchId,
+        item: mapBatchItem(item),
+        outcome,
+      });
+      await this.database.query(
+        `INSERT INTO transcription_batch_item_retry_commands
+           (id, project_id, batch_id, item_id, actor_id, idempotency_key,
+            request_sha256, response_json, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+        [
+          randomUUID(),
+          projectId,
+          batchId,
+          itemId,
+          actor.userId,
+          command.idempotencyKey,
+          requestSha256,
+          JSON.stringify(response),
+          queuedAt,
+        ],
+      );
+      return response;
+    });
+  }
+
+  async archiveTranscriptionBatch(
+    actor: AuthenticatedActor,
+    projectId: string,
+    batchId: string,
+    input: ArchiveTranscriptionBatchRequest,
+  ): Promise<ArchiveTranscriptionBatchResponse> {
+    await this.authorize(actor, projectId, "write");
+    const command = ArchiveTranscriptionBatchRequestSchema.parse(input);
+    const requestSha256 = createHash("sha256")
+      .update(canonicalJson(command))
+      .digest("hex");
+    const archivedAt = this.now().toISOString();
+
+    return this.transaction(async () => {
+      const replay = await this.database.query<DbRow>(
+        `SELECT request_sha256, response_json
+         FROM transcription_batch_archive_commands
+         WHERE project_id = $1 AND actor_id = $2 AND idempotency_key = $3`,
+        [projectId, actor.userId, command.idempotencyKey],
+      );
+      if (replay.rows[0]) {
+        if (String(replay.rows[0].request_sha256) !== requestSha256) {
+          throw new CatalogIdempotencyConflictError(
+            "This batch archive key was already used for another request.",
+          );
+        }
+        return ArchiveTranscriptionBatchResponseSchema.parse(
+          jsonRecord(replay.rows[0].response_json),
+        );
+      }
+
+      const selected = await this.database.query<DbRow>(
+        `SELECT * FROM transcription_batches
+         WHERE id = $1 AND project_id = $2 FOR UPDATE`,
+        [batchId, projectId],
+      );
+      const batch = selected.rows[0];
+      if (!batch)
+        throw new CatalogNotFoundError("Transcription batch not found.");
+
+      let outcome: "archived" | "already_archived";
+      if (batch.archived_at !== null) {
+        outcome = "already_archived";
+      } else {
+        if (Number(batch.version) !== command.expectedVersion) {
+          throw new CatalogConflictError(
+            "The transcription batch changed; reload it before removing it.",
+          );
+        }
+        const remaining = await this.database.query<DbRow>(
+          `SELECT count(*)::integer AS count
+           FROM transcription_batch_items
+           WHERE batch_id = $1 AND state <> 'canceled'`,
+          [batchId],
+        );
+        if (Number(remaining.rows[0]?.count ?? 0) > 0) {
+          throw new CatalogConflictError(
+            "Cancel every batch item before removing this batch from the list.",
+          );
+        }
+        await this.database.query(
+          `UPDATE transcription_batches
+           SET dispatch_status = 'canceled', archived_by = $1,
+               archived_at = $2, updated_at = $2,
+               version = version + 1
+           WHERE id = $3`,
+          [actor.userId, archivedAt, batchId],
+        );
+        outcome = "archived";
+      }
+
+      const detail = await this.getTranscriptionBatch(
+        actor,
+        projectId,
+        batchId,
+      );
+      const response = ArchiveTranscriptionBatchResponseSchema.parse({
+        projectId,
+        batch: detail.batch,
+        outcome,
+      });
+      await this.database.query(
+        `INSERT INTO transcription_batch_archive_commands
+           (id, project_id, batch_id, actor_id, idempotency_key,
+            request_sha256, response_json, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+        [
+          randomUUID(),
+          projectId,
+          batchId,
+          actor.userId,
+          command.idempotencyKey,
+          requestSha256,
+          JSON.stringify(response),
+          archivedAt,
         ],
       );
       return response;

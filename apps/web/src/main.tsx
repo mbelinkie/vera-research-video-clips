@@ -5,6 +5,7 @@ import {
   ApiErrorSchema,
   ClipCandidateSchema,
   ClipSelectionSchema,
+  CreateTranscriptionBatchResponseSchema,
   CreateClipCandidateRequestSchema,
   ExportPresetSnapshotSchema,
   ExportSettingsPreviewSchema,
@@ -13,9 +14,11 @@ import {
   ExportRequestSchema,
   ProjectSchema,
   ProjectSummarySchema,
+  RetryTranscriptionBatchItemResponseSchema,
   ExportSourceRightsSnapshotSchema,
   PlayerTimeRangeSelectionSchema,
   TranscriptSelectionSchema,
+  TranscriptionBatchListResponseSchema,
   TranscriptWorkspaceResponseSchema,
   UserSchema,
   VideoSchema,
@@ -58,6 +61,7 @@ import {
   DESKTOP_CONNECTED_SENTINEL,
 } from "./api-client.ts";
 import { BatchWorkspace } from "./batch-workspace.tsx";
+import { findRetryableTranscriptionItem } from "./transcription-action-batch.ts";
 import { DesktopSetup, type DesktopProfileState } from "./desktop-setup.tsx";
 import { NotificationPreferencesPanel } from "./notification-preferences.tsx";
 import { resolveNotificationNavigation } from "./notification-navigation.ts";
@@ -332,6 +336,10 @@ function App() {
     useState<WorkspaceLoadState>("idle");
   const [workspaceMessage, setWorkspaceMessage] = useState<string>();
   const [workspaceReload, setWorkspaceReload] = useState(0);
+  const [workspaceRetry, setWorkspaceRetry] = useState<{
+    batchId: string;
+    itemId: string;
+  }>();
   const workspaceGeneration = useRef(0);
   const handledKeywordEvidence = useRef<string | undefined>(undefined);
   const recentProjectValidation = useRef<string | undefined>(undefined);
@@ -1263,6 +1271,7 @@ function App() {
         )
           return;
         setWorkspace(resolved);
+        setWorkspaceRetry(undefined);
         setTranscriptView(
           resolved.preferred.state === "ready" ? "preferred" : "english",
         );
@@ -1301,6 +1310,184 @@ function App() {
     workspaceReload,
     workspaceTarget,
   ]);
+
+  async function retryWorkspaceTranscript() {
+    const target = workspaceTarget;
+    if (!authorization || !target || target.projectId !== projectId) return;
+    setWorkspaceLoadState("loading");
+    setWorkspaceMessage("Looking for this video's failed transcript job…");
+    try {
+      const listedResponse = await apiFetch(
+        "cloud",
+        `/api/projects/${target.projectId}/transcription-batches`,
+        {},
+        authorization,
+      );
+      const listedPayload = await listedResponse.json().catch(() => undefined);
+      if (!listedResponse.ok) {
+        const parsed = ApiErrorSchema.safeParse(listedPayload);
+        throw new Error(
+          parsed.success
+            ? parsed.data.error.message
+            : "Unable to inspect failed transcription work.",
+        );
+      }
+      const retryableSummaries = TranscriptionBatchListResponseSchema.parse(
+        listedPayload,
+      ).batches.filter((entry) => entry.progress.retryableFailed > 0);
+      let retryable:
+        ReturnType<typeof findRetryableTranscriptionItem> | undefined;
+      for (const summary of retryableSummaries) {
+        const detailResponse = await apiFetch(
+          "cloud",
+          `/api/projects/${target.projectId}/transcription-batches/${summary.batch.id}`,
+          {},
+          authorization,
+        );
+        const detailPayload = await detailResponse
+          .json()
+          .catch(() => undefined);
+        if (!detailResponse.ok) {
+          const parsed = ApiErrorSchema.safeParse(detailPayload);
+          throw new Error(
+            parsed.success
+              ? parsed.data.error.message
+              : "Unable to inspect a failed transcription batch.",
+          );
+        }
+        const detail =
+          CreateTranscriptionBatchResponseSchema.parse(detailPayload);
+        retryable = findRetryableTranscriptionItem(
+          [detail],
+          target.catalogVideoId,
+          target.youtubeVideoId,
+        );
+        if (retryable) break;
+      }
+      if (!retryable) {
+        setWorkspaceReload((value) => value + 1);
+        throw new Error(
+          "No retryable failed job exists for this exact video. Open Project Videos to inspect its current processing state.",
+        );
+      }
+      const retryResponse = await apiFetch(
+        "cloud",
+        `/api/projects/${target.projectId}/transcription-batches/${retryable.batchId}/items/${retryable.itemId}/retry`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            idempotencyKey: `workspace-transcript-retry:${target.projectId}:${retryable.itemId}:v${retryable.itemVersion}`,
+            expectedVersion: retryable.itemVersion,
+          }),
+        },
+        authorization,
+      );
+      const retryPayload = await retryResponse.json().catch(() => undefined);
+      if (!retryResponse.ok) {
+        const parsed = ApiErrorSchema.safeParse(retryPayload);
+        throw new Error(
+          parsed.success
+            ? parsed.data.error.message
+            : "Unable to retry this video's transcription job.",
+        );
+      }
+      RetryTranscriptionBatchItemResponseSchema.parse(retryPayload);
+      setWorkspaceRetry({
+        batchId: retryable.batchId,
+        itemId: retryable.itemId,
+      });
+      setWorkspaceLoadState("unavailable");
+      setWorkspaceMessage(
+        "Retry queued. Checking the YouTube transcript before Whisper…",
+      );
+    } catch (caught: unknown) {
+      setWorkspaceRetry(undefined);
+      setWorkspaceLoadState("failed");
+      setWorkspaceMessage(
+        caught instanceof Error
+          ? caught.message
+          : "Unable to retry this video's transcript.",
+      );
+    }
+  }
+
+  useEffect(() => {
+    const pending = workspaceRetry;
+    const target = workspaceTarget;
+    if (!pending || !authorization || !target) return;
+    const pendingRetry = pending;
+    const retryTarget = target;
+    let stopped = false;
+    let polling = false;
+    async function poll() {
+      if (polling || stopped) return;
+      polling = true;
+      try {
+        const response = await apiFetch(
+          "cloud",
+          `/api/projects/${retryTarget.projectId}/transcription-batches/${pendingRetry.batchId}`,
+          {},
+          authorization,
+        );
+        const payload = await response.json().catch(() => undefined);
+        if (!response.ok)
+          throw new Error("Unable to refresh transcript retry.");
+        const detail = CreateTranscriptionBatchResponseSchema.parse(payload);
+        const item = detail.items.find(
+          (candidate) => candidate.id === pendingRetry.itemId,
+        );
+        if (!item)
+          throw new Error("The retried transcription item is missing.");
+        if (item.state === "ready_for_review") {
+          setWorkspaceMessage("Transcript published. Loading it now…");
+          setWorkspaceReload((value) => value + 1);
+        } else if (item.state === "failed") {
+          setWorkspaceRetry(undefined);
+          setWorkspaceLoadState("failed");
+          setWorkspaceMessage(
+            item.error?.message ?? "The transcript retry failed.",
+          );
+        } else if (
+          ["blocked", "needs_language_confirmation", "canceled"].includes(
+            item.state,
+          )
+        ) {
+          setWorkspaceRetry(undefined);
+          setWorkspaceLoadState("unavailable");
+          setWorkspaceMessage(
+            item.state === "needs_language_confirmation"
+              ? "Confirm the spoken language in Project Videos to continue."
+              : item.state === "blocked"
+                ? "Transcript processing needs attention in Project Videos."
+                : "The transcript retry was canceled.",
+          );
+        } else {
+          setWorkspaceLoadState("unavailable");
+          setWorkspaceMessage(
+            item.sourcePlan?.strategy === "caption"
+              ? "Downloading and verifying the YouTube transcript…"
+              : "Checking the YouTube transcript before Whisper…",
+          );
+        }
+      } catch (caught: unknown) {
+        if (!stopped) {
+          setWorkspaceMessage(
+            caught instanceof Error
+              ? caught.message
+              : "Unable to refresh transcript retry.",
+          );
+        }
+      } finally {
+        polling = false;
+      }
+    }
+    void poll();
+    const timer = window.setInterval(() => void poll(), 3_000);
+    return () => {
+      stopped = true;
+      window.clearInterval(timer);
+    };
+  }, [authorization, workspaceRetry, workspaceTarget]);
 
   useEffect(() => {
     const intent = workspaceTarget?.keywordEvidence;
@@ -2780,7 +2967,7 @@ function App() {
                 setExportOnlyRequestId(undefined);
                 setSelectionError(undefined);
               }}
-              onRetry={() => setWorkspaceReload((value) => value + 1)}
+              onRetry={() => void retryWorkspaceTranscript()}
             />
           }
           player={

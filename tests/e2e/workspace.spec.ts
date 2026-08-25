@@ -1166,6 +1166,80 @@ test("adds an unknown pasted URL for immediate review and exposes keyboard tabs"
   await mockShellWorkspace(page, 0);
   let resolveCount = 0;
   let resolvedProjectId: string | undefined;
+  const retryBatchId = "019fbb95-cd76-7920-93fa-e23ba755eef0";
+  const retryItemId = "019fbb95-cd76-7920-93fa-e23ba755eef1";
+  let retryItemState: "failed" | "queued" = "failed";
+  let retryItemVersion = 4;
+  let retryCommand: Record<string, unknown> | undefined;
+  const retryBatch = () => ({
+    id: retryBatchId,
+    projectId: shellPersonalProjectId,
+    name: "Immediate transcript retry",
+    targetLanguage: "en",
+    transcriptionProfile: "default",
+    sourcePolicy: "prefer-existing",
+    executionLocation: "local",
+    priority: "normal",
+    dispatchStatus: "active",
+    createdBy: "019fbb95-cd76-7920-93fa-e23ba755ee36",
+    version: 2,
+    createdAt: now,
+    updatedAt: now,
+  });
+  const retryItem = () => ({
+    id: retryItemId,
+    batchId: retryBatchId,
+    inputIndex: 0,
+    input: immediateVideo.canonicalUrl,
+    status: "ready",
+    processingNeed: "transcription",
+    youtubeVideoId: immediateVideo.youtubeVideoId,
+    canonicalUrl: immediateVideo.canonicalUrl,
+    catalogVideoId: immediateVideo.id,
+    title: immediateVideo.title,
+    state: retryItemState,
+    reviewStatus: "unreviewed",
+    attempt: 1,
+    version: retryItemVersion,
+    createdAt: now,
+    updatedAt: now,
+    ...(retryItemState === "failed"
+      ? {
+          error: {
+            code: "worker_execution_failed",
+            message: "Earlier worker failed after caption acquisition.",
+            retryable: true,
+          },
+        }
+      : {}),
+  });
+  const retryProgress = () => ({
+    total: 1,
+    queued: retryItemState === "queued" ? 1 : 0,
+    active: 0,
+    readyForReview: 0,
+    blocked: 0,
+    failed: retryItemState === "failed" ? 1 : 0,
+    retryableFailed: retryItemState === "failed" ? 1 : 0,
+    canceled: 0,
+    unreviewed: 0,
+    reviewing: 0,
+    reviewed: 0,
+    skipped: 0,
+  });
+  const retryDetail = () => ({
+    batch: retryBatch(),
+    items: [retryItem()],
+    summary: {
+      total: 1,
+      ready: 1,
+      existingTranscripts: 0,
+      duplicates: 0,
+      unsupported: 0,
+      metadataFailed: 0,
+    },
+    progress: retryProgress(),
+  });
 
   await page.route("**/cloud-api/api/projects/*/videos", async (route) =>
     route.fulfill({ json: [] }),
@@ -1192,6 +1266,53 @@ test("adds an unknown pasted URL for immediate review and exposes keyboard tabs"
     },
   );
   await page.route(
+    "**/cloud-api/api/projects/*/transcription-batches**",
+    async (route) => {
+      const request = route.request();
+      const path = new URL(request.url()).pathname.replace("/cloud-api", "");
+      if (
+        path ===
+          `/api/projects/${shellPersonalProjectId}/transcription-batches` &&
+        request.method() === "GET"
+      ) {
+        return route.fulfill({
+          json: {
+            batches: [{ batch: retryBatch(), progress: retryProgress() }],
+          },
+        });
+      }
+      if (
+        path ===
+          `/api/projects/${shellPersonalProjectId}/transcription-batches/${retryBatchId}` &&
+        request.method() === "GET"
+      ) {
+        return route.fulfill({ json: retryDetail() });
+      }
+      if (
+        path ===
+          `/api/projects/${shellPersonalProjectId}/transcription-batches/${retryBatchId}/items/${retryItemId}/retry` &&
+        request.method() === "POST"
+      ) {
+        retryCommand = request.postDataJSON();
+        expect(retryCommand).toEqual({
+          idempotencyKey: `workspace-transcript-retry:${shellPersonalProjectId}:${retryItemId}:v4`,
+          expectedVersion: 4,
+        });
+        retryItemState = "queued";
+        retryItemVersion += 1;
+        return route.fulfill({
+          json: {
+            projectId: shellPersonalProjectId,
+            batchId: retryBatchId,
+            item: retryItem(),
+            outcome: "queued",
+          },
+        });
+      }
+      return route.fallback();
+    },
+  );
+  await page.route(
     `**/local-agent/api/projects/*/videos/${immediateVideo.id}/transcript?*`,
     async (route) =>
       route.fulfill({
@@ -1200,7 +1321,7 @@ test("adds an unknown pasted URL for immediate review and exposes keyboard tabs"
           error: {
             code: "not_found",
             message:
-              "No active transcript exists yet. Local processing is queued.",
+              "No active transcript exists yet. Retry this video or open Project Videos to inspect progress.",
             retryable: true,
           },
         },
@@ -1233,9 +1354,14 @@ test("adds an unknown pasted URL for immediate review and exposes keyboard tabs"
   ).toBeVisible();
   await expect(
     page.getByText(
-      "No active transcript exists yet. Local processing is queued.",
+      "No active transcript exists yet. Retry this video or open Project Videos to inspect progress.",
     ),
   ).toBeVisible();
+  await page.getByRole("button", { name: "Retry transcript" }).click();
+  await expect(
+    page.getByText(/Checking the YouTube transcript before Whisper/u),
+  ).toBeVisible();
+  expect(retryCommand).toBeDefined();
   expect(resolveCount).toBe(1);
   expect(resolvedProjectId).toBe(shellPersonalProjectId);
   await expect(
@@ -1932,7 +2058,22 @@ test("separates Add, Review, and Logged workflow destinations", async ({
   await page.getByText("Layout", { exact: true }).click();
   await expect(page.getByLabel("Transcript width")).toHaveValue("54");
   await page.getByRole("button", { name: "Reset layout" }).click();
-  await expect(page.getByLabel("Transcript width")).toHaveValue("42");
+  await expect(page.getByLabel("Transcript width")).toHaveValue("46");
+  const transcriptWidthBeforeResize = await page
+    .locator(".transcript-panel")
+    .evaluate((element) => element.getBoundingClientRect().width);
+  await page
+    .getByRole("separator", { name: "Resize transcript panel" })
+    .press("End");
+  await expect(page.getByLabel("Transcript width")).toHaveValue("70");
+  await expect
+    .poll(() =>
+      page
+        .locator(".transcript-panel")
+        .evaluate((element) => element.getBoundingClientRect().width),
+    )
+    .toBeGreaterThan(transcriptWidthBeforeResize);
+  await page.getByRole("button", { name: "Reset layout" }).click();
 
   await page.getByRole("button", { name: "Add", exact: true }).click();
   await connectShellWorkspace(page);
@@ -1966,6 +2107,13 @@ test("separates Add, Review, and Logged workflow destinations", async ({
   expect(projectVideosGeometry.batchesTop).toBeLessThan(
     projectVideosGeometry.worklistTop,
   );
+
+  await page.getByRole("button", { name: "Logged", exact: true }).click();
+  await expect(page.locator(".batch-grid")).toHaveCount(0);
+  await expect(
+    page.getByRole("heading", { name: "Create a transcription batch" }),
+  ).toHaveCount(0);
+  await expect(page.getByRole("heading", { name: "Batches" })).toHaveCount(0);
 });
 
 test("fails closed for removed recency and gates settings for researchers", async ({
@@ -4173,6 +4321,7 @@ test("connects an explicit project, controls a batch, and updates review state",
   const projectId = "019fbb95-cd76-7920-93fa-e23ba755ee30";
   const batchId = "019fbb95-cd76-7920-93fa-e23ba755ee31";
   let batchVersion = 1;
+  let batchArchived = false;
   let dispatchStatus = "active";
   let hostedApprovalState: "pending" | "approved" | "revoked" = "pending";
   let hostedApprovalVersion = 1;
@@ -4251,6 +4400,12 @@ test("connects an explicit project, controls a batch, and updates review state",
     },
     dispatchStatus,
     createdBy: "019fbb95-cd76-7920-93fa-e23ba755ee36",
+    ...(batchArchived
+      ? {
+          archivedBy: "019fbb95-cd76-7920-93fa-e23ba755ee36",
+          archivedAt: now,
+        }
+      : {}),
     version: batchVersion,
     createdAt: now,
     updatedAt: now,
@@ -4560,7 +4715,9 @@ test("connects an explicit project, controls a batch, and updates review state",
     }
     if (path === `/api/projects/${projectId}/transcription-batches`) {
       return route.fulfill({
-        json: { batches: [{ batch: batch(), progress }] },
+        json: {
+          batches: batchArchived ? [] : [{ batch: batch(), progress }],
+        },
       });
     }
     if (path === `/api/projects/${projectId}/review-inbox`) {
@@ -4995,6 +5152,26 @@ test("connects an explicit project, controls a batch, and updates review state",
       dispatchStatus = "paused";
       batchVersion += 1;
       return route.fulfill({ json: batchResponse() });
+    }
+    if (
+      path.endsWith(`/transcription-batches/${batchId}/archive`) &&
+      request.method() === "POST"
+    ) {
+      const body = request.postDataJSON() as Record<string, unknown>;
+      expect(body.expectedVersion).toBe(batchVersion);
+      expect(body.idempotencyKey).toMatch(
+        /^transcription-batch-archive:[a-f0-9]{64}$/,
+      );
+      batchArchived = true;
+      dispatchStatus = "canceled";
+      batchVersion += 1;
+      return route.fulfill({
+        json: {
+          projectId,
+          batch: batch(),
+          outcome: "archived",
+        },
+      });
     }
     if (
       path.endsWith(`/transcription-batches/${batchId}/hosted-approval`) &&
@@ -5447,6 +5624,14 @@ test("connects an explicit project, controls a batch, and updates review state",
     "Fixture review video",
   );
   expect(itemCancelCommand).toBeDefined();
+  await page.getByRole("button", { name: "Show batch history" }).click();
+  await page
+    .locator(".batch-list-item")
+    .filter({ hasText: "Interview research" })
+    .click();
+  await page.getByRole("button", { name: "Remove from list" }).click();
+  await expect(page.getByText("Batch removed from the list.")).toBeVisible();
+  await expect(page.locator(".batch-list-item")).toHaveCount(0);
 });
 
 test("accepts an explicit language when provider and creator evidence are unknown", async ({

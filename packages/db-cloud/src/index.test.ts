@@ -111,14 +111,14 @@ describe("cloud migrations", () => {
 
     const applied = await runCloudMigrations(database);
 
-    expect(applied).toHaveLength(44);
-    expect(calls.filter((call) => call === "pool:connect")).toHaveLength(45);
-    expect(calls.filter((call) => call === "client:BEGIN")).toHaveLength(45);
+    expect(applied).toHaveLength(45);
+    expect(calls.filter((call) => call === "pool:connect")).toHaveLength(46);
+    expect(calls.filter((call) => call === "client:BEGIN")).toHaveLength(46);
     expect(
       calls.filter((call) =>
         call.startsWith("client:SELECT pg_advisory_xact_lock"),
       ),
-    ).toHaveLength(45);
+    ).toHaveLength(46);
     expect(
       calls.some((call) =>
         call.startsWith("pool:INSERT INTO schema_migrations"),
@@ -199,6 +199,7 @@ describe("cloud migrations", () => {
           "0042_project_bookmarks",
           "0043_workflow_notification_events",
           "0044_transcription_item_cancellation",
+          "0045_transcription_batch_archive_retry",
         ]);
         expect(
           (
@@ -296,6 +297,7 @@ describe("cloud migrations", () => {
       "0042_project_bookmarks",
       "0043_workflow_notification_events",
       "0044_transcription_item_cancellation",
+      "0045_transcription_batch_archive_retry",
     ]);
     expect(await runCloudMigrations(database)).toEqual([]);
     expect(

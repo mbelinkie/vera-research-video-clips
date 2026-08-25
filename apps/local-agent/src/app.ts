@@ -2233,7 +2233,7 @@ function localFailureMessage(
     return "Reconnect to verify project access before reviewing this cached transcript.";
   }
   if (candidateCode === "not_found" && operation === "transcript") {
-    return "No active transcript exists yet. Local processing is queued. Open Project Videos to check progress or resolve required language confirmation.";
+    return "No active transcript exists yet. Retry this video or open Project Videos to inspect progress and resolve required language confirmation.";
   }
   switch (failureClass) {
     case "authentication_required":

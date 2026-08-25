@@ -63,6 +63,8 @@ import {
   LookupDerivedTranslationSchema,
   RequestDerivedTranslationSchema,
   CancelTranscriptionBatchItemRequestSchema,
+  RetryTranscriptionBatchItemRequestSchema,
+  ArchiveTranscriptionBatchRequestSchema,
   TranscriptionBatchControlRequestSchema,
   UpdateHostedTranscriptionApprovalRequestSchema,
   UpdateReviewStatusRequestSchema,
@@ -1734,6 +1736,22 @@ export function createCloudApi(
   );
 
   app.post(
+    "/api/projects/:projectId/transcription-batches/:batchId/items/:itemId/retry",
+    async (request) => {
+      const { projectId, batchId, itemId } = ProjectBatchItemParamsSchema.parse(
+        request.params,
+      );
+      return catalog.retryTranscriptionBatchItem(
+        await authenticate(request),
+        projectId,
+        batchId,
+        itemId,
+        RetryTranscriptionBatchItemRequestSchema.parse(request.body),
+      );
+    },
+  );
+
+  app.post(
     "/api/projects/:projectId/transcription-batches/:batchId/control",
     async (request) => {
       const { projectId, batchId } = ProjectBatchParamsSchema.parse(
@@ -1744,6 +1762,21 @@ export function createCloudApi(
         projectId,
         batchId,
         TranscriptionBatchControlRequestSchema.parse(request.body),
+      );
+    },
+  );
+
+  app.post(
+    "/api/projects/:projectId/transcription-batches/:batchId/archive",
+    async (request) => {
+      const { projectId, batchId } = ProjectBatchParamsSchema.parse(
+        request.params,
+      );
+      return catalog.archiveTranscriptionBatch(
+        await authenticate(request),
+        projectId,
+        batchId,
+        ArchiveTranscriptionBatchRequestSchema.parse(request.body),
       );
     },
   );

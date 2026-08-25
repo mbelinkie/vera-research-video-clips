@@ -4997,23 +4997,36 @@ export const HostedTranscriptionApprovalResponseSchema = z
   })
   .strict();
 
-export const TranscriptionBatchSchema = z.object({
-  id: IdSchema,
-  projectId: IdSchema,
-  name: z.string().trim().min(1).max(160),
-  targetLanguage: z.string().min(2).max(35).default("en"),
-  transcriptionProfile: z.string().trim().min(1).max(160),
-  sourcePolicy: BatchSourcePolicySchema,
-  executionLocation: z.enum(["local", "hosted"]),
-  priority: BatchPrioritySchema,
-  hostedApproval: HostedTranscriptionApprovalSchema.optional(),
-  translationConsent: CloudTranslationConsentSchema.optional(),
-  dispatchStatus: z.enum(["active", "paused", "canceled"]),
-  createdBy: IdSchema,
-  createdAt: UtcTimestampSchema,
-  updatedAt: UtcTimestampSchema,
-  version: z.number().int().positive(),
-});
+export const TranscriptionBatchSchema = z
+  .object({
+    id: IdSchema,
+    projectId: IdSchema,
+    name: z.string().trim().min(1).max(160),
+    targetLanguage: z.string().min(2).max(35).default("en"),
+    transcriptionProfile: z.string().trim().min(1).max(160),
+    sourcePolicy: BatchSourcePolicySchema,
+    executionLocation: z.enum(["local", "hosted"]),
+    priority: BatchPrioritySchema,
+    hostedApproval: HostedTranscriptionApprovalSchema.optional(),
+    translationConsent: CloudTranslationConsentSchema.optional(),
+    dispatchStatus: z.enum(["active", "paused", "canceled"]),
+    createdBy: IdSchema,
+    archivedBy: IdSchema.optional(),
+    archivedAt: UtcTimestampSchema.optional(),
+    createdAt: UtcTimestampSchema,
+    updatedAt: UtcTimestampSchema,
+    version: z.number().int().positive(),
+  })
+  .strict()
+  .superRefine((batch, context) => {
+    if ((batch.archivedAt === undefined) !== (batch.archivedBy === undefined)) {
+      context.addIssue({
+        code: "custom",
+        path: ["archivedAt"],
+        message: "Batch archive actor and timestamp must be present together.",
+      });
+    }
+  });
 
 export const TranscriptionBatchItemSchema = BatchPreflightItemSchema.extend({
   id: IdSchema,
@@ -5085,6 +5098,37 @@ export const CancelTranscriptionBatchItemResponseSchema = z
     item: TranscriptionBatchItemSchema,
     outcome: z.enum(["canceled", "canceling", "already_canceled"]),
     jobCancellationRequested: z.boolean(),
+  })
+  .strict();
+
+export const RetryTranscriptionBatchItemRequestSchema = z
+  .object({
+    idempotencyKey: z.string().trim().min(1).max(512),
+    expectedVersion: z.number().int().positive(),
+  })
+  .strict();
+
+export const RetryTranscriptionBatchItemResponseSchema = z
+  .object({
+    projectId: IdSchema,
+    batchId: IdSchema,
+    item: TranscriptionBatchItemSchema,
+    outcome: z.enum(["queued", "already_queued"]),
+  })
+  .strict();
+
+export const ArchiveTranscriptionBatchRequestSchema = z
+  .object({
+    idempotencyKey: z.string().trim().min(1).max(512),
+    expectedVersion: z.number().int().positive(),
+  })
+  .strict();
+
+export const ArchiveTranscriptionBatchResponseSchema = z
+  .object({
+    projectId: IdSchema,
+    batch: TranscriptionBatchSchema,
+    outcome: z.enum(["archived", "already_archived"]),
   })
   .strict();
 
@@ -8454,6 +8498,18 @@ export type CancelTranscriptionBatchItemRequest = z.infer<
 >;
 export type CancelTranscriptionBatchItemResponse = z.infer<
   typeof CancelTranscriptionBatchItemResponseSchema
+>;
+export type RetryTranscriptionBatchItemRequest = z.infer<
+  typeof RetryTranscriptionBatchItemRequestSchema
+>;
+export type RetryTranscriptionBatchItemResponse = z.infer<
+  typeof RetryTranscriptionBatchItemResponseSchema
+>;
+export type ArchiveTranscriptionBatchRequest = z.infer<
+  typeof ArchiveTranscriptionBatchRequestSchema
+>;
+export type ArchiveTranscriptionBatchResponse = z.infer<
+  typeof ArchiveTranscriptionBatchResponseSchema
 >;
 export type TranscriptionBatchListResponse = z.infer<
   typeof TranscriptionBatchListResponseSchema

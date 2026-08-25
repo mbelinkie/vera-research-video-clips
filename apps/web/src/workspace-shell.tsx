@@ -1,5 +1,8 @@
 import {
+  createContext,
   useEffect,
+  useContext,
+  useRef,
   useState,
   type CSSProperties,
   type FormEvent,
@@ -16,6 +19,17 @@ export type ProjectDestination =
   "videos" | "workbench" | "clips" | "project_settings";
 
 const splitStorageKey = "vera:layout:transcript-width";
+const defaultTranscriptWidth = 46;
+const minTranscriptWidth = 30;
+const maxTranscriptWidth = 70;
+
+const ResearchLayoutContext = createContext<
+  | {
+      transcriptWidth: number;
+      onTranscriptWidthChange(value: number): void;
+    }
+  | undefined
+>(undefined);
 
 function storedNumber(key: string, fallback: number, min: number, max: number) {
   try {
@@ -70,7 +84,12 @@ export function WorkspaceShell({
   onSignOut,
 }: WorkspaceShellProps) {
   const [transcriptWidth, setTranscriptWidth] = useState(() =>
-    storedNumber(splitStorageKey, 42, 30, 62),
+    storedNumber(
+      splitStorageKey,
+      defaultTranscriptWidth,
+      minTranscriptWidth,
+      maxTranscriptWidth,
+    ),
   );
   const activeProject = projects.find((project) => project.id === projectId);
   const canManageProject =
@@ -273,10 +292,17 @@ export function WorkspaceShell({
             transcriptWidth={transcriptWidth}
             onTranscriptWidthChange={setTranscriptWidth}
             onReset={() => {
-              setTranscriptWidth(42);
+              setTranscriptWidth(defaultTranscriptWidth);
             }}
           />
-          <div className="workbench-research">{workspace}</div>
+          <ResearchLayoutContext.Provider
+            value={{
+              transcriptWidth,
+              onTranscriptWidthChange: setTranscriptWidth,
+            }}
+          >
+            <div className="workbench-research">{workspace}</div>
+          </ResearchLayoutContext.Provider>
         </div>
       ) : (
         <section className="project-destination-content">
@@ -304,8 +330,8 @@ function LayoutControls({
         <input
           type="range"
           aria-label="Transcript width"
-          min="30"
-          max="62"
+          min={minTranscriptWidth}
+          max={maxTranscriptWidth}
           step="2"
           value={transcriptWidth}
           onChange={(event) =>
@@ -437,9 +463,73 @@ export function ResearchWorkspaceLayout({
   transcript,
   player,
 }: ResearchWorkspaceLayoutProps) {
+  const layout = useContext(ResearchLayoutContext);
+  const workspaceRef = useRef<HTMLElement>(null);
+
+  function resizeAt(clientX: number) {
+    if (!layout || !workspaceRef.current) return;
+    const bounds = workspaceRef.current.getBoundingClientRect();
+    const percentage = ((clientX - bounds.left) / bounds.width) * 100;
+    layout.onTranscriptWidthChange(
+      Math.min(
+        maxTranscriptWidth,
+        Math.max(minTranscriptWidth, Math.round(percentage)),
+      ),
+    );
+  }
+
   return (
-    <section className="workspace" aria-label="Research workspace">
+    <section
+      ref={workspaceRef}
+      className="workspace"
+      aria-label="Research workspace"
+    >
       {transcript}
+      {layout ? (
+        <div
+          className="workspace-resizer"
+          role="separator"
+          aria-label="Resize transcript panel"
+          aria-orientation="vertical"
+          aria-valuemin={minTranscriptWidth}
+          aria-valuemax={maxTranscriptWidth}
+          aria-valuenow={layout.transcriptWidth}
+          tabIndex={0}
+          onDoubleClick={() =>
+            layout.onTranscriptWidthChange(defaultTranscriptWidth)
+          }
+          onKeyDown={(event) => {
+            if (event.key === "Home") {
+              event.preventDefault();
+              layout.onTranscriptWidthChange(minTranscriptWidth);
+            } else if (event.key === "End") {
+              event.preventDefault();
+              layout.onTranscriptWidthChange(maxTranscriptWidth);
+            } else if (event.key === "ArrowLeft") {
+              event.preventDefault();
+              layout.onTranscriptWidthChange(
+                Math.max(minTranscriptWidth, layout.transcriptWidth - 2),
+              );
+            } else if (event.key === "ArrowRight") {
+              event.preventDefault();
+              layout.onTranscriptWidthChange(
+                Math.min(maxTranscriptWidth, layout.transcriptWidth + 2),
+              );
+            }
+          }}
+          onPointerDown={(event) => {
+            event.currentTarget.setPointerCapture(event.pointerId);
+            resizeAt(event.clientX);
+          }}
+          onPointerMove={(event) => {
+            if (event.currentTarget.hasPointerCapture(event.pointerId))
+              resizeAt(event.clientX);
+          }}
+          onPointerUp={(event) =>
+            event.currentTarget.releasePointerCapture(event.pointerId)
+          }
+        />
+      ) : null}
       {player}
     </section>
   );
