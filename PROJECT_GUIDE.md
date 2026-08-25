@@ -60,7 +60,8 @@ Every foreign-language clip export includes two separate subtitle files covering
    then resolve the requesting user's preferred-language view from the source,
    verified local cache, or the project's shared store before translating it.
 4. Publish a newly completed transcript version to the project so other authorized members can reuse it.
-5. Click transcript text to seek the player.
+5. Click transcript text to seek and play from the exact or honestly estimated
+   word position.
 6. Search, highlight, and adjust a transcript range.
 7. Choose `Queue / log only`, `Export + log`, or `Export only`.
 8. For either logging action, explicitly indicate the destination project.
@@ -191,7 +192,9 @@ rewrites an existing logged clip.
 - Upload an immutable, checksummed transcript bundle to private online storage and finalize its shared manifest.
 - Download and verify a shared transcript on another authorized workstation without regeneration.
 - Render timestamps and a virtualized transcript.
-- Click a segment or timed token to seek.
+- Click a transcript word to seek and play from its exact timestamp or an
+  honestly labeled playback-only estimate within its cue; keep cue timestamps
+  seek-only.
 - Highlight the currently spoken segment and auto-scroll without fighting manual scrolling.
 - Search exact/partial text and jump between matches.
 - Select an arbitrary contiguous text range.
@@ -294,7 +297,11 @@ Do not show a single indefinite spinner for the entire pipeline.
 
 - Render segments as the virtualization unit and tokens inside each segment.
 - Show a readable timestamp per segment.
-- Make tokens clickable when token timing exists; otherwise seek to the segment start.
+- Make every rendered token clickable. Use exact token timing when present;
+  otherwise evenly distribute playback-only estimated starts across the cue,
+  label them as estimated, and never reuse them as selection/export evidence.
+- Token activation seeks and immediately plays. Cue timestamps and other
+  navigation paths remain seek-only.
 - Poll player time while playing and use a binary search over sorted segments/tokens.
 - Highlight the active segment and optionally the active word.
 - Auto-scroll only while follow mode is enabled.
@@ -564,6 +571,9 @@ in the cache for debugging/reprocessing, but do not make UI code depend on them.
 - Use true word timestamps when the source/provider supplies them.
 - When only cues exist, keep cue timing and optionally distribute estimated token times for navigation.
 - Label interpolated token times as `estimated`.
+- Keep estimated token positions ephemeral and playback-only; active-word
+  highlighting may use them, but selection, logging, export, cache identity,
+  and immutable transcript bytes continue to use canonical cue evidence.
 - Never use estimated word bounds for a supposedly frame-accurate export without allowing preview/adjustment.
 - Consider on-demand forced alignment for a selected range before export as a later precision upgrade.
 - Keep segment sizes readable; re-segment long cues without pretending the new text chunks have independent timing unless alignment supports it.
@@ -1285,7 +1295,8 @@ Do not make the normal test suite depend on live YouTube availability. Keep live
 3. Verify unique items proceed independently and completed items enter `Ready for review`.
 4. On workstation A, finalize/upload an English transcript.
 5. On simulated workstation B, open the same project/video and download the verified transcript without generation.
-6. Click transcript text and verify player seek intent.
+6. Click transcript text and verify exact or estimated word seek followed by
+   playback; verify a cue timestamp remains seek-only.
 7. Search and navigate a match.
 8. Select a phrase, indicate a project, and queue it.
 9. Add person/topic tags and an intended-use note, reload the app, and verify the candidate plus its research context remain and can be filtered.
@@ -1353,7 +1364,7 @@ Deliver:
 
 Exit when a local or shared preexisting transcript can drive navigation on a long video without UI slowdown or unnecessary regeneration.
 
-Completed 2026-08-01. Common YouTube URL forms normalize to canonical identities; metadata is isolated behind a provider and project videos persist through the cloud API. Validated canonical tracks, segments, and tokens now pass from the authorized active-version lookup through checksum-verified local caching, compressed-artifact parsing, and transactional SQLite indexing to the local-agent transcript endpoint. The player wrapper supports playback polling and cue seeking; the workspace adds bounded segment windowing, exact timed-word seeking with honest cue fallback, active segment/token state, follow suspension/resume, and literal search with next/previous navigation. A 10,000-segment window test verifies bounded rendering calculations, the shared-store integration verifies that a second resolution reuses the verified cache without regeneration, and browser checks cover the navigation interactions. The standalone browser demo remains deliberately fixture-backed and labeled until the authenticated project shell supplies its session and project context; arbitrary videos never receive fabricated transcript text.
+Completed 2026-08-01; word click-to-play refined 2026-08-25. Common YouTube URL forms normalize to canonical identities; metadata is isolated behind a provider and project videos persist through the cloud API. Validated canonical tracks, segments, and tokens now pass from the authorized active-version lookup through checksum-verified local caching, compressed-artifact parsing, and transactional SQLite indexing to the local-agent transcript endpoint. The player wrapper supports playback polling and cue seeking; activating a transcript token seeks and plays from an exact stored word timestamp or an honestly labeled, ephemeral in-cue estimate. Estimated positions also drive active-word highlighting but never selection, logging, export, cache identity, or immutable transcript evidence. Cue timestamps and every other navigation path remain seek-only. The workspace also provides bounded segment windowing, active segment/token state, follow suspension/resume, and literal search with next/previous navigation. A 10,000-segment window test verifies bounded rendering calculations, the shared-store integration verifies that a second resolution reuses the verified cache without regeneration, and browser checks cover the navigation interactions. The standalone browser demo remains deliberately fixture-backed and labeled until the authenticated project shell supplies its session and project context; arbitrary videos never receive fabricated transcript text.
 
 ### Milestone 3 — Batch transcript acquisition and review inbox
 

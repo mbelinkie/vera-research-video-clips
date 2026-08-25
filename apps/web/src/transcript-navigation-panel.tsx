@@ -35,6 +35,7 @@ type TranscriptNavigationPanelProps = Readonly<{
   onMoveMatch: (direction: 1 | -1) => void;
   onFollowSuspended: () => void;
   onSeek: ComponentProps<typeof VirtualTranscript>["onSeek"];
+  onPlayFromToken: ComponentProps<typeof VirtualTranscript>["onPlayFromToken"];
   onSelect: ComponentProps<typeof VirtualTranscript>["onSelect"];
   onRetry: () => void;
 }>;
@@ -63,6 +64,7 @@ export function TranscriptNavigationPanel({
   onMoveMatch,
   onFollowSuspended,
   onSeek,
+  onPlayFromToken,
   onSelect,
   onRetry,
 }: TranscriptNavigationPanelProps) {
@@ -230,6 +232,7 @@ export function TranscriptNavigationPanel({
             follow={follow}
             onFollowSuspended={onFollowSuspended}
             onSeek={onSeek}
+            onPlayFromToken={onPlayFromToken}
             onSelect={onSelect}
           />
         </>

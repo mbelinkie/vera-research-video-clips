@@ -1437,6 +1437,81 @@ export function timedTranscriptTokens(
     .toSorted((left, right) => left.startMs - right.startMs);
 }
 
+export type TranscriptNavigationToken = Omit<
+  TranscriptToken,
+  "startMs" | "endMs"
+> & {
+  startMs: number;
+  endMs: number;
+  timingPrecision: "word" | "estimated";
+};
+
+/**
+ * Builds playback-only word navigation bounds without changing canonical
+ * transcript evidence. Persisted word starts stay exact. Untimed tokens divide
+ * their owning cue into deterministic integer slots and remain explicitly
+ * estimated.
+ */
+export function transcriptNavigationTokens(
+  segments: readonly TranscriptSegment[],
+  tokens: readonly TranscriptToken[],
+): TranscriptNavigationToken[] {
+  const tokensBySegment = new Map<string, TranscriptToken[]>();
+  for (const token of tokens) {
+    const grouped = tokensBySegment.get(token.segmentId) ?? [];
+    grouped.push(token);
+    tokensBySegment.set(token.segmentId, grouped);
+  }
+
+  const segmentOrder = new Map(
+    segments.map((segment, index) => [segment.id, index]),
+  );
+  const navigationTokens = segments.flatMap((segment) => {
+    const segmentTokens = (tokensBySegment.get(segment.id) ?? []).toSorted(
+      (left, right) => left.ordinal - right.ordinal,
+    );
+    const tokenCount = segmentTokens.length;
+    if (tokenCount === 0) return [];
+    const durationMs = segment.endMs - segment.startMs;
+
+    return segmentTokens.map((token, index) => {
+      const estimatedStartMs = Math.min(
+        segment.endMs - 1,
+        segment.startMs + Math.floor((durationMs * index) / tokenCount),
+      );
+      const estimatedEndMs = Math.min(
+        segment.endMs,
+        Math.max(
+          estimatedStartMs + 1,
+          segment.startMs + Math.floor((durationMs * (index + 1)) / tokenCount),
+        ),
+      );
+      if (token.startMs === undefined) {
+        return {
+          ...token,
+          startMs: estimatedStartMs,
+          endMs: estimatedEndMs,
+          timingPrecision: "estimated" as const,
+        };
+      }
+      return {
+        ...token,
+        startMs: token.startMs,
+        endMs: token.endMs ?? Math.max(token.startMs + 1, estimatedEndMs),
+        timingPrecision: "word" as const,
+      };
+    });
+  });
+
+  return navigationTokens.toSorted(
+    (left, right) =>
+      left.startMs - right.startMs ||
+      (segmentOrder.get(left.segmentId) ?? Number.MAX_SAFE_INTEGER) -
+        (segmentOrder.get(right.segmentId) ?? Number.MAX_SAFE_INTEGER) ||
+      left.ordinal - right.ordinal,
+  );
+}
+
 export function tokenAtTime(
   tokens: readonly (TranscriptToken & { startMs: number; endMs: number })[],
   currentMs: number,

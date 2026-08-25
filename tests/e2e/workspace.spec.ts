@@ -90,9 +90,23 @@ function workspaceFixture(input: {
   projectId: string;
   video: typeof directVideo | typeof romanianVideo;
   preferredLanguage: string;
+  directTiming?: "word" | "cue";
 }) {
   if (input.video.youtubeVideoId === directVideo.youtubeVideoId) {
-    const english = transcriptWithSegmentTrackIds(englishWordFixture);
+    const wordTimedEnglish = transcriptWithSegmentTrackIds(englishWordFixture);
+    const english =
+      input.directTiming === "cue"
+        ? {
+            ...wordTimedEnglish,
+            track: {
+              ...wordTimedEnglish.track,
+              timingPrecision: "cue" as const,
+            },
+            tokens: wordTimedEnglish.tokens.map(
+              ({ startMs: _startMs, endMs: _endMs, ...token }) => token,
+            ),
+          }
+        : wordTimedEnglish;
     return {
       schemaVersion: 1,
       projectId: input.projectId,
@@ -1527,6 +1541,7 @@ async function mockNavigationWorkspace(
   page: Page,
   input: {
     authorizedVideos?: Array<typeof directVideo | typeof romanianVideo>;
+    directTiming?: "word" | "cue";
   } = {},
 ) {
   const now = "2026-08-01T12:00:00.000Z";
@@ -1649,6 +1664,7 @@ async function mockNavigationWorkspace(
         projectId,
         video,
         preferredLanguage: "en",
+        ...(input.directTiming ? { directTiming: input.directTiming } : {}),
       });
       return route.fulfill({
         json: {
@@ -1763,6 +1779,136 @@ async function mockNavigationWorkspace(
     },
   };
 }
+
+test("plays exact transcript words from their stored timestamp", async ({
+  page,
+}) => {
+  await mockNavigationWorkspace(page);
+  await page.goto("/");
+  await page
+    .getByLabel("Development session credential")
+    .fill(`Bearer ${navigationUserId}|fixture:web`);
+  await page.getByRole("button", { name: "Connect" }).click();
+  await page
+    .getByLabel("YouTube URL or video ID")
+    .fill(directVideo.canonicalUrl);
+  await page.getByRole("button", { name: "Load video" }).click();
+  await expect(page.getByText("word timing", { exact: true })).toBeVisible();
+
+  const playerFrame = page
+    .frames()
+    .find((frame) =>
+      frame.url().includes(`/embed/${directVideo.youtubeVideoId}`),
+    );
+  if (!playerFrame) throw new Error("Expected the direct-video player frame.");
+  await playerFrame.evaluate(() => {
+    (
+      window as typeof window & { __receivedPlayerCommands?: unknown[] }
+    ).__receivedPlayerCommands = [];
+  });
+
+  await page.getByRole("button", { name: "fixture", exact: true }).click();
+  await expect
+    .poll(() =>
+      playerFrame.evaluate(() =>
+        (
+          (
+            window as typeof window & {
+              __receivedPlayerCommands?: Array<{
+                func?: string;
+                args?: unknown[];
+              }>;
+            }
+          ).__receivedPlayerCommands ?? []
+        ).filter((command) =>
+          ["seekTo", "playVideo"].includes(command.func ?? ""),
+        ),
+      ),
+    )
+    .toEqual([
+      { event: "command", func: "seekTo", args: [0.3, true] },
+      { event: "command", func: "playVideo", args: [] },
+    ]);
+  await expect(page.getByText("Word requested 0:00.")).toBeVisible();
+});
+
+test("estimates cue word positions, plays them, and keeps drag selection cue-level", async ({
+  page,
+}) => {
+  await mockNavigationWorkspace(page, { directTiming: "cue" });
+  await page.goto("/");
+  await page
+    .getByLabel("Development session credential")
+    .fill(`Bearer ${navigationUserId}|fixture:web`);
+  await page.getByRole("button", { name: "Connect" }).click();
+  await page
+    .getByLabel("YouTube URL or video ID")
+    .fill(directVideo.canonicalUrl);
+  await page.getByRole("button", { name: "Load video" }).click();
+  await expect(page.getByText("cue timing", { exact: true })).toBeVisible();
+
+  const playerFrame = page
+    .frames()
+    .find((frame) =>
+      frame.url().includes(`/embed/${directVideo.youtubeVideoId}`),
+    );
+  if (!playerFrame) throw new Error("Expected the direct-video player frame.");
+  await playerFrame.evaluate(() => {
+    (
+      window as typeof window & { __receivedPlayerCommands?: unknown[] }
+    ).__receivedPlayerCommands = [];
+  });
+
+  await selectDirectFixturePassage(page);
+  await expect(page.getByLabel("Clip selection")).toContainText(
+    "Transcript selection: 0.000s–4.000s",
+  );
+  await expect
+    .poll(() =>
+      playerFrame.evaluate(
+        () =>
+          (
+            window as typeof window & {
+              __receivedPlayerCommands?: Array<{ func?: string }>;
+            }
+          ).__receivedPlayerCommands?.filter((command) =>
+            ["seekTo", "playVideo"].includes(command.func ?? ""),
+          ).length ?? 0,
+      ),
+    )
+    .toBe(0);
+
+  await page.evaluate(() => window.getSelection()?.removeAllRanges());
+  const hasToken = page.getByRole("button", { name: "has", exact: true });
+  await hasToken.focus();
+  await hasToken.press("Enter");
+  await expect
+    .poll(() =>
+      playerFrame.evaluate(() =>
+        (
+          (
+            window as typeof window & {
+              __receivedPlayerCommands?: Array<{
+                func?: string;
+                args?: unknown[];
+              }>;
+            }
+          ).__receivedPlayerCommands ?? []
+        ).filter((command) =>
+          ["seekTo", "playVideo"].includes(command.func ?? ""),
+        ),
+      ),
+    )
+    .toEqual([
+      { event: "command", func: "seekTo", args: [0.9, true] },
+      { event: "command", func: "playVideo", args: [] },
+    ]);
+  await expect(page.getByText("Estimated word requested 0:00.")).toBeVisible();
+  await expect(hasToken).toHaveAttribute(
+    "title",
+    "Estimated word position 0:00",
+  );
+});
 
 test("creates, searches, seeks, and moderates project bookmarks with visible sync state", async ({
   page,
@@ -4309,6 +4455,7 @@ test("maps transcript text selection to stable source and export bounds", async 
   await page.locator("details.account-menu > summary").click();
   await page.getByLabel("Preferred transcript language").fill("en");
   await page.getByRole("button", { name: "Save preference" }).click();
+  await page.locator("details.account-menu > summary").click();
   await clipQueue.getByRole("button", { name: "Refresh" }).click();
   await expect(clipQueue).toContainText("Preferred — Spanish (es)");
 });

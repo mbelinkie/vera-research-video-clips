@@ -23,6 +23,7 @@ import {
   searchTranscript,
   searchTranscriptOccurrences,
   segmentAtTime,
+  transcriptNavigationTokens,
   timedTranscriptTokens,
   tokenAtTime,
   transcriptVirtualWindow,
@@ -739,6 +740,102 @@ describe("timed transcript navigation", () => {
     expect(timed).toHaveLength(1);
     expect(tokenAtTime(timed, 1_450)?.text).toBe("timed");
     expect(tokenAtTime(timed, 1_600)).toBeUndefined();
+  });
+
+  it("preserves exact word bounds and estimates untimed positions inside a cue", () => {
+    const cue = {
+      id: "cue",
+      trackId: "track",
+      ordinal: 0,
+      startMs: 1_000,
+      endMs: 2_000,
+      text: "one two three four",
+    };
+    const estimated = transcriptNavigationTokens(
+      [cue],
+      ["one", "two", "three", "four"].map((text, ordinal) => ({
+        id: `estimated-${ordinal}`,
+        segmentId: cue.id,
+        ordinal,
+        text,
+      })),
+    );
+
+    expect(
+      estimated.map(({ startMs, endMs, timingPrecision }) => ({
+        startMs,
+        endMs,
+        timingPrecision,
+      })),
+    ).toEqual([
+      { startMs: 1_000, endMs: 1_250, timingPrecision: "estimated" },
+      { startMs: 1_250, endMs: 1_500, timingPrecision: "estimated" },
+      { startMs: 1_500, endMs: 1_750, timingPrecision: "estimated" },
+      { startMs: 1_750, endMs: 2_000, timingPrecision: "estimated" },
+    ]);
+    expect(tokenAtTime(estimated, 1_510)?.text).toBe("three");
+
+    const exact = transcriptNavigationTokens(
+      [cue],
+      [
+        {
+          id: "exact",
+          segmentId: cue.id,
+          ordinal: 0,
+          text: "exact",
+          startMs: 1_123,
+          endMs: 1_456,
+        },
+      ],
+    );
+    expect(exact[0]).toMatchObject({
+      startMs: 1_123,
+      endMs: 1_456,
+      timingPrecision: "word",
+    });
+  });
+
+  it("clamps short cue estimates and leaves tokenless segments cue-only", () => {
+    const shortCue = {
+      id: "short-cue",
+      trackId: "track",
+      ordinal: 0,
+      startMs: 2_000,
+      endMs: 2_001,
+      text: "a b c",
+    };
+    const short = transcriptNavigationTokens(
+      [shortCue],
+      ["a", "b", "c"].map((text, ordinal) => ({
+        id: `short-${ordinal}`,
+        segmentId: shortCue.id,
+        ordinal,
+        text,
+      })),
+    );
+    expect(short).toHaveLength(3);
+    expect(
+      short.every(
+        (token) =>
+          token.startMs === shortCue.startMs &&
+          token.endMs === shortCue.endMs &&
+          token.timingPrecision === "estimated",
+      ),
+    ).toBe(true);
+
+    const single = transcriptNavigationTokens(
+      [{ ...shortCue, startMs: 3_000, endMs: 3_500 }],
+      [
+        {
+          id: "single",
+          segmentId: shortCue.id,
+          ordinal: 0,
+          text: "single",
+        },
+      ],
+    );
+    expect(single[0]).toMatchObject({ startMs: 3_000, endMs: 3_500 });
+    expect(transcriptNavigationTokens([shortCue], [])).toEqual([]);
   });
 
   it("windows a ten-thousand-segment transcript to a small render range", () => {

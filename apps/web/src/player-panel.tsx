@@ -14,7 +14,7 @@ type PlayerPanelProps = Readonly<{
   videoId: string | undefined;
   currentMs: number;
   lastSeekMs: number | undefined;
-  lastSeekPrecision: "word" | "cue";
+  lastSeekPrecision: "word" | "cue" | "estimated";
   sourceDurationMs: number | undefined;
   playerRangeStartMs: number | undefined;
   playerRangeEndMs: number | undefined;
@@ -82,8 +82,8 @@ export function PlayerPanel({
         <strong>{formatTime(currentMs)}</strong>
         <p className="muted">
           {lastSeekMs === undefined
-            ? "Click a timed word or cue to seek."
-            : `${lastSeekPrecision === "word" ? "Word" : "Cue"} requested ${formatTime(lastSeekMs)}.`}
+            ? "Click a transcript word to play, or a cue time to seek."
+            : `${seekPrecisionLabel(lastSeekPrecision)} requested ${formatTime(lastSeekMs)}.`}
         </p>
         {clipLoopRange ? (
           <p className="muted" role="status">
@@ -187,6 +187,12 @@ export function PlayerPanel({
       {selectionEditor}
     </aside>
   );
+}
+
+function seekPrecisionLabel(precision: "word" | "cue" | "estimated") {
+  if (precision === "word") return "Word";
+  if (precision === "estimated") return "Estimated word";
+  return "Cue";
 }
 
 export function isPlayerRangeShortcut(event: KeyboardEvent) {

@@ -4,7 +4,10 @@ import type {
   TranscriptSegment,
   TranscriptToken,
 } from "@research-video/contracts";
-import { transcriptVirtualWindow } from "@research-video/transcript";
+import {
+  transcriptNavigationTokens,
+  transcriptVirtualWindow,
+} from "@research-video/transcript";
 import type {
   TranscriptSearchOccurrence,
   TranscriptSelectionBoundary,
@@ -23,7 +26,8 @@ type VirtualTranscriptProps = {
   selectedTokenIds?: ReadonlySet<string>;
   follow: boolean;
   onFollowSuspended(): void;
-  onSeek(milliseconds: number, precision: "word" | "cue"): void;
+  onSeek(milliseconds: number, precision: "word" | "cue" | "estimated"): void;
+  onPlayFromToken(milliseconds: number, precision: "word" | "estimated"): void;
   onSelect(
     anchor: TranscriptSelectionBoundary,
     focus: TranscriptSelectionBoundary,
@@ -41,6 +45,7 @@ export function VirtualTranscript({
   follow,
   onFollowSuspended,
   onSeek,
+  onPlayFromToken,
   onSelect,
 }: VirtualTranscriptProps) {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -54,6 +59,16 @@ export function VirtualTranscript({
     }
     return grouped;
   }, [tokens]);
+  const navigationTargets = useMemo(
+    () =>
+      new Map(
+        transcriptNavigationTokens(segments, tokens).map((token) => [
+          token.id,
+          token,
+        ]),
+      ),
+    [segments, tokens],
+  );
   const virtualWindow = transcriptVirtualWindow({
     itemCount: segments.length,
     scrollTop,
@@ -158,6 +173,7 @@ export function VirtualTranscript({
                 <span className="transcript-text">
                   {segmentTokens.length > 0 ? (
                     segmentTokens.map((token, index) => {
+                      const navigationTarget = navigationTargets.get(token.id)!;
                       const tokenOffset = segment.text.indexOf(
                         token.text,
                         tokenTextCursor,
@@ -184,24 +200,24 @@ export function VirtualTranscript({
                             data-transcript-token-id={token.id}
                             className={`transcript-token${activeTokenId === token.id ? " active" : ""}${selectedTokenIds?.has(token.id) ? " selected" : ""}${tokenMatches.length ? " search-match" : ""}${activeSearch ? " active-search-match" : ""}`}
                             title={
-                              token.startMs === undefined
-                                ? "Cue-level timing"
-                                : `Word timing ${formatTime(token.startMs)}`
+                              navigationTarget.timingPrecision === "estimated"
+                                ? `Estimated word position ${formatTime(navigationTarget.startMs)}`
+                                : `Word timing ${formatTime(navigationTarget.startMs)}`
                             }
                             onClick={() => {
                               if (!window.getSelection()?.isCollapsed) return;
-                              onSeek(
-                                token.startMs ?? segment.startMs,
-                                token.startMs === undefined ? "cue" : "word",
+                              onPlayFromToken(
+                                navigationTarget.startMs,
+                                navigationTarget.timingPrecision,
                               );
                             }}
                             onKeyDown={(event) => {
                               if (event.key !== "Enter" && event.key !== " ")
                                 return;
                               event.preventDefault();
-                              onSeek(
-                                token.startMs ?? segment.startMs,
-                                token.startMs === undefined ? "cue" : "word",
+                              onPlayFromToken(
+                                navigationTarget.startMs,
+                                navigationTarget.timingPrecision,
                               );
                             }}
                           >

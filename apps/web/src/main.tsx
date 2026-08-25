@@ -48,7 +48,7 @@ import {
   buildClipLanguageEvidence,
   searchTranscriptOccurrences,
   segmentAtTime,
-  timedTranscriptTokens,
+  transcriptNavigationTokens,
   transcriptTextForTimeRange,
   tokenAtTime,
   updateTranscriptSelectionExportBounds,
@@ -654,11 +654,14 @@ function App() {
   const activeSegment = transcript
     ? segmentAtTime(transcript.segments, currentMs)
     : undefined;
-  const timedTokens = useMemo(
-    () => timedTranscriptTokens(transcript?.tokens ?? []),
+  const navigationTokens = useMemo(
+    () =>
+      transcript
+        ? transcriptNavigationTokens(transcript.segments, transcript.tokens)
+        : [],
     [transcript],
   );
-  const activeToken = tokenAtTime(timedTokens, currentMs);
+  const activeToken = tokenAtTime(navigationTokens, currentMs);
   const exportOverrides = useMemo(() => {
     const override: ExportSettingsOverride = {};
     if (overrideFields.has("container")) override.container = exportContainer;
@@ -2805,11 +2808,26 @@ function App() {
     }
   }
 
-  function seekTo(startMs: number, precision: "word" | "cue" = "cue") {
+  function seekTo(
+    startMs: number,
+    precision: "word" | "cue" | "estimated" = "cue",
+  ) {
     playerRef.current?.seekTo(startMs);
     setCurrentMs(startMs);
     setLastSeekMs(startMs);
     setLastSeekPrecision(precision);
+  }
+
+  function playFromTranscriptToken(
+    startMs: number,
+    precision: "word" | "estimated",
+  ) {
+    const player = playerRef.current;
+    if (!player?.seekTo(startMs)) return;
+    setCurrentMs(startMs);
+    setLastSeekMs(startMs);
+    setLastSeekPrecision(precision);
+    player.play();
   }
 
   function handlePlayerTimeChange(milliseconds: number) {
@@ -2820,9 +2838,9 @@ function App() {
     }
   }
 
-  const [lastSeekPrecision, setLastSeekPrecision] = useState<"word" | "cue">(
-    "cue",
-  );
+  const [lastSeekPrecision, setLastSeekPrecision] = useState<
+    "word" | "cue" | "estimated"
+  >("cue");
 
   function moveMatch(direction: 1 | -1) {
     if (transcriptMatches.length === 0) return;
@@ -2942,6 +2960,7 @@ function App() {
               onMoveMatch={moveMatch}
               onFollowSuspended={() => setFollow(false)}
               onSeek={seekTo}
+              onPlayFromToken={playFromTranscriptToken}
               onSelect={(anchor, focus) => {
                 playerRef.current?.pause();
                 setPreviewingSelection(false);
