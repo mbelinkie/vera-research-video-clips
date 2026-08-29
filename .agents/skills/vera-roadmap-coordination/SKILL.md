@@ -26,4 +26,4 @@ Exact matching is mandatory. If scope exceeds the profile, stop, record confirme
 
 ## Steward boundary
 
-Stewards may refine scope, verify routing/readiness, maintain parents/dependencies, and detect stale or conflicting claims. They do not reprioritize goals, implement code, close implementation issues, or dispatch tasks. Stay quiet when no meaningful board change is needed.
+Scheduled or autonomous steward passes may refine scope, verify routing/readiness, maintain parents/dependencies, and detect stale or conflicting claims. They do not reprioritize goals, implement code, close implementation issues, or dispatch tasks. A direct user invocation of the personal `$vera-roadmap-dispatch` skill is the sole dispatch exception: it may start exactly one validated Ready issue and must not alter scheduled steward behavior or auto-chain. Stay quiet when no meaningful board change is needed.
