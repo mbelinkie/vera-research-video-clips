@@ -75,12 +75,30 @@ The screenshot set should use fictional data and cover:
    destination, notes, tags, and the three actions together.
 4. **Review:** a mixture of ready, processing, conflict, failed, claimed, and
    completed source states.
-5. **Logged:** several clips with topics/tags, comments, export progress, and a
-   completed artifact.
+5. **Clips:** several clips with topics/tags, comments, export progress, and a
+   completed artifact. Treat each logged excerpt as the primary reading content,
+   use a smaller source-video title as secondary metadata, and let the excerpt
+   wrap within a readable measure rather than truncating it to one line. For a
+   non-English source, show the original excerpt first and its English companion
+   directly below under `Translation from {source language}`.
 6. **Project Settings:** project identity, membership/governance, processing,
    keywords, and export defaults.
 7. **Operational states:** empty, loading, offline cached, authorization lost,
    stale/conflict, retryable failure, and non-retryable failure.
+
+## Clips reading hierarchy
+
+- Use the source-video title as compact secondary metadata; the reference
+  prototype uses 12 px title text.
+- Use larger clip text as the primary row content; the reference prototype uses
+  14.5 px for both the original excerpt and its English companion.
+- Constrain both language texts to about a 68-character measure. Let the
+  original excerpt wrap to a two-line default-row presentation and let the
+  translation wrap naturally at the same measure.
+- For non-English speech, keep the original excerpt first and place one concise
+  `Translation from {source language}` label immediately above the English
+  companion. The simplified visual presentation does not change the canonical
+  Original and English data roles.
 
 ## Fictional fixture vocabulary
 

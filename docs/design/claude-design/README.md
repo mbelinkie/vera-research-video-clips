@@ -11,18 +11,27 @@ Design should read first.
    the opening prompt.
 2. Read [`UI-CONTEXT.md`](./UI-CONTEXT.md) for the audience, workflow,
    terminology, non-negotiable behavior, screen inventory, and source map.
-3. Read [`SANITIZATION.md`](./SANITIZATION.md) before importing screenshots or
+3. Read [`BEHAVIOR-CONTRACT.md`](./BEHAVIOR-CONTRACT.md) for the product
+   decisions made during the redesign review, including deliberate changes to
+   existing behavior and the implementation boundaries they affect.
+4. Read [`WEB-EDITION-DESIGN-BRIEF.md`](./WEB-EDITION-DESIGN-BRIEF.md) for the
+   approved limited-Web capability boundary, Desktop handoff, and browser-suite
+   navigation to VERA Script to Timeline.
+5. Use [`APPROVAL-CHECKLIST.md`](./APPROVAL-CHECKLIST.md) to track every
+   requested prototype correction and the final approval review.
+6. Read [`SANITIZATION.md`](./SANITIZATION.md) before importing screenshots or
    any additional files.
-4. If screenshots have not yet been added, follow
+7. If screenshots have not yet been added, follow
    [`screenshots/README.md`](./screenshots/README.md) to capture the required
    fictional fixture states.
 
 ## Review objective
 
 Improve information hierarchy, navigation, density, transcript readability,
-selection-to-clip actions, accessibility, and visual consistency without
-changing the application's workflow or data semantics. Explore two or three
-coherent directions before selecting one for a detailed interactive prototype.
+selection-to-clip actions, accessibility, and visual consistency. Preserve
+existing workflow and data semantics except where `BEHAVIOR-CONTRACT.md`
+records a deliberate product change. Explore two or three coherent directions
+before selecting one for a detailed interactive prototype.
 
 ## Expected output
 
