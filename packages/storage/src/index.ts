@@ -10,8 +10,16 @@ export type PutObjectInput = Omit<StoredObject, "bytes" | "versionId"> & {
   bytes: Uint8Array;
 };
 
+export type StoredObjectMetadata = Omit<StoredObject, "bytes"> & {
+  byteSize: number;
+};
+
 export interface TranscriptObjectStore {
   put(input: PutObjectInput): Promise<StoredObject>;
+  head?(
+    key: string,
+    versionId?: string,
+  ): Promise<StoredObjectMetadata | undefined>;
   get(key: string, versionId?: string): Promise<StoredObject | undefined>;
   getBounded(
     key: string,
@@ -87,6 +95,16 @@ export class MemoryTranscriptObjectStore implements TranscriptObjectStore {
     return value ? { ...value, bytes: value.bytes.slice() } : undefined;
   }
 
+  async head(
+    key: string,
+    versionId?: string,
+  ): Promise<StoredObjectMetadata | undefined> {
+    const value = await this.get(key, versionId);
+    if (!value) return undefined;
+    const { bytes, ...metadata } = value;
+    return { ...metadata, byteSize: bytes.byteLength };
+  }
+
   async getBounded(
     key: string,
     versionId: string,
@@ -157,6 +175,35 @@ export class S3TranscriptObjectStore implements TranscriptObjectStore {
     versionId?: string,
   ): Promise<StoredObject | undefined> {
     return this.load(key, versionId);
+  }
+
+  async head(
+    key: string,
+    versionId?: string,
+  ): Promise<StoredObjectMetadata | undefined> {
+    try {
+      const response = await this.client.send(
+        new HeadObjectCommand({
+          Bucket: this.bucket,
+          Key: key,
+          ...(versionId ? { VersionId: versionId } : {}),
+        }),
+      );
+      const byteSize = response.ContentLength;
+      if (byteSize === undefined || byteSize < 0) return undefined;
+      return {
+        key,
+        versionId: response.VersionId ?? versionId ?? "unversioned",
+        byteSize,
+        contentType: response.ContentType ?? "application/octet-stream",
+        sha256: response.Metadata?.sha256 ?? "",
+      };
+    } catch (error) {
+      const statusCode = (error as { $metadata?: { httpStatusCode?: number } })
+        .$metadata?.httpStatusCode;
+      if (statusCode === 404) return undefined;
+      throw error;
+    }
   }
 
   async getBounded(
@@ -329,6 +376,7 @@ import { createHash } from "node:crypto";
 import {
   DeleteObjectCommand,
   GetObjectCommand,
+  HeadObjectCommand,
   ListObjectsV2Command,
   PutObjectCommand,
   S3Client,

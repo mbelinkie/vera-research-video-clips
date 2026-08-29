@@ -134,7 +134,32 @@ export const UserHandleSchema = z
 export const AuthenticatedActorSchema = z.object({
   userId: IdSchema,
   externalSubject: z.string().min(1).max(512),
+  /**
+   * Platform-wide authority is intentionally distinct from project membership.
+   * Authentication adapters derive this later; older authenticated sessions
+   * remain valid while that derivation is rolled out.
+   */
+  platformCapabilities: z
+    .array(z.enum(["manage_language_services"]))
+    .max(32)
+    .optional(),
 });
+
+export const PlatformCapabilityGuardSchema = z
+  .object({
+    required: z
+      .array(z.enum(["manage_language_services"]))
+      .min(1)
+      .max(32),
+  })
+  .strict();
+
+export function hasPlatformCapability(
+  actor: z.infer<typeof AuthenticatedActorSchema>,
+  capability: z.infer<typeof PlatformCapabilityGuardSchema>["required"][number],
+): boolean {
+  return actor.platformCapabilities?.includes(capability) ?? false;
+}
 
 export const DesktopAuthStatusSchema = z
   .object({
@@ -4793,10 +4818,976 @@ export const BatchInputListSchema = z
   .min(1)
   .max(500);
 
+/** Opaque registry identity; never a closed vendor enum. */
+export const ProviderIdSchema = z
+  .string()
+  .trim()
+  .min(3)
+  .max(160)
+  .regex(
+    /^[a-z0-9](?:[a-z0-9.-]{1,158}[a-z0-9])?$/,
+    "Provider IDs must be stable lowercase identifiers, not paths or URLs.",
+  );
+
+export const LanguageServiceKindSchema = z.enum([
+  "translation",
+  "transcription",
+]);
+export const CloudProviderStateSchema = z.enum([
+  "draft",
+  "enabled",
+  "draining",
+  "disabled",
+  "suspended",
+]);
+export const ProviderInputModeSchema = z.enum([
+  "text_segments",
+  "object_uri",
+  "direct_upload",
+  "byte_stream",
+  "source_url",
+]);
+
+export const ProviderLanguageCapabilitySchema = z
+  .object({
+    language: LanguageTagSchema,
+    roles: z
+      .array(z.enum(["source", "target", "detected"]))
+      .min(1)
+      .max(3),
+    supportsAutoDetection: z.boolean().default(false),
+  })
+  .strict();
+
+export const ProviderDisclosureSchema = z
+  .object({
+    version: z.number().int().positive(),
+    title: z.string().trim().min(1).max(160),
+    summary: z.string().trim().min(1).max(4_000),
+    dataCategories: z
+      .array(z.enum(["transcript_text", "audio_media", "metadata"]))
+      .min(1)
+      .max(3),
+    publishedAt: UtcTimestampSchema,
+  })
+  .strict();
+
+export const ProviderPricingUnitSchema = z.enum([
+  "characters",
+  "audio_seconds",
+  "requests",
+  "compound",
+]);
+
+export const ProviderPricingScheduleSchema = z
+  .object({
+    currency: z
+      .string()
+      .trim()
+      .regex(/^[A-Z]{3}$/),
+    unit: ProviderPricingUnitSchema,
+    amountMicros: z.number().int().nonnegative(),
+    quantity: z.number().positive(),
+    effectiveAt: UtcTimestampSchema,
+    description: z.string().trim().min(1).max(500).optional(),
+  })
+  .strict();
+
+/**
+ * An opaque server-side handle to a credential kept in a protected secret
+ * store. It deliberately cannot be an API key, password, or serialized
+ * credential value.
+ */
+export const ProtectedCredentialReferenceSchema = z
+  .string()
+  .trim()
+  .min(8)
+  .max(512)
+  .regex(
+    /^(?:credential|keychain|kms|secret|vault):[A-Za-z0-9._:/-]+$/,
+    "Credential configuration must be a protected-store reference.",
+  );
+
+/** Renderer-safe descriptor. Credential values are never represented here. */
+export const CloudProviderDescriptorSchema = z
+  .object({
+    id: ProviderIdSchema,
+    service: LanguageServiceKindSchema,
+    displayName: z.string().trim().min(1).max(160),
+    adapterContractVersion: z.number().int().positive(),
+    configurationRevision: z.string().trim().min(1).max(160),
+    capabilityRevision: z.string().trim().min(1).max(160),
+    supportedLanguages: z.array(ProviderLanguageCapabilitySchema).max(1_000),
+    inputModes: z.array(ProviderInputModeSchema).min(1).max(5),
+    disclosure: ProviderDisclosureSchema,
+    pricing: ProviderPricingScheduleSchema,
+    state: CloudProviderStateSchema,
+  })
+  .strict()
+  .superRefine((descriptor, context) => {
+    if (
+      new Set(descriptor.supportedLanguages.map((item) => item.language))
+        .size !== descriptor.supportedLanguages.length
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["supportedLanguages"],
+        message: "A provider can describe each normalized language only once.",
+      });
+    }
+  });
+
+/** Server-only configuration: it intentionally contains a protected reference,
+ * never a credential value, and is never nested in a public descriptor. */
+export const CloudProviderServerConfigurationSchema = z
+  .object({
+    providerId: ProviderIdSchema,
+    region: z.string().trim().min(1).max(160).optional(),
+    protectedCredentialReference: ProtectedCredentialReferenceSchema,
+    version: z.number().int().positive(),
+    updatedAt: UtcTimestampSchema,
+  })
+  .strict();
+
+export const CloudProviderConfigurationAuditSchema = z
+  .object({
+    id: IdSchema,
+    providerId: ProviderIdSchema,
+    actorId: IdSchema,
+    priorVersion: z.number().int().nonnegative(),
+    nextVersion: z.number().int().positive(),
+    changedFields: z
+      .array(
+        z.enum([
+          "region",
+          "protected_credential_reference",
+          "pricing",
+          "disclosure",
+        ]),
+      )
+      .min(1)
+      .max(4),
+    changedAt: UtcTimestampSchema,
+    reason: z.string().trim().min(1).max(1_000),
+  })
+  .strict()
+  .superRefine((audit, context) => {
+    if (new Set(audit.changedFields).size !== audit.changedFields.length) {
+      context.addIssue({
+        code: "custom",
+        path: ["changedFields"],
+        message: "Configuration audit fields must be unique.",
+      });
+    }
+  });
+
+const CloudExecutionPolicyBaseSchema = z
+  .object({
+    schemaVersion: z.literal(1),
+    execution: z.enum(["local", "cloud"]),
+    providerId: ProviderIdSchema.optional(),
+    /** Cloud work can fall back only to its corresponding local implementation. */
+    fallback: z.enum(["none", "local"]).default("local"),
+  })
+  .strict()
+  .superRefine((policy, context) => {
+    if ((policy.execution === "cloud") !== (policy.providerId !== undefined)) {
+      context.addIssue({
+        code: "custom",
+        path: [policy.execution === "cloud" ? "providerId" : "execution"],
+        message: "Cloud execution requires exactly one provider ID.",
+      });
+    }
+  });
+
+export const TranslationExecutionPolicySchema = CloudExecutionPolicyBaseSchema;
+export const TranscriptionExecutionPolicySchema =
+  CloudExecutionPolicyBaseSchema;
+
+export const CloudProviderAccessStateSchema = z.enum([
+  "requested",
+  "approved",
+  "denied",
+  "withdrawn",
+  "revoked",
+]);
+
+export const CloudProviderAccessRequestSchema = z
+  .object({
+    id: IdSchema,
+    providerId: ProviderIdSchema,
+    service: LanguageServiceKindSchema,
+    accountId: IdSchema,
+    disclosureVersion: z.number().int().positive(),
+    consentAcceptedAt: UtcTimestampSchema,
+    state: CloudProviderAccessStateSchema,
+    decisionBy: IdSchema.optional(),
+    decisionAt: UtcTimestampSchema.optional(),
+    decisionReason: z.string().trim().min(1).max(500).optional(),
+    version: z.number().int().positive(),
+    createdAt: UtcTimestampSchema,
+    updatedAt: UtcTimestampSchema,
+  })
+  .strict()
+  .superRefine((request, context) => {
+    const decided = ["approved", "denied", "revoked"].includes(request.state);
+    if (
+      decided !==
+      (request.decisionBy !== undefined && request.decisionAt !== undefined)
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "Provider access decision evidence must match its state.",
+      });
+    }
+  });
+
+export const CloudProviderAccessDecisionSchema = z
+  .object({
+    action: z.enum(["approve", "deny", "revoke"]),
+    expectedVersion: z.number().int().positive(),
+    idempotencyKey: z.string().trim().min(1).max(512),
+    reason: z.string().trim().min(1).max(500).optional(),
+  })
+  .strict();
+
+export const CloudProviderPreferenceSchema = z
+  .object({
+    service: LanguageServiceKindSchema,
+    providerId: ProviderIdSchema,
+    accessRequestId: IdSchema,
+    version: z.number().int().positive(),
+    updatedAt: UtcTimestampSchema,
+  })
+  .strict();
+
+export const UpdateCloudProviderPreferenceRequestSchema = z
+  .object({
+    providerId: ProviderIdSchema,
+    accessRequestId: IdSchema,
+    expectedVersion: z.number().int().nonnegative(),
+    idempotencyKey: z.string().trim().min(1).max(512),
+  })
+  .strict();
+export const ClearCloudProviderPreferenceRequestSchema = z
+  .object({
+    expectedVersion: z.number().int().positive(),
+    idempotencyKey: z.string().trim().min(1).max(512),
+  })
+  .strict();
+
+export const CreateCloudProviderAccessRequestSchema = z
+  .object({
+    providerId: ProviderIdSchema,
+    service: LanguageServiceKindSchema,
+    disclosureVersion: z.number().int().positive(),
+    consentAccepted: z.literal(true),
+    idempotencyKey: z.string().trim().min(1).max(512),
+  })
+  .strict();
+
+export const WithdrawCloudProviderAccessRequestSchema = z
+  .object({
+    expectedVersion: z.number().int().positive(),
+    idempotencyKey: z.string().trim().min(1).max(512),
+  })
+  .strict();
+
+export const IssueCloudProviderLaunchGrantRequestSchema = z
+  .object({
+    providerId: ProviderIdSchema,
+    service: LanguageServiceKindSchema,
+    accessRequestId: IdSchema,
+    expectedAccessVersion: z.number().int().positive(),
+    idempotencyKey: z.string().trim().min(1).max(512),
+  })
+  .strict();
+
+export const RevokeCloudProviderLaunchGrantRequestSchema = z
+  .object({
+    expectedVersion: z.number().int().positive(),
+    idempotencyKey: z.string().trim().min(1).max(512),
+  })
+  .strict();
+
+export const UpdateCloudProviderStateRequestSchema = z
+  .object({
+    state: CloudProviderStateSchema,
+    recommended: z.boolean().optional(),
+    expectedVersion: z.number().int().positive(),
+    idempotencyKey: z.string().trim().min(1).max(512),
+  })
+  .strict();
+
+export const UpdateCloudProviderConfigurationRequestSchema = z
+  .object({
+    region: z.string().trim().min(1).max(160).optional(),
+    protectedCredentialReference: ProtectedCredentialReferenceSchema.optional(),
+    pricing: ProviderPricingScheduleSchema.optional(),
+    disclosure: ProviderDisclosureSchema.optional(),
+    expectedVersion: z.number().int().positive(),
+    idempotencyKey: z.string().trim().min(1).max(512),
+    reason: z.string().trim().min(1).max(1_000),
+  })
+  .strict()
+  .refine(
+    (request) =>
+      request.region !== undefined ||
+      request.protectedCredentialReference !== undefined ||
+      request.pricing !== undefined ||
+      request.disclosure !== undefined,
+    {
+      message: "Provider configuration update must change at least one field.",
+    },
+  );
+
+export const CloudProviderLaunchGrantSchema = z
+  .object({
+    id: IdSchema,
+    providerId: ProviderIdSchema,
+    service: LanguageServiceKindSchema,
+    accessRequestId: IdSchema,
+    expiresAt: UtcTimestampSchema,
+    /** Opaque reference only; the grant secret stays in the desktop main process. */
+    grantReference: z.string().trim().min(1).max(512),
+    version: z.number().int().positive(),
+    issuedAt: UtcTimestampSchema,
+  })
+  .strict();
+
+export const CloudProviderUsageSchema = z
+  .object({
+    id: IdSchema,
+    providerId: ProviderIdSchema,
+    service: LanguageServiceKindSchema,
+    accountId: IdSchema,
+    operationId: IdSchema.optional(),
+    pricing: ProviderPricingScheduleSchema,
+    quantity: z.number().nonnegative(),
+    estimatedCostMicros: z.number().int().nonnegative(),
+    recordedAt: UtcTimestampSchema,
+  })
+  .strict();
+
+export const CloudProviderOperationStateSchema = z.enum([
+  "staging",
+  "submitted",
+  "running",
+  "succeeded",
+  "failed",
+  "canceled",
+]);
+export const CloudProviderCleanupStateSchema = z.enum([
+  "not_required",
+  "pending",
+  "completed",
+  "failed",
+]);
+
+export const CloudProviderOperationAttemptSchema = z
+  .object({
+    attempt: z.number().int().positive(),
+    externalOperationReference: z.string().trim().min(1).max(1_024).optional(),
+    state: CloudProviderOperationStateSchema,
+    progressPercent: z.number().int().min(0).max(100).optional(),
+    startedAt: UtcTimestampSchema,
+    finishedAt: UtcTimestampSchema.optional(),
+    sanitizedFailureCode: z.string().trim().min(1).max(160).optional(),
+  })
+  .strict();
+
+export const CloudProviderCleanupEvidenceSchema = z
+  .object({
+    state: CloudProviderCleanupStateSchema,
+    completedAt: UtcTimestampSchema.optional(),
+    sanitizedFailureCode: z.string().trim().min(1).max(160).optional(),
+  })
+  .strict()
+  .superRefine((cleanup, context) => {
+    if (cleanup.state === "completed" && cleanup.completedAt === undefined) {
+      context.addIssue({
+        code: "custom",
+        path: ["completedAt"],
+        message: "Completed cleanup needs a timestamp.",
+      });
+    }
+    if (
+      (cleanup.state === "failed") !==
+      (cleanup.sanitizedFailureCode !== undefined)
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["sanitizedFailureCode"],
+        message: "Only failed cleanup carries a sanitized failure code.",
+      });
+    }
+  });
+
+export const CloudProviderOperationSchema = z
+  .object({
+    id: IdSchema,
+    providerId: ProviderIdSchema,
+    service: LanguageServiceKindSchema,
+    accountId: IdSchema,
+    policySnapshot: CloudExecutionPolicyBaseSchema,
+    configurationRevision: z.string().trim().min(1).max(160),
+    capabilityRevision: z.string().trim().min(1).max(160),
+    inputMode: ProviderInputModeSchema,
+    state: CloudProviderOperationStateSchema,
+    attempts: z.array(CloudProviderOperationAttemptSchema).max(100),
+    cleanup: CloudProviderCleanupEvidenceSchema,
+    terminalAt: UtcTimestampSchema.optional(),
+    createdAt: UtcTimestampSchema,
+    updatedAt: UtcTimestampSchema,
+  })
+  .strict()
+  .superRefine((operation, context) => {
+    if (
+      operation.policySnapshot.execution !== "cloud" ||
+      operation.policySnapshot.providerId !== operation.providerId
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["policySnapshot"],
+        message:
+          "A cloud operation must retain its exact cloud-provider policy.",
+      });
+    }
+    if (
+      new Set(operation.attempts.map((attempt) => attempt.attempt)).size !==
+      operation.attempts.length
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["attempts"],
+        message: "Provider operation attempts must be unique.",
+      });
+    }
+    const terminal = ["succeeded", "failed", "canceled"].includes(
+      operation.state,
+    );
+    if (terminal !== (operation.terminalAt !== undefined)) {
+      context.addIssue({
+        code: "custom",
+        path: ["terminalAt"],
+        message: "Terminal provider operations require terminal evidence only.",
+      });
+    }
+  });
+
+export const LocalModelSourceStateSchema = z.enum(["enabled", "disabled"]);
+export const LocalModelCandidateStateSchema = z.enum([
+  "discovered",
+  "evaluating",
+  "evaluated",
+  "rejected",
+]);
+export const LocalModelAvailabilityStateSchema = z.enum([
+  "enabled",
+  "enabled_by_override",
+  "disabled",
+  "revoked",
+]);
+export const LocalModelFindingClassSchema = z.enum([
+  "hard_safety",
+  "recommendation",
+]);
+export const LocalModelFindingStateSchema = z.enum([
+  "pass",
+  "fail",
+  "not_recommended",
+]);
+
+export const LocalModelSourceSchema = z
+  .object({
+    id: ProviderIdSchema,
+    adapter: z.literal("argos-package-index"),
+    sourceUrl: z.url(),
+    state: LocalModelSourceStateSchema,
+    refreshIntervalHours: z
+      .number()
+      .int()
+      .min(1)
+      .max(24 * 31),
+    version: z.number().int().positive(),
+  })
+  .strict();
+
+export const LocalModelFeedSnapshotSchema = z
+  .object({
+    id: IdSchema,
+    sourceId: ProviderIdSchema,
+    sourceUrl: z.url(),
+    feedSha256: Sha256Schema,
+    rawFeedArtifactId: z.string().trim().min(1).max(512),
+    rawFeedByteSize: z.number().int().positive(),
+    fetchedAt: UtcTimestampSchema,
+    additions: z.number().int().nonnegative(),
+    changes: z.number().int().nonnegative(),
+    removals: z.number().int().nonnegative(),
+  })
+  .strict();
+
+export const LocalModelEvaluationFindingSchema = z
+  .object({
+    code: z.string().trim().min(1).max(160),
+    class: LocalModelFindingClassSchema,
+    state: LocalModelFindingStateSchema,
+    message: z.string().trim().min(1).max(1_000),
+  })
+  .strict()
+  .superRefine((finding, context) => {
+    if (
+      finding.class === "hard_safety" &&
+      finding.state === "not_recommended"
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["state"],
+        message: "Hard-safety findings must pass or fail.",
+      });
+    }
+    if (finding.class === "recommendation" && finding.state === "fail") {
+      context.addIssue({
+        code: "custom",
+        path: ["state"],
+        message: "Recommendation findings cannot be hard failures.",
+      });
+    }
+  });
+
+export const LocalModelCandidateSchema = z
+  .object({
+    id: IdSchema,
+    sourceId: ProviderIdSchema,
+    feedSnapshotId: IdSchema,
+    sourceLanguage: LanguageTagSchema,
+    targetLanguage: LanguageTagSchema,
+    packageVersion: z.string().trim().min(1).max(160),
+    runtimeFamily: z.string().trim().min(1).max(160),
+    runtimeVersion: z.string().trim().min(1).max(160),
+    artifactUrl: z.url(),
+    rawEntry: z.record(z.string(), z.unknown()),
+    rawEntrySha256: Sha256Schema,
+    rawEntryArtifactId: z.string().trim().min(1).max(512),
+    version: z.number().int().positive(),
+    state: LocalModelCandidateStateSchema,
+    discoveredAt: UtcTimestampSchema,
+  })
+  .strict();
+
+export const LocalModelEvaluationSchema = z
+  .object({
+    id: IdSchema,
+    candidateId: IdSchema,
+    revision: z.number().int().positive(),
+    evaluationSchemaVersion: z.literal(1),
+    evaluatedBy: IdSchema,
+    rawEvidenceArtifactIds: z
+      .array(z.string().trim().min(1).max(512))
+      .min(1)
+      .max(100),
+    byteSize: z.number().int().positive(),
+    sha256: Sha256Schema,
+    archiveFormat: z.string().trim().min(1).max(80),
+    archiveManifest: z.record(z.string(), z.unknown()),
+    tokenizerFormat: z.string().trim().min(1).max(160).optional(),
+    modelFormat: z.string().trim().min(1).max(160).optional(),
+    licenseEvidence: z
+      .array(z.string().trim().min(1).max(2_048))
+      .min(1)
+      .max(100),
+    attributionEvidence: z
+      .array(z.string().trim().min(1).max(2_048))
+      .min(1)
+      .max(100),
+    trainingProvenanceEvidence: z
+      .array(z.string().trim().min(1).max(2_048))
+      .min(1)
+      .max(100),
+    qualityResults: z
+      .record(z.string(), z.unknown())
+      .refine(
+        (value) => Object.keys(value).length > 0,
+        "Quality results must contain evaluated evidence.",
+      ),
+    compatibleRuntimeVersions: z
+      .array(z.string().trim().min(1).max(160))
+      .min(1)
+      .max(100),
+    compatiblePlatforms: z
+      .array(z.string().trim().min(1).max(160))
+      .min(1)
+      .max(100),
+    findings: z.array(LocalModelEvaluationFindingSchema).min(1).max(100),
+    evaluatedAt: UtcTimestampSchema,
+  })
+  .strict()
+  .superRefine((evaluation, context) => {
+    if (
+      !evaluation.findings.some((finding) => finding.class === "hard_safety")
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["findings"],
+        message: "Every evaluation must record hard-safety evidence.",
+      });
+    }
+  });
+
+export const LocalModelOperationKindSchema = z.enum([
+  "refresh_source",
+  "evaluate_candidate",
+  "mirror_artifact",
+  "publish_catalog_release",
+]);
+export const LocalModelOperationStateSchema = z.enum([
+  "queued",
+  "running",
+  "succeeded",
+  "failed",
+  "canceled",
+]);
+export const LocalModelOperationSchema = z
+  .object({
+    id: IdSchema,
+    kind: LocalModelOperationKindSchema,
+    sourceId: ProviderIdSchema.optional(),
+    candidateId: IdSchema.optional(),
+    catalogReleaseId: IdSchema.optional(),
+    state: LocalModelOperationStateSchema,
+    version: z.number().int().positive(),
+    idempotencyKey: z.string().trim().min(1).max(512),
+    progressPercent: z.number().int().min(0).max(100),
+    sanitizedFailureCode: z.string().trim().min(1).max(160).optional(),
+    createdBy: IdSchema,
+    createdAt: UtcTimestampSchema,
+    startedAt: UtcTimestampSchema.optional(),
+    heartbeatAt: UtcTimestampSchema.optional(),
+    leaseOwner: z.string().trim().min(1).max(160).optional(),
+    leaseExpiresAt: UtcTimestampSchema.optional(),
+    finishedAt: UtcTimestampSchema.optional(),
+  })
+  .strict()
+  .superRefine((operation, context) => {
+    const requiresSource = operation.kind === "refresh_source";
+    const requiresCandidate = [
+      "evaluate_candidate",
+      "mirror_artifact",
+    ].includes(operation.kind);
+    const publish = operation.kind === "publish_catalog_release";
+    if (
+      (requiresSource &&
+        (operation.sourceId === undefined ||
+          operation.candidateId !== undefined ||
+          operation.catalogReleaseId !== undefined)) ||
+      (requiresCandidate &&
+        (operation.candidateId === undefined ||
+          operation.sourceId !== undefined ||
+          operation.catalogReleaseId !== undefined)) ||
+      (publish &&
+        (operation.sourceId !== undefined ||
+          operation.candidateId !== undefined ||
+          operation.catalogReleaseId === undefined))
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "Model operation references must match the operation kind.",
+      });
+    }
+    if (
+      operation.state === "failed" &&
+      operation.sanitizedFailureCode === undefined
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["sanitizedFailureCode"],
+        message: "A failed model operation needs a sanitized failure code.",
+      });
+    }
+    const leased =
+      operation.leaseOwner !== undefined ||
+      operation.leaseExpiresAt !== undefined;
+    if (
+      leased !==
+      (operation.leaseOwner !== undefined &&
+        operation.leaseExpiresAt !== undefined)
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["leaseOwner"],
+        message: "Operation lease owner and expiry must be recorded together.",
+      });
+    }
+    if (
+      operation.state === "running" &&
+      (operation.startedAt === undefined ||
+        !leased ||
+        operation.heartbeatAt === undefined)
+    ) {
+      context.addIssue({
+        code: "custom",
+        message:
+          "Running model operations require start, lease, and heartbeat evidence.",
+      });
+    }
+    if (
+      ["succeeded", "failed", "canceled"].includes(operation.state) &&
+      operation.finishedAt === undefined
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["finishedAt"],
+        message: "Terminal model operations require completion evidence.",
+      });
+    }
+  });
+
+/** Durable desktop-side lifecycle record; no credential or grant secret is present. */
+export const LocalModelRuntimeOperationKindSchema = z.enum([
+  "download",
+  "verify",
+  "activate",
+  "delete",
+]);
+export const LocalModelRuntimeOperationSchema = z
+  .object({
+    id: IdSchema,
+    localModelVersionId: IdSchema,
+    kind: LocalModelRuntimeOperationKindSchema,
+    idempotencyKey: z.string().trim().min(1).max(512),
+    state: LocalModelOperationStateSchema,
+    version: z.number().int().positive(),
+    progressPercent: z.number().int().min(0).max(100),
+    sanitizedFailureCode: z.string().trim().min(1).max(160).optional(),
+    leaseId: z.string().trim().min(1).max(160).optional(),
+    leaseExpiresAt: UtcTimestampSchema.optional(),
+    heartbeatAt: UtcTimestampSchema.optional(),
+    createdAt: UtcTimestampSchema,
+    startedAt: UtcTimestampSchema.optional(),
+    finishedAt: UtcTimestampSchema.optional(),
+  })
+  .strict()
+  .superRefine((operation, context) => {
+    const leased =
+      operation.leaseId !== undefined || operation.leaseExpiresAt !== undefined;
+    if (
+      leased !==
+      (operation.leaseId !== undefined &&
+        operation.leaseExpiresAt !== undefined)
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["leaseId"],
+        message:
+          "Runtime operation lease ID and expiry must be recorded together.",
+      });
+    }
+    if (
+      operation.state === "running" &&
+      (operation.startedAt === undefined ||
+        operation.heartbeatAt === undefined ||
+        !leased)
+    ) {
+      context.addIssue({
+        code: "custom",
+        message:
+          "Running runtime operations require start, lease, and heartbeat evidence.",
+      });
+    }
+    if (
+      ["succeeded", "failed", "canceled"].includes(operation.state) &&
+      operation.finishedAt === undefined
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["finishedAt"],
+        message: "Terminal runtime operations require completion evidence.",
+      });
+    }
+    if (
+      (operation.state === "failed") !==
+      (operation.sanitizedFailureCode !== undefined)
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["sanitizedFailureCode"],
+        message:
+          "Only failed runtime operations carry a sanitized failure code.",
+      });
+    }
+  });
+
+export const UpdateLocalModelRuntimeOperationRequestSchema = z
+  .object({
+    expectedVersion: z.number().int().positive(),
+    idempotencyKey: z.string().trim().min(1).max(512),
+  })
+  .strict();
+
+export const LocalModelAvailabilityAuditSchema = z
+  .object({
+    id: IdSchema,
+    localModelVersionId: IdSchema,
+    actorId: IdSchema,
+    priorVersion: z.number().int().nonnegative(),
+    nextVersion: z.number().int().positive(),
+    state: LocalModelAvailabilityStateSchema,
+    reason: z.string().trim().min(1).max(1_000),
+    changedAt: UtcTimestampSchema,
+  })
+  .strict();
+
+const IdempotentModelMutationBaseSchema = z.object({
+  idempotencyKey: z.string().trim().min(1).max(512),
+});
+
+export const RefreshLocalModelSourceRequestSchema =
+  IdempotentModelMutationBaseSchema.extend({
+    expectedVersion: z.number().int().positive(),
+  }).strict();
+export const UpdateLocalModelSourceRequestSchema =
+  IdempotentModelMutationBaseSchema.extend({
+    state: LocalModelSourceStateSchema,
+    refreshIntervalHours: z
+      .number()
+      .int()
+      .min(1)
+      .max(24 * 31)
+      .optional(),
+    expectedVersion: z.number().int().positive(),
+  }).strict();
+export const EvaluateLocalModelCandidateRequestSchema =
+  IdempotentModelMutationBaseSchema.extend({
+    expectedVersion: z.number().int().positive(),
+    expectedState: z.literal("discovered"),
+  }).strict();
+export const UpdateLocalModelVersionAvailabilityRequestSchema =
+  IdempotentModelMutationBaseSchema.extend({
+    state: LocalModelAvailabilityStateSchema,
+    expectedVersion: z.number().int().positive(),
+    reason: z.string().trim().min(1).max(1_000),
+    overrideReason: z.string().trim().min(1).max(1_000).optional(),
+  })
+    .strict()
+    .superRefine((request, context) => {
+      if (
+        (request.state === "enabled_by_override") !==
+        (request.overrideReason !== undefined)
+      ) {
+        context.addIssue({
+          code: "custom",
+          message:
+            "Only an override enablement accepts a required override reason.",
+        });
+      }
+    });
+
+export const LocalModelAvailabilitySchema = z
+  .object({
+    state: LocalModelAvailabilityStateSchema,
+    version: z.number().int().positive(),
+    changedAt: UtcTimestampSchema,
+    changedBy: IdSchema.optional(),
+    overrideReason: z.string().trim().min(1).max(1_000).optional(),
+  })
+  .strict()
+  .superRefine((availability, context) => {
+    const isOverride = availability.state === "enabled_by_override";
+    if (
+      isOverride !==
+      (availability.changedBy !== undefined &&
+        availability.overrideReason !== undefined)
+    ) {
+      context.addIssue({
+        code: "custom",
+        message:
+          "An override availability state requires actor and reason; non-overrides must omit both.",
+      });
+    }
+  });
+
+export const LocalModelVersionSchema = z
+  .object({
+    id: IdSchema,
+    candidateId: IdSchema,
+    evaluationId: IdSchema,
+    sourceLanguage: LanguageTagSchema,
+    targetLanguage: LanguageTagSchema,
+    packageVersion: z.string().trim().min(1).max(160),
+    runtimeFamily: z.string().trim().min(1).max(160),
+    runtimeVersion: z.string().trim().min(1).max(160),
+    artifactSha256: Sha256Schema,
+    artifactByteSize: z.number().int().positive(),
+    mirroredArtifactId: z.string().trim().min(1).max(512),
+    availability: LocalModelAvailabilitySchema,
+  })
+  .strict();
+
+export const SignedLocalModelCatalogReleaseSchema = z
+  .object({
+    contractVersion: z.literal(1),
+    id: IdSchema,
+    sequence: z.number().int().positive(),
+    catalogSha256: Sha256Schema,
+    signingKeyId: z.string().trim().min(1).max(160),
+    signatureBase64: z
+      .string()
+      .trim()
+      .min(1)
+      .max(16_384)
+      .regex(/^[A-Za-z0-9+/]+={0,2}$/),
+    publishedAt: UtcTimestampSchema,
+    expiresAt: UtcTimestampSchema,
+    canonicalPayload: z.string().trim().min(2).max(20_000_000),
+    versions: z.array(LocalModelVersionSchema).max(10_000),
+    /** Explicit deletion instruction; omitted/disabled versions remain retainable for rollback or offline use. */
+    revokedVersionIds: z.array(IdSchema).max(10_000).default([]),
+  })
+  .strict()
+  .superRefine((release, context) => {
+    if (release.expiresAt <= release.publishedAt) {
+      context.addIssue({
+        code: "custom",
+        path: ["expiresAt"],
+        message: "A signed catalog release must expire after publication.",
+      });
+    }
+    const versionIds = new Set(release.versions.map((version) => version.id));
+    if (
+      new Set(release.revokedVersionIds).size !==
+      release.revokedVersionIds.length
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["revokedVersionIds"],
+        message: "Release revocations must be unique.",
+      });
+    }
+    if (release.revokedVersionIds.some((id) => versionIds.has(id))) {
+      context.addIssue({
+        code: "custom",
+        path: ["revokedVersionIds"],
+        message: "A release cannot publish and revoke the same model version.",
+      });
+    }
+  });
+
+export const LocalModelArtifactDownloadSchema = z
+  .object({
+    catalogReleaseId: IdSchema,
+    versionId: IdSchema,
+    artifactSha256: Sha256Schema,
+    artifactByteSize: z.number().int().positive(),
+    downloadUrl: z.string().trim().min(1).max(16_384),
+    expiresAt: UtcTimestampSchema,
+  })
+  .strict();
+
 export const CloudTranslationConsentSchema = z
   .object({
-    provider: z.literal("amazon-translate"),
-    disclosureVersion: z.literal(1),
+    provider: ProviderIdSchema,
+    disclosureVersion: z.number().int().positive(),
     transcriptTextTransferAccepted: z.literal(true),
   })
   .strict();
@@ -4807,6 +5798,8 @@ export const BatchOptionsSchema = z.object({
   sourcePolicy: BatchSourcePolicySchema.default("prefer-existing"),
   executionLocation: z.enum(["local", "hosted"]).default("local"),
   priority: BatchPrioritySchema.default("normal"),
+  /** Absence is compatibility-only and is interpreted as local Whisper. */
+  transcriptionExecutionPolicy: TranscriptionExecutionPolicySchema.optional(),
   translationConsent: CloudTranslationConsentSchema.optional(),
 });
 
@@ -5007,6 +6000,7 @@ export const TranscriptionBatchSchema = z
     sourcePolicy: BatchSourcePolicySchema,
     executionLocation: z.enum(["local", "hosted"]),
     priority: BatchPrioritySchema,
+    transcriptionExecutionPolicy: TranscriptionExecutionPolicySchema,
     hostedApproval: HostedTranscriptionApprovalSchema.optional(),
     translationConsent: CloudTranslationConsentSchema.optional(),
     dispatchStatus: z.enum(["active", "paused", "canceled"]),
@@ -7653,6 +8647,10 @@ export const TranscriptionJobPayloadSchema = z
     sourcePolicy: BatchSourcePolicySchema,
     executionLocation: z.enum(["local", "hosted"]),
     priority: BatchPrioritySchema,
+    transcriptionExecutionPolicy: TranscriptionExecutionPolicySchema.optional(),
+    /** Internal durable authority references; never provider secrets. */
+    transcriptionGrantId: IdSchema.optional(),
+    translationGrantId: IdSchema.optional(),
     translationConsent: CloudTranslationConsentSchema.optional(),
     creatorReportedLanguage: LanguageTagSchema.optional(),
     /** Absent only for legacy queued work created before language gating. */
@@ -7724,6 +8722,9 @@ export type ProjectKind = z.infer<typeof ProjectKindSchema>;
 export type ProjectVisibility = z.infer<typeof ProjectVisibilitySchema>;
 export type ProjectSummary = z.infer<typeof ProjectSummarySchema>;
 export type AuthenticatedActor = z.infer<typeof AuthenticatedActorSchema>;
+export type PlatformCapabilityGuard = z.infer<
+  typeof PlatformCapabilityGuardSchema
+>;
 export type User = z.infer<typeof UserSchema>;
 export type UpdatePreferredLanguageRequest = z.infer<
   typeof UpdatePreferredLanguageRequestSchema
@@ -8485,6 +9486,119 @@ export type MarkProjectVideoActivitySeenResponse = z.infer<
 export type BatchOptions = z.infer<typeof BatchOptionsSchema>;
 export type CloudTranslationConsent = z.infer<
   typeof CloudTranslationConsentSchema
+>;
+export type ProviderId = z.infer<typeof ProviderIdSchema>;
+export type LanguageServiceKind = z.infer<typeof LanguageServiceKindSchema>;
+export type CloudProviderState = z.infer<typeof CloudProviderStateSchema>;
+export type ProviderInputMode = z.infer<typeof ProviderInputModeSchema>;
+export type ProviderLanguageCapability = z.infer<
+  typeof ProviderLanguageCapabilitySchema
+>;
+export type ProviderDisclosure = z.infer<typeof ProviderDisclosureSchema>;
+export type ProviderPricingSchedule = z.infer<
+  typeof ProviderPricingScheduleSchema
+>;
+export type ProtectedCredentialReference = z.infer<
+  typeof ProtectedCredentialReferenceSchema
+>;
+export type CloudProviderDescriptor = z.infer<
+  typeof CloudProviderDescriptorSchema
+>;
+export type CloudProviderServerConfiguration = z.infer<
+  typeof CloudProviderServerConfigurationSchema
+>;
+export type CloudProviderConfigurationAudit = z.infer<
+  typeof CloudProviderConfigurationAuditSchema
+>;
+export type TranslationExecutionPolicy = z.infer<
+  typeof TranslationExecutionPolicySchema
+>;
+export type TranscriptionExecutionPolicy = z.infer<
+  typeof TranscriptionExecutionPolicySchema
+>;
+export type CloudProviderAccessRequest = z.infer<
+  typeof CloudProviderAccessRequestSchema
+>;
+export type CloudProviderPreference = z.infer<
+  typeof CloudProviderPreferenceSchema
+>;
+export type UpdateCloudProviderPreferenceRequest = z.infer<
+  typeof UpdateCloudProviderPreferenceRequestSchema
+>;
+export type ClearCloudProviderPreferenceRequest = z.infer<
+  typeof ClearCloudProviderPreferenceRequestSchema
+>;
+export type CloudProviderAccessDecision = z.infer<
+  typeof CloudProviderAccessDecisionSchema
+>;
+export type CreateCloudProviderAccessRequest = z.infer<
+  typeof CreateCloudProviderAccessRequestSchema
+>;
+export type WithdrawCloudProviderAccessRequest = z.infer<
+  typeof WithdrawCloudProviderAccessRequestSchema
+>;
+export type IssueCloudProviderLaunchGrantRequest = z.infer<
+  typeof IssueCloudProviderLaunchGrantRequestSchema
+>;
+export type RevokeCloudProviderLaunchGrantRequest = z.infer<
+  typeof RevokeCloudProviderLaunchGrantRequestSchema
+>;
+export type UpdateCloudProviderStateRequest = z.infer<
+  typeof UpdateCloudProviderStateRequestSchema
+>;
+export type UpdateCloudProviderConfigurationRequest = z.infer<
+  typeof UpdateCloudProviderConfigurationRequestSchema
+>;
+export type CloudProviderLaunchGrant = z.infer<
+  typeof CloudProviderLaunchGrantSchema
+>;
+export type CloudProviderUsage = z.infer<typeof CloudProviderUsageSchema>;
+export type CloudProviderOperation = z.infer<
+  typeof CloudProviderOperationSchema
+>;
+export type CloudProviderOperationAttempt = z.infer<
+  typeof CloudProviderOperationAttemptSchema
+>;
+export type CloudProviderCleanupEvidence = z.infer<
+  typeof CloudProviderCleanupEvidenceSchema
+>;
+export type LocalModelSource = z.infer<typeof LocalModelSourceSchema>;
+export type LocalModelFeedSnapshot = z.infer<
+  typeof LocalModelFeedSnapshotSchema
+>;
+export type LocalModelCandidate = z.infer<typeof LocalModelCandidateSchema>;
+export type LocalModelEvaluation = z.infer<typeof LocalModelEvaluationSchema>;
+export type LocalModelOperation = z.infer<typeof LocalModelOperationSchema>;
+export type LocalModelRuntimeOperation = z.infer<
+  typeof LocalModelRuntimeOperationSchema
+>;
+export type UpdateLocalModelRuntimeOperationRequest = z.infer<
+  typeof UpdateLocalModelRuntimeOperationRequestSchema
+>;
+export type RefreshLocalModelSourceRequest = z.infer<
+  typeof RefreshLocalModelSourceRequestSchema
+>;
+export type UpdateLocalModelSourceRequest = z.infer<
+  typeof UpdateLocalModelSourceRequestSchema
+>;
+export type EvaluateLocalModelCandidateRequest = z.infer<
+  typeof EvaluateLocalModelCandidateRequestSchema
+>;
+export type UpdateLocalModelVersionAvailabilityRequest = z.infer<
+  typeof UpdateLocalModelVersionAvailabilityRequestSchema
+>;
+export type LocalModelAvailability = z.infer<
+  typeof LocalModelAvailabilitySchema
+>;
+export type LocalModelAvailabilityAudit = z.infer<
+  typeof LocalModelAvailabilityAuditSchema
+>;
+export type LocalModelVersion = z.infer<typeof LocalModelVersionSchema>;
+export type SignedLocalModelCatalogRelease = z.infer<
+  typeof SignedLocalModelCatalogReleaseSchema
+>;
+export type LocalModelArtifactDownload = z.infer<
+  typeof LocalModelArtifactDownloadSchema
 >;
 export type BatchSourcePolicy = z.infer<typeof BatchSourcePolicySchema>;
 export type CaptionTrackCandidate = z.infer<typeof CaptionTrackCandidateSchema>;

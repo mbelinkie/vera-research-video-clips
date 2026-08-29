@@ -1,7 +1,12 @@
+import { createHash } from "node:crypto";
+
 import Fastify, { type FastifyInstance, type FastifyRequest } from "fastify";
 import { z, ZodError } from "zod";
 
-import { AuthenticationError } from "@research-video/auth";
+import {
+  AuthenticationError,
+  requirePlatformCapability,
+} from "@research-video/auth";
 import {
   CatalogConflictError,
   CatalogInvalidRequestError,
@@ -9,6 +14,7 @@ import {
   TranscriptIntegrityError,
   type SharedProjectCatalog,
 } from "@research-video/catalog";
+import type { LanguageServiceControlPlane } from "@research-video/catalog/language-services";
 import {
   AddProjectMemberRequestSchema,
   CreateProjectInvitationRequestSchema,
@@ -63,6 +69,21 @@ import {
   FailProjectKeywordScanRequestSchema,
   CreateProjectKeywordScanArtifactUploadRequestSchema,
   LookupDerivedTranslationSchema,
+  LocalModelArtifactDownloadSchema,
+  CloudProviderAccessDecisionSchema,
+  ClearCloudProviderPreferenceRequestSchema,
+  CreateCloudProviderAccessRequestSchema,
+  EvaluateLocalModelCandidateRequestSchema,
+  IssueCloudProviderLaunchGrantRequestSchema,
+  ProviderIdSchema,
+  RefreshLocalModelSourceRequestSchema,
+  RevokeCloudProviderLaunchGrantRequestSchema,
+  UpdateCloudProviderConfigurationRequestSchema,
+  UpdateCloudProviderPreferenceRequestSchema,
+  UpdateCloudProviderStateRequestSchema,
+  UpdateLocalModelVersionAvailabilityRequestSchema,
+  UpdateLocalModelSourceRequestSchema,
+  WithdrawCloudProviderAccessRequestSchema,
   RequestDerivedTranslationSchema,
   CancelTranscriptionBatchItemRequestSchema,
   RetryTranscriptionBatchItemRequestSchema,
@@ -131,17 +152,34 @@ import {
   type TranslationProvider,
   type VideoMetadataProvider,
 } from "@research-video/providers";
+import type { LanguageServiceRegistry } from "@research-video/providers/language-service-registry";
 import { transcriptToSrt } from "@research-video/transcript";
 
 export interface CloudApiDependencies {
   catalog: SharedProjectCatalog;
+  languageServices?: LanguageServiceControlPlane;
   authenticate(request: FastifyRequest): Promise<AuthenticatedActor>;
   publicApiOrigin?: string;
   verifyActiveTranscriptArtifacts?: boolean;
   videoMetadataProvider?: VideoMetadataProvider;
   sourceSearchProviders?: Partial<Record<SourceProvider, SourceSearchProvider>>;
   translationProvider?: TranslationProvider;
+  languageServiceRegistry?: LanguageServiceRegistry;
   queueDeliveryRequired?: boolean;
+  localModelArtifactDownloads?: {
+    issue(input: {
+      catalogReleaseId: string;
+      versionId: string;
+      mirroredArtifactId: string;
+      artifactSha256: string;
+      artifactByteSize: number;
+    }): Promise<{ downloadUrl: string; expiresAt: string }>;
+    read?(input: {
+      mirroredArtifactId: string;
+      artifactSha256: string;
+      artifactByteSize: number;
+    }): Promise<{ bytes: Uint8Array; contentType: string }>;
+  };
 }
 
 const IdParamsSchema = z.object({ projectId: z.uuid() });
@@ -150,6 +188,10 @@ const ProjectInvitationParamsSchema = IdParamsSchema.extend({
   invitationId: z.uuid(),
 });
 const ProjectVideoParamsSchema = IdParamsSchema.extend({ videoId: z.uuid() });
+const LocalModelDownloadParamsSchema = z.object({
+  releaseId: z.uuid(),
+  versionId: z.uuid(),
+});
 const ProjectVideoImportParamsSchema = ProjectVideoParamsSchema.extend({
   importId: z.uuid(),
 });
@@ -190,6 +232,15 @@ const ProjectKeywordScanParamsSchema = IdParamsSchema.extend({
   scanId: z.uuid(),
 });
 const JobParamsSchema = z.object({ jobId: z.uuid() });
+const ProviderParamsSchema = z.object({ providerId: ProviderIdSchema });
+const ProviderPreferenceParamsSchema = z.object({
+  service: z.enum(["translation", "transcription"]),
+});
+const AccessRequestParamsSchema = z.object({ requestId: z.uuid() });
+const GrantParamsSchema = z.object({ grantId: z.uuid() });
+const LocalModelSourceParamsSchema = z.object({ sourceId: ProviderIdSchema });
+const LocalModelCandidateParamsSchema = z.object({ candidateId: z.uuid() });
+const LocalModelVersionParamsSchema = z.object({ versionId: z.uuid() });
 const CreateUploadSchema = z.object({
   lineageId: z.uuid(),
   version: z.number().int().positive(),
@@ -268,6 +319,333 @@ export function createCloudApi(
     const body = RegisterUserRequestSchema.parse(request.body);
     return catalog.registerUser(actor, body.displayName, body.handle);
   });
+
+  const languageServices = dependencies.languageServices;
+  const requireTranscriptionProviderAccess = async (
+    actor: AuthenticatedActor,
+    options: BatchOptions,
+  ) => {
+    const policy = options.transcriptionExecutionPolicy;
+    if (!policy || policy.execution === "local") return undefined;
+    if (!policy.providerId) {
+      throw new CatalogInvalidRequestError(
+        "Cloud transcription requires a provider identifier.",
+      );
+    }
+    if (!languageServices) {
+      throw new CatalogInvalidRequestError(
+        "Cloud transcription is not configured for this deployment.",
+      );
+    }
+    return languageServices.requireApprovedProviderAccess(
+      actor,
+      policy.providerId,
+      "transcription",
+    );
+  };
+  const requireTranslationProviderAccess = async (
+    actor: AuthenticatedActor,
+    options: BatchOptions,
+  ) => {
+    const consent = options.translationConsent;
+    if (!consent) return undefined;
+    if (!languageServices) {
+      throw new CatalogInvalidRequestError(
+        "Cloud translation is not configured for this deployment.",
+      );
+    }
+    return languageServices.requireApprovedProviderAccess(
+      actor,
+      consent.provider,
+      "translation",
+    );
+  };
+  if (languageServices) {
+    const authenticateLanguageAdmin = async (request: FastifyRequest) => {
+      const actor = await authenticate(request);
+      requirePlatformCapability(actor, "manage_language_services");
+      return actor;
+    };
+
+    app.get("/api/language-service-providers", async (request) => {
+      await authenticate(request);
+      return languageServices.listEnabledProviders();
+    });
+
+    app.get("/api/account/cloud-provider-access", async (request) =>
+      languageServices.listAccountAccess(await authenticate(request)),
+    );
+
+    app.get("/api/account/cloud-provider-preferences", async (request) =>
+      languageServices.getAccountProviderPreferences(
+        await authenticate(request),
+      ),
+    );
+
+    app.put(
+      "/api/account/cloud-provider-preferences/:service",
+      async (request) => {
+        const { service } = ProviderPreferenceParamsSchema.parse(
+          request.params,
+        );
+        return languageServices.updateAccountProviderPreference(
+          await authenticate(request),
+          service,
+          UpdateCloudProviderPreferenceRequestSchema.parse(request.body),
+        );
+      },
+    );
+    app.delete(
+      "/api/account/cloud-provider-preferences/:service",
+      async (request, reply) => {
+        const { service } = ProviderPreferenceParamsSchema.parse(
+          request.params,
+        );
+        await languageServices.clearAccountProviderPreference(
+          await authenticate(request),
+          service,
+          ClearCloudProviderPreferenceRequestSchema.parse(request.body),
+        );
+        return reply.status(204).send();
+      },
+    );
+
+    app.post("/api/account/cloud-provider-requests", async (request, reply) => {
+      const result = await languageServices.requestProviderAccess(
+        await authenticate(request),
+        CreateCloudProviderAccessRequestSchema.parse(request.body),
+      );
+      return reply.status(201).send(result);
+    });
+
+    app.post(
+      "/api/account/cloud-provider-access/:requestId/withdraw",
+      async (request) => {
+        const { requestId } = AccessRequestParamsSchema.parse(request.params);
+        return languageServices.withdrawProviderAccess(
+          await authenticate(request),
+          requestId,
+          WithdrawCloudProviderAccessRequestSchema.parse(request.body),
+        );
+      },
+    );
+
+    app.post(
+      "/api/account/cloud-provider-launch-grants",
+      async (request, reply) => {
+        const result = await languageServices.issueLaunchGrant(
+          await authenticate(request),
+          IssueCloudProviderLaunchGrantRequestSchema.parse(request.body),
+        );
+        return reply.status(201).send(result);
+      },
+    );
+
+    app.delete(
+      "/api/account/cloud-provider-launch-grants/:grantId",
+      async (request, reply) => {
+        const { grantId } = GrantParamsSchema.parse(request.params);
+        await languageServices.revokeLaunchGrant(
+          await authenticate(request),
+          grantId,
+          RevokeCloudProviderLaunchGrantRequestSchema.parse(request.body),
+        );
+        return reply.status(204).send();
+      },
+    );
+
+    app.get("/api/admin/language-service-providers", async (request) => {
+      await authenticateLanguageAdmin(request);
+      return languageServices.listAdminProviders();
+    });
+
+    app.post(
+      "/api/admin/language-service-providers/:providerId/state",
+      async (request) => {
+        const actor = await authenticateLanguageAdmin(request);
+        const { providerId } = ProviderParamsSchema.parse(request.params);
+        return languageServices.updateProviderState(
+          actor,
+          providerId,
+          UpdateCloudProviderStateRequestSchema.parse(request.body),
+        );
+      },
+    );
+
+    app.post(
+      "/api/admin/language-service-providers/:providerId/configuration",
+      async (request) => {
+        const actor = await authenticateLanguageAdmin(request);
+        const { providerId } = ProviderParamsSchema.parse(request.params);
+        return languageServices.updateProviderConfiguration(
+          actor,
+          providerId,
+          UpdateCloudProviderConfigurationRequestSchema.parse(request.body),
+        );
+      },
+    );
+
+    app.get("/api/admin/cloud-provider-requests", async (request) => {
+      await authenticateLanguageAdmin(request);
+      return languageServices.listPendingAccessRequests();
+    });
+
+    app.post(
+      "/api/admin/cloud-provider-requests/:requestId/decision",
+      async (request) => {
+        const actor = await authenticateLanguageAdmin(request);
+        const { requestId } = AccessRequestParamsSchema.parse(request.params);
+        return languageServices.decideProviderAccess(
+          actor,
+          requestId,
+          CloudProviderAccessDecisionSchema.parse(request.body),
+        );
+      },
+    );
+
+    app.get("/api/admin/cloud-provider-usage", async (request) => {
+      await authenticateLanguageAdmin(request);
+      return languageServices.listUsage();
+    });
+
+    app.get("/api/admin/local-model-sources", async (request) => {
+      await authenticateLanguageAdmin(request);
+      return languageServices.listLocalModelSources();
+    });
+
+    app.post(
+      "/api/admin/local-model-sources/:sourceId/state",
+      async (request) => {
+        const actor = await authenticateLanguageAdmin(request);
+        const { sourceId } = LocalModelSourceParamsSchema.parse(request.params);
+        return languageServices.updateLocalModelSource(
+          actor,
+          sourceId,
+          UpdateLocalModelSourceRequestSchema.parse(request.body),
+        );
+      },
+    );
+
+    app.post(
+      "/api/admin/local-model-sources/:sourceId/refresh",
+      async (request, reply) => {
+        const actor = await authenticateLanguageAdmin(request);
+        const { sourceId } = LocalModelSourceParamsSchema.parse(request.params);
+        const operation = await languageServices.queueSourceRefresh(
+          actor,
+          sourceId,
+          RefreshLocalModelSourceRequestSchema.parse(request.body),
+        );
+        return reply.status(202).send(operation);
+      },
+    );
+
+    app.get("/api/admin/local-model-candidates", async (request) => {
+      await authenticateLanguageAdmin(request);
+      return languageServices.listLocalModelCandidates();
+    });
+
+    app.get("/api/admin/local-model-versions", async (request) => {
+      await authenticateLanguageAdmin(request);
+      return languageServices.listLocalModelVersions();
+    });
+
+    app.post(
+      "/api/admin/local-model-candidates/:candidateId/evaluate",
+      async (request, reply) => {
+        const actor = await authenticateLanguageAdmin(request);
+        const { candidateId } = LocalModelCandidateParamsSchema.parse(
+          request.params,
+        );
+        const operation = await languageServices.queueCandidateEvaluation(
+          actor,
+          candidateId,
+          EvaluateLocalModelCandidateRequestSchema.parse(request.body),
+        );
+        return reply.status(202).send(operation);
+      },
+    );
+
+    app.post(
+      "/api/admin/local-model-versions/:versionId/availability",
+      async (request) => {
+        const actor = await authenticateLanguageAdmin(request);
+        const { versionId } = LocalModelVersionParamsSchema.parse(
+          request.params,
+        );
+        return languageServices.updateLocalModelAvailability(
+          actor,
+          versionId,
+          UpdateLocalModelVersionAvailabilityRequestSchema.parse(request.body),
+        );
+      },
+    );
+
+    app.get("/api/local-model-catalog", async (request, reply) => {
+      await authenticate(request);
+      const release = await languageServices.getLocalModelCatalog();
+      return release ? release : reply.status(204).send();
+    });
+
+    if (dependencies.localModelArtifactDownloads) {
+      app.get(
+        "/api/local-model-catalog/:releaseId/versions/:versionId/download",
+        async (request) => {
+          await authenticate(request);
+          const { releaseId, versionId } = LocalModelDownloadParamsSchema.parse(
+            request.params,
+          );
+          const source = await languageServices.getLocalModelArtifactSource(
+            releaseId,
+            versionId,
+          );
+          const target =
+            await dependencies.localModelArtifactDownloads!.issue(source);
+          return LocalModelArtifactDownloadSchema.parse({
+            catalogReleaseId: releaseId,
+            versionId,
+            artifactSha256: source.artifactSha256,
+            artifactByteSize: source.artifactByteSize,
+            ...target,
+          });
+        },
+      );
+      if (dependencies.localModelArtifactDownloads.read) {
+        app.get(
+          "/api/local-model-catalog/:releaseId/versions/:versionId/artifact",
+          async (request, reply) => {
+            await authenticate(request);
+            const { releaseId, versionId } =
+              LocalModelDownloadParamsSchema.parse(request.params);
+            const { expiresAt } = z
+              .object({ expiresAt: z.iso.datetime() })
+              .parse(request.query);
+            const expiry = Date.parse(expiresAt);
+            if (expiry <= Date.now() || expiry > Date.now() + 5 * 60 * 1_000) {
+              return reply.status(410).send({
+                error: {
+                  code: "local_model_download_expired",
+                  message: "The local-model download target has expired.",
+                  retryable: true,
+                },
+              });
+            }
+            const source = await languageServices.getLocalModelArtifactSource(
+              releaseId,
+              versionId,
+            );
+            const object =
+              await dependencies.localModelArtifactDownloads!.read!(source);
+            return reply
+              .header("cache-control", "private, no-store")
+              .header("content-length", String(object.bytes.byteLength))
+              .type(object.contentType)
+              .send(Buffer.from(object.bytes));
+          },
+        );
+      }
+    }
+  }
 
   app.put("/api/export-workers/self", async (request) =>
     catalog.registerExportWorker(
@@ -1648,6 +2026,8 @@ export function createCloudApi(
       const { projectId } = IdParamsSchema.parse(request.params);
       const actor = await authenticate(request);
       const body = BatchPreflightRequestSchema.parse(request.body);
+      await requireTranscriptionProviderAccess(actor, body);
+      await requireTranslationProviderAccess(actor, body);
       return preflightTranscriptionBatch(
         catalog,
         dependencies.videoMetadataProvider!,
@@ -1665,6 +2045,30 @@ export function createCloudApi(
         const { projectId } = IdParamsSchema.parse(request.params);
         const actor = await authenticate(request);
         const body = CreateTranscriptionBatchRequestSchema.parse(request.body);
+        const transcriptionAccess = await requireTranscriptionProviderAccess(
+          actor,
+          body,
+        );
+        const translationAccess = await requireTranslationProviderAccess(
+          actor,
+          body,
+        );
+        const transcriptionGrant = transcriptionAccess
+          ? await languageServices!.requireActiveLaunchGrant(
+              actor,
+              body.transcriptionExecutionPolicy!.providerId!,
+              "transcription",
+              transcriptionAccess.id,
+            )
+          : undefined;
+        const translationGrant = translationAccess
+          ? await languageServices!.requireActiveLaunchGrant(
+              actor,
+              body.translationConsent!.provider,
+              "translation",
+              translationAccess.id,
+            )
+          : undefined;
         const preflight = await preflightTranscriptionBatch(
           catalog,
           dependencies.videoMetadataProvider!,
@@ -1679,6 +2083,15 @@ export function createCloudApi(
           name: body.name,
           options: preflight.options,
           items: preflight.items,
+          ...(transcriptionAccess
+            ? { transcriptionAccessRequestId: transcriptionAccess.id }
+            : {}),
+          ...(transcriptionGrant
+            ? { transcriptionGrantId: transcriptionGrant.id }
+            : {}),
+          ...(translationGrant
+            ? { translationGrantId: translationGrant.id }
+            : {}),
           trustVerifiedPreflight: Boolean(
             dependencies.verifyActiveTranscriptArtifacts,
           ),
@@ -1888,14 +2301,92 @@ export function createCloudApi(
       },
     );
     if (cached) return WorkerTranslateTranscriptResponseSchema.parse(cached);
-    if (!dependencies.translationProvider) {
+    const operationId = deterministicProviderOperationId(
+      jobId,
+      "translation",
+      body.consent.provider,
+    );
+    let translationProvider = dependencies.translationProvider;
+    let translationGrantId: string | undefined;
+    if (dependencies.languageServices) {
+      translationGrantId = await catalog.requireActiveClaimedTranslationGrant(
+        actor,
+        jobId,
+        body.attempt,
+        body.consent.provider,
+        operationId,
+      );
+    }
+    if (dependencies.languageServiceRegistry) {
+      try {
+        await dependencies.languageServices?.requireProviderAvailable(
+          body.consent.provider,
+          "translation",
+          operationId,
+        );
+        const runtimeConfiguration =
+          await dependencies.languageServices?.getProviderRuntimeConfiguration(
+            body.consent.provider,
+          );
+        translationProvider =
+          dependencies.languageServiceRegistry.resolveTranslation(
+            body.consent.provider,
+            runtimeConfiguration,
+          );
+      } catch {
+        throw new CloudTranslationUnavailableError();
+      }
+    }
+    if (!translationProvider) {
       throw new CloudTranslationUnavailableError();
     }
-    const transcript = await translateCanonicalTranscript(
-      dependencies.translationProvider,
-      source,
-      body.targetLanguage,
-    );
+    if (dependencies.languageServices && translationGrantId) {
+      await dependencies.languageServices.beginProviderOperation({
+        operationId,
+        providerId: body.consent.provider,
+        service: "translation",
+        grantId: translationGrantId,
+        attempt: body.attempt,
+        policySnapshot: {
+          schemaVersion: 1,
+          execution: "cloud",
+          providerId: body.consent.provider,
+          fallback: "local",
+          disclosureVersion: body.consent.disclosureVersion,
+        },
+        inputMode: "text_segments",
+      });
+    }
+    let transcript;
+    try {
+      transcript = await translateCanonicalTranscript(
+        translationProvider,
+        source,
+        body.targetLanguage,
+      );
+      await dependencies.languageServices?.finishProviderOperation({
+        operationId,
+        attempt: body.attempt,
+        state: "succeeded",
+        cleanup: "completed",
+        quantity: source.segments.reduce(
+          (total, segment) => total + segment.text.length,
+          0,
+        ),
+      });
+    } catch (error) {
+      await dependencies.languageServices?.finishProviderOperation({
+        operationId,
+        attempt: body.attempt,
+        state: "failed",
+        cleanup: "completed",
+        sanitizedFailureCode:
+          error instanceof Error && "code" in error
+            ? String(error.code)
+            : "provider_execution_failed",
+      });
+      throw error;
+    }
     return catalog.publishClaimedTranscriptTranslation(actor, jobId, {
       attempt: body.attempt,
       consent: body.consent,
@@ -2225,6 +2716,18 @@ function buildSourceProviderCapabilities(
       ),
     })),
   };
+}
+
+function deterministicProviderOperationId(
+  jobId: string,
+  service: "translation" | "transcription",
+  providerId: string,
+) {
+  const hex = createHash("sha256")
+    .update(`${jobId}\0${service}\0${providerId}`)
+    .digest("hex")
+    .slice(0, 32);
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-a${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
 }
 
 function providerDisplayName(provider: SourceProvider) {

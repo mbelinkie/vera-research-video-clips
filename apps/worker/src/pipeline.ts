@@ -24,6 +24,7 @@ import {
   type TranscriptArtifact,
   type TranscriptManifest,
   type TranscriptUploadGrant,
+  type TranscriptionExecutionPolicy,
   type WorkerTranslateTranscriptResponse,
 } from "@research-video/contracts";
 import {
@@ -32,6 +33,7 @@ import {
 } from "@research-video/contracts";
 import type { MediaAcquisitionProvider } from "@research-video/media";
 import {
+  ProviderExecutionError,
   TranscriptSourceResolver,
   gateCaptionLanguage,
   translateCanonicalTranscript,
@@ -80,6 +82,25 @@ export type TranscriptPipelineOptions = {
   captions?: CaptionProvider;
   media: MediaAcquisitionProvider;
   speechToText: SpeechToTextProvider;
+  resolveCloudSpeechToText?: (
+    providerId: string,
+    context: {
+      grantId?: string;
+      operationId: string;
+      attempt: number;
+      policy: TranscriptionExecutionPolicy;
+    },
+  ) =>
+    | SpeechToTextProvider
+    | undefined
+    | Promise<SpeechToTextProvider | undefined>;
+  finishCloudSpeechToText?: (input: {
+    operationId: string;
+    attempt: number;
+    state: "succeeded" | "failed";
+    quantity?: number;
+    sanitizedFailureCode?: string;
+  }) => Promise<void>;
   translation?: TranslationProvider;
   claimedTranslation?: ClaimedTranslationClient;
   publication: TranscriptPublicationClient;
@@ -226,7 +247,11 @@ export function createTranscriptPipelineExecutor(
       const finalizedArtifacts: FinalizedObject[] = [];
       let uploadedTranslationSource:
         (FinalizedObject & { type: "original-normalized" }) | undefined;
-      if (requiresTranslation && options.claimedTranslation) {
+      if (
+        requiresTranslation &&
+        payload.translationConsent &&
+        options.claimedTranslation
+      ) {
         const artifact = await options.publication.upload(
           requiredTarget(grant, "original-normalized"),
           encodeJson(source),
@@ -388,9 +413,9 @@ async function resolveSourceTranscript(
     }
     try {
       await context.setStage("acquiring");
-      let caption: Awaited<
-        ReturnType<NonNullable<typeof options.captions>["acquire"]>
-      > | undefined;
+      let caption:
+        | Awaited<ReturnType<NonNullable<typeof options.captions>["acquire"]>>
+        | undefined;
       let acquisitionError: unknown;
       for (let attempt = 1; attempt <= 2; attempt += 1) {
         try {
@@ -436,8 +461,9 @@ async function resolveSourceTranscript(
     );
     throw new ActionableLanguageGateError();
   } else {
+    const speechToText = await speechToTextForPolicy(options, claimed, payload);
     const speechCapability = speechCapabilityFor(
-      options.speechToText,
+      speechToText,
       confirmedLanguage,
     );
     const observed = await observeLanguageEvidence(
@@ -466,12 +492,48 @@ async function resolveSourceTranscript(
     context.signal,
   );
   await context.setStage("transcribing");
-  const transcript = await options.speechToText.transcribe({
+  const selectedSpeechToText = await speechToTextForPolicy(
+    options,
+    claimed,
+    payload,
+  );
+  const transcriptionInput = {
     videoId: payload.youtubeVideoId,
     inputPath: media.scratchPath,
     ...(confirmedLanguage ? { language: confirmedLanguage } : {}),
     signal: context.signal,
-  });
+  };
+  let transcript: NormalizedTranscript;
+  try {
+    transcript = await selectedSpeechToText.transcribe(transcriptionInput);
+    if (payload.transcriptionExecutionPolicy?.execution === "cloud") {
+      await options.finishCloudSpeechToText?.({
+        operationId: claimed.job.id,
+        attempt: claimed.lease.attempt,
+        state: "succeeded",
+        quantity:
+          Math.max(...transcript.segments.map((segment) => segment.endMs), 0) /
+          1_000,
+      });
+    }
+  } catch (error) {
+    if (
+      !(error instanceof ProviderExecutionError) ||
+      payload.transcriptionExecutionPolicy?.execution !== "cloud" ||
+      payload.transcriptionExecutionPolicy.fallback !== "local"
+    ) {
+      throw error;
+    }
+    await options.finishCloudSpeechToText?.({
+      operationId: claimed.job.id,
+      attempt: claimed.lease.attempt,
+      state: "failed",
+      sanitizedFailureCode: error.code,
+    });
+    // A cloud failure restarts transcription for the whole locally acquired
+    // source; partial provider output is never merged into the canonical track.
+    transcript = await options.speechToText.transcribe(transcriptionInput);
+  }
   const translationCapability = translationCapabilityFor(
     options,
     transcript.track.language,
@@ -500,6 +562,34 @@ async function resolveSourceTranscript(
   return { transcript };
 }
 
+async function speechToTextForPolicy(
+  options: TranscriptPipelineOptions,
+  claimed: ClaimedTranscriptionJob,
+  payload: ReturnType<typeof TranscriptionJobPayloadSchema.parse>,
+): Promise<SpeechToTextProvider> {
+  const policy = payload.transcriptionExecutionPolicy;
+  if (!policy || policy.execution === "local") return options.speechToText;
+  if (!policy.providerId) {
+    throw new TranscriptPipelineError(
+      "The cloud transcription policy is missing its provider identifier.",
+    );
+  }
+  const provider = await options.resolveCloudSpeechToText?.(policy.providerId, {
+    ...(payload.transcriptionGrantId
+      ? { grantId: payload.transcriptionGrantId }
+      : {}),
+    operationId: claimed.job.id,
+    attempt: claimed.lease.attempt,
+    policy,
+  });
+  if (!provider) {
+    throw new TranscriptPipelineError(
+      `The selected cloud transcription provider (${policy.providerId}) is unavailable on this worker.`,
+    );
+  }
+  return provider;
+}
+
 async function resolveEnglishTranscript(
   options: TranscriptPipelineOptions,
   claimed: ClaimedTranscriptionJob,
@@ -516,34 +606,44 @@ async function resolveEnglishTranscript(
   ) {
     return { transcript: source, serverArtifacts: [] };
   }
-  if (options.claimedTranslation) {
-    if (!payload.translationConsent) {
-      throw new TranscriptPipelineError(
-        "Cloud translation requires the submitting user's explicit transcript-transfer consent.",
-      );
-    }
+  if (payload.translationConsent && options.claimedTranslation) {
     await context.setStage("translating");
     if (!uploadedSource) {
       throw new TranscriptPipelineError(
         "Cloud translation requires a verified uploaded source artifact.",
       );
     }
-    const published = await options.claimedTranslation.translate({
-      jobId: claimed.job.id,
-      attempt: claimed.lease.attempt,
-      consent: payload.translationConsent,
-      uploadId,
-      sourceArtifact: uploadedSource,
-      targetLanguage: payload.targetLanguage,
-      signal: context.signal,
-    });
-    return {
-      transcript: published.transcript,
-      serverArtifacts: [
-        published.normalizedArtifact,
-        published.subtitleArtifact,
-      ],
-    };
+    try {
+      const published = await options.claimedTranslation.translate({
+        jobId: claimed.job.id,
+        attempt: claimed.lease.attempt,
+        consent: payload.translationConsent,
+        uploadId,
+        sourceArtifact: uploadedSource,
+        targetLanguage: payload.targetLanguage,
+        signal: context.signal,
+      });
+      return {
+        transcript: published.transcript,
+        serverArtifacts: [
+          published.normalizedArtifact,
+          published.subtitleArtifact,
+        ],
+      };
+    } catch (error) {
+      if (context.signal?.aborted || !options.translation) throw error;
+      // A cloud failure discards all remote partial output and makes exactly one
+      // local attempt. It never selects a second cloud provider.
+      return {
+        transcript: await translateCanonicalTranscript(
+          options.translation,
+          source,
+          payload.targetLanguage,
+          context.signal,
+        ),
+        serverArtifacts: [],
+      };
+    }
   }
   if (!options.translation) {
     throw new TranscriptPipelineError(
@@ -604,9 +704,7 @@ function translationCapabilityFor(
   if (!decision || decision.status !== "confirmed") return undefined;
   return {
     state: "unknown",
-    provider: options.claimedTranslation
-      ? "amazon-translate"
-      : "translation-provider",
+    provider: "translation-provider",
     operation: "translation",
     sourceLanguage: normalizeLanguageTag(sourceLanguage),
     targetLanguage: normalizeLanguageTag(targetLanguage),

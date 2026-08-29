@@ -66,7 +66,6 @@ describe("selected-video transcript retry", () => {
               {
                 id: "other-video",
                 catalogVideoId: "catalog-other",
-                youtubeVideoId: "OtherVideo1",
                 state: "failed",
                 version: 7,
                 error: { retryable: true },
@@ -79,7 +78,6 @@ describe("selected-video transcript retry", () => {
               {
                 id: "exact-item",
                 catalogVideoId: "catalog-selected",
-                youtubeVideoId: "SelectedVid",
                 state: "failed",
                 version: 9,
                 error: { retryable: true },
@@ -88,7 +86,6 @@ describe("selected-video transcript retry", () => {
           },
         ],
         "catalog-selected",
-        "SelectedVid",
       ),
     ).toEqual({
       batchId: "exact-batch",
@@ -108,7 +105,6 @@ describe("selected-video transcript retry", () => {
               {
                 id: "not-retryable",
                 catalogVideoId: "catalog-selected",
-                youtubeVideoId: "SelectedVid",
                 state: "failed",
                 version: 1,
                 error: { retryable: false },
@@ -116,7 +112,6 @@ describe("selected-video transcript retry", () => {
               {
                 id: "already-queued",
                 catalogVideoId: "catalog-selected",
-                youtubeVideoId: "SelectedVid",
                 state: "queued",
                 version: 2,
                 error: { retryable: true },
@@ -125,7 +120,6 @@ describe("selected-video transcript retry", () => {
           },
         ],
         "catalog-selected",
-        "SelectedVid",
       ),
     ).toBeUndefined();
   });

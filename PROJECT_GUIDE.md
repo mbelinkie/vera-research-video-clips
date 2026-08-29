@@ -5,16 +5,21 @@
 Status: Milestones 1–6 and M7-04 complete; low-cost AWS dogfood live; M7-01 production acceptance remains blocked
 Last updated: 2026-08-25
 
-This document is the source of truth for product scope, architecture, sequencing, and acceptance criteria. Update it when a deliberate product or architectural decision changes. Use `outline.md` as the shorter execution checklist.
+This document is the source of truth for product scope, architecture, security,
+and acceptance criteria. Update it when a deliberate product or architectural
+decision changes. The GitHub Project configured in `.github/vera-roadmap.json`
+is the source of truth for live sequencing, status, dependencies, ownership,
+priority, and model routing. `outline.md` is a historical execution snapshot.
 
 ## 0. Delivery workflow and durable records
 
-Every implementation task begins with exactly one bounded Markdown spec in
-`specs/active/`. Use one task/thread for that spec; do not combine unrelated
-implementation, debugging, review, or product-design work in the same task.
-The spec must name the user-visible outcome, affected boundaries, focused
-context, explicit non-goals, failure states, acceptance criteria, and the
-narrow tests to run first.
+Every implementation task begins with exactly one bounded Ready GitHub issue
+and one dedicated branch/worktree. A linked Markdown spec in `specs/active/`
+may retain deeper design detail, but the issue owns live scope, routing,
+dependencies, status, and acceptance. Do not combine unrelated implementation,
+debugging, review, or product-design work in the same issue or task. The issue
+must name the user-visible outcome, affected boundaries, focused context,
+explicit non-goals, failure states, acceptance criteria, and narrow tests.
 
 Keep the task context to the active spec, this guide, the relevant contracts and
 implementation boundaries, and concrete evidence such as a failing test or
@@ -28,11 +33,11 @@ that task. Record the confirmed facts and open a fresh task/thread with a
 focused reproduction and a new bounded spec or an explicit update to the active
 one.
 
-Move a spec to `specs/completed/` only after the work is complete. Its completion
-record must include the decision(s), files changed, checks and their actual
-results, remaining risks/follow-ups, and commit ID(s). Update `PROJECT_GUIDE.md`,
-`outline.md`, or `README.md` to describe work only after it is completed and
-verified; an active spec is the sole place for planned implementation details.
+Move a linked spec to `specs/completed/` only after the issue is accepted. Its
+completion record must include the decisions, files changed, checks and actual
+results, remaining risks/follow-ups, commit IDs, and issue link. Update
+`PROJECT_GUIDE.md` or `README.md` only for durable completed truth; do not use
+`outline.md` or active specs as a parallel status tracker.
 
 Keep external findings and source links in `docs/research/`. Add a short record
 in `docs/decisions/` only for a durable architectural decision that needs its
@@ -936,11 +941,25 @@ authority.
   worker container compatible with AWS Batch GPU jobs for optional later
   capacity.
 - FFmpeg/FFprobe for media inspection and export.
-- A configurable media acquisition adapter and a multilingual speech-to-text adapter.
-- `yt-dlp` for opt-in authorized audio acquisition and `whisper.cpp` for the first opt-in local multilingual speech-recognition implementation; keep both behind typed adapters.
-- Amazon Translate through a project-authorized cloud endpoint and the ECS task
-  role as the first opt-in text-translation adapter; users receive no AWS
-  credentials, and the UI discloses that transcript text leaves the workstation.
+- A configurable media acquisition adapter and provider-neutral transcription
+  and translation registries. Local Whisper and Argos are defaults; registered
+  cloud adapters are separately disclosed, approved, granted, configured, and
+  metered by opaque provider ID.
+- `yt-dlp` for opt-in authorized audio acquisition and `whisper.cpp` for the
+  first local multilingual speech-recognition implementation. Amazon Transcribe
+  is the first optional cloud transcription adapter; it receives locally
+  acquired job-scoped audio rather than a YouTube watch URL and cleans its
+  private remote input, output, and operation after every terminal result.
+- A server-managed Argos package source that snapshots the mutable upstream
+  feed, evaluates and mirrors exact bytes, separates non-overridable executable
+  safety from advisory quality/license findings, and publishes immutable signed
+  catalog releases. Desktops verify the bundled trust root, descriptor, size,
+  SHA-256, archive containment, and runtime compatibility before atomic local
+  activation. Adding a compatible enabled pack does not require an app rebuild.
+- Amazon Translate as the first optional cloud translation adapter. Users
+  receive no vendor credentials; provider-specific consent and platform
+  approval never transfer to another adapter. Cloud failure may retry only the
+  corresponding local provider and cannot silently hop to another cloud vendor.
 - Electron 43.4.1 and Electron Forge 7.11.2 for the M7 local desktop and the M8
   distribution implementation, with sandboxed renderers, context isolation, no
   Node integration, restrictive CSP, validated IPC, and a minimal preload API.
@@ -2376,7 +2395,7 @@ A slice is done only when:
 - the critical UI state is manually verified
 - errors are actionable and logs do not leak secrets
 - user data/cache compatibility is considered
-- documentation and `outline.md` status are updated
+- durable documentation and the authoritative GitHub issue are updated
 - the active spec has been moved to `specs/completed/` with its completion
   record, including decisions, checks/results, risks, and commit IDs
 

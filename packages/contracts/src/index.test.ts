@@ -18,6 +18,22 @@ import {
   CancelLoggedExportRequestSchema,
   BatchPreflightRequestSchema,
   CloudTranslationConsentSchema,
+  CloudProviderDescriptorSchema,
+  CloudProviderServerConfigurationSchema,
+  CloudProviderOperationSchema,
+  LocalModelAvailabilitySchema,
+  LocalModelEvaluationSchema,
+  LocalModelEvaluationFindingSchema,
+  LocalModelOperationSchema,
+  LocalModelRuntimeOperationSchema,
+  IssueCloudProviderLaunchGrantRequestSchema,
+  SignedLocalModelCatalogReleaseSchema,
+  TranslationExecutionPolicySchema,
+  TranscriptionExecutionPolicySchema,
+  AuthenticatedActorSchema,
+  PlatformCapabilityGuardSchema,
+  hasPlatformCapability,
+  UpdateLocalModelVersionAvailabilityRequestSchema,
   ClipCommentSchema,
   ClipCommentListQuerySchema,
   ClipCommentPageSchema,
@@ -175,6 +191,257 @@ const now = "2026-08-01T12:00:00.000Z";
 const id = "019fbb95-cd76-7920-93fa-e23ba755ee3f";
 
 describe("shared contracts", () => {
+  it("keeps language providers opaque, policy-driven, and capability-gated", () => {
+    const actor = AuthenticatedActorSchema.parse({
+      userId: id,
+      externalSubject: "subject-fixture",
+    });
+    expect(actor.platformCapabilities).toBeUndefined();
+    expect(hasPlatformCapability(actor, "manage_language_services")).toBe(
+      false,
+    );
+    expect(
+      PlatformCapabilityGuardSchema.parse({
+        required: ["manage_language_services"],
+      }),
+    ).toEqual({ required: ["manage_language_services"] });
+
+    const descriptor = CloudProviderDescriptorSchema.parse({
+      id: "test.translation.v3",
+      service: "translation",
+      displayName: "Test Translation",
+      adapterContractVersion: 1,
+      configurationRevision: "config-3",
+      capabilityRevision: "capabilities-3",
+      supportedLanguages: [
+        { language: "en", roles: ["source", "target"] },
+        { language: "ro", roles: ["source", "target"] },
+      ],
+      inputModes: ["text_segments"],
+      disclosure: {
+        version: 2,
+        title: "Text transfer",
+        summary: "Transcript text is sent to the selected provider.",
+        dataCategories: ["transcript_text"],
+        publishedAt: now,
+      },
+      pricing: {
+        currency: "USD",
+        unit: "characters",
+        amountMicros: 15_000,
+        quantity: 1_000_000,
+        effectiveAt: now,
+      },
+      state: "enabled",
+    });
+    expect(descriptor.id).toBe("test.translation.v3");
+    expect(
+      TranslationExecutionPolicySchema.safeParse({
+        schemaVersion: 1,
+        execution: "cloud",
+        fallback: "local",
+      }).success,
+    ).toBe(false);
+    expect(
+      TranscriptionExecutionPolicySchema.parse({
+        schemaVersion: 1,
+        execution: "local",
+      }),
+    ).toMatchObject({ execution: "local", fallback: "local" });
+  });
+
+  it("keeps hard model safety separate from recommendation overrides and cloud cleanup", () => {
+    expect(
+      LocalModelEvaluationFindingSchema.safeParse({
+        code: "unsafe_archive",
+        class: "hard_safety",
+        state: "not_recommended",
+        message: "Archive paths are unsafe.",
+      }).success,
+    ).toBe(false);
+    expect(
+      LocalModelAvailabilitySchema.safeParse({
+        state: "enabled_by_override",
+        version: 1,
+        changedAt: now,
+      }).success,
+    ).toBe(false);
+    expect(
+      LocalModelAvailabilitySchema.parse({
+        state: "enabled_by_override",
+        version: 1,
+        changedAt: now,
+        changedBy: id,
+        overrideReason: "The verified pack is needed for a reviewed pilot.",
+      }).state,
+    ).toBe("enabled_by_override");
+
+    const operation = CloudProviderOperationSchema.parse({
+      id,
+      providerId: "test.transcription.v3",
+      service: "transcription",
+      accountId: "019fbb95-cd76-7920-93fa-e23ba755ee31",
+      policySnapshot: {
+        schemaVersion: 1,
+        execution: "cloud",
+        providerId: "test.transcription.v3",
+      },
+      configurationRevision: "config-3",
+      capabilityRevision: "capabilities-3",
+      inputMode: "direct_upload",
+      state: "succeeded",
+      attempts: [
+        {
+          attempt: 1,
+          externalOperationReference: "opaque-job-reference",
+          state: "succeeded",
+          progressPercent: 100,
+          startedAt: now,
+          finishedAt: now,
+        },
+      ],
+      cleanup: { state: "completed", completedAt: now },
+      terminalAt: now,
+      createdAt: now,
+      updatedAt: now,
+    });
+    expect(operation.cleanup.state).toBe("completed");
+    expect(
+      SignedLocalModelCatalogReleaseSchema.safeParse({
+        id,
+        sequence: 1,
+        catalogSha256: "a".repeat(64),
+        signingKeyId: "catalog-key-1",
+        signatureBase64: "not a base64 signature",
+        publishedAt: now,
+        versions: [],
+      }).success,
+    ).toBe(false);
+  });
+
+  it("requires protected references, immutable model evidence, and durable operation proof", () => {
+    expect(
+      CloudProviderServerConfigurationSchema.safeParse({
+        providerId: "test.translation.v3",
+        protectedCredentialReference: "AKIA-not-a-reference",
+        version: 1,
+        updatedAt: now,
+      }).success,
+    ).toBe(false);
+    expect(
+      CloudProviderServerConfigurationSchema.parse({
+        providerId: "test.translation.v3",
+        protectedCredentialReference:
+          "secret:language-services/test-translation-v3",
+        version: 1,
+        updatedAt: now,
+      }).protectedCredentialReference,
+    ).toContain("secret:");
+
+    const evaluation = {
+      id,
+      candidateId: "019fbb95-cd76-7920-93fa-e23ba755ee32",
+      revision: 1,
+      evaluationSchemaVersion: 1 as const,
+      evaluatedBy: "019fbb95-cd76-7920-93fa-e23ba755ee33",
+      rawEvidenceArtifactIds: ["evidence:archive-report"],
+      byteSize: 42,
+      sha256: "b".repeat(64),
+      archiveFormat: "zip",
+      archiveManifest: { entries: 3 },
+      licenseEvidence: ["license:CC-BY-4.0"],
+      attributionEvidence: ["notice:required"],
+      trainingProvenanceEvidence: ["provenance:upstream"],
+      qualityResults: { fixtureSet: "language-quality-v1", passed: true },
+      compatibleRuntimeVersions: ["1.0"],
+      compatiblePlatforms: ["darwin-x64"],
+      findings: [
+        {
+          code: "archive_safe",
+          class: "hard_safety" as const,
+          state: "pass" as const,
+          message: "Archive layout is safe.",
+        },
+      ],
+      evaluatedAt: now,
+    };
+    expect(
+      LocalModelEvaluationSchema.parse(evaluation).rawEvidenceArtifactIds,
+    ).toHaveLength(1);
+    expect(
+      LocalModelEvaluationSchema.safeParse({
+        ...evaluation,
+        rawEvidenceArtifactIds: [],
+      }).success,
+    ).toBe(false);
+    expect(
+      LocalModelOperationSchema.safeParse({
+        id,
+        kind: "publish_catalog_release",
+        state: "queued",
+        version: 1,
+        idempotencyKey: "publish-release-1",
+        progressPercent: 0,
+        createdBy: "019fbb95-cd76-7920-93fa-e23ba755ee33",
+        createdAt: now,
+      }).success,
+    ).toBe(false);
+    expect(
+      LocalModelRuntimeOperationSchema.safeParse({
+        id,
+        localModelVersionId: "019fbb95-cd76-7920-93fa-e23ba755ee34",
+        kind: "download",
+        idempotencyKey: "download-1",
+        state: "running",
+        version: 1,
+        progressPercent: 30,
+        leaseId: "desktop-agent-1",
+        leaseExpiresAt: "2026-08-01T12:05:00.000Z",
+        heartbeatAt: now,
+        createdAt: now,
+        startedAt: now,
+      }).success,
+    ).toBe(true);
+    expect(
+      IssueCloudProviderLaunchGrantRequestSchema.safeParse({
+        providerId: "test.translation.v3",
+        service: "translation",
+        accessRequestId: "019fbb95-cd76-7920-93fa-e23ba755ee35",
+        idempotencyKey: "grant-1",
+      }).success,
+    ).toBe(false);
+    expect(
+      UpdateLocalModelVersionAvailabilityRequestSchema.safeParse({
+        state: "disabled",
+        expectedVersion: 1,
+        idempotencyKey: "availability-1",
+      }).success,
+    ).toBe(false);
+    expect(
+      UpdateLocalModelVersionAvailabilityRequestSchema.parse({
+        state: "disabled",
+        expectedVersion: 1,
+        idempotencyKey: "availability-1",
+        reason: "The evaluated version is no longer supported.",
+      }).reason,
+    ).toContain("no longer supported");
+    expect(
+      SignedLocalModelCatalogReleaseSchema.parse({
+        contractVersion: 1,
+        id,
+        sequence: 2,
+        catalogSha256: "c".repeat(64),
+        signingKeyId: "catalog-key-1",
+        signatureBase64: "c2lnbmF0dXJl",
+        publishedAt: now,
+        expiresAt: "2026-08-27T13:00:00.000Z",
+        canonicalPayload: "{}",
+        versions: [],
+        revokedVersionIds: ["019fbb95-cd76-7920-93fa-e23ba755ee34"],
+      }).revokedVersionIds,
+    ).toEqual(["019fbb95-cd76-7920-93fa-e23ba755ee34"]);
+  });
+
   it("keeps transcript and player selections distinct without fabricated transcript fields", () => {
     const attachment = {
       selectionType: "transcript_range" as const,
@@ -3195,7 +3462,7 @@ describe("shared contracts", () => {
     );
   });
 
-  it("requires an explicit closed disclosure for cloud translation", () => {
+  it("requires explicit provider-specific disclosure for cloud translation", () => {
     const consent = CloudTranslationConsentSchema.parse({
       provider: "amazon-translate",
       disclosureVersion: 1,
@@ -3215,6 +3482,13 @@ describe("shared contracts", () => {
         transcriptTextTransferAccepted: false,
       }).success,
     ).toBe(false);
+    expect(
+      CloudTranslationConsentSchema.parse({
+        provider: "third-translate",
+        disclosureVersion: 7,
+        transcriptTextTransferAccepted: true,
+      }),
+    ).toMatchObject({ provider: "third-translate", disclosureVersion: 7 });
     expect(
       WorkerTranslateTranscriptRequestSchema.safeParse({
         attempt: 1,

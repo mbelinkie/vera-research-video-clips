@@ -14,6 +14,7 @@ import {
   type ProjectSummary,
   type User,
 } from "@research-video/contracts";
+import { suggestedSpokenLanguages } from "./spoken-language-choice.ts";
 
 export type ProjectDestination =
   "videos" | "workbench" | "clips" | "project_settings";
@@ -424,25 +425,33 @@ export function AccountLanguagePanel({
   try {
     readableLanguage = formatLanguageLabel(preferredLanguage);
   } catch {
-    // Keep the draft visible while the user corrects an invalid value.
+    // Keep an existing legacy value visible until the user replaces it.
   }
+  const hasSuggestedLanguage = suggestedSpokenLanguages.some(
+    (language) => language.value === preferredLanguage,
+  );
   return (
     <section className="account-settings" aria-label="Account settings">
       <label htmlFor="preferred-language">Preferred transcript language</label>
       <div className="loader-row">
-        <input
+        <select
           id="preferred-language"
           value={preferredLanguage}
-          maxLength={35}
           disabled={disabled}
           onChange={(event) => onPreferredLanguageChange(event.target.value)}
-          placeholder="en, fr-CA, zh-Hant…"
-        />
-        <button
-          type="button"
-          disabled={disabled || !preferredLanguage.trim()}
-          onClick={onSave}
         >
+          {!hasSuggestedLanguage && preferredLanguage ? (
+            <option value={preferredLanguage}>
+              {readableLanguage} ({preferredLanguage}) — saved preference
+            </option>
+          ) : null}
+          {suggestedSpokenLanguages.map((language) => (
+            <option key={language.value} value={language.value}>
+              {language.label}
+            </option>
+          ))}
+        </select>
+        <button type="button" disabled={disabled} onClick={onSave}>
           Save preference
         </button>
       </div>

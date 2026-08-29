@@ -57,8 +57,23 @@ export const AppConfigSchema = z
     whisperCppPath: z.string().trim().min(1),
     whisperCppModelPath: z.string().trim().min(1).optional(),
     whisperCppModelName: z.string().trim().min(1).optional(),
-    translationProvider: z.enum(["disabled", "aws-translate"]),
+    /** Compatibility bootstrap ID; deployed cloud adapters are registry-owned. */
+    translationProvider: z
+      .string()
+      .regex(/^(disabled|[a-z0-9][a-z0-9.-]{1,158}[a-z0-9])$/u),
     awsTranslateTerminology: z.string().trim().min(1).optional(),
+    localModelCatalogSigningKeyId: z.string().trim().min(1).max(160).optional(),
+    localModelCatalogSigningPrivateKeyBase64: z
+      .string()
+      .trim()
+      .min(1)
+      .optional(),
+    localModelCatalogTrustRoots: z.record(
+      z.string().trim().min(1).max(160),
+      z.string().trim().min(1).max(32_768),
+    ),
+    argosSidecarPath: z.string().trim().min(1).optional(),
+    argosRuntimeVersions: z.array(z.string().trim().min(1).max(160)).max(32),
     awsRegion: z.string().min(1),
     transcriptBucket: z.string().min(3).optional(),
     workerAuthorization: z.string().trim().min(1).optional(),
@@ -132,6 +147,17 @@ export const AppConfigSchema = z
         }
       }
     }
+    if (
+      Boolean(config.localModelCatalogSigningKeyId) !==
+      Boolean(config.localModelCatalogSigningPrivateKeyBase64)
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["localModelCatalogSigningPrivateKeyBase64"],
+        message:
+          "LOCAL_MODEL_CATALOG_SIGNING_KEY_ID and LOCAL_MODEL_CATALOG_SIGNING_PRIVATE_KEY_BASE64 must be configured together",
+      });
+    }
     if (config.nodeEnv === "production" && config.runtimeRole === "cloud-api") {
       const productionRequirements = [
         [
@@ -163,11 +189,6 @@ export const AppConfigSchema = z
           config.queueMode === "sqs",
           "queueMode",
           "Production requires SQS delivery.",
-        ],
-        [
-          config.translationProvider === "aws-translate",
-          "translationProvider",
-          "Production requires server-side Amazon Translate.",
         ],
         [
           Boolean(config.publicApiOrigin?.startsWith("https://")),
@@ -241,6 +262,17 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     whisperCppModelName: env.WHISPER_CPP_MODEL_NAME,
     translationProvider: env.TRANSLATION_PROVIDER ?? "disabled",
     awsTranslateTerminology: env.AWS_TRANSLATE_TERMINOLOGY,
+    localModelCatalogSigningKeyId: env.LOCAL_MODEL_CATALOG_SIGNING_KEY_ID,
+    localModelCatalogSigningPrivateKeyBase64:
+      env.LOCAL_MODEL_CATALOG_SIGNING_PRIVATE_KEY_BASE64,
+    localModelCatalogTrustRoots: parseStringRecord(
+      env.LOCAL_MODEL_CATALOG_TRUST_ROOTS_JSON,
+    ),
+    argosSidecarPath: env.ARGOS_SIDECAR_PATH,
+    argosRuntimeVersions: (env.ARGOS_RUNTIME_VERSIONS ?? "1.9")
+      .split(",")
+      .map((value) => value.trim())
+      .filter(Boolean),
     awsRegion: env.AWS_REGION ?? "us-east-1",
     transcriptBucket: env.TRANSCRIPT_BUCKET,
     workerAuthorization: env.WORKER_AUTHORIZATION,
@@ -251,4 +283,20 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     workerErrorBackoffMs: env.WORKER_ERROR_BACKOFF_MS ?? 5_000,
     workerLeaseSeconds: env.WORKER_LEASE_SECONDS ?? 120,
   });
+}
+
+function parseStringRecord(value: string | undefined): Record<string, string> {
+  if (!value) return {};
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
+      return {};
+    return Object.fromEntries(
+      Object.entries(parsed).filter(
+        (entry): entry is [string, string] => typeof entry[1] === "string",
+      ),
+    );
+  } catch {
+    return {};
+  }
 }

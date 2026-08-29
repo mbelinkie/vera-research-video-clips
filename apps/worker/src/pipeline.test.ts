@@ -19,7 +19,10 @@ import {
   normalizeGeneratedTranscript,
   normalizeTranscriptFixture,
 } from "@research-video/transcript";
-import { translateCanonicalTranscript } from "@research-video/providers";
+import {
+  ProviderExecutionError,
+  translateCanonicalTranscript,
+} from "@research-video/providers";
 import multilingualFixture from "../../../tests/fixtures/transcripts/romanian-multilingual.json" with { type: "json" };
 
 import {
@@ -401,6 +404,143 @@ describe("transcript pipeline", () => {
     expect(publication.finalize).toHaveBeenCalledOnce();
   });
 
+  it("discards a failed cloud translation and retries the whole source through the local provider only", async () => {
+    const scratchRoot = await mkdtemp(join(tmpdir(), "pipeline-"));
+    temporaryDirectories.add(scratchRoot);
+    const publication = publicationFixture();
+    const claimed = claimedJob();
+    claimed.job.payload = {
+      ...claimed.job.payload,
+      translationConsent: {
+        provider: "provider-alpha",
+        disclosureVersion: 3,
+        transcriptTextTransferAccepted: true,
+      },
+    };
+    const cloudTranslate = vi.fn(async () => {
+      throw new ProviderExecutionError("fixture cloud failure");
+    });
+    const localTranslate = vi.fn(async (request) => ({
+      provider: "argos-local",
+      model: "fixture-es-en",
+      segments: request.segments.map(
+        (segment: { id: string; text: string }) => ({
+          sourceSegmentId: segment.id,
+          text: "Local English.",
+        }),
+      ),
+    }));
+    const executor = createTranscriptPipelineExecutor({
+      scratchRoot,
+      publication: publication.client,
+      captions: {
+        discover: async () => [
+          {
+            id: "fixture:manual:es",
+            language: "es",
+            kind: "manual",
+            translatable: false,
+            downloadAccess: "available",
+          },
+        ],
+        acquire: async (videoId, track, scratch) => {
+          const path = join(scratch, "caption.vtt");
+          const contents =
+            "WEBVTT\n\n00:00.000 --> 00:00:01.000\nHola mundo.\n";
+          await writeFile(path, contents);
+          return {
+            videoId,
+            track,
+            path,
+            format: "vtt",
+            byteSize: Buffer.byteLength(contents),
+            provider: "fixture",
+          };
+        },
+      },
+      media: { acquireAuthorizedSource: vi.fn() },
+      speechToText: { transcribe: vi.fn() },
+      claimedTranslation: { translate: cloudTranslate },
+      translation: { translate: localTranslate },
+    });
+
+    await executor(claimed, executionContext());
+
+    expect(cloudTranslate).toHaveBeenCalledOnce();
+    expect(localTranslate).toHaveBeenCalledOnce();
+    expect(localTranslate).toHaveBeenCalledWith(
+      expect.objectContaining({ sourceLanguage: "es", targetLanguage: "en" }),
+    );
+    expect(
+      NormalizedTranscriptSchema.parse(
+        JSON.parse(
+          new TextDecoder().decode(
+            publication.uploaded.get("english-normalized"),
+          ),
+        ),
+      ).track,
+    ).toMatchObject({ provider: "argos-local", model: "fixture-es-en" });
+    expect(publication.finalize).toHaveBeenCalledOnce();
+  });
+
+  it("uses local translation by default even when a cloud client is configured", async () => {
+    const scratchRoot = await mkdtemp(join(tmpdir(), "pipeline-"));
+    temporaryDirectories.add(scratchRoot);
+    const publication = publicationFixture();
+    const cloudTranslate = vi.fn();
+    const localTranslate = vi.fn(async (request) => ({
+      provider: "argos-local",
+      model: "fixture-ro-en",
+      segments: request.segments.map(
+        (segment: { id: string; text: string }) => ({
+          sourceSegmentId: segment.id,
+          text: "Local English.",
+        }),
+      ),
+    }));
+    const executor = createTranscriptPipelineExecutor({
+      scratchRoot,
+      publication: publication.client,
+      captions: {
+        discover: async () => [
+          {
+            id: "fixture:manual:ro",
+            language: "ro",
+            kind: "manual",
+            translatable: false,
+            downloadAccess: "available",
+          },
+        ],
+        acquire: async (videoId, track, scratch) => {
+          const path = join(scratch, "caption.vtt");
+          const contents = "WEBVTT\n\n00:00.000 --> 00:00:01.000\nBună ziua.\n";
+          await writeFile(path, contents);
+          return {
+            videoId,
+            track,
+            path,
+            format: "vtt",
+            byteSize: Buffer.byteLength(contents),
+            provider: "fixture",
+          };
+        },
+      },
+      media: { acquireAuthorizedSource: vi.fn() },
+      speechToText: { transcribe: vi.fn() },
+      claimedTranslation: { translate: cloudTranslate },
+      translation: { translate: localTranslate },
+    });
+
+    await executor(claimedJob(), executionContext());
+
+    expect(cloudTranslate).not.toHaveBeenCalled();
+    expect(localTranslate).toHaveBeenCalledOnce();
+    expect(localTranslate).toHaveBeenCalledWith(
+      expect.objectContaining({ sourceLanguage: "ro", targetLanguage: "en" }),
+    );
+    expect(publication.finalize).toHaveBeenCalledOnce();
+  });
+
   it("publishes YouTube-style WebVTT captions without falling back to ASR", async () => {
     const scratchRoot = await mkdtemp(join(tmpdir(), "pipeline-"));
     temporaryDirectories.add(scratchRoot);
@@ -582,6 +722,93 @@ describe("transcript pipeline", () => {
       "manifest",
     ]);
     expect(await readdir(scratchRoot)).toEqual([]);
+  });
+
+  it("resolves an opaque cloud transcription provider and falls back only to local ASR", async () => {
+    const scratchRoot = await mkdtemp(join(tmpdir(), "pipeline-"));
+    temporaryDirectories.add(scratchRoot);
+    const publication = publicationFixture();
+    const localTranscribe = vi.fn(async () =>
+      normalizeGeneratedTranscript({
+        videoId: "M7lc1UVf-VE",
+        language: "en",
+        provider: "whisper-local",
+        model: "fixture-local",
+        segments: [{ startMs: 0, endMs: 1_000, text: "Local fallback." }],
+      }),
+    );
+    const cloudTranscribe = vi.fn(async () => {
+      throw new ProviderExecutionError("fixture cloud failure");
+    });
+    const resolveCloudSpeechToText = vi.fn((providerId: string) =>
+      providerId === "provider-beta"
+        ? {
+            checkLanguageSupport: () => ({
+              state: "supported" as const,
+              provider: providerId,
+              operation: "speech_to_text" as const,
+              sourceLanguage: "en",
+              version: "fixture-v1",
+            }),
+            transcribe: cloudTranscribe,
+          }
+        : undefined,
+    );
+    const claimed = claimedJob();
+    claimed.job.payload = {
+      ...claimed.job.payload,
+      sourcePolicy: "force-generate",
+      languageDecision: languageDecision("en", 4),
+      transcriptionExecutionPolicy: {
+        schemaVersion: 1,
+        execution: "cloud",
+        providerId: "provider-beta",
+        fallback: "local",
+      },
+      transcriptionGrantId: "019fbb95-cd76-7920-93fa-e23ba755ee51",
+    };
+    const executor = createTranscriptPipelineExecutor({
+      scratchRoot,
+      publication: publication.client,
+      media: {
+        acquireAuthorizedSource: async (videoId, scratch) => {
+          const scratchPath = join(scratch, "audio.flac");
+          await writeFile(scratchPath, "fixture audio");
+          return {
+            videoId,
+            scratchPath,
+            byteSize: 13,
+            format: "flac",
+            provider: "fixture",
+            contentSha256: "0".repeat(64),
+          };
+        },
+      },
+      speechToText: {
+        checkLanguageSupport: () => ({
+          state: "supported",
+          provider: "whisper-local",
+          operation: "speech_to_text",
+          sourceLanguage: "en",
+          version: "fixture-local-v1",
+        }),
+        transcribe: localTranscribe,
+      },
+      resolveCloudSpeechToText,
+    });
+
+    await executor(claimed, executionContext());
+
+    expect(resolveCloudSpeechToText).toHaveBeenCalledWith(
+      "provider-beta",
+      expect.objectContaining({
+        grantId: "019fbb95-cd76-7920-93fa-e23ba755ee51",
+        operationId: claimed.job.id,
+        attempt: claimed.lease.attempt,
+      }),
+    );
+    expect(cloudTranscribe).toHaveBeenCalledOnce();
+    expect(localTranscribe).toHaveBeenCalledOnce();
   });
 
   it("observes conflicting Korean automatic caption evidence before any provider work", async () => {

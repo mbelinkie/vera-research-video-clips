@@ -12,7 +12,6 @@ type RetryableBatchDetail = Readonly<{
   items: readonly Readonly<{
     id: string;
     catalogVideoId?: string | undefined;
-    youtubeVideoId?: string | undefined;
     state: string;
     version: number;
     error?: Readonly<{ retryable?: boolean | undefined }> | undefined;
@@ -55,13 +54,11 @@ export function selectTranscriptionBatchId(
 export function findRetryableTranscriptionItem(
   batches: readonly RetryableBatchDetail[],
   catalogVideoId: string,
-  youtubeVideoId: string,
 ): RetryableTranscriptionItem | undefined {
   for (const detail of batches) {
     const item = detail.items.find(
       (candidate) =>
         candidate.catalogVideoId === catalogVideoId &&
-        candidate.youtubeVideoId === youtubeVideoId &&
         candidate.state === "failed" &&
         candidate.error?.retryable === true,
     );

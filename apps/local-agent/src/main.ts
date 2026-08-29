@@ -20,7 +20,6 @@ import {
   HeartbeatLoggedExportExecutionResponseSchema,
   LoggedExportSuccessSchema,
   RegisteredExportWorkerSchema,
-  DerivedTranslationIdentitySchema,
   ClipCommentSchema,
   ProjectBookmarkMutationResponseSchema,
   ProjectBookmarkPageSchema,
@@ -47,12 +46,15 @@ import {
   CachedTranscriptDocumentReader,
   HttpActiveTranscriptCatalogClient,
   HttpArtifactDownloader,
-  SharedDerivedTranslationResolver,
   SharedFirstTranscriptResolver,
   SharedTranscriptWorkspaceService,
   VerifiedTranscriptCache,
   OfflineOutbox,
 } from "@research-video/sync";
+import { CloudManagedArgosTranslationProvider } from "@research-video/providers/translation-argos-cloud-managed";
+import { createEd25519CatalogVerifier } from "@research-video/providers/cloud-local-model-catalog";
+import { LocalArgosModelManager } from "@research-video/providers/local-argos-model-manager";
+import { SqliteLocalArgosModelStore } from "@research-video/providers/local-argos-model-store-sqlite";
 import {
   createExportSourceAcquisitionProvider,
   FfmpegCapabilityDiscoveryProvider,
@@ -87,6 +89,7 @@ import { LocalLoggedExportSourceGroupCoordinator } from "./shared-source-group.t
 import { LocalRuntimeCoordinator } from "./local-runtime.ts";
 import { LocalDesktopSetupService } from "./desktop-setup.ts";
 import { CloudDerivedTranslationClient } from "./derived-translation-client.ts";
+import { createPreferredLocalTranslationResolver } from "./preferred-local-translation.ts";
 import { LocalExportSupervisor } from "./export-supervisor.ts";
 import {
   ClipCommentOutboxService,
@@ -261,29 +264,44 @@ const reader = new CachedTranscriptDocumentReader(
 const cloudApiUrl =
   config.publicApiOrigin ??
   `http://${config.cloudApiHost}:${config.cloudApiPort}`;
+const localArgosModelManager =
+  config.argosSidecarPath &&
+  Object.keys(config.localModelCatalogTrustRoots).length > 0
+    ? new LocalArgosModelManager({
+        rootDirectory: join(config.dataDir, "local-argos-models"),
+        verifier: createEd25519CatalogVerifier(
+          config.localModelCatalogTrustRoots,
+        ),
+        store: new SqliteLocalArgosModelStore(database),
+        supportedRuntimeVersions: config.argosRuntimeVersions,
+      })
+    : undefined;
+await localArgosModelManager?.sweep(new Date().toISOString());
 
-function derivedTranslationIdentity(input: {
-  projectId: string;
-  catalogVideoId: string;
-  transcriptVersionId: string;
-  preferredLanguage: string;
-  original: {
-    track: {
-      id: string;
-      contentSha256: string;
-      schemaVersion: number;
-    };
-  };
-}) {
-  return DerivedTranslationIdentitySchema.parse({
-    projectId: input.projectId,
-    catalogVideoId: input.catalogVideoId,
-    baseTranscriptVersionId: input.transcriptVersionId,
-    originalTrackId: input.original.track.id,
-    originalContentSha256: input.original.track.contentSha256,
-    targetLanguage: input.preferredLanguage,
-    provider: "amazon-translate",
-    normalizationSchemaVersion: input.original.track.schemaVersion,
+async function preferredLocalTranslationResolver(authorization: string) {
+  if (!localArgosModelManager || !config.argosSidecarPath) return undefined;
+  const provider = new CloudManagedArgosTranslationProvider({
+    baseUrl: cloudApiUrl,
+    authorizationProvider: {
+      authorizationHeader: async () => authorization,
+    },
+    manager: localArgosModelManager,
+    executable: config.argosSidecarPath,
+  });
+  // Catalog refresh obtains only a signed release descriptor; it never
+  // downloads a model or sends transcript text. It falls back to the verified
+  // local catalog cache when the workstation is offline.
+  try {
+    await provider.initialize();
+  } catch {
+    // Preferred-language generation is additive. A first-launch catalog outage
+    // must not prevent the verified original/English workspace from opening.
+    return undefined;
+  }
+  return createPreferredLocalTranslationResolver({
+    provider,
+    index: transcriptIndex,
+    cloudClient: new CloudDerivedTranslationClient(cloudApiUrl, authorization),
   });
 }
 const exportStorageCapacity =
@@ -810,8 +828,10 @@ app = createLocalAgent({
     authorization,
     preferredLanguage,
     offlineReviewCapability,
-  }) =>
-    new SharedTranscriptWorkspaceService(
+  }) => {
+    const preferredResolver =
+      await preferredLocalTranslationResolver(authorization);
+    return new SharedTranscriptWorkspaceService(
       new SharedFirstTranscriptResolver(
         new HttpActiveTranscriptCatalogClient(cloudApiUrl, authorization),
         new VerifiedTranscriptCache(
@@ -824,34 +844,14 @@ app = createLocalAgent({
         ),
       ),
       reader,
-      {
-        findLocal: async (input) =>
-          transcriptIndex.findDerivedTranslation(
-            derivedTranslationIdentity(input),
-          ),
-        findShared: async (input) => {
-          const identity = derivedTranslationIdentity(input);
-          const client = new CloudDerivedTranslationClient(
-            cloudApiUrl,
-            authorization,
-          );
-          return (
-            await new SharedDerivedTranslationResolver(
-              {
-                getDerivedTranslation: (candidate) =>
-                  client.lookupDerivedTranslation(candidate),
-              },
-              transcriptIndex,
-            ).resolve(identity)
-          )?.transcript;
-        },
-      },
+      preferredResolver,
     ).resolveWorkspace(
       projectId,
       catalogVideoId,
       preferredLanguage,
       offlineReviewCapability,
-    ),
+    );
+  },
 });
 app.addHook("onClose", async () => {
   await exportSupervisor?.stop();

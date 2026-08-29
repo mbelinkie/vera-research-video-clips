@@ -64,6 +64,23 @@ describe("configuration", () => {
     expect(config.awsRegion).toBe("us-west-2");
   });
 
+  it("requires the protected catalog signing key and key ID together", () => {
+    expect(() =>
+      loadConfig({
+        NODE_ENV: "test",
+        LOCAL_MODEL_CATALOG_SIGNING_KEY_ID: "catalog-key-1",
+      }),
+    ).toThrow("must be configured together");
+
+    expect(
+      loadConfig({
+        NODE_ENV: "test",
+        LOCAL_MODEL_CATALOG_SIGNING_KEY_ID: "catalog-key-1",
+        LOCAL_MODEL_CATALOG_SIGNING_PRIVATE_KEY_BASE64: "cHJpdmF0ZS1rZXk=",
+      }),
+    ).toMatchObject({ localModelCatalogSigningKeyId: "catalog-key-1" });
+  });
+
   it("accepts an explicitly configured yt-dlp caption provider", () => {
     const config = loadConfig({
       NODE_ENV: "test",

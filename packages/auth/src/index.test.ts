@@ -9,7 +9,9 @@ import {
   OAuthProtocolError,
   createCognitoAccessTokenVerifier,
   createCognitoSessionProvider,
+  PlatformAuthorizationError,
   requirePermission,
+  requirePlatformCapability,
   requireProjectRoleAssignment,
   type ProjectPermission,
   type CognitoAccessTokenVerifier,
@@ -84,6 +86,30 @@ describe("project authorization", () => {
   });
 });
 
+describe("platform authorization", () => {
+  it("does not derive platform authority from a project role", () => {
+    expect(() =>
+      requirePlatformCapability(
+        { userId: subject, externalSubject: "test:owner" },
+        "manage_language_services",
+      ),
+    ).toThrow(PlatformAuthorizationError);
+  });
+
+  it("accepts only an explicit platform capability", () => {
+    expect(() =>
+      requirePlatformCapability(
+        {
+          userId: subject,
+          externalSubject: "test:platform-admin",
+          platformCapabilities: ["manage_language_services"],
+        },
+        "manage_language_services",
+      ),
+    ).not.toThrow();
+  });
+});
+
 describe("Cognito access-token boundary", () => {
   const configuration = {
     userPoolId: "us-east-1_Example",
@@ -93,6 +119,7 @@ describe("Cognito access-token boundary", () => {
 
   function providerFor(
     claims: Partial<{
+      "cognito:groups": unknown;
       client_id: string;
       exp: number;
       iss: string;
@@ -131,6 +158,29 @@ describe("Cognito access-token boundary", () => {
       externalSubject: `cognito:${issuer}:${subject}`,
     });
     expect(verifier.verify).toHaveBeenCalledWith("a.b.c");
+  });
+
+  it("derives language-service authority only from the exact verified Cognito group", async () => {
+    const { provider } = providerFor({
+      "cognito:groups": ["researchers", "vera-platform-admins"],
+    });
+    await expect(
+      provider.authenticate({ authorization: "Bearer a.b.c" }),
+    ).resolves.toMatchObject({
+      platformCapabilities: ["manage_language_services"],
+    });
+
+    for (const groups of [
+      ["VERA-PLATFORM-ADMINS"],
+      ["vera-platform-admin"],
+      "vera-platform-admins",
+      ["vera-platform-admins", 7],
+    ]) {
+      const { provider: denied } = providerFor({ "cognito:groups": groups });
+      await expect(
+        denied.authenticate({ authorization: "Bearer a.b.c" }),
+      ).resolves.not.toHaveProperty("platformCapabilities");
+    }
   });
 
   it.each([

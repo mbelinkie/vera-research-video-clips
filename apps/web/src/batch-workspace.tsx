@@ -1,4 +1,11 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 
 import {
   ApiErrorSchema,
@@ -66,6 +73,8 @@ import {
   type TranscriptionBatchItem,
   type TranscriptionBatchControlRequest,
   type TranscriptionBatchListResponse,
+  type TranscriptionExecutionPolicy,
+  type CloudTranslationConsent,
   type UpdateHostedTranscriptionApprovalRequest,
 } from "@research-video/contracts";
 
@@ -138,6 +147,9 @@ type BatchWorkspaceProps = {
     inputs: readonly string[];
   }>;
   hasOpenReviewSource?: boolean;
+  batchProviderSelector?: ReactNode;
+  transcriptionExecutionPolicy: TranscriptionExecutionPolicy;
+  translationConsent?: CloudTranslationConsent;
 };
 
 type WorklistView = "all" | "queue" | "reviewed" | "dismissed";
@@ -177,14 +189,15 @@ export function BatchWorkspace({
   bulkAddRequest,
   externalInputsRequest,
   hasOpenReviewSource = false,
+  batchProviderSelector,
+  transcriptionExecutionPolicy,
+  translationConsent,
 }: BatchWorkspaceProps) {
   const [batchName, setBatchName] = useState("Research batch");
   const [inputsText, setInputsText] = useState("");
   const [sourcePolicy, setSourcePolicy] = useState("prefer-existing");
   const [executionLocation, setExecutionLocation] = useState("local");
   const [priority, setPriority] = useState("normal");
-  const [translationConsentAccepted, setTranslationConsentAccepted] =
-    useState(false);
   const [preflight, setPreflight] = useState<BatchPreflightResponse>();
   const [csvDocument, setCsvDocument] = useState<CsvImportDocument>();
   const [csvColumnIndex, setCsvColumnIndex] = useState("");
@@ -288,6 +301,10 @@ export function BatchWorkspace({
     batchRequestGeneration.current += 1;
     clearProjectState();
   }, [projectId, authorization]);
+
+  useEffect(() => {
+    setPreflight(undefined);
+  }, [transcriptionExecutionPolicy]);
 
   useEffect(() => {
     setReviewInboxExpanded(!hasOpenReviewSource);
@@ -553,15 +570,8 @@ export function BatchWorkspace({
     sourcePolicy,
     executionLocation,
     priority,
-    ...(translationConsentAccepted
-      ? {
-          translationConsent: {
-            provider: "amazon-translate" as const,
-            disclosureVersion: 1 as const,
-            transcriptTextTransferAccepted: true as const,
-          },
-        }
-      : {}),
+    transcriptionExecutionPolicy,
+    ...(translationConsent ? { translationConsent } : {}),
   };
 
   async function runPreflight() {
@@ -2604,21 +2614,7 @@ export function BatchWorkspace({
                     </select>
                   </label>
                 </div>
-                <label className="cloud-translation-consent">
-                  <input
-                    type="checkbox"
-                    checked={translationConsentAccepted}
-                    onChange={(event) => {
-                      setTranslationConsentAccepted(event.target.checked);
-                      setPreflight(undefined);
-                    }}
-                  />
-                  <span>
-                    Allow Amazon Translate when a source is not English. The
-                    version-pinned transcript text will be sent to Amazon only
-                    for this batch; no media or local AWS credentials are sent.
-                  </span>
-                </label>
+                {batchProviderSelector}
                 <div className="action-row">
                   <button
                     type="button"

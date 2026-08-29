@@ -24,7 +24,7 @@ describe("desktop runtime configuration", () => {
     directories.add(directory);
     await expect(
       loadDesktopRuntimeConfiguration(directory, {}),
-    ).resolves.toEqual({ whisperModelPin: approvedWhisperModelPin });
+    ).resolves.toEqual(localOnlyConfiguration());
   });
 
   it("loads only a strict HTTPS public-client configuration", async () => {
@@ -89,7 +89,7 @@ describe("desktop runtime configuration", () => {
     );
     await expect(
       loadDesktopRuntimeConfiguration(directory, {}),
-    ).resolves.toEqual({ whisperModelPin: approvedWhisperModelPin });
+    ).resolves.toEqual(localOnlyConfiguration());
   });
 
   it("fails closed for a non-HTTPS model pin", async () => {
@@ -112,7 +112,7 @@ describe("desktop runtime configuration", () => {
     );
     await expect(
       loadDesktopRuntimeConfiguration(directory, {}),
-    ).resolves.toEqual({ whisperModelPin: approvedWhisperModelPin });
+    ).resolves.toEqual(localOnlyConfiguration());
   });
 
   it("fails closed for absent or partial model metadata in file configuration", async () => {
@@ -127,7 +127,7 @@ describe("desktop runtime configuration", () => {
     await writeFile(path, JSON.stringify(cloud), { mode: 0o600 });
     await expect(
       loadDesktopRuntimeConfiguration(directory, {}),
-    ).resolves.toEqual({ whisperModelPin: approvedWhisperModelPin });
+    ).resolves.toEqual(localOnlyConfiguration());
     await writeFile(
       path,
       JSON.stringify({
@@ -138,7 +138,7 @@ describe("desktop runtime configuration", () => {
     );
     await expect(
       loadDesktopRuntimeConfiguration(directory, {}),
-    ).resolves.toEqual({ whisperModelPin: approvedWhisperModelPin });
+    ).resolves.toEqual(localOnlyConfiguration());
   });
 
   it("keeps the approved release model immutable, complete, and SHA-256 pinned", () => {
@@ -151,3 +151,11 @@ describe("desktop runtime configuration", () => {
     });
   });
 });
+
+function localOnlyConfiguration() {
+  return {
+    whisperModelPin: approvedWhisperModelPin,
+    localModelCatalogTrustRoots: {},
+    argosRuntimeVersions: ["1.9"],
+  };
+}

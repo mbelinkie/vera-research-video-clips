@@ -7189,6 +7189,11 @@ describe("claimed cloud translation source", () => {
       disclosureVersion: 1 as const,
       transcriptTextTransferAccepted: true as const,
     };
+    const transcriptionExecutionPolicy = {
+      schemaVersion: 1 as const,
+      execution: "local" as const,
+      fallback: "local" as const,
+    };
     const created = await catalog.createTranscriptionBatch(actor, {
       projectId: project.id,
       name: "Consented batch",
@@ -7198,6 +7203,7 @@ describe("claimed cloud translation source", () => {
         sourcePolicy: "prefer-existing",
         executionLocation: "local",
         priority: "normal",
+        transcriptionExecutionPolicy,
         translationConsent: consent,
       },
       items: [
@@ -7214,11 +7220,17 @@ describe("claimed cloud translation source", () => {
       ],
     });
     expect(created.batch.translationConsent).toEqual(consent);
+    expect(created.batch.transcriptionExecutionPolicy).toEqual(
+      transcriptionExecutionPolicy,
+    );
     const claimed = (await catalog.claimTranscriptionJob(actor, "local", 120))!;
     const claimedPayload = TranscriptionJobPayloadSchema.parse(
       claimed.job.payload,
     );
-    expect(claimed.job.payload).toMatchObject({ translationConsent: consent });
+    expect(claimed.job.payload).toMatchObject({
+      translationConsent: consent,
+      transcriptionExecutionPolicy,
+    });
     const grant = await catalog.createClaimedTranscriptUpload(
       actor,
       claimed.job.id,

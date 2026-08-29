@@ -24,6 +24,7 @@ import {
   VideoSchema,
   languagesEquivalent,
   type ClipCandidate,
+  type CloudTranslationConsent,
   type ClipSelection,
   type DesktopAuthStatus,
   type DesktopNotificationNavigationTarget,
@@ -38,6 +39,7 @@ import {
   type NoSpeechAttestation,
   type TranscriptSelection,
   type TranscriptWorkspaceResponse,
+  type TranscriptionExecutionPolicy,
   type User,
   type Video,
 } from "@research-video/contracts";
@@ -73,11 +75,16 @@ import { SourceIngestPanel } from "./source-ingest-panel.tsx";
 import { TranscriptNavigationPanel } from "./transcript-navigation-panel.tsx";
 import type { YouTubePlayerHandle } from "./youtube-player.tsx";
 import {
-  AccountLanguagePanel,
   ResearchWorkspaceLayout,
   WorkspaceShell,
   type ProjectDestination,
 } from "./workspace-shell.tsx";
+import {
+  AccountLanguageServicesPanel,
+  BatchTranscriptionProviderPanel,
+  PlatformLanguageServicesPanel,
+  createLanguageServiceClient,
+} from "./language-service-panels.tsx";
 
 const builtInPresetKey = "built-in:editing-mp4:v1";
 
@@ -380,6 +387,64 @@ function App() {
     useState<NoSpeechAttestation>();
   const [previewingSelection, setPreviewingSelection] = useState(false);
   const [authorization, setAuthorization] = useState("");
+  const [transcriptionExecutionPolicy, setTranscriptionExecutionPolicy] =
+    useState<TranscriptionExecutionPolicy>({
+      schemaVersion: 1,
+      execution: "local",
+      fallback: "local",
+    });
+  const [translationConsent, setTranslationConsent] =
+    useState<CloudTranslationConsent>();
+  const languageServicesClient = useMemo(
+    () =>
+      createLanguageServiceClient((path, options) =>
+        apiFetch("cloud", path, options, authorization),
+      ),
+    [authorization],
+  );
+  useEffect(() => {
+    if (!authorization) return;
+    const controller = new AbortController();
+    void Promise.all([
+      languageServicesClient.listAccountAccess(controller.signal),
+      languageServicesClient.listProviderPreferences(controller.signal),
+      languageServicesClient.listEnabledProviders(controller.signal),
+    ])
+      .then(async ([access, preferences, providers]) => {
+        const preference = preferences.find(
+          (entry) => entry.service === "translation",
+        );
+        const approved = preference
+          ? access.find(
+              (entry) =>
+                entry.id === preference.accessRequestId &&
+                entry.providerId === preference.providerId &&
+                entry.service === "translation" &&
+                entry.state === "approved",
+            )
+          : undefined;
+        const provider = approved
+          ? providers.find(
+              (entry) =>
+                entry.id === approved.providerId &&
+                entry.service === "translation" &&
+                entry.state === "enabled",
+            )
+          : undefined;
+        if (!approved || !provider) {
+          setTranslationConsent(undefined);
+          return;
+        }
+        await languageServicesClient.issueLaunchGrant(approved);
+        setTranslationConsent({
+          provider: provider.id,
+          disclosureVersion: provider.disclosure.version,
+          transcriptTextTransferAccepted: true,
+        });
+      })
+      .catch(() => undefined);
+    return () => controller.abort();
+  }, [authorization, languageServicesClient]);
   const [desktopAuthStatus, setDesktopAuthStatus] =
     useState<DesktopAuthStatus>();
   const [user, setUser] = useState<User>();
@@ -1363,7 +1428,6 @@ function App() {
         retryable = findRetryableTranscriptionItem(
           [detail],
           target.catalogVideoId,
-          target.youtubeVideoId,
         );
         if (retryable) break;
       }
@@ -2923,12 +2987,29 @@ function App() {
       }
       accountSettings={
         <>
-          <AccountLanguagePanel
+          <AccountLanguageServicesPanel
+            client={languageServicesClient}
+            signedIn={Boolean(authorization)}
             preferredLanguage={preferredLanguageDraft}
             disabled={!authorization}
             message={preferenceMessage}
             onPreferredLanguageChange={setPreferredLanguageDraft}
-            onSave={() => void savePreferredLanguage()}
+            onSavePreference={() => void savePreferredLanguage()}
+            onCloudTranslationProviderChange={(provider) =>
+              setTranslationConsent(
+                provider
+                  ? {
+                      provider: provider.id,
+                      disclosureVersion: provider.disclosure.version,
+                      transcriptTextTransferAccepted: true,
+                    }
+                  : undefined,
+              )
+            }
+          />
+          <PlatformLanguageServicesPanel
+            client={languageServicesClient}
+            signedIn={Boolean(authorization)}
           />
           <NotificationPreferencesPanel signedIn={Boolean(authorization)} />
         </>
@@ -3200,6 +3281,12 @@ function App() {
             pendingNavigationRestore.current = undefined;
             hydratedNavigationIdentity.current = undefined;
             setAuthorization(value);
+            setTranscriptionExecutionPolicy({
+              schemaVersion: 1,
+              execution: "local",
+              fallback: "local",
+            });
+            setTranslationConsent(undefined);
             setProjects([]);
             setProjectsLoaded(false);
             selectProject("");
@@ -3237,6 +3324,16 @@ function App() {
           projectId={projectId}
           projects={projects}
           destination={destination}
+          transcriptionExecutionPolicy={transcriptionExecutionPolicy}
+          {...(translationConsent ? { translationConsent } : {})}
+          batchProviderSelector={
+            <BatchTranscriptionProviderPanel
+              client={languageServicesClient}
+              signedIn={Boolean(authorization)}
+              value={transcriptionExecutionPolicy}
+              onChange={setTranscriptionExecutionPolicy}
+            />
+          }
           hasOpenReviewSource={Boolean(workspaceTarget)}
           {...(notificationTarget ? { notificationTarget } : {})}
           bulkAddRequest={bulkAddRequest}

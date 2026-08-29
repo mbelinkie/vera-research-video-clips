@@ -4,8 +4,11 @@
   "private": true,
   "type": "module",
   "dependencies": {
+    "@research-video/catalog": "*",
     "@research-video/contracts": "*",
     "@research-video/config": "*",
+    "@research-video/db-cloud": "*",
+    "@research-video/db-local": "*",
     "@research-video/media": "*",
     "@research-video/providers": "*",
     "@research-video/sync": "*",

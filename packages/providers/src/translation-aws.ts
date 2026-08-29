@@ -18,6 +18,10 @@ import {
   type TranslationRequest,
   type TranslationResult,
 } from "./index.ts";
+import {
+  LanguageServiceRegistry,
+  type TranslationProviderAdapterFactory,
+} from "./language-service-registry.ts";
 
 export type AwsTranslateSender = (
   input: TranslateTextCommandInput,
@@ -229,6 +233,70 @@ export class AwsTranslationProvider implements TranslationProvider {
   }
 }
 
+/**
+ * Registers Amazon Translate as one deployed translation adapter. The registry
+ * only receives this safe descriptor and a factory closure; AWS SDK values and
+ * credential resolution remain private to this module.
+ */
+export function createAwsTranslationProviderAdapterFactory(
+  options: AwsTranslationProviderOptions,
+): TranslationProviderAdapterFactory {
+  return {
+    descriptor: {
+      id: "amazon-translate",
+      service: "translation",
+      displayName: "Amazon Translate",
+      adapterContractVersion: 1,
+      configurationRevision: awsTranslationConfigurationRevision(options),
+      capabilityRevision: awsTranslateLanguageCapabilityVersion,
+      supportedLanguages: [...awsTranslateLanguageCodes]
+        .sort((left, right) => left.localeCompare(right))
+        .map((language) => ({
+          language,
+          roles: ["source", "target"] as const,
+          supportsAutoDetection: false,
+        })),
+      inputModes: ["text_segments"],
+      disclosure: {
+        version: 1,
+        title: "Amazon Translate disclosure",
+        summary:
+          "Selected transcript segment text is sent to Amazon Translate.",
+        dataCategories: ["transcript_text"],
+        publishedAt: "2026-08-26T00:00:00.000Z",
+      },
+      pricing: {
+        currency: "USD",
+        unit: "characters",
+        amountMicros: 0,
+        quantity: 1,
+        effectiveAt: "2026-08-26T00:00:00.000Z",
+      },
+      state: "enabled",
+    },
+    create: (configuration) => {
+      assertAwsCredentialReference(configuration?.protectedCredentialReference);
+      return new AwsTranslationProvider({
+        ...options,
+        region: configuration?.region ?? options.region,
+      });
+    },
+  };
+}
+
+function assertAwsCredentialReference(reference?: string) {
+  if (reference && reference !== "credential:aws-default") {
+    throw new ProviderExecutionError(
+      "The configured protected AWS credential reference is unavailable to this adapter.",
+    );
+  }
+}
+
+/**
+ * Compatibility entry point retained for the current configuration surface.
+ * New composition should register `createAwsTranslationProviderAdapterFactory`
+ * alongside other provider factories and resolve by opaque provider ID.
+ */
 export function createTranslationProvider(options: {
   mode: "disabled" | "aws-translate";
   region: string;
@@ -236,13 +304,16 @@ export function createTranslationProvider(options: {
   sender?: AwsTranslateSender;
 }): TranslationProvider | undefined {
   if (options.mode === "disabled") return undefined;
-  return new AwsTranslationProvider({
+  const factory = createAwsTranslationProviderAdapterFactory({
     region: options.region,
     ...(options.terminologyName
       ? { terminologyName: options.terminologyName }
       : {}),
     ...(options.sender ? { sender: options.sender } : {}),
   });
+  return new LanguageServiceRegistry([factory]).resolveTranslation(
+    "amazon-translate",
+  );
 }
 
 export function splitForAmazonTranslate(text: string): string[] {
@@ -301,6 +372,23 @@ function safeErrorMessage(error: unknown) {
   const message =
     error instanceof Error ? error.message : "unknown provider error";
   return message.replaceAll(/[\r\n\t]+/gu, " ").slice(0, 300);
+}
+
+function awsTranslationConfigurationRevision(
+  options: AwsTranslationProviderOptions,
+) {
+  const terminology = options.terminologyName?.trim() || "none";
+  // This is a safe revision label, not a credential or an SDK configuration dump.
+  return `amazon-translate-v1-${shortStableHash(`${options.region}\u0000${terminology}`)}`;
+}
+
+function shortStableHash(value: string) {
+  let hash = 2_166_136_261;
+  for (const character of value) {
+    hash ^= character.codePointAt(0) ?? 0;
+    hash = Math.imul(hash, 16_777_619);
+  }
+  return (hash >>> 0).toString(16).padStart(8, "0");
 }
 
 export const amazonTranslateMaximumRequestBytes = maximumRequestBytes;

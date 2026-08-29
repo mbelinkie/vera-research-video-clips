@@ -111,14 +111,14 @@ describe("cloud migrations", () => {
 
     const applied = await runCloudMigrations(database);
 
-    expect(applied).toHaveLength(45);
-    expect(calls.filter((call) => call === "pool:connect")).toHaveLength(46);
-    expect(calls.filter((call) => call === "client:BEGIN")).toHaveLength(46);
+    expect(applied).toHaveLength(52);
+    expect(calls.filter((call) => call === "pool:connect")).toHaveLength(53);
+    expect(calls.filter((call) => call === "client:BEGIN")).toHaveLength(53);
     expect(
       calls.filter((call) =>
         call.startsWith("client:SELECT pg_advisory_xact_lock"),
       ),
-    ).toHaveLength(46);
+    ).toHaveLength(53);
     expect(
       calls.some((call) =>
         call.startsWith("pool:INSERT INTO schema_migrations"),
@@ -200,6 +200,13 @@ describe("cloud migrations", () => {
           "0043_workflow_notification_events",
           "0044_transcription_item_cancellation",
           "0045_transcription_batch_archive_retry",
+          "0046_language_service_and_local_model_foundation",
+          "0047_transcription_provider_policy",
+          "0048_local_model_operation_recovery",
+          "0049_amazon_transcribe_operation_state",
+          "0050_provider_neutral_translation_consent",
+          "0051_language_service_grant_authority",
+          "0052_cloud_provider_account_preferences",
         ]);
         expect(
           (
@@ -237,8 +244,8 @@ describe("cloud migrations", () => {
           runCloudMigrations(first),
           runCloudMigrations(second),
         ]);
-        expect(results.flat()).toHaveLength(40);
-        expect(new Set(results.flat()).size).toBe(40);
+        expect(results.flat()).toHaveLength(52);
+        expect(new Set(results.flat()).size).toBe(46);
         expect(await runCloudMigrations(first)).toEqual([]);
       } finally {
         await Promise.all([first.close(), second.close()]);
@@ -298,8 +305,52 @@ describe("cloud migrations", () => {
       "0043_workflow_notification_events",
       "0044_transcription_item_cancellation",
       "0045_transcription_batch_archive_retry",
+      "0046_language_service_and_local_model_foundation",
+      "0047_transcription_provider_policy",
+      "0048_local_model_operation_recovery",
+      "0049_amazon_transcribe_operation_state",
+      "0050_provider_neutral_translation_consent",
+      "0051_language_service_grant_authority",
+      "0052_cloud_provider_account_preferences",
     ]);
     expect(await runCloudMigrations(database)).toEqual([]);
+    expect(
+      (
+        await database.query<{ table_name: string }>(
+          `SELECT table_name FROM information_schema.tables
+           WHERE table_name IN (
+             'language_service_providers',
+             'language_service_provider_server_configurations',
+             'cloud_provider_access_requests',
+             'local_model_feed_snapshots',
+             'local_model_candidates',
+             'local_model_evaluations',
+             'local_model_operations',
+             'signed_local_model_catalog_release_revocations'
+           ) ORDER BY table_name`,
+        )
+      ).rows,
+    ).toHaveLength(8);
+    expect(
+      (
+        await database.query<{ count: number }>(
+          `SELECT count(*)::integer AS count FROM language_service_providers
+           UNION ALL SELECT count(*)::integer FROM cloud_provider_access_requests
+           UNION ALL SELECT count(*)::integer FROM local_model_versions
+           UNION ALL SELECT count(*)::integer FROM signed_local_model_catalog_releases`,
+        )
+      ).rows,
+    ).toEqual([{ count: 0 }, { count: 0 }, { count: 0 }, { count: 0 }]);
+    expect(
+      (
+        await database.query<{ indexname: string }>(
+          `SELECT indexname FROM pg_indexes
+           WHERE indexname = 'cloud_provider_access_requests_one_active_per_service'`,
+        )
+      ).rows,
+    ).toEqual([
+      { indexname: "cloud_provider_access_requests_one_active_per_service" },
+    ]);
     expect(
       (
         await database.query<{ table_name: string }>(

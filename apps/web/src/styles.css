@@ -348,6 +348,7 @@ h1 {
 }
 
 .loader-row input,
+.loader-row select,
 .search-field input {
   width: 100%;
   border: 1px solid #3a404a;
@@ -357,11 +358,13 @@ h1 {
   outline: none;
 }
 
-.loader-row input {
+.loader-row input,
+.loader-row select {
   padding: 12px 14px;
 }
 
 .loader-row input:focus,
+.loader-row select:focus,
 .search-field input:focus {
   border-color: #c49b50;
   box-shadow: 0 0 0 3px rgb(196 155 80 / 14%);

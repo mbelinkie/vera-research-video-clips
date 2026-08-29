@@ -7,6 +7,7 @@ import fixture from "../../../tests/fixtures/transcripts/spanish-bilingual.json"
 import { translateCanonicalTranscript } from "./index.ts";
 import {
   AwsTranslationProvider,
+  createAwsTranslationProviderAdapterFactory,
   createTranslationProvider,
   splitForAmazonTranslate,
 } from "./translation-aws.ts";
@@ -81,6 +82,31 @@ describe("AwsTranslationProvider", () => {
       },
       undefined,
     );
+  });
+
+  it("keeps the Amazon registry factory descriptor safe while retaining historical provenance", async () => {
+    const sender = vi.fn(async () => ({ TranslatedText: "Hello" }));
+    const factory = createAwsTranslationProviderAdapterFactory({
+      region: "us-east-1",
+      terminologyName: "essay-terms",
+      sender,
+    });
+
+    expect(factory.descriptor).toMatchObject({
+      id: "amazon-translate",
+      service: "translation",
+      state: "enabled",
+    });
+    expect(factory.descriptor).not.toHaveProperty("region");
+    expect(factory.descriptor).not.toHaveProperty("terminologyName");
+    expect(factory.descriptor).not.toHaveProperty("sender");
+    await expect(
+      factory.create().translate({
+        sourceLanguage: "es",
+        targetLanguage: "en",
+        segments: [{ id: "segment-1", text: "Hola" }],
+      }),
+    ).resolves.toMatchObject({ provider: "amazon-translate" });
   });
 
   it("keeps every request below the service byte limit", async () => {

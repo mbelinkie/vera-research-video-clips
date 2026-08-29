@@ -489,6 +489,9 @@ export interface CreateTranscriptionBatchInput {
   name: string;
   options: BatchOptions;
   items: BatchPreflightItem[];
+  transcriptionAccessRequestId?: string;
+  transcriptionGrantId?: string;
+  translationGrantId?: string;
   /**
    * The caller verified active transcript artifacts while producing `items`.
    * Preserve a ready item instead of trusting a stale project-video pointer.
@@ -10255,6 +10258,9 @@ export class SharedProjectCatalog {
         input.options,
         createdAt,
         "manual",
+        input.transcriptionAccessRequestId,
+        input.transcriptionGrantId,
+        input.translationGrantId,
       );
       for (const item of input.items) {
         await this.insertTranscriptionBatchItem(
@@ -10266,6 +10272,8 @@ export class SharedProjectCatalog {
           createdAt,
           true,
           Boolean(input.trustVerifiedPreflight),
+          input.transcriptionGrantId,
+          input.translationGrantId,
         );
       }
       await this.emitTranscriptionNotificationsForBatch(batchId, createdAt);
@@ -10310,6 +10318,10 @@ export class SharedProjectCatalog {
         sourcePolicy: batch.source_policy,
         executionLocation: batch.execution_location,
         priority: batch.priority,
+        transcriptionExecutionPolicy:
+          typeof batch.transcription_execution_policy === "string"
+            ? JSON.parse(batch.transcription_execution_policy)
+            : batch.transcription_execution_policy,
         ...(batch.execution_location === "hosted"
           ? {
               hostedApproval: {
@@ -12971,6 +12983,47 @@ export class SharedProjectCatalog {
     return source;
   }
 
+  async requireActiveClaimedTranslationGrant(
+    actor: AuthenticatedActor,
+    jobId: string,
+    attempt: number,
+    providerId: string,
+    operationId?: string,
+  ): Promise<string> {
+    await this.requireActiveWorkerLease(actor, jobId, attempt);
+    const result = await this.database.query<DbRow>(
+      `SELECT launch_grant.id
+       FROM jobs job
+       JOIN transcription_batches batch
+         ON batch.id = job.payload->>'batchId'
+       JOIN cloud_provider_launch_grants launch_grant
+         ON launch_grant.id = batch.translation_grant_id
+       JOIN cloud_provider_access_requests access
+         ON access.id = launch_grant.access_request_id
+       JOIN language_service_providers provider
+         ON provider.id = launch_grant.provider_id AND provider.service = launch_grant.service
+       WHERE job.id = $1 AND job.kind = 'transcription'
+         AND launch_grant.provider_id = $2 AND launch_grant.service = 'translation'
+         AND (
+           (launch_grant.revoked_at IS NULL AND launch_grant.expires_at > $3
+            AND access.state = 'approved' AND provider.state = 'enabled')
+           OR EXISTS (
+             SELECT 1 FROM cloud_provider_operations operation
+             WHERE operation.id = $4 AND operation.provider_id = $2
+               AND operation.service = 'translation'
+               AND operation.state IN ('staging', 'submitted', 'running')
+           )
+         )`,
+      [jobId, providerId, this.now().toISOString(), operationId ?? null],
+    );
+    if (!result.rows[0]) {
+      throw new AuthorizationError(
+        "The cloud translation launch grant is missing, expired, or revoked.",
+      );
+    }
+    return String(result.rows[0].id);
+  }
+
   async getClaimedTranscriptTranslationPublication(
     actor: AuthenticatedActor,
     jobId: string,
@@ -13048,7 +13101,7 @@ export class SharedProjectCatalog {
     const transcript = NormalizedTranscriptSchema.parse(input.transcript);
     if (
       transcript.track.kind !== "english" ||
-      transcript.track.provider !== "amazon-translate" ||
+      transcript.track.provider !== input.consent.provider ||
       transcript.track.sourceTrackId !== source.track.id ||
       transcript.track.videoId !== source.track.videoId ||
       !languagesEquivalent(transcript.track.language, input.targetLanguage)
@@ -13291,7 +13344,8 @@ export class SharedProjectCatalog {
           ) ||
           source.track.provider !== manifest.provider ||
           translated.track.kind !== "english" ||
-          translated.track.provider !== "amazon-translate" ||
+          translated.track.provider !==
+            String(jsonRecord(jobPayload.translationConsent)?.provider ?? "") ||
           translated.track.sourceTrackId !== source.track.id ||
           translated.track.videoId !== manifest.videoId ||
           !languagesEquivalent(
@@ -14455,7 +14509,9 @@ export class SharedProjectCatalog {
     const result = await this.database.query<DbRow>(
       `SELECT bi.*, b.target_language, b.transcription_profile, b.source_policy,
               b.execution_location, b.priority, b.translation_provider,
-              b.translation_disclosure_version
+              b.translation_disclosure_version,
+              b.transcription_execution_policy, b.transcription_grant_id,
+              b.translation_grant_id
        FROM transcription_batch_items bi
        JOIN transcription_batches b ON b.id = bi.batch_id
        WHERE bi.id = $1 AND b.project_id = $2 FOR UPDATE OF bi`,
@@ -14499,6 +14555,16 @@ export class SharedProjectCatalog {
       sourcePolicy: item.source_policy,
       executionLocation: item.execution_location,
       priority: item.priority,
+      transcriptionExecutionPolicy:
+        typeof item.transcription_execution_policy === "string"
+          ? JSON.parse(item.transcription_execution_policy)
+          : item.transcription_execution_policy,
+      ...(item.transcription_grant_id
+        ? { transcriptionGrantId: item.transcription_grant_id }
+        : {}),
+      ...(item.translation_grant_id
+        ? { translationGrantId: item.translation_grant_id }
+        : {}),
       ...(item.translation_provider
         ? {
             translationConsent: {
@@ -15251,6 +15317,9 @@ export class SharedProjectCatalog {
     options: BatchOptions,
     createdAt: string,
     processingOrigin: "manual" | "project_local",
+    transcriptionAccessRequestId?: string,
+    transcriptionGrantId?: string,
+    translationGrantId?: string,
   ): Promise<void> {
     await this.database.query(
       `INSERT INTO transcription_batches
@@ -15258,10 +15327,12 @@ export class SharedProjectCatalog {
           transcription_profile, source_policy, priority, created_by,
           translation_provider, translation_disclosure_version,
           translation_consent_accepted_at, hosted_approval_state,
-          hosted_approval_version, processing_origin, version, created_at,
-          updated_at)
+          hosted_approval_version, processing_origin,
+          transcription_execution_policy, transcription_access_request_id,
+          transcription_grant_id, translation_grant_id,
+          version, created_at, updated_at)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-               $13, 1, $14, 1, $15, $15)`,
+               $13, 1, $14, $15, $16, $17, $18, 1, $19, $19)`,
       [
         batchId,
         projectId,
@@ -15277,6 +15348,12 @@ export class SharedProjectCatalog {
         options.translationConsent ? createdAt : null,
         options.executionLocation === "hosted" ? "pending" : "not_required",
         processingOrigin,
+        JSON.stringify(
+          options.transcriptionExecutionPolicy ?? localTranscriptionPolicy,
+        ),
+        transcriptionAccessRequestId ?? null,
+        transcriptionGrantId ?? null,
+        translationGrantId ?? null,
         createdAt,
       ],
     );
@@ -15291,6 +15368,8 @@ export class SharedProjectCatalog {
     createdAt: string,
     upsertVideo: boolean,
     trustVerifiedPreflight = false,
+    transcriptionGrantId?: string,
+    translationGrantId?: string,
   ): Promise<void> {
     let catalogVideoId = item.catalogVideoId;
     if (
@@ -15399,6 +15478,10 @@ export class SharedProjectCatalog {
           sourcePolicy: options.sourcePolicy,
           executionLocation: options.executionLocation,
           priority: options.priority,
+          transcriptionExecutionPolicy:
+            options.transcriptionExecutionPolicy ?? localTranscriptionPolicy,
+          ...(transcriptionGrantId ? { transcriptionGrantId } : {}),
+          ...(translationGrantId ? { translationGrantId } : {}),
           ...(options.translationConsent
             ? { translationConsent: options.translationConsent }
             : {}),
@@ -15423,9 +15506,12 @@ export class SharedProjectCatalog {
              )
              AND coalesce(payload->'translationConsent', 'null'::jsonb)
                  = $7::jsonb
-             AND coalesce(payload->>'creatorReportedLanguage', '') = $8
+             AND coalesce(payload->'transcriptionExecutionPolicy',
+                          '{"schemaVersion":1,"execution":"local","fallback":"local"}'::jsonb)
+                 = $8::jsonb
+             AND coalesce(payload->>'creatorReportedLanguage', '') = $9
              AND coalesce(payload->'languageDecision', 'null'::jsonb)
-                 = $9::jsonb
+                 = $10::jsonb
            ORDER BY created_at, id
            LIMIT 1`,
           [
@@ -15436,6 +15522,7 @@ export class SharedProjectCatalog {
             payload.executionLocation,
             payload.sourcePolicy,
             JSON.stringify(payload.translationConsent ?? null),
+            JSON.stringify(payload.transcriptionExecutionPolicy),
             payload.creatorReportedLanguage ?? "",
             JSON.stringify(payload.languageDecision ?? null),
           ],
@@ -18308,11 +18395,14 @@ function transcriptionJobIdempotencyKey(
     payload.translationConsent
       ? `translate-${payload.translationConsent.provider}-v${payload.translationConsent.disclosureVersion}`
       : "translate-disabled",
+    payload.transcriptionExecutionPolicy?.execution === "cloud"
+      ? `transcribe-${payload.transcriptionExecutionPolicy.providerId}`
+      : "transcribe-local",
     payload.creatorReportedLanguage ?? "creator-unknown",
     payload.languageDecision
       ? `decision-${payload.languageDecision.decisionId}-v${payload.languageDecision.decisionVersion}-${payload.languageDecision.status}-${payload.languageDecision.resolvedLanguage ?? "unresolved"}`
       : "decision-none",
-    "schema-2",
+    "schema-3",
   ].join(":");
 }
 
@@ -18515,6 +18605,12 @@ const transcriptionActiveStates = new Set<TranscriptionBatchItem["state"]>([
   "aligning",
   "uploading",
 ]);
+
+const localTranscriptionPolicy = {
+  schemaVersion: 1 as const,
+  execution: "local" as const,
+  fallback: "local" as const,
+};
 
 function mapJob(row: DbRow) {
   return JobSchema.parse({

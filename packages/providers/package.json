@@ -7,11 +7,22 @@
     ".": "./src/index.ts",
     "./captions-local": "./src/captions-local.ts",
     "./speech-whisper-cpp": "./src/speech-whisper-cpp.ts",
-    "./translation-aws": "./src/translation-aws.ts"
+    "./speech-aws-transcribe": "./src/speech-aws-transcribe.ts",
+    "./translation-aws": "./src/translation-aws.ts",
+    "./language-service-registry": "./src/language-service-registry.ts",
+    "./local-model-argos-catalog": "./src/local-model-argos-catalog.ts",
+    "./cloud-local-model-catalog": "./src/cloud-local-model-catalog.ts",
+    "./local-argos-model-manager": "./src/local-argos-model-manager.ts",
+    "./local-argos-model-store-sqlite": "./src/local-argos-model-store-sqlite.ts",
+    "./translation-argos-local": "./src/translation-argos-local.ts",
+    "./translation-argos-cloud-managed": "./src/translation-argos-cloud-managed.ts"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.1119.0",
+    "@aws-sdk/client-transcribe": "^3.1119.0",
     "@aws-sdk/client-translate": "^3.1101.0",
     "@research-video/contracts": "*",
+    "@research-video/db-local": "*",
     "@research-video/transcript": "*"
   }
 }

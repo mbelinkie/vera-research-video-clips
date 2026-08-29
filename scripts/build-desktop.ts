@@ -70,6 +70,14 @@ const publicDesktopConfiguration = {
   cognitoAuthority: process.env.COGNITO_DOMAIN,
   cognitoClientId: process.env.COGNITO_CLIENT_ID,
   whisperModelPin: approvedWhisperModelPin,
+  localModelCatalogTrustRoots: parseTrustRoots(
+    process.env.LOCAL_MODEL_CATALOG_TRUST_ROOTS_JSON,
+  ),
+  argosSidecarPath: process.env.ARGOS_SIDECAR_PATH,
+  argosRuntimeVersions: (process.env.ARGOS_RUNTIME_VERSIONS ?? "1.9")
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean),
 };
 const configuredDesktopValues = [
   publicDesktopConfiguration.publicApiOrigin,
@@ -91,3 +99,14 @@ await writeFile(
   `${JSON.stringify(configuration, null, 2)}\n`,
   { encoding: "utf8", mode: 0o600 },
 );
+
+function parseTrustRoots(value: string | undefined): Record<string, string> {
+  if (!value) return {};
+  const parsed = JSON.parse(value) as unknown;
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
+    throw new Error("LOCAL_MODEL_CATALOG_TRUST_ROOTS_JSON must be an object.");
+  const entries = Object.entries(parsed);
+  if (entries.some(([, root]) => typeof root !== "string"))
+    throw new Error("Every local-model trust root must be a string.");
+  return Object.fromEntries(entries) as Record<string, string>;
+}

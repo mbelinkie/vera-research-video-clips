@@ -102,6 +102,41 @@ describe("CloudDerivedTranslationClient", () => {
     expect(JSON.parse(String(init.body))).toEqual({ identity });
   });
 
+  it("publishes a locally normalized translation through the authorized durable lineage", async () => {
+    const published = readyTranslation();
+    const fetcher = vi.fn(
+      async () => new Response(JSON.stringify(published), { status: 201 }),
+    );
+    const client = new CloudDerivedTranslationClient(
+      "https://api.example.test",
+      "Bearer private-desktop-token",
+      fetcher as unknown as typeof fetch,
+    );
+    const result = await client.publishDerivedTranslation({
+      identity,
+      idempotencyKey: "local-argos:fixture",
+      transcript: published.transcript,
+    });
+    expect(result.manifest.identity).toEqual(identity);
+    const [url, init] = fetcher.mock.calls[0] as unknown as [
+      string,
+      RequestInit,
+    ];
+    expect(url).toBe(
+      `https://api.example.test/api/projects/${identity.projectId}/videos/${identity.catalogVideoId}/derived-translations/publish`,
+    );
+    expect(init).toMatchObject({
+      method: "POST",
+      headers: expect.objectContaining({
+        authorization: "Bearer private-desktop-token",
+      }),
+    });
+    expect(JSON.parse(String(init.body))).toMatchObject({
+      identity,
+      idempotencyKey: "local-argos:fixture",
+    });
+  });
+
   it("rejects malformed or mismatched upstream responses with safe bounded errors", async () => {
     const malformedReady = new CloudDerivedTranslationClient(
       "https://api.example.test",

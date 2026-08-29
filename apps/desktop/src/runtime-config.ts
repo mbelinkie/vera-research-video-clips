@@ -37,6 +37,17 @@ export const DesktopRuntimeConfigurationSchema = z
         pin.sha256 === approvedWhisperModelPin.sha256,
       "The desktop model pin must match the approved release artifact.",
     ),
+    localModelCatalogTrustRoots: z
+      .record(
+        z.string().trim().min(1).max(160),
+        z.string().trim().min(1).max(32_768),
+      )
+      .default({}),
+    argosSidecarPath: z.string().trim().min(1).optional(),
+    argosRuntimeVersions: z
+      .array(z.string().trim().min(1).max(160))
+      .max(32)
+      .default(["1.9"]),
   })
   .strict()
   .superRefine((configuration, context) => {
@@ -83,6 +94,14 @@ export async function loadDesktopRuntimeConfiguration(
     cognitoAuthority: environment.COGNITO_DOMAIN,
     cognitoClientId: environment.COGNITO_CLIENT_ID,
     whisperModelPin: approvedWhisperModelPin,
+    localModelCatalogTrustRoots: readTrustRoots(
+      environment.LOCAL_MODEL_CATALOG_TRUST_ROOTS_JSON,
+    ),
+    argosSidecarPath: environment.ARGOS_SIDECAR_PATH,
+    argosRuntimeVersions: (environment.ARGOS_RUNTIME_VERSIONS ?? "1.9")
+      .split(",")
+      .map((value) => value.trim())
+      .filter(Boolean),
   };
   if (
     fromEnvironment.publicApiOrigin &&
@@ -106,4 +125,20 @@ export async function loadDesktopRuntimeConfiguration(
   return DesktopRuntimeConfigurationSchema.parse({
     whisperModelPin: approvedWhisperModelPin,
   });
+}
+
+function readTrustRoots(value: string | undefined): Record<string, string> {
+  if (!value) return {};
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
+      return {};
+    return Object.fromEntries(
+      Object.entries(parsed).filter(
+        (entry): entry is [string, string] => typeof entry[1] === "string",
+      ),
+    );
+  } catch {
+    return {};
+  }
 }

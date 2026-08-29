@@ -1,8 +1,10 @@
 import {
   DerivedTranslationSchema,
   LookupDerivedTranslationSchema,
+  PublishDerivedTranslationRequestSchema,
   type DerivedTranslation,
   type DerivedTranslationIdentity,
+  type PublishDerivedTranslationRequest,
 } from "@research-video/contracts";
 
 /**
@@ -26,13 +28,27 @@ export class CloudDerivedTranslationClient {
     return this.readyResponse(response, identity);
   }
 
+  /**
+   * Publishes a fully normalized local result through the project-authorized
+   * durable translation lineage. The caller owns local execution; this method
+   * never selects a provider or receives provider credentials.
+   */
+  async publishDerivedTranslation(
+    input: PublishDerivedTranslationRequest,
+  ): Promise<DerivedTranslation> {
+    const request = PublishDerivedTranslationRequestSchema.parse(input);
+    const response = await this.request(request.identity, request, "publish");
+    return this.readyResponse(response, request.identity);
+  }
+
   private async request(
     identity: DerivedTranslationIdentity,
     body: unknown,
+    operation: "lookup" | "publish" = "lookup",
   ): Promise<Response> {
     try {
       return await this.fetcher(
-        `${this.baseUrl}/api/projects/${encodeURIComponent(identity.projectId)}/videos/${encodeURIComponent(identity.catalogVideoId)}/derived-translations/lookup`,
+        `${this.baseUrl}/api/projects/${encodeURIComponent(identity.projectId)}/videos/${encodeURIComponent(identity.catalogVideoId)}/derived-translations/${operation}`,
         {
           method: "POST",
           headers: {

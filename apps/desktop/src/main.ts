@@ -19,6 +19,7 @@ import { CognitoOAuthClient } from "@research-video/auth";
 import {
   DesktopApiRequestSchema,
   DesktopApiResponseSchema,
+  CloudProviderLaunchGrantSchema,
   DesktopTimedTranscriptUploadRequestSchema,
   CreateManualTimedTranscriptImportRequestSchema,
   ManualTimedTranscriptImportUploadGrantSchema,
@@ -90,6 +91,7 @@ import {
 import {
   hasCloudDesktopRuntimeConfiguration,
   loadDesktopRuntimeConfiguration,
+  type DesktopRuntimeConfiguration,
 } from "./runtime-config.ts";
 import { desktopToolSearchPath } from "./tool-search-path.ts";
 import {
@@ -262,6 +264,7 @@ if (!app.requestSingleInstanceLock()) {
           clearLocalAgentPort: (port) => {
             localAgentEndpoint.clear(port);
           },
+          configuration,
         }),
         runtimeControl,
       },
@@ -442,6 +445,7 @@ function installIpcHandlers(options: {
   nativeActionSecret: string;
 }) {
   const timedTranscriptUploadGrants = new TimedTranscriptUploadGrantRegistry();
+  const languageServiceGrantSecrets = new Map<string, string>();
   let activeModelDownload:
     | {
         controller: AbortController;
@@ -654,6 +658,7 @@ function installIpcHandlers(options: {
       enabled: false,
     });
     await options.getSupervisor()?.stop("transcription-worker");
+    languageServiceGrantSecrets.clear();
     await broker.signOut();
     return DesktopAuthStatusSchema.parse(
       rendererAuthStatus(broker, options.getStartupAuthIssue()),
@@ -1013,7 +1018,33 @@ function installIpcHandlers(options: {
       ...(input.body !== undefined ? { body: input.body } : {}),
       redirect: "error",
     });
-    const body = await response.text();
+    let body = await response.text();
+    if (
+      response.ok &&
+      input.target === "cloud" &&
+      input.method === "POST" &&
+      input.path === "/api/account/cloud-provider-launch-grants"
+    ) {
+      try {
+        const grant = CloudProviderLaunchGrantSchema.parse(JSON.parse(body));
+        languageServiceGrantSecrets.set(grant.id, grant.grantReference);
+        body = JSON.stringify({
+          ...grant,
+          grantReference: `desktop-main-memory:${grant.id}`,
+        });
+      } catch {
+        return DesktopApiResponseSchema.parse({
+          status: 502,
+          body: JSON.stringify({
+            error: {
+              code: "invalid_launch_grant",
+              message: "The provider launch grant could not be verified.",
+            },
+          }),
+          contentType: "application/json",
+        });
+      }
+    }
     if (isTimedTranscriptCreateRequest(input) && response.ok) {
       try {
         timedTranscriptUploadGrants.register(
@@ -1348,6 +1379,7 @@ function createElectronProcessLauncher(input: {
   getLocalAgentPort(): number;
   reportLocalAgentPort(port: number): void;
   clearLocalAgentPort(port: number): void;
+  configuration: DesktopRuntimeConfiguration | undefined;
 }): ProcessLauncher {
   return {
     async launch(service: SupervisedServiceName): Promise<SupervisedProcess> {
@@ -1361,7 +1393,15 @@ function createElectronProcessLauncher(input: {
         DATA_DIR: join(input.userData, "data"),
         DESKTOP_APP_TOOLS_DIRECTORY: join(input.userData, "tools"),
         PUBLIC_API_ORIGIN: input.workerCloudOrigin ?? "https://invalid.local",
+        LOCAL_MODEL_CATALOG_TRUST_ROOTS_JSON: JSON.stringify(
+          input.configuration?.localModelCatalogTrustRoots ?? {},
+        ),
+        ARGOS_RUNTIME_VERSIONS: (
+          input.configuration?.argosRuntimeVersions ?? ["1.9"]
+        ).join(","),
       };
+      if (input.configuration?.argosSidecarPath)
+        environment.ARGOS_SIDECAR_PATH = input.configuration.argosSidecarPath;
       let modulePath: string;
       if (service === "local-agent") {
         modulePath = join(serviceRoot, "local-agent.mjs");

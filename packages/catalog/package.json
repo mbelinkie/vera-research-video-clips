@@ -3,12 +3,17 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "exports": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./language-services": "./src/language-services.ts",
+    "./local-model-operation-runner": "./src/local-model-operation-runner.ts"
+  },
   "dependencies": {
     "@electric-sql/pglite": "^0.5.4",
     "@research-video/auth": "*",
     "@research-video/contracts": "*",
     "@research-video/export-settings": "*",
+    "@research-video/providers": "*",
     "@research-video/storage": "*"
   }
 }

@@ -4,6 +4,7 @@ import type {
   AuthenticatedActor,
   ProjectRole,
 } from "@research-video/contracts";
+import { hasPlatformCapability } from "@research-video/contracts";
 
 export type ProjectPermission =
   | "read"
@@ -25,6 +26,26 @@ export class AuthenticationError extends Error {
 export class AuthorizationError extends Error {
   readonly statusCode = 403;
   readonly code = "project_access_denied";
+}
+
+export class PlatformAuthorizationError extends Error {
+  readonly statusCode = 403;
+  readonly code = "platform_access_denied";
+}
+
+type PlatformCapability = NonNullable<
+  AuthenticatedActor["platformCapabilities"]
+>[number];
+
+export function requirePlatformCapability(
+  actor: AuthenticatedActor,
+  capability: PlatformCapability,
+): void {
+  if (!hasPlatformCapability(actor, capability)) {
+    throw new PlatformAuthorizationError(
+      "You do not have access to manage platform language services.",
+    );
+  }
 }
 
 const permissions: Record<ProjectRole, ReadonlySet<ProjectPermission>> = {
@@ -70,6 +91,7 @@ export function requireProjectRoleAssignment(
 
 /** The claims this package needs from a verified Cognito access token. */
 export interface CognitoAccessTokenClaims {
+  "cognito:groups"?: unknown;
   client_id: string;
   exp: number;
   iss: string;
@@ -169,9 +191,23 @@ export function createCognitoSessionProvider<Request>(
       return {
         userId: claims.sub,
         externalSubject: `cognito:${claims.iss}:${claims.sub}`,
+        ...(hasExactCognitoGroup(
+          claims["cognito:groups"],
+          "vera-platform-admins",
+        )
+          ? { platformCapabilities: ["manage_language_services" as const] }
+          : {}),
       };
     },
   };
+}
+
+function hasExactCognitoGroup(value: unknown, expected: string): boolean {
+  return (
+    Array.isArray(value) &&
+    value.every((group) => typeof group === "string") &&
+    value.includes(expected)
+  );
 }
 
 function parseBearerToken(authorization: string | undefined): string {

@@ -1,6 +1,12 @@
-# Project outline
+# Project outline — historical snapshot
 
-This is the short execution map. `PROJECT_GUIDE.md` contains the authoritative product, architecture, data, security, and acceptance details.
+> **Live roadmap moved to GitHub on 2026-08-28.** This file preserves the prior
+> execution map and acceptance history. Do not infer current priority, status,
+> ownership, dependencies, or model routing from the checkboxes below. Use the
+> **VERA Research Roadmap** configured in `.github/vera-roadmap.json`.
+
+This was the short execution map. `PROJECT_GUIDE.md` remains authoritative for
+product, architecture, data, security, and acceptance details.
 
 ## Delivery workflow
 
@@ -62,6 +68,13 @@ In a shared project, load or batch-submit YouTube videos, reuse an online Englis
 - M8 turns the M7-validated application into signed, self-updating macOS 15+
   Universal and Windows 11 23H2+ x64 releases for remote testers.
 - Keep platform, media, transcription, translation, alignment, object storage, dispatch, and sync details behind adapters.
+- Local Whisper and signed-catalog Argos are the default transcription and
+  translation providers. Cloud providers are opaque registered adapters with
+  provider-specific consent, approval, launch grants, pricing, and provenance;
+  a failure may fall back only to the corresponding local provider.
+- Desktops consume immutable signed local-model catalog releases and exact
+  mirrored bytes, never the mutable upstream Argos feed. Compatible packs can
+  be enabled, disabled, revoked, or rolled back without rebuilding the app.
 
 ## Main workflows
 
@@ -163,6 +176,11 @@ Milestone 2 completed 2026-08-01; word click-to-play refined 2026-08-25. URL nor
 - [x] Normalize acquired WebVTT into deterministic canonical cue-timed tracks without inventing word timing.
 - [x] Add a provider-neutral, time-linked translation adapter with an opt-in Amazon Translate implementation.
 - [x] Add opt-in authorized audio acquisition and multilingual speech-to-text adapters.
+- [x] Add a provider-neutral cloud registry, provider-specific grants/metering,
+  and dynamic account/admin/batch provider controls.
+- [x] Add the administrator-governed Argos source/evaluation/catalog lifecycle,
+  signed release-bound downloads, durable local installs/leases, and local-first
+  direct or English-hub execution.
 - [ ] Add an alignment adapter for sources requiring timing refinement.
 - [x] Persist item preflight/stage/review state, attempts, errors, options, idempotency keys, and shared job links.
 - [x] Add authenticated atomic claim, expiring lease, heartbeat stages, stale-attempt rejection, and expiry recovery in the shared catalog/API.
@@ -201,6 +219,23 @@ Eleventh slice completed 2026-08-01. The shared batch control plane now returns 
 Twelfth slice completed 2026-08-01. Projects now have authorized batch discovery and a `Ready for review` inbox across completed batches. Review-status edits are optimistic-versioned and restricted to ready items. The browser connects through an explicit in-memory development session credential, requires a visible target project, supports newline batch preflight/creation and local/hosted policy choices, polls aggregate and exact per-item progress, exposes pause/resume/cancel-unstarted/retry-failed controls, and opens a ready video directly in the research workspace. Same-origin development proxying avoids storing credentials or enabling broad CORS. API integration tests cover membership and stale edits, while Playwright covers the connected queue/review interaction. CSV import remains before the combined creation-UI checklist item is complete.
 
 Thirteenth slice completed 2026-08-01. The batch creation surface now imports CSV through the established Papa Parse library behind a bounded helper. Files are limited to 2 MB, 50 columns, and the existing 500-item batch ceiling; malformed quoting fails closed, recognized URL headers are suggested, ambiguous multi-column files require an explicit column choice, and headerless one-column lists work. Applying an import only replaces the editable URL list and invalidates stale preflight—nothing is submitted until the researcher runs the normal authorized preflight. Empty rows are reported, duplicates remain for server-side labeling, and unit plus browser tests cover quoted fields, embedded newlines, malformed files, bounds, explicit application, and preflight handoff.
+
+Fourteenth slice completed 2026-08-27. Language services now use opaque
+provider IDs and backend adapter factories; Amazon Translate and Amazon
+Transcribe are initial adapters rather than contract assumptions. Provider
+access, disclosures, launch grants, account preferences, operations, cleanup,
+and usage are provider-specific and durable. Platform administrators can
+discover and evaluate exact Argos package bytes, enable only hard-safe versions
+(or audit an advisory override), and publish immutable Ed25519-signed catalog
+releases. Workers and the local agent persist verified catalogs, installations,
+and leases in SQLite, accept only current-release-bound downloads for new
+installs, execute a direct or exactly two-leg English route locally, retain
+installed models offline, and delete revoked bytes after leases drain. Local is
+the default; explicit cloud failure restarts the whole source locally once and
+never selects another cloud vendor. Focused provider/control-plane tests,
+typecheck, both migration suites, the production web build, and all aggregate
+test assertions passed; separately authorized live-provider, real-pack, and
+packaged-platform smoke checks remain release validation.
 
 ### 4. Selection + clip queue
 
@@ -615,7 +650,7 @@ infra/aws        storage, API, database, queues, identity, monitoring
   boundary and reuse compatible verified packages.
 - End-to-end batch -> shared transcript -> second workstation -> review -> select -> log/export.
 
-## Next action
+## Historical next-action snapshot
 
 Milestones 1–6, M7-04, and the deterministic M7-05 export baseline are complete.
 M7-01's real production AWS change-set and acceptance remain an explicit

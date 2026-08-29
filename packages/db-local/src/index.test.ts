@@ -194,8 +194,42 @@ describe("local migrations", () => {
       "0033_comment_outbox_conflicts",
       "0034_bookmark_cache_outbox",
       "0035_local_export_notification_receipts",
+      "0036_language_service_catalog_and_model_runtime",
+      "0037_transcription_provider_policy",
     ]);
     expect(runLocalMigrations(database)).toEqual([]);
+    expect(
+      database
+        .prepare(
+          `SELECT count(*) AS count FROM sqlite_master
+           WHERE type = 'table' AND name IN (
+             'local_language_service_provider_catalog',
+             'local_cloud_provider_access_cache',
+             'local_model_catalog_releases',
+             'local_model_installations',
+             'local_model_leases',
+             'local_model_runtime_operations'
+           )`,
+        )
+        .get(),
+    ).toEqual({ count: 6 });
+    expect(
+      database
+        .prepare(
+          `SELECT count(*) AS count FROM local_language_service_provider_catalog
+           UNION ALL SELECT count(*) FROM local_cloud_provider_access_cache
+           UNION ALL SELECT count(*) FROM local_model_catalog_releases
+           UNION ALL SELECT count(*) FROM local_model_installations
+           UNION ALL SELECT count(*) FROM local_model_runtime_operations`,
+        )
+        .all(),
+    ).toEqual([
+      { count: 0 },
+      { count: 0 },
+      { count: 0 },
+      { count: 0 },
+      { count: 0 },
+    ]);
     expect(
       (
         database.prepare("PRAGMA table_info(export_requests)").all() as Array<{
@@ -551,6 +585,8 @@ describe("local migrations", () => {
       "0033_comment_outbox_conflicts",
       "0034_bookmark_cache_outbox",
       "0035_local_export_notification_receipts",
+      "0036_language_service_catalog_and_model_runtime",
+      "0037_transcription_provider_policy",
     ]);
     expect(
       database
@@ -607,6 +643,8 @@ describe("local migrations", () => {
       "0033_comment_outbox_conflicts",
       "0034_bookmark_cache_outbox",
       "0035_local_export_notification_receipts",
+      "0036_language_service_catalog_and_model_runtime",
+      "0037_transcription_provider_policy",
     ]);
     expect(
       database
@@ -920,6 +958,8 @@ describe("local migrations", () => {
       "0033_comment_outbox_conflicts",
       "0034_bookmark_cache_outbox",
       "0035_local_export_notification_receipts",
+      "0036_language_service_catalog_and_model_runtime",
+      "0037_transcription_provider_policy",
     ]);
     expect(
       database
@@ -1109,6 +1149,8 @@ describe("local migrations", () => {
       "0033_comment_outbox_conflicts",
       "0034_bookmark_cache_outbox",
       "0035_local_export_notification_receipts",
+      "0036_language_service_catalog_and_model_runtime",
+      "0037_transcription_provider_policy",
     ]);
     expect(
       database.prepare("SELECT * FROM export_final_artifacts").all(),
@@ -1254,6 +1296,8 @@ describe("local migrations", () => {
       "0033_comment_outbox_conflicts",
       "0034_bookmark_cache_outbox",
       "0035_local_export_notification_receipts",
+      "0036_language_service_catalog_and_model_runtime",
+      "0037_transcription_provider_policy",
     ]);
     expect(
       database
@@ -2599,6 +2643,8 @@ describe("logged export delivery import", () => {
       "0033_comment_outbox_conflicts",
       "0034_bookmark_cache_outbox",
       "0035_local_export_notification_receipts",
+      "0036_language_service_catalog_and_model_runtime",
+      "0037_transcription_provider_policy",
     ]);
     const after = new LocalExportQueue(database).get(before.id);
     expect(after).toEqual(before);
@@ -2681,6 +2727,8 @@ describe("logged export delivery import", () => {
       "0033_comment_outbox_conflicts",
       "0034_bookmark_cache_outbox",
       "0035_local_export_notification_receipts",
+      "0036_language_service_catalog_and_model_runtime",
+      "0037_transcription_provider_policy",
     ]);
     expect(
       new LocalExportQueue(database).getAcceptedLoggedDelivery(
