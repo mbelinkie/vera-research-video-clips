@@ -1,5 +1,7 @@
 # M7 — Local desktop completion and personal validation
 
+> Historical goal specification. Live hierarchy, status, and routing are in [GitHub goal #1](https://github.com/mbelinkie/vera-research-video-clips/issues/1).
+
 Status: future milestone specification. Begin only after Milestone 6. Execute
 the six slices below sequentially with exactly one bounded specification in
 `specs/active/` at a time.

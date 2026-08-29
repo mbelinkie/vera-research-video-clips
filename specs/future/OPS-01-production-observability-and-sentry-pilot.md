@@ -1,5 +1,7 @@
 # OPS-01 — Production observability and Sentry error pilot
 
+> Live status and routing: [GitHub issue #12](https://github.com/mbelinkie/vera-research-video-clips/issues/12). This file retains detailed design and evidence.
+
 - Status: queued future slice; do not implement from `specs/future/`
 - Task/thread: OPS-01 only
 - Sequence: after M7 has a production deployment and before the first external

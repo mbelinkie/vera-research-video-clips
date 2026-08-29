@@ -1,0 +1,54 @@
+name: Bounded work item
+description: Create implementation, investigation, review, or acceptance work.
+title: ""
+labels: ["model:terra", "effort:medium", "type:implementation"]
+body:
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Outcome
+      description: State the smallest user-visible or evidence-producing result.
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Current evidence and context
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope and non-goals
+      description: Name affected boundaries and explicit exclusions.
+    validations:
+      required: true
+  - type: textarea
+    id: failures
+    attributes:
+      label: Failure states
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      value: "- [ ] "
+    validations:
+      required: true
+  - type: textarea
+    id: verification
+    attributes:
+      label: Verification and manual acceptance
+    validations:
+      required: true
+  - type: textarea
+    id: dependencies
+    attributes:
+      label: Dependencies
+      description: Link dependencies or write "None".
+    validations:
+      required: true
+  - type: markdown
+    attributes:
+      value: "Before Ready, replace the tentative routing labels if needed so exactly one `model:*` and one `effort:*` label remain."

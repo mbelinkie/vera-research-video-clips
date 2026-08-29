@@ -1,5 +1,7 @@
 # BUG-PLAYER-153 — Identify the desktop YouTube player
 
+> Live status and routing: [GitHub issue #3](https://github.com/mbelinkie/vera-research-video-clips/issues/3). This file retains detailed design and evidence.
+
 ## User-visible outcome
 
 YouTube videos embedded in the packaged desktop app load normally instead of

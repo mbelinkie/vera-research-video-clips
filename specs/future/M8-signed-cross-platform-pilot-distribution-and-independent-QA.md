@@ -1,5 +1,7 @@
 # M8 — Signed cross-platform pilot distribution and independent QA
 
+> Historical goal specification. Live hierarchy, status, and routing are in [GitHub goal #11](https://github.com/mbelinkie/vera-research-video-clips/issues/11).
+
 Status: future milestone specification. Begin only after M7 closes. OPS-01
 production observability remains separate and must complete before external M8
 testing. Execute the six slices below sequentially with exactly one bounded

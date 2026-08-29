@@ -13,6 +13,8 @@
     "packages/*"
   ],
   "scripts": {
+    "roadmap": "node scripts/roadmap.mjs",
+    "test:roadmap": "node --test scripts/roadmap.test.mjs",
     "aws:deploy": "bash scripts/deploy-aws.sh",
     "build": "npm run typecheck && npm run build:web",
     "build:desktop": "npm run build:web && node --import tsx scripts/build-desktop.ts",

@@ -1,7 +1,9 @@
 # Claude Code operating guide
 
-This repository is the durable source of truth for the Research Video
-Transcript & Clip Extraction Tool. Work as a careful implementation partner:
+This repository is the durable product and architecture source of truth for the
+Research Video Transcript & Clip Extraction Tool. The GitHub Project configured
+in `.github/vera-roadmap.json` is the sole live roadmap, status, dependency,
+ownership, and model-routing authority. Work as a careful implementation partner:
 complete one bounded, testable vertical slice at a time, preserve existing work,
 and leave evidence that another engineer or coding agent can review.
 
@@ -15,19 +17,19 @@ Before editing anything:
    the assigned slice.
 3. Read `PROJECT_GUIDE.md` completely before changing architecture, behavior,
    schemas, persistence, security, or milestone scope. It is authoritative.
-4. Read `outline.md` for current status and build order, then read `README.md`.
-5. Read the entire active spec in `specs/active/`. There must be exactly one
-   bounded active spec for the implementation task.
+4. Read the assigned Ready GitHub issue, then use `outline.md` only as a
+   historical execution snapshot and read `README.md`.
+5. Read any issue-linked active spec completely. The issue owns live task scope
+   and acceptance; the spec may retain deeper design detail.
 6. Inspect the relevant contracts, implementation, migrations, tests, and
    recent Git history before proposing a change.
 7. State the smallest user-visible end-to-end behavior the slice will prove and
    its important failure states.
 
-If no active spec exists, do not begin broad implementation. Draft the smallest
-useful next spec from the unchecked work in `outline.md`, using the repository's
-spec template and existing completed specs as examples. Show the proposed scope
-to the user before changing product code. Do not combine unrelated work in one
-spec or session.
+If no Ready issue exists, do not begin implementation. Create or refine the
+smallest useful Inbox issue, with explicit non-goals, failure states,
+dependencies, acceptance criteria, and tentative routing. Do not combine
+unrelated work in one issue or session.
 
 ## Current handoff snapshot
 
@@ -38,8 +40,8 @@ As of 2026-08-16:
   repository-owned fixture media and real FFmpeg/FFprobe.
 - Logged/cloud export delivery, conversion presets and broader settings,
   crash-recovery cleanup, optional package artifacts, queue controls, and the
-  release gate still contain open work. Use `outline.md`, not this snapshot, as
-  the current checklist.
+  release gate still contain open work. This is historical; use the GitHub
+  Project, not this snapshot or `outline.md`, for current work.
 - There was no active spec when this guide was written.
 - `mistakes.md` and `specs/future/` were untracked user-owned work. Preserve them
   unless the user explicitly assigns them.
@@ -47,12 +49,14 @@ As of 2026-08-16:
 This snapshot will age. Always trust current files, Git history, tests, and the
 user's latest instruction over it.
 
-## One owner per slice and worktree
+## One owner per issue and worktree
 
 - Do not work in the same Git worktree concurrently with Codex or another agent.
   Ask the user whether the worktree is free if that is unclear.
-- Prefer a dedicated worktree and a dedicated `claude/<spec-id>-<short-name>`
-  branch created from a verified commit.
+- Require a dedicated worktree and a dedicated
+  `claude/<issue-number>-<short-name>` branch created from a verified commit.
+- Claim only an exact `model:*` and `effort:*` profile match. A stronger model
+  does not consume cheaper work without steward-approved relabeling.
 - One agent owns an implementation slice end to end. Parallel agents may review
   or investigate, but adjacent slices must not independently change the same
   contract, migration sequence, persistence model, or worker lifecycle.
@@ -66,10 +70,9 @@ Never use destructive Git or filesystem commands on user work. In particular,
 do not use `git reset --hard`, `git clean`, broad checkout/restore commands,
 recursive deletion, or an automatic stash. Never rewrite shared history.
 
-## Slice workflow
+## Issue workflow
 
-Every implementation slice must have a Markdown spec in `specs/active/` that
-defines:
+Every implementation issue must define, directly or in a linked Markdown spec:
 
 - user-visible outcome and current evidence;
 - in-scope and explicit non-goals;
@@ -93,15 +96,19 @@ Then:
 6. Manually verify critical UI or media interactions when applicable.
 7. Inspect the complete diff and retain actual command output. Never claim that
    tests "should pass."
-8. Update `PROJECT_GUIDE.md`, `outline.md`, and other durable status documents
-   only for completed, verified work.
-9. Move the spec to `specs/completed/` only when the slice is genuinely done,
+8. Update `PROJECT_GUIDE.md` only when durable product or architecture truth
+   changes. Do not use `outline.md` or specs as live status trackers.
+9. Move a linked spec to `specs/completed/` only when the issue is genuinely done,
    with its decisions, files changed, actual checks/results, compatibility
    impact, remaining risks, and commit reference(s).
 
 After two evidence-based debugging attempts without progress, stop patching.
 Record confirmed facts and a focused reproduction, then start a fresh task/spec
 or explicitly revise the active one.
+
+If work exceeds its assigned model profile, stop before expanding scope, mark
+the issue Blocked with `needs:model-escalation`, record evidence and a recommended
+profile, release the claim, and wait for steward-approved routing labels.
 
 ## Product invariants that must not regress
 

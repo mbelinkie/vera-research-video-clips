@@ -1,5 +1,7 @@
 # M7-01 — Production cloud and Cognito authentication
 
+> Live status and routing: [GitHub issue #7](https://github.com/mbelinkie/vera-research-video-clips/issues/7). This file retains detailed design and evidence.
+
 - Status: locally implemented; external production acceptance blocked
 - Milestone: M7 local desktop completion and personal validation
 - Dependencies: Milestones 1–6 and the DOC-02 M7/M8 roadmap split are complete

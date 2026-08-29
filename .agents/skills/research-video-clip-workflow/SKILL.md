@@ -7,7 +7,11 @@ description: Plan, implement, review, and test the shared-project Research Video
 
 ## Establish context
 
-Read `PROJECT_GUIDE.md` completely before changing architecture, behavior, schemas, or milestone scope. Read `outline.md` for the current build order and checklist. Treat the guide as authoritative; update it and the outline when a deliberate decision changes.
+Read `PROJECT_GUIDE.md` completely before changing architecture, behavior,
+schemas, or milestone scope. Read the assigned GitHub issue and
+`.github/vera-roadmap.json` for current status, dependencies, ownership, and
+routing. Treat `outline.md` as historical. Update the guide only when a durable
+product or architectural decision changes.
 
 Inspect the repository and current changes before editing. Preserve unrelated user work. Identify the active milestone and state the smallest end-to-end behavior the task must prove.
 
@@ -45,7 +49,8 @@ For implementation tasks:
 6. Add fixture-based tests and keep live-provider tests optional.
 7. Run the narrow tests, then the relevant broader checks.
 8. Manually verify the critical interaction when a UI or media path changes.
-9. Update `outline.md` only for work actually completed.
+9. Update the GitHub issue with actual evidence; update durable product docs
+   only when their underlying truth changes.
 
 Avoid building isolated UI that cannot reach a real contract, or provider code embedded directly in routes/components.
 

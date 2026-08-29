@@ -1,5 +1,7 @@
 # UI-WORKSPACE-001 — Add, Review, and Logged workflow
 
+> Live status and routing: [GitHub issue #6](https://github.com/mbelinkie/vera-research-video-clips/issues/6). This file retains detailed design and evidence.
+
 ## User-visible outcome
 
 The project workspace follows the research sequence: `Add` owns source ingest

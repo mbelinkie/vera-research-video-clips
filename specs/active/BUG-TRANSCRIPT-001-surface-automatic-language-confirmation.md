@@ -1,5 +1,7 @@
 # BUG-TRANSCRIPT-001 — Surface automatic language confirmation
 
+> Live status and routing: [GitHub issue #4](https://github.com/mbelinkie/vera-research-video-clips/issues/4). This file retains detailed design and evidence.
+
 ## User-visible outcome
 
 When immediate URL transcription pauses for spoken-language confirmation, the

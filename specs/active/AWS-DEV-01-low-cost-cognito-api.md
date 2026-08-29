@@ -1,5 +1,7 @@
 # AWS-DEV-01 — Low-cost Cognito and development API
 
+> Live status and routing: [GitHub issue #2](https://github.com/mbelinkie/vera-research-video-clips/issues/2). This file retains detailed design and evidence.
+
 - Status: active
 - Date authorized: 2026-08-24
 - Environment: AWS account-selected development resources in `us-east-1`

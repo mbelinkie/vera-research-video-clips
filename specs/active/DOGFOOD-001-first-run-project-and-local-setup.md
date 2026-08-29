@@ -1,5 +1,7 @@
 # DOGFOOD-001 — First-run project creation and local setup
 
+> Live status and routing: [GitHub issue #5](https://github.com/mbelinkie/vera-research-video-clips/issues/5). This file retains detailed design and evidence.
+
 ## User-visible outcome
 
 After completing Cognito sign-in in the packaged desktop app, a first-time
