@@ -80,6 +80,9 @@ jobs:
           DISABLE_AUTOUPDATER: "1"
           GH_TOKEN: ""
         run: |
+          # Tolerate stray spaces, newlines or quotes pasted into the secret.
+          ANTHROPIC_AUTH_TOKEN="$(printf %s "$ANTHROPIC_AUTH_TOKEN" | tr -d '[:space:]"'"'"'')"
+          export ANTHROPIC_AUTH_TOKEN
           test -n "$ANTHROPIC_AUTH_TOKEN" || { echo "DEEPSEEK_API_KEY secret is missing" > "$RUNNER_TEMP/agent.err"; exit 1; }
           npm install -g --silent @anthropic-ai/claude-code@2.1.318
           # Prompt goes through stdin: a single argv entry is capped at 128 KB.
