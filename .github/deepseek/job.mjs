@@ -225,7 +225,7 @@ export function readAgentResult(jsonText, errText = "") {
           ? "DeepSeek rejected the API key (401). Re-create the key at platform.deepseek.com and paste it into the DEEPSEEK_API_KEY repository secret."
           : parsed.api_error_status === 402
             ? "DeepSeek reports insufficient balance (402). Top up the DeepSeek account."
-            : `Agent stopped: ${parsed.is_error ? "error" : parsed.subtype}${parsed.api_error_status ? ` (API ${parsed.api_error_status})` : ""}. ${errText.slice(-800)}`.trim()
+            : `Agent stopped: ${parsed.subtype && parsed.subtype !== "success" ? parsed.subtype : "error"}${parsed.api_error_status ? ` (API ${parsed.api_error_status})` : ""}. ${errText.slice(-800)}`.trim()
         : "",
   };
 }
