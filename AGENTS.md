@@ -2,6 +2,11 @@
 
 Read `PROJECT_GUIDE.md` for how this project is built and verified.
 
+Delivery: branch from `main`, run `npm run check`, open a PR with
+`Closes #<issue>`, and turn on auto-merge (`gh pr merge --auto --merge`). The
+`Check` workflow must pass before anything lands on `main`; `main` cannot be
+force-pushed or deleted.
+
 ## "Work on the next prepped ticket"
 
 When Matthew says this (or something like it), find the highest-priority open
