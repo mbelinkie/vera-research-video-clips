@@ -221,7 +221,11 @@ export function readAgentResult(jsonText, errText = "") {
     cost: estimateCost(parsed.modelUsage),
     reason:
       parsed.is_error || parsed.subtype !== "success"
-        ? `Agent stopped: ${parsed.subtype ?? "error"}${parsed.api_error_status ? ` (API ${parsed.api_error_status})` : ""}. ${errText.slice(-800)}`.trim()
+        ? parsed.api_error_status === 401
+          ? "DeepSeek rejected the API key (401). Re-create the key at platform.deepseek.com and paste it into the DEEPSEEK_API_KEY repository secret."
+          : parsed.api_error_status === 402
+            ? "DeepSeek reports insufficient balance (402). Top up the DeepSeek account."
+            : `Agent stopped: ${parsed.is_error ? "error" : parsed.subtype}${parsed.api_error_status ? ` (API ${parsed.api_error_status})` : ""}. ${errText.slice(-800)}`.trim()
         : "",
   };
 }
