@@ -4,6 +4,8 @@ import { createReadStream } from "node:fs";
 import { mkdir, readdir, stat } from "node:fs/promises";
 import { join } from "node:path";
 
+export { formatTimestamp } from "./timestamp.ts";
+
 export type AcquiredMedia = {
   scratchPath: string;
   videoId: string;
