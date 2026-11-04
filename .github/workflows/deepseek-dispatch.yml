@@ -42,7 +42,7 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           VERA_DEEPSEEK_DISPATCH_ENABLED: ${{ vars.VERA_DEEPSEEK_DISPATCH_ENABLED }}
           VERA_DEEPSEEK_ALLOWED_ACTORS: ${{ vars.VERA_DEEPSEEK_ALLOWED_ACTORS }}
-          VERA_DEEPSEEK_TASK_CAP_USD: '0.25'
+          VERA_DEEPSEEK_TASK_CAP_USD: "0.25"
         run: node trusted-validator/scripts/deepseek-dispatch.mjs
   verify-mock-fixture:
     if: github.event_name == 'pull_request'
