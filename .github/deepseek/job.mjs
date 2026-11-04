@@ -264,6 +264,8 @@ async function finish() {
   const costLine = `Model: DeepSeek ${modelChoice} · ${result.turns} turns · ~${result.cost.tokens.toLocaleString("en-US")} tokens · est. **$${result.cost.usd.toFixed(4)}** (peak rates)`;
 
   let prUrl = "";
+  let branchUrl = "";
+  let prError = "";
   if (files.length) {
     const branch = `deepseek/issue-${issueNumber}-${env.GITHUB_RUN_ID}`;
     git([
@@ -273,25 +275,36 @@ async function finish() {
         `https://x-access-token:${env.PUSH_TOKEN}@github.com/${repo}.git`,
       `HEAD:refs/heads/${branch}`,
     ]);
+    const baseBranch = env.DEFAULT_BRANCH || "main";
+    branchUrl = `https://github.com/${repo}/compare/${baseBranch}...${branch}?expand=1`;
     const issue = await gh("GET", `/issues/${issueNumber}`);
-    const pr = await gh("POST", "/pulls", {
-      title: `DeepSeek draft: ${issue.title} (#${issueNumber})`.slice(0, 250),
-      head: branch,
-      base: env.DEFAULT_BRANCH || "main",
-      draft: true,
-      body: `Related to #${issueNumber}. **Unreviewed DeepSeek output** — Codex should review, fix and finish before any merge.\n\n${costLine} · [Run](${runUrl})\n${result.ok ? "" : `\n> ⚠️ ${result.reason}\n`}\n${result.summary || "_The agent did not write a summary._"}\n\n<details><summary>Files changed (${files.length})</summary>\n\n${files.map((f) => `- \`${f}\``).join("\n")}\n</details>`,
-    });
-    prUrl = pr.html_url;
+    try {
+      const pr = await gh("POST", "/pulls", {
+        title: `DeepSeek draft: ${issue.title} (#${issueNumber})`.slice(0, 250),
+        head: branch,
+        base: baseBranch,
+        draft: true,
+        body: `Related to #${issueNumber}. **Unreviewed DeepSeek output** — Codex should review, fix and finish before any merge.\n\n${costLine} · [Run](${runUrl})\n${result.ok ? "" : `\n> ⚠️ ${result.reason}\n`}\n${result.summary || "_The agent did not write a summary._"}\n\n<details><summary>Files changed (${files.length})</summary>\n\n${files.map((f) => `- \`${f}\``).join("\n")}\n</details>`,
+      });
+      prUrl = pr.html_url;
+    } catch (error) {
+      prError = /not permitted to create/i.test(String(error.message))
+        ? 'GitHub Actions isn\'t allowed to open pull requests in this repo. Turn on Settings → Actions → General → Workflow permissions → "Allow GitHub Actions to create and approve pull requests", or open the PR from the branch link.'
+        : `Opening the PR failed: ${String(error.message).slice(0, 300)}`;
+    }
   }
 
   const outcome = prUrl
     ? `Draft PR ready for Codex: ${prUrl}`
-    : "No code changes were produced.";
+    : branchUrl
+      ? `Work pushed to a branch; [open a PR from it](${branchUrl}).`
+      : "No code changes were produced.";
+  const notes = [result.reason, prError].filter(Boolean).join("\n\n");
   await comment(
-    `${STATUS_MARK}\n**DeepSeek ${modelChoice} attempt finished.** ${outcome}\n\n${costLine} · [Run](${runUrl})${result.reason ? `\n\n> ${result.reason.replaceAll("\n", "\n> ")}` : ""}${!prUrl && result.summary ? `\n\n<details><summary>Agent notes</summary>\n\n${result.summary}\n</details>` : ""}`,
+    `${STATUS_MARK}\n**DeepSeek ${modelChoice} attempt finished.** ${outcome}\n\n${costLine} · [Run](${runUrl})${notes ? `\n\n> ${notes.replaceAll("\n", "\n> ")}` : ""}${!prUrl && result.summary ? `\n\n<details><summary>Agent notes</summary>\n\n${result.summary}\n</details>` : ""}`,
   );
   await setLabels(
-    [prUrl ? "deepseek-done" : "deepseek-failed"],
+    [prUrl || branchUrl ? "deepseek-done" : "deepseek-failed"],
     ["deepseek-running"],
   );
   if (env.GITHUB_STEP_SUMMARY)
@@ -308,7 +321,16 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     console.error("usage: job.mjs start|prompt|finish");
     process.exit(2);
   }
-  command().catch((error) => {
+  command().catch(async (error) => {
+    if (process.argv[2] === "finish") {
+      // Never leave the issue stuck on "running".
+      await comment(
+        `${STATUS_MARK}\n**DeepSeek attempt could not be reported cleanly.** ${String(error.message).slice(0, 400)} · [Run](${runUrl})`,
+      ).catch(() => {});
+      await setLabels(["deepseek-failed"], ["deepseek-running"]).catch(
+        () => {},
+      );
+    }
     console.error(error.message);
     process.exit(1);
   });
