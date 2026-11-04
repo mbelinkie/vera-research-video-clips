@@ -33,6 +33,21 @@ export const AddProjectMemberRequestSchema = z.object({
   role: z.enum(["editor", "researcher", "viewer"]),
 });
 
+export const UpdateProjectMemberRequestSchema = z.object({
+  role: z.enum(["editor", "viewer"]),
+  expectedVersion: z.number().int().positive(),
+});
+
+export const RemoveProjectMemberRequestSchema = z.object({
+  expectedVersion: z.number().int().positive(),
+});
+
+export const TransferProjectOwnershipRequestSchema = z.object({
+  targetUserId: IdSchema,
+  expectedOwnerVersion: z.number().int().positive(),
+  expectedTargetVersion: z.number().int().positive(),
+});
+
 export const ProjectSchema = z.object({
   id: IdSchema,
   name: z.string().trim().min(1).max(160),

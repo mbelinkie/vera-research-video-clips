@@ -7,7 +7,10 @@ import {
   HealthResponseSchema,
   JobSchema,
   ProjectSchema,
+  RemoveProjectMemberRequestSchema,
   TranscriptionBatchControlRequestSchema,
+  TransferProjectOwnershipRequestSchema,
+  UpdateProjectMemberRequestSchema,
   UpdateReviewStatusRequestSchema,
 } from "./index.ts";
 
@@ -93,6 +96,57 @@ describe("shared contracts", () => {
         expectedVersion: 3,
       }),
     ).toEqual({ reviewStatus: "reviewing", expectedVersion: 3 });
+  });
+
+  it("bounds versioned membership commands to non-owner role changes", () => {
+    expect(
+      UpdateProjectMemberRequestSchema.parse({
+        role: "editor",
+        expectedVersion: 2,
+      }),
+    ).toEqual({ role: "editor", expectedVersion: 2 });
+    expect(
+      UpdateProjectMemberRequestSchema.safeParse({
+        role: "owner",
+        expectedVersion: 2,
+      }).success,
+    ).toBe(false);
+    expect(
+      UpdateProjectMemberRequestSchema.safeParse({
+        role: "researcher",
+        expectedVersion: 2,
+      }).success,
+    ).toBe(false);
+    expect(
+      UpdateProjectMemberRequestSchema.safeParse({
+        role: "viewer",
+        expectedVersion: 0,
+      }).success,
+    ).toBe(false);
+    expect(
+      RemoveProjectMemberRequestSchema.safeParse({ expectedVersion: 0 })
+        .success,
+    ).toBe(false);
+    expect(
+      RemoveProjectMemberRequestSchema.parse({ expectedVersion: 1 }),
+    ).toEqual({ expectedVersion: 1 });
+    expect(
+      TransferProjectOwnershipRequestSchema.parse({
+        targetUserId: id,
+        expectedOwnerVersion: 1,
+        expectedTargetVersion: 3,
+      }),
+    ).toEqual({
+      targetUserId: id,
+      expectedOwnerVersion: 1,
+      expectedTargetVersion: 3,
+    });
+    expect(
+      TransferProjectOwnershipRequestSchema.safeParse({
+        targetUserId: id,
+        expectedOwnerVersion: 1,
+      }).success,
+    ).toBe(false);
   });
 
   it("validates export setting capabilities before snapshotting a job", () => {

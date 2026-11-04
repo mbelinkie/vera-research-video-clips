@@ -1085,4 +1085,337 @@ describe("cloud API", () => {
       ).statusCode,
     ).toBe(204);
   });
+
+  it("enforces owner-only membership APIs and denies previously authenticated revoked members", async () => {
+    const database = new PGlite();
+    databases.add(database);
+    await runCloudMigrations(database);
+    const catalog = new SharedProjectCatalog(
+      database,
+      new MemoryTranscriptObjectStore(),
+    );
+    const app = createCloudApi({
+      catalog,
+      authenticate: authenticateDevBearer,
+    });
+    apps.add(app);
+    const user = async (label: string) => {
+      const id = randomUUID();
+      const authorization = "Bearer " + id + "|fixture:" + label;
+      const response = await app.inject({
+        method: "POST",
+        url: "/api/session/register",
+        headers: { authorization },
+        payload: { displayName: label },
+      });
+      expect(response.statusCode).toBe(200);
+      return { id, authorization };
+    };
+    const owner = await user("owner");
+    const editor = await user("editor");
+    const viewer = await user("viewer");
+    const outsider = await user("outsider");
+    const projectResponse = await app.inject({
+      method: "POST",
+      url: "/api/projects",
+      headers: { authorization: owner.authorization },
+      payload: { name: "Member API fixture" },
+    });
+    expect(projectResponse.statusCode).toBe(201);
+    const projectId = projectResponse.json<{ id: string }>().id;
+    const base = "/api/projects/" + projectId + "/members";
+    for (const [target, role] of [
+      [editor, "editor"],
+      [viewer, "viewer"],
+    ] as const) {
+      const granted = await app.inject({
+        method: "POST",
+        url: base,
+        headers: { authorization: owner.authorization },
+        payload: { userId: target.id, role },
+      });
+      expect(granted.statusCode).toBe(204);
+    }
+    const listed = await app.inject({
+      method: "GET",
+      url: base,
+      headers: { authorization: owner.authorization },
+    });
+    expect(listed.statusCode).toBe(200);
+    expect(listed.json()).toHaveLength(3);
+    expect(listed.json<Record<string, unknown>[]>()[0]).not.toHaveProperty(
+      "externalSubject",
+    );
+    expect(listed.json<Record<string, unknown>[]>()[0]).not.toHaveProperty(
+      "displayName",
+    );
+    for (const current of [editor, viewer, outsider]) {
+      expect(
+        (
+          await app.inject({
+            method: "GET",
+            url: base,
+            headers: { authorization: current.authorization },
+          })
+        ).statusCode,
+      ).toBe(403);
+      expect(
+        (
+          await app.inject({
+            method: "PATCH",
+            url: base + "/" + editor.id,
+            headers: { authorization: current.authorization },
+            payload: { role: "viewer", expectedVersion: 1 },
+          })
+        ).statusCode,
+      ).toBe(403);
+    }
+    expect(
+      (
+        await app.inject({
+          method: "PATCH",
+          url: base + "/" + viewer.id,
+          headers: { authorization: owner.authorization },
+          payload: { role: "editor", expectedVersion: 1 },
+        })
+      ).statusCode,
+    ).toBe(204);
+    expect(
+      (
+        await app.inject({
+          method: "PATCH",
+          url: base + "/" + viewer.id,
+          headers: { authorization: owner.authorization },
+          payload: { role: "viewer", expectedVersion: 1 },
+        })
+      ).statusCode,
+    ).toBe(409);
+    expect(
+      (
+        await app.inject({
+          method: "DELETE",
+          url: base + "/" + owner.id,
+          headers: { authorization: owner.authorization },
+          payload: { expectedVersion: 1 },
+        })
+      ).statusCode,
+    ).toBe(409);
+    expect(
+      (
+        await app.inject({
+          method: "DELETE",
+          url: base + "/" + editor.id,
+          headers: { authorization: owner.authorization },
+          payload: { expectedVersion: 1 },
+        })
+      ).statusCode,
+    ).toBe(204);
+    expect(
+      (
+        await app.inject({
+          method: "GET",
+          url: "/api/projects/" + projectId + "/videos",
+          headers: { authorization: editor.authorization },
+        })
+      ).statusCode,
+    ).toBe(403);
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: base + "/transfer",
+          headers: { authorization: owner.authorization },
+          payload: {
+            targetUserId: viewer.id,
+            expectedOwnerVersion: 1,
+            expectedTargetVersion: 2,
+          },
+        })
+      ).statusCode,
+    ).toBe(204);
+    expect(
+      (
+        await app.inject({
+          method: "GET",
+          url: base,
+          headers: { authorization: owner.authorization },
+        })
+      ).statusCode,
+    ).toBe(403);
+    expect(
+      (
+        await app.inject({
+          method: "GET",
+          url: base,
+          headers: { authorization: viewer.authorization },
+        })
+      ).statusCode,
+    ).toBe(200);
+    const otherProject = await app.inject({
+      method: "POST",
+      url: "/api/projects",
+      headers: { authorization: outsider.authorization },
+      payload: { name: "Private other project" },
+    });
+    const otherId = otherProject.json<{ id: string }>().id;
+    expect(
+      (
+        await app.inject({
+          method: "GET",
+          url: "/api/projects/" + otherId + "/members",
+          headers: { authorization: viewer.authorization },
+        })
+      ).statusCode,
+    ).toBe(403);
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: "/api/projects/" + otherId + "/members/transfer",
+          headers: { authorization: owner.authorization },
+          payload: {
+            targetUserId: outsider.id,
+            expectedOwnerVersion: 1,
+            expectedTargetVersion: 1,
+          },
+        })
+      ).statusCode,
+    ).toBe(403);
+  });
+
+  it("rejects malformed membership commands and never trusts a body actor", async () => {
+    const database = new PGlite();
+    databases.add(database);
+    await runCloudMigrations(database);
+    const catalog = new SharedProjectCatalog(
+      database,
+      new MemoryTranscriptObjectStore(),
+    );
+    const app = createCloudApi({
+      catalog,
+      authenticate: authenticateDevBearer,
+    });
+    apps.add(app);
+    const user = async (label: string) => {
+      const id = randomUUID();
+      const authorization = "Bearer " + id + "|fixture:" + label;
+      await app.inject({
+        method: "POST",
+        url: "/api/session/register",
+        headers: { authorization },
+        payload: { displayName: label },
+      });
+      return { id, authorization };
+    };
+    const owner = await user("owner");
+    const viewer = await user("viewer");
+    const outsider = await user("outsider");
+    const project = await app.inject({
+      method: "POST",
+      url: "/api/projects",
+      headers: { authorization: owner.authorization },
+      payload: { name: "Malformed member fixture" },
+    });
+    const projectId = project.json<{ id: string }>().id;
+    const base = "/api/projects/" + projectId + "/members";
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: base,
+          headers: { authorization: owner.authorization },
+          payload: { userId: viewer.id, role: "owner" },
+        })
+      ).statusCode,
+    ).toBe(400);
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: base,
+          headers: { authorization: owner.authorization },
+          payload: { userId: viewer.id, role: "viewer" },
+        })
+      ).statusCode,
+    ).toBe(204);
+    expect(
+      (
+        await app.inject({
+          method: "PATCH",
+          url: base + "/" + viewer.id,
+          headers: { authorization: owner.authorization },
+          payload: { role: "editor", expectedVersion: 0 },
+        })
+      ).statusCode,
+    ).toBe(400);
+    expect(
+      (
+        await app.inject({
+          method: "DELETE",
+          url: base + "/" + viewer.id,
+          headers: { authorization: owner.authorization },
+          payload: {},
+        })
+      ).statusCode,
+    ).toBe(400);
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: base + "/transfer",
+          headers: { authorization: owner.authorization },
+          payload: {
+            targetUserId: viewer.id,
+            expectedOwnerVersion: 1,
+          },
+        })
+      ).statusCode,
+    ).toBe(400);
+    expect(
+      (
+        await app.inject({
+          method: "PATCH",
+          url: base + "/" + owner.id,
+          headers: { authorization: outsider.authorization },
+          payload: {
+            role: "viewer",
+            expectedVersion: 1,
+            actorId: owner.id,
+            userId: owner.id,
+          },
+        })
+      ).statusCode,
+    ).toBe(403);
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: base,
+          headers: { authorization: outsider.authorization },
+          payload: { userId: outsider.id, role: "editor" },
+        })
+      ).statusCode,
+    ).toBe(403);
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: base,
+          headers: { authorization: owner.authorization },
+          payload: { userId: randomUUID(), role: "viewer" },
+        })
+      ).statusCode,
+    ).toBe(404);
+    const members = await app.inject({
+      method: "GET",
+      url: base,
+      headers: { authorization: owner.authorization },
+    });
+    expect(members.json()).toHaveLength(2);
+    expect(
+      (members.json<{ role: string }[]>() ?? [])
+        .map((member) => member.role)
+        .sort(),
+    ).toEqual(["owner", "viewer"]);
+  });
 });

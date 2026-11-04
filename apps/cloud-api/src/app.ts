@@ -12,7 +12,10 @@ import {
   CreateClipExportRequestSchema,
   CreateTranscriptionBatchRequestSchema,
   CreateProjectRequestSchema,
+  RemoveProjectMemberRequestSchema,
   TranscriptionBatchControlRequestSchema,
+  TransferProjectOwnershipRequestSchema,
+  UpdateProjectMemberRequestSchema,
   UpdateReviewStatusRequestSchema,
   UpdateClipCandidateRequestSchema,
   FinalizeTranscriptRequestSchema,
@@ -40,6 +43,7 @@ export interface CloudApiDependencies {
 }
 
 const IdParamsSchema = z.object({ projectId: z.uuid() });
+const ProjectMemberParamsSchema = IdParamsSchema.extend({ userId: z.uuid() });
 const ProjectVideoParamsSchema = IdParamsSchema.extend({ videoId: z.uuid() });
 const ProjectClipParamsSchema = IdParamsSchema.extend({ clipId: z.uuid() });
 const ProjectBatchParamsSchema = IdParamsSchema.extend({ batchId: z.uuid() });
@@ -141,6 +145,64 @@ export function createCloudApi(
     );
     return reply.status(204).send();
   });
+
+  app.get("/api/projects/:projectId/members", async (request) => {
+    const { projectId } = IdParamsSchema.parse(request.params);
+    return catalog.listMembers(await authenticate(request), projectId);
+  });
+
+  app.patch(
+    "/api/projects/:projectId/members/:userId",
+    async (request, reply) => {
+      const { projectId, userId } = ProjectMemberParamsSchema.parse(
+        request.params,
+      );
+      const body = UpdateProjectMemberRequestSchema.parse(request.body);
+      await catalog.changeMemberRole(
+        await authenticate(request),
+        projectId,
+        userId,
+        body.role,
+        body.expectedVersion,
+      );
+      return reply.status(204).send();
+    },
+  );
+
+  app.delete(
+    "/api/projects/:projectId/members/:userId",
+    async (request, reply) => {
+      const { projectId, userId } = ProjectMemberParamsSchema.parse(
+        request.params,
+      );
+      const { expectedVersion } = RemoveProjectMemberRequestSchema.parse(
+        request.body,
+      );
+      await catalog.removeMember(
+        await authenticate(request),
+        projectId,
+        userId,
+        expectedVersion,
+      );
+      return reply.status(204).send();
+    },
+  );
+
+  app.post(
+    "/api/projects/:projectId/members/transfer",
+    async (request, reply) => {
+      const { projectId } = IdParamsSchema.parse(request.params);
+      const body = TransferProjectOwnershipRequestSchema.parse(request.body);
+      await catalog.transferOwnership(
+        await authenticate(request),
+        projectId,
+        body.targetUserId,
+        body.expectedOwnerVersion,
+        body.expectedTargetVersion,
+      );
+      return reply.status(204).send();
+    },
+  );
 
   app.post("/api/projects/:projectId/videos", async (request, reply) => {
     const { projectId } = IdParamsSchema.parse(request.params);
