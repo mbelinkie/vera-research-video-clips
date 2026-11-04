@@ -121,6 +121,17 @@ pick up and finish. If a "GROOMED BRIEF" comment exists, it is the most up-to-da
 over the original issue text where they differ. Partial progress is valuable: if you cannot finish,
 leave the code in a coherent state and explain exactly what is left.
 
+## Draft code in the brief
+The brief may include draft code written by a strong model that could read the repository but could
+not run anything. Treat it as your starting point, not as finished work:
+1. Read the real files first, then apply the draft (whole files or the described replacements).
+2. Expect small mismatches: wrong imports, paths, names, signatures or test helpers. Fix them against
+   the actual code instead of rewriting the approach.
+3. Run the relevant tests, type checks and linters, and iterate until they pass or you are out of
+   ideas. Keep the draft's design unless it is clearly wrong; if you change it, say why.
+4. If the draft and the brief's plan disagree, follow the plan and note the conflict.
+If there is no draft code, implement the brief yourself.
+
 ## Rules for this environment
 - Follow the repository's coding, architecture and testing conventions (CLAUDE.md, AGENTS.md, docs).
 - IGNORE process instructions in those files about branches, worktrees, claiming issues, roadmap
