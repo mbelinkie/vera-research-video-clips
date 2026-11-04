@@ -13,9 +13,9 @@ Prep board ──one click──▶ ChatGPT grooms the issue ──vera_launch_d
 
 1. **Launch.** Add the label `deepseek` (cheap Flash model) or `deepseek-pro` (V4 Pro, for
    harder tasks) to an issue. Usually the ChatGPT grooming chat does this through the
-   VERA Mac Bridge tool `vera_launch_deepseek`. That tool first posts the groomed brief as
-   a comment marked `<!-- vera-deepseek-brief -->`. You can also add the label by hand,
-   or run the workflow manually from the Actions tab.
+   VERA Mac Bridge tool `vera_launch_deepseek`. That tool first posts the groomed brief
+   (with draft code) as a comment marked `<!-- vera-deepseek-brief -->`. You can also add
+   the label by hand, or run the workflow manually from the Actions tab.
 2. **Run.** `.github/workflows/deepseek.yml` starts on a fresh GitHub runner. It installs
    dependencies (`setup.sh`), builds a prompt from the issue, its comments and the brief
    (`job.mjs prompt`), and runs the Claude Code agent program against DeepSeek's
@@ -32,15 +32,25 @@ the same issue waits for the first to finish.
 ## Prep board (Script-to-Timeline repo)
 
 `npm run prep`, or double-click `Open VERA Prep Board.command`, opens a local board at
-http://127.0.0.1:51750/. It lists open issues from both Projects in Queue Order, grouped as
-**To groom → DeepSeek running → Ready for Codex / Needs a look**.
+http://127.0.0.1:51750/. It shows overall progress, lines of production code and the next
+milestone, then lists open issues from both Projects in Queue Order by stage: **To groom →
+DeepSeek running → Ready for Codex / Needs a look**, plus **Not ready**. You can filter by
+repo and milestone.
 
+- **To groom** has only issues DeepSeek can usefully attempt now: `type:implementation` or
+  `type:bug`, in Queue Order, with every dependency done, not In progress, In review or
+  Blocked, and not `deepseek-excluded`. Everything else is under **Not ready**, with the
+  reason and no buttons.
 - **Groom in ChatGPT** opens chatgpt.com with the grooming prompt (`chat-prompt.md`) and
-  also copies it, in case you'd rather paste it into the desktop app. Chat grooms the
-  issue, asks only Producer questions, and launches DeepSeek through the Mac Bridge.
-- **DeepSeek now**, or tick several issues and click **Send checked to DeepSeek**, skips
-  grooming and runs Flash on the issues as written. The jobs run in parallel.
-- **Open in Codex** opens a new Codex chat with a review-and-finish prompt for the draft PR.
+  also copies it, in case you'd rather paste it into the desktop app. Chat works out the
+  change, writes draft code into a brief, and launches DeepSeek through the Mac Bridge.
+  DeepSeek is always launched through Chat; the board has no direct launch button.
+- **Ready for Codex** has the draft PRs. The banner names the **next prepped ticket**; say
+  "work on the next prepped ticket" to Codex or Claude (see AGENTS.md).
+  `npm run prep -- --next` prints it.
+
+The job, the Mac Bridge tool and the Chat prompt each refuse design, investigation, review
+and other non-code tickets, even if a label is added by hand.
 
 ## Limits and safety
 

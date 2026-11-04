@@ -91,8 +91,28 @@ function git(args, options = {}) {
   }).trim();
 }
 
+// Only code tickets go to DeepSeek; design, investigation, review and similar don't.
+export const ELIGIBLE_TYPES = ["type:implementation", "type:bug"];
+export function ineligibleReason(labels = []) {
+  if (labels.includes("deepseek-excluded"))
+    return "it is labelled deepseek-excluded";
+  const types = labels.filter((label) => label.startsWith("type:"));
+  if (!types.some((label) => ELIGIBLE_TYPES.includes(label))) {
+    return `its type (${types.join(", ") || "none"}) isn't implementation or bug work`;
+  }
+  return "";
+}
+
 async function start() {
   writeFileSync(join(temp, "base-sha"), git(["rev-parse", "HEAD"]));
+  const issue = await gh("GET", `/issues/${issueNumber}`);
+  const reason = ineligibleReason((issue.labels ?? []).map((l) => l.name));
+  if (reason) {
+    writeFileSync(join(temp, "skip"), reason);
+    await setLabels([], TRIGGERS);
+    await comment(`${STATUS_MARK}\nDeepSeek attempt skipped: ${reason}.`);
+    process.exit(1);
+  }
   await ensureLabels();
   await setLabels(
     ["deepseek-running"],
@@ -256,6 +276,7 @@ function commitWork(base) {
 }
 
 async function finish() {
+  if (existsSync(join(temp, "skip"))) return;
   const base = readFileSync(join(temp, "base-sha"), "utf8").trim();
   const read = (name) =>
     existsSync(join(temp, name)) ? readFileSync(join(temp, name), "utf8") : "";
