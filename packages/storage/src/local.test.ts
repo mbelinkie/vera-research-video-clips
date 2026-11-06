@@ -98,6 +98,29 @@ describe("local immutable object hardening", () => {
 });
 
 describe("local object URL capability", () => {
+  it("uses the public HTTPS BFF path without weakening loopback transport validation", async () => {
+    const secret = "long-test-fixture-secret-must-stay-out-of-logs";
+    const browserIssuer = new LocalStagedUploadUrlIssuer(
+      "https://research.example/cloud-api/",
+      secret,
+    );
+    const put = new URL(
+      await browserIssuer.issuePutUrl({ objectKey: key, expiresInSeconds: 30 }),
+    );
+    expect(put.origin).toBe("https://research.example");
+    expect(put.pathname).toMatch(/^\/cloud-api\/__objects\//u);
+    expect(
+      browserIssuer.verify(put.pathname.split("/").at(-1)!, "PUT").key,
+    ).toBe(key);
+    for (const forbidden of [
+      "http://research.example/",
+      "https://research.example/",
+      "https://research.example/wrong-prefix/",
+      "https://someone@research.example/cloud-api/",
+    ]) {
+      expect(() => new LocalStagedUploadUrlIssuer(forbidden, secret)).toThrow();
+    }
+  });
   it("signs specific method, key and pinned version with expiration", async () => {
     let now = 1_000;
     const signer = new LocalStagedUploadUrlIssuer(

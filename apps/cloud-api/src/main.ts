@@ -63,7 +63,9 @@ const objectStore = pilot
     : new MemoryTranscriptObjectStore();
 const uploadUrlIssuer = pilot
   ? new LocalStagedUploadUrlIssuer(
-      "http://" + config.cloudApiHost + ":" + config.cloudApiPort + "/",
+      config.cloudAuthMode === "browser"
+        ? `${config.browserPublicOrigin!}/cloud-api/`
+        : `http://${config.cloudApiHost}:${config.cloudApiPort}/`,
       config.localSigningSecret!,
     )
   : s3 && transcriptBucket

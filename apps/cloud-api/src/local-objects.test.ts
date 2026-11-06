@@ -31,7 +31,7 @@ describe("local signed transcript HTTP transport", () => {
     const root = await newRoot();
     const store = new LocalTranscriptObjectStore(root);
     const issuer = new LocalStagedUploadUrlIssuer(
-      "http://127.0.0.1:43111/",
+      "https://research.example/cloud-api/",
       "local-objects-test-secret-at-least-32-bytes",
     );
     const catalog = {} as SharedProjectCatalog;
@@ -62,9 +62,12 @@ describe("local signed transcript HTTP transport", () => {
         registered: false,
       });
 
-      const putUrl = new URL(
+      const putCapability = new URL(
         await issuer.issuePutUrl({ objectKey: key, expiresInSeconds: 30 }),
-      ).pathname;
+      );
+      expect(putCapability.origin).toBe("https://research.example");
+      expect(putCapability.pathname).toMatch(/^\/cloud-api\/__objects\//u);
+      const putUrl = putCapability.pathname;
       const upload = () =>
         app.inject({
           method: "PUT",
@@ -73,6 +76,23 @@ describe("local signed transcript HTTP transport", () => {
           payload: Buffer.from("test object"),
         });
       expect((await upload()).statusCode).toBe(200);
+      const stored = await store.get(key);
+      const pinnedCapability = new URL(
+        await issuer.issueGetUrl({
+          objectKey: key,
+          objectVersionId: stored!.versionId,
+          expiresInSeconds: 30,
+        }),
+      );
+      expect(pinnedCapability.origin).toBe("https://research.example");
+      expect(pinnedCapability.pathname).toMatch(/^\/cloud-api\/__objects\//u);
+      const downloaded = await app.inject({
+        method: "GET",
+        url: pinnedCapability.pathname,
+        headers,
+      });
+      expect(downloaded.statusCode).toBe(200);
+      expect(downloaded.rawPayload.toString()).toBe("test object");
       await mkdir(join(root, ".vera-backup-writes-blocked"));
       expect((await upload()).statusCode).toBe(503);
       expect(

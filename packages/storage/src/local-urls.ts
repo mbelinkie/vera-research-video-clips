@@ -26,16 +26,24 @@ export class LocalStagedUploadUrlIssuer implements StagedUploadUrlIssuer {
     private readonly now: () => number = Date.now,
   ) {
     const parsed = new URL(baseUrl);
+    const loopbackHttp =
+      parsed.protocol === "http:" &&
+      ["127.0.0.1", "localhost", "[::1]"].includes(parsed.hostname) &&
+      parsed.pathname === "/";
+    // Only the browser BFF may expose signed local objects at an HTTPS public
+    // origin. Its /cloud-api prefix is rewritten to this internal endpoint.
+    const browserBffHttps =
+      parsed.protocol === "https:" && parsed.pathname === "/cloud-api/";
     if (
-      parsed.protocol !== "http:" ||
-      !["127.0.0.1", "localhost", "[::1]"].includes(parsed.hostname) ||
+      (!loopbackHttp && !browserBffHttps) ||
       parsed.username ||
       parsed.password ||
       parsed.search ||
-      parsed.hash ||
-      parsed.pathname !== "/"
+      parsed.hash
     ) {
-      throw new Error("Local object transport must use a loopback HTTP origin");
+      throw new Error(
+        "Local object transport requires loopback HTTP or browser BFF HTTPS /cloud-api/",
+      );
     }
     if (Buffer.byteLength(secret) < 32)
       throw new Error("Local object URL signing secret is too short");
@@ -68,7 +76,7 @@ export class LocalStagedUploadUrlIssuer implements StagedUploadUrlIssuer {
       }),
     ).toString("base64url");
     return new URL(
-      "/__objects/" + body + "." + this.sign(body).toString("base64url"),
+      "__objects/" + body + "." + this.sign(body).toString("base64url"),
       this.baseUrl,
     ).toString();
   }
