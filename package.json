@@ -16,6 +16,9 @@
     "build:web": "vite build --config apps/web/vite.config.ts",
     "check": "npm run format:check && npm run typecheck && npm run test && npm run build:web && npm run db:migrate:local:test && npm run db:migrate:cloud:test",
     "db:migrate:cloud:test": "node --import tsx packages/db-cloud/src/cli.ts --test",
+    "pilot:backup": "node --import tsx scripts/pilot-data.ts backup",
+    "pilot:restore": "node --import tsx scripts/pilot-data.ts restore",
+    "pilot:import:synthetic": "node --import tsx scripts/pilot-import-synthetic.ts",
     "db:migrate:local": "node --import tsx packages/db-local/src/cli.ts",
     "db:migrate:local:test": "node --import tsx packages/db-local/src/cli.ts --test",
     "dev": "concurrently -n web,local,cloud,worker -c blue,green,magenta,yellow \"npm:dev:web\" \"npm:dev:local-agent\" \"npm:dev:cloud-api\" \"npm:dev:worker\"",
@@ -37,6 +40,7 @@
     "@aws-sdk/s3-request-presigner": "^3.1101.0",
     "@electric-sql/pglite": "^0.5.4",
     "fastify": "^5.11.0",
+    "pg": "^8.23.1",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
     "zod": "^4.4.3"
@@ -44,6 +48,7 @@
   "devDependencies": {
     "@playwright/test": "^1.62.1",
     "@types/node": "^26.1.2",
+    "@types/pg": "^8.23.1",
     "@types/react": "^19.2.18",
     "@types/react-dom": "^19.2.4",
     "@vitejs/plugin-react": "^6.0.5",

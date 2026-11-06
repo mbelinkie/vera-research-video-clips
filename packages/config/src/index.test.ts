@@ -104,4 +104,35 @@ describe("configuration", () => {
     expect(() => loadConfig({ WORKER_CONCURRENCY: "9" })).toThrow();
     expect(() => loadConfig({ WORKER_LEASE_SECONDS: "10" })).toThrow();
   });
+
+  it("rejects every incomplete or exposed Mac pilot mode", () => {
+    const valid = {
+      VERA_RUNTIME_MODE: "mac-pilot",
+      DATABASE_MODE: "postgres",
+      OBJECT_STORE_MODE: "local",
+      PILOT_PG_URL:
+        "postgresql://test:somepassword@127.0.0.1:5432/vera50_test_config",
+      PILOT_OBJECT_ROOT: "/tmp/vera50-test-objects",
+      LOCAL_UPLOAD_SIGNING_SECRET: "not-a-real-secret-32-characters-long",
+    };
+    expect(loadConfig(valid).runtimeMode).toBe("mac-pilot");
+    for (const [key, value] of Object.entries({
+      CLOUD_API_HOST: "0.0.0.0",
+      OBJECT_STORE_MODE: "memory",
+      DATABASE_MODE: "pglite",
+      PILOT_PG_URL: "postgresql://test:pass@remote.example/vera",
+      PILOT_OBJECT_ROOT: "relative-root",
+      LOCAL_UPLOAD_SIGNING_SECRET: "weak",
+    })) {
+      expect(() => loadConfig({ ...valid, [key]: value })).toThrow();
+    }
+    expect(() => loadConfig({ ...valid, PILOT_PG_URL: undefined })).toThrow();
+    expect(() =>
+      loadConfig({ ...valid, LOCAL_UPLOAD_SIGNING_SECRET: undefined }),
+    ).toThrow();
+    expect(loadConfig({ NODE_ENV: "test" }).databaseMode).toBe("pglite");
+    expect(() => loadConfig({ NODE_ENV: "production" })).toThrow(
+      "Production configuration must explicitly select a durable runtime",
+    );
+  });
 });

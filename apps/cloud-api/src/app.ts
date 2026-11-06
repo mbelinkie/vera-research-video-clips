@@ -3,6 +3,12 @@ import { z, ZodError } from "zod";
 
 import { AuthenticationError } from "@research-video/auth";
 import type { SharedProjectCatalog } from "@research-video/catalog";
+import { pilotBackupGateIsActive } from "@research-video/db-cloud";
+import {
+  LocalStagedUploadUrlIssuer,
+  type TranscriptObjectStore,
+} from "@research-video/storage";
+import { createHash } from "node:crypto";
 import {
   AddProjectMemberRequestSchema,
   AddProjectVideoRequestSchema,
@@ -37,6 +43,11 @@ export interface CloudApiDependencies {
   catalog: SharedProjectCatalog;
   authenticate(request: FastifyRequest): Promise<AuthenticatedActor>;
   videoMetadataProvider?: VideoMetadataProvider;
+  localArtifacts?: {
+    store: TranscriptObjectStore;
+    issuer: LocalStagedUploadUrlIssuer;
+    objectRoot: string;
+  };
 }
 
 const IdParamsSchema = z.object({ projectId: z.uuid() });
@@ -79,7 +90,12 @@ export async function authenticateDevBearer(
 export function createCloudApi(
   dependencies?: CloudApiDependencies,
 ): FastifyInstance {
-  const app = Fastify({ logger: false });
+  // Signed local-object capabilities may exceed Fastify's default 100-byte
+  // dynamic parameter limit; the verifier still caps and validates the token.
+  const app = Fastify({
+    logger: false,
+    routerOptions: { maxParamLength: 4_096 },
+  });
 
   app.setErrorHandler((error, _request, reply) => {
     const candidate = error as Error & { statusCode?: number; code?: string };
@@ -109,6 +125,98 @@ export function createCloudApi(
 
   if (!dependencies) return app;
   const { catalog, authenticate } = dependencies;
+
+  if (dependencies.localArtifacts) {
+    const { store, issuer, objectRoot } = dependencies.localArtifacts;
+    // The operator creates the filesystem gate before a backup. Check once
+    // before admitting a write and again after incrementing the in-flight
+    // count, so a write racing with gate creation cannot escape the drain.
+    let inFlightWrites = 0;
+    const registered = new WeakSet<FastifyRequest>();
+    const finish = (request: FastifyRequest) => {
+      if (registered.delete(request)) inFlightWrites--;
+    };
+    app.addHook("onRequest", async (request) => {
+      if (!["POST", "PUT", "PATCH", "DELETE"].includes(request.method)) return;
+      if (await pilotBackupGateIsActive(objectRoot)) {
+        throw new PilotWritesBlockedError();
+      }
+      registered.add(request);
+      inFlightWrites++;
+      if (await pilotBackupGateIsActive(objectRoot)) {
+        finish(request);
+        throw new PilotWritesBlockedError();
+      }
+    });
+    app.addHook("onResponse", async (request) => {
+      finish(request);
+    });
+    app.addHook("onRequestAbort", async (request) => {
+      finish(request);
+    });
+    app.get("/__maintenance/status", async () => ({
+      writesBlocked: await pilotBackupGateIsActive(objectRoot),
+      inFlightWrites,
+    }));
+    // Encapsulated parser: never alter the ordinary JSON catalog API. The
+    // capabilities are issued after authorization by the catalog; no caller
+    // can choose a filesystem path or unpinned download version.
+    app.register(async (local) => {
+      local.removeContentTypeParser("application/json");
+      local.removeContentTypeParser("text/plain");
+      local.addContentTypeParser(
+        "*",
+        { parseAs: "buffer", bodyLimit: 32 * 1024 * 1024 },
+        (_request, body, done) => done(null, body),
+      );
+      local.put(
+        "/__objects/:token",
+        { bodyLimit: 32 * 1024 * 1024 },
+        async (request, reply) => {
+          const token = z
+            .object({ token: z.string() })
+            .parse(request.params).token;
+          const capability = issuer.verify(token, "PUT");
+          const data = request.body;
+          if (!Buffer.isBuffer(data))
+            return reply
+              .code(415)
+              .send({ error: "Binary request body required" });
+          const contentType = request.headers["content-type"];
+          if (
+            typeof contentType !== "string" ||
+            !contentType ||
+            contentType.length > 200
+          ) {
+            return reply.code(415).send({ error: "Content type required" });
+          }
+          const stored = await store.put({
+            key: capability.key,
+            bytes: data,
+            contentType,
+            sha256: createHash("sha256").update(data).digest("hex"),
+          });
+          return reply
+            .header("x-amz-version-id", stored.versionId)
+            .code(200)
+            .send();
+        },
+      );
+      local.get("/__objects/:token", async (request, reply) => {
+        const token = z
+          .object({ token: z.string() })
+          .parse(request.params).token;
+        const capability = issuer.verify(token, "GET");
+        const found = await store.get(capability.key, capability.versionId);
+        if (!found)
+          return reply.code(404).send({ error: "Object version not found" });
+        return reply
+          .header("x-amz-version-id", found.versionId)
+          .type(found.contentType)
+          .send(Buffer.from(found.bytes));
+      });
+    });
+  }
 
   app.post("/api/session/register", async (request) => {
     const actor = await authenticate(request);
@@ -495,6 +603,14 @@ export function createCloudApi(
   );
 
   return app;
+}
+
+class PilotWritesBlockedError extends Error {
+  readonly statusCode = 503;
+  readonly code = "pilot_backup_in_progress";
+  constructor() {
+    super("Pilot writes are paused for a backup");
+  }
 }
 
 export async function preflightTranscriptionBatch(

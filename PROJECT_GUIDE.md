@@ -495,6 +495,12 @@ The manifest records project/video/track IDs, source and target languages, prove
 
 Use a private S3 bucket with versioning, encryption, blocked public access, least-privilege service roles, and lifecycle rules for abandoned staging objects/old versions. The application receives short-lived presigned upload/download URLs from the authenticated project API; do not ship general AWS credentials to clients.
 
+For the friends-only R1 Mac pilot, issue #50 supersedes the historical
+managed-PostgreSQL/S3 *deployment choice* above: use locally installed native
+PostgreSQL and private, immutable local transcript objects with an explicit
+operator-consistent backup/restore mechanism. The publish/version integrity
+contract remains unchanged. See `docs/operations/mac-pilot-data.md`.
+
 ### 6.7 Publish and download protocol
 
 Publish atomically at the catalog level:

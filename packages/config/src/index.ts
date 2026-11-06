@@ -1,4 +1,4 @@
-import { resolve } from "node:path";
+import { isAbsolute, resolve } from "node:path";
 
 import { z } from "zod";
 
@@ -21,9 +21,14 @@ export const AppConfigSchema = z
     localAgentPort: PortSchema,
     cloudApiHost: z.string().min(1),
     cloudApiPort: PortSchema,
+    runtimeMode: z.enum(["development", "mac-pilot"]),
+    databaseMode: z.enum(["pglite", "postgres"]),
+    pilotPgUrl: z.string().optional(),
+    pilotObjectRoot: z.string().optional(),
+    localSigningSecret: z.string().optional(),
     webPort: PortSchema,
     dataDir: z.string().min(1),
-    objectStoreMode: z.enum(["memory", "s3"]),
+    objectStoreMode: z.enum(["memory", "s3", "local"]),
     queueMode: z.enum(["memory", "sqs"]),
     captionProvider: z.enum(["disabled", "yt-dlp"]),
     mediaProvider: z.enum(["disabled", "yt-dlp-audio"]),
@@ -45,6 +50,85 @@ export const AppConfigSchema = z
     workerLeaseSeconds: z.coerce.number().int().min(30).max(900),
   })
   .superRefine((config, context) => {
+    if (config.nodeEnv === "production" && config.runtimeMode !== "mac-pilot") {
+      context.addIssue({
+        code: "custom",
+        path: ["runtimeMode"],
+        message:
+          "Production configuration must explicitly select a durable runtime",
+      });
+    }
+    if (config.runtimeMode === "mac-pilot") {
+      if (
+        config.databaseMode !== "postgres" ||
+        config.objectStoreMode !== "local"
+      ) {
+        context.addIssue({
+          code: "custom",
+          path: ["runtimeMode"],
+          message: "Mac pilot requires PostgreSQL and local durable objects",
+        });
+      }
+      if (!["127.0.0.1", "localhost", "::1"].includes(config.cloudApiHost)) {
+        context.addIssue({
+          code: "custom",
+          path: ["cloudApiHost"],
+          message: "Mac pilot cloud API must bind to loopback",
+        });
+      }
+      if (!config.pilotObjectRoot || !isAbsolute(config.pilotObjectRoot)) {
+        context.addIssue({
+          code: "custom",
+          path: ["pilotObjectRoot"],
+          message: "Mac pilot requires an absolute local object root",
+        });
+      }
+      if (
+        !config.localSigningSecret ||
+        Buffer.byteLength(config.localSigningSecret) < 32
+      ) {
+        context.addIssue({
+          code: "custom",
+          path: ["localSigningSecret"],
+          message:
+            "Mac pilot requires a private signing secret of at least 32 bytes",
+        });
+      }
+      let safePgUrl = false;
+      try {
+        const pg = new URL(config.pilotPgUrl ?? "");
+        safePgUrl =
+          ["postgres:", "postgresql:"].includes(pg.protocol) &&
+          ["127.0.0.1", "localhost", "[::1]"].includes(pg.hostname) &&
+          Boolean(pg.username && pg.password) &&
+          !pg.hash;
+      } catch {
+        // Refuse absent or malformed local PostgreSQL URLs.
+      }
+      if (!safePgUrl) {
+        context.addIssue({
+          code: "custom",
+          path: ["pilotPgUrl"],
+          message: "Mac pilot requires a credentialed loopback PostgreSQL URL",
+        });
+      }
+      if (config.queueMode !== "memory") {
+        context.addIssue({
+          code: "custom",
+          path: ["queueMode"],
+          message: "Mac pilot cannot enable a hosted queue",
+        });
+      }
+    } else if (
+      config.databaseMode !== "pglite" ||
+      config.objectStoreMode === "local"
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["runtimeMode"],
+        message: "PostgreSQL/local objects require explicit Mac pilot mode",
+      });
+    }
     if (config.objectStoreMode === "s3" && !config.transcriptBucket) {
       context.addIssue({
         code: "custom",
@@ -81,6 +165,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     localAgentPort: env.LOCAL_AGENT_PORT ?? 43_110,
     cloudApiHost: env.CLOUD_API_HOST ?? "127.0.0.1",
     cloudApiPort: env.CLOUD_API_PORT ?? 43_111,
+    runtimeMode: env.VERA_RUNTIME_MODE ?? "development",
+    databaseMode: env.DATABASE_MODE ?? "pglite",
+    pilotPgUrl: env.PILOT_PG_URL,
+    pilotObjectRoot: env.PILOT_OBJECT_ROOT,
+    localSigningSecret: env.LOCAL_UPLOAD_SIGNING_SECRET,
     webPort: env.WEB_PORT ?? 43_112,
     dataDir: resolve(env.DATA_DIR ?? "./data"),
     objectStoreMode: env.OBJECT_STORE_MODE ?? "memory",

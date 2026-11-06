@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 
-import type { PGlite } from "@electric-sql/pglite";
 import { AuthorizationError, requirePermission } from "@research-video/auth";
+import type { SqlDatabase } from "@research-video/db-cloud";
 import {
   ActiveTranscriptBundleSchema,
   BatchPreflightSummarySchema,
@@ -118,7 +118,7 @@ const loggedExportRequestSelect = `SELECT er.*, j.state
 
 export class SharedProjectCatalog {
   constructor(
-    private readonly database: PGlite,
+    private readonly database: SqlDatabase,
     private readonly store: TranscriptObjectStore,
     private readonly now: () => Date = () => new Date(),
     private readonly uploadUrlIssuer: StagedUploadUrlIssuer = new MemoryStagedUploadUrlIssuer(),
@@ -1146,8 +1146,7 @@ export class SharedProjectCatalog {
     await this.requireRegistered(actor);
     const claimedAt = this.now();
     const expiresAt = new Date(claimedAt.getTime() + leaseSeconds * 1_000);
-    await this.database.exec("BEGIN");
-    try {
+    return this.transaction(async () => {
       const candidate = await this.database.query<DbRow>(
         `SELECT j.*
          FROM jobs j
@@ -1186,7 +1185,6 @@ export class SharedProjectCatalog {
       );
       const row = candidate.rows[0];
       if (!row) {
-        await this.database.exec("COMMIT");
         return undefined;
       }
       const attempt = Number(row.attempt) + 1;
@@ -1221,7 +1219,6 @@ export class SharedProjectCatalog {
          WHERE job_id = $3 AND state NOT IN ('ready_for_review', 'canceled')`,
         [attempt, claimedAt.toISOString(), row.id],
       );
-      await this.database.exec("COMMIT");
       return ClaimedTranscriptionJobSchema.parse({
         job: mapJob({
           ...row,
@@ -1238,10 +1235,7 @@ export class SharedProjectCatalog {
           expiresAt: expiresAt.toISOString(),
         },
       });
-    } catch (error) {
-      await this.database.exec("ROLLBACK");
-      throw error;
-    }
+    });
   }
 
   async heartbeatTranscriptionJob(
@@ -2008,11 +2002,16 @@ export class SharedProjectCatalog {
     requirePermission(result.rows[0]?.role, permission);
   }
 
-  private async transaction(action: () => Promise<void>) {
+  private async transaction<T>(action: () => Promise<T>): Promise<T> {
+    if (this.database.transaction) {
+      return this.database.transaction(action);
+    }
+    // PGlite is retained for single-process development/fast tests only.
     await this.database.exec("BEGIN");
     try {
-      await action();
+      const result = await action();
       await this.database.exec("COMMIT");
+      return result;
     } catch (error) {
       await this.database.exec("ROLLBACK");
       throw error;
