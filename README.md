@@ -21,6 +21,11 @@ decision needs its own rationale. After two unsuccessful evidence-based
 debugging attempts, start a fresh task with the confirmed facts and a focused
 reproduction.
 
+For an **opt-in local Mac PostgreSQL/transcript-store pilot** (not friend-facing),
+see [the #50 data and backup operator guide](./docs/operations/mac-pilot-data.md).
+No service installation, live migration or external networking is performed by
+the application defaults.
+
 ## Prerequisites
 
 - Node.js 22 or newer
