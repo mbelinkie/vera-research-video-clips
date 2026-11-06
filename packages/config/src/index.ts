@@ -20,6 +20,21 @@ export const AppConfigSchema = z
     localAgentHost: LoopbackHostSchema,
     localAgentPort: PortSchema,
     cloudApiHost: z.string().min(1),
+    cloudAuthMode: z.enum(["development", "browser"]),
+    browserPublicOrigin: z.string().optional(),
+    browserCallbackUrl: z.string().optional(),
+    browserLogoutUrl: z.string().optional(),
+    cognitoIssuer: z.string().optional(),
+    cognitoDomain: z.string().optional(),
+    cognitoClientId: z.string().trim().min(1).optional(),
+    cognitoClientSecret: z.string().min(1).optional(),
+    trustedProxyPeers: z.array(LoopbackHostSchema),
+    browserSessionIdleMs: z.coerce.number().int().min(60_000).max(3_600_000),
+    browserSessionAbsoluteMs: z.coerce
+      .number()
+      .int()
+      .min(300_000)
+      .max(86_400_000),
     cloudApiPort: PortSchema,
     webPort: PortSchema,
     dataDir: z.string().min(1),
@@ -45,6 +60,95 @@ export const AppConfigSchema = z
     workerLeaseSeconds: z.coerce.number().int().min(30).max(900),
   })
   .superRefine((config, context) => {
+    const reject = (path: string, message: string) =>
+      context.addIssue({ code: "custom", path: [path], message });
+    if (config.nodeEnv === "production" && config.cloudAuthMode !== "browser") {
+      reject("cloudAuthMode", "Production cloud API requires browser BFF mode");
+    }
+    if (
+      config.cloudAuthMode === "development" &&
+      !["localhost", "127.0.0.1", "::1"].includes(config.cloudApiHost)
+    ) {
+      reject("cloudApiHost", "Development bearer API must bind to loopback");
+    }
+    if (config.cloudAuthMode === "browser") {
+      if (!["localhost", "127.0.0.1", "::1"].includes(config.cloudApiHost)) {
+        reject(
+          "cloudApiHost",
+          "Browser BFF must be behind a local TLS ingress on loopback",
+        );
+      }
+      const origin = config.browserPublicOrigin;
+      try {
+        const url = new URL(origin ?? "");
+        if (
+          url.protocol !== "https:" ||
+          url.origin !== origin ||
+          url.username ||
+          url.password ||
+          url.hash ||
+          url.search
+        )
+          throw Error();
+      } catch {
+        reject(
+          "browserPublicOrigin",
+          "BROWSER_PUBLIC_ORIGIN must be an exact bare HTTPS origin",
+        );
+      }
+      if (
+        !origin ||
+        config.browserCallbackUrl !== `${origin}/cloud-api/auth/callback`
+      ) {
+        reject(
+          "browserCallbackUrl",
+          "BROWSER_CALLBACK_URL must match exact HTTPS /cloud-api/auth/callback",
+        );
+      }
+      if (!origin || config.browserLogoutUrl !== `${origin}/`) {
+        reject(
+          "browserLogoutUrl",
+          "BROWSER_LOGOUT_URL must match exact HTTPS origin root",
+        );
+      }
+      if (
+        !/^https:\/\/cognito-idp\.[a-z0-9-]+\.amazonaws\.com\/[a-z0-9-]+_[A-Za-z0-9]+$/u.test(
+          config.cognitoIssuer ?? "",
+        )
+      ) {
+        reject(
+          "cognitoIssuer",
+          "COGNITO_ISSUER must identify an exact AWS Cognito user pool",
+        );
+      }
+      try {
+        const domain = new URL(config.cognitoDomain ?? "");
+        if (
+          domain.protocol !== "https:" ||
+          domain.origin !== config.cognitoDomain ||
+          domain.username ||
+          domain.password
+        )
+          throw Error();
+      } catch {
+        reject(
+          "cognitoDomain",
+          "COGNITO_DOMAIN must be a bare HTTPS Managed Login origin",
+        );
+      }
+      if (!config.cognitoClientId)
+        reject("cognitoClientId", "COGNITO_CLIENT_ID required");
+      if (!config.cognitoClientSecret)
+        reject(
+          "cognitoClientSecret",
+          "COGNITO_CLIENT_SECRET required (server only)",
+        );
+      if (config.browserSessionIdleMs > config.browserSessionAbsoluteMs)
+        reject(
+          "browserSessionIdleMs",
+          "Idle timeout cannot exceed absolute timeout",
+        );
+    }
     if (config.objectStoreMode === "s3" && !config.transcriptBucket) {
       context.addIssue({
         code: "custom",
@@ -80,6 +184,19 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     localAgentHost: env.LOCAL_AGENT_HOST ?? "127.0.0.1",
     localAgentPort: env.LOCAL_AGENT_PORT ?? 43_110,
     cloudApiHost: env.CLOUD_API_HOST ?? "127.0.0.1",
+    cloudAuthMode: env.CLOUD_AUTH_MODE ?? "development",
+    browserPublicOrigin: env.BROWSER_PUBLIC_ORIGIN,
+    browserCallbackUrl: env.BROWSER_CALLBACK_URL,
+    browserLogoutUrl: env.BROWSER_LOGOUT_URL,
+    cognitoIssuer: env.COGNITO_ISSUER,
+    cognitoDomain: env.COGNITO_DOMAIN,
+    cognitoClientId: env.COGNITO_CLIENT_ID,
+    cognitoClientSecret: env.COGNITO_CLIENT_SECRET,
+    trustedProxyPeers: (env.TRUSTED_PROXY_PEERS ?? "127.0.0.1,::1")
+      .split(",")
+      .map((value) => value.trim()),
+    browserSessionIdleMs: env.BROWSER_SESSION_IDLE_MS ?? 1_800_000,
+    browserSessionAbsoluteMs: env.BROWSER_SESSION_ABSOLUTE_MS ?? 28_800_000,
     cloudApiPort: env.CLOUD_API_PORT ?? 43_111,
     webPort: env.WEB_PORT ?? 43_112,
     dataDir: resolve(env.DATA_DIR ?? "./data"),
