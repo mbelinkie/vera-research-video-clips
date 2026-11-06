@@ -8,5 +8,9 @@ export interface SqlDatabase {
     parameters?: unknown[],
   ): Promise<{ rows: Row[] }>;
   exec(statement: string): Promise<unknown>;
-  transaction?<T>(action: () => Promise<T>): Promise<T>;
+  // Deliberately distinct from PGlite's native `transaction(callback)`:
+  // its callback receives a *different* transaction handle. Catalog code
+  // queries this interface directly, so calling PGlite.transaction would
+  // deadlock while the original connection is held.
+  withTransaction?<T>(action: () => Promise<T>): Promise<T>;
 }

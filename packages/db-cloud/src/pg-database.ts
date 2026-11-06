@@ -38,7 +38,7 @@ export class ConnectionAffineDatabase implements SqlDatabase {
     await this.query(statement);
   }
 
-  async transaction<T>(action: () => Promise<T>): Promise<T> {
+  async withTransaction<T>(action: () => Promise<T>): Promise<T> {
     if (this.current.getStore()) {
       throw new Error("Nested SQL transactions are not supported");
     }

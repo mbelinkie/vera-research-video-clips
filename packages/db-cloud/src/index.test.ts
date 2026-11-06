@@ -15,6 +15,12 @@ describe("cloud migrations", () => {
     const database = new PGlite();
     databases.add(database);
 
+    // PGlite's native transaction(callbackWithTransactionHandle) must never
+    // be mistaken for our connection-affine withTransaction(callback) API.
+    // The former deadlocks if the callback queries the original PGlite handle.
+    expect(typeof database.transaction).toBe("function");
+    expect("withTransaction" in database).toBe(false);
+
     expect(await runCloudMigrations(database)).toEqual([
       "0001_foundation",
       "0002_shared_transcript_store",

@@ -23,11 +23,11 @@ describe("connection-affine PostgreSQL database", () => {
       },
     });
     await Promise.all([
-      db.transaction(async () => {
+      db.withTransaction(async () => {
         await db.query("SELECT LEFT");
         await db.query("UPDATE LEFT");
       }),
-      db.transaction(async () => {
+      db.withTransaction(async () => {
         await db.query("SELECT RIGHT");
         await db.query("UPDATE RIGHT");
       }),
@@ -66,9 +66,11 @@ describe("connection-affine PostgreSQL database", () => {
       },
     });
     await expect(
-      db.transaction(async () => {
+      db.withTransaction(async () => {
         await db.query("SELECT fixture");
-        await expect(db.transaction(async () => {})).rejects.toThrow("Nested");
+        await expect(db.withTransaction(async () => {})).rejects.toThrow(
+          "Nested",
+        );
         throw new Error("fixture failure");
       }),
     ).rejects.toThrow("fixture failure");
@@ -92,7 +94,7 @@ describe("connection-affine PostgreSQL database", () => {
       },
     });
     const work = vi.fn();
-    await expect(db.transaction(work)).rejects.toThrow("No connection");
+    await expect(db.withTransaction(work)).rejects.toThrow("No connection");
     expect(work).not.toHaveBeenCalled();
     expect(release).toHaveBeenCalledOnce();
   });

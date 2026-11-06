@@ -2003,8 +2003,8 @@ export class SharedProjectCatalog {
   }
 
   private async transaction<T>(action: () => Promise<T>): Promise<T> {
-    if (this.database.transaction) {
-      return this.database.transaction(action);
+    if (this.database.withTransaction) {
+      return this.database.withTransaction(action);
     }
     // PGlite is retained for single-process development/fast tests only.
     await this.database.exec("BEGIN");

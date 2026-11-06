@@ -73,7 +73,7 @@ describe.skipIf(!permitted)(
       // Two independently leased writers; rollback cannot leave partial state.
       const marker = randomUUID();
       await expect(
-        first.transaction(async () => {
+        first.withTransaction(async () => {
           await first.query("UPDATE projects SET name = $1 WHERE id = $2", [
             marker,
             project.id,
@@ -107,7 +107,7 @@ describe.skipIf(!permitted)(
       const waitForLock = new Promise<void>((resolve) => {
         indicateLocked = resolve;
       });
-      const heldTransaction = first.transaction(async () => {
+      const heldTransaction = first.withTransaction(async () => {
         await first.query("SELECT id FROM projects WHERE id=$1 FOR UPDATE", [
           project.id,
         ]);
@@ -115,7 +115,7 @@ describe.skipIf(!permitted)(
         await new Promise((release) => setTimeout(release, 350));
       });
       await waitForLock;
-      const skipped = await second.transaction(() =>
+      const skipped = await second.withTransaction(() =>
         second.query(
           "SELECT id FROM projects WHERE id=$1 FOR UPDATE SKIP LOCKED",
           [project.id],

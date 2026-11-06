@@ -21,8 +21,8 @@ export async function runCloudMigrations(
   // A pool cannot safely BEGIN on one connection and run migrations on another.
   // Hold the advisory lock, schema inspection, and all applied markers on one
   // checked-out client. Creating the table is also protected by the lock.
-  if (database.transaction) {
-    return database.transaction(async () => {
+  if (database.withTransaction) {
+    return database.withTransaction(async () => {
       await database.query("SELECT pg_advisory_xact_lock(7245850, 50)");
       return applyMigrations(database, migrationDirectory, false);
     });
