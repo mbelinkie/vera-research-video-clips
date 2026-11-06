@@ -23,9 +23,13 @@ import {
   type CsvImportDocument,
 } from "./csv-import.ts";
 import { ClipQueue } from "./clip-queue.tsx";
+import { cloudFetch } from "./browser-api.ts";
 
 type BatchWorkspaceProps = {
   authorization: string;
+  browserSession?: boolean;
+  csrfToken?: string | undefined;
+  onAuthUnavailable?: () => void;
   onAuthorizationChange(value: string): void;
   onOpenVideo(canonicalUrl: string): void;
   onProjectChange(projectId: string): void;
@@ -38,6 +42,9 @@ const apiRoot = "/cloud-api";
 
 export function BatchWorkspace({
   authorization,
+  browserSession = false,
+  csrfToken,
+  onAuthUnavailable,
   onAuthorizationChange,
   onOpenVideo,
   onProjectChange,
@@ -59,8 +66,11 @@ export function BatchWorkspace({
   const [selectedBatchId, setSelectedBatchId] = useState("");
   const [reviewItems, setReviewItems] = useState<ReviewInboxItem[]>([]);
   const [busy, setBusy] = useState(false);
+  const [newProject, setNewProject] = useState("");
   const [message, setMessage] = useState(
-    "Connect with a development session credential to load your projects.",
+    browserSession
+      ? "Refresh your projects."
+      : "Connect with a development session credential to load your projects.",
   );
 
   const inputs = useMemo(
@@ -73,15 +83,18 @@ export function BatchWorkspace({
   );
 
   async function request(path: string, init: RequestInit = {}) {
-    const response = await fetch(`${apiRoot}${path}`, {
-      ...init,
-      headers: {
-        accept: "application/json",
-        authorization,
-        ...(init.body ? { "content-type": "application/json" } : {}),
-        ...init.headers,
+    const response = await cloudFetch(
+      `${apiRoot}${path}`,
+      {
+        ...init,
+        headers: {
+          accept: "application/json",
+          ...(init.body ? { "content-type": "application/json" } : {}),
+          ...init.headers,
+        },
       },
-    });
+      { authorization, csrfToken, onUnavailable: onAuthUnavailable },
+    );
     const payload = await response.json().catch(() => undefined);
     if (!response.ok) {
       const parsed = ApiErrorSchema.safeParse(payload);
@@ -90,6 +103,34 @@ export function BatchWorkspace({
       );
     }
     return payload;
+  }
+
+  useEffect(() => {
+    if (browserSession && authorization) void connect();
+  }, [browserSession, authorization]);
+
+  async function createProject() {
+    if (!authorization || !newProject.trim()) return;
+    setBusy(true);
+    try {
+      const created = ProjectSchema.parse(
+        await request("/api/projects", {
+          method: "POST",
+          body: JSON.stringify({ name: newProject.trim() }),
+        }),
+      );
+      onProjectsChange([
+        ...projects.filter((project) => project.id !== created.id),
+        created,
+      ]);
+      onProjectChange(created.id);
+      setNewProject("");
+      setMessage(`Created project “${created.name}”.`);
+    } catch (error) {
+      setMessage(errorMessage(error));
+    } finally {
+      setBusy(false);
+    }
   }
 
   async function connect() {
@@ -310,24 +351,28 @@ export function BatchWorkspace({
       </div>
 
       <div className="session-panel">
-        <label htmlFor="development-authorization">
-          Development session credential
-        </label>
+        {!browserSession && (
+          <label htmlFor="development-authorization">
+            Development session credential
+          </label>
+        )}
         <div className="loader-row">
-          <input
-            id="development-authorization"
-            type="password"
-            autoComplete="off"
-            value={authorization}
-            onChange={(event) => onAuthorizationChange(event.target.value)}
-            placeholder="Bearer user-uuid|external-subject"
-          />
+          {!browserSession && (
+            <input
+              id="development-authorization"
+              type="password"
+              autoComplete="off"
+              value={authorization}
+              onChange={(event) => onAuthorizationChange(event.target.value)}
+              placeholder="Bearer user-uuid|external-subject"
+            />
+          )}
           <button
             type="button"
             disabled={busy || !authorization}
             onClick={connect}
           >
-            Connect
+            {browserSession ? "Refresh projects" : "Connect"}
           </button>
         </div>
         <p className="form-message" role="status">
@@ -335,6 +380,27 @@ export function BatchWorkspace({
         </p>
       </div>
 
+      {browserSession && (
+        <div className="session-panel">
+          <label htmlFor="create-browser-project">Create a project</label>
+          <div className="loader-row">
+            <input
+              id="create-browser-project"
+              value={newProject}
+              maxLength={160}
+              onChange={(event) => setNewProject(event.target.value)}
+              placeholder="Project name"
+            />
+            <button
+              type="button"
+              disabled={busy || !authorization || !newProject.trim()}
+              onClick={() => void createProject()}
+            >
+              Create project
+            </button>
+          </div>
+        </div>
+      )}
       {projects.length ? (
         <>
           <label className="project-picker" htmlFor="batch-project">
@@ -570,6 +636,7 @@ export function BatchWorkspace({
             authorization={authorization}
             projectId={projectId}
             request={request}
+            onAuthUnavailable={onAuthUnavailable}
             onOpenVideo={onOpenVideo}
           />
         </>

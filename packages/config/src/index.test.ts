@@ -105,3 +105,62 @@ describe("configuration", () => {
     expect(() => loadConfig({ WORKER_LEASE_SECONDS: "10" })).toThrow();
   });
 });
+
+describe("browser BFF configuration boundary", () => {
+  const valid = {
+    NODE_ENV: "production",
+    CLOUD_AUTH_MODE: "browser",
+    CLOUD_API_HOST: "127.0.0.1",
+    BROWSER_PUBLIC_ORIGIN: "https://research.example",
+    BROWSER_CALLBACK_URL: "https://research.example/cloud-api/auth/callback",
+    BROWSER_LOGOUT_URL: "https://research.example/",
+    COGNITO_ISSUER:
+      "https://cognito-idp.us-east-1.amazonaws.com/us-east-1_Example",
+    COGNITO_DOMAIN: "https://vera.auth.us-east-1.amazoncognito.com",
+    COGNITO_CLIENT_ID: "test-client",
+    COGNITO_CLIENT_SECRET: "test-only-not-real",
+  };
+  it("requires explicit browser auth for production", () => {
+    expect(() => loadConfig({ NODE_ENV: "production" })).toThrow(
+      "Production cloud API requires browser BFF mode",
+    );
+    expect(() => loadConfig(valid)).not.toThrow();
+  });
+  it("rejects public dev bearer and untrusted browser ingress", () => {
+    expect(() => loadConfig({ CLOUD_API_HOST: "0.0.0.0" })).toThrow(
+      "Development bearer API must bind to loopback",
+    );
+    expect(() => loadConfig({ ...valid, CLOUD_API_HOST: "0.0.0.0" })).toThrow(
+      "Browser BFF must be behind a local TLS ingress",
+    );
+    expect(() =>
+      loadConfig({ ...valid, TRUSTED_PROXY_PEERS: "10.0.0.1" }),
+    ).toThrow();
+  });
+  it("rejects incomplete, http or nonexact HTTPS public origin/callback", () => {
+    expect(() =>
+      loadConfig({ ...valid, COGNITO_CLIENT_SECRET: undefined }),
+    ).toThrow("COGNITO_CLIENT_SECRET");
+    expect(() =>
+      loadConfig({
+        ...valid,
+        BROWSER_PUBLIC_ORIGIN: "http://research.example",
+      }),
+    ).toThrow();
+    expect(() =>
+      loadConfig({
+        ...valid,
+        BROWSER_PUBLIC_ORIGIN: "https://research.example/path",
+      }),
+    ).toThrow();
+    expect(() =>
+      loadConfig({
+        ...valid,
+        BROWSER_CALLBACK_URL: "https://evil.example/callback",
+      }),
+    ).toThrow();
+    expect(() =>
+      loadConfig({ ...valid, BROWSER_SESSION_IDLE_MS: "999999999" }),
+    ).toThrow();
+  });
+});
