@@ -1,3 +1,4 @@
+import type { BrowserAuth } from "./browser-auth/routes.ts";
 import Fastify, { type FastifyInstance, type FastifyRequest } from "fastify";
 import { z, ZodError } from "zod";
 
@@ -41,6 +42,7 @@ import {
 
 export interface CloudApiDependencies {
   catalog: SharedProjectCatalog;
+  browserAuth?: BrowserAuth;
   authenticate(request: FastifyRequest): Promise<AuthenticatedActor>;
   videoMetadataProvider?: VideoMetadataProvider;
   localArtifacts?: {
@@ -95,6 +97,10 @@ export function createCloudApi(
   const app = Fastify({
     logger: false,
     routerOptions: { maxParamLength: 4_096 },
+    rewriteUrl: (request) =>
+      dependencies?.browserAuth && request.url?.startsWith("/cloud-api/")
+        ? request.url.slice("/cloud-api".length)
+        : (request.url ?? "/"),
   });
 
   app.setErrorHandler((error, _request, reply) => {
@@ -124,7 +130,8 @@ export function createCloudApi(
   );
 
   if (!dependencies) return app;
-  const { catalog, authenticate } = dependencies;
+  const { catalog, authenticate, browserAuth } = dependencies;
+  browserAuth?.routes(app);
 
   if (dependencies.localArtifacts) {
     const { store, issuer, objectRoot } = dependencies.localArtifacts;
@@ -219,11 +226,11 @@ export function createCloudApi(
   }
 
   app.post("/api/session/register", async (request) => {
-    const actor = await authenticate(request);
     const body = z
-      .object({ displayName: z.string().trim().min(1).max(160) })
+      .strictObject({ displayName: z.string().trim().min(1).max(160) })
       .parse(request.body);
-    return catalog.registerUser(actor, body.displayName);
+    if (browserAuth) return browserAuth.register(request, body.displayName);
+    return catalog.registerUser(await authenticate(request), body.displayName);
   });
 
   app.get("/api/projects", async (request) =>

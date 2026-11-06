@@ -1,5 +1,8 @@
 import { lstat, mkdir } from "node:fs/promises";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
+import fastifyStatic from "@fastify/static";
+import { createBrowserAuth } from "./browser-auth/routes.ts";
+import { createCognitoProvider } from "./browser-auth/provider.ts";
 
 import { S3Client } from "@aws-sdk/client-s3";
 import { PGlite } from "@electric-sql/pglite";
@@ -72,9 +75,30 @@ const catalog = new SharedProjectCatalog(
   () => new Date(),
   uploadUrlIssuer,
 );
+const browserAuth =
+  config.cloudAuthMode === "browser"
+    ? createBrowserAuth({
+        publicOrigin: config.browserPublicOrigin!,
+        trustedProxyPeers: config.trustedProxyPeers,
+        provider: createCognitoProvider({
+          issuer: config.cognitoIssuer!,
+          domain: config.cognitoDomain!,
+          clientId: config.cognitoClientId!,
+          clientSecret: config.cognitoClientSecret!,
+          callbackUrl: config.browserCallbackUrl!,
+          logoutUrl: config.browserLogoutUrl!,
+        }),
+        catalog,
+        sessionIdleMs: config.browserSessionIdleMs,
+        sessionAbsoluteMs: config.browserSessionAbsoluteMs,
+      })
+    : undefined;
 const app = createCloudApi({
+  ...(browserAuth ? { browserAuth } : {}),
   catalog,
-  authenticate: authenticateDevBearer,
+  authenticate: browserAuth
+    ? (request) => browserAuth.authenticate(request)
+    : authenticateDevBearer,
   videoMetadataProvider: new YouTubeOEmbedMetadataProvider(),
   ...(pilot && uploadUrlIssuer instanceof LocalStagedUploadUrlIssuer
     ? {
@@ -88,6 +112,14 @@ const app = createCloudApi({
 });
 
 try {
+  if (browserAuth) {
+    // In browser mode, serve the built frontend from the SAME BFF origin. Never
+    // mount /local-agent; the local export service remains loopback-only.
+    await app.register(fastifyStatic, {
+      root: resolve("dist/web"),
+      prefix: "/",
+    });
+  }
   await app.listen({ host: config.cloudApiHost, port: config.cloudApiPort });
 } catch (error) {
   await database.close();

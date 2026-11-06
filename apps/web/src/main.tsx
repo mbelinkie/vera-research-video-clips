@@ -25,6 +25,7 @@ import transcriptFixture from "../../../tests/fixtures/transcripts/english-word.
 
 import "./styles.css";
 import { BatchWorkspace } from "./batch-workspace.tsx";
+import { browserMode, cloudFetch, type BrowserSession } from "./browser-api.ts";
 import { YouTubePlayer, type YouTubePlayerHandle } from "./youtube-player.tsx";
 import { VirtualTranscript } from "./virtual-transcript.tsx";
 
@@ -54,7 +55,107 @@ function App() {
   const [selection, setSelection] = useState<TranscriptSelection>();
   const [selectionError, setSelectionError] = useState<string>();
   const [previewingSelection, setPreviewingSelection] = useState(false);
-  const [authorization, setAuthorization] = useState("");
+  const [devAuthorization, setDevAuthorization] = useState("");
+  const [session, setSession] = useState<BrowserSession>();
+  const [sessionIssue, setSessionIssue] = useState<string>();
+  const [sessionBusy, setSessionBusy] = useState(false);
+  const [displayName, setDisplayName] = useState("");
+  const authorization = browserMode
+    ? session?.authenticated && session.registered
+      ? "session"
+      : ""
+    : devAuthorization;
+  const csrfToken = session?.authenticated ? session.csrfToken : undefined;
+  function clearPrivateState() {
+    setProjects([]);
+    setProjectId("");
+    setLoggedClipId(undefined);
+    setLoggedExportRequestId(undefined);
+    setSelection(undefined);
+    setVideoId(undefined);
+    setClipActionMessage(undefined);
+    setProjectMessage(undefined);
+  }
+  function loseSession() {
+    clearPrivateState();
+    setSession(undefined);
+    setSessionIssue(
+      "Session expired or Mac unavailable. Retry the connection or sign in again.",
+    );
+  }
+  async function loadSession() {
+    try {
+      const response = await fetch("/cloud-api/api/session", {
+        credentials: "same-origin",
+        cache: "no-store",
+      });
+      if (!response.ok) throw new Error();
+      const loaded = (await response.json()) as BrowserSession;
+      setSession((previous) => {
+        if (
+          previous?.authenticated &&
+          (!loaded.authenticated || previous.user?.id !== loaded.user?.id)
+        )
+          clearPrivateState();
+        return loaded;
+      });
+      setSessionIssue(undefined);
+    } catch {
+      loseSession();
+    }
+  }
+  useEffect(() => {
+    if (!browserMode) return;
+    void loadSession();
+    const check = () => void loadSession();
+    const poll = window.setInterval(check, 60_000);
+    window.addEventListener("focus", check);
+    return () => {
+      window.clearInterval(poll);
+      window.removeEventListener("focus", check);
+    };
+  }, []);
+  async function registerProfile() {
+    if (!csrfToken || !displayName.trim()) return;
+    setSessionBusy(true);
+    try {
+      const response = await cloudFetch(
+        "/cloud-api/api/session/register",
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ displayName: displayName.trim() }),
+        },
+        { authorization, csrfToken, onUnavailable: loseSession },
+      );
+      if (!response.ok) throw new Error();
+      await loadSession();
+    } catch {
+      setSessionIssue("Unable to create profile. Please retry.");
+    } finally {
+      setSessionBusy(false);
+    }
+  }
+  async function signOut() {
+    if (!csrfToken) return;
+    setSessionBusy(true);
+    try {
+      const response = await cloudFetch(
+        "/cloud-api/auth/logout",
+        { method: "POST" },
+        { authorization, csrfToken, onUnavailable: loseSession },
+      );
+      const result = (await response.json()) as { logoutUrl?: string };
+      if (!response.ok || !result.logoutUrl) throw new Error();
+      clearPrivateState();
+      setSession({ authenticated: false, registered: false });
+      window.location.assign(result.logoutUrl);
+    } catch {
+      loseSession();
+    } finally {
+      setSessionBusy(false);
+    }
+  }
   const [projects, setProjects] = useState<Project[]>([]);
   const [projectId, setProjectId] = useState("");
   const [creatingProject, setCreatingProject] = useState(false);
@@ -254,18 +355,21 @@ function App() {
     if (!authorization || !newProjectName.trim()) return;
     setProjectBusy(true);
     try {
-      const response = await fetch("/cloud-api/api/projects", {
-        method: "POST",
-        headers: {
-          accept: "application/json",
-          authorization,
-          "content-type": "application/json",
+      const response = await cloudFetch(
+        "/cloud-api/api/projects",
+        {
+          method: "POST",
+          headers: {
+            accept: "application/json",
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({
+            name: newProjectName,
+            description: newProjectDescription,
+          }),
         },
-        body: JSON.stringify({
-          name: newProjectName,
-          description: newProjectDescription,
-        }),
-      });
+        { authorization, csrfToken, onUnavailable: loseSession },
+      );
       const payload = await response.json().catch(() => undefined);
       if (!response.ok) {
         const parsed = ApiErrorSchema.safeParse(payload);
@@ -299,13 +403,12 @@ function App() {
       return undefined;
     setClipActionBusy(true);
     try {
-      const response = await fetch(
+      const response = await cloudFetch(
         `/cloud-api/api/projects/${projectId}/clips`,
         {
           method: "POST",
           headers: {
             accept: "application/json",
-            authorization,
             "content-type": "application/json",
           },
           body: JSON.stringify({
@@ -327,6 +430,7 @@ function App() {
               .filter(Boolean),
           }),
         },
+        { authorization, csrfToken, onUnavailable: loseSession },
       );
       const payload = await response.json().catch(() => undefined);
       if (!response.ok) {
@@ -358,13 +462,12 @@ function App() {
     if (!clipId) return;
     setClipActionBusy(true);
     try {
-      const response = await fetch(
+      const response = await cloudFetch(
         `/cloud-api/api/projects/${projectId}/clips/${clipId}/exports`,
         {
           method: "POST",
           headers: {
             accept: "application/json",
-            authorization,
             "content-type": "application/json",
           },
           body: JSON.stringify({
@@ -373,6 +476,7 @@ function App() {
             preset: exportPreset,
           }),
         },
+        { authorization, csrfToken, onUnavailable: loseSession },
       );
       const payload = await response.json().catch(() => undefined);
       if (!response.ok) {
@@ -400,7 +504,7 @@ function App() {
   }
 
   async function requestExportOnly() {
-    if (!videoId || !selection) return;
+    if (browserMode || !videoId || !selection) return;
     setClipActionBusy(true);
     try {
       const response = await fetch("/local-agent/api/exports", {
@@ -479,8 +583,66 @@ function App() {
     seekTo(visibleSegments[next]!.startMs, "cue");
   }
 
+  if (browserMode && (!session?.authenticated || !session.registered)) {
+    return (
+      <main className="shell">
+        <div
+          className="panel"
+          style={{ maxWidth: 650, margin: "5rem auto", padding: 32 }}
+        >
+          <p className="eyebrow">VERA Research · invited access</p>
+          <h1>Research workspace</h1>
+          {sessionIssue && <p role="alert">{sessionIssue}</p>}
+          {!session ? (
+            <button onClick={() => void loadSession()}>Retry connection</button>
+          ) : !session.authenticated ? (
+            <>
+              <p>
+                Sign in using your administrator-invited Cognito account. There
+                is no public signup.
+              </p>
+              <a href="/cloud-api/auth/login">Sign in</a>
+            </>
+          ) : (
+            <>
+              <p>Welcome. Choose a display name to finish your profile.</p>
+              <label htmlFor="onboarding-name">Display name</label>
+              <input
+                id="onboarding-name"
+                maxLength={160}
+                value={displayName}
+                onChange={(event) => setDisplayName(event.target.value)}
+              />
+              <button
+                disabled={sessionBusy || !displayName.trim()}
+                onClick={() => void registerProfile()}
+              >
+                Create profile
+              </button>
+              <button disabled={sessionBusy} onClick={() => void signOut()}>
+                Sign out
+              </button>
+            </>
+          )}
+        </div>
+      </main>
+    );
+  }
   return (
     <main className="shell">
+      {browserMode && session?.authenticated && (
+        <div className="session-panel" role="status">
+          Signed in as {session.user?.displayName ?? "Invited member"}.
+          <button
+            type="button"
+            disabled={sessionBusy}
+            onClick={() => void signOut()}
+          >
+            Sign out
+          </button>
+          {sessionIssue && <p role="alert">{sessionIssue}</p>}
+        </div>
+      )}
       <header className="topbar">
         <div>
           <p className="eyebrow">Research video workspace</p>
@@ -994,10 +1156,18 @@ function App() {
                 </button>
                 <button
                   type="button"
-                  disabled={clipActionBusy || Boolean(exportOnlyRequestId)}
+                  disabled={
+                    browserMode ||
+                    clipActionBusy ||
+                    Boolean(exportOnlyRequestId)
+                  }
                   onClick={() => void requestExportOnly()}
                 >
-                  {exportOnlyRequestId ? "Export-only queued" : "Export only"}
+                  {browserMode
+                    ? "Local export unavailable in browser"
+                    : exportOnlyRequestId
+                      ? "Export-only queued"
+                      : "Export only"}
                 </button>
                 <button type="button" onClick={() => void copySelectionText()}>
                   Copy
@@ -1027,8 +1197,11 @@ function App() {
       </section>
       <BatchWorkspace
         authorization={authorization}
+        browserSession={browserMode}
+        csrfToken={csrfToken}
+        onAuthUnavailable={loseSession}
         onAuthorizationChange={(value) => {
-          setAuthorization(value);
+          setDevAuthorization(value);
           setProjects([]);
           setProjectId("");
           setProjectMessage(undefined);

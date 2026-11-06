@@ -1,6 +1,10 @@
 import { createHash, randomUUID } from "node:crypto";
 
-import { AuthorizationError, requirePermission } from "@research-video/auth";
+import {
+  AuthenticationError,
+  AuthorizationError,
+  requirePermission,
+} from "@research-video/auth";
 import type { SqlDatabase } from "@research-video/db-cloud";
 import {
   ActiveTranscriptBundleSchema,
@@ -138,6 +142,29 @@ export class SharedProjectCatalog {
       [actor.userId, actor.externalSubject, displayName.trim(), now],
     );
     return mapUser(result.rows[0]);
+  }
+
+  /** Only call from a server-verified Cognito session, never with HTTP-supplied identity. */
+  async findUserByVerifiedSubject(subject: string): Promise<User | undefined> {
+    const result = await this.database.query<DbRow>(
+      "SELECT id, external_subject, display_name, created_at, updated_at FROM users WHERE external_subject = $1",
+      [subject],
+    );
+    return result.rows[0] ? mapUser(result.rows[0]) : undefined;
+  }
+
+  async registerVerifiedSubject(
+    subject: string,
+    displayName: string,
+  ): Promise<User> {
+    if (!subject.startsWith("cognito:"))
+      throw new AuthenticationError("A verified Cognito identity is required.");
+    // The conflict target is the stable provider subject, and RETURNING yields
+    // the canonical stored UUID even when two browsers register concurrently.
+    return this.registerUser(
+      { userId: randomUUID(), externalSubject: subject },
+      displayName,
+    );
   }
 
   async createProject(

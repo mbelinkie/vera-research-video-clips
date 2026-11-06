@@ -29,7 +29,7 @@
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "fixture:media": "node --import tsx scripts/generate-media-fixture.ts",
-    "test": "vitest run --exclude tests/e2e/**",
+    "test": "vitest run --maxWorkers=1 --exclude 'tests/e2e/**'",
     "test:aws:s3": "vitest run tests/integration/shared-transcript-store.aws.test.ts",
     "test:e2e": "playwright test",
     "test:watch": "vitest",
