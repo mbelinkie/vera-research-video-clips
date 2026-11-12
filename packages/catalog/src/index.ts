@@ -1,7 +1,12 @@
 import { createHash, randomUUID } from "node:crypto";
 
-import type { PGlite, Transaction } from "@electric-sql/pglite";
-import { AuthorizationError, requirePermission } from "@research-video/auth";
+import type { PGlite } from "@electric-sql/pglite";
+import {
+  AuthenticationError,
+  AuthorizationError,
+  requirePermission,
+} from "@research-video/auth";
+import type { SqlDatabase } from "@research-video/db-cloud";
 import {
   ActiveTranscriptBundleSchema,
   BatchPreflightSummarySchema,
@@ -120,7 +125,7 @@ const loggedExportRequestSelect = `SELECT er.*, j.state
 
 export class SharedProjectCatalog {
   constructor(
-    private readonly database: PGlite,
+    private readonly database: SqlDatabase,
     private readonly store: TranscriptObjectStore,
     private readonly now: () => Date = () => new Date(),
     private readonly uploadUrlIssuer: StagedUploadUrlIssuer = new MemoryStagedUploadUrlIssuer(),
@@ -140,6 +145,29 @@ export class SharedProjectCatalog {
       [actor.userId, actor.externalSubject, displayName.trim(), now],
     );
     return mapUser(result.rows[0]);
+  }
+
+  /** Only call from a server-verified Cognito session, never with HTTP-supplied identity. */
+  async findUserByVerifiedSubject(subject: string): Promise<User | undefined> {
+    const result = await this.database.query<DbRow>(
+      "SELECT id, external_subject, display_name, created_at, updated_at FROM users WHERE external_subject = $1",
+      [subject],
+    );
+    return result.rows[0] ? mapUser(result.rows[0]) : undefined;
+  }
+
+  async registerVerifiedSubject(
+    subject: string,
+    displayName: string,
+  ): Promise<User> {
+    if (!subject.startsWith("cognito:"))
+      throw new AuthenticationError("A verified Cognito identity is required.");
+    // The conflict target is the stable provider subject, and RETURNING yields
+    // the canonical stored UUID even when two browsers register concurrently.
+    return this.registerUser(
+      { userId: randomUUID(), externalSubject: subject },
+      displayName,
+    );
   }
 
   async createProject(
@@ -1299,8 +1327,7 @@ export class SharedProjectCatalog {
     await this.requireRegistered(actor);
     const claimedAt = this.now();
     const expiresAt = new Date(claimedAt.getTime() + leaseSeconds * 1_000);
-    await this.database.exec("BEGIN");
-    try {
+    return this.transaction(async () => {
       const candidate = await this.database.query<DbRow>(
         `SELECT j.*
          FROM jobs j
@@ -1339,7 +1366,6 @@ export class SharedProjectCatalog {
       );
       const row = candidate.rows[0];
       if (!row) {
-        await this.database.exec("COMMIT");
         return undefined;
       }
       const attempt = Number(row.attempt) + 1;
@@ -1374,7 +1400,6 @@ export class SharedProjectCatalog {
          WHERE job_id = $3 AND state NOT IN ('ready_for_review', 'canceled')`,
         [attempt, claimedAt.toISOString(), row.id],
       );
-      await this.database.exec("COMMIT");
       return ClaimedTranscriptionJobSchema.parse({
         job: mapJob({
           ...row,
@@ -1391,10 +1416,7 @@ export class SharedProjectCatalog {
           expiresAt: expiresAt.toISOString(),
         },
       });
-    } catch (error) {
-      await this.database.exec("ROLLBACK");
-      throw error;
-    }
+    });
   }
 
   async heartbeatTranscriptionJob(
@@ -2155,9 +2177,9 @@ export class SharedProjectCatalog {
   private async memberWrite(
     actor: AuthenticatedActor,
     projectId: string,
-    action: (tx: Pick<Transaction, "query">) => Promise<void>,
+    action: (tx: Pick<SqlDatabase, "query">) => Promise<void>,
   ): Promise<void> {
-    await this.database.transaction(async (tx) => {
+    const lockedMutation = async (tx: Pick<SqlDatabase, "query">) => {
       const lockedProject = await tx.query(
         "SELECT id FROM projects WHERE id = $1 FOR UPDATE",
         [projectId],
@@ -2178,7 +2200,21 @@ export class SharedProjectCatalog {
       );
       requirePermission(membership.rows[0]?.role, "manage_members");
       await action(tx);
-    });
+    };
+
+    // #50's PostgreSQL adapter leases one client for the entire callback;
+    // every query here must use that same connection. Embedded PGlite has a
+    // different transaction API: its callback receives the transactional
+    // query handle and querying the original database would deadlock.
+    if (this.database.withTransaction) {
+      await this.database.withTransaction(() => lockedMutation(this.database));
+    } else {
+      const embedded = this.database as PGlite;
+      if (typeof embedded.transaction !== "function") {
+        throw new Error("Membership writes require transactional database support.");
+      }
+      await embedded.transaction(async (tx) => lockedMutation(tx));
+    }
   }
 
   private async authorize(
@@ -2194,11 +2230,16 @@ export class SharedProjectCatalog {
     requirePermission(result.rows[0]?.role, permission);
   }
 
-  private async transaction(action: () => Promise<void>) {
+  private async transaction<T>(action: () => Promise<T>): Promise<T> {
+    if (this.database.withTransaction) {
+      return this.database.withTransaction(action);
+    }
+    // PGlite is retained for single-process development/fast tests only.
     await this.database.exec("BEGIN");
     try {
-      await action();
+      const result = await action();
       await this.database.exec("COMMIT");
+      return result;
     } catch (error) {
       await this.database.exec("ROLLBACK");
       throw error;

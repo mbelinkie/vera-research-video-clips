@@ -1,3 +1,4 @@
+import { cloudFetch } from "./browser-api.ts";
 import { useEffect, useMemo, useState } from "react";
 
 import {
@@ -12,6 +13,7 @@ type ClipQueueProps = {
   authorization: string;
   projectId: string;
   request: CloudRequest;
+  onAuthUnavailable?: (() => void) | undefined;
   onOpenVideo(canonicalUrl: string): void;
 };
 
@@ -19,6 +21,7 @@ export function ClipQueue({
   authorization,
   projectId,
   request,
+  onAuthUnavailable,
   onOpenVideo,
 }: ClipQueueProps) {
   const [clips, setClips] = useState<ClipCandidate[]>([]);
@@ -128,9 +131,10 @@ export function ClipQueue({
   async function downloadCsv() {
     setBusy(true);
     try {
-      const response = await fetch(
+      const response = await cloudFetch(
         `/cloud-api/api/projects/${projectId}/clips.csv`,
-        { headers: { authorization } },
+        { headers: {} },
+        { authorization, onUnavailable: onAuthUnavailable },
       );
       if (!response.ok) throw new Error("Unable to export the project CSV.");
       const blob = await response.blob();

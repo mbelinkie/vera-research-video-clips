@@ -104,4 +104,111 @@ describe("configuration", () => {
     expect(() => loadConfig({ WORKER_CONCURRENCY: "9" })).toThrow();
     expect(() => loadConfig({ WORKER_LEASE_SECONDS: "10" })).toThrow();
   });
+
+  it("rejects every incomplete or exposed Mac pilot mode", () => {
+    const valid = {
+      VERA_RUNTIME_MODE: "mac-pilot",
+      DATABASE_MODE: "postgres",
+      OBJECT_STORE_MODE: "local",
+      PILOT_PG_URL:
+        "postgresql://test:somepassword@127.0.0.1:5432/vera50_test_config",
+      PILOT_OBJECT_ROOT: "/tmp/vera50-test-objects",
+      LOCAL_UPLOAD_SIGNING_SECRET: "not-a-real-secret-32-characters-long",
+    };
+    expect(loadConfig(valid).runtimeMode).toBe("mac-pilot");
+    for (const [key, value] of Object.entries({
+      CLOUD_API_HOST: "0.0.0.0",
+      OBJECT_STORE_MODE: "memory",
+      DATABASE_MODE: "pglite",
+      PILOT_PG_URL: "postgresql://test:pass@remote.example/vera",
+      PILOT_OBJECT_ROOT: "relative-root",
+      LOCAL_UPLOAD_SIGNING_SECRET: "weak",
+    })) {
+      expect(() => loadConfig({ ...valid, [key]: value })).toThrow();
+    }
+    expect(() => loadConfig({ ...valid, PILOT_PG_URL: undefined })).toThrow();
+    expect(() =>
+      loadConfig({ ...valid, LOCAL_UPLOAD_SIGNING_SECRET: undefined }),
+    ).toThrow();
+    expect(loadConfig({ NODE_ENV: "test" }).databaseMode).toBe("pglite");
+    expect(() => loadConfig({ NODE_ENV: "production" })).toThrow(
+      "Production configuration must explicitly select a durable runtime",
+    );
+  });
+});
+
+describe("browser BFF configuration boundary", () => {
+  const valid = {
+    NODE_ENV: "production",
+    // A production browser BFF also needs the durable, loopback Mac-pilot
+    // foundation; neither PR's safety prerequisites can be optional.
+    VERA_RUNTIME_MODE: "mac-pilot",
+    DATABASE_MODE: "postgres",
+    OBJECT_STORE_MODE: "local",
+    PILOT_PG_URL:
+      "postgresql://test:somepassword@127.0.0.1:5432/vera50_test_config",
+    PILOT_OBJECT_ROOT: "/tmp/vera50-test-objects",
+    LOCAL_UPLOAD_SIGNING_SECRET: "not-a-real-secret-32-characters-long",
+    CLOUD_AUTH_MODE: "browser",
+    CLOUD_API_HOST: "127.0.0.1",
+    BROWSER_PUBLIC_ORIGIN: "https://research.example",
+    BROWSER_CALLBACK_URL: "https://research.example/cloud-api/auth/callback",
+    BROWSER_LOGOUT_URL: "https://research.example/",
+    COGNITO_ISSUER:
+      "https://cognito-idp.us-east-1.amazonaws.com/us-east-1_Example",
+    COGNITO_DOMAIN: "https://vera.auth.us-east-1.amazoncognito.com",
+    COGNITO_CLIENT_ID: "test-client",
+    COGNITO_CLIENT_SECRET: "test-only-not-real",
+  };
+  it("requires explicit browser auth for production", () => {
+    expect(() => loadConfig({ NODE_ENV: "production" })).toThrow(
+      "Production cloud API requires browser BFF mode",
+    );
+    expect(() => loadConfig(valid)).not.toThrow();
+    expect(() =>
+      loadConfig({ ...valid, VERA_RUNTIME_MODE: "development" }),
+    ).toThrow(
+      "Production configuration must explicitly select a durable runtime",
+    );
+    expect(() =>
+      loadConfig({ ...valid, CLOUD_AUTH_MODE: "development" }),
+    ).toThrow("Production cloud API requires browser BFF mode");
+  });
+  it("rejects public dev bearer and untrusted browser ingress", () => {
+    expect(() => loadConfig({ CLOUD_API_HOST: "0.0.0.0" })).toThrow(
+      "Development bearer API must bind to loopback",
+    );
+    expect(() => loadConfig({ ...valid, CLOUD_API_HOST: "0.0.0.0" })).toThrow(
+      "Browser BFF must be behind a local TLS ingress",
+    );
+    expect(() =>
+      loadConfig({ ...valid, TRUSTED_PROXY_PEERS: "10.0.0.1" }),
+    ).toThrow();
+  });
+  it("rejects incomplete, http or nonexact HTTPS public origin/callback", () => {
+    expect(() =>
+      loadConfig({ ...valid, COGNITO_CLIENT_SECRET: undefined }),
+    ).toThrow("COGNITO_CLIENT_SECRET");
+    expect(() =>
+      loadConfig({
+        ...valid,
+        BROWSER_PUBLIC_ORIGIN: "http://research.example",
+      }),
+    ).toThrow();
+    expect(() =>
+      loadConfig({
+        ...valid,
+        BROWSER_PUBLIC_ORIGIN: "https://research.example/path",
+      }),
+    ).toThrow();
+    expect(() =>
+      loadConfig({
+        ...valid,
+        BROWSER_CALLBACK_URL: "https://evil.example/callback",
+      }),
+    ).toThrow();
+    expect(() =>
+      loadConfig({ ...valid, BROWSER_SESSION_IDLE_MS: "999999999" }),
+    ).toThrow();
+  });
 });
