@@ -78,6 +78,182 @@ test("rejects a non-YouTube URL without replacing the workspace", async ({
   ).toBeVisible();
 });
 
+test("timed auto-caption fixture seeks exact starts and retains derived-end selection through queue and export", async ({
+  page,
+}) => {
+  const projectId = "019fbb95-cd76-7920-93fa-e23ba755ee40";
+  const now = "2026-08-01T12:00:00.000Z";
+  let loggedSelection: Record<string, unknown> | undefined;
+  let exportedSelection: Record<string, unknown> | undefined;
+  let loggedExportRequests = 0;
+  await page.route("**/cloud-api/api/projects**", async (route) => {
+    const path = new URL(route.request().url()).pathname;
+    if (path === "/cloud-api/api/projects") {
+      return route.fulfill({
+        json: [
+          {
+            id: projectId,
+            name: "Caption evidence",
+            description: "",
+            version: 1,
+            createdAt: now,
+            updatedAt: now,
+          },
+        ],
+      });
+    }
+    if (
+      path === `/cloud-api/api/projects/${projectId}/clips` &&
+      route.request().method() === "POST"
+    ) {
+      const body = route.request().postDataJSON();
+      loggedSelection = body.selection;
+      return route.fulfill({
+        status: 201,
+        json: {
+          id: "019fbb95-cd76-7920-93fa-e23ba755ee42",
+          projectId,
+          catalogVideoId: "019fbb95-cd76-7920-93fa-e23ba755ee43",
+          video: body.video,
+          selection: body.selection,
+          englishText: body.englishText,
+          notes: body.notes,
+          tags: body.tags,
+          researchStatus: "candidate",
+          exportStatus: "not_requested",
+          createdBy: "019fbb95-cd76-7920-93fa-e23ba755ee36",
+          version: 1,
+          createdAt: now,
+          updatedAt: now,
+        },
+      });
+    }
+    if (path.endsWith("/exports") && route.request().method() === "POST") {
+      loggedExportRequests += 1;
+      const body = route.request().postDataJSON();
+      return route.fulfill({
+        status: 201,
+        json: {
+          id: "019fbb95-cd76-7920-93fa-e23ba755ee44",
+          jobId: "019fbb95-cd76-7920-93fa-e23ba755ee45",
+          mode: "logged",
+          projectId,
+          clipId: "019fbb95-cd76-7920-93fa-e23ba755ee42",
+          video: {
+            youtubeVideoId: "M7lc1UVf-VE",
+            canonicalUrl: "https://www.youtube.com/watch?v=M7lc1UVf-VE",
+            title: "YouTube IFrame API demo",
+          },
+          selection: loggedSelection,
+          sourceLanguageClass: body.sourceLanguageClass,
+          preset: body.preset,
+          state: "queued",
+          createdAt: now,
+          updatedAt: now,
+        },
+      });
+    }
+    if (path.endsWith("/transcription-batches"))
+      return route.fulfill({ json: { batches: [] } });
+    if (path.endsWith("/review-inbox"))
+      return route.fulfill({ json: { items: [] } });
+    if (path.endsWith("/clips")) return route.fulfill({ json: [] });
+    if (path.endsWith("/clip-tags")) return route.fulfill({ json: [] });
+    return route.fulfill({ status: 404, json: { error: "not found" } });
+  });
+  await page.route("**/local-agent/api/exports", async (route) => {
+    const body = route.request().postDataJSON();
+    exportedSelection = body.selection;
+    return route.fulfill({
+      status: 201,
+      json: {
+        id: "019fbb95-cd76-7920-93fa-e23ba755ee46",
+        jobId: "019fbb95-cd76-7920-93fa-e23ba755ee47",
+        mode: "export_only",
+        video: body.video,
+        selection: body.selection,
+        sourceLanguageClass: body.sourceLanguageClass,
+        preset: body.preset,
+        state: "queued",
+        createdAt: now,
+        updatedAt: now,
+      },
+    });
+  });
+  await page.goto("/?fixture=auto-word-timed");
+  await page.getByRole("button", { name: "Load video" }).click();
+  await expect(
+    page.getByText("Exact caption word starts · derived ends (estimates)"),
+  ).toBeVisible();
+  await expect(page.getByText(/Timed auto-caption test fixture/)).toBeVisible();
+  await expect(page.getByRole("button", { name: "closely" })).toHaveAttribute(
+    "title",
+    "Exact caption word start 11.840s; derived end (estimate) 12.030s",
+  );
+  await page.getByRole("button", { name: "closely" }).click();
+  await expect(
+    page.getByText(/Exact caption start requested 11.840s/),
+  ).toBeVisible();
+  await expect
+    .poll(() => page.evaluate(() => Reflect.get(window, "__lastSeekSeconds")))
+    .toBe(11.84);
+
+  await page.evaluate(() => {
+    const words = Array.from(
+      document.querySelectorAll<HTMLElement>("[data-transcript-token-id]"),
+    );
+    const anchor = words.find((word) => word.textContent === "closely");
+    const focus = words.find((word) => word.textContent === "please");
+    if (!anchor?.firstChild || !focus?.firstChild || !focus.textContent)
+      throw new Error("Missing timed-caption words");
+    const range = document.createRange();
+    range.setStart(anchor.firstChild, 0);
+    range.setEnd(focus.firstChild, focus.textContent.length);
+    window.getSelection()?.removeAllRanges();
+    window.getSelection()?.addRange(range);
+    focus.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+  });
+  const panel = page.getByLabel("Clip selection");
+  await expect(panel).toContainText("closely now please");
+  await expect(panel).toContainText(
+    "Exact caption start · derived end (estimate)",
+  );
+  await expect(panel).toContainText("Transcript selection: 11.840s–13.100s");
+  await expect(page.getByLabel("Export start (seconds)")).toHaveValue("11.840");
+  await expect(page.getByLabel("Export end (seconds)")).toHaveValue("13.100");
+  await page.getByRole("button", { name: "Loop preview" }).click();
+  await expect
+    .poll(() => page.evaluate(() => Reflect.get(window, "__lastSeekSeconds")))
+    .toBe(11.84);
+  await page.getByRole("button", { name: "Stop preview" }).click();
+  await page.getByRole("button", { name: "Add 0.5s handles" }).click();
+  await expect(page.getByLabel("Export start (seconds)")).toHaveValue("11.340");
+  await expect(page.getByLabel("Export end (seconds)")).toHaveValue("13.600");
+  await page
+    .getByLabel("Development session credential")
+    .fill("Bearer 019fbb95-cd76-7920-93fa-e23ba755ee36|fixture:web");
+  await page.getByRole("button", { name: "Connect" }).click();
+  await expect(page.getByLabel("Logging project")).toHaveValue(projectId);
+  await page.getByRole("button", { name: "Queue / log only" }).click();
+  await expect(panel).toContainText(
+    "Logged to Caption evidence. No export was requested.",
+  );
+  expect(loggedSelection).toMatchObject({
+    transcriptStartMs: 11_840,
+    transcriptEndMs: 13_100,
+    exportStartMs: 11_340,
+    exportEndMs: 13_600,
+    timingPrecision: "estimated",
+    endTiming: "derived",
+  });
+  await page.getByRole("button", { name: "Export + log" }).click();
+  await expect(panel).toContainText("queued an export");
+  expect(loggedExportRequests).toBe(1);
+  await page.getByRole("button", { name: "Export only" }).click();
+  await expect(panel).toContainText("Queued a local export-only job");
+  expect(exportedSelection).toEqual(loggedSelection);
+});
+
 test("maps transcript text selection to stable source and export bounds", async ({
   page,
 }) => {

@@ -22,15 +22,23 @@ import {
   updateTranscriptSelectionExportBounds,
 } from "@research-video/transcript";
 import transcriptFixture from "../../../tests/fixtures/transcripts/english-word.json" with { type: "json" };
+import autoWordTimedFixture from "../../../tests/fixtures/transcripts/auto-word-timed.json" with { type: "json" };
 
 import "./styles.css";
 import { BatchWorkspace } from "./batch-workspace.tsx";
 import { browserMode, cloudFetch, type BrowserSession } from "./browser-api.ts";
 import { YouTubePlayer, type YouTubePlayerHandle } from "./youtube-player.tsx";
-import { VirtualTranscript } from "./virtual-transcript.tsx";
+import {
+  VirtualTranscript,
+  type TranscriptSeekPrecision,
+} from "./virtual-transcript.tsx";
 
 const demoVideoId = "M7lc1UVf-VE";
 const demoUrl = `https://www.youtube.com/watch?v=${demoVideoId}`;
+// Explicit fixture-only route for deterministic browser acceptance, not live YouTube ingestion.
+const timedCaptionDemo =
+  new URLSearchParams(window.location.search).get("fixture") ===
+  "auto-word-timed";
 
 function formatTime(milliseconds: number) {
   const totalSeconds = Math.floor(milliseconds / 1_000);
@@ -190,11 +198,15 @@ function App() {
   const playerRef = useRef<YouTubePlayerHandle>(null);
   const transcript = useMemo(() => {
     if (videoId !== demoVideoId) return undefined;
+    const fixture = timedCaptionDemo ? autoWordTimedFixture : transcriptFixture;
     return normalizeTranscriptFixture({
-      ...transcriptFixture,
-      track: { ...transcriptFixture.track, videoId: demoVideoId },
+      ...fixture,
+      track: { ...fixture.track, videoId: demoVideoId },
     });
   }, [videoId]);
+  const hasDerivedCaptionEnds =
+    transcript?.track.source === "youtube-auto" &&
+    transcript.tokens.some((token) => token.endTiming === "derived");
   const visibleSegments = useMemo(
     () => searchTranscript(transcript?.segments ?? [], query),
     [query, transcript],
@@ -563,16 +575,15 @@ function App() {
     }
   }
 
-  function seekTo(startMs: number, precision: "word" | "cue" = "cue") {
+  function seekTo(startMs: number, precision: TranscriptSeekPrecision = "cue") {
     playerRef.current?.seekTo(startMs);
     setCurrentMs(startMs);
     setLastSeekMs(startMs);
     setLastSeekPrecision(precision);
   }
 
-  const [lastSeekPrecision, setLastSeekPrecision] = useState<"word" | "cue">(
-    "cue",
-  );
+  const [lastSeekPrecision, setLastSeekPrecision] =
+    useState<TranscriptSeekPrecision>("cue");
 
   function moveMatch(direction: 1 | -1) {
     if (visibleSegments.length === 0) return;
@@ -681,7 +692,9 @@ function App() {
               <span>English transcript</span>
               {transcript ? (
                 <span className="precision">
-                  {transcript.track.timingPrecision} timing
+                  {hasDerivedCaptionEnds
+                    ? "Exact caption word starts · derived ends (estimates)"
+                    : `${transcript.track.timingPrecision} timing`}
                 </span>
               ) : null}
             </div>
@@ -698,8 +711,9 @@ function App() {
           {transcript ? (
             <>
               <div className="fixture-warning">
-                Navigation fixture for the API demo—not a transcript of the
-                video.
+                {timedCaptionDemo
+                  ? "Timed auto-caption test fixture—not the video's transcript or an acoustic alignment."
+                  : "Navigation fixture for the API demo—not a transcript of the video."}
               </div>
               <div className="search-field">
                 <label htmlFor="transcript-search">Search transcript</label>
@@ -797,7 +811,9 @@ function App() {
             <p className="muted">
               {lastSeekMs === undefined
                 ? "Click a timed word or cue to seek."
-                : `${lastSeekPrecision === "word" ? "Word" : "Cue"} requested ${formatTime(lastSeekMs)}.`}
+                : lastSeekPrecision === "caption-start"
+                  ? `Exact caption start requested ${formatPreciseTime(lastSeekMs)}; word end is derived (estimate).`
+                  : `${lastSeekPrecision === "word" ? "Word" : "Cue"} requested ${formatTime(lastSeekMs)}.`}
             </p>
           </div>
           {selection ? (
@@ -805,7 +821,11 @@ function App() {
               <div className="selection-heading">
                 <div>
                   <p className="eyebrow">Selected passage</p>
-                  <strong>{selection.timingPrecision} bounds</strong>
+                  <strong>
+                    {selection.endTiming === "derived"
+                      ? "Exact caption start · derived end (estimate)"
+                      : `${selection.timingPrecision} bounds`}
+                  </strong>
                 </div>
                 <button
                   type="button"
@@ -921,6 +941,9 @@ function App() {
                 Transcript selection:{" "}
                 {formatPreciseTime(selection.transcriptStartMs)}–
                 {formatPreciseTime(selection.transcriptEndMs)}
+                {selection.endTiming === "derived"
+                  ? " (source-reported word start; last-word end derived, not exact)"
+                  : null}
               </p>
               <div className="export-bounds">
                 <label>

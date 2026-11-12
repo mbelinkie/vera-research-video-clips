@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -24,7 +25,11 @@ import {
   SharedTranscriptWorkspaceService,
   VerifiedTranscriptCache,
 } from "@research-video/sync";
-import { normalizeTranscriptFixture } from "@research-video/transcript";
+import {
+  deriveTranscriptSelection,
+  normalizeTranscriptFixture,
+  normalizeWebVttCaption,
+} from "@research-video/transcript";
 import { afterEach, describe, expect, it } from "vitest";
 import wordFixture from "../fixtures/transcripts/english-word.json" with { type: "json" };
 
@@ -49,7 +54,9 @@ const actor = (name: string): AuthenticatedActor => ({
 });
 
 describe("shared transcript store", () => {
-  it("publishes on workstation A and reuses a pinned, verified bundle on workstation B", async () => {
+  async function verifyPublishedTranscript(
+    fixtureKind: "word" | "auto-caption",
+  ) {
     const cloud = new PGlite();
     databases.add(cloud);
     await runCloudMigrations(cloud);
@@ -82,10 +89,24 @@ describe("shared transcript store", () => {
       version: 1,
       artifactTypes: ["english-normalized", "english-srt"],
     });
-    const normalizedTranscript = normalizeTranscriptFixture({
-      ...wordFixture,
-      track: { ...wordFixture.track, videoId: video.youtubeVideoId },
-    });
+    const normalizedTranscript =
+      fixtureKind === "auto-caption"
+        ? await normalizeWebVttCaption({
+            contents: await readFile(
+              new URL(
+                "../fixtures/transcripts/auto-word-timed.vtt",
+                import.meta.url,
+              ),
+            ),
+            videoId: video.youtubeVideoId,
+            language: "en",
+            source: "youtube-auto",
+            provider: "fixture",
+          })
+        : normalizeTranscriptFixture({
+            ...wordFixture,
+            track: { ...wordFixture.track, videoId: video.youtubeVideoId },
+          });
     const normalizedBytes = new TextEncoder().encode(
       JSON.stringify(normalizedTranscript),
     );
@@ -121,9 +142,9 @@ describe("shared transcript store", () => {
       version: 1,
       sourceLanguage: "en",
       targetLanguage: "en",
-      timingPrecision: "word",
+      timingPrecision: normalizedTranscript.track.timingPrecision,
       provider: "fixture",
-      normalizationSchemaVersion: 1,
+      normalizationSchemaVersion: normalizedTranscript.track.schemaVersion,
       jobId: grant.jobId,
       createdBy: assistant.userId,
       createdAt: new Date().toISOString(),
@@ -217,7 +238,34 @@ describe("shared transcript store", () => {
     );
     const cachePath = firstResolution.cachePath;
     expect(firstResolution.source).toBe("shared-store");
-    expect(firstResolution.transcript.track.timingPrecision).toBe("word");
+    expect(firstResolution.transcript.track.timingPrecision).toBe(
+      normalizedTranscript.track.timingPrecision,
+    );
+    if (fixtureKind === "auto-caption") {
+      expect(firstResolution.transcript.tokens[1]).toMatchObject({
+        text: "closely",
+        startMs: 11_840,
+        endMs: 12_030,
+        endTiming: "derived",
+      });
+      const selected = deriveTranscriptSelection({
+        transcript: firstResolution.transcript,
+        anchor: {
+          segmentId: firstResolution.transcript.segments[0]!.id,
+          tokenId: firstResolution.transcript.tokens[1]!.id,
+        },
+        focus: {
+          segmentId: firstResolution.transcript.segments[0]!.id,
+          tokenId: firstResolution.transcript.tokens[3]!.id,
+        },
+      });
+      expect(selected).toMatchObject({
+        transcriptStartMs: 11_840,
+        transcriptEndMs: 13_100,
+        timingPrecision: "estimated",
+        endTiming: "derived",
+      });
+    }
     expect(existsSync(join(cachePath, "manifest.json"))).toBe(true);
     expect(existsSync(join(cachePath, "english-normalized.json"))).toBe(true);
     const downloadsAfterPromotion = downloadCount;
@@ -227,6 +275,13 @@ describe("shared transcript store", () => {
     );
     expect(secondResolution.source).toBe("verified-local-cache");
     expect(secondResolution.cachePath).toBe(cachePath);
+    if (fixtureKind === "auto-caption") {
+      expect(secondResolution.transcript.tokens[1]).toMatchObject({
+        startMs: 11_840,
+        endMs: 12_030,
+        endTiming: "derived",
+      });
+    }
     expect(downloadCount).toBe(downloadsAfterPromotion);
     const cacheRow = localDatabase
       .prepare(
@@ -239,5 +294,10 @@ describe("shared transcript store", () => {
     await expect(
       catalog.getActiveTranscript(outsider, project.id, video.id),
     ).rejects.toBeInstanceOf(AuthorizationError);
-  });
+  }
+
+  it.each(["word", "auto-caption"] as const)(
+    "publishes %s transcript on workstation A and reuses a pinned, verified bundle on workstation B",
+    verifyPublishedTranscript,
+  );
 });

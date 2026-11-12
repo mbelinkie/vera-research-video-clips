@@ -1,4 +1,4 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -18,6 +18,7 @@ import {
   normalizeAcquiredCaption,
   type CommandRunner,
 } from "./captions-local.ts";
+import timedBrowserFixture from "../../../tests/fixtures/transcripts/auto-word-timed.json" with { type: "json" };
 
 describe("normalizeYouTubeUrl", () => {
   it.each([
@@ -195,6 +196,73 @@ describe("YtDlpCaptionProvider", () => {
         },
         segments: [{ startMs: 0, endMs: 1_000, text: "Hola" }],
       });
+    } finally {
+      await rm(scratch, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps YouTube automatic-caption inline starts and derived ends through VTT acquisition", async () => {
+    const scratch = await mkdtemp(join(tmpdir(), "caption-auto-provider-"));
+    const sourceVtt = await readFile(
+      new URL(
+        "../../../tests/fixtures/transcripts/auto-word-timed.vtt",
+        import.meta.url,
+      ),
+    );
+    const run = vi.fn<CommandRunner["run"]>(async (_executable, args) => {
+      const template = args[args.indexOf("--output") + 1]!;
+      await writeFile(template.replace("%(ext)s", "en.vtt"), sourceVtt);
+      return { stdout: "", stderr: "" };
+    });
+    const provider = new YtDlpCaptionProvider({ runner: { run } });
+    const track = {
+      id: "yt-dlp:automatic:en",
+      language: "en",
+      kind: "automatic" as const,
+      translatable: false,
+      downloadAccess: "available" as const,
+    };
+    try {
+      const acquired = await provider.acquire("M7lc1UVf-VE", track, scratch);
+      expect(run.mock.calls[0]?.[1]).toEqual(
+        expect.arrayContaining([
+          "--write-auto-subs",
+          "--no-write-subs",
+          "--sub-langs",
+          "en",
+          "--sub-format",
+          "vtt",
+          "--skip-download",
+        ]),
+      );
+      const transcript = await normalizeAcquiredCaption(acquired);
+      expect(transcript.track).toMatchObject({
+        source: "youtube-auto",
+        timingPrecision: "estimated",
+        schemaVersion: 2,
+      });
+      expect(transcript.tokens.slice(0, 4)).toMatchObject([
+        { text: "Look", startMs: 11_500, endMs: 11_840, endTiming: "derived" },
+        {
+          text: "closely",
+          startMs: 11_840,
+          endMs: 12_030,
+          endTiming: "derived",
+        },
+        { text: "now", startMs: 12_030, endMs: 12_530, endTiming: "derived" },
+        {
+          text: "please",
+          startMs: 12_900,
+          endMs: 13_100,
+          endTiming: "derived",
+        },
+      ]);
+      // The browser's fixture must remain a faithful output of this exact VTT.
+      expect(transcript).toEqual(timedBrowserFixture);
+      await expect(
+        provider.acquire("M7lc1UVf-VE", track, scratch),
+      ).resolves.toEqual(acquired);
+      expect(run).toHaveBeenCalledTimes(1);
     } finally {
       await rm(scratch, { recursive: true, force: true });
     }

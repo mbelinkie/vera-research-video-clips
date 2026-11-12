@@ -30,6 +30,7 @@ describe("cloud migrations", () => {
       "0006_clip_candidates",
       "0007_logged_export_requests",
       "0008_membership_regrant_versions",
+      "0009_derived_caption_ends",
     ]);
     expect(await runCloudMigrations(database)).toEqual([]);
     const result = await database.query<{ table_name: string }>(
@@ -44,5 +45,9 @@ describe("cloud migrations", () => {
       "SELECT table_name FROM information_schema.tables WHERE table_name = 'revoked_project_member_versions'",
     );
     expect(versionHistory.rows).toHaveLength(1);
+    const provenance = await database.query<{ column_name: string }>(
+      "SELECT column_name FROM information_schema.columns WHERE table_name = 'clip_candidates' AND column_name = 'end_timing'",
+    );
+    expect(provenance.rows).toEqual([{ column_name: "end_timing" }]);
   });
 });

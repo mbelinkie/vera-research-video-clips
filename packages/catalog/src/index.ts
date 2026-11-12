@@ -264,12 +264,12 @@ export class SharedProjectCatalog {
             transcript_track_id, transcript_version, first_segment_id,
             last_segment_id, first_token_id, last_token_id,
             transcript_start_ms, transcript_end_ms, export_start_ms,
-            export_end_ms, timing_precision, english_text, original_text, notes,
+            export_end_ms, timing_precision, end_timing, english_text, original_text, notes,
             research_status, export_status, created_by, version, created_at,
             updated_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
-                 $14, $15, $16, $17, $18, $19, $20, $21, $22, $23,
-                 'candidate', 'not_requested', $24, 1, $25, $25)
+                 $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24,
+                 'candidate', 'not_requested', $25, 1, $26, $26)
          ON CONFLICT (project_id, idempotency_key) DO NOTHING
          RETURNING id`,
         [
@@ -293,6 +293,7 @@ export class SharedProjectCatalog {
           selection.exportStartMs,
           selection.exportEndMs,
           selection.timingPrecision,
+          selection.endTiming ?? null,
           input.englishText,
           input.originalText ?? null,
           input.notes,
@@ -390,6 +391,7 @@ export class SharedProjectCatalog {
       "export_start_ms",
       "export_end_ms",
       "timing_precision",
+      "end_timing",
       "english_text",
       "original_text",
       "notes",
@@ -414,6 +416,7 @@ export class SharedProjectCatalog {
       clip.selection.exportStartMs,
       clip.selection.exportEndMs,
       clip.selection.timingPrecision,
+      clip.selection.endTiming ?? "",
       clip.englishText,
       clip.originalText ?? "",
       clip.notes,
@@ -2313,6 +2316,7 @@ function mapClipCandidate(row: DbRow, tags: string[]): ClipCandidate {
       exportEndMs: Number(row.export_end_ms),
       text: row.english_text,
       timingPrecision: row.timing_precision,
+      ...(row.end_timing ? { endTiming: row.end_timing } : {}),
     },
     englishText: row.english_text,
     ...(row.original_text ? { originalText: row.original_text } : {}),

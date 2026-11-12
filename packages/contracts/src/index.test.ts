@@ -7,6 +7,8 @@ import {
   HealthResponseSchema,
   JobSchema,
   ProjectSchema,
+  TranscriptSelectionSchema,
+  TranscriptTokenSchema,
   RemoveProjectMemberRequestSchema,
   TranscriptionBatchControlRequestSchema,
   TransferProjectOwnershipRequestSchema,
@@ -18,6 +20,70 @@ const now = "2026-08-01T12:00:00.000Z";
 const id = "019fbb95-cd76-7920-93fa-e23ba755ee3f";
 
 describe("shared contracts", () => {
+  it("preserves explicit derived token ends without changing legacy tokens", () => {
+    const token = {
+      id,
+      segmentId: id,
+      ordinal: 0,
+      text: "caption",
+      startMs: 11_840,
+      endMs: 12_020,
+      endTiming: "derived" as const,
+    };
+    expect(TranscriptTokenSchema.parse(token)).toEqual(token);
+    const legacyToken = { id, segmentId: id, ordinal: 0, text: "legacy" };
+    expect(TranscriptTokenSchema.parse(legacyToken)).toEqual(legacyToken);
+    expect(
+      TranscriptTokenSchema.safeParse({ ...token, startMs: undefined }).success,
+    ).toBe(false);
+    expect(
+      TranscriptTokenSchema.safeParse({ ...token, endMs: undefined }).success,
+    ).toBe(false);
+    expect(
+      TranscriptTokenSchema.safeParse({ ...token, endTiming: "exact" }).success,
+    ).toBe(false);
+  });
+
+  it("only labels estimated token selections as having a derived end", () => {
+    const selection = {
+      trackId: id,
+      transcriptVersion: 1,
+      firstSegmentId: id,
+      lastSegmentId: id,
+      firstTokenId: id,
+      lastTokenId: id,
+      transcriptStartMs: 11_840,
+      transcriptEndMs: 12_020,
+      exportStartMs: 11_500,
+      exportEndMs: 12_500,
+      text: "caption",
+      timingPrecision: "estimated" as const,
+      endTiming: "derived" as const,
+    };
+    expect(TranscriptSelectionSchema.parse(selection)).toEqual(selection);
+    const legacySelection = { ...selection };
+    delete (legacySelection as { endTiming?: "derived" }).endTiming;
+    expect(TranscriptSelectionSchema.parse(legacySelection)).toEqual(
+      legacySelection,
+    );
+    expect(
+      TranscriptSelectionSchema.safeParse({
+        ...selection,
+        timingPrecision: "word",
+      }).success,
+    ).toBe(false);
+    expect(
+      TranscriptSelectionSchema.safeParse({
+        ...selection,
+        lastTokenId: undefined,
+      }).success,
+    ).toBe(false);
+    expect(
+      TranscriptSelectionSchema.safeParse({ ...selection, endTiming: "exact" })
+        .success,
+    ).toBe(false);
+  });
+
   it("accepts a versioned project", () => {
     const project = ProjectSchema.parse({
       id,

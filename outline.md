@@ -129,7 +129,7 @@ Milestone 2 completed 2026-08-01. URL normalization, provider-backed metadata pe
 - [x] Preflight metadata, duplicates, unsupported items, and shared transcript hits.
 - [x] Add the caption-discovery candidate contract and deterministic source precedence.
 - [x] Add an opt-in configured caption discovery/acquisition implementation with honest automatic-translation filtering and isolated VTT output.
-- [x] Normalize acquired WebVTT into deterministic canonical cue-timed tracks without inventing word timing.
+- [x] Normalize acquired WebVTT into deterministic canonical tracks: preserve unambiguous YouTube automatic-caption word starts and label their derived ends; manual and translated captions remain cue timed.
 - [x] Add a provider-neutral, time-linked translation adapter with an opt-in Amazon Translate implementation.
 - [x] Add opt-in authorized audio acquisition and multilingual speech-to-text adapters.
 - [ ] Add an alignment adapter for sources requiring timing refinement.

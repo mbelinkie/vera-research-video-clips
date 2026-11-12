@@ -10,6 +10,8 @@ import type { TranscriptSelectionBoundary } from "@research-video/transcript";
 const rowHeight = 76;
 const viewportHeight = 500;
 
+export type TranscriptSeekPrecision = "word" | "cue" | "caption-start";
+
 type VirtualTranscriptProps = {
   segments: readonly TranscriptSegment[];
   tokens: readonly TranscriptToken[];
@@ -18,7 +20,7 @@ type VirtualTranscriptProps = {
   selectedTokenIds?: ReadonlySet<string>;
   follow: boolean;
   onFollowSuspended(): void;
-  onSeek(milliseconds: number, precision: "word" | "cue"): void;
+  onSeek(milliseconds: number, precision: TranscriptSeekPrecision): void;
   onSelect(
     anchor: TranscriptSelectionBoundary,
     focus: TranscriptSelectionBoundary,
@@ -138,13 +140,19 @@ export function VirtualTranscript({
                           title={
                             token.startMs === undefined
                               ? "Cue-level timing"
-                              : `Word timing ${formatTime(token.startMs)}`
+                              : token.endTiming === "derived"
+                                ? `Exact caption word start ${(token.startMs / 1_000).toFixed(3)}s; derived end (estimate) ${(token.endMs! / 1_000).toFixed(3)}s`
+                                : `Word timing ${(token.startMs / 1_000).toFixed(3)}s`
                           }
                           onClick={() => {
                             if (!window.getSelection()?.isCollapsed) return;
                             onSeek(
                               token.startMs ?? segment.startMs,
-                              token.startMs === undefined ? "cue" : "word",
+                              token.startMs === undefined
+                                ? "cue"
+                                : token.endTiming === "derived"
+                                  ? "caption-start"
+                                  : "word",
                             );
                           }}
                           onKeyDown={(event) => {
@@ -153,7 +161,11 @@ export function VirtualTranscript({
                             event.preventDefault();
                             onSeek(
                               token.startMs ?? segment.startMs,
-                              token.startMs === undefined ? "cue" : "word",
+                              token.startMs === undefined
+                                ? "cue"
+                                : token.endTiming === "derived"
+                                  ? "caption-start"
+                                  : "word",
                             );
                           }}
                         >

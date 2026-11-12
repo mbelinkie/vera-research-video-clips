@@ -207,6 +207,143 @@ async function membershipFixture() {
   return { database, catalog, register, owner, project, member, ownerCount };
 }
 
+describe("derived caption provenance through the cloud catalog", () => {
+  it("retains it in candidate reads, CSV, and a durable logged export snapshot", async () => {
+    const f = await membershipFixture();
+    const trackId = randomUUID();
+    const firstSegmentId = randomUUID();
+    const lastSegmentId = randomUUID();
+    const firstTokenId = randomUUID();
+    const lastTokenId = randomUUID();
+    const selection = {
+      trackId,
+      transcriptVersion: 2,
+      firstSegmentId,
+      lastSegmentId,
+      firstTokenId,
+      lastTokenId,
+      transcriptStartMs: 11_840,
+      transcriptEndMs: 13_100,
+      exportStartMs: 11_500,
+      exportEndMs: 13_500,
+      text: "closely now please",
+      timingPrecision: "estimated" as const,
+      endTiming: "derived" as const,
+    };
+    const video = {
+      youtubeVideoId: "M7lc1UVf-VE",
+      canonicalUrl: "https://www.youtube.com/watch?v=M7lc1UVf-VE",
+      title: '=HYPERLINK("malicious")',
+    };
+    const created = await f.catalog.createClipCandidate(f.owner, f.project.id, {
+      idempotencyKey: "derived-case",
+      video,
+      selection,
+      englishText: selection.text,
+      notes: "source caption",
+      tags: ["timed"],
+    });
+    expect(created.selection).toEqual(selection);
+    expect(
+      (await f.catalog.listClipCandidates(f.owner, f.project.id))[0]?.selection,
+    ).toEqual(selection);
+    const raw = await f.database.query<{ end_timing: string }>(
+      "SELECT end_timing FROM clip_candidates WHERE id = $1",
+      [created.id],
+    );
+    expect(raw.rows[0]?.end_timing).toBe("derived");
+    await expect(
+      f.database.query(
+        "UPDATE clip_candidates SET end_timing = 'exact' WHERE id = $1",
+        [created.id],
+      ),
+    ).rejects.toThrow();
+    const csv = await f.catalog.exportClipCandidatesCsv(f.owner, f.project.id);
+    expect(csv).toContain('"timing_precision","end_timing"');
+    expect(csv).toContain('"estimated","derived"');
+    expect(csv).toContain('"\'=HYPERLINK(""malicious"")"');
+
+    const preset = {
+      presetVersion: 1,
+      name: "MP4",
+      settings: {
+        container: "mp4" as const,
+        videoCodec: "h264" as const,
+        videoRateControl: { mode: "crf" as const, value: 20 },
+        maxWidth: 1_920,
+        frameRate: "source" as const,
+        audioCodec: "aac" as const,
+        audioKilobitsPerSecond: 192,
+        omitSubtitleFilesForConfirmedEnglish: false,
+        embedEnglishSubtitleTrack: false,
+      },
+    };
+    const exported = await f.catalog.createClipExport(
+      f.owner,
+      f.project.id,
+      created.id,
+      {
+        idempotencyKey: "export-derived",
+        sourceLanguageClass: "confirmed_english",
+        preset,
+      },
+    );
+    expect(exported.selection).toEqual(selection);
+    expect(
+      (
+        await f.catalog.getLoggedExportRequest(
+          f.owner,
+          f.project.id,
+          exported.id,
+        )
+      ).selection,
+    ).toEqual(selection);
+    const snapshot = await f.database.query<{ selection_snapshot: unknown }>(
+      "SELECT selection_snapshot FROM export_requests WHERE id = $1",
+      [exported.id],
+    );
+    expect(snapshot.rows[0]?.selection_snapshot).toEqual(selection);
+  });
+
+  it("reads legacy candidates without adding a fictitious derived end", async () => {
+    const f = await membershipFixture();
+    const selection = {
+      trackId: randomUUID(),
+      transcriptVersion: 1,
+      firstSegmentId: randomUUID(),
+      lastSegmentId: randomUUID(),
+      transcriptStartMs: 0,
+      transcriptEndMs: 1_000,
+      exportStartMs: 0,
+      exportEndMs: 1_000,
+      text: "Legacy cue",
+      timingPrecision: "cue" as const,
+    };
+    const created = await f.catalog.createClipCandidate(f.owner, f.project.id, {
+      idempotencyKey: "legacy-case",
+      video: {
+        youtubeVideoId: "legacy-video-1",
+        canonicalUrl: "https://youtu.be/legacy-video-1",
+        title: "Legacy",
+      },
+      selection,
+      englishText: selection.text,
+      notes: "",
+      tags: [],
+    });
+    expect(created.selection).toEqual(selection);
+    const rows = await f.database.query<{ end_timing: string | null }>(
+      "SELECT end_timing FROM clip_candidates WHERE id = $1",
+      [created.id],
+    );
+    expect(rows.rows[0]?.end_timing).toBeNull();
+    expect(
+      (await f.catalog.getClipCandidate(f.owner, f.project.id, created.id))
+        .selection,
+    ).toEqual(selection);
+  });
+});
+
 describe("project membership grant safety", () => {
   it("rejects sole Owner self-demotion and preserves role/version/count", async () => {
     const f = await membershipFixture();
