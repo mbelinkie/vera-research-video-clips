@@ -2211,7 +2211,9 @@ export class SharedProjectCatalog {
     } else {
       const embedded = this.database as PGlite;
       if (typeof embedded.transaction !== "function") {
-        throw new Error("Membership writes require transactional database support.");
+        throw new Error(
+          "Membership writes require transactional database support.",
+        );
       }
       await embedded.transaction(async (tx) => lockedMutation(tx));
     }

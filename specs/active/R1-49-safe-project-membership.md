@@ -77,9 +77,25 @@ Commands actually executed on 2026-11-04 in this worktree:
 - `npm run typecheck` → passed with no diagnostics.
 - `npx prettier --check` on the changed files → passed after formatting.
 
-Remaining limitation: PGlite serializes transactions on one embedded connection,
-so these tests prove the business invariant and the transaction boundary, not
-pooled native PostgreSQL connection affinity. Do not mark #49 accepted until the
-#50 adapter supplies a connection-affine `transaction(callback)` and the
-two-connection PostgreSQL race tests (simultaneous last-Owner demotions,
-transfer-vs-revoke, stale-version rejection) pass.
+2026-11-12 phase-1 integration verification (Linux Zodex worktree; PR #68
+DeepSeek draft rebased by merging `origin/main` with the completed #50 adapter
+and #51 authentication work):
+
+- `npm ci --no-audit --no-fund` → clean worktree dependencies installed; the
+  parent checkout's platform-mismatched dependencies were not used for the
+  accepted results.
+- `npm test -- packages/catalog/src/index.test.ts apps/cloud-api/src/app.test.ts packages/contracts/src/index.test.ts packages/auth/src/index.test.ts`
+  → **4 files passed, 34 tests passed**.
+- `npm run typecheck` → **passed** after integrating the catalog with #50's
+  native connection-affine `withTransaction` API and preserving PGlite's own
+  transactional callback handle.
+- `VERA49_TEST_PG_URL=postgres://root@127.0.0.1:5432/vera49_test_membership_pipeline_49 VERA49_TEST_PG_ALLOW_SCHEMA_CREATE=1 npm test -- packages/catalog/src/membership.postgres.integration.test.ts`
+  → **1 file passed, 1 test passed** on local PostgreSQL 16, with two separate
+  pools/clients and an empty disposable database. The test covers concurrent
+  conflicting Owner demotions, transactionally current Owner permission,
+  last-Owner refusal, versioned stale retry, and transfer-vs-revoke safety.
+
+Do not mark #49 accepted until phase-2 full `npm run check`, independent
+security mutation/review and CI are complete. The PostgreSQL proof is a local
+two-connection integration test, not a deployment or production authentication
+test; browser sharing remains outside this issue.
