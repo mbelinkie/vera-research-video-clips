@@ -462,15 +462,17 @@ export function deriveTranscriptSelection(input: {
       : orderedTokens[first.tokenIndex];
   const lastToken =
     last.tokenIndex === undefined ? undefined : orderedTokens[last.tokenIndex];
-  const exactWordBounds =
+  const tokenBounds =
     firstToken?.startMs !== undefined &&
     firstToken.endMs !== undefined &&
     lastToken?.startMs !== undefined &&
     lastToken.endMs !== undefined
       ? { startMs: firstToken.startMs, endMs: lastToken.endMs }
       : undefined;
-  const transcriptStartMs = exactWordBounds?.startMs ?? firstSegment.startMs;
-  const transcriptEndMs = exactWordBounds?.endMs ?? lastSegment.endMs;
+  const hasDerivedEnd =
+    tokenBounds !== undefined && lastToken?.endTiming === "derived";
+  const transcriptStartMs = tokenBounds?.startMs ?? firstSegment.startMs;
+  const transcriptEndMs = tokenBounds?.endMs ?? lastSegment.endMs;
   const text =
     first.tokenIndex !== undefined && last.tokenIndex !== undefined
       ? orderedTokens
@@ -498,11 +500,14 @@ export function deriveTranscriptSelection(input: {
         ? unboundedExportEndMs
         : Math.min(sourceDurationMs, unboundedExportEndMs),
     text,
-    timingPrecision: exactWordBounds
-      ? "word"
+    timingPrecision: tokenBounds
+      ? hasDerivedEnd || transcript.track.timingPrecision === "estimated"
+        ? "estimated"
+        : "word"
       : transcript.track.timingPrecision === "estimated"
         ? "estimated"
         : "cue",
+    ...(hasDerivedEnd ? { endTiming: "derived" as const } : {}),
   });
 }
 

@@ -141,6 +141,8 @@ export const TranscriptTokenSchema = z
     text: z.string().min(1),
     startMs: z.number().int().nonnegative().optional(),
     endMs: z.number().int().positive().optional(),
+    /** Caption start is source-reported; only the end was derived. */
+    endTiming: z.literal("derived").optional(),
     timingConfidence: z.number().min(0).max(1).optional(),
   })
   .refine(
@@ -149,6 +151,12 @@ export const TranscriptTokenSchema = z
       token.endMs === undefined ||
       token.endMs > token.startMs,
     { message: "Transcript token end must be after its start." },
+  )
+  .refine(
+    (token) =>
+      token.endTiming !== "derived" ||
+      (token.startMs !== undefined && token.endMs !== undefined),
+    { message: "Derived token ends require a start and end." },
   );
 
 export const NormalizedTranscriptSchema = z.object({
@@ -171,6 +179,7 @@ export const TranscriptSelectionSchema = z
     exportEndMs: z.number().int().positive(),
     text: z.string().trim().min(1),
     timingPrecision: TimingPrecisionSchema,
+    endTiming: z.literal("derived").optional(),
   })
   .refine(
     (selection) => selection.transcriptEndMs > selection.transcriptStartMs,
@@ -186,7 +195,17 @@ export const TranscriptSelectionSchema = z
   )
   .refine((selection) => selection.exportEndMs >= selection.transcriptEndMs, {
     message: "Export end must include the transcript selection.",
-  });
+  })
+  .refine(
+    (selection) =>
+      selection.endTiming !== "derived" ||
+      (selection.timingPrecision === "estimated" &&
+        selection.firstTokenId !== undefined &&
+        selection.lastTokenId !== undefined),
+    {
+      message: "Derived selection ends require estimated token bounds.",
+    },
+  );
 
 export const ClipResearchStatusSchema = z.enum([
   "candidate",

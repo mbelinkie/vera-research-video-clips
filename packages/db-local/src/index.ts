@@ -253,8 +253,8 @@ export class LocalTranscriptIndex {
       const insertToken = this.database.prepare(
         `INSERT INTO transcript_tokens
            (transcript_version_id, id, segment_id, ordinal, text,
-            start_ms, end_ms, timing_confidence)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+            start_ms, end_ms, timing_confidence, end_timing)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       );
       for (const token of transcript.tokens) {
         insertToken.run(
@@ -266,6 +266,7 @@ export class LocalTranscriptIndex {
           token.startMs ?? null,
           token.endMs ?? null,
           token.timingConfidence ?? null,
+          token.endTiming ?? null,
         );
       }
       this.database.exec("COMMIT;");
@@ -337,6 +338,7 @@ export class LocalTranscriptIndex {
         ...(token.timing_confidence === null
           ? {}
           : { timingConfidence: Number(token.timing_confidence) }),
+        ...(token.end_timing === null ? {} : { endTiming: token.end_timing }),
       })),
     });
   }

@@ -23,6 +23,96 @@ import {
 } from "./index.ts";
 
 describe("transcript range selection", () => {
+  it("uses exact caption starts and derived last-word ends for reverse selection and export padding", async () => {
+    const transcript = await normalizeWebVttCaption({
+      contents: await readFile(autoWordTimedFixture),
+      videoId: "M7lc1UVf-VE",
+      language: "en",
+      source: "youtube-auto",
+      provider: "yt-dlp",
+    });
+    expect(transcript.tokens[1]).toMatchObject({
+      startMs: 11_840,
+      endMs: 12_030,
+      endTiming: "derived",
+    });
+    const selection = deriveTranscriptSelection({
+      transcript,
+      anchor: {
+        segmentId: transcript.segments[0]!.id,
+        tokenId: transcript.tokens[3]!.id,
+      },
+      focus: {
+        segmentId: transcript.segments[0]!.id,
+        tokenId: transcript.tokens[1]!.id,
+      },
+      paddingBeforeMs: 200,
+      paddingAfterMs: 500,
+      sourceDurationMs: 13_350,
+    });
+    expect(selection).toMatchObject({
+      transcriptStartMs: 11_840,
+      transcriptEndMs: 13_100,
+      exportStartMs: 11_640,
+      exportEndMs: 13_350,
+      text: "closely now please",
+      timingPrecision: "estimated",
+      endTiming: "derived",
+    });
+    expect(
+      updateTranscriptSelectionExportBounds(selection, {
+        startMs: 11_500,
+        endMs: 13_200,
+      }),
+    ).toMatchObject({
+      transcriptStartMs: 11_840,
+      transcriptEndMs: 13_100,
+      endTiming: "derived",
+      exportStartMs: 11_500,
+      exportEndMs: 13_200,
+    });
+  });
+
+  it("falls back to cue bounds rather than inventing partial word selection", async () => {
+    const transcript = await normalizeWebVttCaption({
+      contents: await readFile(autoWordTimedFixture),
+      videoId: "M7lc1UVf-VE",
+      language: "en",
+      source: "youtube-auto",
+      provider: "yt-dlp",
+    });
+    const incomplete = {
+      ...transcript,
+      tokens: transcript.tokens.map((token, index) =>
+        index === 3
+          ? {
+              ...token,
+              startMs: undefined,
+              endMs: undefined,
+              endTiming: undefined,
+            }
+          : token,
+      ),
+    };
+    const selection = deriveTranscriptSelection({
+      transcript: incomplete,
+      anchor: {
+        segmentId: transcript.segments[0]!.id,
+        tokenId: transcript.tokens[1]!.id,
+      },
+      focus: {
+        segmentId: transcript.segments[0]!.id,
+        tokenId: transcript.tokens[3]!.id,
+      },
+    });
+    expect(selection).toMatchObject({
+      transcriptStartMs: 11_500,
+      transcriptEndMs: 13_100,
+      timingPrecision: "estimated",
+    });
+    expect(selection).not.toHaveProperty("endTiming");
+  });
+
   it("normalizes reverse DOM selection into stable word-timed bounds", () => {
     const transcript = normalizeTranscriptFixture(wordFixture);
     const selection = deriveTranscriptSelection({
