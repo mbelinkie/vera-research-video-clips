@@ -74,6 +74,26 @@ The adapter invokes the executable with argument arrays, ignores ambient
 `yt-dlp` configuration, downloads only the selected VTT caption track into the
 job scratch directory, and does not download source video during this step.
 
+When the **original YouTube automatic-caption VTT** includes unambiguous
+per-word timestamps, the normalizer preserves its source-reported word starts.
+It estimates each word's end as the earliest of the next word start, 500 ms
+after the word start, and the caption cue end. The end is labelled **derived**;
+the resulting transcript and selections have `estimated` precision, **not**
+acoustically aligned or frame-exact word ends. Seeking uses the reported start;
+phrase selections retain the last derived end, with independently editable
+export padding. Manual captions, generated whisper.cpp output and translated
+English from foreign-language captions do **not** gain invented word timings.
+The original foreign-language auto-caption track may retain word starts while
+its separately stored English translation remains cue-timed. New timed tracks
+have their own content identities and persist the derived-end label through
+publication, verified caching, logged clips and export snapshots.
+
+The existing browser transcript is still an explicitly labelled demo fixture,
+not a live transcript lookup. The deterministic `/?fixture=auto-word-timed`
+demo after loading the API test video illustrates exact caption starts,
+estimated ends, selection, preview and queue/export payloads; it does not
+connect the live YouTube caption provider to browser transcript loading.
+
 Translation is also disabled by default because it sends transcript text to a
 remote, billable service. To opt into the initial Amazon Translate adapter, set:
 

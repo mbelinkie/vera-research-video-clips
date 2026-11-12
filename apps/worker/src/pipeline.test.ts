@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -9,9 +9,12 @@ import type {
   ActiveTranscriptBundle,
   ClaimedTranscriptionJob,
   FinalizedObject,
+  NormalizedTranscript,
+  TranscriptManifest,
   TranscriptUploadGrant,
 } from "@research-video/contracts";
 import { normalizeGeneratedTranscript } from "@research-video/transcript";
+import type { TranslationRequest } from "@research-video/providers";
 
 import {
   createTranscriptPipelineExecutor,
@@ -100,6 +103,175 @@ function publicationFixture() {
 }
 
 describe("transcript pipeline", () => {
+  it("publishes and pins an English automatic VTT's word starts and derived ends", async () => {
+    const scratchRoot = await mkdtemp(join(tmpdir(), "pipeline-auto-"));
+    temporaryDirectories.add(scratchRoot);
+    const publication = publicationFixture();
+    const media = { acquireAuthorizedSource: vi.fn() };
+    const speechToText = { transcribe: vi.fn() };
+    const vtt = await readFile(
+      new URL(
+        "../../../tests/fixtures/transcripts/auto-word-timed.vtt",
+        import.meta.url,
+      ),
+    );
+    const executor = createTranscriptPipelineExecutor({
+      scratchRoot,
+      publication: publication.client,
+      captions: {
+        discover: async () => [
+          {
+            id: "fixture:automatic:en",
+            language: "en",
+            kind: "automatic",
+            translatable: false,
+            downloadAccess: "available",
+          },
+        ],
+        acquire: async (videoId, track, scratch) => {
+          const path = join(scratch, "auto.en.vtt");
+          await writeFile(path, vtt);
+          return {
+            videoId,
+            track,
+            path,
+            format: "vtt",
+            byteSize: vtt.length,
+            provider: "fixture",
+          };
+        },
+      },
+      media,
+      speechToText,
+    });
+    const plans: unknown[] = [];
+    await executor(claimedJob(), {
+      signal: new AbortController().signal,
+      setStage: async () => undefined,
+      recordSourcePlan: async (plan) => void plans.push(plan),
+    });
+    const transcript = JSON.parse(
+      new TextDecoder().decode(publication.uploaded.get("english-normalized")),
+    ) as NormalizedTranscript;
+    const manifest = JSON.parse(
+      new TextDecoder().decode(publication.uploaded.get("manifest")),
+    ) as TranscriptManifest;
+    expect(transcript.track).toMatchObject({
+      source: "youtube-auto",
+      timingPrecision: "estimated",
+      schemaVersion: 2,
+    });
+    expect(transcript.tokens[1]).toMatchObject({
+      text: "closely",
+      startMs: 11_840,
+      endMs: 12_030,
+      endTiming: "derived",
+    });
+    expect(manifest).toMatchObject({
+      timingPrecision: "estimated",
+      normalizationSchemaVersion: 2,
+      artifacts: expect.arrayContaining([
+        expect.objectContaining({ type: "english-normalized" }),
+      ]),
+    });
+    expect([...publication.uploaded.keys()].sort()).toEqual([
+      "english-normalized",
+      "english-srt",
+      "manifest",
+    ]);
+    expect(plans).toMatchObject([
+      { strategy: "caption", sourceLanguage: "en" },
+    ]);
+    expect(media.acquireAuthorizedSource).not.toHaveBeenCalled();
+    expect(speechToText.transcribe).not.toHaveBeenCalled();
+    expect(publication.finalize).toHaveBeenCalledOnce();
+    expect(await readdir(scratchRoot)).toEqual([]);
+  });
+
+  it("keeps original foreign auto word starts without transferring them to English translation", async () => {
+    const scratchRoot = await mkdtemp(join(tmpdir(), "pipeline-auto-es-"));
+    temporaryDirectories.add(scratchRoot);
+    const publication = publicationFixture();
+    const translate = vi.fn(async (input: TranslationRequest) => ({
+      provider: "fixture-translation",
+      segments: input.segments.map((segment) => ({
+        sourceSegmentId: segment.id,
+        text: "Hello world",
+      })),
+    }));
+    const executor = createTranscriptPipelineExecutor({
+      scratchRoot,
+      publication: publication.client,
+      captions: {
+        discover: async () => [
+          {
+            id: "fixture:automatic:es",
+            language: "es",
+            kind: "automatic",
+            translatable: false,
+            downloadAccess: "available",
+          },
+        ],
+        acquire: async (videoId, track, scratch) => {
+          const contents =
+            "WEBVTT\n\n00:00.500 --> 00:02.500\n<00:00:00.610><c> Hola</c><00:00:01.200><c> mundo</c>\n";
+          const path = join(scratch, "auto.es.vtt");
+          await writeFile(path, contents);
+          return {
+            videoId,
+            track,
+            path,
+            format: "vtt",
+            byteSize: Buffer.byteLength(contents),
+            provider: "fixture",
+          };
+        },
+      },
+      media: { acquireAuthorizedSource: vi.fn() },
+      speechToText: { transcribe: vi.fn() },
+      translation: { translate },
+    });
+    await executor(claimedJob(), {
+      signal: new AbortController().signal,
+      setStage: async () => undefined,
+      recordSourcePlan: async () => undefined,
+    });
+    const original = JSON.parse(
+      new TextDecoder().decode(publication.uploaded.get("original-normalized")),
+    ) as NormalizedTranscript;
+    const english = JSON.parse(
+      new TextDecoder().decode(publication.uploaded.get("english-normalized")),
+    ) as NormalizedTranscript;
+    const manifest = JSON.parse(
+      new TextDecoder().decode(publication.uploaded.get("manifest")),
+    ) as TranscriptManifest;
+    expect(original.track.timingPrecision).toBe("estimated");
+    expect(original.tokens[0]).toMatchObject({
+      startMs: 610,
+      endMs: 1_110,
+      endTiming: "derived",
+    });
+    expect(original.tokens[1]).toMatchObject({
+      startMs: 1_200,
+      endMs: 1_700,
+      endTiming: "derived",
+    });
+    expect(english.track).toMatchObject({
+      source: "translated",
+      timingPrecision: "cue",
+      sourceTrackId: original.track.id,
+    });
+    expect(
+      english.tokens.every(
+        (token) => token.startMs === undefined && token.endTiming === undefined,
+      ),
+    ).toBe(true);
+    expect(manifest.timingPrecision).toBe("cue");
+    expect(translate).toHaveBeenCalledOnce();
+    expect(publication.finalize).toHaveBeenCalledOnce();
+    expect(await readdir(scratchRoot)).toEqual([]);
+  });
+
   it("publishes separate time-linked original and English caption tracks", async () => {
     const scratchRoot = await mkdtemp(join(tmpdir(), "pipeline-"));
     temporaryDirectories.add(scratchRoot);
@@ -177,6 +349,26 @@ describe("transcript pipeline", () => {
     expect(
       new TextDecoder().decode(publication.uploaded.get("english-srt")),
     ).toContain("00:00:00,500 --> 00:00:02,500\nThis is a short example.");
+    const original = JSON.parse(
+      new TextDecoder().decode(publication.uploaded.get("original-normalized")),
+    ) as NormalizedTranscript;
+    const english = JSON.parse(
+      new TextDecoder().decode(publication.uploaded.get("english-normalized")),
+    ) as NormalizedTranscript;
+    expect(original.track).toMatchObject({
+      source: "youtube-manual",
+      timingPrecision: "cue",
+    });
+    expect(english.track).toMatchObject({
+      source: "translated",
+      timingPrecision: "cue",
+    });
+    expect(
+      original.tokens.every((token) => token.endTiming === undefined),
+    ).toBe(true);
+    expect(english.tokens.every((token) => token.endTiming === undefined)).toBe(
+      true,
+    );
     expect(await readdir(scratchRoot)).toEqual([]);
     expect(publication.finalize).toHaveBeenCalledOnce();
   });
@@ -242,6 +434,16 @@ describe("transcript pipeline", () => {
       "english-srt",
       "manifest",
     ]);
+    const generated = JSON.parse(
+      new TextDecoder().decode(publication.uploaded.get("english-normalized")),
+    ) as NormalizedTranscript;
+    expect(generated.track).toMatchObject({
+      source: "generated",
+      timingPrecision: "cue",
+    });
+    expect(
+      generated.tokens.every((token) => token.endTiming === undefined),
+    ).toBe(true);
     expect(await readdir(scratchRoot)).toEqual([]);
   });
 });

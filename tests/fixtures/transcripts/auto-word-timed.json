@@ -1,0 +1,123 @@
+{
+  "track": {
+    "id": "93bae103-5e83-85d0-b086-8aa3cb7da4fa",
+    "videoId": "M7lc1UVf-VE",
+    "language": "en",
+    "kind": "english",
+    "source": "youtube-auto",
+    "provider": "yt-dlp",
+    "timingPrecision": "estimated",
+    "schemaVersion": 2,
+    "contentSha256": "c37db66b4cb37e452960f51d2978505265a4e80ea574d7572965832d79a14cef",
+    "version": 1
+  },
+  "segments": [
+    {
+      "id": "45c0f7d7-40d9-8c07-9bc1-68bd0c73cf9c",
+      "trackId": "93bae103-5e83-85d0-b086-8aa3cb7da4fa",
+      "ordinal": 0,
+      "startMs": 11500,
+      "endMs": 13100,
+      "text": "Look closely now please"
+    },
+    {
+      "id": "9f8989a1-52cc-8f3e-b170-57fff06b194c",
+      "trackId": "93bae103-5e83-85d0-b086-8aa3cb7da4fa",
+      "ordinal": 1,
+      "startMs": 13000,
+      "endMs": 15500,
+      "text": "Résumé & José"
+    },
+    {
+      "id": "0ca11c35-e699-85c0-86a9-d6ed0e5c1aaa",
+      "trackId": "93bae103-5e83-85d0-b086-8aa3cb7da4fa",
+      "ordinal": 2,
+      "startMs": 3723004,
+      "endMs": 3724000,
+      "text": "hours count"
+    }
+  ],
+  "tokens": [
+    {
+      "id": "f730082f-16e2-8ad0-9cdd-ffbecff28c83",
+      "segmentId": "45c0f7d7-40d9-8c07-9bc1-68bd0c73cf9c",
+      "ordinal": 0,
+      "text": "Look",
+      "startMs": 11500,
+      "endMs": 11840,
+      "endTiming": "derived"
+    },
+    {
+      "id": "719e7919-b203-8a85-b1a3-955578c93431",
+      "segmentId": "45c0f7d7-40d9-8c07-9bc1-68bd0c73cf9c",
+      "ordinal": 1,
+      "text": "closely",
+      "startMs": 11840,
+      "endMs": 12030,
+      "endTiming": "derived"
+    },
+    {
+      "id": "69a8cca0-3b23-826b-9adf-d097537f9ea2",
+      "segmentId": "45c0f7d7-40d9-8c07-9bc1-68bd0c73cf9c",
+      "ordinal": 2,
+      "text": "now",
+      "startMs": 12030,
+      "endMs": 12530,
+      "endTiming": "derived"
+    },
+    {
+      "id": "d31e5f40-bf88-8b58-b58b-b5d0171ddddf",
+      "segmentId": "45c0f7d7-40d9-8c07-9bc1-68bd0c73cf9c",
+      "ordinal": 3,
+      "text": "please",
+      "startMs": 12900,
+      "endMs": 13100,
+      "endTiming": "derived"
+    },
+    {
+      "id": "6b260036-65b5-8b8f-8265-5dc34df5c3ba",
+      "segmentId": "9f8989a1-52cc-8f3e-b170-57fff06b194c",
+      "ordinal": 0,
+      "text": "Résumé",
+      "startMs": 13200,
+      "endMs": 13600,
+      "endTiming": "derived"
+    },
+    {
+      "id": "19bb4c82-4400-8208-bb87-aa50642fabd1",
+      "segmentId": "9f8989a1-52cc-8f3e-b170-57fff06b194c",
+      "ordinal": 1,
+      "text": "&",
+      "startMs": 13600,
+      "endMs": 14100,
+      "endTiming": "derived"
+    },
+    {
+      "id": "dd71118e-2fc5-8ce9-a147-6b04c9ab01f5",
+      "segmentId": "9f8989a1-52cc-8f3e-b170-57fff06b194c",
+      "ordinal": 2,
+      "text": "José",
+      "startMs": 14200,
+      "endMs": 14700,
+      "endTiming": "derived"
+    },
+    {
+      "id": "e40b29d2-9ac9-841e-9dab-006ef390ea71",
+      "segmentId": "0ca11c35-e699-85c0-86a9-d6ed0e5c1aaa",
+      "ordinal": 0,
+      "text": "hours",
+      "startMs": 3723120,
+      "endMs": 3723300,
+      "endTiming": "derived"
+    },
+    {
+      "id": "40c93c14-fefb-83c2-867a-11fe653382b7",
+      "segmentId": "0ca11c35-e699-85c0-86a9-d6ed0e5c1aaa",
+      "ordinal": 1,
+      "text": "count",
+      "startMs": 3723300,
+      "endMs": 3723800,
+      "endTiming": "derived"
+    }
+  ]
+}
