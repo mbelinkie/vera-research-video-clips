@@ -88,9 +88,11 @@ export function immediateProgress(item: BatchItem): ImmediateProgress {
     const message =
       item.error?.code === "recognizer_not_configured"
         ? "No captions are available and local speech recognition is not configured."
-        : item.error?.code === "source_unavailable"
-          ? "This video cannot be fetched for authorized transcription."
-          : "Transcript processing failed; check the local worker and retry.";
+        : item.error?.code === "translation_not_configured"
+          ? "English translation is not configured for this source language."
+          : item.error?.code === "source_unavailable"
+            ? "This video cannot be fetched for authorized transcription."
+            : "Transcript processing failed; check the local worker and retry.";
     return { kind: "failed", message };
   }
   return {

@@ -90,9 +90,10 @@ if (!config.workerAuthorization) {
       concurrency: config.workerConcurrency,
       idlePollMs: config.workerPollIntervalMs,
       errorBackoffMs: config.workerErrorBackoffMs,
-      onUnexpectedError: (error) => {
-        const message = error instanceof Error ? error.message : String(error);
-        process.stderr.write(`Worker loop error; retrying: ${message}\n`);
+      onUnexpectedError: () => {
+        // Worker control-plane exceptions may contain credentials or private
+        // endpoints; do not print raw exceptions to shared supervisor logs.
+        process.stderr.write("Worker loop error; retrying.\n");
       },
     });
     process.stdout.write(

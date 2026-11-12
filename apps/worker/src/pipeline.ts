@@ -87,6 +87,14 @@ export class LocalRecognizerUnavailableError extends Error {
   }
 }
 
+export class LocalTranslationUnavailableError extends Error {
+  readonly code = "translation_not_configured";
+  readonly retryable = false;
+  constructor() {
+    super("English translation is not configured for this source language.");
+  }
+}
+
 export function createTranscriptPipelineExecutor(
   options: TranscriptPipelineOptions,
 ): TranscriptionJobExecutor {
@@ -265,9 +273,7 @@ async function resolveEnglishTranscript(
     return source;
   }
   if (!translation) {
-    throw new TranscriptPipelineError(
-      "A translation provider is required for the detected source language.",
-    );
+    throw new LocalTranslationUnavailableError();
   }
   await context.setStage("translating");
   return translateCanonicalTranscript(

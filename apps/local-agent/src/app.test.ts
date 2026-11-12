@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { HealthResponseSchema } from "@research-video/contracts";
 import type { WorkspaceTranscriptResolution } from "@research-video/sync";
+import { SharedCatalogHttpError } from "@research-video/sync";
 import { normalizeTranscriptFixture } from "@research-video/transcript";
 import transcriptFixture from "../../../tests/fixtures/transcripts/english-word.json" with { type: "json" };
 
@@ -57,6 +58,25 @@ describe("local agent", () => {
       transcript: { track: { timingPrecision: "word" } },
     });
     expect(response.json()).not.toHaveProperty("cachePath");
+  });
+
+  it("preserves cloud project authorization denials without revealing credentials", async () => {
+    const app = createLocalAgent({
+      resolveTranscript: async () => {
+        throw new SharedCatalogHttpError(403);
+      },
+    });
+    apps.add(app);
+    const response = await app.inject({
+      method: "GET",
+      url: `/api/projects/019fbb95-cd76-7920-93fa-e23ba755e391/videos/019fbb95-cd76-7920-93fa-e23ba755e392/transcript`,
+      headers: { authorization: "Bearer private-test-credential" },
+    });
+    expect(response.statusCode).toBe(403);
+    expect(response.body).not.toContain("private-test-credential");
+    expect(response.json()).toMatchObject({
+      error: { code: "shared_transcript_unavailable" },
+    });
   });
 
   it("accepts a projectless export-only request through the loopback boundary", async () => {

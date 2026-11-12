@@ -1,4 +1,7 @@
 import { randomUUID } from "node:crypto";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { PGlite } from "@electric-sql/pglite";
 import { afterEach, describe, expect, it } from "vitest";
@@ -7,7 +10,11 @@ import { SharedProjectCatalog } from "@research-video/catalog";
 import { HealthResponseSchema } from "@research-video/contracts";
 import { runCloudMigrations } from "@research-video/db-cloud";
 import type { VideoMetadataProvider } from "@research-video/providers";
-import { MemoryTranscriptObjectStore } from "@research-video/storage";
+import {
+  LocalStagedUploadUrlIssuer,
+  LocalTranscriptObjectStore,
+  MemoryTranscriptObjectStore,
+} from "@research-video/storage";
 
 import { authenticateDevBearer, createCloudApi } from "./app.ts";
 
@@ -22,6 +29,75 @@ afterEach(async () => {
 });
 
 describe("cloud API", () => {
+  it("enforces signed method, version and expiry on the real local binary HTTP routes", async () => {
+    const root = await mkdtemp(join(tmpdir(), "research19-cloud-cap-"));
+    const database = new PGlite();
+    databases.add(database);
+    try {
+      await runCloudMigrations(database);
+      let clock = Date.now();
+      const issuer = new LocalStagedUploadUrlIssuer(
+        "http://127.0.0.1:43111/",
+        "research19-test-signing-secret-longer-than-32-bytes",
+        () => clock,
+      );
+      const store = new LocalTranscriptObjectStore(root);
+      const app = createCloudApi({
+        catalog: new SharedProjectCatalog(
+          database,
+          store,
+          () => new Date(),
+          issuer,
+        ),
+        authenticate: authenticateDevBearer,
+        localArtifacts: { store, issuer, objectRoot: root },
+      });
+      apps.add(app);
+      const putUrl = await issuer.issuePutUrl({
+        objectKey: "projects/test/transcripts/caption.json",
+        expiresInSeconds: 60,
+      });
+      const path = new URL(putUrl).pathname;
+      expect((await app.inject({ method: "GET", url: path })).statusCode).toBe(
+        403,
+      );
+      const bytes = Buffer.from('{"verified":true}');
+      const written = await app.inject({
+        method: "PUT",
+        url: path,
+        payload: bytes,
+        headers: { "content-type": "application/json" },
+      });
+      expect(written.statusCode).toBe(200);
+      const objectVersionId = String(written.headers["x-amz-version-id"]);
+      expect(objectVersionId).toMatch(/^[0-9a-f-]{36}$/u);
+      const getUrl = await issuer.issueGetUrl({
+        objectKey: "projects/test/transcripts/caption.json",
+        objectVersionId,
+        expiresInSeconds: 1,
+      });
+      const getPath = new URL(getUrl).pathname;
+      expect(
+        (
+          await app.inject({
+            method: "PUT",
+            url: getPath,
+            payload: bytes,
+            headers: { "content-type": "application/json" },
+          })
+        ).statusCode,
+      ).toBe(403);
+      expect(
+        (await app.inject({ method: "GET", url: getPath })).rawPayload,
+      ).toEqual(bytes);
+      clock += 2_000;
+      expect(
+        (await app.inject({ method: "GET", url: getPath })).statusCode,
+      ).toBe(403);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
   it("reports a contract-valid health response", async () => {
     const app = createCloudApi();
     apps.add(app);
