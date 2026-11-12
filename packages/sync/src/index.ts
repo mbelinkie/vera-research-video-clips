@@ -349,6 +349,238 @@ export class CachedTranscriptDocumentReader {
   }
 }
 
+export type VerifiedLoggedClipTracks = {
+  english: NormalizedTranscript;
+  original?: NormalizedTranscript;
+  transcriptVersionId: string;
+};
+
+/**
+ * Export-only read path. Unlike the workspace's current-English reader, this
+ * rechecks cached immutable artifact bytes and pins the *logged* selection to
+ * its exact track and version before any source media may be acquired.
+ */
+export function readVerifiedLoggedClipTracks(input: {
+  resolution: TranscriptResolution;
+  clip: ClipCandidate;
+  sourceLanguageClass: "confirmed_english" | "foreign" | "mixed" | "unknown";
+}): VerifiedLoggedClipTracks {
+  const clip = ClipCandidateSchema.parse(input.clip);
+  const languageClass = ExportSourceLanguageClassSchema.parse(
+    input.sourceLanguageClass,
+  );
+  const { resolution } = input;
+  const { bundle } = resolution;
+  if (!lstatSync(resolution.cachePath).isDirectory()) {
+    throw new LocalCacheIntegrityError(
+      "Verified transcript cache directory is unsafe.",
+    );
+  }
+  const manifestBytes = readRegularCacheFile(
+    join(resolution.cachePath, "manifest.json"),
+  );
+  if (
+    manifestBytes.byteLength !== bundle.manifestObject.byteSize ||
+    digestBytes(manifestBytes) !== bundle.manifestObject.sha256
+  ) {
+    throw new LocalCacheIntegrityError(
+      "Verified transcript manifest bytes changed.",
+    );
+  }
+  let manifest: TranscriptManifest;
+  try {
+    manifest = TranscriptManifestSchema.parse(
+      JSON.parse(manifestBytes.toString("utf8")),
+    );
+  } catch {
+    throw new LocalCacheIntegrityError(
+      "Verified transcript manifest is invalid.",
+    );
+  }
+  if (
+    manifest.id !== bundle.transcriptVersionId ||
+    !isDeepStrictEqual(manifest, bundle.manifest) ||
+    manifest.projectId !== clip.projectId ||
+    manifest.catalogVideoId !== clip.catalogVideoId ||
+    manifest.videoId !== clip.video.youtubeVideoId ||
+    (clip.video.sourceLanguage !== undefined &&
+      manifest.sourceLanguage.toLowerCase() !==
+        clip.video.sourceLanguage.toLowerCase()) ||
+    manifest.version !== clip.selection.transcriptVersion
+  ) {
+    throw new LocalCacheIntegrityError(
+      "Logged clip does not match the verified transcript manifest identity/version.",
+    );
+  }
+  if (
+    languageClass === "confirmed_english" &&
+    !/^en(?:-|$)/iu.test(manifest.sourceLanguage)
+  ) {
+    throw new LocalCacheIntegrityError(
+      "Source language is not confirmed English.",
+    );
+  }
+
+  const english = readTrackFromVerifiedBundle(
+    resolution,
+    manifest,
+    "english-normalized",
+  );
+  if (
+    english.track.kind !== "english" ||
+    !/^en(?:-|$)/iu.test(english.track.language) ||
+    english.track.timingPrecision !== manifest.timingPrecision ||
+    english.track.schemaVersion !== manifest.normalizationSchemaVersion
+  ) {
+    throw new LocalCacheIntegrityError(
+      "Verified English track does not match its manifest.",
+    );
+  }
+  const original =
+    languageClass === "confirmed_english"
+      ? undefined
+      : readTrackFromVerifiedBundle(
+          resolution,
+          manifest,
+          "original-normalized",
+        );
+  if (
+    original &&
+    (original.track.kind !== "original" ||
+      original.track.id === english.track.id ||
+      english.track.sourceTrackId !== original.track.id ||
+      (!["und", "unknown", "mixed"].includes(
+        manifest.sourceLanguage.toLowerCase(),
+      ) &&
+        original.track.language.toLowerCase() !==
+          manifest.sourceLanguage.toLowerCase()))
+  ) {
+    throw new LocalCacheIntegrityError(
+      "Verified original/English tracks are not linked.",
+    );
+  }
+  const loggedTrack = [english, original].find(
+    (track) => track?.track.id === clip.selection.trackId,
+  );
+  if (
+    !loggedTrack ||
+    loggedTrack.track.version !== clip.selection.transcriptVersion
+  ) {
+    throw new LocalCacheIntegrityError(
+      "Logged clip track ID/version is not in the verified transcript bundle.",
+    );
+  }
+  if (
+    english.track.version !== manifest.version ||
+    (original && original.track.version !== manifest.version)
+  ) {
+    throw new LocalCacheIntegrityError(
+      "Required track version differs from the manifest.",
+    );
+  }
+  return {
+    english,
+    ...(original ? { original } : {}),
+    transcriptVersionId: manifest.id,
+  };
+}
+
+function readTrackFromVerifiedBundle(
+  resolution: TranscriptResolution,
+  manifest: TranscriptManifest,
+  type: "english-normalized" | "original-normalized",
+): NormalizedTranscript {
+  const artifacts = manifest.artifacts.filter((item) => item.type === type);
+  const targets = resolution.bundle.downloads.filter(
+    (item) => item.type === type,
+  );
+  const artifact = artifacts[0];
+  if (
+    artifacts.length !== 1 ||
+    targets.length !== 1 ||
+    !artifact?.objectVersionId ||
+    !isDeepStrictEqual(artifact, {
+      type: targets[0]!.type,
+      objectKey: targets[0]!.objectKey,
+      objectVersionId: targets[0]!.objectVersionId,
+      byteSize: targets[0]!.byteSize,
+      sha256: targets[0]!.sha256,
+    })
+  ) {
+    throw new LocalCacheIntegrityError(
+      `Verified ${type} artifact is missing or unpinned.`,
+    );
+  }
+  const extension = extname(artifact.objectKey);
+  if (extension !== ".json" && extension !== ".gz") {
+    throw new LocalCacheIntegrityError(
+      `Verified ${type} artifact has an unsupported extension.`,
+    );
+  }
+  const stored = readRegularCacheFile(
+    join(resolution.cachePath, `${type}${extension}`),
+  );
+  if (
+    stored.byteLength !== artifact.byteSize ||
+    digestBytes(stored) !== artifact.sha256
+  ) {
+    throw new LocalCacheIntegrityError(
+      `Verified ${type} artifact bytes changed.`,
+    );
+  }
+  let transcript: NormalizedTranscript;
+  try {
+    const bytes =
+      extension === ".gz"
+        ? gunzipSync(stored, { maxOutputLength: 64 * 1024 * 1024 })
+        : stored;
+    transcript = NormalizedTranscriptSchema.parse(
+      JSON.parse(bytes.toString("utf8")),
+    );
+  } catch {
+    throw new LocalCacheIntegrityError(
+      `Verified ${type} normalized transcript is invalid.`,
+    );
+  }
+  if (
+    transcript.track.videoId !== manifest.videoId ||
+    transcript.track.version !== manifest.version ||
+    transcript.segments.some(
+      (segment, index) =>
+        segment.trackId !== transcript.track.id ||
+        segment.ordinal !== index ||
+        (index > 0 &&
+          segment.startMs < transcript.segments[index - 1]!.startMs),
+    ) ||
+    transcript.tokens.some(
+      (token) =>
+        !transcript.segments.some((segment) => segment.id === token.segmentId),
+    )
+  ) {
+    throw new LocalCacheIntegrityError(
+      `Verified ${type} track identity/timing is inconsistent.`,
+    );
+  }
+  return transcript;
+}
+
+function readRegularCacheFile(path: string): Buffer {
+  try {
+    const file = lstatSync(path);
+    if (!file.isFile() || file.nlink !== 1)
+      throw new Error("Unsafe cached file.");
+    return readFileSync(path);
+  } catch {
+    throw new LocalCacheIntegrityError(
+      "Verified transcript cache file is missing or unsafe.",
+    );
+  }
+}
+
+function digestBytes(bytes: Uint8Array): string {
+  return createHash("sha256").update(bytes).digest("hex");
+}
+
 export type WorkspaceTranscriptResolution = TranscriptResolution & {
   transcript: NormalizedTranscript;
 };
@@ -487,8 +719,10 @@ export class OfflineOutbox {
   }
 }
 import { createHash, randomUUID } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import {
   existsSync,
+  lstatSync,
   mkdirSync,
   readFileSync,
   readdirSync,
@@ -502,11 +736,15 @@ import { gunzipSync } from "node:zlib";
 
 import {
   ActiveTranscriptBundleSchema,
+  ClipCandidateSchema,
+  ExportSourceLanguageClassSchema,
   NormalizedTranscriptSchema,
   TranscriptManifestSchema,
   type ActiveTranscriptBundle,
+  type ClipCandidate,
   type NormalizedTranscript,
   type TranscriptDownloadTarget,
+  type TranscriptManifest,
 } from "@research-video/contracts";
 import { LocalTranscriptIndex } from "@research-video/db-local";
 import type { TranscriptObjectStore } from "@research-video/storage";
