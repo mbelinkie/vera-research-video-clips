@@ -1,4 +1,471 @@
-import { expect, test } from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
+import { normalizeTranscriptFixture } from "@research-video/transcript";
+import captionFixture from "../fixtures/transcripts/auto-word-timed.json" with { type: "json" };
+import englishFixture from "../fixtures/transcripts/english-word.json" with { type: "json" };
+
+const liveProject = "019fbb95-cd76-7920-93fa-e23ba755ee40";
+const secondProject = "019fbb95-cd76-7920-93fa-e23ba755ee48";
+const liveBatch = "019fbb95-cd76-7920-93fa-e23ba755ee41";
+const liveItem = "019fbb95-cd76-7920-93fa-e23ba755ee42";
+const catalogVideo = "019fbb95-cd76-7920-93fa-e23ba755ee43";
+const liveVersion = "019fbb95-cd76-7920-93fa-e23ba755ee44";
+const liveVideo = "M7lc1UVf-VE";
+const liveTime = "2026-11-12T12:00:00.000Z";
+
+function fakeBatch(
+  projectId: string,
+  batchId: string,
+  youtubeVideoId: string,
+  state: "ready_for_review" | "transcribing" | "failed",
+  overrides: Record<string, unknown> = {},
+) {
+  return {
+    batch: {
+      id: batchId,
+      projectId,
+      name: "Immediate review",
+      targetLanguage: "en",
+      transcriptionProfile: "default",
+      sourcePolicy: "prefer-existing",
+      executionLocation: "local",
+      priority: "high",
+      dispatchStatus: "active",
+      createdBy: "019fbb95-cd76-7920-93fa-e23ba755ee36",
+      version: 1,
+      createdAt: liveTime,
+      updatedAt: liveTime,
+    },
+    items: [
+      {
+        id: liveItem,
+        batchId,
+        inputIndex: 0,
+        input: `https://www.youtube.com/watch?v=${youtubeVideoId}`,
+        youtubeVideoId,
+        canonicalUrl: `https://www.youtube.com/watch?v=${youtubeVideoId}`,
+        catalogVideoId: catalogVideo,
+        status: "ready",
+        processingNeed: "transcription",
+        state,
+        ...(state === "ready_for_review"
+          ? { activeTranscriptVersionId: liveVersion }
+          : {}),
+        reviewStatus: "unreviewed",
+        attempt: 0,
+        version: 1,
+        createdAt: liveTime,
+        updatedAt: liveTime,
+        ...overrides,
+      },
+    ],
+    summary: {
+      total: 1,
+      ready: 1,
+      existingTranscripts: 0,
+      duplicates: 0,
+      unsupported: 0,
+      metadataFailed: 0,
+    },
+    progress: {
+      total: 1,
+      queued: 0,
+      active: state === "transcribing" ? 1 : 0,
+      readyForReview: state === "ready_for_review" ? 1 : 0,
+      blocked: 0,
+      failed: state === "failed" ? 1 : 0,
+      retryableFailed: 0,
+      canceled: 0,
+      unreviewed: 1,
+      reviewing: 0,
+      reviewed: 0,
+      skipped: 0,
+    },
+  };
+}
+
+function verifiedFixture(videoId: string, kind: "caption" | "asr") {
+  const original = kind === "caption" ? captionFixture : englishFixture;
+  const transcript = normalizeTranscriptFixture({
+    ...original,
+    track: {
+      ...original.track,
+      videoId,
+      ...(kind === "asr" ? { timingPrecision: "cue" } : {}),
+    },
+    tokens:
+      kind === "asr"
+        ? original.tokens.map(
+            ({ startMs: _start, endMs: _end, ...token }) => token,
+          )
+        : original.tokens,
+  });
+  return {
+    transcriptVersionId: liveVersion,
+    source: "verified-local-cache",
+    transcript,
+  };
+}
+
+async function connectFakeProject(page: Page, projects = [liveProject]) {
+  await page.route("**/cloud-api/api/projects", (route) =>
+    route.fulfill({
+      json: projects.map((id, index) => ({
+        id,
+        name: index === 0 ? "Personal research" : "Second research",
+        description: "",
+        version: 1,
+        createdAt: liveTime,
+        updatedAt: liveTime,
+      })),
+    }),
+  );
+  await page.goto("/");
+  await page
+    .getByLabel("Development session credential")
+    .fill("Bearer 019fbb95-cd76-7920-93fa-e23ba755ee36|fixture:web");
+  await page.getByRole("button", { name: "Connect" }).click();
+  await expect(page.getByLabel("Target project")).toHaveValue(projects[0]!);
+}
+
+test("a normal launch never substitutes the API demo transcript", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await expect(
+    page.getByRole("heading", { name: "Load a video" }),
+  ).toBeVisible();
+  await expect(page.getByText(/navigation fixture/i)).toHaveCount(0);
+});
+
+for (const source of ["caption", "asr", "failed"] as const) {
+  test(`immediate ${source} workflow uses the exact batch and verified local transcript`, async ({
+    page,
+  }) => {
+    let postCount = 0;
+    let exactPolls = 0;
+    let localGets = 0;
+    await page.route("**/cloud-api/api/projects/**", (route) => {
+      const request = route.request();
+      const path = new URL(request.url()).pathname;
+      if (path.endsWith("/review-inbox"))
+        return route.fulfill({ json: { items: [] } });
+      if (
+        path.endsWith("/transcription-batches") &&
+        request.method() === "GET"
+      ) {
+        const failed = fakeBatch(liveProject, liveBatch, liveVideo, "failed", {
+          error: {
+            code: "worker_execution_failed",
+            message: "/private/model/token SECRET",
+          },
+        });
+        return route.fulfill({
+          json: {
+            batches:
+              source === "failed"
+                ? [{ batch: failed.batch, progress: failed.progress }]
+                : [],
+          },
+        });
+      }
+      if (
+        path.endsWith("/transcription-batches") &&
+        request.method() === "POST"
+      ) {
+        postCount += 1;
+        expect(request.postDataJSON()).toMatchObject({
+          inputs: [`https://www.youtube.com/watch?v=${liveVideo}`],
+          targetLanguage: "en",
+          executionLocation: "local",
+          sourcePolicy: "prefer-existing",
+        });
+        return route.fulfill({
+          json: fakeBatch(
+            liveProject,
+            liveBatch,
+            liveVideo,
+            source === "asr"
+              ? "transcribing"
+              : source === "failed"
+                ? "failed"
+                : "ready_for_review",
+            source === "failed"
+              ? {
+                  error: {
+                    code: "worker_execution_failed",
+                    message: "/private/model/token SECRET",
+                  },
+                }
+              : {},
+          ),
+        });
+      }
+      if (path.endsWith(`/transcription-batches/${liveBatch}`)) {
+        exactPolls += 1;
+        return route.fulfill({
+          json: fakeBatch(
+            liveProject,
+            liveBatch,
+            liveVideo,
+            source === "failed" ? "failed" : "ready_for_review",
+            source === "failed"
+              ? {
+                  error: {
+                    code: "worker_execution_failed",
+                    message: "/private/model/token SECRET",
+                  },
+                }
+              : {},
+          ),
+        });
+      }
+      return route.fulfill({ status: 404, json: {} });
+    });
+    await page.route("**/local-agent/api/projects/**", (route) => {
+      localGets += 1;
+      expect(new URL(route.request().url()).pathname).toBe(
+        `/local-agent/api/projects/${liveProject}/videos/${catalogVideo}/transcript`,
+      );
+      return route.fulfill({
+        json: verifiedFixture(liveVideo, source === "asr" ? "asr" : "caption"),
+      });
+    });
+    await connectFakeProject(page);
+    await page
+      .getByLabel("YouTube URL or video ID")
+      .fill(`https://youtu.be/${liveVideo}`);
+    await page.getByRole("button", { name: "Load video" }).click();
+    if (source === "failed") {
+      await expect(
+        page
+          .getByText(
+            "Transcript processing failed; check the local worker and retry.",
+          )
+          .first(),
+      ).toBeVisible();
+      expect(localGets).toBe(0);
+      await expect(page.getByText("/private/model/token SECRET")).toHaveCount(
+        0,
+      );
+      await expect(page.getByTestId("transcript-window-row")).toHaveCount(0);
+    } else {
+      await expect(
+        page.getByText("Verified English transcript ready.").first(),
+      ).toBeVisible();
+      await expect(page.getByTestId("transcript-window-row")).toHaveCount(
+        source === "caption" ? 3 : 2,
+      );
+      await expect(
+        page.getByText(/test fixture—not|Navigation fixture for the API demo/),
+      ).toHaveCount(0);
+      if (source === "caption") {
+        await page.getByRole("button", { name: "closely" }).click();
+        await expect(
+          page.getByText(/Exact caption start requested 11.840s/),
+        ).toBeVisible();
+        await expect
+          .poll(() =>
+            page.evaluate(() => Reflect.get(window, "__lastSeekSeconds")),
+          )
+          .toBe(11.84);
+      } else {
+        await page
+          .getByRole("button", { name: "any word", exact: true })
+          .click();
+        await expect(page.getByText("Cue requested 0:01.")).toBeVisible();
+        await expect
+          .poll(() =>
+            page.evaluate(() => Reflect.get(window, "__lastSeekSeconds")),
+          )
+          .toBe(1.8);
+        expect(exactPolls).toBeGreaterThan(0);
+      }
+      expect(localGets).toBe(1);
+    }
+    expect(postCount).toBe(1);
+  });
+}
+
+test("switching project and video discards late transcript responses", async ({
+  page,
+}) => {
+  const otherVideo = "abcdefghijk";
+  let releaseFirst!: () => void;
+  const holdFirst = new Promise<void>((resolve) => {
+    releaseFirst = resolve;
+  });
+  let firstRead = 0;
+  const submitted: string[] = [];
+
+  await page.route("**/cloud-api/api/projects/**", (route) => {
+    const request = route.request();
+    const path = new URL(request.url()).pathname;
+    if (path.endsWith("/review-inbox"))
+      return route.fulfill({ json: { items: [] } });
+    if (path.endsWith("/transcription-batches") && request.method() === "GET")
+      return route.fulfill({ json: { batches: [] } });
+    if (
+      path.endsWith("/transcription-batches") &&
+      request.method() === "POST"
+    ) {
+      const projectId = path.split("/")[4]!;
+      const submittedVideo = new URL(
+        request.postDataJSON().inputs[0],
+      ).searchParams.get("v")!;
+      submitted.push(`${projectId}:${submittedVideo}`);
+      return route.fulfill({
+        json: fakeBatch(
+          projectId,
+          liveBatch,
+          submittedVideo,
+          "ready_for_review",
+        ),
+      });
+    }
+    return route.fulfill({ status: 404, json: {} });
+  });
+
+  await page.route("**/local-agent/api/projects/**", async (route) => {
+    const path = new URL(route.request().url()).pathname;
+    if (path.includes(`/projects/${liveProject}/`)) {
+      firstRead += 1;
+      await holdFirst;
+      try {
+        await route.fulfill({ json: verifiedFixture(liveVideo, "caption") });
+      } catch {
+        // The old request was intentionally aborted on project change.
+      }
+    } else {
+      const videoId = submitted.at(-1)!.split(":")[1]!;
+      await route.fulfill({
+        json: verifiedFixture(
+          videoId,
+          videoId === otherVideo ? "caption" : "asr",
+        ),
+      });
+    }
+  });
+
+  await connectFakeProject(page, [liveProject, secondProject]);
+  await page.getByLabel("YouTube URL or video ID").fill(liveVideo);
+  await page.getByRole("button", { name: "Load video" }).click();
+  await expect.poll(() => firstRead).toBe(1);
+
+  await page.getByLabel("Target project").selectOption(secondProject);
+  await expect(
+    page.getByRole("button", { name: "fixture", exact: true }),
+  ).toBeVisible();
+  await expect(page.getByRole("button", { name: "closely" })).toHaveCount(0);
+  releaseFirst();
+  await expect(
+    page.getByRole("button", { name: "fixture", exact: true }),
+  ).toBeVisible();
+
+  await page.getByLabel("YouTube URL or video ID").fill(otherVideo);
+  await page.getByRole("button", { name: "Load video" }).click();
+  await expect(page.getByRole("button", { name: "closely" })).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "fixture", exact: true }),
+  ).toHaveCount(0);
+  expect(submitted).toEqual([
+    `${liveProject}:${liveVideo}`,
+    `${secondProject}:${liveVideo}`,
+    `${secondProject}:${otherVideo}`,
+  ]);
+});
+
+test("rejects a mismatched immutable version without showing any transcript", async ({
+  page,
+}) => {
+  await page.route("**/cloud-api/api/projects/**", (route) => {
+    const path = new URL(route.request().url()).pathname;
+    if (path.endsWith("/review-inbox"))
+      return route.fulfill({ json: { items: [] } });
+    if (
+      path.endsWith("/transcription-batches") &&
+      route.request().method() === "GET"
+    )
+      return route.fulfill({ json: { batches: [] } });
+    if (
+      path.endsWith("/transcription-batches") &&
+      route.request().method() === "POST"
+    )
+      return route.fulfill({
+        json: fakeBatch(liveProject, liveBatch, liveVideo, "ready_for_review"),
+      });
+    return route.fulfill({ status: 404, json: {} });
+  });
+  await page.route("**/local-agent/api/projects/**", (route) =>
+    route.fulfill({
+      json: {
+        ...verifiedFixture(liveVideo, "caption"),
+        transcriptVersionId: "019fbb95-cd76-7920-93fa-e23ba755ee99",
+      },
+    }),
+  );
+  await connectFakeProject(page);
+  await page.getByLabel("YouTube URL or video ID").fill(liveVideo);
+  await page.getByRole("button", { name: "Load video" }).click();
+  await expect(
+    page.getByText(/Unable to load a verified transcript/).first(),
+  ).toBeVisible();
+  await expect(page.getByTestId("transcript-window-row")).toHaveCount(0);
+  await expect(page.getByText("closely", { exact: true })).toHaveCount(0);
+});
+
+for (const mismatch of ["project", "video", "batch"] as const) {
+  test(`refuses a ${mismatch} identity mismatch before reading local transcript`, async ({
+    page,
+  }) => {
+    let localGets = 0;
+    const ready = fakeBatch(
+      liveProject,
+      liveBatch,
+      liveVideo,
+      "ready_for_review",
+    );
+    const invalid = {
+      ...ready,
+      batch: {
+        ...ready.batch,
+        ...(mismatch === "project" ? { projectId: secondProject } : {}),
+      },
+      items: ready.items.map((item) => ({
+        ...item,
+        ...(mismatch === "video" ? { youtubeVideoId: "abcdefghijk" } : {}),
+        ...(mismatch === "batch" ? { batchId: secondProject } : {}),
+      })),
+    };
+    await page.route("**/cloud-api/api/projects/**", (route) => {
+      const path = new URL(route.request().url()).pathname;
+      if (path.endsWith("/review-inbox"))
+        return route.fulfill({ json: { items: [] } });
+      if (
+        path.endsWith("/transcription-batches") &&
+        route.request().method() === "GET"
+      )
+        return route.fulfill({ json: { batches: [] } });
+      if (
+        path.endsWith("/transcription-batches") &&
+        route.request().method() === "POST"
+      )
+        return route.fulfill({ json: invalid });
+      return route.fulfill({ status: 404, json: {} });
+    });
+    await page.route("**/local-agent/api/projects/**", (route) => {
+      localGets += 1;
+      return route.fulfill({ json: verifiedFixture(liveVideo, "caption") });
+    });
+    await connectFakeProject(page);
+    await page.getByLabel("YouTube URL or video ID").fill(liveVideo);
+    await page.getByRole("button", { name: "Load video" }).click();
+    await expect(
+      page.getByText(/Unable to load a verified transcript/).first(),
+    ).toBeVisible();
+    expect(localGets).toBe(0);
+    await expect(page.getByTestId("transcript-window-row")).toHaveCount(0);
+  });
+}
 
 test.beforeEach(async ({ page }) => {
   await page.addInitScript(() => {
@@ -42,7 +509,7 @@ test.beforeEach(async ({ page }) => {
 test("loads a canonical YouTube video and seeks from its transcript", async ({
   page,
 }) => {
-  await page.goto("/");
+  await page.goto("/?fixture=english-word");
 
   await expect(
     page.getByRole("heading", { name: "Navigate video by transcript" }),
@@ -411,7 +878,7 @@ test("maps transcript text selection to stable source and export bounds", async 
       },
     });
   });
-  await page.goto("/");
+  await page.goto("/?fixture=english-word");
   await page.getByRole("button", { name: "Load video" }).click();
 
   await page.evaluate(() => {

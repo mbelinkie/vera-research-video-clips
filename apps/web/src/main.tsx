@@ -4,10 +4,12 @@ import ReactDOM from "react-dom/client";
 import {
   ApiErrorSchema,
   ClipCandidateSchema,
+  CreateTranscriptionBatchResponseSchema,
   ExportPresetSnapshotSchema,
   ExportRequestSchema,
   ProjectSchema,
   type ClipCandidate,
+  type NormalizedTranscript,
   type Project,
   type TranscriptSelection,
 } from "@research-video/contracts";
@@ -26,7 +28,18 @@ import autoWordTimedFixture from "../../../tests/fixtures/transcripts/auto-word-
 
 import "./styles.css";
 import { BatchWorkspace } from "./batch-workspace.tsx";
-import { browserMode, cloudFetch, type BrowserSession } from "./browser-api.ts";
+import {
+  browserMode,
+  cloudFetch,
+  managedResearch,
+  managedResearchSession,
+  type BrowserSession,
+} from "./browser-api.ts";
+import {
+  immediateBatchRequest,
+  immediateProgress,
+  verifiedEnglishTranscript,
+} from "./immediate-transcript.ts";
 import { YouTubePlayer, type YouTubePlayerHandle } from "./youtube-player.tsx";
 import {
   VirtualTranscript,
@@ -36,9 +49,10 @@ import {
 const demoVideoId = "M7lc1UVf-VE";
 const demoUrl = `https://www.youtube.com/watch?v=${demoVideoId}`;
 // Explicit fixture-only route for deterministic browser acceptance, not live YouTube ingestion.
-const timedCaptionDemo =
-  new URLSearchParams(window.location.search).get("fixture") ===
-  "auto-word-timed";
+const fixtureMode = new URLSearchParams(window.location.search).get("fixture");
+const explicitFixture =
+  fixtureMode === "english-word" || fixtureMode === "auto-word-timed";
+const timedCaptionDemo = fixtureMode === "auto-word-timed";
 
 function formatTime(milliseconds: number) {
   const totalSeconds = Math.floor(milliseconds / 1_000);
@@ -52,8 +66,19 @@ function formatPreciseTime(milliseconds: number) {
 }
 
 function App() {
-  const [url, setUrl] = useState(demoUrl);
+  const [url, setUrl] = useState(explicitFixture ? demoUrl : "");
   const [videoId, setVideoId] = useState<string>();
+  const [loadRequest, setLoadRequest] = useState<{
+    videoId: string;
+    canonicalUrl: string;
+    id: string;
+  }>();
+  const [resolvedTranscript, setResolvedTranscript] = useState<{
+    requestId: string;
+    projectId: string;
+    transcript: NormalizedTranscript;
+  }>();
+  const [transcriptStatus, setTranscriptStatus] = useState("");
   const [error, setError] = useState<string>();
   const [query, setQuery] = useState("");
   const [matchIndex, setMatchIndex] = useState(0);
@@ -68,12 +93,22 @@ function App() {
   const [sessionIssue, setSessionIssue] = useState<string>();
   const [sessionBusy, setSessionBusy] = useState(false);
   const [displayName, setDisplayName] = useState("");
+  const [managedCsrf, setManagedCsrf] = useState<string>();
+  const [managedIssue, setManagedIssue] = useState<string>();
   const authorization = browserMode
     ? session?.authenticated && session.registered
       ? "session"
       : ""
-    : devAuthorization;
-  const csrfToken = session?.authenticated ? session.csrfToken : undefined;
+    : managedResearch
+      ? managedCsrf
+        ? "managed-local"
+        : ""
+      : devAuthorization;
+  const csrfToken = managedResearch
+    ? managedCsrf
+    : session?.authenticated
+      ? session.csrfToken
+      : undefined;
   function clearPrivateState() {
     setProjects([]);
     setProjectId("");
@@ -81,6 +116,9 @@ function App() {
     setLoggedExportRequestId(undefined);
     setSelection(undefined);
     setVideoId(undefined);
+    setLoadRequest(undefined);
+    setResolvedTranscript(undefined);
+    setTranscriptStatus("");
     setClipActionMessage(undefined);
     setProjectMessage(undefined);
   }
@@ -91,6 +129,23 @@ function App() {
       "Session expired or Mac unavailable. Retry the connection or sign in again.",
     );
   }
+  function loseManagedConnection() {
+    clearPrivateState();
+    setManagedCsrf(undefined);
+    setManagedIssue("Local Research disconnected. Reconnect to continue.");
+  }
+  async function connectManaged() {
+    try {
+      const token = await managedResearchSession();
+      setManagedCsrf(token);
+      setManagedIssue(undefined);
+    } catch {
+      loseManagedConnection();
+    }
+  }
+  useEffect(() => {
+    if (managedResearch) void connectManaged();
+  }, []);
   async function loadSession() {
     try {
       const response = await fetch("/cloud-api/api/session", {
@@ -197,13 +252,135 @@ function App() {
   const [embedEnglishSubtitles, setEmbedEnglishSubtitles] = useState(false);
   const playerRef = useRef<YouTubePlayerHandle>(null);
   const transcript = useMemo(() => {
-    if (videoId !== demoVideoId) return undefined;
-    const fixture = timedCaptionDemo ? autoWordTimedFixture : transcriptFixture;
-    return normalizeTranscriptFixture({
-      ...fixture,
-      track: { ...fixture.track, videoId: demoVideoId },
-    });
-  }, [videoId]);
+    if (explicitFixture && videoId === demoVideoId) {
+      const fixture = timedCaptionDemo
+        ? autoWordTimedFixture
+        : transcriptFixture;
+      return normalizeTranscriptFixture({
+        ...fixture,
+        track: { ...fixture.track, videoId: demoVideoId },
+      });
+    }
+    return resolvedTranscript &&
+      loadRequest &&
+      resolvedTranscript.requestId === loadRequest.id &&
+      resolvedTranscript.projectId === projectId
+      ? resolvedTranscript.transcript
+      : undefined;
+  }, [videoId, loadRequest, resolvedTranscript, projectId]);
+
+  useEffect(() => {
+    if (!loadRequest || explicitFixture) return;
+    if (!authorization || !projectId) {
+      setTranscriptStatus(
+        "Connect and choose a project to load its transcript.",
+      );
+      return;
+    }
+    const controller = new AbortController();
+    let canceled = false;
+    const active = () => !canceled && !controller.signal.aborted;
+    const auth = {
+      authorization,
+      csrfToken,
+      onUnavailable: browserMode
+        ? loseSession
+        : managedResearch
+          ? loseManagedConnection
+          : undefined,
+    };
+    const requestJson = async (path: string, init: RequestInit = {}) => {
+      const response = await cloudFetch(
+        path,
+        { ...init, signal: controller.signal },
+        auth,
+      );
+      if (!response.ok) throw new Error("Research request failed.");
+      return (await response.json()) as unknown;
+    };
+    const readBatch = (payload: unknown, expectedBatchId?: string) => {
+      const batch = CreateTranscriptionBatchResponseSchema.parse(payload);
+      const item = batch.items[0];
+      if (
+        batch.batch.projectId !== projectId ||
+        (expectedBatchId && batch.batch.id !== expectedBatchId) ||
+        batch.items.length !== 1 ||
+        !item ||
+        item.batchId !== batch.batch.id ||
+        item.youtubeVideoId !== loadRequest.videoId
+      )
+        throw new Error("Batch identity mismatch.");
+      return { batch, item };
+    };
+    async function hydrate() {
+      try {
+        setResolvedTranscript(undefined);
+        setTranscriptStatus("Submitting the video for transcript review.");
+        const initial = readBatch(
+          await requestJson(
+            `/cloud-api/api/projects/${projectId}/transcription-batches`,
+            {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify(
+                immediateBatchRequest(loadRequest!.canonicalUrl),
+              ),
+            },
+          ),
+        );
+        let item = initial.item;
+        while (active()) {
+          const progress = immediateProgress(item);
+          if (progress.kind === "failed") {
+            setTranscriptStatus(progress.message);
+            return;
+          }
+          if (progress.kind === "ready") {
+            if (progress.youtubeVideoId !== loadRequest!.videoId)
+              throw new Error("Ready video identity mismatch.");
+            setTranscriptStatus("Opening the verified transcript.");
+            const payload = await requestJson(
+              `/local-agent/api/projects/${projectId}/videos/${progress.catalogVideoId}/transcript`,
+            );
+            const verified = verifiedEnglishTranscript(payload, {
+              youtubeVideoId: loadRequest!.videoId,
+              transcriptVersionId: progress.transcriptVersionId,
+            });
+            if (active()) {
+              setResolvedTranscript({
+                requestId: loadRequest!.id,
+                projectId,
+                transcript: verified,
+              });
+              setTranscriptStatus("Verified English transcript ready.");
+            }
+            return;
+          }
+          setTranscriptStatus(progress.message);
+          await new Promise((resolve) => window.setTimeout(resolve, 1_000));
+          if (!active()) return;
+          item = readBatch(
+            await requestJson(
+              `/cloud-api/api/projects/${projectId}/transcription-batches/${initial.batch.batch.id}`,
+            ),
+            initial.batch.batch.id,
+          ).item;
+        }
+      } catch {
+        if (active())
+          setTranscriptStatus(
+            "Unable to load a verified transcript. Check the local Research service and retry.",
+          );
+      }
+    }
+    // Avoid StrictMode's throwaway effect creating a duplicate batch POST.
+    const start = window.setTimeout(() => void hydrate(), 0);
+    return () => {
+      canceled = true;
+      window.clearTimeout(start);
+      controller.abort();
+    };
+  }, [loadRequest, projectId, authorization, csrfToken]);
   const hasDerivedCaptionEnds =
     transcript?.track.source === "youtube-auto" &&
     transcript.tokens.some((token) => token.endTiming === "derived");
@@ -291,6 +468,13 @@ function App() {
     try {
       const normalized = normalizeYouTubeUrl(nextUrl);
       setVideoId(normalized.videoId);
+      setLoadRequest({
+        videoId: normalized.videoId,
+        canonicalUrl: normalized.canonicalUrl,
+        id: crypto.randomUUID(),
+      });
+      setResolvedTranscript(undefined);
+      setTranscriptStatus("");
       setUrl(normalized.canonicalUrl);
       setCurrentMs(0);
       setLastSeekMs(undefined);
@@ -662,6 +846,15 @@ function App() {
         <span className="status">Milestone 4 in progress</span>
       </header>
 
+      {managedResearch && managedIssue && (
+        <div className="session-panel" role="alert">
+          {managedIssue}{" "}
+          <button type="button" onClick={() => void connectManaged()}>
+            Reconnect
+          </button>
+        </div>
+      )}
+
       <form
         className="loader"
         onSubmit={(event) => {
@@ -681,7 +874,10 @@ function App() {
         </div>
         <p className={error ? "form-message error" : "form-message"}>
           {error ??
-            "The included API demo opens with a short navigation fixture; other valid videos load without inventing a transcript."}
+            (explicitFixture
+              ? "Explicit navigation test fixture; not a real video transcript."
+              : transcriptStatus ||
+                "Paste an authorized YouTube link to load its verified transcript.")}
         </p>
       </form>
 
@@ -710,11 +906,13 @@ function App() {
 
           {transcript ? (
             <>
-              <div className="fixture-warning">
-                {timedCaptionDemo
-                  ? "Timed auto-caption test fixture—not the video's transcript or an acoustic alignment."
-                  : "Navigation fixture for the API demo—not a transcript of the video."}
-              </div>
+              {explicitFixture && (
+                <div className="fixture-warning">
+                  {timedCaptionDemo
+                    ? "Timed auto-caption test fixture—not the video's transcript or an acoustic alignment."
+                    : "Navigation fixture for the API demo—not a transcript of the video."}
+                </div>
+              )}
               <div className="search-field">
                 <label htmlFor="transcript-search">Search transcript</label>
                 <input
@@ -785,11 +983,12 @@ function App() {
           ) : (
             <div className="empty-state">
               <span className="step">01</span>
-              <h2>{videoId ? "No shared transcript yet" : "Load a video"}</h2>
+              <h2>{videoId ? "Preparing transcript" : "Load a video"}</h2>
               <p>
                 {videoId
-                  ? "This slice will not invent transcript text. Shared transcript resolution is the next connection."
-                  : "Paste a supported YouTube URL to create a canonical video identity."}
+                  ? transcriptStatus ||
+                    "Connect and choose a project to load its transcript."
+                  : "Paste an authorized YouTube URL to review its transcript."}
               </p>
             </div>
           )}
@@ -1220,9 +1419,11 @@ function App() {
       </section>
       <BatchWorkspace
         authorization={authorization}
-        browserSession={browserMode}
+        browserSession={browserMode || managedResearch}
         csrfToken={csrfToken}
-        onAuthUnavailable={loseSession}
+        onAuthUnavailable={
+          managedResearch ? loseManagedConnection : loseSession
+        }
         onAuthorizationChange={(value) => {
           setDevAuthorization(value);
           setProjects([]);

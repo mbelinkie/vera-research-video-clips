@@ -44,7 +44,7 @@ starts continuously even with no opt-in caption/recognizer tools; missing
 recognition is terminal and no transcript is invented.
 
 Phase 3 browser wiring: detect `import.meta.env.VITE_MANAGED_RESEARCH === "true"`;
-fetch same-origin `GET /__research/session` to obtain a *CSRF token only* (not
+fetch same-origin `GET /__research/session` to obtain a _CSRF token only_ (not
 the bearer), then send `x-vera-csrf` on mutation requests (the browser supplies
 the matching `Origin` header)
 through `/cloud-api/api/*` and `/local-agent/api/*`. Vite injects the private
