@@ -85,3 +85,34 @@ On the isolated Linux pipeline worktree:
 
 Subsequent phases will update this spec with their own verified evidence
 before completion. No network video or Resolve check was attempted in phase 1.
+
+## Phase 2 evidence
+
+- Added distinct **opt-in** yt-dlp full-MP4 acquisition, FFprobe media
+  inspection, and exact-range FFmpeg H.264/AAC rendering ports; existing
+  transcription/audio acquisition remains separate. Spawned commands use
+  no shell, bounded output, timeout, cancellation and credential/URL error
+  sanitization. Scratch and output files reject symlinks and hardlinks.
+- Added an injected foreground cutter that authorizes and pins every requested
+  clip/track before acquiring media, groups one active acquisition per source,
+  rejects overlong cuts or wrong codecs, stages hashed MP4/SRT/manifest
+  artifacts in private directories, refuses overwrites and promotes validated
+  packages. It removes/validates absence of full-source scratch on all normal
+  success/error paths; a cleanup error **rejects** the entire call.
+- `npx vitest run packages/media/src/index.test.ts apps/local-agent/src/clip-cutter.test.ts --maxWorkers=1`:
+  17/17 passing (two same-source clips / one fetch; different sources;
+  authorization/rights/version/bounds; English/Spanish SRTs; no leftovers
+  after failure; cleanup failure not success; output collision; timeout).
+- `npm run typecheck`: passed. `git diff --check`: passed.
+- `npm run check`: passed, including Prettier, typecheck, 189 passing tests
+  (4 intentionally skipped), web build, four local and eight cloud migrations.
+- A temporary authorization-guard mutation replacing `z.literal(true)` with
+  `z.boolean()` made the rights-refusal test fail; the original guard was
+  restored before the passing full suite. No authorized live video, real
+  tool execution, or Mac playback has been attempted in phase 2.
+
+Phase 3 will compose these ports with authenticated cloud catalog and verified
+cache readers, then expose the CLI and loopback endpoint. A separate later
+request may redownload: no cross-invocation full-source cache is retained.
+If source cleanup fails **after** verified promotion, the package may remain
+for operator recovery but the API must not report success or overwrite it.
