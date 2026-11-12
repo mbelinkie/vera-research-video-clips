@@ -1,6 +1,6 @@
 # R1 / #20 — Cut an authorized logged clip to a local file
 
-- Status: active (pipeline phase 1 of 4)
+- Status: completed for the bounded foreground implementation (2026-11-12); live authorized Mac acceptance remains unverified
 - Task/thread: issue #20 only; branch from `origin/main`
 
 ## User-visible outcome
@@ -116,3 +116,62 @@ cache readers, then expose the CLI and loopback endpoint. A separate later
 request may redownload: no cross-invocation full-source cache is retained.
 If source cleanup fails **after** verified promotion, the package may remain
 for operator recovery but the API must not report success or overwrite it.
+
+## Phase 3 evidence
+
+- Commit `7033ca3` added the CLI, loopback POST route, registered project-member
+  cloud clip fetch and verified cached-transcript composition, separate
+  disabled-by-default full-source configuration, tests and README instructions.
+- Focused CLI, route and runtime checks passed (38 tests prior to the final
+  route assertion). `npm run check` passed: 203 tests, 4 skipped, Vite build,
+  4 local and 8 cloud migrations.
+- The disabled-provider CLI was invoked with fixed IDs; it exited nonzero with
+  one actionable sentence instead of acquiring media.
+
+## Phase 4 evidence and completion record
+
+- Recovered a clean worktree on `7033ca3`; no usable uncommitted changes or
+  abandoned phase-4 handoff existed.
+- `npx vitest run packages/transcript/src/index.test.ts packages/sync/src/index.test.ts packages/media/src/index.test.ts apps/local-agent/src/clip-cutter.test.ts apps/local-agent/src/clip-cut-runtime.test.ts apps/local-agent/src/clip-cut-cli.test.ts apps/local-agent/src/app.test.ts --maxWorkers=1`: **65 tests passed** in 7 files before the added regression case.
+- `CI=1 npm run check`: **passed twice**, including Prettier, TypeScript,
+  **203 tests passed / 4 skipped** before the extra regression and **204 passed
+  / 4 skipped** on the final full gate, Vite web build, 4 local migration
+  applications and 8 cloud migration applications.
+- Added a regression test proving a cleanup callback that _returns successfully
+  without deleting source_ must still reject the call; `npx vitest run
+apps/local-agent/src/clip-cutter.test.ts --maxWorkers=1`: **10/10 passed**.
+  Commit `5e4300c` records this test.
+- Reversible, one-at-a-time mutations of the bearer guard, exact English track
+  version guard, no-overwrite pre-acquisition guard and verified-source-deletion
+  guard made their targeted fake tests **fail in all four cases**. Each original
+  guard was restored, and the focused cutter suite passed afterward. Transcript
+  artifact/manifest integrity is also covered by the 9 sync tests; no mutations
+  remain in the worktree.
+- **Mac tool check:** The isolated Mac workspace exposed `ffmpeg`, `ffprobe`
+  and `yt-dlp`, but launching its `ffmpeg` binary exited 134 because macOS
+  Seatbelt blocked loading `libvmaf.3.dylib`. The Linux worktree has no usable
+  FFmpeg/FFprobe binaries. The Mac sandbox is network-denied, and no registered
+  member bearer, rights-cleared logged clip IDs or independently authorized
+  source were supplied. **No real yt-dlp source fetch, two-clip FFprobe smoke,
+  native playback or first/last audible-word check is claimed.** Those are
+  required for later producer-side real-source acceptance; do not infer them
+  from injected media fakes.
+
+### Implementation decisions and limits
+
+- Authenticated logged clip lookup precedes any download. Exact verified
+  transcript evidence, export bounds and required languages are pinned; a
+  newer active version is not silently substituted. One invocation shares one
+  ephemeral acquisition per source, while a later invocation may redownload.
+- Completed MP4/SRT/manifest bytes are verified and output folders refuse
+  overwrite. No successful response is emitted until source scratch deletion
+  is independently verified. A previously promoted clip can remain after a
+  different clip fails or cleanup fails, for manual recovery; a subsequent
+  invocation refuses to overwrite it.
+- This is a bounded **foreground** path, not the full queued M5 worker,
+  resumable crash sweeper, new editor UI, arbitrary source provider or cloud
+  export/preset system. `outline.md` leaves those broader milestone checks open.
+- Implementation files: `apps/local-agent/src/{app,main,clip-cut-cli,clip-cut-runtime,clip-cutter}*`,
+  `packages/{config,media,sync,transcript}/src/*`, `.env.example`, `README.md`
+  and `package.json`. Commits: `197a1b8`, `853bc52`, `c0ffe7c`, `7033ca3`,
+  `5e4300c` (plus the final completion-record commit).
