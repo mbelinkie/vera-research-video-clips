@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 
+import type { PGlite } from "@electric-sql/pglite";
 import {
   AuthenticationError,
   AuthorizationError,
@@ -14,6 +15,7 @@ import {
   CreateTranscriptionBatchResponseSchema,
   ExportRequestSchema,
   JobSchema,
+  ProjectMemberSchema,
   ProjectSchema,
   ReviewInboxItemSchema,
   ReviewInboxResponseSchema,
@@ -36,6 +38,7 @@ import {
   type FinalizeTranscriptRequest,
   type ExportRequest,
   type Project,
+  type ProjectMember,
   type ProjectRole,
   type TranscriptArtifact,
   type TranscriptUploadGrant,
@@ -622,29 +625,197 @@ export class SharedProjectCatalog {
     return mapProject(result.rows[0]);
   }
 
+  async listMembers(
+    actor: AuthenticatedActor,
+    projectId: string,
+  ): Promise<ProjectMember[]> {
+    await this.authorize(actor, projectId, "manage_members");
+    const found = await this.database.query<DbRow>(
+      `SELECT project_id, user_id, role, version, created_at, updated_at
+       FROM project_members
+       WHERE project_id = $1
+       ORDER BY created_at, user_id`,
+      [projectId],
+    );
+    return found.rows.map((row) =>
+      ProjectMemberSchema.parse({
+        projectId: row.project_id,
+        userId: row.user_id,
+        role: row.role,
+        version: Number(row.version),
+        createdAt: iso(row.created_at),
+        updatedAt: iso(row.updated_at),
+      }),
+    );
+  }
+
   async addMember(
     actor: AuthenticatedActor,
     projectId: string,
     userId: string,
     role: Exclude<ProjectRole, "owner">,
   ): Promise<void> {
-    await this.authorize(actor, projectId, "manage_members");
-    const target = await this.database.query(
-      "SELECT id FROM users WHERE id = $1",
-      [userId],
-    );
-    if (!target.rows[0]) throw new CatalogNotFoundError("User not found.");
-    const now = this.now().toISOString();
-    await this.database.query(
-      `INSERT INTO project_members
-         (project_id, user_id, role, version, created_at, updated_at)
-       VALUES ($1, $2, $3, 1, $4, $4)
-       ON CONFLICT (project_id, user_id) DO UPDATE
-       SET role = EXCLUDED.role,
-           version = project_members.version + 1,
-           updated_at = EXCLUDED.updated_at`,
-      [projectId, userId, role, now],
-    );
+    await this.memberWrite(actor, projectId, async (tx) => {
+      const target = await tx.query("SELECT id FROM users WHERE id = $1", [
+        userId,
+      ]);
+      if (!target.rows[0]) throw new CatalogNotFoundError("User not found.");
+      const existing = await tx.query<{ role: ProjectRole }>(
+        "SELECT role FROM project_members WHERE project_id = $1 AND user_id = $2",
+        [projectId, userId],
+      );
+      if (existing.rows[0]) {
+        if (existing.rows[0].role !== role) {
+          throw new CatalogConflictError(
+            "Member already has a different role; use a versioned role change.",
+          );
+        }
+        return;
+      }
+      const revoked = await tx.query<{ last_version: number }>(
+        "SELECT last_version FROM revoked_project_member_versions WHERE project_id = $1 AND user_id = $2",
+        [projectId, userId],
+      );
+      const nextVersion = revoked.rows[0]
+        ? Number(revoked.rows[0].last_version) + 1
+        : 1;
+      const now = this.now().toISOString();
+      await tx.query(
+        `INSERT INTO project_members
+           (project_id, user_id, role, version, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $5)`,
+        [projectId, userId, role, nextVersion, now],
+      );
+    });
+  }
+
+  async changeMemberRole(
+    actor: AuthenticatedActor,
+    projectId: string,
+    userId: string,
+    role: "editor" | "viewer",
+    expectedVersion: number,
+  ): Promise<void> {
+    await this.memberWrite(actor, projectId, async (tx) => {
+      const current = await tx.query<{ role: ProjectRole; version: number }>(
+        "SELECT role, version FROM project_members WHERE project_id = $1 AND user_id = $2",
+        [projectId, userId],
+      );
+      const member = current.rows[0];
+      if (!member) throw new CatalogNotFoundError("Member not found.");
+      if (Number(member.version) !== expectedVersion) {
+        throw new CatalogConflictError("Member version has changed.");
+      }
+      if (member.role === role) return;
+      if (member.role === "owner") {
+        const owners = await tx.query<{ count: string }>(
+          "SELECT count(*)::text AS count FROM project_members WHERE project_id = $1 AND role = 'owner'",
+          [projectId],
+        );
+        if (Number(owners.rows[0]?.count) <= 1) {
+          throw new CatalogConflictError("Cannot demote the last Owner.");
+        }
+      }
+      await tx.query(
+        `UPDATE project_members
+         SET role = $1, version = version + 1, updated_at = $2
+         WHERE project_id = $3 AND user_id = $4 AND version = $5`,
+        [role, this.now().toISOString(), projectId, userId, expectedVersion],
+      );
+    });
+  }
+
+  async removeMember(
+    actor: AuthenticatedActor,
+    projectId: string,
+    userId: string,
+    expectedVersion: number,
+  ): Promise<void> {
+    await this.memberWrite(actor, projectId, async (tx) => {
+      const current = await tx.query<{ role: ProjectRole; version: number }>(
+        "SELECT role, version FROM project_members WHERE project_id = $1 AND user_id = $2",
+        [projectId, userId],
+      );
+      const member = current.rows[0];
+      if (!member) throw new CatalogNotFoundError("Member not found.");
+      if (Number(member.version) !== expectedVersion) {
+        throw new CatalogConflictError("Member version has changed.");
+      }
+      if (member.role === "owner") {
+        const owners = await tx.query<{ count: string }>(
+          "SELECT count(*)::text AS count FROM project_members WHERE project_id = $1 AND role = 'owner'",
+          [projectId],
+        );
+        if (Number(owners.rows[0]?.count) <= 1) {
+          throw new CatalogConflictError("Cannot remove the last Owner.");
+        }
+      }
+      // A revoked member may be invited again. Preserve their last version
+      // so that old PATCH/DELETE/transfer preconditions can never target the
+      // new membership, even when the old row has been deleted.
+      await tx.query(
+        `INSERT INTO revoked_project_member_versions(project_id, user_id, last_version)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (project_id, user_id) DO UPDATE
+         SET last_version = GREATEST(revoked_project_member_versions.last_version, EXCLUDED.last_version)`,
+        [projectId, userId, Number(member.version)],
+      );
+      await tx.query(
+        "DELETE FROM project_members WHERE project_id = $1 AND user_id = $2 AND version = $3",
+        [projectId, userId, expectedVersion],
+      );
+    });
+  }
+
+  async transferOwnership(
+    actor: AuthenticatedActor,
+    projectId: string,
+    targetUserId: string,
+    expectedOwnerVersion: number,
+    expectedTargetVersion: number,
+  ): Promise<void> {
+    await this.memberWrite(actor, projectId, async (tx) => {
+      if (targetUserId === actor.userId) {
+        throw new CatalogConflictError(
+          "Cannot transfer ownership to yourself.",
+        );
+      }
+      const owner = await tx.query<{ role: ProjectRole; version: number }>(
+        "SELECT role, version FROM project_members WHERE project_id = $1 AND user_id = $2",
+        [projectId, actor.userId],
+      );
+      if (
+        owner.rows[0]?.role !== "owner" ||
+        Number(owner.rows[0].version) !== expectedOwnerVersion
+      ) {
+        throw new CatalogConflictError("Owner version has changed.");
+      }
+      const target = await tx.query<{ role: ProjectRole; version: number }>(
+        "SELECT role, version FROM project_members WHERE project_id = $1 AND user_id = $2",
+        [projectId, targetUserId],
+      );
+      if (!target.rows[0]) {
+        throw new CatalogNotFoundError("Member not found.");
+      }
+      if (Number(target.rows[0].version) !== expectedTargetVersion) {
+        throw new CatalogConflictError("Target version has changed.");
+      }
+      const now = this.now().toISOString();
+      if (target.rows[0].role !== "owner") {
+        await tx.query(
+          `UPDATE project_members
+           SET role = 'owner', version = version + 1, updated_at = $1
+           WHERE project_id = $2 AND user_id = $3 AND version = $4`,
+          [now, projectId, targetUserId, expectedTargetVersion],
+        );
+      }
+      await tx.query(
+        `UPDATE project_members
+         SET role = 'editor', version = version + 1, updated_at = $1
+         WHERE project_id = $2 AND user_id = $3 AND version = $4`,
+        [now, projectId, actor.userId, expectedOwnerVersion],
+      );
+    });
   }
 
   async addVideo(
@@ -2014,6 +2185,55 @@ export class SharedProjectCatalog {
       throw new CatalogConflictError("The worker lease is stale or expired.");
     }
     return lease;
+  }
+
+  // All membership mutations must use this transaction boundary: lock the
+  // project row, then re-check the actor, target versions and remaining Owners
+  // before writing. A native PostgreSQL adapter must run the callback on one
+  // checked-out connection (no pool.query) so the lock and writes stay affine.
+  private async memberWrite(
+    actor: AuthenticatedActor,
+    projectId: string,
+    action: (tx: Pick<SqlDatabase, "query">) => Promise<void>,
+  ): Promise<void> {
+    const lockedMutation = async (tx: Pick<SqlDatabase, "query">) => {
+      const lockedProject = await tx.query(
+        "SELECT id FROM projects WHERE id = $1 FOR UPDATE",
+        [projectId],
+      );
+      if (!lockedProject.rows[0]) {
+        throw new AuthorizationError("You do not have access to this project.");
+      }
+      const registered = await tx.query(
+        "SELECT 1 FROM users WHERE id = $1 AND external_subject = $2",
+        [actor.userId, actor.externalSubject],
+      );
+      if (!registered.rows[0]) {
+        throw new AuthorizationError("You do not have access to this project.");
+      }
+      const membership = await tx.query<{ role: ProjectRole }>(
+        "SELECT role FROM project_members WHERE project_id = $1 AND user_id = $2",
+        [projectId, actor.userId],
+      );
+      requirePermission(membership.rows[0]?.role, "manage_members");
+      await action(tx);
+    };
+
+    // #50's PostgreSQL adapter leases one client for the entire callback;
+    // every query here must use that same connection. Embedded PGlite has a
+    // different transaction API: its callback receives the transactional
+    // query handle and querying the original database would deadlock.
+    if (this.database.withTransaction) {
+      await this.database.withTransaction(() => lockedMutation(this.database));
+    } else {
+      const embedded = this.database as PGlite;
+      if (typeof embedded.transaction !== "function") {
+        throw new Error(
+          "Membership writes require transactional database support.",
+        );
+      }
+      await embedded.transaction(async (tx) => lockedMutation(tx));
+    }
   }
 
   private async authorize(
