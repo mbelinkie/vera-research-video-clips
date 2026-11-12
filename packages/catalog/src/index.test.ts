@@ -264,6 +264,38 @@ const makeOwner = async (
 };
 
 describe("safe project membership", () => {
+  it("never reuses a revoked membership version after a new grant", async () => {
+    const f = await membershipFixture();
+    const member = await f.register("Reinvited member");
+    await f.catalog.addMember(f.owner, f.project.id, member.userId, "viewer");
+    await f.catalog.removeMember(f.owner, f.project.id, member.userId, 1);
+    await f.catalog.addMember(f.owner, f.project.id, member.userId, "editor");
+    const current = await f.member(member.userId);
+    expect(current).toMatchObject({ role: "editor", version: 2 });
+    await expect(
+      f.catalog.changeMemberRole(
+        f.owner,
+        f.project.id,
+        member.userId,
+        "viewer",
+        1,
+      ),
+    ).rejects.toMatchObject({ statusCode: 409 });
+    await expect(
+      f.catalog.removeMember(f.owner, f.project.id, member.userId, 1),
+    ).rejects.toMatchObject({ statusCode: 409 });
+    expect(await f.member(member.userId)).toMatchObject({
+      role: "editor",
+      version: 2,
+    });
+    await f.catalog.removeMember(f.owner, f.project.id, member.userId, 2);
+    await f.catalog.addMember(f.owner, f.project.id, member.userId, "viewer");
+    expect(await f.member(member.userId)).toMatchObject({
+      role: "viewer",
+      version: 3,
+    });
+  });
+
   it("version-checks explicit changes, no-op retries and revocations", async () => {
     const f = await membershipFixture();
     const editor = await f.register("Editor");

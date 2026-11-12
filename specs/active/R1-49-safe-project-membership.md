@@ -48,6 +48,10 @@ fixture and is not a production authentication mode.
   version is `409`.
 - Replaying a completed `DELETE` returns `404` (the member is gone), never a
   silent success.
+- A later re-grant after `DELETE` advances the pair's previous membership
+  version rather than resetting to 1. Migration `0008_membership_regrant_versions`
+  stores the revoked pair's last version; commands saved before revocation
+  cannot affect a subsequently re-granted membership (no version ABA).
 - Replaying a transfer after the acting Owner has stepped down returns `403`;
   stale preconditions never succeed.
 
@@ -99,3 +103,10 @@ Do not mark #49 accepted until phase-2 full `npm run check`, independent
 security mutation/review and CI are complete. The PostgreSQL proof is a local
 two-connection integration test, not a deployment or production authentication
 test; browser sharing remains outside this issue.
+
+Phase-2 review added a RED repro for revocation/re-grant version reuse
+(re-granted Editor unexpectedly had version 1), then fixed it with a durable
+version tombstone. Independent PostgreSQL checks additionally prove a held
+project lock stays affine across a later query and failed two-step transfers
+roll back target promotion. Final gate, mutation and handoff results are
+recorded in the phase-2 ticket log, not assumed here.

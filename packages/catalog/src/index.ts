@@ -672,12 +672,19 @@ export class SharedProjectCatalog {
         }
         return;
       }
+      const revoked = await tx.query<{ last_version: number }>(
+        "SELECT last_version FROM revoked_project_member_versions WHERE project_id = $1 AND user_id = $2",
+        [projectId, userId],
+      );
+      const nextVersion = revoked.rows[0]
+        ? Number(revoked.rows[0].last_version) + 1
+        : 1;
       const now = this.now().toISOString();
       await tx.query(
         `INSERT INTO project_members
            (project_id, user_id, role, version, created_at, updated_at)
-         VALUES ($1, $2, $3, 1, $4, $4)`,
-        [projectId, userId, role, now],
+         VALUES ($1, $2, $3, $4, $5, $5)`,
+        [projectId, userId, role, nextVersion, now],
       );
     });
   }
@@ -743,6 +750,16 @@ export class SharedProjectCatalog {
           throw new CatalogConflictError("Cannot remove the last Owner.");
         }
       }
+      // A revoked member may be invited again. Preserve their last version
+      // so that old PATCH/DELETE/transfer preconditions can never target the
+      // new membership, even when the old row has been deleted.
+      await tx.query(
+        `INSERT INTO revoked_project_member_versions(project_id, user_id, last_version)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (project_id, user_id) DO UPDATE
+         SET last_version = GREATEST(revoked_project_member_versions.last_version, EXCLUDED.last_version)`,
+        [projectId, userId, Number(member.version)],
+      );
       await tx.query(
         "DELETE FROM project_members WHERE project_id = $1 AND user_id = $2 AND version = $3",
         [projectId, userId, expectedVersion],

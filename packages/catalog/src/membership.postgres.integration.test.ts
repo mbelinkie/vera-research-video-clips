@@ -7,6 +7,7 @@ import type { AuthenticatedActor } from "@research-video/contracts";
 import {
   ConnectionAffineDatabase,
   runCloudMigrations,
+  type SqlDatabase,
 } from "@research-video/db-cloud";
 import { MemoryTranscriptObjectStore } from "@research-video/storage";
 
@@ -77,6 +78,58 @@ describe.skipIf(!enabled)("real PostgreSQL membership serialization", () => {
         );
         return result.rows[0];
       };
+
+      // Prove the project lock is still held after a later query on the same
+      // leased transaction. A bare pool.query or autocommit FOR UPDATE would
+      // release it before this test reaches the NOWAIT probe.
+      const lockProject = await left.createProject(owner, {
+        name: "Connection-affine lock probe",
+      });
+      let resume!: () => void;
+      let reached!: () => void;
+      const held = new Promise<void>((resolve) => {
+        resume = resolve;
+      });
+      const paused = new Promise<void>((resolve) => {
+        reached = resolve;
+      });
+      const observed: SqlDatabase = {
+        query: async <Row extends Record<string, unknown>>(
+          sql: string,
+          params: unknown[] = [],
+        ) => {
+          const result = await first.query<Row>(sql, params);
+          if (sql.startsWith("SELECT 1 FROM users WHERE id =")) {
+            reached();
+            await held;
+          }
+          return result;
+        },
+        exec: (sql) => first.exec(sql),
+        withTransaction: (action) => first.withTransaction(action),
+      };
+      const lockCatalog = new SharedProjectCatalog(
+        observed,
+        new MemoryTranscriptObjectStore(),
+      );
+      const pendingGrant = lockCatalog.addMember(
+        owner,
+        lockProject.id,
+        target.userId,
+        "viewer",
+      );
+      try {
+        await paused;
+        await expect(
+          second.query(
+            "SELECT id FROM projects WHERE id = $1 FOR UPDATE NOWAIT",
+            [lockProject.id],
+          ),
+        ).rejects.toMatchObject({ code: "55P03" });
+      } finally {
+        resume();
+        await pendingGrant;
+      }
 
       const project = await left.createProject(owner, { name: "Two owners" });
       // Only test setup may inject a second Owner: public grants never do so.
@@ -167,6 +220,33 @@ describe.skipIf(!enabled)("real PostgreSQL membership serialization", () => {
           statusCode: 403,
         });
       }
+
+      // A failure after target promotion must roll back BOTH sides of the
+      // transfer. This fixture constraint deliberately rejects the second
+      // UPDATE, when the acting Owner would become Editor.
+      const rollbackProject = await left.createProject(owner, {
+        name: "Transfer rollback",
+      });
+      await left.addMember(owner, rollbackProject.id, target.userId, "viewer");
+      await first.query(
+        `ALTER TABLE project_members ADD CONSTRAINT vera49_reject_owner_stepdown
+         CHECK (NOT (project_id = '${rollbackProject.id}'::uuid
+                AND user_id = '${owner.userId}'::uuid AND role = 'editor'))`,
+      );
+      await expect(
+        left.transferOwnership(owner, rollbackProject.id, target.userId, 1, 1),
+      ).rejects.toThrow();
+      expect(await countOwners(rollbackProject.id)).toBe(1);
+      expect(await membership(rollbackProject.id, owner.userId)).toMatchObject({
+        role: "owner",
+        version: 1,
+      });
+      expect(await membership(rollbackProject.id, target.userId)).toMatchObject(
+        {
+          role: "viewer",
+          version: 1,
+        },
+      );
 
       // Concurrent checks do not waive CAS or safe retry rules.
       await expect(
