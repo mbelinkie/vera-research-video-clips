@@ -4,6 +4,7 @@ import {
   lstat,
   mkdtemp,
   readFile,
+  rename,
   rm,
   symlink,
   writeFile,
@@ -89,6 +90,16 @@ describe("single-command private Research environment", () => {
     await expect(managedResearchEnvironment({}, root)).rejects.toThrow(
       "private, non-symlink",
     );
+  });
+
+  it("refuses a symlinked identity even when the target is a valid private file", async () => {
+    const root = await tempRoot();
+    await managedResearchEnvironment({}, root);
+    const identity = join(root, "identity.json");
+    const privateBackup = join(root, "previous-identity.json");
+    await rename(identity, privateBackup);
+    await symlink(privateBackup, identity);
+    await expect(managedResearchEnvironment({}, root)).rejects.toThrow();
   });
 
   it("rejects invalid private state rather than substituting a new credential", async () => {

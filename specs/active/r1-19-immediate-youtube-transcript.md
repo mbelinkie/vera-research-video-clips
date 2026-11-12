@@ -85,3 +85,34 @@ workspace checks, `npm run check`, and on-Mac authorized captioned, captionless,
 unavailable-source and restart smoke checks. Do not treat fixture tests as real
 YouTube/recognition evidence or mark this spec complete until all required
 integration evidence exists.
+
+## Phase 5 automated verification — 2026-11-12
+
+- Linux pipeline: 15 focused suites passed (130 passed, 1 skipped), including
+  signed cross-process HTTP publication, verified local-agent reuse, safe worker
+  failure, authorization, proxy and browser request guards.
+- Playwright: `npx playwright test tests/e2e/workspace.spec.ts` passed 14/14
+  live-shaped fake-browser scenarios, including seeking, stale project/video
+  handling, immutable version rejection and visible failure states.
+- Initial `npm run check` passed 266 tests (4 skipped). The **final
+  post-restoration `npm run check` passed 267 tests (4 skipped)**, formatting,
+  typecheck, production browser build and local/cloud migration checks.
+  Full output is retained in `.pipeline/19/phase5-final-check.log`.
+- Thirteen temporarily disabled security or integrity guards were each caught
+  by a relevant test and byte-restored: proxy origin, CSRF, browser bearer,
+  managed runtime mode, private-root permissions, symlinked private identity,
+  project binding, transcript version, signed-object HMAC, URL expiry, SHA-256,
+  worker lease loss, and scratch deletion before finalization. One explicit
+  valid-target symlink regression test was added for the identity-file guard.
+- Self-review: compared the complete change set against `origin/main`, checked
+  worktree/untracked files, scanned added lines for embedded credentials and
+  debug markers, and ran `git diff --check`. No source mutation was retained.
+- **Mac acceptance is outstanding, not passed.** The assigned execution host
+  is an isolated Linux Zodex container without access to the user's running
+  Mac, authorized captioned/captionless test videos or installed `yt-dlp`,
+  `whisper-cli` and model. The automated tests use fake provider sources;
+  they do not establish live YouTube acquisition or Mac speech recognition.
+  The earlier isolated Linux four-service startup checks are also not Mac
+  acceptance. Keep this spec active and the issue in review until a separately
+  run Mac `npm run dev:research` captioned, no-caption/ASR, unavailable-video,
+  restart, seeking and scratch-cleanup acceptance is recorded.
