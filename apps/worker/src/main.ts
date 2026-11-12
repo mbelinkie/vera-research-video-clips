@@ -36,11 +36,6 @@ if (!config.workerAuthorization) {
           modelName: config.whisperCppModelName!,
         })
       : undefined;
-  if (!media || !speechToText) {
-    throw new Error(
-      "Configured workers require opt-in MEDIA_PROVIDER and SPEECH_TO_TEXT_PROVIDER fallbacks before claiming jobs.",
-    );
-  }
   const captions = createCaptionProvider({
     mode: config.captionProvider,
     ytDlpPath: config.ytDlpPath,
@@ -65,8 +60,8 @@ if (!config.workerAuthorization) {
   });
   const execute = createTranscriptPipelineExecutor({
     ...(captions ? { captions } : {}),
-    media,
-    speechToText,
+    ...(media ? { media } : {}),
+    ...(speechToText ? { speechToText } : {}),
     ...(translation ? { translation } : {}),
     publication,
     scratchRoot: join(config.dataDir, "jobs", "transcription-scratch"),

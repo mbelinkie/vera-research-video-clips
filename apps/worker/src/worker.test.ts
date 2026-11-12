@@ -7,6 +7,7 @@ import {
   JobSchema,
 } from "@research-video/contracts";
 import { MemoryJobQueue } from "@research-video/sync";
+import { LocalRecognizerUnavailableError } from "./pipeline.ts";
 
 import {
   ClaimingTranscriptionWorker,
@@ -152,6 +153,21 @@ describe("claiming transcription worker", () => {
       code: "worker_execution_failed",
       message: "caption provider unavailable",
       retryable: true,
+    });
+  });
+
+  it("records missing local recognizer as a safe terminal failure", async () => {
+    const api = controlPlane();
+    const worker = new ClaimingTranscriptionWorker(api, async () => {
+      throw new LocalRecognizerUnavailableError();
+    });
+    await expect(worker.runOnce()).resolves.toBe("failed");
+    expect(api.fail).toHaveBeenCalledWith(job.id, {
+      attempt: 1,
+      code: "recognizer_not_configured",
+      message:
+        "No captions are available and local speech recognition is not configured.",
+      retryable: false,
     });
   });
 

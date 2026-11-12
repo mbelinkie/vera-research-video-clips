@@ -36,7 +36,7 @@ export const AppConfigSchema = z
       .min(300_000)
       .max(86_400_000),
     cloudApiPort: PortSchema,
-    runtimeMode: z.enum(["development", "mac-pilot"]),
+    runtimeMode: z.enum(["development", "mac-pilot", "managed-local"]),
     databaseMode: z.enum(["pglite", "postgres"]),
     pilotPgUrl: z.string().optional(),
     pilotObjectRoot: z.string().optional(),
@@ -170,6 +170,58 @@ export const AppConfigSchema = z
           "Production configuration must explicitly select a durable runtime",
       });
     }
+    if (config.runtimeMode === "managed-local") {
+      if (
+        config.nodeEnv === "production" ||
+        config.cloudAuthMode !== "development"
+      )
+        reject(
+          "runtimeMode",
+          "Managed Research is development-only and cannot enable browser BFF mode",
+        );
+      if (!["127.0.0.1", "localhost", "::1"].includes(config.cloudApiHost))
+        reject(
+          "cloudApiHost",
+          "Managed Research cloud API must bind to loopback",
+        );
+      if (
+        config.databaseMode !== "pglite" ||
+        config.objectStoreMode !== "local" ||
+        config.queueMode !== "memory"
+      )
+        reject(
+          "runtimeMode",
+          "Managed Research requires isolated PGlite, signed local objects and memory queue",
+        );
+      if (
+        !config.pilotObjectRoot ||
+        !isAbsolute(config.pilotObjectRoot) ||
+        config.pilotObjectRoot.includes("\0") ||
+        resolve(config.pilotObjectRoot) !==
+          join(config.dataDir, "transcript-objects")
+      )
+        reject(
+          "pilotObjectRoot",
+          "Managed Research requires objects under its private data root",
+        );
+      if (
+        !config.localSigningSecret ||
+        Buffer.byteLength(config.localSigningSecret) < 32
+      )
+        reject(
+          "localSigningSecret",
+          "Managed Research requires a private signing secret of at least 32 bytes",
+        );
+      if (
+        config.workerMode !== "continuous" ||
+        config.workerExecutionLocation !== "local" ||
+        !config.workerAuthorization
+      )
+        reject(
+          "workerMode",
+          "Managed Research requires a continuously running authorized local worker",
+        );
+    }
     if (config.runtimeMode === "mac-pilot") {
       if (
         config.databaseMode !== "postgres" ||
@@ -232,8 +284,8 @@ export const AppConfigSchema = z
         });
       }
     } else if (
-      config.databaseMode !== "pglite" ||
-      config.objectStoreMode === "local"
+      config.runtimeMode !== "managed-local" &&
+      (config.databaseMode !== "pglite" || config.objectStoreMode === "local")
     ) {
       context.addIssue({
         code: "custom",

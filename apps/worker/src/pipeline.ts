@@ -64,8 +64,8 @@ export interface TranscriptPublicationClient {
 
 export type TranscriptPipelineOptions = {
   captions?: CaptionProvider;
-  media: MediaAcquisitionProvider;
-  speechToText: SpeechToTextProvider;
+  media?: MediaAcquisitionProvider;
+  speechToText?: SpeechToTextProvider;
   translation?: TranslationProvider;
   publication: TranscriptPublicationClient;
   scratchRoot: string;
@@ -75,6 +75,16 @@ export type TranscriptPipelineOptions = {
 export class TranscriptPipelineError extends Error {
   readonly code = "transcript_pipeline_failed";
   readonly retryable = true;
+}
+
+export class LocalRecognizerUnavailableError extends Error {
+  readonly code = "recognizer_not_configured";
+  readonly retryable = false;
+  constructor() {
+    super(
+      "No captions are available and local speech recognition is not configured.",
+    );
+  }
 }
 
 export function createTranscriptPipelineExecutor(
@@ -225,6 +235,10 @@ async function resolveSourceTranscript(
   }
 
   await context.recordSourcePlan(plan);
+  // Caption-only installations must still claim and publish captioned videos.
+  // Missing fallback is terminal, not an infinite standby or fake transcript.
+  if (!options.media || !options.speechToText)
+    throw new LocalRecognizerUnavailableError();
   await context.setStage("acquiring");
   const media = await options.media.acquireAuthorizedSource(
     payload.youtubeVideoId,

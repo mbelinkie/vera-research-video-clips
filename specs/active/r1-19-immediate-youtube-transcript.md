@@ -30,6 +30,33 @@ may immediately reuse an active transcript or enter a queued worker path. A
 catalog video UUID is never interchangeable with a YouTube video ID; the
 published version must match the exact active version and English track.
 
+## Phase 2 managed-local runtime contract
+
+`npm run dev:research` supervises the existing cloud API, local agent, worker
+and Vite web server on 127.0.0.1 ports 43111, 43110 and 43112. Its personal
+private state defaults to `~/.vera-research-managed` (0700); `identity.json`
+is 0600 and contains the stable catalog identity and local object HMAC key.
+Managed cloud uses the isolated PGlite catalog and signed immutable on-disk
+objects, never the cross-process-broken memory upload URLs. The bootstrap
+registers this identity and creates one visible `Personal research` project
+only when none exists, reusing membership/project across restarts. The worker
+starts continuously even with no opt-in caption/recognizer tools; missing
+recognition is terminal and no transcript is invented.
+
+Phase 3 browser wiring: detect `import.meta.env.VITE_MANAGED_RESEARCH === "true"`;
+fetch same-origin `GET /__research/session` to obtain a *CSRF token only* (not
+the bearer), then send `x-vera-csrf` on mutation requests (the browser supplies
+the matching `Origin` header)
+through `/cloud-api/api/*` and `/local-agent/api/*`. Vite injects the private
+bearer only on its server-side proxy path. Never forward a browser bearer:
+the proxy rejects one, all cross-origin and mismatched Host/Sec-Fetch-Site
+requests, and unsigned object-route forwarding. The signed `/__objects` URL
+comes from the catalog grant on the direct loopback cloud HTTP endpoint;
+there is no browser-supplied object path or `memory-upload://` transport.
+
+Provider opt-ins and Mac acceptance remain phase 4/5; phase 2 deterministic
+checks do not establish real Mac YouTube/provider success.
+
 ## Failure and recovery states
 
 - Unsupported URL or unavailable metadata: safe terminal sentence.

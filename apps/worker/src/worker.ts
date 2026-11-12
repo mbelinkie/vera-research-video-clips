@@ -405,14 +405,23 @@ export class HttpTranscriptionWorkerControlPlane implements TranscriptionWorkerC
 function failureFrom(error: unknown, attempt: number): WorkerFailureRequest {
   const controlPlaneError =
     error instanceof WorkerControlPlaneError ? error : undefined;
+  const recognizerNotConfigured =
+    error instanceof Error &&
+    "code" in error &&
+    error.code === "recognizer_not_configured";
   const rawMessage = error instanceof Error ? error.message : String(error);
-  const message =
-    rawMessage.trim().slice(0, 2_000) || "Worker execution failed.";
+  const message = recognizerNotConfigured
+    ? "No captions are available and local speech recognition is not configured."
+    : rawMessage.trim().slice(0, 2_000) || "Worker execution failed.";
   return WorkerFailureRequestSchema.parse({
     attempt,
-    code: controlPlaneError?.code ?? "worker_execution_failed",
+    code: recognizerNotConfigured
+      ? "recognizer_not_configured"
+      : (controlPlaneError?.code ?? "worker_execution_failed"),
     message,
-    retryable: controlPlaneError?.retryable ?? true,
+    retryable: recognizerNotConfigured
+      ? false
+      : (controlPlaneError?.retryable ?? true),
   });
 }
 

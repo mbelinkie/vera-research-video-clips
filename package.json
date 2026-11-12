@@ -23,6 +23,7 @@
     "db:migrate:local": "node --import tsx packages/db-local/src/cli.ts",
     "db:migrate:local:test": "node --import tsx packages/db-local/src/cli.ts --test",
     "dev": "concurrently -n web,local,cloud,worker -c blue,green,magenta,yellow \"npm:dev:web\" \"npm:dev:local-agent\" \"npm:dev:cloud-api\" \"npm:dev:worker\"",
+    "dev:research": "node --import tsx scripts/start-research.ts",
     "dev:cloud-api": "node --import tsx apps/cloud-api/src/main.ts",
     "dev:local-agent": "node --import tsx apps/local-agent/src/main.ts",
     "dev:web": "vite --config apps/web/vite.config.ts",

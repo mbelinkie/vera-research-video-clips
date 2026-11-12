@@ -103,6 +103,80 @@ function publicationFixture() {
 }
 
 describe("transcript pipeline", () => {
+  it("starts a caption-only worker without an audio or recognizer opt-in", async () => {
+    const scratchRoot = await mkdtemp(join(tmpdir(), "pipeline-caption-only-"));
+    temporaryDirectories.add(scratchRoot);
+    const publication = publicationFixture();
+    const vtt = await readFile(
+      new URL(
+        "../../../tests/fixtures/transcripts/auto-word-timed.vtt",
+        import.meta.url,
+      ),
+    );
+    const executor = createTranscriptPipelineExecutor({
+      scratchRoot,
+      publication: publication.client,
+      captions: {
+        discover: async () => [
+          {
+            id: "english:auto",
+            language: "en",
+            kind: "automatic",
+            translatable: false,
+            downloadAccess: "available",
+          },
+        ],
+        acquire: async (videoId, track, scratch) => {
+          const path = join(scratch, "captions.vtt");
+          await writeFile(path, vtt);
+          return {
+            videoId,
+            track,
+            path,
+            format: "vtt",
+            byteSize: vtt.length,
+            provider: "fixture",
+          };
+        },
+      },
+    });
+    await executor(claimedJob(), {
+      signal: new AbortController().signal,
+      setStage: async () => undefined,
+      recordSourcePlan: async () => undefined,
+    });
+    expect(publication.finalize).toHaveBeenCalledOnce();
+    expect(await readdir(scratchRoot)).toEqual([]);
+  });
+
+  it("refuses an uncaptioned source immediately without acquiring audio when recognizer is disabled", async () => {
+    const scratchRoot = await mkdtemp(
+      join(tmpdir(), "pipeline-no-recognizer-"),
+    );
+    temporaryDirectories.add(scratchRoot);
+    const publication = publicationFixture();
+    const media = { acquireAuthorizedSource: vi.fn() };
+    const executor = createTranscriptPipelineExecutor({
+      scratchRoot,
+      publication: publication.client,
+      media,
+      captions: { discover: async () => [], acquire: vi.fn() },
+    });
+    await expect(
+      executor(claimedJob(), {
+        signal: new AbortController().signal,
+        setStage: async () => undefined,
+        recordSourcePlan: async () => undefined,
+      }),
+    ).rejects.toMatchObject({
+      code: "recognizer_not_configured",
+      retryable: false,
+    });
+    expect(media.acquireAuthorizedSource).not.toHaveBeenCalled();
+    expect(publication.finalize).not.toHaveBeenCalled();
+    expect(await readdir(scratchRoot)).toEqual([]);
+  });
+
   it("publishes and pins an English automatic VTT's word starts and derived ends", async () => {
     const scratchRoot = await mkdtemp(join(tmpdir(), "pipeline-auto-"));
     temporaryDirectories.add(scratchRoot);

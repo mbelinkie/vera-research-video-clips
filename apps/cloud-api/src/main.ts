@@ -24,16 +24,29 @@ import {
 } from "@research-video/storage";
 
 import { authenticateDevBearer, createCloudApi } from "./app.ts";
+import { bootstrapManagedResearch } from "./managed-bootstrap.ts";
 
 const config = loadConfig();
 await mkdir(config.dataDir, { recursive: true });
+if (config.runtimeMode === "managed-local") {
+  const rootInfo = await lstat(config.dataDir);
+  if (
+    !rootInfo.isDirectory() ||
+    rootInfo.isSymbolicLink() ||
+    (rootInfo.mode & 0o077) !== 0
+  )
+    throw new Error(
+      "Managed Research requires a private non-symlink data directory (0700)",
+    );
+}
 const pilot = config.runtimeMode === "mac-pilot";
+const localObjects = pilot || config.runtimeMode === "managed-local";
 if (pilot && (await pilotBackupGateIsActive(config.pilotObjectRoot!))) {
   throw new Error(
     "Mac pilot cannot start while the backup write gate is active",
   );
 }
-if (pilot) {
+if (localObjects) {
   await mkdir(config.pilotObjectRoot!, { recursive: true, mode: 0o700 });
   const objectRootInfo = await lstat(config.pilotObjectRoot!);
   if (
@@ -42,7 +55,7 @@ if (pilot) {
     (objectRootInfo.mode & 0o077) !== 0
   ) {
     throw new Error(
-      "Mac pilot transcript root must be a private non-symlink directory (0700)",
+      "Local transcript root must be a private non-symlink directory (0700)",
     );
   }
 }
@@ -56,12 +69,12 @@ const s3 =
     ? new S3Client({ region: config.awsRegion })
     : undefined;
 const transcriptBucket = config.transcriptBucket;
-const objectStore = pilot
+const objectStore = localObjects
   ? new LocalTranscriptObjectStore(config.pilotObjectRoot!)
   : s3 && transcriptBucket
     ? new S3TranscriptObjectStore(s3, transcriptBucket)
     : new MemoryTranscriptObjectStore();
-const uploadUrlIssuer = pilot
+const uploadUrlIssuer = localObjects
   ? new LocalStagedUploadUrlIssuer(
       config.cloudAuthMode === "browser"
         ? `${config.browserPublicOrigin!}/cloud-api/`
@@ -77,6 +90,16 @@ const catalog = new SharedProjectCatalog(
   () => new Date(),
   uploadUrlIssuer,
 );
+if (config.runtimeMode === "managed-local") {
+  const authorization = process.env.MANAGED_RESEARCH_AUTHORIZATION;
+  if (!authorization || authorization !== config.workerAuthorization) {
+    await database.close();
+    throw new Error(
+      "Managed Research requires matching private proxy and worker identities.",
+    );
+  }
+  await bootstrapManagedResearch(catalog, authorization);
+}
 const browserAuth =
   config.cloudAuthMode === "browser"
     ? createBrowserAuth({
@@ -102,7 +125,7 @@ const app = createCloudApi({
     ? (request) => browserAuth.authenticate(request)
     : authenticateDevBearer,
   videoMetadataProvider: new YouTubeOEmbedMetadataProvider(),
-  ...(pilot && uploadUrlIssuer instanceof LocalStagedUploadUrlIssuer
+  ...(localObjects && uploadUrlIssuer instanceof LocalStagedUploadUrlIssuer
     ? {
         localArtifacts: {
           store: objectStore,
