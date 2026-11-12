@@ -355,6 +355,20 @@ describe("foreground logged clip cutter", () => {
     ).toHaveLength(1);
   });
 
+  it("refuses success when cleanup silently leaves the full source behind", async () => {
+    const f = await fakeCutter([makeClip()]);
+    f.deps.removeScratch = async () => {};
+    await expect(cutLoggedClips(f.request, f.deps)).rejects.toThrow(
+      /cleanup failed/u,
+    );
+    expect(f.renderer.render).toHaveBeenCalledTimes(1);
+    expect(
+      (await readdir(f.exportDirectory)).filter((name) =>
+        name.startsWith(".scratch"),
+      ),
+    ).toHaveLength(1);
+  });
+
   it("refuses overwrite before acquisition, preserving the prior package", async () => {
     const f = await fakeCutter([makeClip()]);
     const first = await cutLoggedClips(f.request, f.deps);
