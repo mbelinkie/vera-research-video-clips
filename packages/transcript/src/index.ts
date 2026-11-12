@@ -544,6 +544,75 @@ export function transcriptToSrt(transcript: NormalizedTranscript): string {
     .join("\n");
 }
 
+export type ClipRelativeSrtCue = {
+  startMs: number;
+  endMs: number;
+  text: string;
+};
+
+/** Derive clip-only cues from source-time segments without mutating the source. */
+export function deriveClipRelativeSrtCues(input: {
+  transcript: NormalizedTranscript;
+  startMs: number;
+  endMs: number;
+}): ClipRelativeSrtCue[] {
+  const { startMs, endMs } = input;
+  if (
+    !Number.isSafeInteger(startMs) ||
+    !Number.isSafeInteger(endMs) ||
+    startMs < 0 ||
+    endMs <= startMs
+  ) {
+    throw new Error("Clip bounds must be increasing nonnegative milliseconds.");
+  }
+  const transcript = NormalizedTranscriptSchema.parse(input.transcript);
+  assertOrdered(transcript.segments);
+  const cues = transcript.segments
+    .filter((segment) => segment.endMs > startMs && segment.startMs < endMs)
+    .map((segment) => ({
+      startMs: Math.max(segment.startMs, startMs) - startMs,
+      endMs: Math.min(segment.endMs, endMs) - startMs,
+      text: segment.text.trim(),
+      ordinal: segment.ordinal,
+    }))
+    .sort(
+      (left, right) =>
+        left.startMs - right.startMs ||
+        left.endMs - right.endMs ||
+        left.ordinal - right.ordinal,
+    )
+    .map(({ ordinal: _ordinal, ...cue }) => cue);
+  if (cues.length === 0) {
+    throw new Error("Required transcript has no cues in the clip range.");
+  }
+  if (
+    cues.some(
+      (cue) =>
+        !cue.text ||
+        cue.startMs < 0 ||
+        cue.endMs <= cue.startMs ||
+        cue.endMs > endMs - startMs,
+    )
+  ) {
+    throw new Error("Required subtitle cues fall outside the clip.");
+  }
+  return cues;
+}
+
+/** A full-source SRT must never be attached to a cut clip. */
+export function clipRelativeSrt(input: {
+  transcript: NormalizedTranscript;
+  startMs: number;
+  endMs: number;
+}): string {
+  return deriveClipRelativeSrtCues(input)
+    .map(
+      (cue, index) =>
+        `${index + 1}\n${srtTimestamp(cue.startMs)} --> ${srtTimestamp(cue.endMs)}\n${cue.text}\n`,
+    )
+    .join("\n");
+}
+
 export function timedTranscriptTokens(
   tokens: readonly TranscriptToken[],
 ): Array<TranscriptToken & { startMs: number; endMs: number }> {

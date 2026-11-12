@@ -189,6 +189,13 @@ Gate: logging requires a visible project and atomically preserves entered notes/
 
 ### 5. Clip export
 
+The **narrow foreground logged-clip cutting path (#20)** now has a documented
+CLI and loopback endpoint, exact verified subtitle inputs, one ephemeral source
+per same-video request, staged output and confirmed cleanup, with passing fake
+integration and guard-mutation checks. Real rights-cleared Mac playback and
+source verification remain to be accepted. This does **not** close the broader
+queued M5 worker, preset, recovery or full milestone acceptance items below.
+
 - [ ] M5-01: authorized full-source acquisition and verified job-scoped scratch lifecycle (`specs/active/M5-01-authorized-source-acquisition-and-scratch-lifecycle.md`).
 - [ ] Acquire the full authorized source when needed into isolated job-scoped scratch storage.
 - [ ] Group active same-source exports where practical so one download can cut many requested ranges.

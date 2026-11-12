@@ -7,6 +7,8 @@ import wordFixture from "../../../tests/fixtures/transcripts/english-word.json" 
 import bilingualFixture from "../../../tests/fixtures/transcripts/spanish-bilingual.json" with { type: "json" };
 
 import {
+  clipRelativeSrt,
+  deriveClipRelativeSrtCues,
   deriveTranscriptSelection,
   normalizeTranscriptFixture,
   normalizeGeneratedTranscript,
@@ -182,6 +184,76 @@ describe("SRT serialization", () => {
     expect(transcriptToSrt(transcript)).toContain(
       "1\n00:00:00,000 --> 00:00:01,800\nThis fixture is intentionally short.\n",
     );
+  });
+});
+
+describe("clip-relative SRT sidecars", () => {
+  it("clamps and zero-bases English cues at the exported range, not selected speech", () => {
+    const transcript = normalizeTranscriptFixture(wordFixture);
+    const before = structuredClone(transcript);
+    const cues = deriveClipRelativeSrtCues({
+      transcript,
+      startMs: 1_000,
+      endMs: 2_500,
+    });
+    expect(cues).toEqual([
+      {
+        startMs: 0,
+        endMs: 800,
+        text: "This fixture has accurate word timing.",
+      },
+      { startMs: 800, endMs: 1_500, text: "Click any word to seek precisely." },
+    ]);
+    expect(clipRelativeSrt({ transcript, startMs: 1_000, endMs: 2_500 })).toBe(
+      "1\n00:00:00,000 --> 00:00:00,800\nThis fixture has accurate word timing.\n\n" +
+        "2\n00:00:00,800 --> 00:00:01,500\nClick any word to seek precisely.\n",
+    );
+    expect(transcript).toEqual(before);
+  });
+
+  it("retains cue timing and padded handle coverage for non-word transcript", () => {
+    const transcript = normalizeTranscriptFixture(fixture);
+    expect(
+      deriveClipRelativeSrtCues({ transcript, startMs: 900, endMs: 2_200 }),
+    ).toEqual([
+      { startMs: 0, endMs: 900, text: "This fixture is intentionally short." },
+      {
+        startMs: 900,
+        endMs: 1_300,
+        text: "It tests cue-level transcript behavior.",
+      },
+    ]);
+  });
+
+  it("produces independent clip-bounded original and translated subtitles", () => {
+    for (const input of [bilingualFixture.original, bilingualFixture.english]) {
+      const transcript = normalizeTranscriptFixture(input);
+      const srt = clipRelativeSrt({ transcript, startMs: 1_000, endMs: 1_800 });
+      expect(srt).toContain("00:00:00,000 --> 00:00:00,800");
+      expect(srt).not.toContain("00:00:02,500");
+      expect(srt).toContain(transcript.segments[0]!.text);
+    }
+  });
+
+  it("rejects inverted, invalid, empty and edge-only ranges", () => {
+    const transcript = normalizeTranscriptFixture(fixture);
+    for (const bounds of [
+      { startMs: -1, endMs: 10 },
+      { startMs: 1_000, endMs: 1_000 },
+      { startMs: 2_000, endMs: 1_000 },
+      { startMs: 0.5, endMs: 1_000 },
+      { startMs: 0, endMs: Number.POSITIVE_INFINITY },
+    ]) {
+      expect(() =>
+        deriveClipRelativeSrtCues({ transcript, ...bounds }),
+      ).toThrow(/bounds/u);
+    }
+    expect(() =>
+      clipRelativeSrt({ transcript, startMs: 4_000, endMs: 5_000 }),
+    ).toThrow(/no cues/u);
+    expect(() =>
+      clipRelativeSrt({ transcript, startMs: 9_000, endMs: 10_000 }),
+    ).toThrow(/no cues/u);
   });
 });
 

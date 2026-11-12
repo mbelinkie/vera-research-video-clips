@@ -4,6 +4,8 @@ import { createReadStream } from "node:fs";
 import { mkdir, readdir, stat } from "node:fs/promises";
 import { join } from "node:path";
 
+export * from "./video.ts";
+
 export type AcquiredMedia = {
   scratchPath: string;
   videoId: string;
@@ -44,37 +46,74 @@ export class SpawnMediaCommandRunner implements MediaCommandRunner {
   ): Promise<MediaCommandResult> {
     validateExecutable(executable);
     return new Promise((resolve, reject) => {
-      const child = spawn(executable, [...args], {
-        shell: false,
-        stdio: ["ignore", "pipe", "pipe"],
-        ...(options.signal ? { signal: options.signal } : {}),
-      });
+      if (options.signal?.aborted) {
+        reject(new MediaAcquisitionError("Media command canceled."));
+        return;
+      }
+      const timeoutMs = options.timeoutMs ?? 6 * 60 * 60 * 1_000;
+      if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) {
+        reject(new MediaAcquisitionError("Media command timeout is invalid."));
+        return;
+      }
+      let child: ReturnType<typeof spawn>;
+      try {
+        child = spawn(executable, [...args], {
+          shell: false,
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+      } catch {
+        reject(new MediaAcquisitionError("Could not start the media command."));
+        return;
+      }
       let stdout = "";
       let stderr = "";
+      let failedReason: string | undefined;
+      let settled = false;
       const append = (current: string, chunk: Buffer) =>
-        (current + chunk.toString("utf8")).slice(-(4 * 1024 * 1024));
-      child.stdout.on("data", (chunk: Buffer) => {
+        (current + chunk.toString("utf8")).slice(-(512 * 1024));
+      child.stdout?.on("data", (chunk: Buffer) => {
         stdout = append(stdout, chunk);
       });
-      child.stderr.on("data", (chunk: Buffer) => {
+      child.stderr?.on("data", (chunk: Buffer) => {
         stderr = append(stderr, chunk);
       });
+      const terminate = (reason: string) => {
+        if (failedReason) return;
+        failedReason = reason;
+        child.kill("SIGTERM");
+        killTimer = setTimeout(() => child.kill("SIGKILL"), 2_000);
+        killTimer.unref?.();
+      };
+      let killTimer: ReturnType<typeof setTimeout> | undefined;
+      const onAbort = () => terminate("Media command canceled.");
+      options.signal?.addEventListener("abort", onAbort, { once: true });
+      if (options.signal?.aborted) onAbort();
       const timeout = setTimeout(
-        () => child.kill("SIGTERM"),
-        options.timeoutMs ?? 6 * 60 * 60 * 1_000,
+        () => terminate("Media command timed out."),
+        timeoutMs,
       );
       timeout.unref?.();
-      child.once("error", (error) => {
+      const cleanup = () => {
         clearTimeout(timeout);
+        if (killTimer) clearTimeout(killTimer);
+        options.signal?.removeEventListener("abort", onAbort);
+      };
+      child.once("error", () => {
+        if (settled) return;
+        settled = true;
+        cleanup();
         reject(
           new MediaAcquisitionError(
-            `Could not run the configured media provider: ${error.message}`,
+            "Could not run the configured media command.",
           ),
         );
       });
       child.once("close", (code, childSignal) => {
-        clearTimeout(timeout);
-        if (code === 0) resolve({ stdout, stderr });
+        if (settled) return;
+        settled = true;
+        cleanup();
+        if (failedReason) reject(new MediaAcquisitionError(failedReason));
+        else if (code === 0) resolve({ stdout, stderr });
         else {
           const detail = sanitizedDetail(stderr);
           reject(
@@ -215,6 +254,8 @@ function validateExecutable(executable: string) {
 
 function sanitizedDetail(stderr: string) {
   return stderr
+    .replaceAll(/https?:\/\/\S+/giu, "[source URL]")
+    .replaceAll(/(?:Bearer|Authorization:)\s+\S+/giu, "[credential]")
     .replaceAll(/[\r\n\t]+/gu, " ")
     .trim()
     .slice(-500);
