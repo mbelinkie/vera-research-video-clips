@@ -1,4 +1,4 @@
-import { isAbsolute, resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 
 import { z } from "zod";
 
@@ -43,11 +43,19 @@ export const AppConfigSchema = z
     localSigningSecret: z.string().optional(),
     webPort: PortSchema,
     dataDir: z.string().min(1),
+    clipExportDir: z
+      .string()
+      .refine((path) => isAbsolute(path) && !path.includes("\0"), {
+        message: "CLIP_EXPORT_DIR must be an absolute local directory",
+      }),
     objectStoreMode: z.enum(["memory", "s3", "local"]),
     queueMode: z.enum(["memory", "sqs"]),
     captionProvider: z.enum(["disabled", "yt-dlp"]),
     mediaProvider: z.enum(["disabled", "yt-dlp-audio"]),
+    exportSourceProvider: z.enum(["disabled", "yt-dlp"]),
     ytDlpPath: z.string().trim().min(1),
+    ffmpegPath: z.string().trim().min(1),
+    ffprobePath: z.string().trim().min(1),
     speechToTextProvider: z.enum(["disabled", "whisper-cpp"]),
     whisperCppPath: z.string().trim().min(1),
     whisperCppModelPath: z.string().trim().min(1).optional(),
@@ -289,11 +297,16 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     localSigningSecret: env.LOCAL_UPLOAD_SIGNING_SECRET,
     webPort: env.WEB_PORT ?? 43_112,
     dataDir: resolve(env.DATA_DIR ?? "./data"),
+    clipExportDir:
+      env.CLIP_EXPORT_DIR ?? join(resolve(env.DATA_DIR ?? "./data"), "exports"),
     objectStoreMode: env.OBJECT_STORE_MODE ?? "memory",
     queueMode: env.QUEUE_MODE ?? "memory",
     captionProvider: env.CAPTION_PROVIDER ?? "disabled",
     mediaProvider: env.MEDIA_PROVIDER ?? "disabled",
+    exportSourceProvider: env.EXPORT_SOURCE_PROVIDER ?? "disabled",
     ytDlpPath: env.YT_DLP_PATH ?? "yt-dlp",
+    ffmpegPath: env.FFMPEG_PATH ?? "ffmpeg",
+    ffprobePath: env.FFPROBE_PATH ?? "ffprobe",
     speechToTextProvider: env.SPEECH_TO_TEXT_PROVIDER ?? "disabled",
     whisperCppPath: env.WHISPER_CPP_PATH ?? "whisper-cli",
     whisperCppModelPath: env.WHISPER_CPP_MODEL_PATH,

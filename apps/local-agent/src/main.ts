@@ -18,6 +18,7 @@ import {
 } from "@research-video/sync";
 
 import { createLocalAgent } from "./app.ts";
+import { createClipCutRunner } from "./clip-cut-runtime.ts";
 
 const config = loadConfig();
 await mkdir(config.dataDir, { recursive: true });
@@ -34,6 +35,7 @@ const reader = new CachedTranscriptDocumentReader(
 );
 const cloudApiUrl = `http://${config.cloudApiHost}:${config.cloudApiPort}`;
 const app = createLocalAgent({
+  cutLoggedClips: createClipCutRunner(config, cache),
   createExportOnly: (input) => exportQueue.createExportOnly(input),
   listExportRequests: () => exportQueue.list(),
   resolveTranscript: async ({ projectId, catalogVideoId, authorization }) =>

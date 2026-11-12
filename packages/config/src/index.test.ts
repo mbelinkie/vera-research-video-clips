@@ -11,6 +11,10 @@ describe("configuration", () => {
     expect(config.queueMode).toBe("memory");
     expect(config.captionProvider).toBe("disabled");
     expect(config.mediaProvider).toBe("disabled");
+    expect(config.exportSourceProvider).toBe("disabled");
+    expect(config.ffmpegPath).toBe("ffmpeg");
+    expect(config.ffprobePath).toBe("ffprobe");
+    expect(config.clipExportDir).toMatch(/\/data\/exports$/u);
     expect(config.ytDlpPath).toBe("yt-dlp");
     expect(config.speechToTextProvider).toBe("disabled");
     expect(config.whisperCppPath).toBe("whisper-cli");
@@ -38,6 +42,26 @@ describe("configuration", () => {
     expect(config.mediaProvider).toBe("yt-dlp-audio");
     expect(config.speechToTextProvider).toBe("whisper-cpp");
     expect(config.whisperCppModelName).toBe("large-v3-turbo");
+  });
+
+  it("enables full-video cutting only by separate opt-in and requires a fixed absolute output root", () => {
+    const config = loadConfig({
+      NODE_ENV: "test",
+      EXPORT_SOURCE_PROVIDER: "yt-dlp",
+      CLIP_EXPORT_DIR: "/private/research-exports",
+      YT_DLP_PATH: "/opt/yt-dlp",
+      FFMPEG_PATH: "/opt/ffmpeg",
+      FFPROBE_PATH: "/opt/ffprobe",
+    });
+    expect(config.exportSourceProvider).toBe("yt-dlp");
+    expect(config.mediaProvider).toBe("disabled");
+    expect(config.clipExportDir).toBe("/private/research-exports");
+    expect(config.ffmpegPath).toBe("/opt/ffmpeg");
+    expect(config.ffprobePath).toBe("/opt/ffprobe");
+    expect(() => loadConfig({ CLIP_EXPORT_DIR: "./relative" })).toThrow(
+      "CLIP_EXPORT_DIR must be an absolute local directory",
+    );
+    expect(() => loadConfig({ EXPORT_SOURCE_PROVIDER: "automatic" })).toThrow();
   });
 
   it("requires explicit model provenance for whisper.cpp", () => {

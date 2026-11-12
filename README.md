@@ -105,6 +105,98 @@ The adapters never enable themselves based on installed tools. The caller must
 confirm source authorization, use isolated job scratch storage, and delete the
 acquired audio after transcript publication or any terminal failure.
 
+## Cut logged project clips to local files (#20)
+
+Use this **foreground, opt-in** path on the Mac when a project clip is already
+logged and its exact original/English transcript version is published in the
+authorized project's verified cache. Install `yt-dlp`, `ffmpeg` and `ffprobe`
+on that machine (for example using your local package manager); confirm you
+have rights to process the selected video. These tools are not automatically
+enabled and the service will never infer consent from a video URL.
+
+```bash
+EXPORT_SOURCE_PROVIDER=yt-dlp
+YT_DLP_PATH=/absolute/path/to/yt-dlp
+FFMPEG_PATH=/absolute/path/to/ffmpeg
+FFPROBE_PATH=/absolute/path/to/ffprobe
+# Optional: CLIP_EXPORT_DIR=/absolute/private/output/folder
+```
+
+Export the settings into the local shell before running the command or server;
+editing `.env` alone does not make `npm` load it automatically. If you keep
+the settings in an untracked `.env` file, use `set -a; . ./.env; set +a`
+in the shell that starts the service (do not source untrusted files). The default
+output folder is `DATA_DIR/exports` (by default `./data/exports`), and every
+clip is placed in a directory named for its UUID. Start the authenticated
+cloud API locally with `npm run dev:cloud-api`, using its documented project
+member authorization. The clip cut command opens the local SQLite verified
+cache directly; a running local-agent server is **not** required for the CLI.
+
+```bash
+export RESEARCH_AUTHORIZATION='Bearer <registered-project-member-credential>'
+npm run clip:cut -- \
+  --project-id <project-uuid> \
+  --clip-id <logged-clip-uuid-1> \
+  --clip-id <logged-clip-uuid-2> \
+  --confirm-rights
+```
+
+`RESEARCH_AUTHORIZATION` is read **only from the environment**, never from
+command-line flags or JSON request bodies. Keep it out of shell history and
+logs (for an interactive shell, enter it privately with `read -rs RESEARCH_AUTHORIZATION`
+and then `export RESEARCH_AUTHORIZATION`). This local path uses the existing
+development project-member bearer API, not a browser Cognito cookie session;
+do not expose the legacy development bearer endpoint to public networks.
+The command exits nonzero with one concise error sentence if the source,
+project membership, exact transcript version, required language track, media
+tools or source rights are unavailable. Success writes JSON on stdout:
+
+```json
+{
+  "clips": [
+    {
+      "clipId": "<logged-clip-uuid>",
+      "videoId": "<youtube-video-id>",
+      "folder": "<absolute-export-folder>/<logged-clip-uuid>",
+      "mediaPath": "<folder>/<logged-clip-uuid>.mp4",
+      "subtitlePaths": ["<folder>/<logged-clip-uuid>.en.srt"],
+      "manifestPath": "<folder>/<logged-clip-uuid>.json"
+    }
+  ]
+}
+```
+
+For the loopback API, run `npm run dev:local-agent` with the **same** provider
+settings and the cloud API available. A Prep Media client can call:
+
+```bash
+curl --fail-with-body -X POST \
+  'http://127.0.0.1:43110/api/projects/<project-uuid>/clips/cut' \
+  -H "Authorization: ${RESEARCH_AUTHORIZATION}" \
+  -H 'Content-Type: application/json' \
+  --data '{"clipIds":["<logged-clip-uuid-1>","<logged-clip-uuid-2>"],"authorizationConfirmed":true}'
+```
+
+The endpoint accepts **1–20 distinct clip UUIDs**, an authenticated project
+bearer and explicit rights confirmation; rejects caller-provided URLs or
+paths; and responds `200` with the same `{ "clips": [...] }` payload. Errors
+use `{ "error": { "code", "message", "retryable" } }` and non-2xx HTTP
+status. A request with no valid bearer is rejected before catalog lookup or
+acquisition. `EXPORT_SOURCE_PROVIDER=disabled` refuses cutting even if other
+media adapters are enabled. This is a local file handoff, **not** a cloud
+export queue update; existing `POST /api/exports` still enqueues as before.
+
+Two or more clips from the **same video in one invocation** share a single
+temporary full-source download. Each result is an editing H.264/AAC MP4, a
+small hash/track/bounds manifest, English clip-relative SRT, and (for non-English
+or uncertain language) a separate original-language SRT. Full-source scratch
+is deleted and absence verified before success is reported. Later, independent
+invocations may download the source again rather than retaining full videos.
+Existing output folders are never overwritten. The final Mac acceptance check
+should inspect codecs/duration with `ffprobe` and **listen** for the logged
+first and last spoken words; subtitle metadata alone cannot prove audible
+word-exact timing.
+
 To let the local worker claim one shared job, also provide the development
 authorization value for a registered project member:
 
