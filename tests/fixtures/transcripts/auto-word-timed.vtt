@@ -1,0 +1,15 @@
+WEBVTT Auto captions with per-word source timestamps
+
+NOTE Exact starts come from the caption file, not an acoustic aligner.
+
+caption-1
+00:00:11.500 --> 00:00:13.100 align:start
+<v Narrator><c>Look</c><00:00:11.840><c> closely</c><00:00:12.030><c> now</c><00:00:12.900><c> please</c></v>
+
+caption-2
+00:00:13.000 --> 00:00:15.500
+<00:00:13.200><c>Résumé</c><00:00:13.600><c> &amp;</c><00:00:14.200><c> José</c>
+
+caption-hour
+01:02:03.004 --> 01:02:04.000
+<01:02:03.120><c> hours</c><01:02:03.300><c> count</c>
