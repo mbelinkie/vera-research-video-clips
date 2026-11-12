@@ -77,8 +77,11 @@ On the isolated Linux pipeline worktree:
   2 files, 32 tests passed.
 - `npm run typecheck`: passed (`tsc --noEmit`).
 - `git diff --check`: passed; changed files formatted with Prettier.
-- Full `npm run check`: running separately; final outcome belongs in the
-  phase progress log.
+- `npm run check`: passed. Format, typecheck, 174 passing tests (4 explicitly
+  skipped), production Vite build, 4 local and 8 cloud migrations valid.
+- Reversible mutation proof: forcing the exact logged-track ID/version
+  comparison to false made the focused wrong-track test fail with the expected
+  assertion; original code restored, with no remaining source diff.
 
 Subsequent phases will update this spec with their own verified evidence
 before completion. No network video or Resolve check was attempted in phase 1.
