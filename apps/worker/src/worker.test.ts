@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { spawn } from "node:child_process";
 
 import { describe, expect, it, vi } from "vitest";
 
@@ -7,6 +8,7 @@ import {
   JobSchema,
 } from "@research-video/contracts";
 import { MemoryJobQueue } from "@research-video/sync";
+import { LocalRecognizerUnavailableError } from "./pipeline.ts";
 
 import {
   ClaimingTranscriptionWorker,
@@ -143,15 +145,36 @@ describe("claiming transcription worker", () => {
   it("durably reports executor failure for the active attempt", async () => {
     const api = controlPlane();
     const worker = new ClaimingTranscriptionWorker(api, async () => {
-      throw new Error("caption provider unavailable");
+      throw new Error(
+        "caption provider unavailable; token=private-key at /Users/research/media",
+      );
     });
 
     await expect(worker.runOnce()).resolves.toBe("failed");
     expect(api.fail).toHaveBeenCalledWith(job.id, {
       attempt: 1,
       code: "worker_execution_failed",
-      message: "caption provider unavailable",
+      message:
+        "Transcript processing failed; check source availability and local providers.",
       retryable: true,
+    });
+    expect(
+      JSON.stringify((api.fail as ReturnType<typeof vi.fn>).mock.calls),
+    ).not.toContain("private-key");
+  });
+
+  it("records missing local recognizer as a safe terminal failure", async () => {
+    const api = controlPlane();
+    const worker = new ClaimingTranscriptionWorker(api, async () => {
+      throw new LocalRecognizerUnavailableError();
+    });
+    await expect(worker.runOnce()).resolves.toBe("failed");
+    expect(api.fail).toHaveBeenCalledWith(job.id, {
+      attempt: 1,
+      code: "recognizer_not_configured",
+      message:
+        "No captions are available and local speech recognition is not configured.",
+      retryable: false,
     });
   });
 
@@ -170,6 +193,51 @@ describe("claiming transcription worker", () => {
 });
 
 describe("continuous transcription worker service", () => {
+  it("keeps a truly idle Node worker alive until an explicit shutdown", async () => {
+    const code = `
+      import { TranscriptionWorkerService } from ${JSON.stringify(new URL("./worker.ts", import.meta.url).href)};
+      const shutdown = new AbortController();
+      process.once("SIGTERM", () => shutdown.abort());
+      const service = new TranscriptionWorkerService({runOnce: async () => "idle"}, {idlePollMs: 50});
+      process.stdout.write("idle-ready\\n");
+      await service.run(shutdown.signal);
+      process.stdout.write("idle-stopped\\n");
+    `;
+    const child = spawn(
+      process.execPath,
+      ["--import", "tsx", "--input-type=module", "-e", code],
+      {
+        cwd: process.cwd(),
+        stdio: ["ignore", "pipe", "pipe"],
+      },
+    );
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk: Buffer) => {
+      stdout += chunk.toString();
+    });
+    child.stderr.on("data", (chunk: Buffer) => {
+      stderr += chunk.toString();
+    });
+    const exited = new Promise<number | null>((resolve) => {
+      child.once("exit", (code) => resolve(code));
+      child.once("error", () => resolve(null));
+    });
+    try {
+      await vi.waitFor(() => expect(stdout).toContain("idle-ready"), {
+        timeout: 10_000,
+      });
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      expect(child.exitCode, stderr).toBeNull();
+      child.kill("SIGTERM");
+      await expect(exited).resolves.toBe(0);
+      expect(stdout).toContain("idle-stopped");
+    } finally {
+      if (child.exitCode === null && child.signalCode === null)
+        child.kill("SIGKILL");
+    }
+  }, 15_000);
+
   it("never exceeds its fixed concurrency", async () => {
     const shutdown = new AbortController();
     let active = 0;

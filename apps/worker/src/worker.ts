@@ -403,16 +403,30 @@ export class HttpTranscriptionWorkerControlPlane implements TranscriptionWorkerC
 }
 
 function failureFrom(error: unknown, attempt: number): WorkerFailureRequest {
-  const controlPlaneError =
-    error instanceof WorkerControlPlaneError ? error : undefined;
-  const rawMessage = error instanceof Error ? error.message : String(error);
-  const message =
-    rawMessage.trim().slice(0, 2_000) || "Worker execution failed.";
+  // Provider errors may embed private URLs, file paths, credentials and stderr.
+  // Durable batch status is user-readable: persist only approved messages.
+  const code = error instanceof Error && "code" in error ? error.code : null;
+  const known =
+    code === "recognizer_not_configured"
+      ? {
+          code,
+          message:
+            "No captions are available and local speech recognition is not configured.",
+        }
+      : code === "translation_not_configured"
+        ? {
+            code,
+            message:
+              "English translation is not configured for this source language.",
+          }
+        : null;
   return WorkerFailureRequestSchema.parse({
     attempt,
-    code: controlPlaneError?.code ?? "worker_execution_failed",
-    message,
-    retryable: controlPlaneError?.retryable ?? true,
+    code: known?.code ?? "worker_execution_failed",
+    message:
+      known?.message ??
+      "Transcript processing failed; check source availability and local providers.",
+    retryable: !known,
   });
 }
 
@@ -442,7 +456,9 @@ function waitForAbortableDelay(
       resolve();
     };
     const timer = setTimeout(finish, milliseconds);
-    timer.unref?.();
+    // This is the continuous service's idle polling loop. An unref'ed timer
+    // leaves a pending top-level await with no event-loop handles, so Node
+    // exits the otherwise healthy worker (exit code 13) between claims.
     signal.addEventListener("abort", finish, { once: true });
   });
 }

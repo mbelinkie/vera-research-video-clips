@@ -308,6 +308,14 @@ export class CachedTranscriptDocumentReader {
   constructor(private readonly index: LocalTranscriptIndex) {}
 
   read(resolution: TranscriptResolution): NormalizedTranscript {
+    const expectedArtifact = resolution.bundle.manifest.artifacts.find(
+      (item) => item.type === "english-normalized",
+    );
+    if (!expectedArtifact) {
+      throw new LocalCacheIntegrityError(
+        "Verified bundle has no pinned English transcript artifact.",
+      );
+    }
     const artifact = readdirSync(resolution.cachePath).find((filename) =>
       filename.startsWith("english-normalized."),
     );
@@ -317,7 +325,15 @@ export class CachedTranscriptDocumentReader {
       );
     }
     const artifactPath = join(resolution.cachePath, artifact);
-    const stored = readFileSync(artifactPath);
+    const stored = readRegularCacheFile(artifactPath);
+    if (
+      stored.byteLength !== expectedArtifact.byteSize ||
+      digestBytes(stored) !== expectedArtifact.sha256
+    ) {
+      throw new LocalCacheIntegrityError(
+        "Cached English transcript bytes no longer match the published version.",
+      );
+    }
     const bytes = artifact.endsWith(".gz") ? gunzipSync(stored) : stored;
     let transcript: NormalizedTranscript;
     try {
@@ -621,11 +637,29 @@ export class HttpActiveTranscriptCatalogClient implements ActiveTranscriptCatalo
       },
     );
     if (!response.ok) {
-      throw new Error(
-        `Shared transcript catalog request failed (${response.status}).`,
-      );
+      throw new SharedCatalogHttpError(response.status);
     }
     return ActiveTranscriptBundleSchema.parse(await response.json());
+  }
+}
+
+/** Preserve safe access-denied/missing statuses without surfacing upstream response bodies. */
+export class SharedCatalogHttpError extends Error {
+  readonly statusCode: number;
+  readonly code = "shared_transcript_unavailable";
+
+  constructor(upstreamStatus: number) {
+    const recognized = [401, 403, 404].includes(upstreamStatus);
+    super(
+      upstreamStatus === 403
+        ? "This project transcript is not accessible to this user."
+        : upstreamStatus === 404
+          ? "No published transcript is available for this video."
+          : upstreamStatus === 401
+            ? "Authentication is required for the shared transcript."
+            : "The shared transcript catalog could not be reached.",
+    );
+    this.statusCode = recognized ? upstreamStatus : 502;
   }
 }
 

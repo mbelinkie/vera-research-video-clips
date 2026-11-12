@@ -22,14 +22,51 @@ import {
 import {
   openLocalDatabase,
   runLocalMigrations,
+  LocalTranscriptIndex,
 } from "@research-video/db-local";
 
 import {
+  CachedTranscriptDocumentReader,
   LocalCacheIntegrityError,
   MemoryJobQueue,
   OfflineOutbox,
   readVerifiedLoggedClipTracks,
 } from "./index.ts";
+
+describe("workspace cached transcript integrity", () => {
+  it("rechecks transcript SHA on every read, including after an authorized cache hit", () => {
+    const { resolution, english, directory } = verifiedLoggedClipFixture();
+    const db = openLocalDatabase(join(directory, "reader.sqlite"));
+    try {
+      runLocalMigrations(db);
+      const reader = new CachedTranscriptDocumentReader(
+        new LocalTranscriptIndex(db),
+      );
+      expect(reader.read(resolution).segments[0]?.text).toBe(
+        "A logged selection.",
+      );
+      writeFileSync(
+        join(directory, "english-normalized.json"),
+        JSON.stringify({
+          ...english,
+          segments: [
+            // Same byte count as "A logged selection.": SHA, not size, must reject.
+            { ...english.segments[0], text: "A forged selection." },
+          ],
+        }),
+      );
+      expect(() => reader.read(resolution)).toThrow(LocalCacheIntegrityError);
+      const cached = join(directory, "english-normalized.json");
+      const validCopy = join(directory, "valid-copy.json");
+      writeFileSync(validCopy, JSON.stringify(english));
+      unlinkSync(cached);
+      symlinkSync(validCopy, cached);
+      expect(() => reader.read(resolution)).toThrow(LocalCacheIntegrityError);
+    } finally {
+      db.close();
+    }
+  });
+});
 
 const temporaryCachePaths: string[] = [];
 afterEach(() => {

@@ -37,6 +37,69 @@ PostgreSQL and AWS are not required for the normal development test suite. Cloud
 
 ## Start
 
+### Single-command private Research (Mac)
+
+After `npm install`, start the existing Research web screen, catalog, verified
+local-agent cache **and continuously polling worker together**:
+
+```bash
+npm run dev:research
+```
+
+Open `http://127.0.0.1:43112/`. Paste a YouTube URL into the existing video
+field; an immediate one-item project batch checks for a shared version, then
+uses the worker to acquire authorized captions or speech recognition, publish
+the immutable transcript and load it from the verified local-agent reader.
+Click transcript text to seek. Job progress and safe one-sentence failures
+appear in the same screen. There is no separate worker command, credential to
+paste into the browser, or automatic substitution of demonstration text.
+Fixtures are explicitly available only with `?fixture=english-word` or
+`?fixture=auto-word-timed` for development tests.
+
+This command runs **only on loopback**, creates an isolated private identity,
+project and signed local object store under `~/.vera-research-managed` (or an
+explicit private `DATA_DIR`), and stops all four child processes on shutdown.
+It does **not** touch the separately configured PostgreSQL Mac pilot or enable
+production sharing. The supervisor refuses incompatible ambient settings such
+as `OBJECT_STORE_MODE=memory`, `WORKER_MODE=once`, remote hosts or a public
+browser mode. The general `.env.example` settings below describe ordinary
+development, not a file to source unchanged into the managed launcher.
+
+Provider opt-ins are explicit; without caption acquisition enabled, a new
+uncaptioned source terminates with a clear missing-recognizer message instead
+of silently showing fixture text:
+
+```bash
+# First install yt-dlp on this Mac and confirm rights for the source.
+export CAPTION_PROVIDER=yt-dlp
+export YT_DLP_PATH=/absolute/path/to/yt-dlp
+npm run dev:research
+```
+
+For **sources without downloadable captions**, also install `whisper.cpp` and
+its local model, then opt into both source-audio acquisition and recognition:
+
+```bash
+export CAPTION_PROVIDER=yt-dlp
+export MEDIA_PROVIDER=yt-dlp-audio
+export YT_DLP_PATH=/absolute/path/to/yt-dlp
+export SPEECH_TO_TEXT_PROVIDER=whisper-cpp
+export WHISPER_CPP_PATH=/absolute/path/to/whisper-cli
+export WHISPER_CPP_MODEL_PATH=/absolute/path/to/ggml-large-v3-turbo.bin
+export WHISPER_CPP_MODEL_NAME=large-v3-turbo
+npm run dev:research
+```
+
+The exported variables must be in the shell that starts npm; editing `.env`
+alone does not load them automatically. Do not commit identities or provider
+credentials. The audio download is ephemeral, restricted to authorized
+sources, and checked for scratch cleanup before publication. Optional foreign
+language translation stays **off** unless separately enabled (it uses a
+remote billable service); unavailable translation fails terminally. Source
+restrictions, missing executables/model, and unavailable videos may still fail.
+
+### Ordinary multi-service development
+
 ```bash
 npm install
 cp .env.example .env
@@ -88,11 +151,10 @@ its separately stored English translation remains cue-timed. New timed tracks
 have their own content identities and persist the derived-end label through
 publication, verified caching, logged clips and export snapshots.
 
-The existing browser transcript is still an explicitly labelled demo fixture,
-not a live transcript lookup. The deterministic `/?fixture=auto-word-timed`
-demo after loading the API test video illustrates exact caption starts,
-estimated ends, selection, preview and queue/export payloads; it does not
-connect the live YouTube caption provider to browser transcript loading.
+The explicit `/?fixture=auto-word-timed` demo after loading the API test video
+illustrates exact caption starts, estimated ends, selection, preview and
+queue/export payloads. Normal managed-local startup instead uses the live
+shared-first batch/worker/verified-cache pipeline, never a fixture fallback.
 
 Translation is also disabled by default because it sends transcript text to a
 remote, billable service. To opt into the initial Amazon Translate adapter, set:

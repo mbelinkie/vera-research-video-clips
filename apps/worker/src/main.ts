@@ -36,11 +36,6 @@ if (!config.workerAuthorization) {
           modelName: config.whisperCppModelName!,
         })
       : undefined;
-  if (!media || !speechToText) {
-    throw new Error(
-      "Configured workers require opt-in MEDIA_PROVIDER and SPEECH_TO_TEXT_PROVIDER fallbacks before claiming jobs.",
-    );
-  }
   const captions = createCaptionProvider({
     mode: config.captionProvider,
     ytDlpPath: config.ytDlpPath,
@@ -65,8 +60,8 @@ if (!config.workerAuthorization) {
   });
   const execute = createTranscriptPipelineExecutor({
     ...(captions ? { captions } : {}),
-    media,
-    speechToText,
+    ...(media ? { media } : {}),
+    ...(speechToText ? { speechToText } : {}),
     ...(translation ? { translation } : {}),
     publication,
     scratchRoot: join(config.dataDir, "jobs", "transcription-scratch"),
@@ -95,9 +90,10 @@ if (!config.workerAuthorization) {
       concurrency: config.workerConcurrency,
       idlePollMs: config.workerPollIntervalMs,
       errorBackoffMs: config.workerErrorBackoffMs,
-      onUnexpectedError: (error) => {
-        const message = error instanceof Error ? error.message : String(error);
-        process.stderr.write(`Worker loop error; retrying: ${message}\n`);
+      onUnexpectedError: () => {
+        // Worker control-plane exceptions may contain credentials or private
+        // endpoints; do not print raw exceptions to shared supervisor logs.
+        process.stderr.write("Worker loop error; retrying.\n");
       },
     });
     process.stdout.write(

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import {
   ApiErrorSchema,
@@ -24,6 +24,7 @@ import {
 } from "./csv-import.ts";
 import { ClipQueue } from "./clip-queue.tsx";
 import { cloudFetch } from "./browser-api.ts";
+import { immediateProgress } from "./immediate-transcript.ts";
 
 type BatchWorkspaceProps = {
   authorization: string;
@@ -65,6 +66,7 @@ export function BatchWorkspace({
     useState<CreateTranscriptionBatchResponse>();
   const [selectedBatchId, setSelectedBatchId] = useState("");
   const [reviewItems, setReviewItems] = useState<ReviewInboxItem[]>([]);
+  const [reviewProjectId, setReviewProjectId] = useState("");
   const [busy, setBusy] = useState(false);
   const [newProject, setNewProject] = useState("");
   const [message, setMessage] = useState(
@@ -72,6 +74,25 @@ export function BatchWorkspace({
       ? "Refresh your projects."
       : "Connect with a development session credential to load your projects.",
   );
+  const currentContext = useRef({ projectId, authorization });
+  currentContext.current = { projectId, authorization };
+  const sameContext = (targetProjectId: string, targetAuth = authorization) =>
+    currentContext.current.projectId === targetProjectId &&
+    currentContext.current.authorization === targetAuth;
+
+  useEffect(() => {
+    // Never keep another project's private batch/review rows visible.
+    setBatchList(undefined);
+    setSelectedBatch(undefined);
+    setSelectedBatchId("");
+    setReviewItems([]);
+    setReviewProjectId("");
+  }, [projectId, authorization]);
+
+  const visibleReviewItems = reviewProjectId === projectId ? reviewItems : [];
+  const visibleBatches =
+    batchList?.batches.filter((entry) => entry.batch.projectId === projectId) ??
+    [];
 
   const inputs = useMemo(
     () =>
@@ -160,15 +181,24 @@ export function BatchWorkspace({
     preferredBatchId = selectedBatchId,
   ) {
     if (!targetProjectId || !authorization) return;
+    const expectedAuth = authorization;
     try {
       const [listed, inbox] = await Promise.all([
         request(`/api/projects/${targetProjectId}/transcription-batches`),
         request(`/api/projects/${targetProjectId}/review-inbox`),
       ]);
+      if (!sameContext(targetProjectId, expectedAuth)) return;
       const parsedList = TranscriptionBatchListResponseSchema.parse(listed);
       const parsedInbox = ReviewInboxResponseSchema.parse(inbox);
+      if (
+        parsedList.batches.some(
+          (entry) => entry.batch.projectId !== targetProjectId,
+        )
+      )
+        throw new Error("Batch list does not match the selected project.");
       setBatchList(parsedList);
       setReviewItems(parsedInbox.items);
+      setReviewProjectId(targetProjectId);
       const selectedId =
         parsedList.batches.find((entry) => entry.batch.id === preferredBatchId)
           ?.batch.id ?? parsedList.batches[0]?.batch.id;
@@ -178,15 +208,24 @@ export function BatchWorkspace({
         setSelectedBatchId("");
       }
     } catch (error) {
-      setMessage(errorMessage(error));
+      if (sameContext(targetProjectId, expectedAuth))
+        setMessage(errorMessage(error));
     }
   }
 
   async function loadBatch(targetProjectId: string, batchId: string) {
+    const expectedAuth = authorization;
     const payload = await request(
       `/api/projects/${targetProjectId}/transcription-batches/${batchId}`,
     );
-    setSelectedBatch(CreateTranscriptionBatchResponseSchema.parse(payload));
+    if (!sameContext(targetProjectId, expectedAuth)) return;
+    const parsed = CreateTranscriptionBatchResponseSchema.parse(payload);
+    if (
+      parsed.batch.projectId !== targetProjectId ||
+      parsed.batch.id !== batchId
+    )
+      throw new Error("Batch does not match the selected project or request.");
+    setSelectedBatch(parsed);
     setSelectedBatchId(batchId);
   }
 
@@ -549,9 +588,9 @@ export function BatchWorkspace({
 
             <article className="queue-card">
               <h3>Batches</h3>
-              {batchList?.batches.length ? (
+              {visibleBatches.length ? (
                 <div className="batch-list">
-                  {batchList.batches.map((entry) => (
+                  {visibleBatches.map((entry) => (
                     <button
                       type="button"
                       className={
@@ -575,7 +614,7 @@ export function BatchWorkspace({
               ) : (
                 <p className="muted">No transcription batches yet.</p>
               )}
-              {selectedBatch ? (
+              {selectedBatch && selectedBatch.batch.projectId === projectId ? (
                 <BatchDetail
                   batch={selectedBatch}
                   busy={busy}
@@ -588,11 +627,11 @@ export function BatchWorkspace({
           <article className="queue-card review-card">
             <h3>
               Ready for review{" "}
-              <span className="count-badge">{reviewItems.length}</span>
+              <span className="count-badge">{visibleReviewItems.length}</span>
             </h3>
-            {reviewItems.length ? (
+            {visibleReviewItems.length ? (
               <div className="review-list">
-                {reviewItems.map((item) => (
+                {visibleReviewItems.map((item) => (
                   <div className="review-item" key={item.id}>
                     <div>
                       <strong>{item.title ?? item.youtubeVideoId}</strong>
@@ -742,7 +781,7 @@ function BatchDetail({
               <tr key={item.id}>
                 <td>
                   {item.title ?? item.input}
-                  {item.error ? <small>{item.error.message}</small> : null}
+                  {item.error ? <small>{safeBatchError(item)}</small> : null}
                 </td>
                 <td>{item.state}</td>
                 <td>{item.attempt}</td>
@@ -753,6 +792,15 @@ function BatchDetail({
       </div>
     </div>
   );
+}
+
+function safeBatchError(
+  item: CreateTranscriptionBatchResponse["items"][number],
+) {
+  const progress = immediateProgress(item);
+  return progress.kind === "failed"
+    ? progress.message
+    : "Transcript processing requires attention.";
 }
 
 function errorMessage(error: unknown) {

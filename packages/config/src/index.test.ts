@@ -236,3 +236,49 @@ describe("browser BFF configuration boundary", () => {
     ).toThrow();
   });
 });
+
+describe("managed local Research configuration", () => {
+  const valid = {
+    NODE_ENV: "development",
+    VERA_RUNTIME_MODE: "managed-local",
+    CLOUD_AUTH_MODE: "development",
+    CLOUD_API_HOST: "127.0.0.1",
+    LOCAL_AGENT_HOST: "127.0.0.1",
+    DATABASE_MODE: "pglite",
+    OBJECT_STORE_MODE: "local",
+    QUEUE_MODE: "memory",
+    DATA_DIR: "/private/vera-managed",
+    PILOT_OBJECT_ROOT: "/private/vera-managed/transcript-objects",
+    LOCAL_UPLOAD_SIGNING_SECRET:
+      "test-only-signing-secret-with-more-than-32-bytes",
+    WORKER_MODE: "continuous",
+    WORKER_EXECUTION_LOCATION: "local",
+    WORKER_AUTHORIZATION:
+      "Bearer 83d2ba23-ea11-4343-8c2b-a19a821f7a12|managed:76495c1e-3d89-4f0b-a9a1-2320d1a492f6",
+  };
+  it("allows signed local objects with an isolated PGlite catalog and continuous worker", () => {
+    const config = loadConfig(valid);
+    expect(config.runtimeMode).toBe("managed-local");
+    expect(config.databaseMode).toBe("pglite");
+    expect(config.objectStoreMode).toBe("local");
+    expect(config.workerMode).toBe("continuous");
+  });
+  it("rejects production, remote, memory-object, hosted-worker and weak secret bypasses", () => {
+    for (const [key, value] of Object.entries({
+      NODE_ENV: "production",
+      CLOUD_AUTH_MODE: "browser",
+      CLOUD_API_HOST: "0.0.0.0",
+      LOCAL_AGENT_HOST: "10.0.0.1",
+      DATABASE_MODE: "postgres",
+      OBJECT_STORE_MODE: "memory",
+      QUEUE_MODE: "sqs",
+      PILOT_OBJECT_ROOT: "./relative",
+      LOCAL_UPLOAD_SIGNING_SECRET: "weak",
+      WORKER_MODE: "once",
+      WORKER_EXECUTION_LOCATION: "hosted",
+      WORKER_AUTHORIZATION: "",
+    })) {
+      expect(() => loadConfig({ ...valid, [key]: value }), key).toThrow();
+    }
+  });
+});
