@@ -25,6 +25,13 @@ import {
   UpdateProjectMemberRequestSchema,
   UpdateReviewStatusRequestSchema,
   UpdateClipCandidateRequestSchema,
+  CreateSourceRequestSchema,
+  UpdateSourceRequestSchema,
+  SourceListQuerySchema,
+  CreateItemRequestSchema,
+  CreateTranscriptClipItemRequestSchema,
+  UpdateItemRequestSchema,
+  ItemListQuerySchema,
   FinalizeTranscriptRequestSchema,
   HealthResponseSchema,
   WorkerClaimRequestSchema,
@@ -59,6 +66,8 @@ const IdParamsSchema = z.object({ projectId: z.uuid() });
 const ProjectMemberParamsSchema = IdParamsSchema.extend({ userId: z.uuid() });
 const ProjectVideoParamsSchema = IdParamsSchema.extend({ videoId: z.uuid() });
 const ProjectClipParamsSchema = IdParamsSchema.extend({ clipId: z.uuid() });
+const ProjectSourceParamsSchema = IdParamsSchema.extend({ sourceId: z.uuid() });
+const ProjectItemParamsSchema = IdParamsSchema.extend({ itemId: z.uuid() });
 const ProjectBatchParamsSchema = IdParamsSchema.extend({ batchId: z.uuid() });
 const ProjectReviewItemParamsSchema = IdParamsSchema.extend({
   itemId: z.uuid(),
@@ -344,6 +353,95 @@ export function createCloudApi(
   app.get("/api/projects/:projectId/videos", async (request) => {
     const { projectId } = IdParamsSchema.parse(request.params);
     return catalog.listVideos(await authenticate(request), projectId);
+  });
+
+  app.post("/api/projects/:projectId/sources", async (request, reply) => {
+    const { projectId } = IdParamsSchema.parse(request.params);
+    const created = await catalog.library.createSource(
+      await authenticate(request),
+      projectId,
+      CreateSourceRequestSchema.parse(request.body),
+    );
+    return reply.status(201).send(created);
+  });
+
+  app.get("/api/projects/:projectId/sources", async (request) => {
+    const { projectId } = IdParamsSchema.parse(request.params);
+    return catalog.library.listSources(
+      await authenticate(request),
+      projectId,
+      SourceListQuerySchema.parse(request.query),
+    );
+  });
+
+  app.get("/api/projects/:projectId/sources/:sourceId", async (request) => {
+    const { projectId, sourceId } = ProjectSourceParamsSchema.parse(
+      request.params,
+    );
+    return catalog.library.getSource(
+      await authenticate(request),
+      projectId,
+      sourceId,
+    );
+  });
+
+  app.patch("/api/projects/:projectId/sources/:sourceId", async (request) => {
+    const { projectId, sourceId } = ProjectSourceParamsSchema.parse(
+      request.params,
+    );
+    return catalog.library.updateSource(
+      await authenticate(request),
+      projectId,
+      sourceId,
+      UpdateSourceRequestSchema.parse(request.body),
+    );
+  });
+
+  app.post("/api/projects/:projectId/items", async (request, reply) => {
+    const { projectId } = IdParamsSchema.parse(request.params);
+    const actor = await authenticate(request);
+    const { body } = request;
+    const created =
+      typeof body === "object" && body !== null && "clip" in body
+        ? await catalog.library.createTranscriptClip(
+            actor,
+            projectId,
+            CreateTranscriptClipItemRequestSchema.parse(body),
+          )
+        : await catalog.library.createItem(
+            actor,
+            projectId,
+            CreateItemRequestSchema.parse(body),
+          );
+    return reply.status(201).send(created);
+  });
+
+  app.get("/api/projects/:projectId/items", async (request) => {
+    const { projectId } = IdParamsSchema.parse(request.params);
+    return catalog.library.listItems(
+      await authenticate(request),
+      projectId,
+      ItemListQuerySchema.parse(request.query),
+    );
+  });
+
+  app.get("/api/projects/:projectId/items/:itemId", async (request) => {
+    const { projectId, itemId } = ProjectItemParamsSchema.parse(request.params);
+    return catalog.library.getItem(
+      await authenticate(request),
+      projectId,
+      itemId,
+    );
+  });
+
+  app.patch("/api/projects/:projectId/items/:itemId", async (request) => {
+    const { projectId, itemId } = ProjectItemParamsSchema.parse(request.params);
+    return catalog.library.updateItem(
+      await authenticate(request),
+      projectId,
+      itemId,
+      UpdateItemRequestSchema.parse(request.body),
+    );
   });
 
   app.post("/api/projects/:projectId/clips", async (request, reply) => {

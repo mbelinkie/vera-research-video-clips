@@ -62,15 +62,16 @@ import {
   type TranscriptObjectStore,
 } from "@research-video/storage";
 
-export class CatalogNotFoundError extends Error {
-  readonly statusCode = 404;
-  readonly code = "not_found";
-}
-
-export class CatalogConflictError extends Error {
-  readonly statusCode = 409;
-  readonly code = "conflict";
-}
+import {
+  CatalogNotFoundError,
+  CatalogConflictError,
+} from "./catalog-errors.ts";
+export {
+  CatalogNotFoundError,
+  CatalogConflictError,
+} from "./catalog-errors.ts";
+import { catalogTransaction, ProjectLibrary } from "./project-library.ts";
+import { addTopics } from "./topics.ts";
 
 export class TranscriptIntegrityError extends Error {
   readonly statusCode = 422;
@@ -124,12 +125,21 @@ const loggedExportRequestSelect = `SELECT er.*, j.state
  JOIN jobs j ON j.id = er.job_id`;
 
 export class SharedProjectCatalog {
+  readonly library: ProjectLibrary;
   constructor(
     private readonly database: SqlDatabase,
     private readonly store: TranscriptObjectStore,
     private readonly now: () => Date = () => new Date(),
     private readonly uploadUrlIssuer: StagedUploadUrlIssuer = new MemoryStagedUploadUrlIssuer(),
-  ) {}
+  ) {
+    this.library = new ProjectLibrary(
+      database,
+      now,
+      (actor, projectId) => this.authorize(actor, projectId, "read"),
+      (actor, projectId, input, sourceId) =>
+        this.createClipCandidate(actor, projectId, input, sourceId),
+    );
+  }
 
   async registerUser(
     actor: AuthenticatedActor,
@@ -217,15 +227,16 @@ export class SharedProjectCatalog {
     actor: AuthenticatedActor,
     projectId: string,
     input: CreateClipCandidateRequest,
+    expectedSourceId?: string,
   ): Promise<ClipCandidate> {
     await this.authorize(actor, projectId, "write");
     const candidateId = randomUUID();
     const now = this.now().toISOString();
     let persistedCandidateId: string = candidateId;
 
-    await this.transaction(async () => {
+    await catalogTransaction(this.database, async (tx) => {
       const videoId = randomUUID();
-      const videoResult = await this.database.query<DbRow>(
+      const videoResult = await tx.query<DbRow>(
         `INSERT INTO videos
            (id, youtube_video_id, canonical_url, title, channel, source_language,
             created_at, updated_at)
@@ -248,7 +259,11 @@ export class SharedProjectCatalog {
         ],
       );
       const catalogVideoId = String(videoResult.rows[0]!.id);
-      await this.database.query(
+      if (expectedSourceId && catalogVideoId !== expectedSourceId)
+        throw new CatalogConflictError(
+          "The supplied clip belongs to a different source.",
+        );
+      await tx.query(
         `INSERT INTO project_videos
            (project_id, video_id, version, created_at, updated_at)
          VALUES ($1, $2, 1, $3, $3)
@@ -257,7 +272,7 @@ export class SharedProjectCatalog {
       );
 
       const selection = input.selection;
-      const inserted = await this.database.query<DbRow>(
+      const inserted = await tx.query<DbRow>(
         `INSERT INTO clip_candidates
            (id, project_id, video_id, youtube_video_id, canonical_url,
             video_title, video_channel, source_language, idempotency_key,
@@ -303,32 +318,21 @@ export class SharedProjectCatalog {
       );
       const created = Boolean(inserted.rows[0]);
       if (!created) {
-        const existing = await this.database.query<DbRow>(
-          `SELECT id FROM clip_candidates
+        const existing = await tx.query<DbRow>(
+          `SELECT id,video_id FROM clip_candidates
            WHERE project_id = $1 AND idempotency_key = $2`,
           [projectId, input.idempotencyKey],
         );
+        if (expectedSourceId && existing.rows[0]!.video_id !== expectedSourceId)
+          throw new CatalogConflictError(
+            "The idempotency key belongs to a different source.",
+          );
         persistedCandidateId = String(existing.rows[0]!.id);
         return;
       }
 
-      for (const tagName of uniqueTagNames(input.tags)) {
-        const tagResult = await this.database.query<DbRow>(
-          `INSERT INTO clip_tags
-             (id, project_id, name, normalized_name, created_at)
-           VALUES ($1, $2, $3, $4, $5)
-           ON CONFLICT (project_id, normalized_name) DO UPDATE
-           SET normalized_name = EXCLUDED.normalized_name
-           RETURNING id`,
-          [randomUUID(), projectId, tagName, normalizeTagName(tagName), now],
-        );
-        await this.database.query(
-          `INSERT INTO clip_candidate_tags (clip_id, tag_id)
-           VALUES ($1, $2) ON CONFLICT DO NOTHING`,
-          [candidateId, tagResult.rows[0]!.id],
-        );
-      }
-      await this.database.query(
+      await addTopics(tx, true, projectId, candidateId, input.tags, now);
+      await tx.query(
         `INSERT INTO sync_events
            (project_id, event_type, entity_id, server_version, payload, created_at)
          VALUES ($1, 'clip_candidate.created', $2, 1, $3, $4)`,
@@ -451,8 +455,8 @@ export class SharedProjectCatalog {
   ): Promise<ClipCandidate> {
     await this.authorize(actor, projectId, "write");
     const now = this.now().toISOString();
-    await this.transaction(async () => {
-      const updated = await this.database.query<DbRow>(
+    await catalogTransaction(this.database, async (tx) => {
+      const updated = await tx.query<DbRow>(
         `UPDATE clip_candidates
          SET notes = $1, version = version + 1, updated_at = $2
          WHERE id = $3 AND project_id = $4 AND version = $5
@@ -460,7 +464,7 @@ export class SharedProjectCatalog {
         [input.notes, now, clipId, projectId, input.expectedVersion],
       );
       if (!updated.rows[0]) {
-        const exists = await this.database.query(
+        const exists = await tx.query(
           "SELECT 1 FROM clip_candidates WHERE id = $1 AND project_id = $2",
           [clipId, projectId],
         );
@@ -470,27 +474,11 @@ export class SharedProjectCatalog {
           "This clip changed elsewhere. Reload it before saving edits.",
         );
       }
-      await this.database.query(
-        "DELETE FROM clip_candidate_tags WHERE clip_id = $1",
-        [clipId],
-      );
-      for (const tagName of uniqueTagNames(input.tags)) {
-        const tagResult = await this.database.query<DbRow>(
-          `INSERT INTO clip_tags
-             (id, project_id, name, normalized_name, created_at)
-           VALUES ($1, $2, $3, $4, $5)
-           ON CONFLICT (project_id, normalized_name) DO UPDATE
-           SET normalized_name = EXCLUDED.normalized_name
-           RETURNING id`,
-          [randomUUID(), projectId, tagName, normalizeTagName(tagName), now],
-        );
-        await this.database.query(
-          `INSERT INTO clip_candidate_tags (clip_id, tag_id)
-           VALUES ($1, $2) ON CONFLICT DO NOTHING`,
-          [clipId, tagResult.rows[0]!.id],
-        );
-      }
-      await this.database.query(
+      await tx.query("DELETE FROM clip_candidate_tags WHERE clip_id = $1", [
+        clipId,
+      ]);
+      await addTopics(tx, true, projectId, clipId, input.tags, now);
+      await tx.query(
         `INSERT INTO sync_events
            (project_id, event_type, entity_id, server_version, payload, created_at)
          VALUES ($1, 'clip_candidate.updated', $2, $3, $4, $5)`,
@@ -834,14 +822,9 @@ export class SharedProjectCatalog {
     },
   ): Promise<Video> {
     await this.authorize(actor, projectId, "write");
-    const existing = await this.database.query<DbRow>(
-      "SELECT id FROM videos WHERE youtube_video_id = $1",
-      [input.youtubeVideoId],
-    );
-    const id = String(existing.rows[0]?.id ?? randomUUID());
     const now = this.now().toISOString();
-    await this.transaction(async () => {
-      await this.database.query(
+    const id = await catalogTransaction(this.database, async (tx) => {
+      const stored = await tx.query<{ id: string }>(
         `INSERT INTO videos
            (id, youtube_video_id, canonical_url, title, channel, duration_ms,
             source_language, created_at, updated_at)
@@ -852,9 +835,9 @@ export class SharedProjectCatalog {
              channel = EXCLUDED.channel,
              duration_ms = EXCLUDED.duration_ms,
              source_language = EXCLUDED.source_language,
-             updated_at = EXCLUDED.updated_at`,
+             updated_at = EXCLUDED.updated_at RETURNING id`,
         [
-          id,
+          randomUUID(),
           input.youtubeVideoId,
           input.canonicalUrl,
           input.title.trim(),
@@ -864,13 +847,15 @@ export class SharedProjectCatalog {
           now,
         ],
       );
-      await this.database.query(
+      const videoId = stored.rows[0]!.id;
+      await tx.query(
         `INSERT INTO project_videos
            (project_id, video_id, version, created_at, updated_at)
          VALUES ($1, $2, 1, $3, $3)
          ON CONFLICT (project_id, video_id) DO NOTHING`,
-        [projectId, id, now],
+        [projectId, videoId, now],
       );
+      return videoId;
     });
     const result = await this.database.query<DbRow>(
       `SELECT id, youtube_video_id, canonical_url, title, channel, duration_ms,
@@ -2108,12 +2093,7 @@ export class SharedProjectCatalog {
     item: BatchPreflightItem,
     now: string,
   ): Promise<string> {
-    const existing = await this.database.query<DbRow>(
-      "SELECT id FROM videos WHERE youtube_video_id = $1",
-      [item.youtubeVideoId],
-    );
-    const id = String(existing.rows[0]?.id ?? randomUUID());
-    await this.database.query(
+    const stored = await this.database.query<{ id: string }>(
       `INSERT INTO videos
          (id, youtube_video_id, canonical_url, title, channel, duration_ms,
           source_language, created_at, updated_at)
@@ -2124,9 +2104,9 @@ export class SharedProjectCatalog {
            channel = EXCLUDED.channel,
            duration_ms = EXCLUDED.duration_ms,
            source_language = EXCLUDED.source_language,
-           updated_at = EXCLUDED.updated_at`,
+           updated_at = EXCLUDED.updated_at RETURNING id`,
       [
-        id,
+        randomUUID(),
         item.youtubeVideoId,
         item.canonicalUrl,
         item.title,
@@ -2136,6 +2116,7 @@ export class SharedProjectCatalog {
         now,
       ],
     );
+    const id = stored.rows[0]!.id;
     await this.database.query(
       `INSERT INTO project_videos
          (project_id, video_id, version, created_at, updated_at)
@@ -2346,19 +2327,6 @@ function mapLoggedExportRequest(row: DbRow): ExportRequest {
     createdAt: iso(row.created_at),
     updatedAt: iso(row.updated_at),
   });
-}
-
-function normalizeTagName(value: string) {
-  return value.trim().normalize("NFKC").toLocaleLowerCase("en-US");
-}
-
-function uniqueTagNames(values: readonly string[]) {
-  const unique = new Map<string, string>();
-  for (const value of values) {
-    const normalized = normalizeTagName(value);
-    if (!unique.has(normalized)) unique.set(normalized, value.trim());
-  }
-  return [...unique.values()];
 }
 
 function csvRow(values: readonly (string | number)[]) {

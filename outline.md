@@ -244,6 +244,8 @@ Gate: one sheet action requests exactly one export and status returns to the sam
 
 ## Canonical domains
 
+The project Library exposes sources and logged items through the project-scoped catalog API. Existing clips keep their Timeline UUIDs. See the [Research #76 implementation record](specs/completed/r-76-general-source-item-model.md).
+
 ```text
 Project
   -> ProjectMember

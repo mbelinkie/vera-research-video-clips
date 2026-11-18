@@ -800,6 +800,27 @@ Return job IDs for long operations. Stream progress via server-sent events or po
 
 Registered local workers claim eligible `execution_location = local` jobs through the authenticated API and heartbeat their lease; they do not receive broad SQS or S3 credentials. Hosted workers consume SQS using a narrow service role and use the same executor/finalize contracts. The database remains authoritative for state in both modes.
 
+### 9.5 Project Library API
+
+Research and the editor Library share `/api/projects/:projectId/sources` and `/api/projects/:projectId/items`. Each collection supports POST and GET. Each record supports GET and PATCH by UUID. Project members can read, and owners, editors and researchers can write. PATCH requires the record's `expectedVersion`. A stale edit returns HTTP 409.
+
+A source represents one YouTube video, web page, PDF, offline work, image, audio file or local video. The project stores its bibliography once. A citation field holds a value and its `automatic` or `confirmed` state. Legacy fields can have an unknown state. A bibliography patch changes the supplied fields and clears any explicitly set to null. Details are validated for the source kind. Existing qualified provider videos retain their provider and media ID under `provider_video`.
+
+An item identifies its project source by `sourceId` and its kind by `clip`, `quote`, `still` or `audio`. The service records the authenticated logger in `createdBy` and commits its notes and Topics together. Native create requests accept an optional `idempotencyKey` for safe retries. For example, a producer can log a quote with this body.
+
+```json
+{
+  "sourceId": "f0f17f46-3566-4f93-b396-83d899908aba",
+  "kind": "quote",
+  "content": { "text": "The first edition appeared in May." },
+  "topics": ["Publication history"]
+}
+```
+
+For a transcript-backed YouTube clip, POST an item with `kind`, `sourceId` and `clip`. The `clip` field takes the established clip logging request with its transcript evidence, notes, tags and idempotency key. Both clip routes return the same persisted clip UUID. Original evidence and export bounds remain available through the existing clip endpoint. Library edits to the log share its optimistic version and Topic assignments.
+
+Both list routes accept `kind`, `topic`, `q`, `limit` and `offset`. Items also accept `logger` (a user UUID). The default page holds 50 records and the maximum is 100. Search matches literal, case-insensitive text in item titles, transcripts, quotes, speakers, notes, and source titles, authors and credits. A source matches a Topic when at least one of its logged items carries it. The request and response schemas are exported from `@research-video/contracts`.
+
 ## 10. Persistence model
 
 Separate shared control-plane data from the local working cache.

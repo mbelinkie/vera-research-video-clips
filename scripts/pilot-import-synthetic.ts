@@ -21,6 +21,7 @@ const tablesInFkOrder = [
   "videos",
   "project_members",
   "transcript_versions",
+  "library_sources",
   "project_videos",
   "transcription_batches",
   "jobs",
@@ -34,6 +35,8 @@ const tablesInFkOrder = [
   "clip_tags",
   "clip_candidate_tags",
   "export_requests",
+  "library_items",
+  "library_item_topics",
 ] as const;
 const keyColumns: Record<string, string[]> = {
   users: ["id"],
@@ -41,6 +44,7 @@ const keyColumns: Record<string, string[]> = {
   videos: ["id"],
   project_members: ["project_id", "user_id"],
   transcript_versions: ["id"],
+  library_sources: ["project_id", "id"],
   project_videos: ["project_id", "video_id"],
   transcription_batches: ["id"],
   jobs: ["id"],
@@ -54,6 +58,8 @@ const keyColumns: Record<string, string[]> = {
   clip_tags: ["id"],
   clip_candidate_tags: ["clip_id", "tag_id"],
   export_requests: ["id"],
+  library_items: ["id"],
+  library_item_topics: ["item_id", "tag_id"],
 };
 
 const normalize = (value: unknown): unknown => {
@@ -169,6 +175,8 @@ export async function importSyntheticPglite(
         "Schema drift: source and target migration versions differ",
       );
     }
+    // A Library containing only logged items can have zero transcript objects.
+    await mkdir(objectStage, { mode: 0o700 });
     const targetStore = new LocalTranscriptObjectStore(objectStage);
     const sourceStore = new LocalTranscriptObjectStore(sourceObjectRoot);
     const refs = await source.query<{
