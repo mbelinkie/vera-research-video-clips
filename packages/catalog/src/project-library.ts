@@ -30,6 +30,11 @@ import {
   listLibraryItems,
 } from "./library-queries.ts";
 import { addTopics } from "./topics.ts";
+import {
+  articleIdentity,
+  findArticle,
+  lockSourceIdentity,
+} from "./library-web-source.ts";
 
 type Session = Pick<SqlDatabase, "query">;
 type Actor = AuthenticatedActor;
@@ -55,9 +60,15 @@ async function readCreateReplay(
   if (!retry) return undefined;
   const actorColumn =
     table === "library_sources" ? "create_actor_id" : "created_by";
+  const reuseReceipts =
+    table === "library_sources"
+      ? `UNION ALL SELECT source_id,create_fingerprint FROM library_source_reuse_receipts
+         WHERE project_id=$1 AND actor_id=$2 AND idempotency_key=$3`
+      : "";
   const result = await tx.query<{ id: string; create_fingerprint: string }>(
     `SELECT id,create_fingerprint FROM ${table}
-     WHERE project_id=$1 AND ${actorColumn}=$2 AND create_idempotency_key=$3`,
+     WHERE project_id=$1 AND ${actorColumn}=$2 AND create_idempotency_key=$3
+     ${reuseReceipts}`,
     [projectId, actorId, retry.key],
   );
   const existing = result.rows[0];
@@ -136,10 +147,28 @@ export class ProjectLibrary {
         input.idempotencyKey === undefined
           ? undefined
           : createRetry(CreateSourceRequestSchema.parse(input));
+      if (retry || input.kind === "web_page")
+        await lockSourceIdentity(tx, projectId);
       const replay = () =>
         readCreateReplay(tx, "library_sources", projectId, actor.userId, retry);
       const existing = await replay();
       if (existing) return readLibrarySource(tx, projectId, existing);
+
+      const url = input.bibliography.url?.value;
+      if (input.kind === "web_page" && url !== undefined) {
+        const match = await findArticle(tx, projectId, articleIdentity(url));
+        if (match) {
+          if (retry) {
+            await tx.query(
+              `INSERT INTO library_source_reuse_receipts(
+                 project_id,actor_id,idempotency_key,create_fingerprint,source_id
+               ) VALUES($1,$2,$3,$4,$5)`,
+              [projectId, actor.userId, retry.key, retry.fingerprint, match],
+            );
+          }
+          return readLibrarySource(tx, projectId, match);
+        }
+      }
 
       let id: string = randomUUID();
       if (input.kind === "youtube") {
@@ -188,7 +217,21 @@ export class ProjectLibrary {
     input: UpdateSourceRequest,
   ) {
     return this.write(actor, projectId, async (tx) => {
+      const newUrl = input.bibliography?.url;
+      if (newUrl !== undefined) await lockSourceIdentity(tx, projectId);
       const current = await readLibrarySource(tx, projectId, id);
+      if (current.kind === "web_page" && newUrl) {
+        const identity = articleIdentity(newUrl.value);
+        const oldUrl = current.bibliography.url?.value;
+        if (
+          (oldUrl === undefined || articleIdentity(oldUrl) !== identity) &&
+          (await findArticle(tx, projectId, identity, id))
+        ) {
+          throw new CatalogConflictError(
+            "This article already has a source in the project.",
+          );
+        }
+      }
       // The response schema checks details against the immutable source kind.
       if (input.details)
         LibrarySourceSchema.parse({ ...current, details: input.details });
@@ -290,9 +333,39 @@ export class ProjectLibrary {
   ) {
     return this.write(actor, projectId, async (tx) => {
       const { item, legacy } = await readLibraryItemRow(tx, projectId, id);
+      if ("latestDisplayText" in input) {
+        if (item.kind !== "quote")
+          throw new CatalogConflictError("Only quotes have display text.");
+        const { rows } = await tx.query(
+          `UPDATE library_items SET content=jsonb_set(content,'{latestDisplayText}',to_jsonb($4::text)),
+             version=version+1,updated_at=$5
+           WHERE project_id=$1 AND id=$2 AND version=$3 AND kind='quote' RETURNING id`,
+          [
+            projectId,
+            id,
+            input.expectedVersion,
+            input.latestDisplayText,
+            this.now().toISOString(),
+          ],
+        );
+        if (!rows.length)
+          throw new CatalogConflictError(
+            "Reload the updated item before saving edits.",
+          );
+        return (await readLibraryItemRow(tx, projectId, id)).item;
+      }
+      const content =
+        item.kind === "quote" &&
+        input.content &&
+        item.content.latestDisplayText !== undefined
+          ? {
+              ...input.content,
+              latestDisplayText: item.content.latestDisplayText,
+            }
+          : (input.content ?? item.content);
       const updated = LibraryItemSchema.parse({
         ...item,
-        content: input.content ?? item.content,
+        content,
       });
       const now = this.now().toISOString();
       let saved;
@@ -367,6 +440,28 @@ export class ProjectLibrary {
         );
       }
       return (await readLibraryItemRow(tx, projectId, id)).item;
+    });
+  }
+
+  async deleteQuote(
+    actor: Actor,
+    projectId: string,
+    id: string,
+    expectedVersion: number,
+  ) {
+    await this.write(actor, projectId, async (tx) => {
+      const { item } = await readLibraryItemRow(tx, projectId, id);
+      if (item.kind !== "quote")
+        throw new CatalogNotFoundError("Quote not found.");
+      const { rows } = await tx.query(
+        `DELETE FROM library_items WHERE project_id=$1 AND id=$2 AND version=$3 AND kind='quote'
+         RETURNING id`,
+        [projectId, id, expectedVersion],
+      );
+      if (!rows.length)
+        throw new CatalogConflictError(
+          "Reload the updated quote before deleting it.",
+        );
     });
   }
 }

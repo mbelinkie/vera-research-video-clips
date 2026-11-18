@@ -147,11 +147,13 @@ export async function listLibraryItems(
            i.content ->> 'text',
            i.content ->> 'originalText',
            i.content ->> 'speaker',
+           i.content ->> 'speakerTitle',
            i.content ->> 'credit',
            i.notes
          ]) AS field(value) WHERE strpos(lower(field.value), lower($4)) > 0
        ) OR ${sourceTextMatches})
        AND ($5::uuid IS NULL OR i.created_by = $5)
+       AND ($8::uuid IS NULL OR i.source_id = $8)
      ORDER BY i.created_at DESC, i.id
      LIMIT $6 OFFSET $7`,
     [
@@ -162,6 +164,7 @@ export async function listLibraryItems(
       query.logger ?? null,
       query.limit,
       query.offset,
+      query.sourceId ?? null,
     ],
   );
   return rows.map(mapItem);

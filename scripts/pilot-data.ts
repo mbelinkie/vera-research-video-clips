@@ -222,9 +222,13 @@ async function readSnapshot(pool: Pool) {
     const counts: Record<string, number> = {};
     const tableDigests: Record<string, string> = {};
     const schemaVersions = versions.rows.map((row) => row.version);
-    const snapshotTables = schemaVersions.includes("0053_project_library")
-      ? [...tables, ...libraryTables]
-      : tables;
+    const snapshotTables = [
+      ...tables,
+      ...(schemaVersions.includes("0053_project_library") ? libraryTables : []),
+      ...(schemaVersions.includes("0054_library_source_reuse")
+        ? ["library_source_reuse_receipts"]
+        : []),
+    ];
     for (const table of snapshotTables) {
       const result = await client.query<{ total: string }>(
         "SELECT count(*)::text AS total FROM " + table,
