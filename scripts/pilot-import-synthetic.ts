@@ -175,6 +175,8 @@ export async function importSyntheticPglite(
         "Schema drift: source and target migration versions differ",
       );
     }
+    // A Library containing only logged items can have zero transcript objects.
+    await mkdir(objectStage, { mode: 0o700 });
     const targetStore = new LocalTranscriptObjectStore(objectStage);
     const sourceStore = new LocalTranscriptObjectStore(sourceObjectRoot);
     const refs = await source.query<{
