@@ -59,6 +59,7 @@ const secretQueryKeys = new Set([
   "authorization",
   "credential",
   "jwt",
+  "key-pair-id",
   "password",
   "secret",
   "session",
@@ -302,7 +303,11 @@ export function inspectPublicUrl(raw: string): InspectedPublicUrl {
     );
   }
   for (const key of url.searchParams.keys()) {
-    if (secretQueryKeys.has(key.toLowerCase())) {
+    const name = key.toLowerCase();
+    if (
+      secretQueryKeys.has(name) ||
+      /^(?:x-amz-|x-goog-|x-ms-|oauth_)/u.test(name)
+    ) {
       deny(
         "credential_shape_not_allowed",
         "Credential-shaped query parameters are not allowed.",

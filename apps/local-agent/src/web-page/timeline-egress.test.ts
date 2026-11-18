@@ -52,6 +52,17 @@ describe("Timeline public-page egress in the Mac agent", () => {
     expect(request).not.toHaveBeenCalled();
   });
 
+  it("declines signed addresses before DNS and transport", async () => {
+    const resolve = vi.fn();
+    const request = vi.fn();
+    const guard = new PublicEgressGuard({ resolve }, { request });
+    await expect(
+      guard.fetch(`${url}?X-Amz-Signature=synthetic`),
+    ).rejects.toMatchObject({ code: "credential_shape_not_allowed" });
+    expect(resolve).not.toHaveBeenCalled();
+    expect(request).not.toHaveBeenCalled();
+  });
+
   it("validates a redirect's DNS before opening a second connection", async () => {
     const resolve = vi
       .fn()
