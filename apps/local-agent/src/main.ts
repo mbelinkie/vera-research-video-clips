@@ -19,6 +19,7 @@ import {
 
 import { createLocalAgent } from "./app.ts";
 import { createClipCutRunner } from "./clip-cut-runtime.ts";
+import { createWebPageImporter } from "./web-page/import.ts";
 
 const config = loadConfig();
 await mkdir(config.dataDir, { recursive: true });
@@ -35,6 +36,7 @@ const reader = new CachedTranscriptDocumentReader(
 );
 const cloudApiUrl = `http://${config.cloudApiHost}:${config.cloudApiPort}`;
 const app = createLocalAgent({
+  importWebPage: createWebPageImporter(cloudApiUrl),
   cutLoggedClips: createClipCutRunner(config, cache),
   createExportOnly: (input) => exportQueue.createExportOnly(input),
   listExportRequests: () => exportQueue.list(),

@@ -105,11 +105,74 @@ const LicenceFields = {
   usageNote: NotesSchema.optional(),
 };
 const AudioRoleSchema = z.enum(["sound_effect", "ambience", "music", "speech"]);
+export const WebPageExtractionSchema = z.discriminatedUnion("status", [
+  z.strictObject({ status: z.literal("ready"), text: ExcerptSchema }),
+  z.strictObject({
+    status: z.literal("failed"),
+    reason: z.enum([
+      "blocked",
+      "unavailable",
+      "not_html",
+      "too_large",
+      "timed_out",
+      "no_article",
+    ]),
+  }),
+]);
+export type WebPageExtraction = z.infer<typeof WebPageExtractionSchema>;
+
+export const webPageExtractionMessages = {
+  blocked:
+    "This address or page could not be accessed publicly. Add a typed quote or send the page from your browser.",
+  unavailable:
+    "The page could not be downloaded. Check the address or add a typed quote.",
+  not_html:
+    "The address did not return a supported HTML page. You can still add a typed quote.",
+  too_large:
+    "The page exceeded the extraction size limit. Add a typed quote from the page.",
+  timed_out:
+    "The page took too long to download. Try again or add a typed quote.",
+  no_article:
+    "No readable article text was found. You can still add a typed quote.",
+} satisfies Record<
+  Extract<
+    z.infer<typeof WebPageExtractionSchema>,
+    { status: "failed" }
+  >["reason"],
+  string
+>;
+
+const WebPageMetadataFields = {
+  title: TitleSchema,
+  authors: BibliographyFields.authors.shape.value,
+  publication: TitleSchema,
+  date: BibliographyFields.date.shape.value,
+  url: WebUrlSchema,
+};
+
+export const MaxWebPageHtmlBytes = 1024 * 1024;
+export const ImportWebPageRequestSchema = z.discriminatedUnion("mode", [
+  z.strictObject({
+    mode: z.literal("public_url"),
+    url: WebUrlSchema,
+  }),
+  z.strictObject({
+    mode: z.literal("extension"),
+    url: WebUrlSchema,
+    html: TextSchema.max(MaxWebPageHtmlBytes),
+    metadata: z.strictObject(WebPageMetadataFields).partial().default({}),
+    idempotencyKey: IdempotencyKeySchema,
+  }),
+]);
+export type ImportWebPageRequest = z.infer<typeof ImportWebPageRequestSchema>;
+
 const SourceDetailsByKind = {
   youtube: VideoDetailsSchema,
   provider_video: VideoDetailsSchema,
   web_page: z.strictObject({
     accessedDate: z.iso.date().optional(),
+    submittedUrl: WebUrlSchema.optional(),
+    extraction: WebPageExtractionSchema.optional(),
   }),
   pdf: z.strictObject({
     pageCount: z.number().int().positive().optional(),
