@@ -1,7 +1,0 @@
-# Project Library sources and logged items
-
-Research #76 exposes a project Library through the shared catalog and Cloud API. The accepted Research Sources spec sections 2 and 4 define the seven source kinds, four item kinds, citation fields, Topics and logger identity. The issue is Ready at launch, with no dependencies. The protected Research check is npm run check.
-
-Existing videos appear under their catalog UUID and project membership. Existing clips appear as items under their original UUID. The migration retains the original records, transcript and export evidence, Topic assignments and any dependent comment rows. The new model also accepts records with no YouTube identity. Authenticated project members can read. Writers can log and edit within their project using version checks. Bibliography stores supplied values and their confirmation state. Unknown values remain absent.
-
-First prove a generated project created before migration through both the legacy clip API and the new source and item APIs, including live writes in both directions. Then cover create, get, edit, bounded search and kind/Topic filters for each kind, multiple item kinds on one source, project isolation, stale edits and literal text lookup. Include the pilot checkpoint comment foreign key and provider identity shape in migration fixtures. This change covers catalog contracts, project-scoped persistence, backup/import coverage and routes. Extraction, media acquisition, placement and producer UI have their own issues.
