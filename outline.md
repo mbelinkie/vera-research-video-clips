@@ -248,6 +248,8 @@ The project Library exposes sources and logged items through the project-scoped 
 
 Research #77 adds quote editing and deletion, separate original and display text, and reuse of the same article source across captures.
 
+Research #78 adds Mac-agent web page import, automatic citation details and clean article text. See the [implementation record](specs/completed/r-78-web-page-sources.md).
+
 ```text
 Project
   -> ProjectMember

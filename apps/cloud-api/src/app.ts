@@ -356,6 +356,18 @@ export function createCloudApi(
     return catalog.listVideos(await authenticate(request), projectId);
   });
 
+  app.head(
+    "/api/projects/:projectId/source-write-access",
+    async (request, reply) => {
+      const { projectId } = IdParamsSchema.parse(request.params);
+      await catalog.authorizeSourceWrite(
+        await authenticate(request),
+        projectId,
+      );
+      return reply.header("cache-control", "no-store").code(204).send();
+    },
+  );
+
   app.post("/api/projects/:projectId/sources", async (request, reply) => {
     const { projectId } = IdParamsSchema.parse(request.params);
     const created = await catalog.library.createSource(

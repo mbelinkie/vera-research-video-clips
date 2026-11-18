@@ -602,6 +602,10 @@ export class SharedProjectCatalog {
     return mapLoggedExportRequest(result.rows[0]);
   }
 
+  async authorizeSourceWrite(actor: AuthenticatedActor, projectId: string) {
+    await this.authorize(actor, projectId, "write");
+  }
+
   async getProject(
     actor: AuthenticatedActor,
     projectId: string,

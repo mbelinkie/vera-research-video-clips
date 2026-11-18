@@ -6,12 +6,19 @@ import {
   type CreateExportOnlyRequest,
   type ExportRequest,
   HealthResponseSchema,
+  ImportWebPageRequestSchema,
+  MaxWebPageHtmlBytes,
 } from "@research-video/contracts";
 import type { WorkspaceTranscriptResolution } from "@research-video/sync";
 
 import type { CutClipResult, CutLoggedClipsRequest } from "./clip-cutter.ts";
+import {
+  WebPageImportError,
+  type createWebPageImporter,
+} from "./web-page/import.ts";
 
 export interface LocalAgentDependencies {
+  importWebPage?: ReturnType<typeof createWebPageImporter>;
   resolveTranscript?(input: {
     projectId: string;
     catalogVideoId: string;
@@ -93,6 +100,34 @@ export function createLocalAgent(
       timestamp: new Date().toISOString(),
     }),
   );
+
+  if (dependencies?.importWebPage) {
+    const importWebPage = dependencies.importWebPage;
+    app.post(
+      "/api/projects/:projectId/web-page-sources",
+      { bodyLimit: MaxWebPageHtmlBytes + 64 * 1024 },
+      async (request, reply) => {
+        const { projectId } = ClipCutParamsSchema.parse(request.params);
+        const authorization = request.headers.authorization;
+        if (!authorization || !/^Bearer\s+[^\s]+$/u.test(authorization))
+          throw new LocalAuthenticationError(
+            "A project bearer credential is required to import a page.",
+          );
+        const input = ImportWebPageRequestSchema.safeParse(request.body);
+        if (!input.success)
+          throw new WebPageImportError(
+            400,
+            "Provide a page address or the browser's page details and HTML.",
+          );
+        const source = await importWebPage(
+          projectId,
+          authorization,
+          input.data,
+        );
+        return reply.code(200).send(source);
+      },
+    );
+  }
 
   if (dependencies?.resolveTranscript) {
     app.get(
