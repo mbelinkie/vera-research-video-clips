@@ -29,6 +29,7 @@ import {
   UpdateSourceRequestSchema,
   SourceListQuerySchema,
   CreateItemRequestSchema,
+  DeleteQuoteRequestSchema,
   CreateTranscriptClipItemRequestSchema,
   UpdateItemRequestSchema,
   ItemListQuerySchema,
@@ -443,6 +444,23 @@ export function createCloudApi(
       UpdateItemRequestSchema.parse(request.body),
     );
   });
+
+  app.delete(
+    "/api/projects/:projectId/items/:itemId",
+    async (request, reply) => {
+      const { projectId, itemId } = ProjectItemParamsSchema.parse(
+        request.params,
+      );
+      const { expectedVersion } = DeleteQuoteRequestSchema.parse(request.body);
+      await catalog.library.deleteQuote(
+        await authenticate(request),
+        projectId,
+        itemId,
+        expectedVersion,
+      );
+      return reply.status(204).send();
+    },
+  );
 
   app.post("/api/projects/:projectId/clips", async (request, reply) => {
     const { projectId } = IdParamsSchema.parse(request.params);

@@ -49,7 +49,7 @@ describe.skipIf(!permitted)(
         runCloudMigrations(first),
         runCloudMigrations(second),
       ]);
-      expect(left.length + right.length).toBe(10);
+      expect(left.length + right.length).toBe(11);
       expect(await runCloudMigrations(second)).toEqual([]);
 
       const catalog = new SharedProjectCatalog(
@@ -64,11 +64,61 @@ describe.skipIf(!permitted)(
       const project = await catalog.createProject(actor, {
         name: "Durable PG fixture",
       });
-      const found = await new SharedProjectCatalog(
+      const secondCatalog = new SharedProjectCatalog(
         second,
         new MemoryTranscriptObjectStore(),
-      ).listProjects(actor);
+      );
+      const found = await secondCatalog.listProjects(actor);
       expect(found.some((item) => item.id === project.id)).toBe(true);
+
+      const webSource = (url: string) => ({
+        kind: "web_page" as const,
+        bibliography: { url: { value: url, state: "automatic" as const } },
+        details: {},
+      });
+      const articleUrl = "https://example.org/concurrent?edition=1";
+      const [article, concurrent] = await Promise.all([
+        catalog.library.createSource(actor, project.id, {
+          ...webSource(articleUrl + "&utm_source=first"),
+          idempotencyKey: "first capture",
+        }),
+        secondCatalog.library.createSource(actor, project.id.toUpperCase(), {
+          ...webSource(articleUrl + "&utm_source=second"),
+          idempotencyKey: "second capture",
+        }),
+      ]);
+      expect(concurrent.id).toBe(article.id);
+
+      const corrected = "https://example.org/concurrent?edition=2";
+      const [edit, capture] = await Promise.allSettled([
+        catalog.library.updateSource(actor, project.id, article.id, {
+          expectedVersion: article.version,
+          bibliography: webSource(corrected).bibliography,
+        }),
+        secondCatalog.library.createSource(
+          actor,
+          project.id,
+          webSource(corrected),
+        ),
+      ]);
+      expect(capture.status).toBe("fulfilled");
+      if (capture.status === "fulfilled") {
+        if (edit.status === "fulfilled")
+          expect(capture.value.id).toBe(article.id);
+        else {
+          expect(edit.reason).toMatchObject({ statusCode: 409 });
+          expect(capture.value.id).not.toBe(article.id);
+        }
+      }
+      const sources = await catalog.library.listSources(actor, project.id, {
+        limit: 50,
+        offset: 0,
+      });
+      expect(
+        sources.filter(
+          (source) => source.bibliography.url?.value === corrected,
+        ),
+      ).toHaveLength(1);
 
       // Two independently leased writers; rollback cannot leave partial state.
       const marker = randomUUID();

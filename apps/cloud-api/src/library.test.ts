@@ -39,7 +39,7 @@ function createFixture() {
       const id = randomUUID();
       const headers = { authorization: `Bearer ${id}|fixture:${label}` };
       const request = (
-        method: "POST" | "GET" | "PATCH",
+        method: "POST" | "GET" | "PATCH" | "DELETE",
         url: string,
         payload?: Record<string, unknown>,
       ) =>
@@ -113,6 +113,256 @@ function clipFixture(idempotencyKey: string, identity = sourceIdentity) {
 }
 
 describe("project Library API", () => {
+  it("stores exact offline quotes and edits display text independently through deletion", async () => {
+    const { database, register } = createFixture();
+    await runCloudMigrations(database);
+    const { id: logger, request, read } = await register("quote-logger");
+    const viewer = await register("quote-viewer");
+    const { id: projectId } = await read("POST", "/api/projects", {
+      name: "Quote fixture",
+    });
+    const base = `/api/projects/${projectId}`;
+    const otherProject = await read("POST", "/api/projects", {
+      name: "Other project",
+    });
+    await request("POST", `${base}/members`, {
+      userId: viewer.id,
+      role: "viewer",
+    });
+    const { id: sourceId } = await read("POST", `${base}/sources`, {
+      kind: "offline",
+      details: { subtype: "book" },
+    });
+    const text = "  “A first line.”\nThe next line.  ";
+    const content = {
+      text,
+      location: "p. 42, second paragraph",
+      surroundingWords: { before: "Before ", after: " after" },
+      highlight: {
+        page: 42,
+        rectangles: [{ x: 0.2, y: 0.3, width: 0.5, height: 0.1 }],
+      },
+      citationOverride: "Example, p. 42.",
+    };
+    const input = {
+      sourceId,
+      kind: "quote",
+      content,
+      topics: ["Archive"],
+      notes: "Use in opening.",
+    };
+    const quote = await read("POST", `${base}/items`, input);
+    const item = `${base}/items/${quote.id}`;
+    expect(await read("GET", item)).toMatchObject({
+      ...input,
+      createdBy: logger,
+    });
+    expect(quote).toHaveProperty("content", content);
+    expect(
+      (
+        await request("POST", `${base}/items`, {
+          ...input,
+          content: { text: "  \n" },
+        })
+      ).statusCode,
+    ).toBe(400);
+    expect(
+      (
+        await request("POST", `${base}/items`, {
+          ...input,
+          content: { text, latestDisplayText: "Injected on create" },
+        })
+      ).statusCode,
+    ).toBe(400);
+
+    const display = {
+      expectedVersion: 1,
+      latestDisplayText: "  A shortened line.  ",
+    };
+    expect((await viewer.request("PATCH", item, display)).statusCode).toBe(403);
+    expect(
+      (
+        await request("PATCH", item, {
+          ...display,
+          content: { text: "Overwrite" },
+        })
+      ).statusCode,
+    ).toBe(400);
+    expect(await read("PATCH", item, display)).toMatchObject({
+      version: 2,
+      content: { ...content, latestDisplayText: display.latestDisplayText },
+    });
+    expect((await request("PATCH", item, display)).statusCode).toBe(409);
+    const speakerOnly = { ...content, speaker: "Ada Example" };
+    expect(
+      await read("PATCH", item, { expectedVersion: 2, content: speakerOnly }),
+    ).toMatchObject({
+      version: 3,
+      content: { ...speakerOnly, latestDisplayText: display.latestDisplayText },
+    });
+    const attributed = { ...speakerOnly, speakerTitle: "Archivist" };
+    expect(
+      await read("PATCH", item, { expectedVersion: 3, content: attributed }),
+    ).toMatchObject({
+      version: 4,
+      content: { ...attributed, latestDisplayText: display.latestDisplayText },
+    });
+    const list = `${base}/items?kind=quote&sourceId=${sourceId}&logger=${logger}&topic=archive&q=Archivist`;
+    expect(await viewer.read("GET", list)).toEqual([
+      expect.objectContaining({
+        id: quote.id,
+        content: {
+          ...attributed,
+          latestDisplayText: display.latestDisplayText,
+        },
+      }),
+    ]);
+    expect(
+      await read("GET", `${base}/items?kind=quote&sourceId=${randomUUID()}`),
+    ).toEqual([]);
+    expect(
+      (await viewer.request("DELETE", item, { expectedVersion: 4 })).statusCode,
+    ).toBe(403);
+    expect(
+      (
+        await request(
+          "DELETE",
+          `/api/projects/${otherProject.id}/items/${quote.id}`,
+          { expectedVersion: 4 },
+        )
+      ).statusCode,
+    ).toBe(404);
+    expect(
+      (await request("DELETE", item, { expectedVersion: 3 })).statusCode,
+    ).toBe(409);
+    const still = await read("POST", `${base}/items`, {
+      kind: "still",
+      sourceId,
+      content: {},
+    });
+    expect(
+      (
+        await request("DELETE", `${base}/items/${still.id}`, {
+          expectedVersion: 1,
+        })
+      ).statusCode,
+    ).toBe(404);
+    expect(
+      (await request("DELETE", item, { expectedVersion: 4 })).statusCode,
+    ).toBe(204);
+    expect((await request("GET", item)).statusCode).toBe(404);
+    expect(await read("GET", list)).toEqual([]);
+    expect((await read("GET", `${base}/sources/${sourceId}`)).id).toBe(
+      sourceId,
+    );
+  });
+
+  it("reuses legacy and concurrent article sources within a project and honors URL edits", async () => {
+    const { database, register } = createFixture();
+    await runCloudMigrations(database);
+    const { read, request } = await register("article-logger");
+    const { id } = await read("POST", "/api/projects", {
+      name: "Article fixture",
+    });
+    const { id: otherProject } = await read("POST", "/api/projects", {
+      name: "Other articles",
+    });
+    const base = `/api/projects/${id}`;
+    const sourceRequest = (url: string, idempotencyKey?: string) => ({
+      kind: "web_page",
+      bibliography: { url: confirmed(url), title: confirmed("Incoming title") },
+      ...(idempotencyKey === undefined ? {} : { idempotencyKey }),
+    });
+    const addSource = (url: string, key?: string) =>
+      read("POST", `${base}/sources`, sourceRequest(url, key));
+    const url =
+      "https://example.org/article?edition=2&section=a&section=b#intro";
+    const originalUrl = url.replace("#", "&utm_medium=email#");
+    const legacyId = randomUUID();
+    await database.query(
+      "INSERT INTO library_sources (project_id,id,kind,bibliography) VALUES($1,$2,'web_page',$3)",
+      [
+        id,
+        legacyId,
+        JSON.stringify({
+          url: confirmed(originalUrl),
+          title: confirmed("Saved title"),
+        }),
+      ],
+    );
+    const captured = url.replace("#", "&%75tm_source=one&fbclid=two#");
+    expect(await addSource(captured, "capture-retry")).toMatchObject({
+      id: legacyId,
+      bibliography: {
+        title: confirmed("Saved title"),
+        url: confirmed(originalUrl),
+      },
+    });
+    const laterCapture = url.replace("#", "&gclid=three#");
+    expect((await addSource(laterCapture)).id).toBe(legacyId);
+    for (const [index, locator] of [captured, laterCapture].entries()) {
+      const source = await addSource(locator);
+      await read("POST", `${base}/items`, {
+        sourceId: source.id,
+        kind: "quote",
+        content: { text: `Quote ${index + 1}` },
+      });
+    }
+    expect(
+      await read("GET", `${base}/items?kind=quote&sourceId=${legacyId}`),
+    ).toHaveLength(2);
+    const distinct = await addSource(url.replace("edition=2", "edition=3"));
+    expect(distinct.id).not.toBe(legacyId);
+    expect(
+      (
+        await addSource(
+          url.replace("section=a&section=b", "section=b&section=a"),
+        )
+      ).id,
+    ).not.toBe(legacyId);
+    expect(
+      (
+        await read(
+          "POST",
+          `/api/projects/${otherProject}/sources`,
+          sourceRequest(captured),
+        )
+      ).id,
+    ).not.toBe(legacyId);
+
+    const [first, second] = await Promise.all([
+      addSource("https://example.org/new?utm_medium=email", "first"),
+      addSource("https://example.org/new?utm_source=search", "second"),
+    ]);
+    expect(first.id).toBe(second.id);
+    expect(
+      (
+        await request("PATCH", `${base}/sources/${distinct.id}`, {
+          expectedVersion: 1,
+          bibliography: { url: confirmed(captured) },
+        })
+      ).statusCode,
+    ).toBe(409);
+
+    const corrected = "https://example.org/corrected?edition=2";
+    await read("PATCH", `${base}/sources/${legacyId}`, {
+      expectedVersion: 1,
+      bibliography: { url: confirmed(corrected) },
+    });
+    expect((await addSource(corrected + "&utm_source=bar")).id).toBe(legacyId);
+    expect((await addSource(captured, "capture-retry")).id).toBe(legacyId);
+    expect(
+      (
+        await request(
+          "POST",
+          `${base}/sources`,
+          sourceRequest(corrected, "capture-retry"),
+        )
+      ).statusCode,
+    ).toBe(409);
+    expect((await addSource(captured)).id).not.toBe(legacyId);
+  });
+
   it("logs and edits each kind with project-scoped lookup and optimistic versions", async () => {
     const { database, register } = createFixture();
     await runCloudMigrations(database);

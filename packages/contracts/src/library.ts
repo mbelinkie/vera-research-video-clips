@@ -258,8 +258,39 @@ const QuoteContentSchema = z.strictObject({
   text: ExcerptSchema,
   speaker: TextSchema.trim().min(1).max(300).optional(),
   title: TitleSchema.optional(),
+  speakerTitle: TitleSchema.optional(),
   location: TextSchema.trim().min(1).max(500).optional(),
+  surroundingWords: z
+    .strictObject({
+      before: TextSchema.max(5000).optional(),
+      after: TextSchema.max(5000).optional(),
+    })
+    .optional(),
+  // Normalized rectangles on the passage picture or PDF page.
+  highlight: z
+    .strictObject({
+      page: z.number().int().positive().optional(),
+      rectangles: z
+        .array(
+          z
+            .strictObject({
+              x: z.number().min(0).max(1),
+              y: z.number().min(0).max(1),
+              width: z.number().gt(0).max(1),
+              height: z.number().gt(0).max(1),
+            })
+            .refine(
+              ({ x, y, width, height }) => x + width <= 1 && y + height <= 1,
+              "Highlight must fit within the image or page.",
+            ),
+        )
+        .min(1)
+        .max(200),
+    })
+    .optional(),
+  citationOverride: TextSchema.max(20_000).optional(),
 });
+const DisplayTextSchema = TextSchema.max(100_000);
 const StillContentSchema = z.strictObject({
   ...LicenceFields,
   title: TitleSchema.optional(),
@@ -299,7 +330,7 @@ export const CreateItemRequestSchema = z.discriminatedUnion("kind", [
   AudioItemSchema.extend(ItemCreateFields),
 ]);
 
-export const UpdateItemRequestSchema = z
+const EditItemRequestSchema = z
   .strictObject({
     expectedVersion: VersionSchema,
     notes: NotesSchema.optional(),
@@ -319,6 +350,18 @@ export const UpdateItemRequestSchema = z
     "Provide notes, topics or content to update.",
   );
 
+export const UpdateItemRequestSchema = z.union([
+  EditItemRequestSchema,
+  z.strictObject({
+    expectedVersion: VersionSchema,
+    latestDisplayText: DisplayTextSchema,
+  }),
+]);
+
+export const DeleteQuoteRequestSchema = z.strictObject({
+  expectedVersion: VersionSchema,
+});
+
 const ItemReadFields = {
   ...ItemFields,
   notes: NotesSchema,
@@ -333,7 +376,12 @@ const ItemReadFields = {
 
 export const LibraryItemSchema = z.discriminatedUnion("kind", [
   ClipItemSchema.extend(ItemReadFields),
-  QuoteItemSchema.extend(ItemReadFields),
+  QuoteItemSchema.extend({
+    ...ItemReadFields,
+    content: QuoteContentSchema.extend({
+      latestDisplayText: DisplayTextSchema.optional(),
+    }),
+  }),
   StillItemSchema.extend(ItemReadFields),
   AudioItemSchema.extend(ItemReadFields),
 ]);
@@ -359,6 +407,7 @@ export const ItemListQuerySchema = z.strictObject({
   ...ListQueryFields,
   kind: ItemKindSchema.optional(),
   logger: IdSchema.optional(),
+  sourceId: IdSchema.optional(),
 });
 
 export type SourceIdentityV1 = z.infer<typeof SourceIdentityV1Schema>;

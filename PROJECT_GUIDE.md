@@ -806,6 +806,8 @@ Research and the editor Library share `/api/projects/:projectId/sources` and `/a
 
 A source represents one YouTube video, web page, PDF, offline work, image, audio file or local video. The project stores its bibliography once. A citation field holds a value and its `automatic` or `confirmed` state. Legacy fields can have an unknown state. A bibliography patch changes the supplied fields and clears any explicitly set to null. Details are validated for the source kind. Existing qualified provider videos retain their provider and media ID under `provider_video`.
 
+To log quotes from a web page, POST a `web_page` source with `bibliography.url`, then POST each quote with the returned `sourceId`. Source creation reuses an existing web page in that project when its URL differs only in recognized tracking parameters such as `utm_source` or `fbclid`. The source keeps its saved bibliography and URL. A URL edit changes the address used for future matches, and an edit that would take another source's address returns HTTP 409. Existing source IDs and their items stay in place.
+
 An item identifies its project source by `sourceId` and its kind by `clip`, `quote`, `still` or `audio`. The service records the authenticated logger in `createdBy` and commits its notes and Topics together. Native create requests accept an optional `idempotencyKey` for safe retries. For example, a producer can log a quote with this body.
 
 ```json
@@ -817,9 +819,13 @@ An item identifies its project source by `sourceId` and its kind by `clip`, `quo
 }
 ```
 
+Quote `content.text` is the exact original text. Optional content fields include `speaker`, `speakerTitle`, `location`, `surroundingWords` (`before` and/or `after`), `highlight` (normalized `rectangles` and a one-based PDF `page` when applicable), and `citationOverride` (text). A library edit replaces the supplied quote content and preserves the most recently used display text. To record display text, PATCH with just `expectedVersion` and `latestDisplayText`. Read it from `content.latestDisplayText`, falling back to `content.text` when absent. The editor owns the display text of each individual placement.
+
+Delete a quote with `DELETE /api/projects/:projectId/items/:itemId` and an `expectedVersion` in the JSON body. A successful delete returns HTTP 204. The source and its other items stay in the Library.
+
 For a transcript-backed YouTube clip, POST an item with `kind`, `sourceId` and `clip`. The `clip` field takes the established clip logging request with its transcript evidence, notes, tags and idempotency key. Both clip routes return the same persisted clip UUID. Original evidence and export bounds remain available through the existing clip endpoint. Library edits to the log share its optimistic version and Topic assignments.
 
-Both list routes accept `kind`, `topic`, `q`, `limit` and `offset`. Items also accept `logger` (a user UUID). The default page holds 50 records and the maximum is 100. Search matches literal, case-insensitive text in item titles, transcripts, quotes, speakers, notes, and source titles, authors and credits. A source matches a Topic when at least one of its logged items carries it. The request and response schemas are exported from `@research-video/contracts`.
+Both list routes accept `kind`, `topic`, `q`, `limit` and `offset`. Items also accept `logger` and `sourceId` (UUIDs). The default page holds 50 records and the maximum is 100. Search matches literal, case-insensitive text in item titles, transcripts, quotes, speaker names and titles, notes, and source titles, authors and credits. A source matches a Topic when at least one of its logged items carries it. The request and response schemas are exported from `@research-video/contracts`.
 
 ## 10. Persistence model
 

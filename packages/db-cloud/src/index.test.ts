@@ -32,6 +32,7 @@ describe("cloud migrations", () => {
       "0008_membership_regrant_versions",
       "0009_derived_caption_ends",
       "0053_project_library",
+      "0054_library_source_reuse",
     ]);
     expect(await runCloudMigrations(database)).toEqual([]);
     const result = await database.query<{ table_name: string }>(
