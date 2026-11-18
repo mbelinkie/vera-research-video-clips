@@ -49,7 +49,7 @@ describe.skipIf(!permitted)(
         runCloudMigrations(first),
         runCloudMigrations(second),
       ]);
-      expect(left.length + right.length).toBe(7);
+      expect(left.length + right.length).toBe(10);
       expect(await runCloudMigrations(second)).toEqual([]);
 
       const catalog = new SharedProjectCatalog(

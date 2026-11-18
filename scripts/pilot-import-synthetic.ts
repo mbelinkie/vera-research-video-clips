@@ -21,6 +21,7 @@ const tablesInFkOrder = [
   "videos",
   "project_members",
   "transcript_versions",
+  "library_sources",
   "project_videos",
   "transcription_batches",
   "jobs",
@@ -34,6 +35,8 @@ const tablesInFkOrder = [
   "clip_tags",
   "clip_candidate_tags",
   "export_requests",
+  "library_items",
+  "library_item_topics",
 ] as const;
 const keyColumns: Record<string, string[]> = {
   users: ["id"],
@@ -41,6 +44,7 @@ const keyColumns: Record<string, string[]> = {
   videos: ["id"],
   project_members: ["project_id", "user_id"],
   transcript_versions: ["id"],
+  library_sources: ["project_id", "id"],
   project_videos: ["project_id", "video_id"],
   transcription_batches: ["id"],
   jobs: ["id"],
@@ -54,6 +58,8 @@ const keyColumns: Record<string, string[]> = {
   clip_tags: ["id"],
   clip_candidate_tags: ["clip_id", "tag_id"],
   export_requests: ["id"],
+  library_items: ["id"],
+  library_item_topics: ["item_id", "tag_id"],
 };
 
 const normalize = (value: unknown): unknown => {

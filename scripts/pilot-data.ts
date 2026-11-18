@@ -74,6 +74,12 @@ const tables = [
   "export_requests",
 ];
 
+const libraryTables = [
+  "library_sources",
+  "library_items",
+  "library_item_topics",
+];
+
 function localPg(raw: string, restore: boolean) {
   if (!raw)
     throw new Error("A local PostgreSQL URL is required in the environment");
@@ -215,7 +221,11 @@ async function readSnapshot(pool: Pool) {
     }
     const counts: Record<string, number> = {};
     const tableDigests: Record<string, string> = {};
-    for (const table of tables) {
+    const schemaVersions = versions.rows.map((row) => row.version);
+    const snapshotTables = schemaVersions.includes("0053_project_library")
+      ? [...tables, ...libraryTables]
+      : tables;
+    for (const table of snapshotTables) {
       const result = await client.query<{ total: string }>(
         "SELECT count(*)::text AS total FROM " + table,
       );
@@ -236,7 +246,7 @@ async function readSnapshot(pool: Pool) {
     }
     await client.query("COMMIT");
     return {
-      schemaVersions: versions.rows.map((row) => row.version),
+      schemaVersions,
       references: references.rows,
       tableCounts: counts,
       tableDigests,

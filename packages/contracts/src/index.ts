@@ -1,4 +1,7 @@
 import { z } from "zod";
+import { ClipTagNameSchema } from "./library.js";
+
+export * from "./library.js";
 
 const IdSchema = z.string().uuid();
 const UtcTimestampSchema = z.string().datetime({ offset: true });
@@ -219,14 +222,6 @@ export const ClipExportStatusSchema = z.enum([
   "complete",
   "failed",
 ]);
-export const ClipTagNameSchema = z
-  .string()
-  .trim()
-  .min(1)
-  .max(80)
-  .refine((value) => !/[\u0000-\u001f\u007f]/u.test(value), {
-    message: "Clip tags cannot contain control characters.",
-  });
 export const ClipVideoSnapshotSchema = z.object({
   youtubeVideoId: z.string().min(1).max(64),
   canonicalUrl: z.url(),
@@ -242,6 +237,11 @@ export const CreateClipCandidateRequestSchema = z.object({
   originalText: z.string().trim().min(1).max(100_000).optional(),
   notes: z.string().trim().max(20_000).default(""),
   tags: z.array(ClipTagNameSchema).max(50).default([]),
+});
+export const CreateTranscriptClipItemRequestSchema = z.strictObject({
+  kind: z.literal("clip"),
+  sourceId: IdSchema,
+  clip: CreateClipCandidateRequestSchema,
 });
 export const ClipCandidateSchema = z.object({
   id: IdSchema,
@@ -774,6 +774,9 @@ export type TranscriptSelection = z.infer<typeof TranscriptSelectionSchema>;
 export type ClipCandidate = z.infer<typeof ClipCandidateSchema>;
 export type CreateClipCandidateRequest = z.infer<
   typeof CreateClipCandidateRequestSchema
+>;
+export type CreateTranscriptClipItemRequest = z.infer<
+  typeof CreateTranscriptClipItemRequestSchema
 >;
 export type UpdateClipCandidateRequest = z.infer<
   typeof UpdateClipCandidateRequestSchema
