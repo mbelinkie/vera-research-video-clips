@@ -1212,6 +1212,11 @@ describe("cloud API", () => {
       });
       expect(granted.statusCode).toBe(204);
     }
+    // An account that predates the display-name migration still has access
+    // and must not prevent the Owner from viewing the roster.
+    await database.query("UPDATE users SET display_name = '' WHERE id = $1", [
+      viewer.id,
+    ]);
     const listed = await app.inject({
       method: "GET",
       url: base,
@@ -1222,8 +1227,16 @@ describe("cloud API", () => {
     expect(listed.json<Record<string, unknown>[]>()[0]).not.toHaveProperty(
       "externalSubject",
     );
-    expect(listed.json<Record<string, unknown>[]>()[0]).not.toHaveProperty(
-      "displayName",
+    expect(listed.json()[0]).toMatchObject({
+      displayName: "owner",
+      verifiedEmail: null,
+    });
+    expect(listed.json()).toContainEqual(
+      expect.objectContaining({
+        userId: viewer.id,
+        role: "viewer",
+        displayName: "Registered member",
+      }),
     );
     for (const current of [editor, viewer, outsider]) {
       expect(

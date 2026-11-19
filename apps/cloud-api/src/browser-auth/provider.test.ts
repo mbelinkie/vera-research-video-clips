@@ -119,6 +119,37 @@ describe("verified Cognito protocol", () => {
     expect(calls).toEqual(["https://managed.example/oauth2/token"]);
   });
   it.each([
+    ["Friend+tag@EXAMPLE.com", true, "friend+tag@example.com"],
+    ["friend@example.com", false, undefined],
+    ["friend@example.com", "true", undefined],
+    ["friend", true, undefined],
+  ])(
+    "accepts only a verified address from the nonce-bound ID token (%s, %s)",
+    async (email, emailVerified, expected) => {
+      const provider = createCognitoProvider(options, {
+        jwksCache: cache(),
+        fetcher: response(
+          tokens({
+            id_token: id({ email, email_verified: emailVerified }),
+            access_token: access({
+              email: "access@example.com",
+              email_verified: true,
+            }),
+          }),
+        ),
+      });
+      expect(
+        (await provider.exchange("code", "verifier", "correct-nonce"))
+          .verifiedEmail,
+      ).toBe(expected);
+      expect(
+        (await provider.refresh("refresh", `cognito:${issuer}#${base.sub}`))
+          .verifiedEmail,
+      ).toBeUndefined();
+    },
+  );
+
+  it.each([
     ["wrong nonce", { id_token: id({ nonce: "forged" }) }],
     ["wrong ID audience", { id_token: id({ aud: "other-client" }) }],
     [

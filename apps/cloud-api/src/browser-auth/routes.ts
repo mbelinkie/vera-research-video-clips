@@ -127,6 +127,7 @@ export function createBrowserAuth(options: BrowserAuthOptions): BrowserAuth {
       return options.catalog.registerVerifiedSubject(
         session.subject,
         displayName,
+        session.memberEmail,
       );
     },
     routes(app) {
@@ -183,6 +184,7 @@ export function createBrowserAuth(options: BrowserAuthOptions): BrowserAuth {
         )
           throw invalidCallback();
         try {
+          const observedAtMs = now();
           const tokens = await options.provider.exchange(
             query.data.code,
             pending.verifier,
@@ -194,7 +196,16 @@ export function createBrowserAuth(options: BrowserAuthOptions): BrowserAuth {
           )
             throw new Error("Invalid provider subject");
           await sessions.invalidate(cookieId(request)); // no session fixation on account switch
-          const { id } = sessions.create(tokens);
+          const { id, session } = sessions.create(tokens, observedAtMs);
+          try {
+            await options.catalog.associateVerifiedMemberEmail(
+              session.subject,
+              session.memberEmail,
+            );
+          } catch (error) {
+            await sessions.invalidate(id);
+            throw error;
+          }
           reply.header("set-cookie", [
             clearCookie(LOGIN_COOKIE),
             cookieHeader(

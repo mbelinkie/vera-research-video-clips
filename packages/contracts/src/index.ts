@@ -36,6 +36,18 @@ export const AddProjectMemberRequestSchema = z.object({
   role: z.enum(["editor", "researcher", "viewer"]),
 });
 
+export const MemberEmailSchema = z
+  .string()
+  .trim()
+  .max(254)
+  .pipe(z.email())
+  .transform((email) => email.toLowerCase());
+
+export const GrantProjectMemberByEmailSchema = z.strictObject({
+  email: MemberEmailSchema,
+  role: z.enum(["editor", "viewer"]),
+});
+
 export const UpdateProjectMemberRequestSchema = z.object({
   role: z.enum(["editor", "viewer"]),
   expectedVersion: z.number().int().positive(),
@@ -67,6 +79,11 @@ export const ProjectMemberSchema = z.object({
   version: z.number().int().positive(),
   createdAt: UtcTimestampSchema,
   updatedAt: UtcTimestampSchema,
+});
+
+export const ProjectMemberDetailsSchema = ProjectMemberSchema.extend({
+  displayName: UserSchema.shape.displayName,
+  verifiedEmail: MemberEmailSchema.nullable(),
 });
 
 export const VideoSchema = z.object({

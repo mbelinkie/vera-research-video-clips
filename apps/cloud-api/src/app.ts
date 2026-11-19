@@ -34,6 +34,7 @@ import {
   UpdateItemRequestSchema,
   ItemListQuerySchema,
   FinalizeTranscriptRequestSchema,
+  GrantProjectMemberByEmailSchema,
   HealthResponseSchema,
   WorkerClaimRequestSchema,
   WorkerFailureRequestSchema,
@@ -260,6 +261,61 @@ export function createCloudApi(
       CreateProjectRequestSchema.parse(request.body),
     );
     return reply.status(201).send(project);
+  });
+
+  const memberGrantAttempts = new Map<string, number[]>();
+  const takeMemberGrantAttempt = (actorId: string) => {
+    const now = Date.now();
+    const cutoff = now - 10 * 60_000;
+    for (const [id, attempts] of memberGrantAttempts) {
+      if (attempts.at(-1)! <= cutoff) memberGrantAttempts.delete(id);
+    }
+    const recent =
+      memberGrantAttempts.get(actorId)?.filter((time) => time > cutoff) ?? [];
+    if (
+      recent.length >= 10 ||
+      (!recent.length && memberGrantAttempts.size >= 1_000)
+    ) {
+      throw Object.assign(
+        new Error("Too many sharing attempts. Try again in 10 minutes."),
+        { statusCode: 429, code: "member_grant_rate_limited" },
+      );
+    }
+    memberGrantAttempts.set(actorId, [...recent, now]);
+  };
+
+  app.post(
+    "/api/projects/:projectId/members/by-email",
+    async (request, reply) => {
+      const actor = await authenticate(request);
+      const { projectId } = IdParamsSchema.parse(request.params);
+      const body = GrantProjectMemberByEmailSchema.safeParse(request.body);
+      if (!body.success)
+        throw Object.assign(
+          new Error("Enter a full email address and select Editor or Viewer."),
+          {
+            statusCode: 400,
+            code: "invalid_request",
+          },
+        );
+      await catalog.addMemberByVerifiedEmail(
+        actor,
+        projectId,
+        body.data.email,
+        body.data.role,
+        () => takeMemberGrantAttempt(actor.userId),
+      );
+      return reply.status(204).send();
+    },
+  );
+
+  app.get("/api/projects/:projectId/my-membership", async (request) => {
+    const { projectId } = IdParamsSchema.parse(request.params);
+    const membership = await catalog.getOwnMembership(
+      await authenticate(request),
+      projectId,
+    );
+    return { membership };
   });
 
   app.post("/api/projects/:projectId/members", async (request, reply) => {

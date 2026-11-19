@@ -248,6 +248,75 @@ describe.skipIf(!enabled)("real PostgreSQL membership serialization", () => {
         },
       );
 
+      // Even a stale alias claim competes with a fresh claim by a different
+      // subject. An ambiguity must never grant membership to either account.
+      const email = "verified@example.com";
+      const [oldAccount, nextAccount] = await Promise.all([
+        left.registerVerifiedSubject("cognito:first", "First", {
+          email,
+          observedAt: new Date("2020-01-01"),
+        }),
+        right.registerVerifiedSubject("cognito:second", "Second", {
+          email,
+          observedAt: new Date(),
+        }),
+      ]);
+      const emailProject = await left.createProject(owner, {
+        name: "Exact email grant",
+      });
+      const resolve = () =>
+        left.addMemberByVerifiedEmail(
+          owner,
+          emailProject.id,
+          email,
+          "editor",
+          () => {},
+        );
+      await expect(resolve()).rejects.toMatchObject({ statusCode: 404 });
+      expect(await membership(emailProject.id, oldAccount.id)).toBeUndefined();
+      expect(await membership(emailProject.id, nextAccount.id)).toBeUndefined();
+      await right.associateVerifiedMemberEmail(oldAccount.externalSubject, {
+        email: null,
+        observedAt: new Date(),
+      });
+      let probedAssociationWrite = false;
+      const lockProbe = new SharedProjectCatalog(
+        {
+          ...observed,
+          async query<Row extends Record<string, unknown>>(
+            sql: string,
+            params: unknown[] = [],
+          ) {
+            const result = await first.query<Row>(sql, params);
+            if (sql.startsWith("SELECT user_id, observed_at >")) {
+              await expect(
+                second.withTransaction(() =>
+                  second.query(
+                    "LOCK TABLE verified_member_emails IN ROW EXCLUSIVE MODE NOWAIT",
+                  ),
+                ),
+              ).rejects.toMatchObject({ code: "55P03" });
+              probedAssociationWrite = true;
+            }
+            return result;
+          },
+        },
+        new MemoryTranscriptObjectStore(),
+      );
+      await lockProbe.addMemberByVerifiedEmail(
+        owner,
+        emailProject.id,
+        email,
+        "editor",
+        () => {},
+      );
+      expect(probedAssociationWrite).toBe(true);
+      expect(await membership(emailProject.id, nextAccount.id)).toMatchObject({
+        role: "editor",
+        version: 1,
+      });
+      expect(await membership(emailProject.id, oldAccount.id)).toBeUndefined();
+
       // Concurrent checks do not waive CAS or safe retry rules.
       await expect(
         left.changeMemberRole(

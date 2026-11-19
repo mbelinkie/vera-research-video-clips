@@ -16,6 +16,7 @@ import {
   ExportRequestSchema,
   JobSchema,
   ProjectMemberSchema,
+  ProjectMemberDetailsSchema,
   ProjectSchema,
   ReviewInboxItemSchema,
   ReviewInboxResponseSchema,
@@ -124,6 +125,41 @@ const loggedExportRequestSelect = `SELECT er.*, j.state
  FROM export_requests er
  JOIN jobs j ON j.id = er.job_id`;
 
+type CatalogQuery = Pick<SqlDatabase, "query">;
+type EmailObservation = { email: string | null; observedAt: Date };
+const verifiedEmailMaxAgeMs = 24 * 60 * 60_000;
+
+async function saveMemberEmail(
+  tx: CatalogQuery,
+  userId: string,
+  observation: EmailObservation,
+) {
+  await tx.query(
+    `INSERT INTO verified_member_emails (user_id, email, observed_at)
+     VALUES ($1, $2, $3)
+     ON CONFLICT (user_id) DO UPDATE
+       SET email = CASE WHEN verified_member_emails.observed_at = EXCLUDED.observed_at
+                      THEN NULL ELSE EXCLUDED.email END,
+           observed_at = EXCLUDED.observed_at
+     WHERE verified_member_emails.observed_at < EXCLUDED.observed_at
+        OR (verified_member_emails.observed_at = EXCLUDED.observed_at
+            AND verified_member_emails.email IS NOT NULL
+            AND verified_member_emails.email IS DISTINCT FROM EXCLUDED.email)`,
+    [userId, observation.email, observation.observedAt.toISOString()],
+  );
+}
+
+function memberFields(row: DbRow) {
+  return {
+    projectId: row.project_id,
+    userId: row.user_id,
+    role: row.role,
+    version: Number(row.version),
+    createdAt: iso(row.created_at),
+    updatedAt: iso(row.updated_at),
+  };
+}
+
 export class SharedProjectCatalog {
   readonly library: ProjectLibrary;
   constructor(
@@ -146,8 +182,16 @@ export class SharedProjectCatalog {
     actor: AuthenticatedActor,
     displayName: string,
   ): Promise<User> {
+    return this.upsertUser(this.database, actor, displayName);
+  }
+
+  private async upsertUser(
+    tx: CatalogQuery,
+    actor: AuthenticatedActor,
+    displayName: string,
+  ): Promise<User> {
     const now = this.now().toISOString();
-    const result = await this.database.query<DbRow>(
+    const result = await tx.query<DbRow>(
       `INSERT INTO users (id, external_subject, display_name, created_at, updated_at)
        VALUES ($1, $2, $3, $4, $4)
        ON CONFLICT (external_subject) DO UPDATE
@@ -167,18 +211,32 @@ export class SharedProjectCatalog {
     return result.rows[0] ? mapUser(result.rows[0]) : undefined;
   }
 
+  async associateVerifiedMemberEmail(
+    subject: string,
+    observation: EmailObservation,
+  ): Promise<void> {
+    const user = await this.findUserByVerifiedSubject(subject);
+    if (user) await saveMemberEmail(this.database, user.id, observation);
+  }
+
   async registerVerifiedSubject(
     subject: string,
     displayName: string,
+    observation: EmailObservation,
   ): Promise<User> {
     if (!subject.startsWith("cognito:"))
       throw new AuthenticationError("A verified Cognito identity is required.");
     // The conflict target is the stable provider subject, and RETURNING yields
     // the canonical stored UUID even when two browsers register concurrently.
-    return this.registerUser(
-      { userId: randomUUID(), externalSubject: subject },
-      displayName,
-    );
+    return catalogTransaction(this.database, async (tx) => {
+      const user = await this.upsertUser(
+        tx,
+        { userId: randomUUID(), externalSubject: subject },
+        displayName,
+      );
+      await saveMemberEmail(tx, user.id, observation);
+      return user;
+    });
   }
 
   async createProject(
@@ -621,28 +679,84 @@ export class SharedProjectCatalog {
     return mapProject(result.rows[0]);
   }
 
-  async listMembers(
+  async getOwnMembership(
     actor: AuthenticatedActor,
     projectId: string,
-  ): Promise<ProjectMember[]> {
-    await this.authorize(actor, projectId, "manage_members");
+  ): Promise<ProjectMember> {
     const found = await this.database.query<DbRow>(
-      `SELECT project_id, user_id, role, version, created_at, updated_at
-       FROM project_members
-       WHERE project_id = $1
-       ORDER BY created_at, user_id`,
-      [projectId],
+      `SELECT pm.* FROM project_members pm
+       JOIN users u ON u.id = pm.user_id
+       WHERE pm.project_id = $1 AND u.id = $2 AND u.external_subject = $3`,
+      [projectId, actor.userId, actor.externalSubject],
     );
+    const row = found.rows[0];
+    if (!row)
+      throw new AuthorizationError("You do not have access to this project.");
+    return ProjectMemberSchema.parse(memberFields(row));
+  }
+
+  async listMembers(actor: AuthenticatedActor, projectId: string) {
+    const found = await this.database.query<DbRow>(
+      `SELECT pm.*, COALESCE(NULLIF(BTRIM(u.display_name), ''), 'Registered member') AS display_name, e.email
+       FROM project_members pm
+       JOIN users u ON u.id = pm.user_id
+       LEFT JOIN verified_member_emails e ON e.user_id = pm.user_id
+         AND e.observed_at > $4
+       WHERE pm.project_id = $1 AND EXISTS (
+         SELECT 1 FROM project_members owner
+         JOIN users account ON account.id = owner.user_id
+         WHERE owner.project_id = $1 AND owner.user_id = $2
+           AND owner.role = 'owner' AND account.external_subject = $3
+       )
+       ORDER BY pm.created_at, pm.user_id`,
+      [
+        projectId,
+        actor.userId,
+        actor.externalSubject,
+        this.memberEmailCutoff(),
+      ],
+    );
+    if (!found.rows.length)
+      throw new AuthorizationError("You do not have access to this project.");
     return found.rows.map((row) =>
-      ProjectMemberSchema.parse({
-        projectId: row.project_id,
-        userId: row.user_id,
-        role: row.role,
-        version: Number(row.version),
-        createdAt: iso(row.created_at),
-        updatedAt: iso(row.updated_at),
+      ProjectMemberDetailsSchema.parse({
+        ...memberFields(row),
+        displayName: row.display_name,
+        verifiedEmail: row.email,
       }),
     );
+  }
+
+  private memberEmailCutoff() {
+    return new Date(this.now().getTime() - verifiedEmailMaxAgeMs).toISOString();
+  }
+
+  async addMemberByVerifiedEmail(
+    actor: AuthenticatedActor,
+    projectId: string,
+    email: string,
+    role: "editor" | "viewer",
+    takeAttempt: () => void,
+  ): Promise<void> {
+    await this.memberWrite(actor, projectId, async (tx) => {
+      takeAttempt();
+      // A row lock would miss a new association for the same address on another
+      // user's row. Hold a read lock on the registry until the grant commits.
+      await tx.query("LOCK TABLE verified_member_emails IN SHARE MODE");
+      // An expired claim still makes a second subject's claim ambiguous.
+      const { rows } = await tx.query<{ user_id: string; fresh: boolean }>(
+        `SELECT user_id, observed_at > $2 AS fresh
+         FROM verified_member_emails
+         WHERE email = $1
+         ORDER BY user_id LIMIT 2`,
+        [email, this.memberEmailCutoff()],
+      );
+      if (rows.length !== 1 || !rows[0]?.fresh)
+        throw new CatalogNotFoundError(
+          "No account is available to share with at this address. Ask the person to sign in and complete their profile.",
+        );
+      await this.grantMember(tx, projectId, rows[0].user_id, role);
+    });
   }
 
   async addMember(
@@ -656,33 +770,42 @@ export class SharedProjectCatalog {
         userId,
       ]);
       if (!target.rows[0]) throw new CatalogNotFoundError("User not found.");
-      const existing = await tx.query<{ role: ProjectRole }>(
-        "SELECT role FROM project_members WHERE project_id = $1 AND user_id = $2",
-        [projectId, userId],
-      );
-      if (existing.rows[0]) {
-        if (existing.rows[0].role !== role) {
-          throw new CatalogConflictError(
-            "Member already has a different role; use a versioned role change.",
-          );
-        }
-        return;
-      }
-      const revoked = await tx.query<{ last_version: number }>(
-        "SELECT last_version FROM revoked_project_member_versions WHERE project_id = $1 AND user_id = $2",
-        [projectId, userId],
-      );
-      const nextVersion = revoked.rows[0]
-        ? Number(revoked.rows[0].last_version) + 1
-        : 1;
-      const now = this.now().toISOString();
-      await tx.query(
-        `INSERT INTO project_members
-           (project_id, user_id, role, version, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $5)`,
-        [projectId, userId, role, nextVersion, now],
-      );
+      await this.grantMember(tx, projectId, userId, role);
     });
+  }
+
+  private async grantMember(
+    tx: CatalogQuery,
+    projectId: string,
+    userId: string,
+    role: Exclude<ProjectRole, "owner">,
+  ) {
+    const existing = await tx.query<{ role: ProjectRole }>(
+      "SELECT role FROM project_members WHERE project_id = $1 AND user_id = $2",
+      [projectId, userId],
+    );
+    if (existing.rows[0]) {
+      if (existing.rows[0].role !== role) {
+        throw new CatalogConflictError(
+          "Member already has a different role; use a versioned role change.",
+        );
+      }
+      return;
+    }
+    const revoked = await tx.query<{ last_version: number }>(
+      "SELECT last_version FROM revoked_project_member_versions WHERE project_id = $1 AND user_id = $2",
+      [projectId, userId],
+    );
+    const nextVersion = revoked.rows[0]
+      ? Number(revoked.rows[0].last_version) + 1
+      : 1;
+    const now = this.now().toISOString();
+    await tx.query(
+      `INSERT INTO project_members
+         (project_id, user_id, role, version, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $5)`,
+      [projectId, userId, role, nextVersion, now],
+    );
   }
 
   async changeMemberRole(

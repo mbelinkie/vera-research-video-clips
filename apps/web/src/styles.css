@@ -712,6 +712,145 @@ h1 {
   margin-bottom: 20px;
 }
 
+.members-panel {
+  margin-bottom: 18px;
+}
+
+.members-heading,
+.members-grant-row,
+.member-row,
+.member-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.members-heading {
+  justify-content: space-between;
+  margin-bottom: 12px;
+}
+
+.members-heading h3 {
+  margin-bottom: 4px;
+}
+
+.members-grant-form {
+  padding: 14px;
+  border: 1px solid #303640;
+  border-radius: 9px;
+  background: #111419;
+}
+
+.members-grant-form > label {
+  display: block;
+  margin-bottom: 7px;
+  color: #b9bec7;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.members-grant-row {
+  align-items: stretch;
+}
+
+.members-grant-row input,
+.members-grant-row select {
+  min-width: 0;
+  padding: 9px 10px;
+  border: 1px solid #3a404a;
+  border-radius: 7px;
+  color: #ece9e2;
+  background: #101217;
+}
+
+.members-grant-row input {
+  flex: 1 1 auto;
+}
+
+.members-grant-row select {
+  flex: 0 0 116px;
+}
+
+.members-grant-row button,
+.member-actions button {
+  padding: 8px 10px;
+  border: 1px solid #3a404a;
+  border-radius: 7px;
+  color: #d9dce2;
+  background: #20242b;
+  white-space: nowrap;
+}
+
+.members-grant-row .primary-action {
+  border-color: #d1ad67;
+  color: #17120a;
+  background: #c49b50;
+  font-weight: 800;
+}
+
+.members-help,
+.members-own-role {
+  margin: 9px 0 0;
+  color: #777e8b;
+  font-size: 12px;
+}
+
+.members-list {
+  display: grid;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.member-row {
+  align-items: flex-start;
+  justify-content: space-between;
+  padding: 11px 12px;
+  border: 1px solid #303640;
+  border-radius: 8px;
+  background: #111419;
+}
+
+.member-identity {
+  display: grid;
+  min-width: 0;
+  gap: 4px;
+}
+
+.member-identity strong,
+.member-identity span {
+  overflow-wrap: anywhere;
+}
+
+.member-identity span {
+  color: #8d95a2;
+  font-size: 12px;
+}
+
+.member-role {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.member-role-label {
+  color: #d8bd86;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.member-actions {
+  justify-content: flex-end;
+  flex-wrap: wrap;
+}
+
+.member-actions .danger-action {
+  border-color: #724342;
+  color: #efb0ad;
+  background: #2a191a;
+}
+
 .batch-grid {
   display: grid;
   grid-template-columns: minmax(340px, 1fr) minmax(420px, 1.3fr);
@@ -1364,6 +1503,23 @@ h1 {
   .stills-form-grid,
   .stills-crop-editor {
     grid-template-columns: 1fr;
+  }
+
+  .members-grant-row,
+  .member-row {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .members-grant-row select,
+  .members-grant-row button,
+  .member-role {
+    width: 100%;
+  }
+
+  .member-role,
+  .member-actions {
+    justify-content: flex-start;
   }
 
   .review-item {
