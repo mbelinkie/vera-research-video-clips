@@ -5,6 +5,7 @@
   "type": "module",
   "exports": {
     ".": "./src/index.ts",
+    "./public-egress": "./src/public-egress.ts",
     "./captions-local": "./src/captions-local.ts",
     "./speech-whisper-cpp": "./src/speech-whisper-cpp.ts",
     "./translation-aws": "./src/translation-aws.ts"

@@ -38,6 +38,7 @@ const tablesInFkOrder = [
   "export_requests",
   "library_items",
   "library_item_topics",
+  "library_still_assets",
 ] as const;
 const keyColumns: Record<string, string[]> = {
   users: ["id"],
@@ -62,6 +63,7 @@ const keyColumns: Record<string, string[]> = {
   export_requests: ["id"],
   library_items: ["id"],
   library_item_topics: ["item_id", "tag_id"],
+  library_still_assets: ["project_id", "item_id", "role"],
 };
 
 const normalize = (value: unknown): unknown => {
@@ -187,7 +189,9 @@ export async function importSyntheticPglite(
       sha256: string;
       byte_size: number;
     }>(
-      "SELECT object_key, object_version_id, sha256, byte_size FROM transcript_artifacts",
+      `SELECT object_key, object_version_id, sha256, byte_size FROM transcript_artifacts
+       UNION ALL
+       SELECT object_key, object_version_id, sha256, byte_size FROM library_still_assets`,
     );
     const imported = new Set<string>();
     for (const ref of refs.rows) {

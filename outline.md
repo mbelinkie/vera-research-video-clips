@@ -246,6 +246,8 @@ Gate: one sheet action requests exactly one export and status returns to the sam
 
 The project Library exposes sources and logged items through the project-scoped catalog API. Existing clips keep their Timeline UUIDs. See the [Research #76 implementation record](specs/completed/r-76-general-source-item-model.md).
 
+The Stills workspace adds image import, credit and licence, cropping, and verified private previews and build bytes. See [Research #82](https://github.com/mbelinkie/vera-research-video-clips/issues/82).
+
 Research #77 adds quote editing and deletion, separate original and display text, and reuse of the same article source across captures.
 
 Research #78 adds Mac-agent web page import, automatic citation details and clean article text. See the [implementation record](specs/completed/r-78-web-page-sources.md).

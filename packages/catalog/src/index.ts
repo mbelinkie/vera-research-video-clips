@@ -134,6 +134,7 @@ export class SharedProjectCatalog {
   ) {
     this.library = new ProjectLibrary(
       database,
+      store,
       now,
       (actor, projectId) => this.authorize(actor, projectId, "read"),
       (actor, projectId, input, sourceId) =>

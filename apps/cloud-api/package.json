@@ -12,6 +12,7 @@
     "@research-video/config": "*",
     "@research-video/contracts": "*",
     "@research-video/db-cloud": "*",
+    "@research-video/media": "*",
     "@research-video/storage": "*",
     "aws-jwt-verify": "^5.2.1",
     "fastify": "^5.11.0",

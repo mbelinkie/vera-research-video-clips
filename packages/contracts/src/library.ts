@@ -360,6 +360,85 @@ const StillContentSchema = z.strictObject({
   credit: TextSchema.trim().min(1).max(2000).optional(),
 });
 
+export const StillCropSchema = z
+  .strictObject({
+    x: z.number().min(0).max(1),
+    y: z.number().min(0).max(1),
+    width: z.number().gt(0).max(1),
+    height: z.number().gt(0).max(1),
+  })
+  .refine(
+    ({ x, y, width, height }) => x + width <= 1 && y + height <= 1,
+    "Crop must fit within the image.",
+  );
+
+export const StillProvenanceUrlSchema = WebUrlSchema.refine((value) => {
+  const url = new URL(value);
+  return !url.username && !url.password;
+}, "Image provenance URLs must not contain credentials.");
+
+export const StillUploadSchema = StillContentSchema.extend({
+  title: TitleSchema,
+  idempotencyKey: IdempotencyKeySchema.unwrap(),
+  topics: TopicsSchema.default([]),
+  originalUrl: StillProvenanceUrlSchema.optional(),
+  pageUrl: StillProvenanceUrlSchema.optional(),
+  altText: TextSchema.max(2000).optional(),
+});
+export const StillUrlImportSchema = StillUploadSchema.omit({
+  originalUrl: true,
+}).extend({ url: WebUrlSchema });
+export const StillPageCropSchema = StillUploadSchema.extend({
+  sourceId: IdSchema,
+  crop: StillCropSchema,
+});
+export const StillCropRequestSchema = StillUploadSchema.omit({
+  originalUrl: true,
+  pageUrl: true,
+}).extend({ crop: StillCropSchema });
+
+export const StillAssetRoleSchema = z.enum([
+  "original",
+  "display",
+  "thumbnail",
+]);
+export const StillImageMimeSchema = z.enum([
+  "image/jpeg",
+  "image/png",
+  "image/webp",
+]);
+const Sha256Schema = z.string().regex(/^[a-f0-9]{64}$/u);
+export const StillAssetSchema = z.strictObject({
+  versionId: z.string().min(1),
+  sha256: Sha256Schema,
+  byteCount: z.number().int().positive(),
+  mimeType: StillImageMimeSchema,
+  width: VersionSchema,
+  height: VersionSchema,
+});
+export const StillAssetManifestSchema = z.strictObject({
+  assets: z.strictObject({
+    original: StillAssetSchema,
+    display: StillAssetSchema,
+    thumbnail: StillAssetSchema,
+  }),
+  provenance: z.strictObject({
+    kind: z.enum(["url", "file", "page_picture", "still_crop"]),
+    sourceUrl: StillProvenanceUrlSchema.optional(),
+    resolvedUrl: StillProvenanceUrlSchema.optional(),
+    pageUrl: StillProvenanceUrlSchema.optional(),
+    altText: TextSchema.max(2000).optional(),
+    parentItemId: IdSchema.optional(),
+    crop: StillCropSchema.optional(),
+    inputSha256: Sha256Schema,
+  }),
+});
+export type StillUpload = z.infer<typeof StillUploadSchema>;
+export type StillContent = z.infer<typeof StillContentSchema>;
+export type StillAssetRole = z.infer<typeof StillAssetRoleSchema>;
+export type StillAsset = z.infer<typeof StillAssetSchema>;
+export type StillAssetManifest = z.infer<typeof StillAssetManifestSchema>;
+
 const ItemFields = {
   sourceId: IdSchema,
   notes: NotesSchema.default(""),

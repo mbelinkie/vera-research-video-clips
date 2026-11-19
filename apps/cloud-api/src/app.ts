@@ -51,11 +51,14 @@ import {
   type VideoMetadataProvider,
 } from "@research-video/providers";
 
+import { registerStillRoutes, type PublicStillReader } from "./still-import.ts";
+
 export interface CloudApiDependencies {
   catalog: SharedProjectCatalog;
   browserAuth?: BrowserAuth;
   authenticate(request: FastifyRequest): Promise<AuthenticatedActor>;
   videoMetadataProvider?: VideoMetadataProvider;
+  publicStillReader?: PublicStillReader;
   localArtifacts?: {
     store: TranscriptObjectStore;
     issuer: LocalStagedUploadUrlIssuer;
@@ -367,6 +370,10 @@ export function createCloudApi(
       return reply.header("cache-control", "no-store").code(204).send();
     },
   );
+
+  app.register(async (stillRoutes) => {
+    registerStillRoutes(stillRoutes, dependencies);
+  });
 
   app.post("/api/projects/:projectId/sources", async (request, reply) => {
     const { projectId } = IdParamsSchema.parse(request.params);
