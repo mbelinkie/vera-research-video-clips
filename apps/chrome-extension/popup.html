@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>VERA Research Capture</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        font:
+          14px system-ui,
+          sans-serif;
+      }
+      body {
+        width: 280px;
+        margin: 0;
+        padding: 16px;
+      }
+      h1 {
+        font-size: 16px;
+        margin: 0 0 12px;
+      }
+      button {
+        width: 100%;
+        margin: 4px 0;
+        padding: 8px 10px;
+        text-align: left;
+      }
+      #status {
+        min-height: 2.5em;
+        margin-top: 10px;
+        white-space: pre-wrap;
+      }
+      a {
+        display: inline-block;
+        margin-top: 8px;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Send to VERA Research</h1>
+    <button type="button" data-kind="quote">Log selected quote</button>
+    <button type="button" data-kind="page">Save current page</button>
+    <button type="button" data-kind="youtube">Send YouTube video</button>
+    <p id="status" role="status" aria-live="polite">
+      Only the current tab is read after you choose an action.
+    </p>
+    <a href="options.html" target="_blank">Connection and privacy settings</a>
+    <script src="popup.js"></script>
+  </body>
+</html>

@@ -185,6 +185,9 @@ async function readSnapshot(pool: Pool) {
       "SELECT version FROM schema_migrations ORDER BY version",
     );
     const schemaVersions = versions.rows.map((row) => row.version);
+    const hasCaptures = schemaVersions.includes(
+      "0059_extension_capture_assets",
+    );
     const hasStills = schemaVersions.includes("0055_library_still_assets");
     const references =
       await client.query<Ref>(`SELECT object_key, object_version_id, sha256, byte_size::text
@@ -230,6 +233,12 @@ async function readSnapshot(pool: Pool) {
         ? ["library_source_reuse_receipts"]
         : []),
       ...(hasStills ? ["library_still_assets"] : []),
+      ...(hasCaptures
+        ? ["extension_captures", "extension_capture_assets"]
+        : []),
+      ...(schemaVersions.includes("0060_chrome_capture_connections")
+        ? ["chrome_capture_connections", "chrome_video_submissions"]
+        : []),
     ];
     for (const table of snapshotTables) {
       const result = await client.query<{ total: string }>(
@@ -256,10 +265,21 @@ async function readSnapshot(pool: Pool) {
           FROM library_still_assets ORDER BY object_key, object_version_id`)
         ).rows
       : [];
+    const captureReferences = hasCaptures
+      ? (
+          await client.query<Ref>(
+            `SELECT object_key,object_version_id,sha256,byte_size::text FROM extension_capture_assets ORDER BY object_key,object_version_id`,
+          )
+        ).rows
+      : [];
     await client.query("COMMIT");
     return {
       schemaVersions,
-      references: [...references.rows, ...stillReferences],
+      references: [
+        ...references.rows,
+        ...stillReferences,
+        ...captureReferences,
+      ],
       tableCounts: counts,
       tableDigests,
     };

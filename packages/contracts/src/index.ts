@@ -594,7 +594,20 @@ export const TranscriptionBatchSchema = z.object({
   version: z.number().int().positive(),
 });
 
+export const VideoCommentSchema = z.object({
+  id: IdSchema,
+  sourceId: IdSchema,
+  text: z.string().min(1).max(2000).nullable(),
+  // Elapsed milliseconds from the start of this source. Zero is a valid marker position.
+  timecodeMs: z.int().nonnegative().nullable(),
+  authorId: IdSchema,
+  authorName: z.string(),
+  createdAt: UtcTimestampSchema,
+});
+export type VideoComment = z.infer<typeof VideoCommentSchema>;
 export const TranscriptionBatchItemSchema = BatchPreflightItemSchema.extend({
+  videoCommentCount: z.int().nonnegative().optional(),
+  videoComments: VideoCommentSchema.array().max(3).optional(),
   id: IdSchema,
   batchId: IdSchema,
   state: TranscriptionItemStateSchema,

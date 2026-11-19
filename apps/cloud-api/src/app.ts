@@ -1,3 +1,5 @@
+import { registerChromeConnection } from "./chrome-connection.ts";
+import { registerExtensionCaptureRoutes } from "./extension-capture.ts";
 import type { BrowserAuth } from "./browser-auth/routes.ts";
 import Fastify, { type FastifyInstance, type FastifyRequest } from "fastify";
 import { z, ZodError } from "zod";
@@ -243,6 +245,9 @@ export function createCloudApi(
     });
   }
 
+  registerChromeConnection(app, dependencies);
+  registerExtensionCaptureRoutes(app, dependencies);
+
   app.post("/api/session/register", async (request) => {
     const body = z
       .strictObject({ displayName: z.string().trim().min(1).max(160) })
@@ -449,6 +454,31 @@ export function createCloudApi(
       SourceListQuerySchema.parse(request.query),
     );
   });
+
+  app.get(
+    "/api/projects/:projectId/sources/:sourceId/comments",
+    async (request) => {
+      const { projectId, sourceId } = ProjectSourceParamsSchema.parse(
+        request.params,
+      );
+      const { offset } = z
+        .strictObject({
+          offset: z.coerce
+            .number()
+            .int()
+            .nonnegative()
+            .max(2147483647)
+            .default(0),
+        })
+        .parse(request.query);
+      return catalog.videoComments(
+        await authenticate(request),
+        projectId,
+        sourceId,
+        offset,
+      );
+    },
+  );
 
   app.get("/api/projects/:projectId/sources/:sourceId", async (request) => {
     const { projectId, sourceId } = ProjectSourceParamsSchema.parse(

@@ -33,6 +33,7 @@ import transcriptFixture from "../../../tests/fixtures/transcripts/english-word.
 import autoWordTimedFixture from "../../../tests/fixtures/transcripts/auto-word-timed.json" with { type: "json" };
 
 import "./styles.css";
+import { ChromePairing } from "./chrome-pairing.tsx";
 import { BatchWorkspace } from "./batch-workspace.tsx";
 import { StillsWorkspace } from "./stills-workspace.tsx";
 import {
@@ -1478,6 +1479,10 @@ function App() {
 
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
-    <App />
+    {["?chrome-pair", "?chrome-connections"].includes(location.search) ? (
+      <ChromePairing />
+    ) : (
+      <App />
+    )}
   </React.StrictMode>,
 );

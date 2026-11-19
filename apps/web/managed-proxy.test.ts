@@ -151,3 +151,31 @@ describe("managed loopback reverse-proxy guard", () => {
     );
   });
 });
+
+it("isolates the capture gateway from the managed browser credential", () => {
+  const path = "/extension/v1/projects";
+  const extension = "chrome-extension://" + "a".repeat(32);
+  const options = {
+    path,
+    method: "POST",
+    headers: { origin: extension, "sec-fetch-site": "cross-site" },
+  };
+  expect(request(options).nextCalled).toBe(true);
+  for (const headers of [
+    { origin: "https://other.example" },
+    { host: "other.example" },
+    { cookie: "session=private" },
+    { authorization: "forbidden" },
+  ]) {
+    expect(
+      request({ ...options, headers: { ...options.headers, ...headers } })
+        .status,
+    ).toBe(403);
+  }
+  expect(
+    request({ ...options, path: "/extension/v1/../api/projects" }).status,
+  ).toBe(403);
+  expect(request({ ...options, path: "/cloud-api/api/projects" }).status).toBe(
+    403,
+  );
+});

@@ -140,6 +140,57 @@ async function readMultipart(request: FastifyRequest) {
   return { fields, bytes: Buffer.from(await image.arrayBuffer()) };
 }
 
+export async function publishKeptStill(
+  catalog: CloudApiDependencies["catalog"],
+  actor: AuthenticatedActor,
+  projectId: string,
+  metadata: StillUpload,
+  bytes: Buffer,
+  provenance: Omit<StillAssetManifest["provenance"], "inputSha256">,
+  sourceId?: string,
+) {
+  if (bytes.byteLength > MAX_STILL_BYTES)
+    throw new StillImportError(413, "This image exceeds the size limit.");
+  const inputSha256 = digest(bytes);
+  let images;
+  try {
+    images = await prepareStill(bytes, provenance.crop);
+  } catch (error) {
+    if (error instanceof InvalidStillImage)
+      throw new StillImportError(400, error.message);
+    throw error;
+  }
+  const source = sourceId
+    ? { id: sourceId }
+    : {
+        create: CreateSourceRequestSchema.parse({
+          kind: "image",
+          bibliography: {
+            title: { value: metadata.title, state: "confirmed" },
+            ...(metadata.credit && {
+              credit: { value: metadata.credit, state: "confirmed" },
+            }),
+            ...(provenance.sourceUrl && {
+              url: { value: provenance.sourceUrl, state: "confirmed" },
+            }),
+          },
+          details: {
+            originalUrl: provenance.sourceUrl,
+            pageUrl: provenance.pageUrl,
+            altText: metadata.altText,
+            width: images.display.width,
+            height: images.display.height,
+          },
+        }),
+      };
+  return catalog.library.publishStill(actor, projectId, {
+    metadata,
+    images,
+    provenance: { altText: metadata.altText, ...provenance, inputSha256 },
+    source,
+  });
+}
+
 export function registerStillRoutes(
   app: FastifyInstance,
   dependencies: CloudApiDependencies,
@@ -184,7 +235,7 @@ export function registerStillRoutes(
     return context;
   };
 
-  const publish = async (
+  const publish = (
     request: FastifyRequest,
     metadata: StillUpload,
     bytes: Buffer,
@@ -192,46 +243,15 @@ export function registerStillRoutes(
     sourceId?: string,
   ) => {
     const { actor, projectId } = writeContext(request);
-    if (bytes.byteLength > MAX_STILL_BYTES)
-      throw new StillImportError(413, "This image exceeds the size limit.");
-    const inputSha256 = digest(bytes);
-    let images;
-    try {
-      images = await prepareStill(bytes, provenance.crop);
-    } catch (error) {
-      if (error instanceof InvalidStillImage)
-        throw new StillImportError(400, error.message);
-      throw error;
-    }
-    const source = sourceId
-      ? { id: sourceId }
-      : {
-          create: CreateSourceRequestSchema.parse({
-            kind: "image",
-            bibliography: {
-              title: { value: metadata.title, state: "confirmed" },
-              ...(metadata.credit && {
-                credit: { value: metadata.credit, state: "confirmed" },
-              }),
-              ...(provenance.sourceUrl && {
-                url: { value: provenance.sourceUrl, state: "confirmed" },
-              }),
-            },
-            details: {
-              originalUrl: provenance.sourceUrl,
-              pageUrl: provenance.pageUrl,
-              altText: metadata.altText,
-              width: images.display.width,
-              height: images.display.height,
-            },
-          }),
-        };
-    return catalog.library.publishStill(actor, projectId, {
+    return publishKeptStill(
+      catalog,
+      actor,
+      projectId,
       metadata,
-      images,
-      provenance: { altText: metadata.altText, ...provenance, inputSha256 },
-      source,
-    });
+      bytes,
+      provenance,
+      sourceId,
+    );
   };
 
   app.post(base + "/from-url", async (request, reply) => {

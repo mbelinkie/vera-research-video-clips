@@ -25,6 +25,26 @@ export function managedResearchGuard(settings: ManagedProxySettings) {
     next: () => void,
   ) => {
     const path = (request.url ?? "").split("?", 1)[0] ?? "";
+    // This independent gateway receives only its own capture key. Never let
+    // these requests use the launcher's private managed-proxy credentials.
+    if (path.startsWith("/extension/")) {
+      if (
+        request.headers.host === `127.0.0.1:${settings.webPort}` &&
+        request.method === "POST" &&
+        /^chrome-extension:\/\/[a-p]{32}$/u.test(
+          String(request.headers.origin),
+        ) &&
+        request.headers.authorization === undefined &&
+        request.headers.cookie === undefined &&
+        /^\/extension\/v1\/(?:pair|projects|disconnect|projects\/[a-f0-9-]{36}\/captures)$/u.test(
+          path,
+        )
+      )
+        return next();
+      reply.writeHead(403, { "cache-control": "no-store" });
+      reply.end();
+      return;
+    }
     const relevant =
       path === "/__research/session" ||
       path === "/cloud-api" ||
