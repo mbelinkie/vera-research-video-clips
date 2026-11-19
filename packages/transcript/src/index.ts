@@ -93,6 +93,144 @@ export async function normalizeGeneratedTranscript(input: {
   return transcript;
 }
 
+export type AcousticAlignmentToken =
+  | {
+      tokenId: string;
+      status: "acoustic";
+      startMs: number;
+      endMs: number;
+    }
+  | {
+      tokenId: string;
+      status: "unaligned";
+      startMs: null;
+      endMs: null;
+    };
+
+export async function applyAcousticAlignment(
+  transcript: NormalizedTranscript,
+  alignment: {
+    artifactId: string;
+    tokens: readonly AcousticAlignmentToken[];
+  },
+): Promise<NormalizedTranscript> {
+  const source = NormalizedTranscriptSchema.parse(transcript);
+  if (source.track.source === "translated") {
+    throw new Error(
+      "Acoustic alignment must be applied to a speech transcript.",
+    );
+  }
+  const artifactId = alignment.artifactId.trim();
+  if (!artifactId || artifactId.length > 512) {
+    throw new Error("Alignment artifact ID must contain 1 to 512 characters.");
+  }
+  if (!Array.isArray(alignment.tokens)) {
+    throw new Error("Alignment tokens must be an array.");
+  }
+
+  const sourceTokenIds = new Set(source.tokens.map((token) => token.id));
+  const seenTokenIds = new Set<string>();
+  const acousticByTokenId = new Map<
+    string,
+    { startMs: number; endMs: number }
+  >();
+  for (const result of alignment.tokens) {
+    if (!result.tokenId.trim()) {
+      throw new Error("Alignment token IDs cannot be empty.");
+    }
+    if (seenTokenIds.has(result.tokenId)) {
+      throw new Error(`Alignment repeated token ${result.tokenId}.`);
+    }
+    if (!sourceTokenIds.has(result.tokenId)) {
+      throw new Error(`Alignment returned unknown token ${result.tokenId}.`);
+    }
+    if (
+      result.status === "acoustic" &&
+      (!Number.isSafeInteger(result.startMs) ||
+        !Number.isSafeInteger(result.endMs) ||
+        result.startMs < 0 ||
+        result.endMs <= result.startMs)
+    ) {
+      throw new Error(
+        `Alignment bounds for token ${result.tokenId} are invalid.`,
+      );
+    }
+    if (
+      result.status === "unaligned" &&
+      (result.startMs !== null || result.endMs !== null)
+    ) {
+      throw new Error(`Unaligned token ${result.tokenId} cannot have bounds.`);
+    }
+    if (result.status !== "acoustic" && result.status !== "unaligned") {
+      throw new Error(
+        `Alignment status for token ${result.tokenId} is invalid.`,
+      );
+    }
+    seenTokenIds.add(result.tokenId);
+    if (result.status === "acoustic") {
+      acousticByTokenId.set(result.tokenId, {
+        startMs: result.startMs,
+        endMs: result.endMs,
+      });
+    }
+  }
+
+  const tokens: TranscriptToken[] = source.tokens.map((token) => {
+    const {
+      startMs: _startMs,
+      endMs: _endMs,
+      endTiming: _endTiming,
+      timingConfidence: _timingConfidence,
+      alignmentStatus: _alignmentStatus,
+      ...identity
+    } = token;
+    const timing = acousticByTokenId.get(token.id);
+    if (timing) {
+      return {
+        ...identity,
+        startMs: timing.startMs,
+        endMs: timing.endMs,
+        alignmentStatus: "acoustic" as const,
+      };
+    }
+    return { ...identity, alignmentStatus: "unaligned" as const };
+  });
+  const sourceContentSha256 =
+    source.track.alignment?.sourceContentSha256 ?? source.track.contentSha256;
+  const fingerprint = await sha256Hex(
+    new TextEncoder().encode(
+      JSON.stringify({
+        artifactId,
+        sourceContentSha256,
+        tokens: tokens.map((token) => ({
+          tokenId: token.id,
+          status: token.alignmentStatus,
+          startMs: token.startMs ?? null,
+          endMs: token.endMs ?? null,
+        })),
+      }),
+    ),
+  );
+  const trackId = await stableUuid(`acoustic-alignment-track:${fingerprint}`);
+
+  return NormalizedTranscriptSchema.parse({
+    track: {
+      ...source.track,
+      id: trackId,
+      alignment: { artifactId, fingerprint, sourceContentSha256 },
+      timingPrecision:
+        tokens.length > 0 &&
+        tokens.every((token) => token.alignmentStatus === "acoustic")
+          ? "word"
+          : "cue",
+      schemaVersion: Math.max(2, source.track.schemaVersion),
+      contentSha256: fingerprint,
+    },
+    segments: source.segments.map((segment) => ({ ...segment, trackId })),
+    tokens,
+  });
+}
+
 export async function normalizeTranslatedTranscript(input: {
   sourceTranscript: NormalizedTranscript;
   targetLanguage: string;
@@ -463,6 +601,8 @@ export function deriveTranscriptSelection(input: {
   const lastToken =
     last.tokenIndex === undefined ? undefined : orderedTokens[last.tokenIndex];
   const tokenBounds =
+    firstToken?.alignmentStatus !== "unaligned" &&
+    lastToken?.alignmentStatus !== "unaligned" &&
     firstToken?.startMs !== undefined &&
     firstToken.endMs !== undefined &&
     lastToken?.startMs !== undefined &&
@@ -765,7 +905,14 @@ function parseWebVtt(input: string): ParsedCue[] {
   if (!header || !/^WEBVTT(?:[\t ].*)?$/.test(header)) {
     throw new WebVttNormalizationError("WebVTT header is missing or invalid.");
   }
-  const blocks = lines.join("\n").split(/\n{2,}/u);
+  let firstCueLine = 0;
+  // YouTube puts Kind and Language fields directly after the signature.
+  while (/^(?:Kind|Language):[\t ]*\S/u.test(lines[firstCueLine] ?? ""))
+    firstCueLine += 1;
+  const blocks = lines
+    .slice(firstCueLine)
+    .join("\n")
+    .split(/\n{2,}/u);
   const cues: ParsedCue[] = [];
   for (const rawBlock of blocks) {
     const block = rawBlock.trim();
@@ -795,11 +942,7 @@ function parseWebVtt(input: string): ParsedCue[] {
     }
     const rawLines = blockLines.slice(timingIndex + 1);
     const text = normalizeCueText(rawLines);
-    if (!text) {
-      throw new WebVttNormalizationError(
-        `WebVTT cue ${cues.length + 1} has no readable text.`,
-      );
-    }
+    if (!text) continue;
     cues.push({ inputOrdinal: cues.length, startMs, endMs, text, rawLines });
     if (cues.length > maxWebVttCues) {
       throw new WebVttNormalizationError(

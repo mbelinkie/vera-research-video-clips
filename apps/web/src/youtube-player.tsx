@@ -8,13 +8,18 @@ import {
 
 type PlayerStateEvent = { data: number };
 type PlayerErrorEvent = { data: number };
+type PlaybackRange = { startMs: number; endMs: number };
 
 type YouTubePlayerInstance = {
   cueVideoById(videoId: string): void;
+  loadVideoById(options: {
+    videoId: string;
+    startSeconds: number;
+    endSeconds: number;
+  }): void;
   destroy(): void;
   getCurrentTime(): number;
   pauseVideo(): void;
-  playVideo(): void;
   seekTo(seconds: number, allowSeekAhead: boolean): void;
 };
 
@@ -31,7 +36,7 @@ type YouTubeNamespace = {
       };
     },
   ) => YouTubePlayerInstance;
-  PlayerState: { PLAYING: number };
+  PlayerState: { ENDED: number; PAUSED: number; PLAYING: number };
 };
 
 declare global {
@@ -43,13 +48,14 @@ declare global {
 
 export type YouTubePlayerHandle = {
   seekTo(milliseconds: number): boolean;
-  play(): boolean;
+  playRange(startMilliseconds: number, endMilliseconds: number): boolean;
   pause(): boolean;
 };
 
 type YouTubePlayerProps = {
   videoId: string;
   onTimeChange(milliseconds: number): void;
+  onRangeInterrupted(): void;
 };
 
 let apiPromise: Promise<YouTubeNamespace> | undefined;
@@ -78,36 +84,75 @@ function loadYouTubeApi(): Promise<YouTubeNamespace> {
   return apiPromise;
 }
 
+function loadRange(
+  player: YouTubePlayerInstance,
+  videoId: string,
+  range: PlaybackRange,
+  startMs = range.startMs,
+) {
+  player.loadVideoById({
+    videoId,
+    startSeconds: startMs / 1_000,
+    endSeconds: range.endMs / 1_000,
+  });
+}
+
 export const YouTubePlayer = forwardRef<
   YouTubePlayerHandle,
   YouTubePlayerProps
->(function YouTubePlayer({ videoId, onTimeChange }, forwardedRef) {
+>(function YouTubePlayer(
+  { videoId, onRangeInterrupted, onTimeChange },
+  forwardedRef,
+) {
   const mountRef = useRef<HTMLDivElement>(null);
   const playerRef = useRef<YouTubePlayerInstance | undefined>(undefined);
   const playingRef = useRef(false);
+  const pausedRef = useRef(false);
+  const rangeRef = useRef<PlaybackRange | undefined>(undefined);
   const [state, setState] = useState<"loading" | "ready" | "error">("loading");
 
   useImperativeHandle(
     forwardedRef,
     () => ({
       seekTo(milliseconds) {
-        if (!playerRef.current) return false;
-        playerRef.current.seekTo(milliseconds / 1_000, true);
+        const player = playerRef.current;
+        if (!player) return false;
+        const range = rangeRef.current;
+        if (range) {
+          if (milliseconds < range.startMs || milliseconds >= range.endMs) {
+            rangeRef.current = undefined;
+            player.seekTo(milliseconds / 1_000, true);
+            onTimeChange(milliseconds);
+            onRangeInterrupted();
+            return true;
+          }
+          const wasPaused = pausedRef.current;
+          loadRange(player, videoId, range, milliseconds);
+          if (wasPaused) player.pauseVideo();
+          onTimeChange(milliseconds);
+          return true;
+        }
+        player.seekTo(milliseconds / 1_000, true);
         onTimeChange(milliseconds);
         return true;
       },
-      play() {
-        if (!playerRef.current) return false;
-        playerRef.current.playVideo();
+      playRange(startMilliseconds, endMilliseconds) {
+        const player = playerRef.current;
+        if (!player) return false;
+        const range = { startMs: startMilliseconds, endMs: endMilliseconds };
+        rangeRef.current = range;
+        loadRange(player, videoId, range);
+        onTimeChange(startMilliseconds);
         return true;
       },
       pause() {
         if (!playerRef.current) return false;
+        rangeRef.current = undefined;
         playerRef.current.pauseVideo();
         return true;
       },
     }),
-    [onTimeChange],
+    [onRangeInterrupted, onTimeChange, videoId],
   );
 
   useEffect(() => {
@@ -132,6 +177,19 @@ export const YouTubePlayer = forwardRef<
             onReady: () => setState("ready"),
             onStateChange: (event) => {
               playingRef.current = event.data === youtube.PlayerState.PLAYING;
+              pausedRef.current = event.data === youtube.PlayerState.PAUSED;
+              if (event.data !== youtube.PlayerState.ENDED) return;
+              const range = rangeRef.current;
+              const player = playerRef.current;
+              if (!range || !player) {
+                if (player)
+                  onTimeChange(
+                    Math.max(0, Math.round(player.getCurrentTime() * 1_000)),
+                  );
+                return;
+              }
+              loadRange(player, videoId, range);
+              onTimeChange(range.startMs);
             },
             onError: () => setState("error"),
           },
@@ -142,6 +200,9 @@ export const YouTubePlayer = forwardRef<
     return () => {
       disposed = true;
       window.clearInterval(interval);
+      playingRef.current = false;
+      pausedRef.current = false;
+      rangeRef.current = undefined;
       playerRef.current?.destroy();
       playerRef.current = undefined;
     };

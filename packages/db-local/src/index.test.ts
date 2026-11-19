@@ -5,8 +5,12 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import fixture from "../../../tests/fixtures/transcripts/english-cue.json" with { type: "json" };
-import { normalizeTranscriptFixture } from "@research-video/transcript";
-import { normalizeWebVttCaption } from "@research-video/transcript";
+import wordFixture from "../../../tests/fixtures/transcripts/english-word.json" with { type: "json" };
+import {
+  applyAcousticAlignment,
+  normalizeTranscriptFixture,
+  normalizeWebVttCaption,
+} from "@research-video/transcript";
 import { readFileSync } from "node:fs";
 
 import {
@@ -39,6 +43,7 @@ describe("local migrations", () => {
       "0003_normalized_transcripts",
       "0004_export_only_requests",
       "0005_derived_caption_ends",
+      "0006_acoustic_alignment",
     ]);
     expect(runLocalMigrations(database)).toEqual([]);
     expect(
@@ -219,6 +224,91 @@ describe("local migrations", () => {
           ),
         ),
       ).toEqual(selection);
+    } finally {
+      database.close();
+    }
+  });
+
+  it("persists alignment provenance and unaligned status without relabeling legacy timings", async () => {
+    const directory = mkdtempSync(
+      join(tmpdir(), "research-video-alignment-sqlite-"),
+    );
+    temporaryDirectories.add(directory);
+    const database = openLocalDatabase(join(directory, "test.sqlite"));
+    runLocalMigrations(database);
+    try {
+      const source = await normalizeWebVttCaption({
+        contents: readFileSync(
+          new URL(
+            "../../../tests/fixtures/transcripts/auto-word-timed.vtt",
+            import.meta.url,
+          ),
+        ),
+        videoId: "M7lc1UVf-VE",
+        language: "en",
+        source: "youtube-auto",
+        provider: "yt-dlp",
+      });
+      const aligned = await applyAcousticAlignment(source, {
+        artifactId: "recognition-fixture",
+        tokens: [
+          {
+            tokenId: source.tokens[0]!.id,
+            status: "acoustic",
+            startMs: source.segments[0]!.startMs,
+            endMs: source.segments[0]!.startMs + 100,
+          },
+        ],
+      });
+      const index = new LocalTranscriptIndex(database);
+      index.replace({
+        projectId: "project-fixture",
+        catalogVideoId: "video-fixture",
+        transcriptVersionId: "aligned-v1",
+        transcript: aligned,
+      });
+
+      expect(index.get("aligned-v1", "english")).toEqual(aligned);
+      expect(
+        database
+          .prepare(
+            `SELECT alignment_artifact_id, alignment_fingerprint,
+                    alignment_source_content_sha256
+             FROM transcript_tracks WHERE transcript_version_id = ?`,
+          )
+          .get("aligned-v1"),
+      ).toEqual({
+        alignment_artifact_id: "recognition-fixture",
+        alignment_fingerprint: aligned.track.alignment?.fingerprint,
+        alignment_source_content_sha256: source.track.contentSha256,
+      });
+      expect(
+        database
+          .prepare(
+            "SELECT alignment_status, start_ms, end_ms FROM transcript_tokens WHERE id = ?",
+          )
+          .get(aligned.tokens[1]!.id),
+      ).toEqual({
+        alignment_status: "unaligned",
+        start_ms: null,
+        end_ms: null,
+      });
+
+      const legacy = normalizeTranscriptFixture(wordFixture);
+      index.replace({
+        projectId: "project-fixture",
+        catalogVideoId: "video-fixture",
+        transcriptVersionId: "legacy-v1",
+        transcript: legacy,
+      });
+      expect(index.get("legacy-v1", "english")).toEqual(legacy);
+      expect(
+        database
+          .prepare(
+            "SELECT alignment_status FROM transcript_tokens WHERE transcript_version_id = ? LIMIT 1",
+          )
+          .get("legacy-v1"),
+      ).toEqual({ alignment_status: null });
     } finally {
       database.close();
     }

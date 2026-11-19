@@ -13,8 +13,12 @@ import type {
   TranscriptManifest,
   TranscriptUploadGrant,
 } from "@research-video/contracts";
-import { normalizeGeneratedTranscript } from "@research-video/transcript";
+import {
+  applyAcousticAlignment,
+  normalizeGeneratedTranscript,
+} from "@research-video/transcript";
 import type { TranslationRequest } from "@research-video/providers";
+import { AlignmentShutdownUnconfirmedError } from "@research-video/providers/alignment-local";
 
 import {
   createTranscriptPipelineExecutor,
@@ -305,6 +309,183 @@ describe("transcript pipeline", () => {
     expect(publication.finalize).toHaveBeenCalledOnce();
     expect(await readdir(scratchRoot)).toEqual([]);
   });
+
+  it.each(["caption", "generated", "canceled", "unconfirmed"] as const)(
+    "keeps the %s word alignment inside the job audio lifetime",
+    async (source) => {
+      const scratchRoot = await mkdtemp(join(tmpdir(), "pipeline-align-"));
+      temporaryDirectories.add(scratchRoot);
+      const publication = publicationFixture();
+      const controller = new AbortController();
+      const lostLease = new Error("Lease expired during alignment.");
+      const failed = source === "canceled" || source === "unconfirmed";
+      const stages: string[] = [];
+      let alignmentCalls = 0;
+      const acquireAuthorizedSource = vi.fn(
+        async (videoId: string, scratch: string) => {
+          const scratchPath = join(scratch, "audio.flac");
+          await writeFile(scratchPath, "temporary audio");
+          return {
+            videoId,
+            scratchPath,
+            byteSize: 15,
+            format: "flac" as const,
+            provider: "fixture",
+            contentSha256: "0".repeat(64),
+          };
+        },
+      );
+      const transcribe = vi.fn(async () =>
+        normalizeGeneratedTranscript({
+          videoId: "M7lc1UVf-VE",
+          language: "en",
+          provider: "fixture-asr",
+          model: "fixture-model",
+          segments: [{ startMs: 0, endMs: 1_000, text: "Hello world." }],
+        }),
+      );
+      const executor = createTranscriptPipelineExecutor({
+        scratchRoot,
+        publication: publication.client,
+        ...(source === "caption"
+          ? {
+              captions: {
+                discover: async () => [
+                  {
+                    id: "english:manual",
+                    language: "en",
+                    kind: "manual" as const,
+                    translatable: false,
+                    downloadAccess: "available" as const,
+                  },
+                ],
+                acquire: async (videoId, track, scratch) => {
+                  const path = join(scratch, "captions.vtt");
+                  const vtt =
+                    "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nHello world.\n";
+                  await writeFile(path, vtt);
+                  return {
+                    videoId,
+                    track,
+                    path,
+                    format: "vtt",
+                    byteSize: vtt.length,
+                    provider: "fixture",
+                  };
+                },
+              },
+            }
+          : {}),
+        media: { acquireAuthorizedSource },
+        speechToText: { transcribe },
+        alignment: {
+          supports: () => true,
+          align: async ({ transcript, inputPath, signal }) => {
+            alignmentCalls += 1;
+            expect(signal).toBe(controller.signal);
+            expect(transcript.track.source).toBe(
+              source === "caption" ? "youtube-manual" : "generated",
+            );
+            if (failed) controller.abort(lostLease);
+            await expect(readFile(inputPath, "utf8")).resolves.toBe(
+              "temporary audio",
+            );
+            if (source === "unconfirmed")
+              throw new AlignmentShutdownUnconfirmedError();
+            return applyAcousticAlignment(transcript, {
+              artifactId: `sha256:${"a".repeat(64)}`,
+              tokens: transcript.tokens.map(({ id }, index) =>
+                index === 0
+                  ? {
+                      tokenId: id,
+                      status: "acoustic",
+                      startMs: 160,
+                      endMs: 480,
+                    }
+                  : {
+                      tokenId: id,
+                      status: "unaligned",
+                      startMs: null,
+                      endMs: null,
+                    },
+              ),
+            });
+          },
+        },
+      });
+      const claimed = claimedJob();
+      const result = executor(claimed, {
+        signal: controller.signal,
+        setStage: async (stage) => void stages.push(stage),
+        recordSourcePlan: async () => undefined,
+      });
+      if (failed) {
+        if (source === "unconfirmed")
+          await expect(result).rejects.toBeInstanceOf(
+            AlignmentShutdownUnconfirmedError,
+          );
+        else await expect(result).rejects.toBe(lostLease);
+        expect(publication.uploaded.size).toBe(0);
+        expect(publication.finalize).not.toHaveBeenCalled();
+      } else {
+        await result;
+        const transcript = JSON.parse(
+          new TextDecoder().decode(
+            publication.uploaded.get("english-normalized"),
+          ),
+        ) as NormalizedTranscript;
+        expect(transcript.tokens[0]).toMatchObject({
+          text: "Hello",
+          startMs: 160,
+          endMs: 480,
+          alignmentStatus: "acoustic",
+        });
+        expect(transcript.tokens[1]).toMatchObject({
+          alignmentStatus: "unaligned",
+        });
+        expect(transcript.track.alignment?.artifactId).toBe(
+          `sha256:${"a".repeat(64)}`,
+        );
+        expect(publication.finalize).toHaveBeenCalledOnce();
+      }
+      expect(stages).toEqual([
+        "resolving",
+        "acquiring",
+        ...(source === "caption" ? [] : ["transcribing"]),
+        "aligning",
+        ...(failed ? [] : ["uploading"]),
+      ]);
+      expect(acquireAuthorizedSource).toHaveBeenCalledOnce();
+      expect(transcribe).toHaveBeenCalledTimes(source === "caption" ? 0 : 1);
+      const remaining = await readdir(scratchRoot);
+      if (source === "unconfirmed") {
+        expect(remaining).toHaveLength(2);
+        expect(remaining).toContain(`.alignment-${claimed.job.id}`);
+        const retained = remaining.find((entry) =>
+          entry.startsWith(claimed.job.id),
+        );
+        expect(retained).toBeDefined();
+        await expect(
+          readFile(join(scratchRoot, retained!, "audio.flac"), "utf8"),
+        ).resolves.toBe("temporary audio");
+        await expect(
+          executor(
+            {
+              job: { ...claimed.job, attempt: 2 },
+              lease: { ...claimed.lease, attempt: 2 },
+            },
+            {
+              signal: new AbortController().signal,
+              setStage: async () => undefined,
+              recordSourcePlan: async () => undefined,
+            },
+          ),
+        ).rejects.toMatchObject({ code: "previous_alignment_pending" });
+        expect(alignmentCalls).toBe(1);
+        expect((await readdir(scratchRoot)).sort()).toEqual(remaining.sort());
+      } else expect(remaining).toEqual([]);
+    },
+  );
 
   it("keeps original foreign auto word starts without transferring them to English translation", async () => {
     const scratchRoot = await mkdtemp(join(tmpdir(), "pipeline-auto-es-"));

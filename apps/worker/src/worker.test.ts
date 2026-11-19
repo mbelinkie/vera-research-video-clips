@@ -367,4 +367,33 @@ describe("HTTP worker control plane", () => {
 
     await expect(client.claim()).resolves.toBeUndefined();
   });
+
+  it("can abort a stalled heartbeat before the lease expires", async () => {
+    const deadline = new AbortController();
+    const timeout = vi
+      .spyOn(AbortSignal, "timeout")
+      .mockReturnValue(deadline.signal);
+    try {
+      const client = new HttpTranscriptionWorkerControlPlane({
+        baseUrl: "http://127.0.0.1:43111",
+        authorization: "Bearer development-worker",
+        executionLocation: "local",
+        leaseSeconds: 60,
+        fetcher: async (_request, init) =>
+          new Promise<Response>((_resolve, reject) => {
+            const signal = init?.signal;
+            signal?.addEventListener("abort", () => reject(signal.reason), {
+              once: true,
+            });
+          }),
+      });
+      const pending = client.heartbeat(job.id, 1, "aligning");
+      const expired = new Error("Fixture heartbeat exhausted its time budget");
+      deadline.abort(expired);
+      await expect(pending).rejects.toBe(expired);
+      expect(timeout).toHaveBeenCalledWith(20_000);
+    } finally {
+      timeout.mockRestore();
+    }
+  });
 });

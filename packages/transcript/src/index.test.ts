@@ -7,6 +7,7 @@ import wordFixture from "../../../tests/fixtures/transcripts/english-word.json" 
 import bilingualFixture from "../../../tests/fixtures/transcripts/spanish-bilingual.json" with { type: "json" };
 
 import {
+  applyAcousticAlignment,
   clipRelativeSrt,
   deriveClipRelativeSrtCues,
   deriveTranscriptSelection,
@@ -161,6 +162,47 @@ describe("transcript range selection", () => {
     });
   });
 
+  it("uses cue bounds when an aligned selection starts or ends on an unaligned token", async () => {
+    const source = await normalizeWebVttCaption({
+      contents: await readFile(autoWordTimedFixture),
+      videoId: "M7lc1UVf-VE",
+      language: "en",
+      source: "youtube-auto",
+      provider: "yt-dlp",
+    });
+    const aligned = await applyAcousticAlignment(source, {
+      artifactId: "recognition-fixture",
+      tokens: source.tokens.slice(1).map((token, index) =>
+        index === 0
+          ? {
+              tokenId: token.id,
+              status: "acoustic" as const,
+              startMs: 11_840,
+              endMs: 12_020,
+            }
+          : {
+              tokenId: token.id,
+              status: "unaligned" as const,
+              startMs: null,
+              endMs: null,
+            },
+      ),
+    });
+    const segment = aligned.segments[0]!;
+    const selection = deriveTranscriptSelection({
+      transcript: aligned,
+      anchor: { segmentId: segment.id, tokenId: aligned.tokens[0]!.id },
+      focus: { segmentId: segment.id, tokenId: aligned.tokens[1]!.id },
+    });
+
+    expect(selection).toMatchObject({
+      transcriptStartMs: segment.startMs,
+      transcriptEndMs: segment.endMs,
+      timingPrecision: "cue",
+    });
+    expect(selection).not.toHaveProperty("endTiming");
+  });
+
   it("keeps source selection bounds immutable while padding export bounds", () => {
     const transcript = normalizeTranscriptFixture(wordFixture);
     const selection = deriveTranscriptSelection({
@@ -226,6 +268,36 @@ describe("translated transcript normalization", () => {
     ).toBe(true);
   });
 
+  it("links translation to the aligned speech track without copying acoustic status", async () => {
+    const source = normalizeTranscriptFixture(wordFixture);
+    const alignedOriginal = await applyAcousticAlignment(source, {
+      artifactId: "recognition-fixture",
+      tokens: source.tokens.map((token) => ({
+        tokenId: token.id,
+        status: "acoustic" as const,
+        startMs: token.startMs!,
+        endMs: token.endMs!,
+      })),
+    });
+    const translated = await normalizeTranslatedTranscript({
+      sourceTranscript: alignedOriginal,
+      targetLanguage: "es",
+      provider: "fixture",
+      translations: source.segments.map((segment) => ({
+        sourceSegmentId: segment.id,
+        text: "Una traducción de ejemplo.",
+      })),
+    });
+
+    expect(translated.track.sourceTrackId).toBe(alignedOriginal.track.id);
+    expect(
+      translated.tokens.every((token) => token.alignmentStatus === undefined),
+    ).toBe(true);
+    expect(
+      translated.tokens.every((token) => token.startMs === undefined),
+    ).toBe(true);
+  });
+
   it("rejects missing, duplicate, or empty translated segments", async () => {
     const original = normalizeTranscriptFixture(bilingualFixture.original);
     await expect(
@@ -265,6 +337,131 @@ describe("generated transcript normalization", () => {
     expect(
       transcript.tokens.every((token) => token.startMs === undefined),
     ).toBe(true);
+  });
+});
+
+describe("acoustic alignment normalization", () => {
+  it("preserves token identity and order, fingerprints timings, and clears stale estimates", async () => {
+    const source = await normalizeWebVttCaption({
+      contents: await readFile(autoWordTimedFixture),
+      videoId: "M7lc1UVf-VE",
+      language: "en",
+      source: "youtube-auto",
+      provider: "yt-dlp",
+    });
+    const alignment = {
+      artifactId: "recognition-fixture",
+      tokens: [
+        {
+          tokenId: source.tokens[1]!.id,
+          status: "acoustic" as const,
+          startMs: 11_840,
+          endMs: 12_020,
+        },
+        {
+          tokenId: source.tokens[2]!.id,
+          status: "unaligned" as const,
+          startMs: null,
+          endMs: null,
+        },
+      ],
+    };
+
+    const aligned = await applyAcousticAlignment(source, alignment);
+    const repeated = await applyAcousticAlignment(source, alignment);
+
+    expect(aligned.track).toMatchObject({
+      timingPrecision: "cue",
+      alignment: {
+        artifactId: "recognition-fixture",
+        sourceContentSha256: source.track.contentSha256,
+      },
+    });
+    expect(aligned.track.id).not.toBe(source.track.id);
+    expect(aligned.track.contentSha256).toBe(
+      aligned.track.alignment?.fingerprint,
+    );
+    expect(aligned.track.id).toBe(repeated.track.id);
+    expect(aligned.track.alignment?.fingerprint).toBe(
+      repeated.track.alignment?.fingerprint,
+    );
+    expect(
+      aligned.segments.map(({ id, text, ordinal }) => ({ id, text, ordinal })),
+    ).toEqual(
+      source.segments.map(({ id, text, ordinal }) => ({ id, text, ordinal })),
+    );
+    expect(
+      aligned.tokens.map(({ id, text, ordinal }) => ({ id, text, ordinal })),
+    ).toEqual(
+      source.tokens.map(({ id, text, ordinal }) => ({ id, text, ordinal })),
+    );
+    expect(aligned.tokens.slice(0, 4)).toMatchObject([
+      { alignmentStatus: "unaligned" },
+      {
+        startMs: 11_840,
+        endMs: 12_020,
+        alignmentStatus: "acoustic",
+      },
+      { alignmentStatus: "unaligned" },
+      { alignmentStatus: "unaligned" },
+    ]);
+    expect(
+      aligned.tokens.every(
+        (token) => !("endTiming" in token) && !("timingConfidence" in token),
+      ),
+    ).toBe(true);
+
+    const changed = await applyAcousticAlignment(source, {
+      ...alignment,
+      tokens: [
+        {
+          tokenId: source.tokens[1]!.id,
+          status: "acoustic",
+          startMs: 11_850,
+          endMs: 12_020,
+        },
+        alignment.tokens[1]!,
+      ],
+    });
+    expect(changed.track.alignment?.fingerprint).not.toBe(
+      aligned.track.alignment?.fingerprint,
+    );
+  });
+
+  it("rejects unexpected IDs and invalid acoustic bounds", async () => {
+    const source = await normalizeWebVttCaption({
+      contents: await readFile(autoWordTimedFixture),
+      videoId: "M7lc1UVf-VE",
+      language: "en",
+      source: "youtube-auto",
+      provider: "yt-dlp",
+    });
+    await expect(
+      applyAcousticAlignment(source, {
+        artifactId: "recognition-fixture",
+        tokens: [
+          {
+            tokenId: "unexpected-token",
+            status: "unaligned",
+            startMs: null,
+            endMs: null,
+          },
+        ],
+      }),
+    ).rejects.toThrow(/unknown token/u);
+    await expect(
+      applyAcousticAlignment(source, {
+        artifactId: "recognition-fixture",
+        tokens: [
+          {
+            tokenId: source.tokens[0]!.id,
+            status: "acoustic",
+            startMs: -1,
+            endMs: 100,
+          },
+        ],
+      }),
+    ).rejects.toThrow(/bounds .* invalid/u);
   });
 });
 
@@ -689,7 +886,8 @@ describe("WebVTT normalization", () => {
 
   it("produces stable IDs and hashes for equivalent normalized content", async () => {
     const input = {
-      contents: "WEBVTT\r\n\r\n00:00.000 --> 00:01.250\r\nHello\r\n",
+      contents:
+        "WEBVTT\r\nKind: captions\r\nLanguage: en\r\n\r\n00:00.000 --> 00:01.250\r\nHello\r\n",
       videoId: "M7lc1UVf-VE",
       language: "en",
       source: "youtube-auto" as const,
@@ -719,6 +917,25 @@ describe("WebVTT normalization", () => {
       startMs: 3_723_004,
       endMs: 3_725_006,
     });
+  });
+
+  it("skips empty cues while preserving the following speech cues", async () => {
+    const transcript = await normalizeWebVttCaption({
+      contents:
+        "WEBVTT\n\n00:00.000 --> 00:01.000\nFirst word\n\n" +
+        "00:01.000 --> 00:02.000\n<c></c>\n\n" +
+        "00:02.000 --> 00:03.000\nSecond word\n",
+      videoId: "M7lc1UVf-VE",
+      language: "en",
+      provider: "fixture",
+      source: "youtube-auto",
+    });
+    expect(
+      transcript.segments.map(({ startMs, text }) => [startMs, text]),
+    ).toEqual([
+      [0, "First word"],
+      [2_000, "Second word"],
+    ]);
   });
 
   it.each([

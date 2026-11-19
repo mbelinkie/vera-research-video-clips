@@ -2,6 +2,7 @@ import { join } from "node:path";
 
 import { loadConfig } from "@research-video/config";
 import { createMediaAcquisitionProvider } from "@research-video/media";
+import { createLocalAlignmentProvider } from "@research-video/providers/alignment-local";
 import { createCaptionProvider } from "@research-video/providers/captions-local";
 import { createSpeechToTextProvider } from "@research-video/providers/speech-whisper-cpp";
 import { createTranslationProvider } from "@research-video/providers/translation-aws";
@@ -36,6 +37,12 @@ if (!config.workerAuthorization) {
           modelName: config.whisperCppModelName!,
         })
       : undefined;
+  const alignment = config.wordTimingPython
+    ? await createLocalAlignmentProvider({
+        python: config.wordTimingPython,
+        ffmpeg: config.ffmpegPath,
+      })
+    : undefined;
   const captions = createCaptionProvider({
     mode: config.captionProvider,
     ytDlpPath: config.ytDlpPath,
@@ -62,6 +69,7 @@ if (!config.workerAuthorization) {
     ...(captions ? { captions } : {}),
     ...(media ? { media } : {}),
     ...(speechToText ? { speechToText } : {}),
+    ...(alignment ? { alignment } : {}),
     ...(translation ? { translation } : {}),
     publication,
     scratchRoot: join(config.dataDir, "jobs", "transcription-scratch"),

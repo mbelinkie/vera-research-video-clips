@@ -132,7 +132,7 @@ Milestone 2 completed 2026-08-01. URL normalization, provider-backed metadata pe
 - [x] Normalize acquired WebVTT into deterministic canonical tracks: preserve unambiguous YouTube automatic-caption word starts and label their derived ends; manual and translated captions remain cue timed.
 - [x] Add a provider-neutral, time-linked translation adapter with an opt-in Amazon Translate implementation.
 - [x] Add opt-in authorized audio acquisition and multilingual speech-to-text adapters.
-- [ ] Add an alignment adapter for sources requiring timing refinement.
+- [x] Add opt-in local acoustic word alignment for supported captioned and speech-recognized transcripts (#47).
 - [x] Persist item preflight/stage/review state, attempts, errors, options, idempotency keys, and shared job links.
 - [x] Add authenticated atomic claim, expiring lease, heartbeat stages, stale-attempt rejection, and expiry recovery in the shared catalog/API.
 - [x] Persist the winning worker's validated transcript source plan on jobs and batch items.

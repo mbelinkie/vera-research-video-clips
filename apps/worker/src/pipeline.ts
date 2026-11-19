@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { access, mkdir, mkdtemp, rm } from "node:fs/promises";
+import { access, mkdir, mkdtemp, rm, rmdir } from "node:fs/promises";
 import { join } from "node:path";
 
 import {
@@ -27,6 +27,7 @@ import {
   type TranslationProvider,
 } from "@research-video/providers";
 import { normalizeAcquiredCaption } from "@research-video/providers/captions-local";
+import { AlignmentShutdownUnconfirmedError } from "@research-video/providers/alignment-local";
 import { transcriptToSrt } from "@research-video/transcript";
 
 import type {
@@ -66,11 +67,22 @@ export type TranscriptPipelineOptions = {
   captions?: CaptionProvider;
   media?: MediaAcquisitionProvider;
   speechToText?: SpeechToTextProvider;
+  alignment?: TranscriptAlignmentProvider;
   translation?: TranslationProvider;
   publication: TranscriptPublicationClient;
   scratchRoot: string;
   now?: () => Date;
 };
+
+export interface TranscriptAlignmentProvider {
+  supports(transcript: NormalizedTranscript): boolean;
+  align(input: {
+    transcript: NormalizedTranscript;
+    inputPath: string;
+    scratchDirectory: string;
+    signal: AbortSignal;
+  }): Promise<NormalizedTranscript>;
+}
 
 export class TranscriptPipelineError extends Error {
   readonly code = "transcript_pipeline_failed";
@@ -95,6 +107,16 @@ export class LocalTranslationUnavailableError extends Error {
   }
 }
 
+class PreviousAlignmentPendingError extends Error {
+  readonly code = "previous_alignment_pending";
+
+  constructor() {
+    super(
+      "An earlier word alignment attempt must stop before retrying on this worker.",
+    );
+  }
+}
+
 export function createTranscriptPipelineExecutor(
   options: TranscriptPipelineOptions,
 ): TranscriptionJobExecutor {
@@ -116,12 +138,14 @@ export function createTranscriptPipelineExecutor(
       join(options.scratchRoot, `${claimed.job.id}-a${claimed.lease.attempt}-`),
     );
     let cleaned = false;
+    let retainScratch = false;
     try {
       const source = await resolveSourceTranscript(
         options,
         payload,
         scratch,
         context,
+        join(options.scratchRoot, `.alignment-${claimed.job.id}`),
       );
       const english = await resolveEnglishTranscript(
         options.translation,
@@ -194,8 +218,11 @@ export function createTranscriptPipelineExecutor(
         idempotencyKey: `finalize:${transcriptVersionId}`,
         manifest: { ...manifestObject, type: "manifest" },
       });
+    } catch (error) {
+      retainScratch = error instanceof AlignmentShutdownUnconfirmedError;
+      throw error;
     } finally {
-      if (!cleaned) await cleanupScratch(scratch);
+      if (!cleaned && !retainScratch) await cleanupScratch(scratch);
     }
   };
 }
@@ -205,6 +232,7 @@ async function resolveSourceTranscript(
   payload: ReturnType<typeof TranscriptionJobPayloadSchema.parse>,
   scratch: string,
   context: TranscriptionExecutionContext,
+  attemptMarker: string,
 ) {
   await context.setStage("resolving");
   const resolver = new TranscriptSourceResolver(
@@ -220,6 +248,7 @@ async function resolveSourceTranscript(
   );
 
   if (plan.strategy === "caption" && options.captions) {
+    let transcript: NormalizedTranscript | undefined;
     try {
       await context.setStage("acquiring");
       const caption = await options.captions.acquire(
@@ -228,9 +257,7 @@ async function resolveSourceTranscript(
         scratch,
         context.signal,
       );
-      const transcript = await normalizeAcquiredCaption(caption);
-      await context.recordSourcePlan(plan);
-      return transcript;
+      transcript = await normalizeAcquiredCaption(caption);
     } catch (error) {
       if (context.signal.aborted) throw context.signal.reason;
       plan = TranscriptSourcePlanSchema.parse({
@@ -239,6 +266,28 @@ async function resolveSourceTranscript(
         requiresLanguageDetection: true,
         reason: "caption-acquisition-failed",
       });
+    }
+    if (transcript) {
+      await context.recordSourcePlan(plan);
+      return alignSourceTranscript(
+        options.alignment,
+        transcript,
+        async () => {
+          if (!options.media)
+            throw new TranscriptPipelineError(
+              "Local word alignment requires an audio acquisition provider.",
+            );
+          const audio = await options.media.acquireAuthorizedSource(
+            payload.youtubeVideoId,
+            scratch,
+            context.signal,
+          );
+          return audio.scratchPath;
+        },
+        scratch,
+        context,
+        attemptMarker,
+      );
     }
   }
 
@@ -254,11 +303,59 @@ async function resolveSourceTranscript(
     context.signal,
   );
   await context.setStage("transcribing");
-  return options.speechToText.transcribe({
+  const transcript = await options.speechToText.transcribe({
     videoId: payload.youtubeVideoId,
     inputPath: media.scratchPath,
     signal: context.signal,
   });
+  return alignSourceTranscript(
+    options.alignment,
+    transcript,
+    async () => media.scratchPath,
+    scratch,
+    context,
+    attemptMarker,
+  );
+}
+
+async function alignSourceTranscript(
+  alignment: TranscriptAlignmentProvider | undefined,
+  transcript: NormalizedTranscript,
+  audioPath: () => Promise<string>,
+  scratchDirectory: string,
+  context: TranscriptionExecutionContext,
+  attemptMarker: string,
+) {
+  if (!alignment?.supports(transcript)) return transcript;
+  const inputPath = await audioPath();
+  context.signal.throwIfAborted();
+  await context.setStage("aligning");
+  try {
+    await mkdir(attemptMarker, { mode: 0o700 });
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "EEXIST")
+      throw new PreviousAlignmentPendingError();
+    throw error;
+  }
+  // A reclaimed lease can start another attempt before this process returns.
+  // Keep the local marker when the engine's shutdown cannot be confirmed.
+  let releaseMarker = true;
+  try {
+    context.signal.throwIfAborted();
+    const aligned = await alignment.align({
+      transcript,
+      inputPath,
+      scratchDirectory,
+      signal: context.signal,
+    });
+    context.signal.throwIfAborted();
+    return aligned;
+  } catch (error) {
+    releaseMarker = !(error instanceof AlignmentShutdownUnconfirmedError);
+    throw error;
+  } finally {
+    if (releaseMarker) await rmdir(attemptMarker);
+  }
 }
 
 async function resolveEnglishTranscript(

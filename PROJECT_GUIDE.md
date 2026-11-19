@@ -458,7 +458,7 @@ Store time as integer milliseconds relative to the original video. Keep raw prov
 - When only cues exist, keep cue timing and optionally distribute estimated token times for navigation.
 - Label interpolated token times as `estimated`.
 - Never use estimated word bounds for a supposedly frame-accurate export without allowing preview/adjustment.
-- Consider on-demand forced alignment for a selected range before export as a later precision upgrade.
+- The opt-in local worker aligns supported spoken transcripts before publication and keeps the alignment artifact fingerprint. Unaligned words are marked and a selection with an unaligned endpoint uses cue bounds. Translated text retains cue timing.
 - Keep segment sizes readable; re-segment long cues without pretending the new text chunks have independent timing unless alignment supports it.
 
 ### 6.5 Cache identity

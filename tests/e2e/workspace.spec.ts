@@ -474,24 +474,44 @@ test.beforeEach(async ({ page }) => {
 
       constructor(
         _element: HTMLElement,
-        options: { events: { onReady(): void } },
+        options: {
+          videoId: string;
+          events: {
+            onReady(): void;
+            onStateChange(event: { data: number }): void;
+          };
+        },
       ) {
         queueMicrotask(() => options.events.onReady());
+        Object.assign(window, {
+          __triggerYouTubeEnded: () =>
+            options.events.onStateChange({ data: 0 }),
+        });
       }
 
       cueVideoById() {}
       destroy() {}
+      loadVideoById(options: {
+        videoId: string;
+        startSeconds: number;
+        endSeconds: number;
+      }) {
+        this.currentTime = options.startSeconds;
+        const calls = (Reflect.get(window, "__loadVideoByIdCalls") ??
+          []) as (typeof options)[];
+        calls.push(options);
+        Object.assign(window, {
+          __loadVideoByIdCalls: calls,
+          __lastSeekSeconds: options.startSeconds,
+          __playCalls: Number(Reflect.get(window, "__playCalls") ?? 0) + 1,
+        });
+      }
       getCurrentTime() {
         return this.currentTime;
       }
       seekTo(seconds: number) {
         this.currentTime = seconds;
         Object.assign(window, { __lastSeekSeconds: seconds });
-      }
-      playVideo() {
-        Object.assign(window, {
-          __playCalls: Number(Reflect.get(window, "__playCalls") ?? 0) + 1,
-        });
       }
       pauseVideo() {
         Object.assign(window, {
@@ -501,7 +521,10 @@ test.beforeEach(async ({ page }) => {
     }
 
     Object.assign(window, {
-      YT: { Player: MockPlayer, PlayerState: { PLAYING: 1 } },
+      YT: {
+        Player: MockPlayer,
+        PlayerState: { ENDED: 0, PAUSED: 2, PLAYING: 1 },
+      },
     });
   });
 });
@@ -688,14 +711,58 @@ test("timed auto-caption fixture seeks exact starts and retains derived-end sele
   await expect(panel).toContainText("Transcript selection: 11.840s–13.100s");
   await expect(page.getByLabel("Export start (seconds)")).toHaveValue("11.840");
   await expect(page.getByLabel("Export end (seconds)")).toHaveValue("13.100");
+  const rangeLoads = () =>
+    page.evaluate(
+      () =>
+        (Reflect.get(window, "__loadVideoByIdCalls") ?? []) as Array<{
+          videoId: string;
+          startSeconds: number;
+          endSeconds: number;
+        }>,
+    );
+  const expectRangeLoadCount = async (count: number) =>
+    expect.poll(async () => (await rangeLoads()).length).toBe(count);
+
   await page.getByRole("button", { name: "Loop preview" }).click();
   await expect
     .poll(() => page.evaluate(() => Reflect.get(window, "__lastSeekSeconds")))
     .toBe(11.84);
-  await page.getByRole("button", { name: "Stop preview" }).click();
+  await expectRangeLoadCount(1);
+  expect((await rangeLoads()).at(-1)).toEqual({
+    videoId: "M7lc1UVf-VE",
+    startSeconds: 11.84,
+    endSeconds: 13.1,
+  });
+  await page.evaluate(() => window.getSelection()?.removeAllRanges());
+  await page.getByRole("button", { name: "now" }).click();
+  await expectRangeLoadCount(2);
+  expect((await rangeLoads()).at(-1)).toEqual({
+    videoId: "M7lc1UVf-VE",
+    startSeconds: 12.03,
+    endSeconds: 13.1,
+  });
+  await page.evaluate(() => {
+    const triggerEnded = Reflect.get(window, "__triggerYouTubeEnded");
+    if (typeof triggerEnded !== "function")
+      throw new Error("Missing YouTube ended event mock.");
+    triggerEnded();
+  });
+  await expectRangeLoadCount(3);
+  expect((await rangeLoads()).at(-1)).toEqual({
+    videoId: "M7lc1UVf-VE",
+    startSeconds: 11.84,
+    endSeconds: 13.1,
+  });
   await page.getByRole("button", { name: "Add 0.5s handles" }).click();
   await expect(page.getByLabel("Export start (seconds)")).toHaveValue("11.340");
   await expect(page.getByLabel("Export end (seconds)")).toHaveValue("13.600");
+  await expectRangeLoadCount(4);
+  expect((await rangeLoads()).at(-1)).toEqual({
+    videoId: "M7lc1UVf-VE",
+    startSeconds: 11.34,
+    endSeconds: 13.6,
+  });
+  await page.getByRole("button", { name: "Stop preview" }).click();
   await page
     .getByLabel("Development session credential")
     .fill("Bearer 019fbb95-cd76-7920-93fa-e23ba755ee36|fixture:web");
@@ -719,6 +786,78 @@ test("timed auto-caption fixture seeks exact starts and retains derived-end sele
   await page.getByRole("button", { name: "Export only" }).click();
   await expect(panel).toContainText("Queued a local export-only job");
   expect(exportedSelection).toEqual(loggedSelection);
+});
+
+test("updates a running preview when the selected passage changes", async ({
+  page,
+}) => {
+  await page.goto("/?fixture=auto-word-timed");
+  await page.getByRole("button", { name: "Load video" }).click();
+  await expect(page.getByText(/Timed auto-caption test fixture/)).toBeVisible();
+
+  const selectRange = async (anchorText: string, focusText: string) => {
+    await page.evaluate(
+      ({ anchorText, focusText }) => {
+        const words = Array.from(
+          document.querySelectorAll<HTMLElement>("[data-transcript-token-id]"),
+        );
+        const anchor = words.find((word) => word.textContent === anchorText);
+        const focus = words.find((word) => word.textContent === focusText);
+        if (!anchor?.firstChild || !focus?.firstChild || !focus.textContent)
+          throw new Error("Missing transcript words for selection.");
+        const range = document.createRange();
+        range.setStart(anchor.firstChild, 0);
+        range.setEnd(focus.firstChild, focus.textContent.length);
+        window.getSelection()?.removeAllRanges();
+        window.getSelection()?.addRange(range);
+        focus.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+      },
+      { anchorText, focusText },
+    );
+  };
+  const rangeLoads = () =>
+    page.evaluate(
+      () =>
+        (Reflect.get(window, "__loadVideoByIdCalls") ?? []) as Array<{
+          videoId: string;
+          startSeconds: number;
+          endSeconds: number;
+        }>,
+    );
+
+  await selectRange("closely", "please");
+  const panel = page.getByLabel("Clip selection");
+  await expect(panel).toContainText("Transcript selection: 11.840s–13.100s");
+  await page.getByRole("button", { name: "Loop preview" }).click();
+  await expect(
+    page.getByRole("button", { name: "Stop preview" }),
+  ).toBeVisible();
+  expect((await rangeLoads()).at(-1)).toEqual({
+    videoId: "M7lc1UVf-VE",
+    startSeconds: 11.84,
+    endSeconds: 13.1,
+  });
+
+  await selectRange("Résumé", "José");
+  await expect(panel).toContainText("Transcript selection: 13.200s–14.700s");
+  await expect(
+    page.getByRole("button", { name: "Stop preview" }),
+  ).toBeVisible();
+  expect((await rangeLoads()).at(-1)).toEqual({
+    videoId: "M7lc1UVf-VE",
+    startSeconds: 13.2,
+    endSeconds: 14.7,
+  });
+
+  await page.evaluate(() => window.getSelection()?.removeAllRanges());
+  await page.getByRole("button", { name: "Look" }).click();
+  await expect(
+    page.getByRole("button", { name: "Loop preview" }),
+  ).toBeVisible();
+  await expect
+    .poll(() => page.evaluate(() => Reflect.get(window, "__lastSeekSeconds")))
+    .toBe(11.5);
+  expect(await rangeLoads()).toHaveLength(2);
 });
 
 test("maps transcript text selection to stable source and export bounds", async ({

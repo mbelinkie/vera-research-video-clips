@@ -60,15 +60,7 @@ describe("YtDlpCaptionProvider", () => {
 
   it("normalizes manual and automatic tracks from provider metadata", async () => {
     const run = vi.fn(async () => ({
-      stdout: JSON.stringify({
-        language: "en",
-        subtitles: {
-          es: [{ ext: "vtt" }],
-          en: [{ ext: "vtt" }],
-          invalid: [],
-        },
-        automatic_captions: { en: [{ ext: "vtt" }] },
-      }),
+      stdout: "en\tes, en, live_chat\ten\n",
       stderr: "",
     }));
     const provider = new YtDlpCaptionProvider({
@@ -105,7 +97,8 @@ describe("YtDlpCaptionProvider", () => {
         "--no-config",
         "--no-playlist",
         "--skip-download",
-        "--dump-single-json",
+        "--print",
+        "%(language|-)s\t%(subtitles|-)l\t%(automatic_captions|-)l",
         "--no-warnings",
         "--",
         "https://www.youtube.com/watch?v=M7lc1UVf-VE",
@@ -118,13 +111,7 @@ describe("YtDlpCaptionProvider", () => {
     const provider = new YtDlpCaptionProvider({
       runner: {
         run: vi.fn(async () => ({
-          stdout: JSON.stringify({
-            automatic_captions: {
-              "es-orig": [{ ext: "vtt" }],
-              en: [{ ext: "vtt" }],
-              fr: [{ ext: "vtt" }],
-            },
-          }),
+          stdout: "-\t-\tes-orig, en, fr\n",
           stderr: "",
         })),
       },
