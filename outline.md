@@ -94,6 +94,7 @@ Gate: clean checkout installs, migrates both stores, runs against local fakes, a
 ### 1. Shared projects + transcript store
 
 - [x] Add sign-in/session boundary and project membership roles.
+- [x] Let Project Owners manage members and share with existing registered Editors and Viewers.
 - [x] Create/open projects and project-video records.
 - [x] Provision private encrypted versioned S3 storage.
 - [x] Define immutable transcript bundle/manifest schema.

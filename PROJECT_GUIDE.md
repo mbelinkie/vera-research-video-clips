@@ -306,6 +306,14 @@ A project is a named, access-controlled research collection, not merely a tag. L
 - Permit browsing a video without choosing a project.
 - Require a project before `Queue / log only` or `Export + log` can complete.
 - Let the user change or quick-create the project without discarding the selection.
+- Show the user's role in the selected project. Only Owners can view the
+  roster, grant an existing registered account access by exact verified email,
+  change Editor/Viewer roles, revoke access, or transfer ownership to an
+  existing member. The server checks membership and versions for every change.
+- A person must have a registered profile and a verified email observed at sign-in
+  within the past 24 hours to receive a grant by email. The grant uses their
+  stable account ID, and ambiguous addresses are unavailable for sharing.
+  Existing Researcher memberships preserve their write permissions.
 - Store a logged clip in exactly one project initially; add cross-project linking only if later usage proves it necessary.
 - Use the project's export directory/settings for logged exports and global defaults for `Export only`.
 - When a project has an enabled Sheets binding, enqueue its row upsert immediately after the local log commit. Do not fail or roll back the local log if Sheets is offline.

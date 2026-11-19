@@ -31,3 +31,27 @@ and run the browser-auth suite. Verify keyboard/error/empty states, Editor clip
 durability, Viewer/nonmember denials, stale updates, transfer, revocation and
 legacy behavior. Finish with independent permission review, npm run check and
 the protected Test check.
+
+## Acceptance evidence
+
+Implemented in `6efb6d8` and `76540bf`. The changes span shared contracts,
+migration 0057, Cognito sign-in and server sessions, the catalog and project
+API, the Members panel and the synthetic HTTPS browser fixtures.
+
+- The focused auth suite passed all 24 tests. Removing the verified-email
+  claim check in a scratch copy made the false and string-true claim tests fail.
+- Disposable native PostgreSQL passed the membership test across separate
+  connections, including stale and fresh duplicate email observations and
+  a competing registry write blocked while the grant is in progress.
+- The independent permission review confirmed the transaction locks the
+  current Owner and stabilizes the email registry through grant commit.
+- The Chromium HTTPS suite passed both tests. Independent signed-in sessions
+  proved keyboard grant, unavailable address, stale role changes, Editor
+  clip persistence after the Owner reload, Viewer write denial, nonmember
+  refusal, revocation and ownership transfer.
+
+Existing memberships keep their user IDs and versions. The verified-email
+association is additive. The in-memory grant budget targets the single-instance
+pilot, and its counters reset on restart. Cognito's existing OpenID scope
+includes the email claims when the app client can read the attribute. The
+browser proof used a synthetic provider and an isolated catalog.
