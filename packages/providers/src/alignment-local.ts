@@ -1,6 +1,7 @@
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import type { NormalizedTranscript } from "@research-video/contracts";
 import { z } from "zod";
@@ -78,45 +79,101 @@ export async function alignEnglishCaptions(
       "Local caption alignment requires English captions.",
     );
   }
-  const entries = captionEntries(transcript);
+  return alignTranscript(transcript, wavPath, executable, [], runner);
+}
+
+/** Uses the incumbent recognizer's words and segment anchors without retranscribing. */
+export async function alignLocalRecognition(
+  transcript: NormalizedTranscript,
+  wavPath: string,
+  python: string,
+  runner: CommandRunner = new SpawnCommandRunner(),
+) {
+  if (
+    transcript.track.source !== "generated" ||
+    !transcript.track.model ||
+    !/^(?:en|de|fr|sv)(?:-|$)/iu.test(transcript.track.language)
+  ) {
+    throw new ProviderExecutionError(
+      "Local word alignment requires a supported language and the recognizer's model.",
+    );
+  }
+  return alignTranscript(
+    transcript,
+    wavPath,
+    python,
+    ["-m", "vera_word_timing.cli"],
+    runner,
+  );
+}
+
+async function alignTranscript(
+  transcript: NormalizedTranscript,
+  wavPath: string,
+  executable: string,
+  cliPrefix: readonly string[],
+  runner: CommandRunner,
+) {
+  const entries = alignmentEntries(transcript);
   if (!entries.some((entry) => entry.kind === "word")) {
-    throw new ProviderExecutionError("The captions have no words to align.");
+    throw new ProviderExecutionError("The transcript has no words to align.");
   }
   const scratch = await mkdtemp(join(tmpdir(), "vera-caption-alignment-"));
   try {
     const audio = resolve(wavPath);
-    const captions = join(scratch, "captions.json");
+    const input = join(scratch, "recognition-input.json");
     const recognitionPath = join(scratch, "recognition.json");
     const alignmentPath = join(scratch, "alignment.json");
-    await writeFile(
-      captions,
-      JSON.stringify({
-        // One entry per anchor preserves native auto-caption word starts as well
-        // as full cue anchors. The CLI uses these only to place words near speech.
-        events: entries.map((entry) => ({
-          tStartMs: entry.startMs,
-          dDurationMs: entry.endMs - entry.startMs,
-          segs: [{ utf8: entry.text }],
-        })),
-      }),
-    );
+    const fromRecognition = transcript.track.source === "generated";
+    const recognitionArgs = fromRecognition
+      ? [
+          fileURLToPath(
+            new URL("./word-timing-recognition.py", import.meta.url),
+          ),
+          "--input",
+          input,
+        ]
+      : [
+          ...cliPrefix,
+          "recognise",
+          "--engine",
+          "youtube",
+          "--language",
+          "en",
+          "--captions",
+          input,
+        ];
+    const recognitionInput = fromRecognition
+      ? {
+          language: transcript.track.language.toLowerCase(),
+          provider: transcript.track.provider,
+          model: transcript.track.model,
+          tokens: entries.map(({ text, startMs, endMs }) => ({
+            display: text,
+            startMs,
+            endMs,
+          })),
+        }
+      : {
+          // These anchors only place words near speech.
+          events: entries.map(({ text, startMs, endMs }) => ({
+            tStartMs: startMs,
+            dDurationMs: endMs - startMs,
+            segs: [{ utf8: text }],
+          })),
+        };
+    await writeFile(input, JSON.stringify(recognitionInput));
     await runner
       .run(executable, [
-        "recognise",
-        "--engine",
-        "youtube",
-        "--language",
-        "en",
+        ...recognitionArgs,
         "--audio",
         audio,
-        "--captions",
-        captions,
         "--out",
         recognitionPath,
       ])
       .catch(() => {
         throw new ProviderExecutionError(
-          "Could not read captions using vera-word-timing. Check the CLI installation and WAV input.",
+          "Could not prepare the transcript for vera-word-timing. Check the runtime and WAV input.",
         );
       });
     const recognition = await readArtifact(
@@ -140,6 +197,7 @@ export async function alignEnglishCaptions(
       .run(
         executable,
         [
+          ...cliPrefix,
           "align",
           "--audio",
           audio,
@@ -179,7 +237,8 @@ export async function alignEnglishCaptions(
   }
 }
 
-function captionEntries(transcript: NormalizedTranscript): CaptionEntry[] {
+function alignmentEntries(transcript: NormalizedTranscript): CaptionEntry[] {
+  const fromRecognition = transcript.track.source === "generated";
   const tokensBySegment = new Map<string, NormalizedTranscript["tokens"]>();
   for (const token of transcript.tokens) {
     const tokens = tokensBySegment.get(token.segmentId);
@@ -197,7 +256,7 @@ function captionEntries(transcript: NormalizedTranscript): CaptionEntry[] {
       let eventEnd = -1;
       for (const [index, token] of tokens.entries()) {
         if (index <= eventEnd) continue;
-        if (token.text.startsWith("[")) {
+        if (!fromRecognition && token.text.startsWith("[")) {
           eventEnd = tokens.findIndex(
             (candidate, position) =>
               position >= index && candidate.text.endsWith("]"),
@@ -214,17 +273,16 @@ function captionEntries(transcript: NormalizedTranscript): CaptionEntry[] {
             continue;
           }
         }
-        const startMs = token.startMs ?? segment.startMs;
+        const wordStartMs = fromRecognition ? undefined : token.startMs;
+        const startMs = wordStartMs ?? segment.startMs;
         entries.push({
           ids: [token.id],
           text: token.text,
           startMs,
           endMs:
-            token.endMs ??
-            Math.min(
-              segment.endMs,
-              token.startMs === undefined ? segment.endMs : startMs + 1,
-            ),
+            wordStartMs === undefined
+              ? segment.endMs
+              : (token.endMs ?? Math.min(segment.endMs, startMs + 1)),
           kind: "word",
         });
       }

@@ -136,13 +136,17 @@ export function VirtualTranscript({
                           tabIndex={0}
                           data-transcript-segment-id={segment.id}
                           data-transcript-token-id={token.id}
-                          className={`transcript-token${activeTokenId === token.id ? " active" : ""}${selectedTokenIds?.has(token.id) ? " selected" : ""}`}
+                          data-alignment-status={token.alignmentStatus}
+                          aria-label={`${token.text}${token.alignmentStatus === "unaligned" ? ", unaligned, cue timing only" : ""}`}
+                          className={`transcript-token${activeTokenId === token.id ? " active" : ""}${selectedTokenIds?.has(token.id) ? " selected" : ""}${token.alignmentStatus === "unaligned" ? " unaligned" : ""}`}
                           title={
-                            token.startMs === undefined
-                              ? "Cue-level timing"
-                              : token.endTiming === "derived"
-                                ? `Exact caption word start ${(token.startMs / 1_000).toFixed(3)}s; derived end (estimate) ${(token.endMs! / 1_000).toFixed(3)}s`
-                                : `Word timing ${(token.startMs / 1_000).toFixed(3)}s`
+                            token.alignmentStatus === "unaligned"
+                              ? "Unaligned word · cue timing"
+                              : token.startMs === undefined
+                                ? "Cue-level timing"
+                                : token.endTiming === "derived"
+                                  ? `Exact caption word start ${(token.startMs / 1_000).toFixed(3)}s; derived end (estimate) ${(token.endMs! / 1_000).toFixed(3)}s`
+                                  : `Word timing ${(token.startMs / 1_000).toFixed(3)}s`
                           }
                           onClick={() => {
                             if (!window.getSelection()?.isCollapsed) return;

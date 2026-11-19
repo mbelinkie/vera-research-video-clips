@@ -213,8 +213,9 @@ export class LocalTranscriptIndex {
              (transcript_version_id, id, project_id, catalog_video_id,
               video_id, language, kind, source, provider, model,
               source_track_id, timing_precision, schema_version,
-              content_sha256, version, indexed_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+              content_sha256, version, indexed_at, alignment_artifact_id,
+              alignment_fingerprint, alignment_source_content_sha256)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           input.transcriptVersionId,
@@ -233,6 +234,9 @@ export class LocalTranscriptIndex {
           transcript.track.contentSha256,
           transcript.track.version,
           this.now().toISOString(),
+          transcript.track.alignment?.artifactId ?? null,
+          transcript.track.alignment?.fingerprint ?? null,
+          transcript.track.alignment?.sourceContentSha256 ?? null,
         );
       const insertSegment = this.database.prepare(
         `INSERT INTO transcript_segments
@@ -253,8 +257,8 @@ export class LocalTranscriptIndex {
       const insertToken = this.database.prepare(
         `INSERT INTO transcript_tokens
            (transcript_version_id, id, segment_id, ordinal, text,
-            start_ms, end_ms, timing_confidence, end_timing)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            start_ms, end_ms, timing_confidence, end_timing, alignment_status)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       );
       for (const token of transcript.tokens) {
         insertToken.run(
@@ -267,6 +271,7 @@ export class LocalTranscriptIndex {
           token.endMs ?? null,
           token.timingConfidence ?? null,
           token.endTiming ?? null,
+          token.alignmentStatus ?? null,
         );
       }
       this.database.exec("COMMIT;");
@@ -315,6 +320,15 @@ export class LocalTranscriptIndex {
         ...(track.source_track_id === null
           ? {}
           : { sourceTrackId: track.source_track_id }),
+        ...(track.alignment_artifact_id === null
+          ? {}
+          : {
+              alignment: {
+                artifactId: track.alignment_artifact_id,
+                fingerprint: track.alignment_fingerprint,
+                sourceContentSha256: track.alignment_source_content_sha256,
+              },
+            }),
         timingPrecision: track.timing_precision,
         schemaVersion: Number(track.schema_version),
         contentSha256: track.content_sha256,
@@ -339,6 +353,9 @@ export class LocalTranscriptIndex {
           ? {}
           : { timingConfidence: Number(token.timing_confidence) }),
         ...(token.end_timing === null ? {} : { endTiming: token.end_timing }),
+        ...(token.alignment_status === null
+          ? {}
+          : { alignmentStatus: token.alignment_status }),
       })),
     });
   }

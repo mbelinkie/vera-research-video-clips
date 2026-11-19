@@ -330,6 +330,12 @@ h1 {
   user-select: text;
 }
 
+.transcript-token.unaligned {
+  background: rgb(164 91 66 / 12%);
+  text-decoration: underline dotted #e3a18a;
+  text-underline-offset: 3px;
+}
+
 .transcript-token.active {
   color: #f4e1b9;
   background: #5a4724;

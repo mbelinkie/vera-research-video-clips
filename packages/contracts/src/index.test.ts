@@ -44,6 +44,34 @@ describe("shared contracts", () => {
     ).toBe(false);
   });
 
+  it("records acoustic token timing and keeps unaligned tokens untimed", () => {
+    const acoustic = {
+      id,
+      segmentId: id,
+      ordinal: 0,
+      text: "measured",
+      startMs: 100,
+      endMs: 250,
+      alignmentStatus: "acoustic" as const,
+    };
+    const unaligned = {
+      id,
+      segmentId: id,
+      ordinal: 1,
+      text: "unmeasured",
+      alignmentStatus: "unaligned" as const,
+    };
+    expect(TranscriptTokenSchema.parse(acoustic)).toEqual(acoustic);
+    expect(TranscriptTokenSchema.parse(unaligned)).toEqual(unaligned);
+    expect(
+      TranscriptTokenSchema.safeParse({ ...unaligned, startMs: 10 }).success,
+    ).toBe(false);
+    expect(
+      TranscriptTokenSchema.safeParse({ ...acoustic, endTiming: "derived" })
+        .success,
+    ).toBe(false);
+  });
+
   it("only labels estimated token selections as having a derived end", () => {
     const selection = {
       trackId: id,

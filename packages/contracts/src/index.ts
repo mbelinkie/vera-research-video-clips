@@ -100,6 +100,14 @@ export const ProjectVideoSchema = z.object({
 
 export const TimingPrecisionSchema = z.enum(["word", "cue", "estimated"]);
 
+const Sha256Schema = z.string().regex(/^[a-f0-9]{64}$/);
+
+export const TranscriptAlignmentProvenanceSchema = z.strictObject({
+  artifactId: z.string().trim().min(1).max(512),
+  fingerprint: Sha256Schema,
+  sourceContentSha256: Sha256Schema,
+});
+
 export const TranscriptSourceSchema = z.enum([
   "youtube-manual",
   "youtube-auto",
@@ -117,9 +125,10 @@ export const TranscriptTrackSchema = z.object({
   provider: z.string().min(1),
   model: z.string().min(1).optional(),
   sourceTrackId: IdSchema.optional(),
+  alignment: TranscriptAlignmentProvenanceSchema.optional(),
   timingPrecision: TimingPrecisionSchema,
   schemaVersion: z.number().int().positive(),
-  contentSha256: z.string().regex(/^[a-f0-9]{64}$/),
+  contentSha256: Sha256Schema,
   version: z.number().int().positive(),
 });
 
@@ -147,6 +156,7 @@ export const TranscriptTokenSchema = z
     /** Caption start is source-reported; only the end was derived. */
     endTiming: z.literal("derived").optional(),
     timingConfidence: z.number().min(0).max(1).optional(),
+    alignmentStatus: z.enum(["acoustic", "unaligned"]).optional(),
   })
   .refine(
     (token) =>
@@ -160,6 +170,22 @@ export const TranscriptTokenSchema = z
       token.endTiming !== "derived" ||
       (token.startMs !== undefined && token.endMs !== undefined),
     { message: "Derived token ends require a start and end." },
+  )
+  .refine(
+    (token) =>
+      token.alignmentStatus !== "acoustic" ||
+      (token.startMs !== undefined &&
+        token.endMs !== undefined &&
+        token.endTiming === undefined),
+    { message: "Acoustic alignment requires measured token bounds." },
+  )
+  .refine(
+    (token) =>
+      token.alignmentStatus !== "unaligned" ||
+      (token.startMs === undefined &&
+        token.endMs === undefined &&
+        token.endTiming === undefined),
+    { message: "Unaligned tokens cannot carry timing bounds." },
   );
 
 export const NormalizedTranscriptSchema = z.object({
@@ -767,6 +793,9 @@ export type ProjectMember = z.infer<typeof ProjectMemberSchema>;
 export type Video = z.infer<typeof VideoSchema>;
 export type ProjectVideo = z.infer<typeof ProjectVideoSchema>;
 export type TranscriptTrack = z.infer<typeof TranscriptTrackSchema>;
+export type TranscriptAlignmentProvenance = z.infer<
+  typeof TranscriptAlignmentProvenanceSchema
+>;
 export type TranscriptSegment = z.infer<typeof TranscriptSegmentSchema>;
 export type TranscriptToken = z.infer<typeof TranscriptTokenSchema>;
 export type NormalizedTranscript = z.infer<typeof NormalizedTranscriptSchema>;

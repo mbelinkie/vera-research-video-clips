@@ -78,18 +78,37 @@ Feeding the short fixture's measured timings to the existing selection
 function gave 510–1,440 ms for “opened the interview,” using the first word's
 onset and the last word's offset.
 
+## Captionless and publication checkpoint
+
+Research passes the incumbent recognizer's display tokens and segment anchors
+to Timeline's recognition-artifact builder, then runs the same MFA model. A
+real Mac run on 22 seconds of the generated speech used whisper.cpp
+`small.en`, without consulting the fixture captions. Recognition took
+20.18 seconds and produced 70 tokens over six segments. The shared alignment
+command took 147.32 seconds and returned acoustic bounds for all 70 tokens.
+The existing selection function used those acoustic bounds for “opened the
+interview” at 510–1,440 ms.
+
+The worker pipeline has an injectable alignment stage before translation and
+publication. It acquires audio for a supported caption track or reuses the
+recognizer's audio. The tests verify that the audio remains available while
+the provider is running and that a job which lost its lease skips publication.
+Aligned bundles carry a fingerprint and per-token alignment statuses. SQLite
+keeps those fields alongside the existing cue and estimated data. The
+transcript view marks unaligned words and uses cue bounds when they are
+selection endpoints. Timeline #51 accepted no replacement recognizer.
+
 ## Remaining issue acceptance
 
-1. Add a typed recognition-artifact handoff for generated transcripts that
-   preserves recognizer identity and segment anchors. Verify cancellation and
-   lease loss stop the Python engine process group before removing job media.
-   Timeline #51 accepted no replacement recognizer. Use the existing Research
-   recognizer and share its audio with the aligner.
-2. Run local alignment in the worker after source transcript normalization
-   and before translation and publication. Keep active transcript lookup and
-   immutable versioning intact. Persist timing provenance in the bundle and
-   local index and visibly mark unaligned words. Limit acoustic bounds to the
-   spoken source track and honor language capability refusals.
+1. Use a shared CLI release with supported cancellation. A focused mock-engine
+   run on the Mac established that sending SIGTERM to the pinned shared runner
+   exits its caller while the isolated engine process stays alive. The
+   worker's production alignment setting awaits
+   [Timeline #664](https://github.com/mbelinkie/vera-script-to-timeline/issues/664).
+2. Wire the supported runner into the worker. Prepare 16 kHz mono PCM audio
+   in the job directory, pass through the lease abort, and retain scratch
+   whenever engine shutdown cannot be confirmed. Limit acoustic bounds to the
+   spoken source track and keep cue timing for unsupported languages.
 3. Highlight phrases from one authorized captioned video and one authorized
    captionless video. Check first and last word playback and the visible
    unaligned state in the browser before accepting the whole issue.

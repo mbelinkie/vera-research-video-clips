@@ -66,11 +66,22 @@ export type TranscriptPipelineOptions = {
   captions?: CaptionProvider;
   media?: MediaAcquisitionProvider;
   speechToText?: SpeechToTextProvider;
+  alignment?: TranscriptAlignmentProvider;
   translation?: TranslationProvider;
   publication: TranscriptPublicationClient;
   scratchRoot: string;
   now?: () => Date;
 };
+
+export interface TranscriptAlignmentProvider {
+  supports(transcript: NormalizedTranscript): boolean;
+  align(input: {
+    transcript: NormalizedTranscript;
+    inputPath: string;
+    scratchDirectory: string;
+    signal: AbortSignal;
+  }): Promise<NormalizedTranscript>;
+}
 
 export class TranscriptPipelineError extends Error {
   readonly code = "transcript_pipeline_failed";
@@ -220,6 +231,7 @@ async function resolveSourceTranscript(
   );
 
   if (plan.strategy === "caption" && options.captions) {
+    let transcript: NormalizedTranscript | undefined;
     try {
       await context.setStage("acquiring");
       const caption = await options.captions.acquire(
@@ -228,9 +240,7 @@ async function resolveSourceTranscript(
         scratch,
         context.signal,
       );
-      const transcript = await normalizeAcquiredCaption(caption);
-      await context.recordSourcePlan(plan);
-      return transcript;
+      transcript = await normalizeAcquiredCaption(caption);
     } catch (error) {
       if (context.signal.aborted) throw context.signal.reason;
       plan = TranscriptSourcePlanSchema.parse({
@@ -239,6 +249,27 @@ async function resolveSourceTranscript(
         requiresLanguageDetection: true,
         reason: "caption-acquisition-failed",
       });
+    }
+    if (transcript) {
+      await context.recordSourcePlan(plan);
+      return alignSourceTranscript(
+        options.alignment,
+        transcript,
+        async () => {
+          if (!options.media)
+            throw new TranscriptPipelineError(
+              "Local word alignment requires an audio acquisition provider.",
+            );
+          const audio = await options.media.acquireAuthorizedSource(
+            payload.youtubeVideoId,
+            scratch,
+            context.signal,
+          );
+          return audio.scratchPath;
+        },
+        scratch,
+        context,
+      );
     }
   }
 
@@ -254,11 +285,39 @@ async function resolveSourceTranscript(
     context.signal,
   );
   await context.setStage("transcribing");
-  return options.speechToText.transcribe({
+  const transcript = await options.speechToText.transcribe({
     videoId: payload.youtubeVideoId,
     inputPath: media.scratchPath,
     signal: context.signal,
   });
+  return alignSourceTranscript(
+    options.alignment,
+    transcript,
+    async () => media.scratchPath,
+    scratch,
+    context,
+  );
+}
+
+async function alignSourceTranscript(
+  alignment: TranscriptAlignmentProvider | undefined,
+  transcript: NormalizedTranscript,
+  audioPath: () => Promise<string>,
+  scratchDirectory: string,
+  context: TranscriptionExecutionContext,
+) {
+  if (!alignment?.supports(transcript)) return transcript;
+  const inputPath = await audioPath();
+  context.signal.throwIfAborted();
+  await context.setStage("aligning");
+  const aligned = await alignment.align({
+    transcript,
+    inputPath,
+    scratchDirectory,
+    signal: context.signal,
+  });
+  context.signal.throwIfAborted();
+  return aligned;
 }
 
 async function resolveEnglishTranscript(

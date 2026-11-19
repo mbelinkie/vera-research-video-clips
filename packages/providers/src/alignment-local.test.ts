@@ -1,10 +1,16 @@
 import { access, readFile, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 
-import { normalizeWebVttCaption } from "@research-video/transcript";
+import {
+  normalizeGeneratedTranscript,
+  normalizeWebVttCaption,
+} from "@research-video/transcript";
 import { describe, expect, it } from "vitest";
 
-import { alignEnglishCaptions } from "./alignment-local.ts";
+import {
+  alignEnglishCaptions,
+  alignLocalRecognition,
+} from "./alignment-local.ts";
 import type { CommandRunner } from "./captions-local.ts";
 
 const hash = (digit: string) => `sha256:${digit.repeat(64)}`;
@@ -51,20 +57,29 @@ function mockCli(
     "[audience applause]",
     "Hello",
   ],
+  usePython = false,
 ) {
   const calls: string[] = [];
   let scratch = "";
   let handoff: unknown;
   const runner: CommandRunner = {
     async run(executable, args) {
-      expect(executable).toBe("vera-word-timing");
+      expect(executable).toBe(
+        usePython ? "word-timing-python" : "vera-word-timing",
+      );
       const arg = (name: string) => args[args.indexOf(name) + 1]!;
       const out = arg("--out");
       scratch = dirname(out);
-      calls.push(args[0]!);
-      if (args[0] === "recognise") {
-        expect(arg("--engine")).toBe("youtube");
-        handoff = JSON.parse(await readFile(arg("--captions"), "utf8"));
+      const operation = args.includes("--input")
+        ? "recognise-generated"
+        : args[usePython ? 2 : 0]!;
+      calls.push(operation);
+      if (operation !== "align") {
+        if (usePython) expect(args[0]).toMatch(/word-timing-recognition\.py$/u);
+        else expect(arg("--engine")).toBe("youtube");
+        handoff = JSON.parse(
+          await readFile(arg(usePython ? "--input" : "--captions"), "utf8"),
+        );
         await writeFile(
           out,
           JSON.stringify({
@@ -79,6 +94,8 @@ function mockCli(
           }),
         );
       } else {
+        if (usePython)
+          expect(args.slice(0, 2)).toEqual(["-m", "vera_word_timing.cli"]);
         await access(arg("--recognition"));
         await writeFile(
           out,
@@ -113,6 +130,55 @@ const acoustic = (
   status: "acoustic",
   startMs,
   endMs,
+});
+
+describe("local recognition word alignment", () => {
+  it("passes through the existing recognizer and its segment anchors", async () => {
+    const transcript = await normalizeGeneratedTranscript({
+      videoId: "fixture0001",
+      language: "en-US",
+      provider: "whisper.cpp",
+      model: "small.en",
+      segments: [
+        { text: "Generated words", startMs: 1_000, endMs: 3_000 },
+        { text: "remain", startMs: 4_000, endMs: 5_000 },
+      ],
+    });
+    const cli = mockCli(
+      [acoustic(0, 0, 1_050, 1_400), acoustic(1, 0, 2_100, 2_280)],
+      alignmentIdentity,
+      ["Generated", "words", "remain"],
+      true,
+    );
+    const result = await alignLocalRecognition(
+      transcript,
+      "local.wav",
+      "word-timing-python",
+      cli.runner,
+    );
+    expect(cli.calls).toEqual(["recognise-generated", "align"]);
+    expect(cli.handoff()).toEqual({
+      language: "en-us",
+      provider: "whisper.cpp",
+      model: "small.en",
+      tokens: [
+        { display: "Generated", startMs: 1_000, endMs: 3_000 },
+        { display: "words", startMs: 1_000, endMs: 3_000 },
+        { display: "remain", startMs: 4_000, endMs: 5_000 },
+      ],
+    });
+    expect(result.tokens).toMatchObject([
+      { tokenId: transcript.tokens[0]!.id, status: "acoustic" },
+      { tokenId: transcript.tokens[1]!.id, status: "acoustic" },
+      {
+        tokenId: transcript.tokens[2]!.id,
+        status: "unaligned",
+        startMs: null,
+        endMs: null,
+      },
+    ]);
+    await cli.assertCleaned();
+  });
 });
 
 describe("local caption word alignment", () => {
