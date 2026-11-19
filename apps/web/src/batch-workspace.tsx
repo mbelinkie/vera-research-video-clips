@@ -25,6 +25,7 @@ import {
 import { ClipQueue } from "./clip-queue.tsx";
 import { cloudFetch } from "./browser-api.ts";
 import { immediateProgress } from "./immediate-transcript.ts";
+import { ProjectMembersPanel } from "./project-members-panel.tsx";
 
 type BatchWorkspaceProps = {
   authorization: string;
@@ -459,6 +460,18 @@ export function BatchWorkspace({
               ))}
             </select>
           </label>
+
+          <ProjectMembersPanel
+            key={`${projectId}:${authorization}:${csrfToken ?? ""}`}
+            authorization={authorization}
+            csrfToken={csrfToken}
+            onAuthUnavailable={onAuthUnavailable}
+            projectId={projectId}
+            projectName={
+              projects.find((project) => project.id === projectId)?.name ??
+              "Selected project"
+            }
+          />
 
           <div className="batch-grid">
             <article className="queue-card batch-create-card">

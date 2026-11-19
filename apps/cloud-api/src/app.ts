@@ -263,31 +263,25 @@ export function createCloudApi(
     return reply.status(201).send(project);
   });
 
-  const memberGrantWindows = new Map<
-    string,
-    { count: number; expires: number }
-  >();
+  const memberGrantAttempts = new Map<string, number[]>();
   const takeMemberGrantAttempt = (actorId: string) => {
     const now = Date.now();
-    for (const [id, window] of memberGrantWindows) {
-      if (window.expires <= now) memberGrantWindows.delete(id);
+    const cutoff = now - 10 * 60_000;
+    for (const [id, attempts] of memberGrantAttempts) {
+      if (attempts.at(-1)! <= cutoff) memberGrantAttempts.delete(id);
     }
-    const window = memberGrantWindows.get(actorId);
+    const recent =
+      memberGrantAttempts.get(actorId)?.filter((time) => time > cutoff) ?? [];
     if (
-      (window && window.count >= 10) ||
-      (!window && memberGrantWindows.size >= 1_000)
+      recent.length >= 10 ||
+      (!recent.length && memberGrantAttempts.size >= 1_000)
     ) {
       throw Object.assign(
         new Error("Too many sharing attempts. Try again in 10 minutes."),
-        {
-          statusCode: 429,
-          code: "member_grant_rate_limited",
-        },
+        { statusCode: 429, code: "member_grant_rate_limited" },
       );
     }
-    if (window) window.count++;
-    else
-      memberGrantWindows.set(actorId, { count: 1, expires: now + 10 * 60_000 });
+    memberGrantAttempts.set(actorId, [...recent, now]);
   };
 
   app.post(

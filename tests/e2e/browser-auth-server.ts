@@ -45,14 +45,27 @@ const catalog = new SharedProjectCatalog(
   database,
   new MemoryTranscriptObjectStore(),
 );
-const subjects = [randomUUID(), randomUUID()];
-const subjectFor = (code: string) =>
-  `cognito:https://cognito-idp.us-east-1.amazonaws.com/us-east-1_Test#${code === "alice" ? subjects[0] : subjects[1]}`;
-const tokenFor = (code: string): VerifiedTokens => ({
+const codes = ["alice", "bob", "carol"] as const;
+const subjects = new Map(codes.map((code) => [code, randomUUID()] as const));
+const emails = new Map(
+  codes.map((code) => [code, `${code}@example.test`] as const),
+);
+const subjectFor = (code: (typeof codes)[number]) => {
+  const subject = subjects.get(code);
+  if (!subject) throw new Error("Unknown fake subject");
+  return `cognito:https://cognito-idp.us-east-1.amazonaws.com/us-east-1_Test#${subject}`;
+};
+const codeForSubject = (subject: string) =>
+  codes.find((code) => subject === subjectFor(code));
+const tokenFor = (
+  code: (typeof codes)[number],
+  includeVerifiedEmail = true,
+): VerifiedTokens => ({
   subject: subjectFor(code),
   accessToken: "fixture-access",
   refreshToken: "fixture-refresh",
   expiresAtMs: Date.now() + 3600_000,
+  ...(includeVerifiedEmail ? { verifiedEmail: emails.get(code)! } : {}),
 });
 const provider: IdentityProvider = {
   authorizeUrl({ state, nonce, challenge }) {
@@ -69,11 +82,14 @@ const provider: IdentityProvider = {
   },
   logoutUrl: () => `${publicOrigin}/`, // synthetic managed logout returns to same-origin
   async exchange(code) {
-    if (code !== "alice" && code !== "bob") throw Error("Unknown fake code");
-    return tokenFor(code);
+    if (!codes.includes(code as (typeof codes)[number]))
+      throw Error("Unknown fake code");
+    return tokenFor(code as (typeof codes)[number]);
   },
   async refresh(_refresh, subject) {
-    return { ...tokenFor("alice"), subject };
+    const code = codeForSubject(subject);
+    if (!code) throw Error("Unknown fake subject");
+    return { ...tokenFor(code, false), subject };
   },
   async revoke() {},
 };
@@ -89,7 +105,8 @@ const app = createCloudApi({
   browserAuth: auth,
 });
 await app.register(fastifyStatic, { root: resolve("dist/web"), prefix: "/" });
-await app.listen({ host: "127.0.0.1", port: 43178 });
+const upstreamAddress = await app.listen({ host: "127.0.0.1", port: 0 });
+const upstreamPort = Number(new URL(upstreamAddress).port);
 const proxy = createTlsServer(
   {
     key: readFileSync(join(temp, "key.pem")),
@@ -99,7 +116,7 @@ const proxy = createTlsServer(
     const upstream = httpRequest(
       {
         host: "127.0.0.1",
-        port: 43178,
+        port: upstreamPort,
         path: request.url,
         method: request.method,
         headers: request.headers,

@@ -143,8 +143,8 @@ async function saveMemberEmail(
            observed_at = EXCLUDED.observed_at
      WHERE verified_member_emails.observed_at < EXCLUDED.observed_at
         OR (verified_member_emails.observed_at = EXCLUDED.observed_at
-            AND verified_member_emails.email IS DISTINCT FROM EXCLUDED.email
-            AND (EXCLUDED.email IS NULL OR verified_member_emails.email IS NOT NULL))`,
+            AND verified_member_emails.email IS NOT NULL
+            AND verified_member_emails.email IS DISTINCT FROM EXCLUDED.email)`,
     [userId, observation.email, observation.observedAt.toISOString()],
   );
 }
@@ -697,7 +697,7 @@ export class SharedProjectCatalog {
 
   async listMembers(actor: AuthenticatedActor, projectId: string) {
     const found = await this.database.query<DbRow>(
-      `SELECT pm.*, u.display_name, e.email
+      `SELECT pm.*, COALESCE(NULLIF(BTRIM(u.display_name), ''), 'Registered member') AS display_name, e.email
        FROM project_members pm
        JOIN users u ON u.id = pm.user_id
        LEFT JOIN verified_member_emails e ON e.user_id = pm.user_id
@@ -740,13 +740,15 @@ export class SharedProjectCatalog {
   ): Promise<void> {
     await this.memberWrite(actor, projectId, async (tx) => {
       takeAttempt();
-      // Cognito aliases can move. Never pick a winner when multiple subjects
-      // have presented the address, even if one observation has expired.
+      // A row lock would miss a new association for the same address on another
+      // user's row. Hold a read lock on the registry until the grant commits.
+      await tx.query("LOCK TABLE verified_member_emails IN SHARE MODE");
+      // An expired claim still makes a second subject's claim ambiguous.
       const { rows } = await tx.query<{ user_id: string; fresh: boolean }>(
         `SELECT user_id, observed_at > $2 AS fresh
          FROM verified_member_emails
          WHERE email = $1
-         ORDER BY user_id LIMIT 2 FOR SHARE`,
+         ORDER BY user_id LIMIT 2`,
         [email, this.memberEmailCutoff()],
       );
       if (rows.length !== 1 || !rows[0]?.fresh)

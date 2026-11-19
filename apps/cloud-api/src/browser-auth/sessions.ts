@@ -56,13 +56,30 @@ export class MemorySessionStore {
     if (this.sessions.size >= this.cap)
       throw new Error("Too many active sessions");
     const id = secret();
+    let memberEmail = {
+      email: tokens.verifiedEmail ?? null,
+      observedAt: new Date(observedAtMs),
+    };
+    const sameSubject = [...this.sessions.values()].filter(
+      (session) => session.subject === tokens.subject,
+    );
+    // A new login may supersede evidence held by another browser that has
+    // signed in but hasn't created a profile yet.
+    for (const session of sameSubject) {
+      const prior = session.memberEmail;
+      if (prior.observedAt > memberEmail.observedAt) memberEmail = prior;
+      else if (
+        prior.observedAt.getTime() === memberEmail.observedAt.getTime() &&
+        prior.email !== memberEmail.email
+      ) {
+        memberEmail = { email: null, observedAt: memberEmail.observedAt };
+      }
+    }
+    for (const session of sameSubject) session.memberEmail = memberEmail;
     const session: ServerSession = {
       subject: tokens.subject,
       tokens,
-      memberEmail: {
-        email: tokens.verifiedEmail ?? null,
-        observedAt: new Date(observedAtMs),
-      },
+      memberEmail,
       csrf: secret(),
       createdAtMs: time,
       lastSeenMs: time,
