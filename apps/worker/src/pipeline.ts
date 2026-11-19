@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { access, mkdir, mkdtemp, rm } from "node:fs/promises";
+import { access, mkdir, mkdtemp, rm, rmdir } from "node:fs/promises";
 import { join } from "node:path";
 
 import {
@@ -27,6 +27,7 @@ import {
   type TranslationProvider,
 } from "@research-video/providers";
 import { normalizeAcquiredCaption } from "@research-video/providers/captions-local";
+import { AlignmentShutdownUnconfirmedError } from "@research-video/providers/alignment-local";
 import { transcriptToSrt } from "@research-video/transcript";
 
 import type {
@@ -106,6 +107,16 @@ export class LocalTranslationUnavailableError extends Error {
   }
 }
 
+class PreviousAlignmentPendingError extends Error {
+  readonly code = "previous_alignment_pending";
+
+  constructor() {
+    super(
+      "An earlier word alignment attempt must stop before retrying on this worker.",
+    );
+  }
+}
+
 export function createTranscriptPipelineExecutor(
   options: TranscriptPipelineOptions,
 ): TranscriptionJobExecutor {
@@ -127,12 +138,14 @@ export function createTranscriptPipelineExecutor(
       join(options.scratchRoot, `${claimed.job.id}-a${claimed.lease.attempt}-`),
     );
     let cleaned = false;
+    let retainScratch = false;
     try {
       const source = await resolveSourceTranscript(
         options,
         payload,
         scratch,
         context,
+        join(options.scratchRoot, `.alignment-${claimed.job.id}`),
       );
       const english = await resolveEnglishTranscript(
         options.translation,
@@ -205,8 +218,11 @@ export function createTranscriptPipelineExecutor(
         idempotencyKey: `finalize:${transcriptVersionId}`,
         manifest: { ...manifestObject, type: "manifest" },
       });
+    } catch (error) {
+      retainScratch = error instanceof AlignmentShutdownUnconfirmedError;
+      throw error;
     } finally {
-      if (!cleaned) await cleanupScratch(scratch);
+      if (!cleaned && !retainScratch) await cleanupScratch(scratch);
     }
   };
 }
@@ -216,6 +232,7 @@ async function resolveSourceTranscript(
   payload: ReturnType<typeof TranscriptionJobPayloadSchema.parse>,
   scratch: string,
   context: TranscriptionExecutionContext,
+  attemptMarker: string,
 ) {
   await context.setStage("resolving");
   const resolver = new TranscriptSourceResolver(
@@ -269,6 +286,7 @@ async function resolveSourceTranscript(
         },
         scratch,
         context,
+        attemptMarker,
       );
     }
   }
@@ -296,6 +314,7 @@ async function resolveSourceTranscript(
     async () => media.scratchPath,
     scratch,
     context,
+    attemptMarker,
   );
 }
 
@@ -305,19 +324,38 @@ async function alignSourceTranscript(
   audioPath: () => Promise<string>,
   scratchDirectory: string,
   context: TranscriptionExecutionContext,
+  attemptMarker: string,
 ) {
   if (!alignment?.supports(transcript)) return transcript;
   const inputPath = await audioPath();
   context.signal.throwIfAborted();
   await context.setStage("aligning");
-  const aligned = await alignment.align({
-    transcript,
-    inputPath,
-    scratchDirectory,
-    signal: context.signal,
-  });
-  context.signal.throwIfAborted();
-  return aligned;
+  try {
+    await mkdir(attemptMarker, { mode: 0o700 });
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "EEXIST")
+      throw new PreviousAlignmentPendingError();
+    throw error;
+  }
+  // A reclaimed lease can start another attempt before this process returns.
+  // Keep the local marker when the engine's shutdown cannot be confirmed.
+  let releaseMarker = true;
+  try {
+    context.signal.throwIfAborted();
+    const aligned = await alignment.align({
+      transcript,
+      inputPath,
+      scratchDirectory,
+      signal: context.signal,
+    });
+    context.signal.throwIfAborted();
+    return aligned;
+  } catch (error) {
+    releaseMarker = !(error instanceof AlignmentShutdownUnconfirmedError);
+    throw error;
+  } finally {
+    if (releaseMarker) await rmdir(attemptMarker);
+  }
 }
 
 async function resolveEnglishTranscript(

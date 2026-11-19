@@ -905,7 +905,14 @@ function parseWebVtt(input: string): ParsedCue[] {
   if (!header || !/^WEBVTT(?:[\t ].*)?$/.test(header)) {
     throw new WebVttNormalizationError("WebVTT header is missing or invalid.");
   }
-  const blocks = lines.join("\n").split(/\n{2,}/u);
+  let firstCueLine = 0;
+  // YouTube puts Kind and Language fields directly after the signature.
+  while (/^(?:Kind|Language):[\t ]*\S/u.test(lines[firstCueLine] ?? ""))
+    firstCueLine += 1;
+  const blocks = lines
+    .slice(firstCueLine)
+    .join("\n")
+    .split(/\n{2,}/u);
   const cues: ParsedCue[] = [];
   for (const rawBlock of blocks) {
     const block = rawBlock.trim();

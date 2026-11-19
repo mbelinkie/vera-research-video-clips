@@ -886,7 +886,8 @@ describe("WebVTT normalization", () => {
 
   it("produces stable IDs and hashes for equivalent normalized content", async () => {
     const input = {
-      contents: "WEBVTT\r\n\r\n00:00.000 --> 00:01.250\r\nHello\r\n",
+      contents:
+        "WEBVTT\r\nKind: captions\r\nLanguage: en\r\n\r\n00:00.000 --> 00:01.250\r\nHello\r\n",
       videoId: "M7lc1UVf-VE",
       language: "en",
       source: "youtube-auto" as const,

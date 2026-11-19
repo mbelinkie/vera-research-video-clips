@@ -55,6 +55,7 @@ export const AppConfigSchema = z
     exportSourceProvider: z.enum(["disabled", "yt-dlp"]),
     ytDlpPath: z.string().trim().min(1),
     ffmpegPath: z.string().trim().min(1),
+    wordTimingPython: z.string().trim().min(1).optional(),
     ffprobePath: z.string().trim().min(1),
     speechToTextProvider: z.enum(["disabled", "whisper-cpp"]),
     whisperCppPath: z.string().trim().min(1),
@@ -300,6 +301,20 @@ export const AppConfigSchema = z
         message: "TRANSCRIPT_BUCKET is required when OBJECT_STORE_MODE=s3",
       });
     }
+    if (config.wordTimingPython && config.mediaProvider !== "yt-dlp-audio") {
+      context.addIssue({
+        code: "custom",
+        path: ["wordTimingPython"],
+        message: "VERA_WORD_TIMING_PYTHON requires MEDIA_PROVIDER=yt-dlp-audio",
+      });
+    }
+    if (config.wordTimingPython && config.workerExecutionLocation !== "local") {
+      context.addIssue({
+        code: "custom",
+        path: ["wordTimingPython"],
+        message: "VERA_WORD_TIMING_PYTHON is only supported by local workers",
+      });
+    }
     if (config.speechToTextProvider === "whisper-cpp") {
       if (!config.whisperCppModelPath) {
         context.addIssue({
@@ -358,6 +373,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     exportSourceProvider: env.EXPORT_SOURCE_PROVIDER ?? "disabled",
     ytDlpPath: env.YT_DLP_PATH ?? "yt-dlp",
     ffmpegPath: env.FFMPEG_PATH ?? "ffmpeg",
+    wordTimingPython: env.VERA_WORD_TIMING_PYTHON,
     ffprobePath: env.FFPROBE_PATH ?? "ffprobe",
     speechToTextProvider: env.SPEECH_TO_TEXT_PROVIDER ?? "disabled",
     whisperCppPath: env.WHISPER_CPP_PATH ?? "whisper-cli",

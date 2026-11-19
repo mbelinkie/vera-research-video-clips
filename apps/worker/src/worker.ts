@@ -349,6 +349,9 @@ export class HttpTranscriptionWorkerControlPlane implements TranscriptionWorkerC
       await this.request(
         `/api/transcription-jobs/${encodeURIComponent(jobId)}/heartbeat`,
         body,
+        // A stalled heartbeat must reach the executor's abort signal before
+        // this lease can be picked up by a later attempt.
+        AbortSignal.timeout(Math.floor((this.#leaseSeconds * 1_000) / 3)),
       ),
     );
   }
@@ -375,7 +378,11 @@ export class HttpTranscriptionWorkerControlPlane implements TranscriptionWorkerC
     );
   }
 
-  private async request(path: string, body: unknown): Promise<unknown> {
+  private async request(
+    path: string,
+    body: unknown,
+    signal?: AbortSignal,
+  ): Promise<unknown> {
     const response = await this.#fetcher(new URL(path, this.#baseUrl), {
       method: "POST",
       headers: {
@@ -384,6 +391,7 @@ export class HttpTranscriptionWorkerControlPlane implements TranscriptionWorkerC
         "content-type": "application/json",
       },
       body: JSON.stringify(body),
+      ...(signal ? { signal } : {}),
     });
     if (response.status === 204) return undefined;
     const payload = await response.json().catch(() => undefined);
@@ -419,7 +427,19 @@ function failureFrom(error: unknown, attempt: number): WorkerFailureRequest {
             message:
               "English translation is not configured for this source language.",
           }
-        : null;
+        : code === "alignment_shutdown_unconfirmed"
+          ? {
+              code,
+              message:
+                "Word alignment shutdown could not be confirmed. Temporary audio was retained.",
+            }
+          : code === "previous_alignment_pending"
+            ? {
+                code,
+                message:
+                  "An earlier word alignment attempt must stop before retrying on this worker.",
+              }
+            : null;
   return WorkerFailureRequestSchema.parse({
     attempt,
     code: known?.code ?? "worker_execution_failed",

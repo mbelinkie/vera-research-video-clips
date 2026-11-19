@@ -18,6 +18,7 @@ import {
   normalizeGeneratedTranscript,
 } from "@research-video/transcript";
 import type { TranslationRequest } from "@research-video/providers";
+import { AlignmentShutdownUnconfirmedError } from "@research-video/providers/alignment-local";
 
 import {
   createTranscriptPipelineExecutor,
@@ -309,7 +310,7 @@ describe("transcript pipeline", () => {
     expect(await readdir(scratchRoot)).toEqual([]);
   });
 
-  it.each(["caption", "generated", "canceled"] as const)(
+  it.each(["caption", "generated", "canceled", "unconfirmed"] as const)(
     "keeps the %s word alignment inside the job audio lifetime",
     async (source) => {
       const scratchRoot = await mkdtemp(join(tmpdir(), "pipeline-align-"));
@@ -317,7 +318,9 @@ describe("transcript pipeline", () => {
       const publication = publicationFixture();
       const controller = new AbortController();
       const lostLease = new Error("Lease expired during alignment.");
+      const failed = source === "canceled" || source === "unconfirmed";
       const stages: string[] = [];
+      let alignmentCalls = 0;
       const acquireAuthorizedSource = vi.fn(
         async (videoId: string, scratch: string) => {
           const scratchPath = join(scratch, "audio.flac");
@@ -378,14 +381,17 @@ describe("transcript pipeline", () => {
         alignment: {
           supports: () => true,
           align: async ({ transcript, inputPath, signal }) => {
+            alignmentCalls += 1;
             expect(signal).toBe(controller.signal);
             expect(transcript.track.source).toBe(
               source === "caption" ? "youtube-manual" : "generated",
             );
-            if (source === "canceled") controller.abort(lostLease);
+            if (failed) controller.abort(lostLease);
             await expect(readFile(inputPath, "utf8")).resolves.toBe(
               "temporary audio",
             );
+            if (source === "unconfirmed")
+              throw new AlignmentShutdownUnconfirmedError();
             return applyAcousticAlignment(transcript, {
               artifactId: `sha256:${"a".repeat(64)}`,
               tokens: transcript.tokens.map(({ id }, index) =>
@@ -407,13 +413,18 @@ describe("transcript pipeline", () => {
           },
         },
       });
-      const result = executor(claimedJob(), {
+      const claimed = claimedJob();
+      const result = executor(claimed, {
         signal: controller.signal,
         setStage: async (stage) => void stages.push(stage),
         recordSourcePlan: async () => undefined,
       });
-      if (source === "canceled") {
-        await expect(result).rejects.toBe(lostLease);
+      if (failed) {
+        if (source === "unconfirmed")
+          await expect(result).rejects.toBeInstanceOf(
+            AlignmentShutdownUnconfirmedError,
+          );
+        else await expect(result).rejects.toBe(lostLease);
         expect(publication.uploaded.size).toBe(0);
         expect(publication.finalize).not.toHaveBeenCalled();
       } else {
@@ -442,11 +453,37 @@ describe("transcript pipeline", () => {
         "acquiring",
         ...(source === "caption" ? [] : ["transcribing"]),
         "aligning",
-        ...(source === "canceled" ? [] : ["uploading"]),
+        ...(failed ? [] : ["uploading"]),
       ]);
       expect(acquireAuthorizedSource).toHaveBeenCalledOnce();
       expect(transcribe).toHaveBeenCalledTimes(source === "caption" ? 0 : 1);
-      expect(await readdir(scratchRoot)).toEqual([]);
+      const remaining = await readdir(scratchRoot);
+      if (source === "unconfirmed") {
+        expect(remaining).toHaveLength(2);
+        expect(remaining).toContain(`.alignment-${claimed.job.id}`);
+        const retained = remaining.find((entry) =>
+          entry.startsWith(claimed.job.id),
+        );
+        expect(retained).toBeDefined();
+        await expect(
+          readFile(join(scratchRoot, retained!, "audio.flac"), "utf8"),
+        ).resolves.toBe("temporary audio");
+        await expect(
+          executor(
+            {
+              job: { ...claimed.job, attempt: 2 },
+              lease: { ...claimed.lease, attempt: 2 },
+            },
+            {
+              signal: new AbortController().signal,
+              setStage: async () => undefined,
+              recordSourcePlan: async () => undefined,
+            },
+          ),
+        ).rejects.toMatchObject({ code: "previous_alignment_pending" });
+        expect(alignmentCalls).toBe(1);
+        expect((await readdir(scratchRoot)).sort()).toEqual(remaining.sort());
+      } else expect(remaining).toEqual([]);
     },
   );
 

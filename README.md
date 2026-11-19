@@ -98,6 +98,28 @@ language translation stays **off** unless separately enabled (it uses a
 remote billable service); unavailable translation fails terminally. Source
 restrictions, missing executables/model, and unavailable videos may still fail.
 
+### Local acoustic word timing
+
+Use the audio acquisition settings above and install Timeline's
+`packages/word-timing` in a Python 3.12 environment. Use a package that includes
+[worker cancellation](https://github.com/mbelinkie/vera-script-to-timeline/pull/668).
+Set `VERA_WORD_TIMING_PYTHON` to the Python executable in that environment.
+Configure `VERA_TOOLS_PYTHON` for Silero VAD, `VERA_MFA_COMMAND` for the MFA
+Python runtime, and `VERA_MFA_ROOT_DIR` for its installed models.
+
+On a newly processed source the local worker aligns English caption tracks
+or recognizer output in English, German, French, or Swedish when the matching
+model is installed. Spoken words without a measured interval appear with a
+dotted underline and use cue bounds when selected as a clip endpoint.
+Translation keeps cue timing. Previously saved transcripts retain their timing.
+
+If the worker reports unconfirmed aligner shutdown, the job audio is kept
+under its private data directory in `jobs/transcription-scratch`. Confirm the
+job's aligner has stopped before removing that scratch or retrying the job.
+The local `.alignment-<job ID>` marker prevents another local attempt from
+starting alignment. Once you confirm shutdown and remove the marker, submit
+the source in a new batch.
+
 ### Ordinary multi-service development
 
 ```bash

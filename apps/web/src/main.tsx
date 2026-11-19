@@ -448,18 +448,6 @@ function App() {
 
   useEffect(() => setMatchIndex(0), [query, videoId]);
 
-  useEffect(() => {
-    if (
-      !previewingSelection ||
-      !selection ||
-      currentMs < selection.exportEndMs
-    ) {
-      return;
-    }
-    playerRef.current?.seekTo(selection.exportStartMs);
-    playerRef.current?.play();
-  }, [currentMs, previewingSelection, selection]);
-
   function loadVideo() {
     loadVideoUrl(url);
   }
@@ -501,12 +489,19 @@ function App() {
     if (!selection || secondsText.trim() === "") return;
     const milliseconds = Math.round(Number(secondsText) * 1_000);
     try {
-      setSelection(
-        updateTranscriptSelectionExportBounds(selection, {
+      const updatedSelection = updateTranscriptSelectionExportBounds(
+        selection,
+        {
           startMs: bound === "start" ? milliseconds : selection.exportStartMs,
           endMs: bound === "end" ? milliseconds : selection.exportEndMs,
-        }),
+        },
       );
+      setSelection(updatedSelection);
+      if (previewingSelection)
+        playerRef.current?.playRange(
+          updatedSelection.exportStartMs,
+          updatedSelection.exportEndMs,
+        );
       setSelectionError(undefined);
     } catch (caught) {
       setSelectionError(
@@ -517,12 +512,16 @@ function App() {
 
   function addExportHandles() {
     if (!selection) return;
-    setSelection(
-      updateTranscriptSelectionExportBounds(selection, {
-        startMs: Math.max(0, selection.exportStartMs - 500),
-        endMs: selection.exportEndMs + 500,
-      }),
-    );
+    const updatedSelection = updateTranscriptSelectionExportBounds(selection, {
+      startMs: Math.max(0, selection.exportStartMs - 500),
+      endMs: selection.exportEndMs + 500,
+    });
+    setSelection(updatedSelection);
+    if (previewingSelection)
+      playerRef.current?.playRange(
+        updatedSelection.exportStartMs,
+        updatedSelection.exportEndMs,
+      );
     setSelectionError(undefined);
   }
 
@@ -533,9 +532,12 @@ function App() {
       setPreviewingSelection(false);
       return;
     }
-    const sought = playerRef.current?.seekTo(selection.exportStartMs) ?? false;
-    const played = playerRef.current?.play() ?? false;
-    if (!sought || !played) {
+    const played =
+      playerRef.current?.playRange(
+        selection.exportStartMs,
+        selection.exportEndMs,
+      ) ?? false;
+    if (!played) {
       setSelectionError("The video player is not ready for preview yet.");
       return;
     }
@@ -957,15 +959,23 @@ function App() {
                   onFollowSuspended={() => setFollow(false)}
                   onSeek={seekTo}
                   onSelect={(anchor, focus) => {
-                    playerRef.current?.pause();
-                    setPreviewingSelection(false);
-                    setSelection(
-                      deriveTranscriptSelection({
-                        transcript,
-                        anchor,
-                        focus,
-                      }),
-                    );
+                    const nextSelection = deriveTranscriptSelection({
+                      transcript,
+                      anchor,
+                      focus,
+                    });
+                    if (previewingSelection) {
+                      if (
+                        !playerRef.current?.playRange(
+                          nextSelection.exportStartMs,
+                          nextSelection.exportEndMs,
+                        )
+                      )
+                        setPreviewingSelection(false);
+                    } else {
+                      playerRef.current?.pause();
+                    }
+                    setSelection(nextSelection);
                     setClipNotes("");
                     setClipTags("");
                     setSelectionCommandId(crypto.randomUUID());
@@ -999,6 +1009,7 @@ function App() {
             <YouTubePlayer
               ref={playerRef}
               videoId={videoId}
+              onRangeInterrupted={() => setPreviewingSelection(false)}
               onTimeChange={setCurrentMs}
             />
           ) : (

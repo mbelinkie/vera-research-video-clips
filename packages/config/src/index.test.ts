@@ -13,6 +13,7 @@ describe("configuration", () => {
     expect(config.mediaProvider).toBe("disabled");
     expect(config.exportSourceProvider).toBe("disabled");
     expect(config.ffmpegPath).toBe("ffmpeg");
+    expect(config.wordTimingPython).toBeUndefined();
     expect(config.ffprobePath).toBe("ffprobe");
     expect(config.clipExportDir).toMatch(/\/data\/exports$/u);
     expect(config.ytDlpPath).toBe("yt-dlp");
@@ -42,6 +43,30 @@ describe("configuration", () => {
     expect(config.mediaProvider).toBe("yt-dlp-audio");
     expect(config.speechToTextProvider).toBe("whisper-cpp");
     expect(config.whisperCppModelName).toBe("large-v3-turbo");
+  });
+
+  it("enables local word timing only with explicit Python and audio acquisition", () => {
+    const config = loadConfig({
+      NODE_ENV: "test",
+      MEDIA_PROVIDER: "yt-dlp-audio",
+      VERA_WORD_TIMING_PYTHON: "/opt/timeline/bin/python3",
+    });
+
+    expect(config.wordTimingPython).toBe("/opt/timeline/bin/python3");
+    expect(() =>
+      loadConfig({
+        NODE_ENV: "test",
+        VERA_WORD_TIMING_PYTHON: "/opt/timeline/bin/python3",
+      }),
+    ).toThrow("VERA_WORD_TIMING_PYTHON requires MEDIA_PROVIDER=yt-dlp-audio");
+    expect(() =>
+      loadConfig({
+        NODE_ENV: "test",
+        MEDIA_PROVIDER: "yt-dlp-audio",
+        WORKER_EXECUTION_LOCATION: "hosted",
+        VERA_WORD_TIMING_PYTHON: "/opt/timeline/bin/python3",
+      }),
+    ).toThrow("VERA_WORD_TIMING_PYTHON is only supported by local workers");
   });
 
   it("enables full-video cutting only by separate opt-in and requires a fixed absolute output root", () => {

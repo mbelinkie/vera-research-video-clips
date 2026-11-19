@@ -98,20 +98,48 @@ keeps those fields alongside the existing cue and estimated data. The
 transcript view marks unaligned words and uses cue bounds when they are
 selection endpoints. Timeline #51 accepted no replacement recognizer.
 
+## Local worker enablement
+
+Timeline #664 shipped in [PR #668](https://github.com/mbelinkie/vera-script-to-timeline/pull/668).
+The Mac worker uses that package from `897b6110b859fe12e50e5f9546e0d084d9aa5ba8`.
+Opt in with `VERA_WORD_TIMING_PYTHON` and local audio acquisition. The provider
+prepares 16 kHz mono PCM in job scratch and uses a unique cancellation marker.
+On lease loss it waits for the CLI's confirmation before cleaning up. It keeps
+job scratch when shutdown is unconfirmed. The worker preserves cue timing
+for unsupported tracks.
+
+On the same Intel Mac, the cancellation-capable worker provider processed
+3,597.630 seconds of the generated workload in 237.658 seconds, including
+audio preparation, caption handoff, VAD, and MFA. That is 3.96 minutes per
+hour of audio. It produced 11,360 acoustic tokens and two unaligned sound-cue
+tokens. This run used the same four-job MFA profile with worker-mode SQLite.
+In a separate Mac run through the same CLI, a fake VAD process was gone
+0.10 seconds after a lease abort. Research observed the confirmation first.
+
+## Live browser evidence
+
+- On an authorized NASA Marshall video, Research processed the downloaded
+  English manual caption track and published 143 acoustic tokens. Selecting
+  “Hi, my name is” gave 0.220–1.160 seconds. Chrome looped the actual embedded
+  video through that range. [NASA video](https://www.youtube.com/watch?v=p0W_cxbbTQA)
+- The official Blender Foundation Sintel trailer went through whisper.cpp
+  with caption acquisition disabled in the managed test worker. The resulting
+  transcript had 31 acoustic tokens and six unaligned tokens. Selecting
+  “What brings you to” gave 12.220–12.990 seconds, and Chrome looped it.
+  Chrome displayed a dotted underline and an accessible cue-timing label on
+  the unaligned sound cue. [Sintel trailer](https://www.youtube.com/watch?v=HOfdboHvshg)
+
+The live run led to accepting YouTube's WebVTT `Kind` and `Language` headers,
+and to handing both preview bounds to the player. The former preview's
+250 ms clock poll could let playback cross the selected end.
+[YouTube IFrame player API](https://developers.google.com/youtube/iframe_api_reference#Queueing_Functions)
+
 ## Remaining issue acceptance
 
-1. Use a shared CLI release with supported cancellation. A focused mock-engine
-   run on the Mac established that sending SIGTERM to the pinned shared runner
-   exits its caller while the isolated engine process stays alive. The
-   worker's production alignment setting awaits
-   [Timeline #664](https://github.com/mbelinkie/vera-script-to-timeline/issues/664).
-2. Wire the supported runner into the worker. Prepare 16 kHz mono PCM audio
-   in the job directory, pass through the lease abort, and retain scratch
-   whenever engine shutdown cannot be confirmed. Limit acoustic bounds to the
-   spoken source track and keep cue timing for unsupported languages.
-3. Highlight phrases from one authorized captioned video and one authorized
-   captionless video. Check first and last word playback and the visible
-   unaligned state in the browser before accepting the whole issue.
+Repeat the generated-source playback check with an authorized video that has
+no available captions in the normal acquisition configuration. Two NASA
+candidate videos exposed zero manual and automatic tracks, and neither
+produced a verified spoken transcript in the live run.
 
 Hosted execution, audio cleanup, replacing the recognizer, regenerating cached
 transcripts, and Resolve work are outside this slice.

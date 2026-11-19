@@ -4,10 +4,18 @@ import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import type { NormalizedTranscript } from "@research-video/contracts";
+import { SpawnMediaCommandRunner } from "@research-video/media";
+import { applyAcousticAlignment } from "@research-video/transcript";
 import { z } from "zod";
 
 import { SpawnCommandRunner, type CommandRunner } from "./captions-local.ts";
 import { ProviderExecutionError } from "./index.ts";
+import {
+  AlignmentShutdownUnconfirmedError,
+  runCancelableAlignment,
+} from "./word-timing-process.ts";
+
+export { AlignmentShutdownUnconfirmedError } from "./word-timing-process.ts";
 
 const artifactId = z.string().regex(/^sha256:[a-f0-9]{64}$/u);
 const sourceMs = z.number().int().nonnegative();
@@ -64,6 +72,84 @@ type TokenAlignment =
   | { tokenId: string; status: "acoustic"; startMs: number; endMs: number }
   | { tokenId: string; status: "unaligned"; startMs: null; endMs: null };
 
+const pythonCli = ["-m", "vera_word_timing.cli"];
+
+type WorkerAlignmentContext = {
+  scratchDirectory: string;
+  signal: AbortSignal;
+};
+
+export async function createLocalAlignmentProvider(options: {
+  python: string;
+  ffmpeg: string;
+}) {
+  if (process.platform !== "darwin" && process.platform !== "linux")
+    throw new ProviderExecutionError(
+      "Local worker word alignment requires macOS or Linux.",
+    );
+  const runner = new SpawnMediaCommandRunner();
+  const help = await runner
+    .run(options.python, [...pythonCli, "align", "--help"], {
+      timeoutMs: 15_000,
+    })
+    .catch(() => undefined);
+  if (!help?.stdout.includes("--cancel-file")) {
+    throw new ProviderExecutionError(
+      "Install the Timeline word-timing package with worker cancellation support and set VERA_WORD_TIMING_PYTHON.",
+    );
+  }
+  return {
+    supports({ track }: NormalizedTranscript) {
+      return track.source === "generated"
+        ? !!track.model && /^(?:en|de|fr|sv)(?:-|$)/iu.test(track.language)
+        : (track.source === "youtube-auto" ||
+            track.source === "youtube-manual") &&
+            /^en(?:-|$)/iu.test(track.language);
+    },
+    async align(
+      input: WorkerAlignmentContext & {
+        transcript: NormalizedTranscript;
+        inputPath: string;
+      },
+    ) {
+      const wav = join(input.scratchDirectory, "alignment-input.wav");
+      await runner.run(
+        options.ffmpeg,
+        [
+          "-nostdin",
+          "-hide_banner",
+          "-loglevel",
+          "error",
+          "-n",
+          "-i",
+          input.inputPath,
+          "-map",
+          "0:a:0",
+          "-vn",
+          "-ar",
+          "16000",
+          "-ac",
+          "1",
+          "-c:a",
+          "pcm_s16le",
+          wav,
+        ],
+        { signal: input.signal },
+      );
+      input.signal.throwIfAborted();
+      const alignment = await alignTranscript(
+        input.transcript,
+        wav,
+        options.python,
+        pythonCli,
+        runner,
+        input,
+      );
+      return applyAcousticAlignment(input.transcript, alignment);
+    },
+  };
+}
+
 /** Local handoff to Timeline's installed word-timing CLI. WAV is 16 kHz mono PCM. */
 export async function alignEnglishCaptions(
   transcript: NormalizedTranscript,
@@ -98,13 +184,7 @@ export async function alignLocalRecognition(
       "Local word alignment requires a supported language and the recognizer's model.",
     );
   }
-  return alignTranscript(
-    transcript,
-    wavPath,
-    python,
-    ["-m", "vera_word_timing.cli"],
-    runner,
-  );
+  return alignTranscript(transcript, wavPath, python, pythonCli, runner);
 }
 
 async function alignTranscript(
@@ -113,12 +193,16 @@ async function alignTranscript(
   executable: string,
   cliPrefix: readonly string[],
   runner: CommandRunner,
+  worker?: WorkerAlignmentContext,
 ) {
   const entries = alignmentEntries(transcript);
   if (!entries.some((entry) => entry.kind === "word")) {
     throw new ProviderExecutionError("The transcript has no words to align.");
   }
-  const scratch = await mkdtemp(join(tmpdir(), "vera-caption-alignment-"));
+  const scratch = await mkdtemp(
+    join(worker?.scratchDirectory ?? tmpdir(), "vera-caption-alignment-"),
+  );
+  let retainScratch = false;
   try {
     const audio = resolve(wavPath);
     const input = join(scratch, "recognition-input.json");
@@ -164,14 +248,13 @@ async function alignTranscript(
         };
     await writeFile(input, JSON.stringify(recognitionInput));
     await runner
-      .run(executable, [
-        ...recognitionArgs,
-        "--audio",
-        audio,
-        "--out",
-        recognitionPath,
-      ])
+      .run(
+        executable,
+        [...recognitionArgs, "--audio", audio, "--out", recognitionPath],
+        { ...(worker ? { signal: worker.signal } : {}), timeoutMs: 120_000 },
+      )
       .catch(() => {
+        worker?.signal.throwIfAborted();
         throw new ProviderExecutionError(
           "Could not prepare the transcript for vera-word-timing. Check the runtime and WAV input.",
         );
@@ -193,26 +276,32 @@ async function alignTranscript(
 
     const start = performance.now();
     // The installed CLI gives VAD and MFA their own 30-minute timeouts.
-    await runner
-      .run(
+    const alignArgs = [
+      ...cliPrefix,
+      "align",
+      "--audio",
+      audio,
+      "--recognition",
+      recognitionPath,
+      "--out",
+      alignmentPath,
+    ];
+    if (worker) {
+      await runCancelableAlignment(
         executable,
-        [
-          ...cliPrefix,
-          "align",
-          "--audio",
-          audio,
-          "--recognition",
-          recognitionPath,
-          "--out",
-          alignmentPath,
-        ],
-        { timeoutMs: 65 * 60_000 },
-      )
-      .catch(() => {
-        throw new ProviderExecutionError(
-          "Word alignment failed. Check the local Silero VAD and MFA setup and the audio and caption inputs.",
-        );
-      });
+        alignArgs,
+        join(scratch, "cancel"),
+        worker.signal,
+      );
+    } else {
+      await runner
+        .run(executable, alignArgs, { timeoutMs: 65 * 60_000 })
+        .catch(() => {
+          throw new ProviderExecutionError(
+            "Word alignment failed. Check the local Silero VAD and MFA setup and the audio and caption inputs.",
+          );
+        });
+    }
     const alignmentSeconds = (performance.now() - start) / 1_000;
     const alignment = await readArtifact(alignmentPath, alignmentArtifact);
     const audioInfo = recognition.identity.audio;
@@ -232,8 +321,11 @@ async function alignTranscript(
       minutesPerAudioHour: (60 * alignmentSeconds) / audioSeconds,
       tokens: projectAlignment(entries, alignment.words, audioSeconds * 1_000),
     };
+  } catch (error) {
+    retainScratch = error instanceof AlignmentShutdownUnconfirmedError;
+    throw error;
   } finally {
-    await rm(scratch, { recursive: true, force: true });
+    if (!retainScratch) await rm(scratch, { recursive: true, force: true });
   }
 }
 
