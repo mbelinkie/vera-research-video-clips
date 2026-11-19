@@ -919,6 +919,25 @@ describe("WebVTT normalization", () => {
     });
   });
 
+  it("skips empty cues while preserving the following speech cues", async () => {
+    const transcript = await normalizeWebVttCaption({
+      contents:
+        "WEBVTT\n\n00:00.000 --> 00:01.000\nFirst word\n\n" +
+        "00:01.000 --> 00:02.000\n<c></c>\n\n" +
+        "00:02.000 --> 00:03.000\nSecond word\n",
+      videoId: "M7lc1UVf-VE",
+      language: "en",
+      provider: "fixture",
+      source: "youtube-auto",
+    });
+    expect(
+      transcript.segments.map(({ startMs, text }) => [startMs, text]),
+    ).toEqual([
+      [0, "First word"],
+      [2_000, "Second word"],
+    ]);
+  });
+
   it.each([
     ["missing header", "00:00.000 --> 00:01.000\nText"],
     ["invalid timestamp", "WEBVTT\n\n00:61.000 --> 00:62.000\nText"],

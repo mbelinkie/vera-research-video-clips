@@ -942,11 +942,7 @@ function parseWebVtt(input: string): ParsedCue[] {
     }
     const rawLines = blockLines.slice(timingIndex + 1);
     const text = normalizeCueText(rawLines);
-    if (!text) {
-      throw new WebVttNormalizationError(
-        `WebVTT cue ${cues.length + 1} has no readable text.`,
-      );
-    }
+    if (!text) continue;
     cues.push({ inputOrdinal: cues.length, startMs, endMs, text, rawLines });
     if (cues.length > maxWebVttCues) {
       throw new WebVttNormalizationError(

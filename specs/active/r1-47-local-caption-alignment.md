@@ -134,6 +134,12 @@ and to handing both preview bounds to the player. The former preview's
 250 ms clock poll could let playback cross the selected end.
 [YouTube IFrame player API](https://developers.google.com/youtube/iframe_api_reference#Queueing_Functions)
 
+A 32-minute creator-provided video also exposed a caption discovery and
+normalization failure. Research now requests only track identifiers, so
+embedded format URLs do not overflow the command's output limit. YouTube's
+live chat entry is excluded from caption selection. Empty timed cues are
+skipped so a placeholder cannot discard the surrounding speech.
+
 ## Remaining issue acceptance
 
 Repeat the generated-source playback check with an authorized video that has
