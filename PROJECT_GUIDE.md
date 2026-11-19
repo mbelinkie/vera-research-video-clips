@@ -831,6 +831,19 @@ For a transcript-backed YouTube clip, POST an item with `kind`, `sourceId` and `
 
 Both list routes accept `kind`, `topic`, `q`, `limit` and `offset`. Items also accept `logger` and `sourceId` (UUIDs). The default page holds 50 records and the maximum is 100. Search matches literal, case-insensitive text in item titles, transcripts, quotes, speaker names and titles, notes, and source titles, authors and credits. A source matches a Topic when at least one of its logged items carries it. The request and response schemas are exported from `@research-video/contracts`.
 
+### Kept stills
+
+Open **Stills** below the transcription queue for the selected project. Researchers can import a public image URL or upload a JPEG, PNG or WebP. For a page picture, choose an existing web-page source and supply a screenshot. Cropping a supplied picture or a saved still creates a separate Library item. The item records its title, Topics, credit and licence or usage note. A saved copy carries no assertion of usage rights.
+
+The authenticated still routes share the base `/api/projects/:projectId/stills`:
+
+- POST `/from-url` accepts JSON with the public image URL, a title and an idempotency key. The server downloads anonymously through the same public URL guard as web-page imports.
+- POST `/from-file` and `/from-page-picture` accept multipart with one `metadata` JSON field and one `image` file. A page picture also supplies the web-page `sourceId` and a crop measured from 0 to 1 on the oriented image.
+- POST `/:itemId/crop` crops the saved image into a new item. Each creation uses the project, actor, request and submitted bytes to detect mismatched replays.
+- GET `/:itemId/assets` returns version IDs, checksums, sizes, dimensions, MIME types and provenance. GET `/:itemId/assets/:role` returns the verified bytes for `original`, `display` or `thumbnail`. Build consumers should use `original` and the matching checksum. The original keeps exact source bytes for direct imports and the full cropped raster for crops. The display derivative applies orientation and strips metadata. The thumbnail fits within 320 × 320 pixels.
+
+Image ingress is limited to 20 MiB and 25 megapixels. Storage uses the existing private, versioned object store. Publication makes the image and thumbnail reachable only after each asset verifies. A missing or corrupt kept object is unavailable even if the source URL still works. Older still items remain readable and report that they have no kept copy.
+
 ## 10. Persistence model
 
 Separate shared control-plane data from the local working cache.

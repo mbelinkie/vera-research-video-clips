@@ -1,4 +1,10 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import ReactDOM from "react-dom/client";
 
 import {
@@ -28,6 +34,7 @@ import autoWordTimedFixture from "../../../tests/fixtures/transcripts/auto-word-
 
 import "./styles.css";
 import { BatchWorkspace } from "./batch-workspace.tsx";
+import { StillsWorkspace } from "./stills-workspace.tsx";
 import {
   browserMode,
   cloudFetch,
@@ -109,7 +116,7 @@ function App() {
     : session?.authenticated
       ? session.csrfToken
       : undefined;
-  function clearPrivateState() {
+  const clearPrivateState = useCallback(() => {
     setProjects([]);
     setProjectId("");
     setLoggedClipId(undefined);
@@ -121,19 +128,19 @@ function App() {
     setTranscriptStatus("");
     setClipActionMessage(undefined);
     setProjectMessage(undefined);
-  }
-  function loseSession() {
+  }, []);
+  const loseSession = useCallback(() => {
     clearPrivateState();
     setSession(undefined);
     setSessionIssue(
       "Session expired or Mac unavailable. Retry the connection or sign in again.",
     );
-  }
-  function loseManagedConnection() {
+  }, [clearPrivateState]);
+  const loseManagedConnection = useCallback(() => {
     clearPrivateState();
     setManagedCsrf(undefined);
     setManagedIssue("Local Research disconnected. Reconnect to continue.");
-  }
+  }, [clearPrivateState]);
   async function connectManaged() {
     try {
       const token = await managedResearchSession();
@@ -1436,6 +1443,21 @@ function App() {
         }}
         onProjectChange={setProjectId}
         onProjectsChange={setProjects}
+        projectId={projectId}
+        projects={projects}
+      />
+      <StillsWorkspace
+        key={JSON.stringify([
+          projectId,
+          authorization,
+          session?.authenticated ? session.user?.id : null,
+        ])}
+        authorization={authorization}
+        browserSession={browserMode || managedResearch}
+        csrfToken={csrfToken}
+        onAuthUnavailable={
+          managedResearch ? loseManagedConnection : loseSession
+        }
         projectId={projectId}
         projects={projects}
       />

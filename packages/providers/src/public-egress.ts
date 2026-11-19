@@ -1,5 +1,5 @@
 // Timeline policy.ts at 4472ddeb1c8b882e6aa1ee318f36ecf551710d8f.
-// See README.md for upstream and the Research-specific transport limits.
+// See apps/local-agent/src/web-page/README.md for the upstream pin and hardening.
 import { createHash } from "node:crypto";
 import { lookup } from "node:dns/promises";
 import * as http from "node:http";
