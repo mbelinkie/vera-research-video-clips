@@ -17,8 +17,20 @@ import {
   type SourceListQuery,
   type CreateClipCandidateRequest,
   type ClipCandidate,
+  type StillAssetManifest,
+  type StillAssetRole,
+  type StillContent,
+  type StillUpload,
 } from "@research-video/contracts";
 import type { SqlDatabase } from "@research-video/db-cloud";
+import type { TranscriptObjectStore } from "@research-video/storage";
+import {
+  insertStillAssets,
+  keepStillAssets,
+  readStillManifest,
+  readStillObject,
+  type StillImages,
+} from "./library-still-assets.ts";
 import {
   CatalogConflictError,
   CatalogNotFoundError,
@@ -79,6 +91,74 @@ async function readCreateReplay(
   return existing?.id;
 }
 
+type StillPublication = {
+  metadata: StillUpload;
+  source: { create: CreateSourceRequest } | { id: string };
+  provenance: StillAssetManifest["provenance"];
+  images: StillImages;
+};
+
+async function insertLibrarySource(
+  tx: Session,
+  projectId: string,
+  id: string,
+  actorId: string,
+  input: CreateSourceRequest,
+  retry?: ReturnType<typeof createRetry>,
+) {
+  const { rows } = await tx.query(
+    `INSERT INTO library_sources(
+      project_id,id,kind,source_identity,bibliography,details,
+      create_actor_id,create_idempotency_key,create_fingerprint
+    ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT DO NOTHING RETURNING id`,
+    [
+      projectId,
+      id,
+      input.kind,
+      input.sourceIdentity ? JSON.stringify(input.sourceIdentity) : null,
+      JSON.stringify(input.bibliography),
+      JSON.stringify(input.details),
+      retry ? actorId : null,
+      retry?.key ?? null,
+      retry?.fingerprint ?? null,
+    ],
+  );
+  return rows.length > 0;
+}
+
+async function insertLibraryItem(
+  tx: Session,
+  projectId: string,
+  id: string,
+  actorId: string,
+  now: string,
+  input: CreateItemRequest,
+  retry: ReturnType<typeof createRetry>,
+) {
+  const { rows } = await tx.query(
+    `INSERT INTO library_items(
+      id,project_id,source_id,kind,content,notes,created_by,created_at,updated_at,
+      create_idempotency_key,create_fingerprint
+    ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$8,$9,$10)
+    ON CONFLICT(project_id,created_by,create_idempotency_key) DO NOTHING RETURNING id`,
+    [
+      id,
+      projectId,
+      input.sourceId,
+      input.kind,
+      JSON.stringify(input.content),
+      input.notes,
+      actorId,
+      now,
+      retry?.key ?? null,
+      retry?.fingerprint ?? null,
+    ],
+  );
+  if (!rows.length) return false;
+  await addTopics(tx, false, projectId, id, input.topics, now);
+  return true;
+}
+
 // Use the transaction's actual query handle in embedded mode. Independent
 // requests must never contribute statements to another request's transaction.
 export function catalogTransaction<T>(
@@ -92,6 +172,7 @@ export function catalogTransaction<T>(
 export class ProjectLibrary {
   constructor(
     private readonly db: SqlDatabase,
+    private readonly store: TranscriptObjectStore,
     private readonly now: () => Date,
     private readonly authorizeRead: (
       actor: Actor,
@@ -183,24 +264,16 @@ export class ProjectLibrary {
           );
         id = reserved.rows[0].id;
       }
-      const inserted = await tx.query(
-        `INSERT INTO library_sources(
-          project_id,id,kind,source_identity,bibliography,details,
-          create_actor_id,create_idempotency_key,create_fingerprint
-        ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT DO NOTHING RETURNING id`,
-        [
+      if (
+        !(await insertLibrarySource(
+          tx,
           projectId,
           id,
-          input.kind,
-          input.sourceIdentity ? JSON.stringify(input.sourceIdentity) : null,
-          JSON.stringify(input.bibliography),
-          JSON.stringify(input.details),
-          retry ? actor.userId : null,
-          retry?.key ?? null,
-          retry?.fingerprint ?? null,
-        ],
-      );
-      if (!inserted.rows.length) {
+          actor.userId,
+          input,
+          retry,
+        ))
+      ) {
         const winner = await replay();
         if (winner) return readLibrarySource(tx, projectId, winner);
         throw new CatalogConflictError(
@@ -296,35 +369,136 @@ export class ProjectLibrary {
         );
       const id = randomUUID();
       const now = this.now().toISOString();
-      const inserted = await tx.query(
-        `INSERT INTO library_items(
-          id,project_id,source_id,kind,content,notes,created_by,created_at,updated_at,
-          create_idempotency_key,create_fingerprint
-        ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$8,$9,$10)
-        ON CONFLICT(project_id,created_by,create_idempotency_key) DO NOTHING RETURNING id`,
-        [
-          id,
+      if (
+        !(await insertLibraryItem(
+          tx,
           projectId,
-          input.sourceId,
-          input.kind,
-          JSON.stringify(input.content),
-          input.notes,
+          id,
           actor.userId,
           now,
-          retry?.key ?? null,
-          retry?.fingerprint ?? null,
-        ],
-      );
-      if (!inserted.rows.length) {
+          input,
+          retry,
+        ))
+      ) {
         const winner = await replay();
         if (winner)
           return (await readLibraryItemRow(tx, projectId, winner)).item;
         throw new CatalogConflictError("Reload the Library before retrying.");
       }
-      await addTopics(tx, false, projectId, id, input.topics, now);
       return (await readLibraryItemRow(tx, projectId, id)).item;
     });
   }
+  async publishStill(actor: Actor, projectId: string, input: StillPublication) {
+    const { idempotencyKey, title, credit, licence, usageNote, topics } =
+      input.metadata;
+    const content: StillContent = { title, credit, licence, usageNote };
+    const { kind, crop, parentItemId, inputSha256, sourceUrl } =
+      input.provenance;
+    const retry = {
+      key: idempotencyKey,
+      fingerprint: createHash("sha256")
+        .update(
+          JSON.stringify({
+            metadata: input.metadata,
+            kind,
+            crop,
+            parentItemId,
+            inputSha256,
+            url: kind === "url" ? sourceUrl : undefined,
+            sourceId: "id" in input.source ? input.source.id : undefined,
+          }),
+        )
+        .digest("hex"),
+    };
+    const replay = async (tx: Session) => {
+      const id = await readCreateReplay(
+        tx,
+        "library_items",
+        projectId,
+        actor.userId,
+        retry,
+      );
+      if (id) return (await readLibraryItemRow(tx, projectId, id)).item;
+    };
+    const existing = await this.write(actor, projectId, replay);
+    if (existing) return existing;
+
+    const id = randomUUID();
+    const references = await keepStillAssets(
+      this.store,
+      projectId,
+      id,
+      input.images,
+    );
+
+    // Only the transaction makes the verified objects reachable. A failed
+    // transaction may leave unreferenced versions, never a partially saved still.
+    return this.write(actor, projectId, async (tx) => {
+      await lockSourceIdentity(tx, projectId);
+      const winner = await replay(tx);
+      if (winner) return winner;
+
+      let sourceId: string;
+      if ("id" in input.source) {
+        sourceId = input.source.id;
+        const source = await readLibrarySource(tx, projectId, sourceId);
+        if (
+          input.provenance.kind === "page_picture" &&
+          source.kind !== "web_page"
+        ) {
+          throw new CatalogConflictError(
+            "Choose a web-page source for the picture.",
+          );
+        }
+      } else {
+        sourceId = randomUUID();
+        if (
+          !(await insertLibrarySource(
+            tx,
+            projectId,
+            sourceId,
+            actor.userId,
+            input.source.create,
+          ))
+        ) {
+          throw new CatalogConflictError(
+            "Could not create the image source. Try again.",
+          );
+        }
+      }
+      const inserted = await insertLibraryItem(
+        tx,
+        projectId,
+        id,
+        actor.userId,
+        this.now().toISOString(),
+        { kind: "still", sourceId, content, notes: "", topics },
+        retry,
+      );
+      if (!inserted)
+        throw new CatalogConflictError(
+          "This idempotency key was already used for a different request.",
+        );
+      await insertStillAssets(tx, projectId, id, references, input.provenance);
+      return (await readLibraryItemRow(tx, projectId, id)).item;
+    });
+  }
+
+  async getStillManifest(actor: Actor, projectId: string, itemId: string) {
+    await this.authorizeRead(actor, projectId);
+    return readStillManifest(this.db, projectId, itemId);
+  }
+
+  async getStillObject(
+    actor: Actor,
+    projectId: string,
+    itemId: string,
+    role: StillAssetRole,
+  ) {
+    await this.authorizeRead(actor, projectId);
+    return readStillObject(this.db, this.store, projectId, itemId, role);
+  }
+
   async updateItem(
     actor: Actor,
     projectId: string,

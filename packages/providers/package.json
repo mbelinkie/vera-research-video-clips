@@ -7,6 +7,7 @@
     ".": "./src/index.ts",
     "./alignment-local": "./src/alignment-local.ts",
     "./captions-local": "./src/captions-local.ts",
+    "./public-egress": "./src/public-egress.ts",
     "./speech-whisper-cpp": "./src/speech-whisper-cpp.ts",
     "./translation-aws": "./src/translation-aws.ts"
   },

@@ -1,5 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
-import { PublicEgressGuard, type TransportRequest } from "./timeline-egress.ts";
+import {
+  PublicEgressGuard,
+  type TransportRequest,
+} from "@research-video/providers/public-egress";
 
 const url = "https://allowed.fixture.example/article";
 const approved = { address: "93.184.216.34", family: 4 as const };

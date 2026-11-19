@@ -12,7 +12,7 @@ import {
   NodePinnedTransport,
   PublicEgressGuard,
   SystemDnsResolver,
-} from "./timeline-egress.ts";
+} from "@research-video/providers/public-egress";
 
 type FindPage = Pick<PublicEgressGuard, "fetch">;
 type FailureReason = Extract<WebPageExtraction, { status: "failed" }>["reason"];

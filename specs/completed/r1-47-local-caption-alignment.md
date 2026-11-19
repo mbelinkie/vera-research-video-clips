@@ -140,12 +140,29 @@ embedded format URLs do not overflow the command's output limit. YouTube's
 live chat entry is excluded from caption selection. Empty timed cues are
 skipped so a placeholder cannot discard the surrounding speech.
 
-## Remaining issue acceptance
+## Acceptance and delivery
 
-Repeat the generated-source playback check with an authorized video that has
-no available captions in the normal acquisition configuration. Two NASA
-candidate videos exposed zero manual and automatic tracks, and neither
-produced a verified spoken transcript in the live run.
+Matthew approved disabling caption acquisition to exercise the no-caption
+path. The Sintel test used the normal browser, worker, whisper.cpp, alignment,
+publication, and playback flow with `CAPTION_PROVIDER=disabled`. The NASA test
+used real downloaded manual captions. Both previews looped at the selected
+bounds, and Chrome rendered the unaligned markers on the generated track.
+The Intel Mac timings are recorded on #47.
+
+Focused local checks passed, including 108 worker/transcript tests and two
+Chrome Playwright tests for preview boundaries, reselection, and manual seeks.
+After the caption discovery and blank-cue fixes, 67 focused tests and
+`npm run check` passed. [GitHub Test on the implementation head](https://github.com/mbelinkie/vera-research-video-clips/actions/runs/44613146580)
+
+The provider, worker, configuration, normalized contracts, local transcript
+index, and browser preview changed. SQLite migration `0006_acoustic_alignment`
+adds optional provenance and token status. Shared bundles and older cached
+tracks remain readable. The recovery marker covers retries sharing the same
+local scratch directory.
+
+Implementation commits are `1a465be` (caption adapter), `f22e317` (generated
+handoff and persistence), `d5074cc` (worker and playback), and `562a19d`
+(caption discovery and normalization fixes).
 
 Hosted execution, audio cleanup, replacing the recognizer, regenerating cached
 transcripts, and Resolve work are outside this slice.

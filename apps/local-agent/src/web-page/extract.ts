@@ -5,7 +5,7 @@ import type {
   ImportWebPageRequest,
   WebPageExtraction,
 } from "@research-video/contracts";
-import { inspectPublicUrl } from "./timeline-egress.ts";
+import { inspectPublicUrl } from "@research-video/providers/public-egress";
 
 type Metadata = Extract<
   ImportWebPageRequest,
