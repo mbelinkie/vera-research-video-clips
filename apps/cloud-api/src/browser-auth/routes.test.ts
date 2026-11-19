@@ -17,8 +17,13 @@ afterEach(async () => {
 });
 const origin = "https://research.example";
 const names = [randomUUID(), randomUUID()];
-function identityProvider(now: () => number): IdentityProvider {
-  const tokens = (code: string): VerifiedTokens => ({
+type TestIdentity = "alice" | "bob";
+function identityProvider(
+  now: () => number,
+  emails: Record<TestIdentity, string | null>,
+): IdentityProvider {
+  const tokens = (code: TestIdentity): VerifiedTokens => ({
+    ...(emails[code] ? { verifiedEmail: emails[code] } : {}),
     subject: `cognito:https://cognito-idp.us-east-1.amazonaws.com/us-east-1_Test#${code === "alice" ? names[0] : names[1]}`,
     accessToken: "hidden",
     refreshToken: "hidden-refresh",
@@ -32,7 +37,7 @@ function identityProvider(now: () => number): IdentityProvider {
       return "https://idp.example/logout";
     },
     async exchange(code) {
-      if (!["alice", "bob"].includes(code)) throw Error("invalid code");
+      if (code !== "alice" && code !== "bob") throw Error("invalid code");
       return tokens(code);
     },
     async refresh(_refresh, subject) {
@@ -42,19 +47,24 @@ function identityProvider(now: () => number): IdentityProvider {
   };
 }
 async function setup() {
+  let now = 1000;
+  const emails: Record<TestIdentity, string | null> = {
+    alice: "alice@example.com",
+    bob: "bob@example.com",
+  };
   const db = new PGlite();
   dbs.push(db);
   await runCloudMigrations(db);
   const catalog = new SharedProjectCatalog(
     db,
     new MemoryTranscriptObjectStore(),
+    () => new Date(now),
   );
-  let now = 1000;
   const auth = createBrowserAuth({
     publicOrigin: origin,
     trustedProxyPeers: ["127.0.0.1"],
     catalog,
-    provider: identityProvider(() => now),
+    provider: identityProvider(() => now, emails),
     now: () => now,
   });
   const app = createCloudApi({
@@ -120,6 +130,7 @@ async function setup() {
     app,
     db,
     catalog,
+    emails,
     login,
     inject,
     advance: (ms: number) => {
@@ -129,6 +140,92 @@ async function setup() {
 }
 
 describe("browser BFF and catalog authorization", () => {
+  it("limits exact grants to Owners and available registered verified addresses", async () => {
+    const { login, emails, inject, advance } = await setup();
+    const alice = await login("alice");
+    const bob = await login("bob");
+    const post = (session: typeof alice, path: string, payload: object) =>
+      inject({
+        method: "POST",
+        url: "/cloud-api/api" + path,
+        headers: {
+          cookie: session.cookie,
+          origin,
+          "x-vera-csrf": session.csrf,
+        },
+        payload,
+      });
+    const register = (session: typeof alice, displayName: string) =>
+      post(session, "/session/register", { displayName });
+    expect((await register(alice, "Alice")).statusCode).toBe(200);
+    const project = (
+      await post(alice, "/projects", { name: "Email proof" })
+    ).json<{ id: string }>();
+    const base = `/projects/${project.id}`;
+    const grant = (session: typeof alice, email: string, role = "editor") =>
+      post(session, base + "/members/by-email", { email, role });
+    const read = (session: typeof alice, path: string) =>
+      inject({
+        method: "GET",
+        url: "/cloud-api/api" + base + path,
+        headers: { cookie: session.cookie },
+      });
+    const missing = await grant(alice, "missing@example.com");
+    const unregistered = await grant(alice, "bob@example.com");
+    expect(missing.statusCode).toBe(404);
+    expect(unregistered.json()).toEqual(missing.json());
+    expect(missing.body).not.toContain("missing@example.com");
+    expect((await grant(alice, "bob@example.com", "owner")).statusCode).toBe(
+      400,
+    );
+    expect((await register(bob, "Bob")).statusCode).toBe(200);
+    expect((await grant(bob, "alice@example.com")).statusCode).toBe(403);
+    expect((await read(bob, "/my-membership")).statusCode).toBe(403);
+    expect((await grant(alice, "BOB@EXAMPLE.COM")).statusCode).toBe(204);
+    expect((await read(bob, "/my-membership")).json()).toMatchObject({
+      membership: { role: "editor" },
+    });
+    expect((await read(bob, "/members")).statusCode).toBe(403);
+    expect((await grant(bob, "missing@example.com")).statusCode).toBe(403);
+    const roster = await read(alice, "/members");
+    expect(roster.json()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          displayName: "Bob",
+          verifiedEmail: "bob@example.com",
+          role: "editor",
+        }),
+      ]),
+    );
+    expect(roster.body).not.toContain("externalSubject");
+
+    // A second subject verified the same address. It cannot implicitly take
+    // over the first account's address or receive access for a new project.
+    advance(100);
+    emails.bob = "alice@example.com";
+    const duplicate = await login("bob");
+    expect(JSON.stringify(duplicate.state)).not.toContain("alice@example.com");
+    expect((await grant(alice, "alice@example.com")).json()).toEqual(
+      missing.json(),
+    );
+    advance(100);
+    emails.bob = null;
+    await login("bob");
+    expect((await grant(alice, "bob@example.com")).json()).toEqual(
+      missing.json(),
+    );
+    // A still-valid older session cannot restore the old association.
+    expect((await register(bob, "Bob")).statusCode).toBe(200);
+    expect((await grant(alice, "bob@example.com")).json()).toEqual(
+      missing.json(),
+    );
+
+    for (let i = 0; i < 4; i++) {
+      expect((await grant(alice, "missing@example.com")).statusCode).toBe(404);
+    }
+    expect((await grant(alice, "missing@example.com")).statusCode).toBe(429);
+  });
+
   it("binds two invited identities to distinct stable actors and live membership checks", async () => {
     const { db, catalog, login, inject } = await setup();
     const alice = await login("alice");

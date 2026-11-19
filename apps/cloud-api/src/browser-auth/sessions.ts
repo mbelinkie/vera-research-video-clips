@@ -29,6 +29,7 @@ export function readCookie(
 export type ServerSession = {
   subject: string;
   tokens: VerifiedTokens;
+  memberEmail: { email: string | null; observedAt: Date };
   csrf: string;
   createdAtMs: number;
   lastSeenMs: number;
@@ -44,7 +45,10 @@ export class MemorySessionStore {
     private readonly absoluteMs = 28_800_000,
     private readonly cap = 1000,
   ) {}
-  create(tokens: VerifiedTokens): { id: string; session: ServerSession } {
+  create(
+    tokens: VerifiedTokens,
+    observedAtMs = this.now(),
+  ): { id: string; session: ServerSession } {
     const time = this.now();
     for (const [key, session] of this.sessions)
       if (session.revoked || this.expired(session, time))
@@ -55,6 +59,10 @@ export class MemorySessionStore {
     const session: ServerSession = {
       subject: tokens.subject,
       tokens,
+      memberEmail: {
+        email: tokens.verifiedEmail ?? null,
+        observedAt: new Date(observedAtMs),
+      },
       csrf: secret(),
       createdAtMs: time,
       lastSeenMs: time,

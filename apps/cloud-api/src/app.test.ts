@@ -1222,9 +1222,10 @@ describe("cloud API", () => {
     expect(listed.json<Record<string, unknown>[]>()[0]).not.toHaveProperty(
       "externalSubject",
     );
-    expect(listed.json<Record<string, unknown>[]>()[0]).not.toHaveProperty(
-      "displayName",
-    );
+    expect(listed.json()[0]).toMatchObject({
+      displayName: "owner",
+      verifiedEmail: null,
+    });
     for (const current of [editor, viewer, outsider]) {
       expect(
         (
