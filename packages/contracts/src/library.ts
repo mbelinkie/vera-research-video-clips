@@ -104,7 +104,12 @@ const LicenceFields = {
   licence: TextSchema.trim().min(1).max(2000).optional(),
   usageNote: NotesSchema.optional(),
 };
-const AudioRoleSchema = z.enum(["sound_effect", "ambience", "music", "speech"]);
+export const AudioRoleSchema = z.enum([
+  "sound_effect",
+  "ambience",
+  "music",
+  "speech",
+]);
 export const WebPageExtractionSchema = z.discriminatedUnion("status", [
   z.strictObject({ status: z.literal("ready"), text: ExcerptSchema }),
   z.strictObject({
@@ -376,6 +381,53 @@ export const StillProvenanceUrlSchema = WebUrlSchema.refine((value) => {
   const url = new URL(value);
   return !url.username && !url.password;
 }, "Image provenance URLs must not contain credentials.");
+
+export const MaxAudioBytes = 50 * 1024 * 1024;
+export const MaxAudioDurationMs = 30 * 60 * 1000;
+export const AudioPreviewLimitMs = 15_000;
+export const AudioPeakCount = 256;
+
+const AudioChecksumSchema = z.string().regex(/^[0-9a-f]{64}$/u);
+const AudioAnalysisSchema = z.strictObject({
+  durationMs: z.number().int().positive().max(MaxAudioDurationMs),
+  peaks: z.array(z.number().min(0).max(1)).length(AudioPeakCount),
+});
+
+const AudioImportFields = {
+  title: TitleSchema,
+  role: AudioRoleSchema.optional(),
+  idempotencyKey: IdempotencyKeySchema.unwrap(),
+};
+export const AudioFileImportSchema = AudioAnalysisSchema.extend({
+  ...AudioImportFields,
+  originalSha256: AudioChecksumSchema,
+  previewBase64: z.base64().max(321_000),
+});
+export const AudioUrlImportSchema = z.strictObject({
+  ...AudioImportFields,
+  url: WebUrlSchema,
+});
+export const AudioMimeSchema = z.enum([
+  "audio/mpeg",
+  "audio/wav",
+  "audio/mp4",
+  "audio/ogg",
+  "audio/flac",
+  "audio/webm",
+]);
+export const AudioAssetManifestSchema = AudioAnalysisSchema.extend({
+  playbackSha256: AudioChecksumSchema,
+  playbackDurationMs: z.number().int().positive().max(MaxAudioDurationMs),
+  mimeType: AudioMimeSchema,
+  origin: z.discriminatedUnion("kind", [
+    z.strictObject({ kind: z.literal("url") }),
+    z.strictObject({
+      kind: z.literal("file"),
+      originalSha256: AudioChecksumSchema,
+    }),
+  ]),
+});
+export type AudioAssetManifest = z.infer<typeof AudioAssetManifestSchema>;
 
 export const StillUploadSchema = StillContentSchema.extend({
   title: TitleSchema,

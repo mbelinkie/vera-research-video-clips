@@ -51,6 +51,11 @@ import {
   type VideoMetadataProvider,
 } from "@research-video/providers";
 
+import {
+  registerAudioRoutes,
+  type PublicAudioReader,
+  type PublicAudioPreparation,
+} from "./audio-import.ts";
 import { registerStillRoutes, type PublicStillReader } from "./still-import.ts";
 
 export interface CloudApiDependencies {
@@ -59,6 +64,8 @@ export interface CloudApiDependencies {
   authenticate(request: FastifyRequest): Promise<AuthenticatedActor>;
   videoMetadataProvider?: VideoMetadataProvider;
   publicStillReader?: PublicStillReader;
+  publicAudioReader?: PublicAudioReader;
+  publicAudioPreparation?: PublicAudioPreparation;
   localArtifacts?: {
     store: TranscriptObjectStore;
     issuer: LocalStagedUploadUrlIssuer;
@@ -371,6 +378,9 @@ export function createCloudApi(
     },
   );
 
+  app.register(async (audioRoutes) => {
+    registerAudioRoutes(audioRoutes, dependencies);
+  });
   app.register(async (stillRoutes) => {
     registerStillRoutes(stillRoutes, dependencies);
   });

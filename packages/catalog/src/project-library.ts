@@ -2,10 +2,13 @@ import { createHash, randomUUID } from "node:crypto";
 import type { PGlite } from "@electric-sql/pglite";
 import { requirePermission } from "@research-video/auth";
 import {
+  AudioAssetManifestSchema,
   CreateItemRequestSchema,
   CreateSourceRequestSchema,
   LibrarySourceSchema,
   LibraryItemSchema,
+  type AudioAssetManifest,
+  type LibraryItem,
   type AuthenticatedActor,
   type ProjectRole,
   type CreateSourceRequest,
@@ -31,6 +34,13 @@ import {
   readStillObject,
   type StillImages,
 } from "./library-still-assets.ts";
+import {
+  audioDigest,
+  insertAudioReference,
+  keepAudioAsset,
+  readAudioPlayback,
+  readAudioReference,
+} from "./library-audio-assets.ts";
 import {
   CatalogConflictError,
   CatalogNotFoundError,
@@ -97,6 +107,20 @@ type StillPublication = {
   provenance: StillAssetManifest["provenance"];
   images: StillImages;
 };
+
+async function validateAudioSelection(
+  tx: Session,
+  projectId: string,
+  sourceId: string,
+  content: Extract<LibraryItem, { kind: "audio" }>["content"],
+) {
+  const ref = await readAudioReference(tx, projectId, sourceId);
+  if (!ref) return;
+  if (!content.title || content.endMs > ref.manifest.durationMs)
+    throw new CatalogConflictError(
+      "Name the selection and keep its in and out within the source duration.",
+    );
+}
 
 async function insertLibrarySource(
   tx: Session,
@@ -363,6 +387,13 @@ export class ProjectLibrary {
         return (await readLibraryItemRow(tx, projectId, existing)).item;
 
       const source = await readLibrarySource(tx, projectId, input.sourceId);
+      if (input.kind === "audio")
+        await validateAudioSelection(
+          tx,
+          projectId,
+          input.sourceId,
+          input.content,
+        );
       if (input.kind === "clip" && source.kind === "youtube")
         throw new CatalogConflictError(
           "Logging a YouTube clip requires its transcript selection and idempotency key in the clip field.",
@@ -388,6 +419,83 @@ export class ProjectLibrary {
       return (await readLibraryItemRow(tx, projectId, id)).item;
     });
   }
+  async publishAudio(
+    actor: Actor,
+    projectId: string,
+    input: CreateSourceRequest,
+    analysis: Omit<AudioAssetManifest, "playbackSha256">,
+    bytes: Uint8Array,
+  ) {
+    if (input.kind !== "audio" || !input.idempotencyKey)
+      throw new CatalogConflictError(
+        "Audio publication requires an audio source and retry key.",
+      );
+    const manifest = AudioAssetManifestSchema.parse({
+      ...analysis,
+      playbackSha256: audioDigest(bytes),
+    });
+    const retry = {
+      key: input.idempotencyKey,
+      fingerprint: createHash("sha256")
+        .update(JSON.stringify({ input, manifest }))
+        .digest("hex"),
+    };
+    const replay = async (tx: Session) => {
+      const id = await readCreateReplay(
+        tx,
+        "library_sources",
+        projectId,
+        actor.userId,
+        retry,
+      );
+      if (id) return readLibrarySource(tx, projectId, id);
+    };
+    const existing = await this.write(actor, projectId, replay);
+    if (existing) return existing;
+
+    const id = randomUUID();
+    const ref = await keepAudioAsset(
+      this.store,
+      projectId,
+      id,
+      manifest,
+      bytes,
+    );
+    return this.write(actor, projectId, async (tx) => {
+      await lockSourceIdentity(tx, projectId);
+      const winner = await replay(tx);
+      if (winner) return winner;
+      if (
+        !(await insertLibrarySource(
+          tx,
+          projectId,
+          id,
+          actor.userId,
+          input,
+          retry,
+        ))
+      )
+        throw new CatalogConflictError(
+          "Could not create this audio source. Try again.",
+        );
+      await insertAudioReference(tx, projectId, id, ref);
+      return readLibrarySource(tx, projectId, id);
+    });
+  }
+
+  async getAudioManifest(actor: Actor, projectId: string, sourceId: string) {
+    await this.authorizeRead(actor, projectId);
+    const ref = await readAudioReference(this.db, projectId, sourceId);
+    if (!ref) throw new CatalogNotFoundError("This source has no kept audio.");
+    return ref.manifest;
+  }
+
+  async getAudioPlayback(actor: Actor, projectId: string, sourceId: string) {
+    await this.authorizeRead(actor, projectId);
+    const ref = await readAudioReference(this.db, projectId, sourceId);
+    return readAudioPlayback(this.store, projectId, sourceId, ref);
+  }
+
   async publishStill(actor: Actor, projectId: string, input: StillPublication) {
     const { idempotencyKey, title, credit, licence, usageNote, topics } =
       input.metadata;
@@ -541,6 +649,13 @@ export class ProjectLibrary {
         ...item,
         content,
       });
+      if (updated.kind === "audio" && input.content)
+        await validateAudioSelection(
+          tx,
+          projectId,
+          updated.sourceId,
+          updated.content,
+        );
       const now = this.now().toISOString();
       let saved;
       if (legacy && item.kind === "clip" && updated.kind === "clip") {
