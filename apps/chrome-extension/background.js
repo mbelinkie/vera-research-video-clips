@@ -152,6 +152,7 @@ async function assertContext(
     );
   }
   if (
+    !context.youtubeIdentity &&
     (activationEpoch.get(context.windowId) ?? 0) !== context.activationEpoch
   ) {
     throw new CaptureSafetyError("The capture tab was switched during capture");
@@ -375,7 +376,6 @@ function youtubeSessionValue(record) {
             videoKey: context.youtubeIdentity.videoKey,
           }
         : null,
-      activationEpoch: context.activationEpoch,
     },
   };
 }

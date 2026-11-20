@@ -78,6 +78,7 @@ describe("browser captures", () => {
       url: "https://www.youtube.com/watch?v=M7lc1UVf-VE",
     };
     for (const youtubeDetails of [
+      { kind: "general" },
       { kind: "general", reason: "" },
       { kind: "general", reason: "x".repeat(200) },
       { kind: "moment", timecodeMs: 0, note: "" },

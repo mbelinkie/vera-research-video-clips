@@ -631,7 +631,7 @@ export type ExtensionCaptureRequest = z.infer<
 export const YouTubeCaptureDetailsSchema = z.discriminatedUnion("kind", [
   z.strictObject({
     kind: z.literal("general"),
-    reason: TextSchema.trim().max(200),
+    reason: TextSchema.trim().max(200).optional(),
   }),
   z.strictObject({
     kind: z.literal("moment"),

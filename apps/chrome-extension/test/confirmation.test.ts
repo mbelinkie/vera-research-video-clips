@@ -126,6 +126,7 @@ it("prefills and explicitly clears a general YouTube reason", async () => {
   const fixture = await runConfirmation();
   expect(fixture.byId("reason").value).toBe("Compare this video.");
   fixture.byId("reason").value = "";
+  fixture.byId("reason").oninput!();
   fixture.byId("project").value = "project";
   await fixture.byId("save").onsubmit!({ preventDefault() {} });
   expect(fixture.captures[0]).toEqual({
@@ -146,6 +147,11 @@ it("waits for the selected project's reason before enabling an untouched general
   finishLookup();
   await vi.waitFor(() => expect(fixture.byId("submit").disabled).toBe(false));
   expect(fixture.byId("reason").value).toBe("Compare this video.");
+  await fixture.byId("save").onsubmit!({ preventDefault() {} });
+  expect(fixture.captures[0]).toMatchObject({
+    youtubeDetails: { kind: "general" },
+  });
+  expect(fixture.captures[0]).not.toHaveProperty("youtubeDetails.reason");
 });
 
 it("samples a frozen time once and sends a separate moment note", async () => {

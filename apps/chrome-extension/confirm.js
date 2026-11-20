@@ -333,7 +333,10 @@ byId("save").onsubmit = async (event) => {
             timecodeMs: sampledPlayheadMs,
             note: note.value.trim(),
           }
-        : { kind: "general", reason: reason.value.trim() };
+        : {
+            kind: "general",
+            ...(reasonDirty.get(projectId) && { reason: reason.value.trim() }),
+          };
       if (
         details.kind === "moment" &&
         (!Number.isSafeInteger(details.timecodeMs) || details.timecodeMs < 0)

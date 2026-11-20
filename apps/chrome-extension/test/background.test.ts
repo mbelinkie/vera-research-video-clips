@@ -514,6 +514,10 @@ describe("capture worker", () => {
       },
     });
     await loadWorker(first.chrome);
+    first.tabsOnActivated.dispatch({
+      windowId: source.windowId,
+      tabId: source.id,
+    });
     const start = await runtimeMessage(
       first,
       { type: "vera.capture.start", kind: "youtube" },

@@ -1177,7 +1177,7 @@ export class SharedProjectCatalog {
           detailsFingerprint,
         ],
       );
-      if (details?.kind === "general") {
+      if (details?.kind === "general" && details.reason !== undefined) {
         await tx.query(
           `UPDATE library_sources
            SET youtube_reason=$3, youtube_reason_updated_by=$4,

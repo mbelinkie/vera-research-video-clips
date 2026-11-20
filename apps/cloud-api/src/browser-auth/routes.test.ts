@@ -778,6 +778,12 @@ it("keeps one project reason and independent YouTube moments across replays", as
   expect(
     (await post(path, alice.client, { ...first, url: alias })).json(),
   ).toEqual(blank.json());
+  const untouched = await post(
+    path,
+    alice.client,
+    capture({ kind: "general" }),
+  );
+  expect(untouched.statusCode, untouched.body).toBe(201);
   const reason = (await read(detailsPath, bob.cookie)).reason;
   expect(reason).toMatchObject({
     text: "Use the interview",
