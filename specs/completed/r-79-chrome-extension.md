@@ -27,5 +27,13 @@ The local full check passed with 358 tests passing and three skipped. Formatting
 - The still menu preserved the image URL, page URL and alt text. The kept original matched the captured bytes. The audio link menu registered an audio source for the selected file URL.
 - Two native YouTube menu saves on a disposable watch page produced one video source and one transcription batch. The source and batch returned the same two distinct attributed comments. Research stored 8,122 ms for the checked playhead. The unchecked submission omitted the position and Research returned null. The fixture supplied local playback and a synthetic metadata response for its video ID.
 - The Producer saved a quote from a signed-in paywalled article and confirmed Chrome returned to the same reading position. The local Research project returned the saved quote, title, URL, byline and both verified picture revisions. The headline was visible in the top picture and the saved highlight covered the quote in the passage picture.
-- A complete quote save now closes its confirmation window after briefly showing the receipt. An incomplete picture save keeps the receipt open so the repair code can be copied. Merge remains pending. The source marker editor remains a separate product decision.
+- A complete quote save now closes its confirmation window after briefly showing the receipt. An incomplete picture save keeps the receipt open so the repair code can be copied.
 - Quote capture scrolls the article panel and the outer page to the top. Chrome captures clean pictures and stores highlight coordinates separately. The browser fixture checks distinct top and passage views, clean pixels, matching highlight bounds, and restoration of the original scroll and selection.
+
+- The YouTube confirmation shows an enabled, unchecked timecode only when Chrome reads a usable position. A hidden ad overlay no longer hides the control, and an active ad leaves it disabled with an explanation. The real Chrome test verifies both states with seekable fixture media.
+- The Producer accepted closure after reviewing the signed-in capture. The final implementation at `b281725` passed the full local check, the opt-in real Chrome regression test, and the protected [GitHub Test run](https://github.com/mbelinkie/vera-research-video-clips/actions/runs/44660834916).
+
+## Follow-ups
+
+- The [Producer's visual design re-review](https://github.com/mbelinkie/vera-research-video-clips/issues/75) covers the extension pop-ups and success notification.
+- The [taller top picture](https://github.com/mbelinkie/vera-research-video-clips/issues/95), [automatic ad detection and white-out feasibility](https://github.com/mbelinkie/vera-research-video-clips/issues/96), and [visual still cropping](https://github.com/mbelinkie/vera-research-video-clips/issues/97) are independent follow-ups. The source marker editor remains a separate product decision.
