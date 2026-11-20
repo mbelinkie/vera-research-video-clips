@@ -34,6 +34,15 @@ import {
   type StillImages,
 } from "./library-still-assets.ts";
 import {
+  assertReferencePictureOwner,
+  checkReferencePictureRevision,
+  keepReferencePictureAssets,
+  readReferencePictureManifest,
+  readReferencePictureObject,
+  replaceReferencePictureRows,
+  type ReferencePictureOwnerKind,
+} from "./library-reference-pictures.ts";
+import {
   extensionCaptureFingerprint,
   insertExtensionCaptureAssets,
   keepExtensionCaptureAssets,
@@ -292,6 +301,97 @@ export class ProjectLibrary {
   async listItems(actor: Actor, projectId: string, input: ItemListQuery) {
     await this.authorizeRead(actor, projectId);
     return listLibraryItems(this.db, projectId, input);
+  }
+  async authorizeReferencePictureWrite(
+    actor: Actor,
+    projectId: string,
+    kind: ReferencePictureOwnerKind,
+    ownerId: string,
+  ) {
+    await this.write(actor, projectId, (tx) =>
+      assertReferencePictureOwner(tx, projectId, kind, ownerId),
+    );
+  }
+  async putReferencePicture(
+    actor: Actor,
+    projectId: string,
+    kind: ReferencePictureOwnerKind,
+    ownerId: string,
+    expectedRevisionId: string | null,
+    images: StillImages,
+  ) {
+    // No object is retained before checking membership and its exact owner.
+    await this.authorizeReferencePictureWrite(actor, projectId, kind, ownerId);
+    const kept = await keepReferencePictureAssets(
+      this.store,
+      projectId,
+      kind,
+      ownerId,
+      images,
+    );
+    return this.write(actor, projectId, async (tx) => {
+      await assertReferencePictureOwner(tx, projectId, kind, ownerId, true);
+      await replaceReferencePictureRows(
+        tx,
+        projectId,
+        kind,
+        ownerId,
+        expectedRevisionId,
+        kept,
+      );
+      return readReferencePictureManifest(tx, projectId, kind, ownerId);
+    });
+  }
+  async getReferencePictureManifest(
+    actor: Actor,
+    projectId: string,
+    kind: ReferencePictureOwnerKind,
+    ownerId: string,
+  ) {
+    await this.authorizeRead(actor, projectId);
+    await assertReferencePictureOwner(this.db, projectId, kind, ownerId);
+    return readReferencePictureManifest(this.db, projectId, kind, ownerId);
+  }
+  async getReferencePictureObject(
+    actor: Actor,
+    projectId: string,
+    kind: ReferencePictureOwnerKind,
+    ownerId: string,
+    role: StillAssetRole,
+  ) {
+    await this.authorizeRead(actor, projectId);
+    await assertReferencePictureOwner(this.db, projectId, kind, ownerId);
+    return readReferencePictureObject(
+      this.db,
+      this.store,
+      projectId,
+      kind,
+      ownerId,
+      role,
+    );
+  }
+  async deleteReferencePicture(
+    actor: Actor,
+    projectId: string,
+    kind: ReferencePictureOwnerKind,
+    ownerId: string,
+    expectedRevisionId: string,
+  ) {
+    return this.write(actor, projectId, async (tx) => {
+      await assertReferencePictureOwner(tx, projectId, kind, ownerId, true);
+      await checkReferencePictureRevision(
+        tx,
+        projectId,
+        kind,
+        ownerId,
+        expectedRevisionId,
+      );
+      await tx.query(
+        `DELETE FROM library_reference_pictures
+         WHERE project_id=$1 AND owner_kind=$2 AND owner_id=$3`,
+        [projectId, kind, ownerId],
+      );
+    });
   }
   private write<T>(
     actor: Actor,

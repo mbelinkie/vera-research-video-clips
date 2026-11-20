@@ -61,6 +61,7 @@ import {
 } from "@research-video/providers";
 
 import { registerStillRoutes, type PublicStillReader } from "./still-import.ts";
+import { registerLibraryReferencePictureRoutes } from "./library-reference-pictures.ts";
 
 export interface CloudApiDependencies {
   catalog: SharedProjectCatalog;
@@ -505,6 +506,9 @@ export function createCloudApi(
 
   app.register(async (stillRoutes) => {
     registerStillRoutes(stillRoutes, dependencies);
+  });
+  app.register(async (pictureRoutes) => {
+    registerLibraryReferencePictureRoutes(pictureRoutes, dependencies);
   });
 
   app.post("/api/projects/:projectId/sources", async (request, reply) => {
