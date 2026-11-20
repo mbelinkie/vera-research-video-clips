@@ -92,6 +92,9 @@ describe("local Intel desktop package boundary", () => {
       'void mainWindow.loadURL("rvc://app/index.html")',
     );
     expect(activation).not.toContain("installYouTubePlayerIdentification");
+    expect(main).toContain(
+      'app.on("window-all-closed", () => {\n    mainWindow = undefined;\n    if (process.platform !== "darwin") app.quit();',
+    );
     expect(main).not.toMatch(/partition:\s*["']/u);
   });
 
