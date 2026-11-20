@@ -243,6 +243,31 @@
 
   async function prepareQuote() {
     const { range, text } = selectionRange();
+    const anchor =
+      range.startContainer instanceof Element
+        ? range.startContainer
+        : range.startContainer.parentElement;
+    const scrollContainers = [];
+    const scrollable = /^(auto|scroll|hidden|overlay)$/;
+    for (
+      let element = anchor;
+      element && element !== document.scrollingElement;
+      element = element.parentElement
+    ) {
+      const { overflowX, overflowY } = getComputedStyle(element);
+      if (
+        (element.scrollHeight > element.clientHeight &&
+          scrollable.test(overflowY)) ||
+        (element.scrollWidth > element.clientWidth &&
+          scrollable.test(overflowX))
+      ) {
+        scrollContainers.push({
+          element,
+          left: element.scrollLeft,
+          top: element.scrollTop,
+        });
+      }
+    }
     const original = {
       x: window.scrollX,
       y: window.scrollY,
@@ -255,10 +280,6 @@
     if (!rectangles.length)
       throw new Error("The selected passage is not visible");
     if (clipped(rectangles)) {
-      const anchor =
-        range.startContainer instanceof Element
-          ? range.startContainer
-          : range.startContainer.parentElement;
       anchor?.scrollIntoView({
         block: "center",
         inline: "nearest",
@@ -274,8 +295,8 @@
       range,
       text,
       original,
-      identity: pageIdentity(),
-      rectangles,
+      anchor,
+      scrollContainers,
       before: textAroundRange(range, true),
       after: textAroundRange(range, false),
     };
@@ -287,7 +308,6 @@
     const rectangles = visibleRectangles(quoteState.range);
     if (!rectangles.length || clipped(rectangles))
       throw new Error("The selected passage moved out of view");
-    quoteState.rectangles = rectangles;
     return {
       ...pageIdentity(),
       metadata: metadata(),
@@ -303,18 +323,25 @@
 
   async function scrollTop() {
     if (!quoteState) throw new Error("Quote capture is not prepared");
+    const { scrollContainers } = quoteState;
+    // The cloned range still gives us the passage bounds after clearing its paint.
+    window.getSelection()?.removeAllRanges();
+    for (const { element } of scrollContainers)
+      element.scrollTo({ left: 0, top: 0, behavior: "instant" });
     window.scrollTo({ left: 0, top: 0, behavior: "instant" });
     await stablePaint();
-    return pageIdentity();
+    return {
+      atTop:
+        Math.abs(window.scrollY) < 1 &&
+        scrollContainers.every(
+          ({ element }) => Math.abs(element.scrollTop) < 1,
+        ),
+    };
   }
 
   async function scrollSelection() {
     if (!quoteState) throw new Error("Quote capture is not prepared");
-    const anchor =
-      quoteState.range.startContainer instanceof Element
-        ? quoteState.range.startContainer
-        : quoteState.range.startContainer.parentElement;
-    anchor?.scrollIntoView({
+    quoteState.anchor?.scrollIntoView({
       block: "center",
       inline: "nearest",
       behavior: "instant",
@@ -323,25 +350,27 @@
     return quoteData();
   }
 
-  async function restore() {
-    if (!quoteState) return pageIdentity();
-    const restoreState = quoteState;
+  function restore(expectedNavigationKey) {
+    if (!quoteState || expectedNavigationKey !== navigationKey())
+      return pageIdentity();
+    const { range, original, scrollContainers } = quoteState;
     quoteState = null;
-    window.scrollTo({
-      left: restoreState.original.x,
-      top: restoreState.original.y,
-      behavior: "instant",
-    });
     const selection = window.getSelection();
     selection?.removeAllRanges();
-    selection?.addRange(restoreState.range);
+    selection?.addRange(range);
     if (
-      restoreState.original.active?.isConnected &&
-      typeof restoreState.original.active.focus === "function"
+      original.active?.isConnected &&
+      typeof original.active.focus === "function"
     ) {
-      restoreState.original.active.focus({ preventScroll: true });
+      original.active.focus({ preventScroll: true });
     }
-    await stablePaint();
+    for (const { element, left, top } of scrollContainers)
+      element.scrollTo({ left, top, behavior: "instant" });
+    window.scrollTo({
+      left: original.x,
+      top: original.y,
+      behavior: "instant",
+    });
     return pageIdentity();
   }
 
@@ -520,7 +549,7 @@
         case "vera.capture.scroll-selection":
           return { ok: true, value: await scrollSelection() };
         case "vera.capture.restore":
-          return { ok: true, value: await restore() };
+          return { ok: true, value: restore(message.navigationKey) };
         case "vera.capture.page":
           return { ok: true, value: pageData() };
         case "vera.capture.youtube-playhead":

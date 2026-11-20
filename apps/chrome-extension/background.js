@@ -314,8 +314,10 @@ async function captureQuote(context) {
   let geometry;
   try {
     await assertContext(context);
-    await sendContent(context.tabId, { type: "vera.capture.scroll-top" });
-    top = await capturePng(context);
+    const scrolled = await sendContent(context.tabId, {
+      type: "vera.capture.scroll-top",
+    });
+    if (scrolled.value.atTop) top = await capturePng(context);
     await sendContent(context.tabId, { type: "vera.capture.scroll-selection" });
     const beforeCapture = await sendContent(context.tabId, {
       type: "vera.capture.quote-data",
@@ -351,9 +353,14 @@ async function captureQuote(context) {
   } finally {
     try {
       await assertContext(context);
-      await sendContent(context.tabId, { type: "vera.capture.restore" });
     } catch (error) {
       if (isCaptureSafetyError(error)) throw error;
+    } finally {
+      // Restore the original document even when switching tabs aborted capture.
+      await sendContent(context.tabId, {
+        type: "vera.capture.restore",
+        navigationKey: context.navigationKey,
+      }).catch(() => undefined);
     }
   }
   return quotePayload(context.requestId, core, top, {

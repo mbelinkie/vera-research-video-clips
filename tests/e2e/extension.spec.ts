@@ -337,7 +337,16 @@ test.describe("Research #79 real Chrome synthetic capture", () => {
         waitUntil: "domcontentloaded",
       });
       await expect(article).toHaveURL(fixture.articleUrl);
-      const originalScrollY = await article.evaluate(() => window.scrollY);
+      const reader = article.locator("main");
+      await article
+        .locator('[data-fixture="quote"]')
+        .evaluate((element) =>
+          element.scrollIntoView({ block: "center", behavior: "instant" }),
+        );
+      const originalScrollY = await reader.evaluate(
+        (element) => element.scrollTop,
+      );
+      expect(originalScrollY).toBeGreaterThan(0);
       const expectedSelection = await article
         .locator('[data-fixture="quote"]')
         .evaluate((element) => {
@@ -467,11 +476,27 @@ test.describe("Research #79 real Chrome synthetic capture", () => {
         expect(data.equals(Buffer.from(String(submitted.data), "base64"))).toBe(
           true,
         );
-        if (asset.role === "passage") {
-          const { data: rgb, info } = await sharp(data)
-            .removeAlpha()
-            .raw()
-            .toBuffer({ resolveWithObject: true });
+        const { data: rgb, info } = await sharp(data)
+          .removeAlpha()
+          .raw()
+          .toBuffer({ resolveWithObject: true });
+        let headlinePixels = 0;
+        let selectionPixels = 0;
+        for (let i = 0; i < rgb.length; i += info.channels) {
+          if (rgb[i] === 0 && rgb[i + 1] === 140 && rgb[i + 2] === 240)
+            headlinePixels++;
+          if (rgb[i] === 0 && rgb[i + 1] === 255 && rgb[i + 2] === 0)
+            selectionPixels++;
+        }
+        expect
+          .soft(selectionPixels, asset.role + " picture has clean text")
+          .toBe(0);
+        if (asset.role === "top") {
+          expect
+            .soft(headlinePixels, "top picture includes the headline")
+            .toBeGreaterThan(0);
+        } else {
+          expect(headlinePixels, "passage picture is a distinct view").toBe(0);
           // The synthetic article uses magenta ink only for the selected words.
           // Each stored line rectangle must actually contain that ink.
           for (const box of asset.pixelRectangles) {
@@ -495,9 +520,14 @@ test.describe("Research #79 real Chrome synthetic capture", () => {
         (path) => path === "/article",
       );
       expect(articleRequests.length).toBe(1);
-      const endingScrollY = await article.evaluate(() => window.scrollY);
+      const endingScrollY = await reader.evaluate(
+        (element) => element.scrollTop,
+      );
       expect(Math.abs(endingScrollY - originalScrollY)).toBeLessThanOrEqual(1);
       await expect.poll(() => confirmation.isClosed()).toBe(true);
+      expect(
+        await article.evaluate(() => window.getSelection()?.toString()),
+      ).toBe(FIXTURE_QUOTE);
       await article.evaluate(() => window.getSelection()?.removeAllRanges());
       const pageConfirmation = await triggerPopupCapture(
         article,
