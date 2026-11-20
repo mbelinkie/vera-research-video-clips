@@ -10,6 +10,7 @@ import {
   highlightFromVisibleRects,
   pngDimensions,
 } from "./src/highlight-geometry.mjs";
+import { stitchTallTop } from "./src/tall-top.mjs";
 
 const pending = new Map();
 const statuses = new Map();
@@ -230,6 +231,30 @@ function imagePayload(capture) {
   return { data: capture.data, width: capture.width, height: capture.height };
 }
 
+async function captureTallTop(context) {
+  const first = await capturePng(context);
+  if (!first) return undefined;
+  try {
+    const step = (
+      await sendContent(context.tabId, { type: "vera.capture.top-next" })
+    ).value;
+    if (!step?.delta) return first;
+    await assertContext(context);
+    const second = await capturePng(context);
+    if (!second) return first;
+    return (
+      (await stitchTallTop(first, second, step, context.viewport)) ?? first
+    );
+  } catch (error) {
+    // A tab switch, navigation or viewport change is never a valid fallback.
+    if (isCaptureSafetyError(error)) throw error;
+    await assertContext(context);
+    // Page shifts, screenshot failures and unavailable canvas processing keep
+    // the original valid one-viewport top image.
+    return first;
+  }
+}
+
 function quotePayload(request, core, top, passage) {
   const result = {
     kind: "quote",
@@ -317,7 +342,7 @@ async function captureQuote(context) {
     const scrolled = await sendContent(context.tabId, {
       type: "vera.capture.scroll-top",
     });
-    if (scrolled.value.atTop) top = await capturePng(context);
+    if (scrolled.value.atTop) top = await captureTallTop(context);
     await sendContent(context.tabId, { type: "vera.capture.scroll-selection" });
     const beforeCapture = await sendContent(context.tabId, {
       type: "vera.capture.quote-data",
@@ -382,7 +407,7 @@ async function capturePage(context) {
     passage = await capturePng(context);
     await assertContext(context);
     await sendContent(context.tabId, { type: "vera.capture.page-top" });
-    top = await capturePng(context);
+    top = await captureTallTop(context);
   } finally {
     try {
       await assertContext(context);

@@ -30,6 +30,7 @@
     /(?:access|auth|csrf|password|secret|session|signature|sig|token)$/;
   let quoteState = null;
   let pageScrollState = null;
+  let topCaptureState = null;
 
   function navigationKey() {
     const navigation = performance.getEntriesByType("navigation")[0];
@@ -200,6 +201,88 @@
     });
   }
 
+  function scrollableArticlePanel(start) {
+    for (
+      let element = start;
+      element && element !== document.scrollingElement;
+      element = element.parentElement
+    ) {
+      const { overflowY } = getComputedStyle(element);
+      if (
+        /^(auto|scroll|overlay)$/.test(overflowY) &&
+        element.scrollHeight > element.clientHeight + 1
+      ) {
+        return element;
+      }
+    }
+    return null;
+  }
+
+  function topScrollRect(element) {
+    if (!element) {
+      return {
+        left: 0,
+        top: 0,
+        right: window.innerWidth,
+        bottom: window.innerHeight,
+      };
+    }
+    const rect = element.getBoundingClientRect();
+    return {
+      left: Math.max(0, rect.left),
+      top: Math.max(0, rect.top),
+      right: Math.min(window.innerWidth, rect.right),
+      bottom: Math.min(window.innerHeight, rect.bottom),
+    };
+  }
+
+  function startTopCapture(element) {
+    topCaptureState = { element, rect: topScrollRect(element) };
+  }
+
+  // The first screenshot has already been captured. Scroll *only* the content
+  // that contributes to the top view, leaving a generous overlap for an
+  // image-level seam check in the extension worker.
+  async function nextTopViewport() {
+    if (!topCaptureState) return { delta: 0 };
+    const { element, rect } = topCaptureState;
+    const height = rect.bottom - rect.top;
+    if (rect.right - rect.left < 80 || height < 100) return { delta: 0 };
+    const before = element ? element.scrollTop : window.scrollY;
+    const maxScroll = element
+      ? element.scrollHeight - element.clientHeight
+      : (document.scrollingElement?.scrollHeight ?? 0) - window.innerHeight;
+    const requested = Math.min(Math.floor(height * 0.7), maxScroll - before);
+    if (!Number.isFinite(requested) || requested < 40) return { delta: 0 };
+    if (element) {
+      element.scrollTo({
+        left: element.scrollLeft,
+        top: before + requested,
+        behavior: "instant",
+      });
+    } else {
+      window.scrollTo({
+        left: window.scrollX,
+        top: before + requested,
+        behavior: "instant",
+      });
+    }
+    await stablePaint();
+    const actual = (element ? element.scrollTop : window.scrollY) - before;
+    const afterRect = topScrollRect(element);
+    if (
+      !Number.isFinite(actual) ||
+      actual < 40 ||
+      actual > requested + 1 ||
+      ["left", "top", "right", "bottom"].some(
+        (key) => Math.abs(afterRect[key] - rect[key]) > 1,
+      )
+    ) {
+      return { delta: 0 };
+    }
+    return { delta: actual, rect, viewport: pageIdentity().viewport };
+  }
+
   function textAroundRange(range, before) {
     const probe = range.cloneRange();
     try {
@@ -330,16 +413,16 @@
       element.scrollTo({ left: 0, top: 0, behavior: "instant" });
     window.scrollTo({ left: 0, top: 0, behavior: "instant" });
     await stablePaint();
-    return {
-      atTop:
-        Math.abs(window.scrollY) < 1 &&
-        scrollContainers.every(
-          ({ element }) => Math.abs(element.scrollTop) < 1,
-        ),
-    };
+    const atTop =
+      Math.abs(window.scrollY) < 1 &&
+      scrollContainers.every(({ element }) => Math.abs(element.scrollTop) < 1);
+    topCaptureState = null;
+    if (atTop) startTopCapture(scrollContainers[0]?.element ?? null);
+    return { atTop };
   }
 
   async function scrollSelection() {
+    topCaptureState = null;
     if (!quoteState) throw new Error("Quote capture is not prepared");
     quoteState.anchor?.scrollIntoView({
       block: "center",
@@ -351,6 +434,7 @@
   }
 
   function restore(expectedNavigationKey) {
+    topCaptureState = null;
     if (!quoteState || expectedNavigationKey !== navigationKey())
       return pageIdentity();
     const { range, original, scrollContainers } = quoteState;
@@ -441,20 +525,41 @@
   }
 
   async function pageTop() {
-    pageScrollState = { x: window.scrollX, y: window.scrollY };
-    window.scrollTo({ left: 0, top: 0, behavior: "auto" });
+    const preferred = document.querySelector(
+      "article,[itemprop='articleBody'],main,[role='main']",
+    );
+    const element = scrollableArticlePanel(preferred);
+    pageScrollState = {
+      x: window.scrollX,
+      y: window.scrollY,
+      element,
+      left: element?.scrollLeft ?? 0,
+      top: element?.scrollTop ?? 0,
+    };
+    if (element) element.scrollTo({ left: 0, top: 0, behavior: "instant" });
+    window.scrollTo({ left: 0, top: 0, behavior: "instant" });
     await stablePaint();
+    startTopCapture(element);
     return pageIdentity();
   }
 
   async function pageRestore() {
+    topCaptureState = null;
     if (pageScrollState) {
-      window.scrollTo({
-        left: pageScrollState.x,
-        top: pageScrollState.y,
-        behavior: "auto",
-      });
+      const original = pageScrollState;
       pageScrollState = null;
+      if (original.element?.isConnected) {
+        original.element.scrollTo({
+          left: original.left,
+          top: original.top,
+          behavior: "instant",
+        });
+      }
+      window.scrollTo({
+        left: original.x,
+        top: original.y,
+        behavior: "instant",
+      });
       await stablePaint();
     }
     return pageIdentity();
@@ -573,6 +678,8 @@
           return { ok: true, value: await youtubePlayhead() };
         case "vera.capture.page-top":
           return { ok: true, value: await pageTop() };
+        case "vera.capture.top-next":
+          return { ok: true, value: await nextTopViewport() };
         case "vera.capture.page-restore":
           return { ok: true, value: await pageRestore() };
         case "vera.capture.still":

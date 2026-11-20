@@ -306,6 +306,82 @@ describe("capture worker", () => {
     expect(draft.quote.highlight.rectangles).toHaveLength(1);
   }, 10_000);
 
+  it("keeps a clean quote passage and restores selection when the extra top screenshot fails", async () => {
+    const fixture = createFixture({
+      onContent: (_tab, message) => {
+        if (message.type === "vera.capture.top-next") {
+          return {
+            ok: true,
+            value: {
+              delta: 360,
+              rect: { left: 0, top: 0, right: 800, bottom: 600 },
+              viewport: { width: 800, height: 600 },
+            },
+          };
+        }
+      },
+    });
+    fixture.chrome.tabs.captureVisibleTab
+      .mockResolvedValueOnce(PNG_DATA_URL)
+      .mockRejectedValueOnce(new Error("second screenshot unavailable"))
+      .mockResolvedValueOnce(PNG_DATA_URL);
+    await loadWorker(fixture.chrome);
+
+    const start = await runtimeMessage(
+      fixture,
+      { type: "vera.capture.start", kind: "quote" },
+      { url: fixture.chrome.runtime.getURL("popup.html") },
+    );
+    expect(start.ok).toBe(true);
+    const draft = await readDraft(fixture, start, 100);
+    const messages = fixture.chrome.tabs.sendMessage.mock.calls.map(
+      ([, message]: any[]) => message.type,
+    );
+    expect(fixture.chrome.tabs.captureVisibleTab).toHaveBeenCalledTimes(3);
+    expect(messages.indexOf("vera.capture.top-next")).toBeLessThan(
+      messages.indexOf("vera.capture.scroll-selection"),
+    );
+    expect(messages.at(-1)).toBe("vera.capture.restore");
+    expect(draft.top).toMatchObject({ width: 2, height: 3 });
+    expect(draft.passage).toMatchObject({ width: 2, height: 3 });
+    expect(draft.quote.highlight.rectangles).toEqual([
+      { x: 0, y: 0, width: 0.5, height: 1 / 3 },
+    ]);
+  }, 10_000);
+
+  it("keeps the original page top and restores the reader on an unstable stitch", async () => {
+    const fixture = createFixture({
+      onContent: (_tab, message) => {
+        if (message.type === "vera.capture.top-next") {
+          return {
+            ok: true,
+            value: {
+              delta: 360,
+              rect: { left: 0, top: 0, right: 800, bottom: 600 },
+              viewport: { width: 800, height: 600 },
+            },
+          };
+        }
+      },
+    });
+    await loadWorker(fixture.chrome);
+    const start = await runtimeMessage(
+      fixture,
+      { type: "vera.capture.start", kind: "page" },
+      { url: fixture.chrome.runtime.getURL("popup.html") },
+    );
+    expect(start.ok).toBe(true);
+    const draft = await readDraft(fixture, start, 100);
+    expect(fixture.chrome.tabs.captureVisibleTab).toHaveBeenCalledTimes(3);
+    expect(draft.top).toMatchObject({ width: 2, height: 3 });
+    expect(draft.passage).toMatchObject({ width: 2, height: 3 });
+    expect(
+      fixture.chrome.tabs.sendMessage.mock.calls.map(
+        ([, message]: any[]) => message.type,
+      ),
+    ).toContain("vera.capture.page-restore");
+  }, 10_000);
+
   it.each(["Chrome declines capture", "page cannot reach the top"])(
     "can save the quote and passage picture when %s",
     async (reason) => {
