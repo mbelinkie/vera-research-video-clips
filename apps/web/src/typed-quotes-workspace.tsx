@@ -13,10 +13,17 @@ import {
   createOfflineSourceRequest,
   createTypedQuoteRequest,
   emptyTypedQuoteDraft,
+  typedQuoteDraftFromItem,
+  updateTypedQuoteRequest,
   type OfflineSourceDraft,
   type QuoteItem,
   type TypedQuoteDraft,
 } from "./typed-quote-model.ts";
+import {
+  picturePath,
+  uploadPicture,
+  ReferencePicturePicker,
+} from "./typed-quote-pictures.tsx";
 
 type Props = {
   authorization: string;
@@ -28,6 +35,7 @@ type Props = {
 };
 
 const pageSize = 20;
+const quotePageSize = 100;
 const offlineKinds: { value: OfflineSourceDraft["subtype"]; label: string }[] =
   [
     { value: "book", label: "Book" },
@@ -116,15 +124,28 @@ export function TypedQuotesWorkspace({
   const [quotes, setQuotes] = useState<QuoteItem[]>([]);
   const [quotesError, setQuotesError] = useState<string>();
   const [quotesRetry, setQuotesRetry] = useState(0);
+  const [quoteOffset, setQuoteOffset] = useState(0);
+  const [moreQuotes, setMoreQuotes] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string>();
   const [message, setMessage] = useState<string>();
   const [focusSavedId, setFocusSavedId] = useState<string>();
+  const [editingItem, setEditingItem] = useState<QuoteItem>();
+  const [editLoading, setEditLoading] = useState(false);
+  const [editConflict, setEditConflict] = useState(false);
+  const [sourcePicture, setSourcePicture] = useState<File>();
+  const [quotePicture, setQuotePicture] = useState<File>();
+  const [pictureRefresh, setPictureRefresh] = useState(0);
   const quoteTextRef = useRef<HTMLTextAreaElement>(null);
   const savedQuoteRefs = useRef(new Map<string, HTMLLIElement>());
   const listRequest = useRef<AbortController | null>(null);
   const quoteRequest = useRef<AbortController | null>(null);
   const saveRequest = useRef<AbortController | null>(null);
+  const editRequest = useRef<AbortController | null>(null);
+  // If the item PATCH/POST committed but an attachment failed, only retry
+  // pictures. Retrying the entire save could create a second quote.
+  const savedPendingPictures = useRef<QuoteItem | null>(null);
+  const pendingAddAnother = useRef(false);
   // Keys belong to user intentions, not HTTP attempts. A failed write is retried
   // with the same key; edits/new quotes begin a new intention.
   const sourceIntentKey = useRef(crypto.randomUUID());
@@ -151,6 +172,7 @@ export function TypedQuotesWorkspace({
     listRequest.current?.abort();
     quoteRequest.current?.abort();
     saveRequest.current?.abort();
+    editRequest.current?.abort();
     saveRequest.current = null;
     setSaving(false);
     setOpen(false);
@@ -158,6 +180,8 @@ export function TypedQuotesWorkspace({
     setSelectedSource(undefined);
     setSources([]);
     setQuotes([]);
+    setQuoteOffset(0);
+    setMoreQuotes(false);
     setQuery("");
     setQueryInput("");
     setOffset(0);
@@ -167,6 +191,13 @@ export function TypedQuotesWorkspace({
     setError(undefined);
     setMessage(undefined);
     setFocusSavedId(undefined);
+    setEditingItem(undefined);
+    setEditLoading(false);
+    setEditConflict(false);
+    setSourcePicture(undefined);
+    setQuotePicture(undefined);
+    savedPendingPictures.current = null;
+    pendingAddAnother.current = false;
     sourceIntentKey.current = crypto.randomUUID();
     quoteIntentKey.current = crypto.randomUUID();
   }, [projectId, authorization, csrfToken]);
@@ -176,6 +207,7 @@ export function TypedQuotesWorkspace({
       listRequest.current?.abort();
       quoteRequest.current?.abort();
       saveRequest.current?.abort();
+      editRequest.current?.abort();
     },
     [],
   );
@@ -252,7 +284,7 @@ export function TypedQuotesWorkspace({
 
   useEffect(() => {
     quoteRequest.current?.abort();
-    setQuotes([]);
+    if (quoteOffset === 0) setQuotes([]);
     setQuotesError(undefined);
     if (!open || !canWrite || !selectedSource) return;
     const controller = new AbortController();
@@ -262,8 +294,8 @@ export function TypedQuotesWorkspace({
         const params = new URLSearchParams({
           kind: "quote",
           sourceId: selectedSource.id,
-          limit: "100",
-          offset: "0",
+          limit: String(quotePageSize),
+          offset: String(quoteOffset),
         });
         const response = await cloudFetch(
           `/cloud-api/api/projects/${projectId}/items?${params}`,
@@ -280,13 +312,19 @@ export function TypedQuotesWorkspace({
           );
         if (next.some((item) => item.projectId !== projectId))
           throw new Error("Quote list did not match the selected project.");
-        if (!controller.signal.aborted)
-          setQuotes((current) => [
-            ...current.filter(
-              (item) => !next.some((loaded) => loaded.id === item.id),
-            ),
-            ...next,
-          ]);
+        if (!controller.signal.aborted) {
+          setQuotes((current) =>
+            quoteOffset === 0
+              ? next
+              : [
+                  ...current,
+                  ...next.filter(
+                    (item) => !current.some((seen) => seen.id === item.id),
+                  ),
+                ],
+          );
+          setMoreQuotes(next.length === quotePageSize);
+        }
       } catch (cause) {
         if (!controller.signal.aborted)
           setQuotesError(
@@ -307,11 +345,21 @@ export function TypedQuotesWorkspace({
     onAuthUnavailable,
     selectedSource,
     quotesRetry,
+    quoteOffset,
   ]);
 
   useEffect(() => {
     if (focusSavedId) savedQuoteRefs.current.get(focusSavedId)?.focus();
   }, [focusSavedId, quotes]);
+
+  useEffect(() => {
+    if (
+      open &&
+      (editingItem ||
+        message === "Quote saved. Add another to the same source.")
+    )
+      quoteTextRef.current?.focus();
+  }, [open, editingItem, message]);
 
   function changeSourceDraft<K extends keyof OfflineSourceDraft>(
     field: K,
@@ -341,21 +389,137 @@ export function TypedQuotesWorkspace({
     setMessage(undefined);
     quoteIntentKey.current = crypto.randomUUID();
     setFocusSavedId(undefined);
+    setSourcePicture(undefined);
+    setQuotePicture(undefined);
+    setQuoteOffset(0);
+    setMoreQuotes(false);
     queueMicrotask(() => quoteTextRef.current?.focus());
   }
 
+  function cancelEdit() {
+    editRequest.current?.abort();
+    setEditLoading(false);
+    setEditConflict(false);
+    setEditingItem(undefined);
+    setQuoteDraft(emptyTypedQuoteDraft());
+    setTopicsText("");
+    setQuotePicture(undefined);
+    setError(undefined);
+    quoteIntentKey.current = crypto.randomUUID();
+  }
+
+  async function editQuote(item: QuoteItem) {
+    if (saveRequest.current || savedPendingPictures.current || !selectedSource)
+      return;
+    editRequest.current?.abort();
+    const controller = new AbortController();
+    editRequest.current = controller;
+    setEditLoading(true);
+    setError(undefined);
+    const expected = { ...context.current };
+    try {
+      const response = await cloudFetch(
+        `/cloud-api/api/projects/${projectId}/items/${item.id}`,
+        { signal: controller.signal, cache: "no-store" },
+        auth,
+      );
+      if (!response.ok)
+        throw await apiFailure(response, "Unable to open quote for editing.");
+      const fresh = LibraryItemSchema.parse(await response.json());
+      if (
+        fresh.kind !== "quote" ||
+        fresh.projectId !== projectId ||
+        fresh.sourceId !== selectedSource.id ||
+        fresh.id !== item.id
+      )
+        throw new Error("Edited quote is not in the selected source.");
+      if (
+        controller.signal.aborted ||
+        context.current.projectId !== expected.projectId ||
+        context.current.authorization !== expected.authorization ||
+        context.current.csrfToken !== expected.csrfToken
+      )
+        return;
+      const draft = typedQuoteDraftFromItem(fresh);
+      setEditingItem(fresh);
+      setQuoteDraft(draft);
+      setTopicsText(draft.topics.join(", "));
+      setQuotePicture(undefined);
+      setEditConflict(false);
+      setMessage(undefined);
+      setFocusSavedId(undefined);
+      queueMicrotask(() => {
+        if (!controller.signal.aborted) quoteTextRef.current?.focus();
+      });
+    } catch (cause) {
+      if (!controller.signal.aborted)
+        setError(
+          cause instanceof Error ? cause.message : "Unable to open quote.",
+        );
+    } finally {
+      if (editRequest.current === controller) {
+        editRequest.current = null;
+        setEditLoading(false);
+      }
+    }
+  }
+
+  function finishSavedQuote(item: QuoteItem, skippedPictures = false) {
+    savedPendingPictures.current = null;
+    if (skippedPictures) {
+      setSourcePicture(undefined);
+      setQuotePicture(undefined);
+    }
+    setError(undefined);
+    const wasEditing = Boolean(editingItem);
+    // Keep an edited quote from a later page mounted and focused; a new
+    // quote belongs at the beginning of the list, which we refresh.
+    if (!wasEditing) setQuoteOffset(0);
+    if (!wasEditing || quoteOffset === 0) setQuotesRetry((retry) => retry + 1);
+    quoteIntentKey.current = crypto.randomUUID();
+    const continueAdding = pendingAddAnother.current;
+    pendingAddAnother.current = false;
+    setEditConflict(false);
+    setEditingItem(undefined);
+    setMessage(
+      skippedPictures
+        ? "Quote saved without the selected pictures."
+        : wasEditing
+          ? "Quote changes saved."
+          : continueAdding
+            ? "Quote saved. Add another to the same source."
+            : "Quote saved to this source.",
+    );
+    if (continueAdding || wasEditing) {
+      setQuoteDraft(emptyTypedQuoteDraft());
+      setTopicsText("");
+      setFocusSavedId(wasEditing ? item.id : undefined);
+      if (continueAdding) queueMicrotask(() => quoteTextRef.current?.focus());
+    } else {
+      setFocusSavedId(item.id);
+    }
+  }
+
   async function saveQuote(addAnother: boolean) {
-    if (saveRequest.current || !canWrite) return;
+    if (saveRequest.current || editLoading || editConflict || !canWrite) return;
     const controller = new AbortController();
     let nextSource = selectedSource;
     let quoteRequestBody:
       ReturnType<typeof createTypedQuoteRequest> | undefined;
     let sourceRequestBody:
       ReturnType<typeof createOfflineSourceRequest> | undefined;
+    let editBody: ReturnType<typeof updateTypedQuoteRequest> | undefined;
     try {
       // Validate both documents before making either write. A failed quote
       // validation must not leave an accidental empty source in the Library.
-      if (!nextSource && sourceMode === "new") {
+      if (savedPendingPictures.current) {
+        // A previous HTTP write has already succeeded. Only pictures remain.
+      } else if (editingItem) {
+        editBody = updateTypedQuoteRequest(editingItem, {
+          ...quoteDraft,
+          topics: topicsFromText(topicsText),
+        });
+      } else if (!nextSource && sourceMode === "new") {
         sourceRequestBody = createOfflineSourceRequest(
           sourceDraft,
           sourceIntentKey.current,
@@ -416,7 +580,7 @@ export function TypedQuotesWorkspace({
     };
     try {
       const base = `/cloud-api/api/projects/${projectId}`;
-      if (!nextSource) {
+      if (!nextSource && !savedPendingPictures.current) {
         nextSource = LibrarySourceSchema.parse(
           await post(`${base}/sources`, sourceRequestBody),
         );
@@ -427,46 +591,91 @@ export function TypedQuotesWorkspace({
         setSelectedSource(nextSource);
         setSourceMode("existing");
       }
-      const body = { ...quoteRequestBody!, sourceId: nextSource.id };
-      const item = LibraryItemSchema.parse(await post(`${base}/items`, body));
+      let item = savedPendingPictures.current;
+      if (!item && editingItem) {
+        const response = await cloudFetch(
+          `${base}/items/${editingItem.id}`,
+          {
+            method: "PATCH",
+            headers: {
+              "content-type": "application/json",
+              accept: "application/json",
+            },
+            body: JSON.stringify(editBody),
+            signal: controller.signal,
+          },
+          auth,
+        );
+        if (response.status === 409) {
+          if (isCurrent()) {
+            setEditConflict(true);
+            setError(
+              "This quote was changed elsewhere. Reload its latest version before editing again; your draft has not been overwritten.",
+            );
+          }
+          return;
+        }
+        if (!response.ok)
+          throw await apiFailure(response, "Unable to update quote.");
+        const updated = LibraryItemSchema.parse(await response.json());
+        if (updated.kind !== "quote")
+          throw new Error("Expected updated quote.");
+        item = updated;
+      } else if (!item) {
+        const body = { ...quoteRequestBody!, sourceId: nextSource!.id };
+        const created = LibraryItemSchema.parse(
+          await post(`${base}/items`, body),
+        );
+        if (created.kind !== "quote") throw new Error("Expected saved quote.");
+        item = created;
+      }
       if (
         item.kind !== "quote" ||
-        item.sourceId !== nextSource.id ||
+        item.sourceId !== nextSource?.id ||
         item.projectId !== projectId
       )
         throw new Error(
           "Saved quote response did not match the selected source.",
         );
       if (!isCurrent()) return;
+      if (!savedPendingPictures.current)
+        pendingAddAnother.current = editingItem ? false : addAnother;
+      savedPendingPictures.current = item;
       setQuotes((current) => [
         item,
         ...current.filter((existing) => existing.id !== item.id),
       ]);
-      setQuotesRetry((retry) => retry + 1);
-      quoteIntentKey.current = crypto.randomUUID();
-      setMessage(
-        addAnother
-          ? "Quote saved. Add another to the same source."
-          : "Quote saved to this source.",
-      );
-      if (addAnother) {
-        setQuoteDraft(emptyTypedQuoteDraft());
-        setTopicsText("");
-        setFocusSavedId(undefined);
-        // The textarea stays mounted; focus is restored after the successful save.
-        queueMicrotask(() => {
-          if (isCurrent()) quoteTextRef.current?.focus();
-        });
-      } else {
-        setFocusSavedId(item.id);
-      }
-    } catch (cause) {
-      if (isCurrent())
-        setError(
-          cause instanceof Error
-            ? cause.message
-            : "Unable to save; retry this quote.",
+      // The picture writes are intentionally separate, versioned operations.
+      // Retain item/source IDs and file inputs if any upload fails.
+      if (sourcePicture && nextSource?.kind === "offline") {
+        await uploadPicture(
+          picturePath(projectId, "source", nextSource.id),
+          sourcePicture,
+          auth,
+          controller.signal,
         );
+        if (!isCurrent()) return;
+        setSourcePicture(undefined);
+        setPictureRefresh((value) => value + 1);
+      }
+      if (quotePicture) {
+        await uploadPicture(
+          picturePath(projectId, "quote", item.id),
+          quotePicture,
+          auth,
+          controller.signal,
+        );
+        if (!isCurrent()) return;
+        setQuotePicture(undefined);
+        setPictureRefresh((value) => value + 1);
+      }
+      finishSavedQuote(item);
+    } catch (cause) {
+      if (isCurrent()) {
+        setError(
+          `${savedPendingPictures.current ? "Quote saved, but its picture upload failed. Retry pictures without creating another quote: " : ""}${cause instanceof Error ? cause.message : "Unable to save; retry this quote."}`,
+        );
+      }
     } finally {
       if (saveRequest.current === controller) saveRequest.current = null;
       if (isCurrent()) setSaving(false);
@@ -489,7 +698,12 @@ export function TypedQuotesWorkspace({
             type="button"
             aria-expanded={addMenuOpen}
             aria-controls="typed-quotes-add-menu"
-            disabled={!canWrite || saving}
+            disabled={
+              !canWrite ||
+              saving ||
+              editLoading ||
+              Boolean(savedPendingPictures.current)
+            }
             onClick={() => setAddMenuOpen((value) => !value)}
           >
             + Add
@@ -512,11 +726,13 @@ export function TypedQuotesWorkspace({
       {open && (
         <div className="typed-quotes-body">
           <div className="typed-quotes-topline">
-            <strong>Log a quote</strong>
+            <strong>{editingItem ? "Edit saved quote" : "Log a quote"}</strong>
             <button
               type="button"
               className="quiet-button"
-              disabled={saving}
+              disabled={
+                saving || editLoading || Boolean(savedPendingPictures.current)
+              }
               onClick={() => {
                 setOpen(false);
                 setError(undefined);
@@ -543,10 +759,19 @@ export function TypedQuotesWorkspace({
                 </p>
                 <button
                   type="button"
-                  disabled={saving}
+                  disabled={
+                    saving ||
+                    Boolean(editingItem) ||
+                    editLoading ||
+                    Boolean(savedPendingPictures.current)
+                  }
                   onClick={() => {
                     setSelectedSource(undefined);
+                    setSourcePicture(undefined);
+                    setQuotePicture(undefined);
                     setSources([]);
+                    setQuoteOffset(0);
+                    setMoreQuotes(false);
                     setOffset(0);
                     setSourceRetry((retry) => retry + 1);
                     setFocusSavedId(undefined);
@@ -740,11 +965,35 @@ export function TypedQuotesWorkspace({
                       Only the first save creates this source; later quotes
                       reuse it.
                     </p>
+                    <ReferencePicturePicker
+                      label="Source cover photo"
+                      file={sourcePicture}
+                      onFileChange={setSourcePicture}
+                      projectId={projectId}
+                      kind="source"
+                      auth={auth}
+                      refreshKey={pictureRefresh}
+                      disabled={saving}
+                    />
                   </div>
                 )}
               </>
             )}
           </div>
+          {selectedSource?.kind === "offline" && (
+            <ReferencePicturePicker
+              key={`source-${selectedSource.id}`}
+              label="Source cover photo"
+              file={sourcePicture}
+              onFileChange={setSourcePicture}
+              projectId={projectId}
+              kind="source"
+              ownerId={selectedSource.id}
+              auth={auth}
+              refreshKey={pictureRefresh}
+              disabled={saving || Boolean(savedPendingPictures.current)}
+            />
+          )}
           <form
             className="typed-quotes-form"
             onSubmit={(event: FormEvent<HTMLFormElement>) => {
@@ -752,12 +1001,19 @@ export function TypedQuotesWorkspace({
               void saveQuote(false);
             }}
           >
-            <h3>2. Quote</h3>
+            <h3>{editingItem ? "2. Correct quote details" : "2. Quote"}</h3>
+            {editingItem && (
+              <p className="muted">
+                Editing a saved quote. The source and browser capture provenance
+                stay unchanged.
+              </p>
+            )}
             <label>
               Quote text *
               <textarea
                 ref={quoteTextRef}
                 required
+                disabled={saving || Boolean(savedPendingPictures.current)}
                 rows={5}
                 maxLength={100000}
                 value={quoteDraft.text}
@@ -771,6 +1027,7 @@ export function TypedQuotesWorkspace({
               <label>
                 Speaker name
                 <input
+                  disabled={saving || Boolean(savedPendingPictures.current)}
                   maxLength={300}
                   value={quoteDraft.speaker}
                   onChange={(event) =>
@@ -781,6 +1038,7 @@ export function TypedQuotesWorkspace({
               <label>
                 Speaker title / role
                 <input
+                  disabled={saving || Boolean(savedPendingPictures.current)}
                   maxLength={500}
                   value={quoteDraft.speakerTitle}
                   onChange={(event) =>
@@ -791,6 +1049,7 @@ export function TypedQuotesWorkspace({
               <label>
                 Page / location
                 <input
+                  disabled={saving || Boolean(savedPendingPictures.current)}
                   maxLength={500}
                   value={quoteDraft.page}
                   onChange={(event) =>
@@ -801,6 +1060,7 @@ export function TypedQuotesWorkspace({
               <label>
                 Topics (comma-separated)
                 <input
+                  disabled={saving || Boolean(savedPendingPictures.current)}
                   value={topicsText}
                   onChange={(event) => {
                     setTopicsText(event.target.value);
@@ -814,6 +1074,7 @@ export function TypedQuotesWorkspace({
             <label>
               Quote note
               <textarea
+                disabled={saving || Boolean(savedPendingPictures.current)}
                 rows={2}
                 maxLength={20000}
                 value={quoteDraft.note}
@@ -825,6 +1086,7 @@ export function TypedQuotesWorkspace({
             <label>
               Citation override (optional)
               <textarea
+                disabled={saving || Boolean(savedPendingPictures.current)}
                 rows={2}
                 maxLength={20000}
                 value={quoteDraft.citationOverride}
@@ -833,6 +1095,18 @@ export function TypedQuotesWorkspace({
                 }
               />
             </label>
+            <ReferencePicturePicker
+              key={`quote-${editingItem?.id ?? "new"}`}
+              label="Quote photo"
+              file={quotePicture}
+              onFileChange={setQuotePicture}
+              projectId={projectId}
+              kind="quote"
+              ownerId={editingItem?.id}
+              auth={auth}
+              refreshKey={pictureRefresh}
+              disabled={saving || Boolean(savedPendingPictures.current)}
+            />
             {error && (
               <p className="typed-quotes-error" role="alert">
                 {error}
@@ -843,17 +1117,63 @@ export function TypedQuotesWorkspace({
                 {message}
               </p>
             )}
-            <div className="typed-quotes-actions">
-              <button type="submit" disabled={!canWrite || saving}>
-                {saving ? "Saving…" : "Save"}
-              </button>
+            {editConflict && editingItem && (
               <button
                 type="button"
-                disabled={!canWrite || saving}
-                onClick={() => void saveQuote(true)}
+                onClick={() => void editQuote(editingItem)}
+                disabled={editLoading || saving}
               >
-                Save and add another
+                Reload latest quote (discard current edits)
               </button>
+            )}
+            <div className="typed-quotes-actions">
+              <button
+                type="submit"
+                disabled={!canWrite || saving || editLoading || editConflict}
+              >
+                {saving
+                  ? "Saving…"
+                  : savedPendingPictures.current
+                    ? "Retry pictures"
+                    : editingItem
+                      ? "Save changes"
+                      : "Save"}
+              </button>
+              {!editingItem && (
+                <button
+                  type="button"
+                  disabled={
+                    !canWrite ||
+                    saving ||
+                    editLoading ||
+                    editConflict ||
+                    Boolean(savedPendingPictures.current)
+                  }
+                  onClick={() => void saveQuote(true)}
+                >
+                  Save and add another
+                </button>
+              )}
+              {editingItem && !savedPendingPictures.current && (
+                <button
+                  type="button"
+                  disabled={saving || editLoading}
+                  onClick={cancelEdit}
+                >
+                  Cancel edit
+                </button>
+              )}
+              {savedPendingPictures.current && (
+                <button
+                  type="button"
+                  disabled={saving}
+                  onClick={() =>
+                    finishSavedQuote(savedPendingPictures.current!, true)
+                  }
+                >
+                  Continue without pictures
+                </button>
+              )}
             </div>
           </form>
           {selectedSource && (
@@ -886,11 +1206,33 @@ export function TypedQuotesWorkspace({
                   >
                     <blockquote>{item.content.text}</blockquote>
                     <small>{item.content.location ?? "No page"}</small>
+                    <button
+                      type="button"
+                      disabled={
+                        saving ||
+                        editLoading ||
+                        Boolean(savedPendingPictures.current)
+                      }
+                      onClick={() => void editQuote(item)}
+                      aria-label={`Edit quote: ${item.content.text.slice(0, 100)}`}
+                    >
+                      Edit quote
+                    </button>
                   </li>
                 ))}
               </ul>
               {!quotes.length && !quotesError && (
                 <p className="muted">No quotes from this source yet.</p>
+              )}
+              {moreQuotes && !quotesError && (
+                <button
+                  type="button"
+                  onClick={() =>
+                    setQuoteOffset((value) => value + quotePageSize)
+                  }
+                >
+                  Load more saved quotes
+                </button>
               )}
             </section>
           )}

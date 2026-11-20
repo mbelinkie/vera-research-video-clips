@@ -221,6 +221,59 @@
 .typed-quotes-saved small {
   color: #b7bdc8;
 }
+.typed-quotes-picture {
+  min-width: 0;
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+  border: 1px dashed #555d68;
+  border-radius: 8px;
+}
+.typed-quotes-source-form > .typed-quotes-picture {
+  grid-column: 1 / -1;
+}
+.typed-quotes-picture img {
+  max-width: 100%;
+  max-height: 200px;
+  object-fit: contain;
+  justify-self: start;
+  border-radius: 5px;
+}
+.typed-quotes-picture .muted {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.typed-quotes-saved li {
+  overflow-wrap: anywhere;
+}
+.typed-quotes-saved li button {
+  margin-top: 8px;
+}
+@media (min-width: 1100px) {
+  .typed-quotes-body {
+    display: grid;
+    grid-template-columns: minmax(0, 1.75fr) minmax(260px, 1fr);
+    gap: 0 16px;
+  }
+  .typed-quotes-topline,
+  .typed-quotes-body > .muted,
+  .typed-quotes-source,
+  .typed-quotes-body > .typed-quotes-picture {
+    grid-column: 1 / -1;
+  }
+  .typed-quotes-form {
+    grid-column: 1;
+    align-content: start;
+  }
+  .typed-quotes-saved {
+    grid-column: 2;
+    align-self: start;
+    min-width: 0;
+  }
+  .typed-quotes-form:last-child {
+    grid-column: 1 / -1;
+  }
+}
 @media (max-width: 760px) {
   .typed-quotes-workspace .section-heading {
     align-items: flex-start;
