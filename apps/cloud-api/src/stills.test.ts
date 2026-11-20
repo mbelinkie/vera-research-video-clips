@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { deflateSync } from "node:zlib";
 
 import { PGlite } from "@electric-sql/pglite";
+import sharp from "sharp";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 
 import { SharedProjectCatalog } from "@research-video/catalog";
@@ -333,6 +334,182 @@ describe("retained Library still HTTP API", () => {
         crop: { x: 0, y: 0, width: 0.5, height: 1 },
       },
     });
+  });
+
+  it("crops exact retained pixels into a second immutable item, with lineage and guarded retries", async () => {
+    const owner = await register("pixel crop owner");
+    const viewer = await register("pixel crop viewer");
+    const outsider = await register("pixel crop outsider");
+    const projectId = await project(owner);
+    const otherProjectId = await project(outsider, "Isolated crop project");
+    await addViewer(projectId, owner, viewer);
+    const parentResponse = await postFile(
+      projectId,
+      owner,
+      metadata("pixel-parent"),
+    );
+    expect(parentResponse.statusCode, parentResponse.body).toBe(201);
+    const parent = parentResponse.json<{ id: string; sourceId: string }>();
+    const assetPath = (id: string, role = "original") =>
+      `/api/projects/${projectId}/stills/${id}/assets/${role}`;
+    const manifestPath = (id: string) =>
+      `/api/projects/${projectId}/stills/${id}/assets`;
+    const get = (url: string) =>
+      cloud.inject({ method: "GET", url, headers: auth(owner) });
+
+    const beforeBytes = await get(assetPath(parent.id));
+    const beforeDisplay = await get(assetPath(parent.id, "display"));
+    const beforeManifest = await get(manifestPath(parent.id));
+    expect(beforeBytes.statusCode).toBe(200);
+    expect(beforeBytes.rawPayload).toEqual(PNG);
+    const parentDigest = beforeManifest.json<{
+      assets: { original: { sha256: string; versionId: string } };
+    }>().assets.original;
+    expect(parentDigest.sha256).toBe(PNG_SHA256);
+
+    // Floor left/top and ceil right/bottom on the oriented four-by-two raster:
+    // x=[1,3), y=[1,2), so the two exact lower-row source pixels survive.
+    const crop = { x: 0.25, y: 0.5, width: 0.5, height: 0.5 };
+    const payload = { ...metadata("pixel-child", "Exact retained crop"), crop };
+    const cropPath = `/api/projects/${projectId}/stills/${parent.id}/crop`;
+    const childResponse = await cloud.inject({
+      method: "POST",
+      url: cropPath,
+      headers: auth(owner),
+      payload,
+    });
+    expect(childResponse.statusCode, childResponse.body).toBe(201);
+    const child = childResponse.json<{
+      id: string;
+      sourceId: string;
+      kind: string;
+      topics: string[];
+      content: { credit: string; licence: string; usageNote: string };
+    }>();
+    expect(child.id).not.toBe(parent.id);
+    expect(child).toMatchObject({
+      kind: "still",
+      sourceId: parent.sourceId,
+      topics: ["Research", "Synthetic"],
+      content: {
+        credit: "Fixture photographer",
+        licence: "CC BY 4.0",
+        usageNote: "Generated pixels for API verification.",
+      },
+    });
+
+    const childManifestResponse = await get(manifestPath(child.id));
+    expect(childManifestResponse.statusCode, childManifestResponse.body).toBe(
+      200,
+    );
+    expect(childManifestResponse.json()).toMatchObject({
+      assets: {
+        original: { mimeType: "image/webp", width: 2, height: 1 },
+        display: { width: 2, height: 1 },
+      },
+      provenance: {
+        kind: "still_crop",
+        parentItemId: parent.id,
+        inputSha256: PNG_SHA256,
+        crop,
+      },
+    });
+    for (const role of ["original", "display"] as const) {
+      const saved = await get(assetPath(child.id, role));
+      expect(saved.statusCode, saved.body).toBe(200);
+      const { data, info } = await sharp(saved.rawPayload)
+        .ensureAlpha()
+        .raw()
+        .toBuffer({ resolveWithObject: true });
+      expect(info).toMatchObject({ width: 2, height: 1, channels: 4 });
+      expect(data).toEqual(
+        Buffer.from([0xec, 0x99, 0x55, 0xff, 0x22, 0x99, 0x55, 0xff]),
+      );
+    }
+
+    const replay = await cloud.inject({
+      method: "POST",
+      url: cropPath,
+      headers: auth(owner),
+      payload,
+    });
+    expect(replay.statusCode, replay.body).toBe(201);
+    expect(replay.json<{ id: string }>().id).toBe(child.id);
+    const divergent = await cloud.inject({
+      method: "POST",
+      url: cropPath,
+      headers: auth(owner),
+      payload: { ...payload, crop: { x: 0, y: 0, width: 1, height: 1 } },
+    });
+    expect(divergent.statusCode, divergent.body).toBe(409);
+
+    // Full edge selection and a single-column crop at x=1-width remain valid.
+    const edge = await cloud.inject({
+      method: "POST",
+      url: cropPath,
+      headers: auth(owner),
+      payload: {
+        ...metadata("pixel-edge"),
+        crop: { x: 0.75, y: 0, width: 0.25, height: 1 },
+      },
+    });
+    expect(edge.statusCode, edge.body).toBe(201);
+    expect(
+      (await get(manifestPath(edge.json<{ id: string }>().id))).json(),
+    ).toMatchObject({
+      assets: { original: { width: 1, height: HEIGHT } },
+    });
+    for (const [index, invalid] of [
+      { x: 0, y: 0, width: 0, height: 1 },
+      { x: 0, y: 0, width: 1, height: 0 },
+      { x: -0.01, y: 0, width: 0.5, height: 1 },
+      { x: 0, y: -0.01, width: 1, height: 0.5 },
+      { x: 0.9, y: 0, width: 0.2, height: 1 },
+      { x: 0, y: 0.9, width: 1, height: 0.2 },
+    ].entries()) {
+      const denied = await cloud.inject({
+        method: "POST",
+        url: cropPath,
+        headers: auth(owner),
+        payload: { ...metadata(`pixel-invalid-${index}`), crop: invalid },
+      });
+      expect(denied.statusCode, JSON.stringify(invalid)).toBe(400);
+    }
+    for (const [actor, expected] of [
+      [viewer, 403],
+      [outsider, 403],
+    ] as const) {
+      const denied = await cloud.inject({
+        method: "POST",
+        url: cropPath,
+        headers: auth(actor),
+        payload: { ...metadata(`unauthorized-${actor}`), crop },
+      });
+      expect(denied.statusCode).toBe(expected);
+    }
+    const foreign = await cloud.inject({
+      method: "POST",
+      url: `/api/projects/${otherProjectId}/stills/${parent.id}/crop`,
+      headers: auth(outsider),
+      payload: { ...metadata("foreign-crop"), crop },
+    });
+    expect(foreign.statusCode).toBe(404);
+    const afterBytes = await get(assetPath(parent.id));
+    const afterDisplay = await get(assetPath(parent.id, "display"));
+    const afterManifest = await get(manifestPath(parent.id));
+    expect(afterBytes.rawPayload).toEqual(beforeBytes.rawPayload);
+    expect(afterDisplay.rawPayload).toEqual(beforeDisplay.rawPayload);
+    expect(afterManifest.json()).toEqual(beforeManifest.json());
+    expect(
+      afterManifest.json<{
+        assets: { original: { sha256: string; versionId: string } };
+      }>().assets.original,
+    ).toEqual(parentDigest);
+    const count = await database.query<{ count: string }>(
+      "SELECT count(*)::text AS count FROM library_items WHERE project_id=$1 AND kind='still'",
+      [projectId],
+    );
+    expect(count.rows[0]?.count).toBe("3");
   });
 
   it("replays only an identical idempotent import and rejects divergent retries", async () => {

@@ -1606,8 +1606,25 @@ export function StillsWorkspace({
                         type="number"
                         min="0"
                         max="1"
-                        step="0.01"
+                        // Pointer crops can have sub-step precision. Native
+                        // step-mismatch validation must not block their POST.
+                        step="any"
                         value={crop[field]}
+                        onKeyDown={(event) => {
+                          if (
+                            event.key !== "ArrowUp" &&
+                            event.key !== "ArrowDown"
+                          )
+                            return;
+                          event.preventDefault();
+                          updateCrop(
+                            field,
+                            String(
+                              crop[field] +
+                                (event.key === "ArrowUp" ? 0.01 : -0.01),
+                            ),
+                          );
+                        }}
                         onChange={(event) =>
                           updateCrop(field, event.target.value)
                         }
