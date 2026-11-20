@@ -1,6 +1,11 @@
 import { registerChromeConnection } from "./chrome-connection.ts";
 import { registerExtensionCaptureRoutes } from "./extension-capture.ts";
 import type { BrowserAuth } from "./browser-auth/routes.ts";
+import {
+  PilotWriteGate,
+  PilotWritesPausedError,
+  type OperatorCounters,
+} from "./pilot-operations.ts";
 import Fastify, { type FastifyInstance, type FastifyRequest } from "fastify";
 import { z, ZodError } from "zod";
 
@@ -66,7 +71,13 @@ export interface CloudApiDependencies {
     store: TranscriptObjectStore;
     issuer: LocalStagedUploadUrlIssuer;
     objectRoot: string;
+    /** Shared with the loopback operator listener; created here when absent. */
+    gate?: PilotWriteGate;
   };
+  /** Runs before every other hook, e.g. Cloudflare Access verification. */
+  ingressGuard?: (request: FastifyRequest) => Promise<void>;
+  /** Bounded operator diagnostics; never records identities or URLs. */
+  counters?: OperatorCounters;
 }
 
 const IdParamsSchema = z.object({ projectId: z.uuid() });
@@ -151,25 +162,63 @@ export function createCloudApi(
 
   if (!dependencies) return app;
   const { catalog, authenticate, browserAuth } = dependencies;
+  const { ingressGuard, counters } = dependencies;
+  if (ingressGuard) app.addHook("onRequest", ingressGuard);
+  if (!browserAuth) {
+    // Development/managed bearer auth trusts the caller's claimed identity, so
+    // it must never serve anything that arrived through a Cloudflare tunnel
+    // (for example if a dev server ever took the pilot's port).
+    app.addHook("onRequest", async (request) => {
+      if (
+        Object.keys(request.headers).some((name) =>
+          /^cf-(?:connecting-ip|ray|visitor|access-jwt-assertion|ipcountry)$/u.test(
+            name.toLowerCase(),
+          ),
+        )
+      )
+        throw Object.assign(new Error("Request not permitted."), {
+          statusCode: 403,
+          code: "tunnel_refused",
+        });
+    });
+  }
+  if (counters) {
+    app.addHook("onSend", async (request, reply, payload) => {
+      let errorCode: string | undefined;
+      if (reply.statusCode >= 400 && typeof payload === "string") {
+        try {
+          const parsed = JSON.parse(payload) as { error?: { code?: unknown } };
+          if (typeof parsed.error?.code === "string")
+            errorCode = parsed.error.code;
+        } catch {
+          // Not an API error body.
+        }
+      }
+      counters.record(reply.statusCode, request.url, errorCode);
+      return payload;
+    });
+  }
   browserAuth?.routes(app);
 
   if (dependencies.localArtifacts) {
     const { store, issuer, objectRoot } = dependencies.localArtifacts;
+    const gate =
+      dependencies.localArtifacts.gate ?? new PilotWriteGate(objectRoot);
     // The operator creates the filesystem gate before a backup. Check once
     // before admitting a write and again after incrementing the in-flight
     // count, so a write racing with gate creation cannot escape the drain.
-    let inFlightWrites = 0;
     const registered = new WeakSet<FastifyRequest>();
     const finish = (request: FastifyRequest) => {
-      if (registered.delete(request)) inFlightWrites--;
+      if (registered.delete(request)) gate.inFlightWrites--;
     };
     app.addHook("onRequest", async (request) => {
       if (!["POST", "PUT", "PATCH", "DELETE"].includes(request.method)) return;
       if (await pilotBackupGateIsActive(objectRoot)) {
         throw new PilotWritesBlockedError();
       }
+      if (await gate.diskPaused()) throw new PilotWritesPausedError();
       registered.add(request);
-      inFlightWrites++;
+      gate.inFlightWrites++;
       if (await pilotBackupGateIsActive(objectRoot)) {
         finish(request);
         throw new PilotWritesBlockedError();
@@ -181,10 +230,14 @@ export function createCloudApi(
     app.addHook("onRequestAbort", async (request) => {
       finish(request);
     });
-    app.get("/__maintenance/status", async () => ({
-      writesBlocked: await pilotBackupGateIsActive(objectRoot),
-      inFlightWrites,
-    }));
+    // Behind the tunnel every request arrives from loopback, so the browser
+    // (public) listener never serves maintenance state; the separate
+    // loopback-only operator listener does.
+    if (!browserAuth)
+      app.get("/__maintenance/status", async () => ({
+        writesBlocked: await pilotBackupGateIsActive(objectRoot),
+        inFlightWrites: gate.inFlightWrites,
+      }));
     // Encapsulated parser: never alter the ordinary JSON catalog API. The
     // capabilities are issued after authorization by the catalog; no caller
     // can choose a filesystem path or unpinned download version.

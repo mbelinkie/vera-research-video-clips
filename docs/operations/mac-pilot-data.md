@@ -85,8 +85,9 @@ provided here; #53 owns those. Make no backup while editing/migrating data.
    SQL dump and writes a checksummed completion manifest last. The staging
    directory is atomically published to a previously nonexistent destination.
    A failed backup cannot claim completion, and the write gate is released.
-   Inspect the result/permissions and copy it off-device only through a future
-   approved encrypted backup procedure (#53).
+   Inspect the result/permissions. For scheduled, encrypted, off-device copies
+   and restore drills, use `npm run pilot -- backup` / `drill` (#53, see
+   `mac-pilot-hosting.md`), which wrap this protocol.
 
 **Safety:** the database and filesystem have no shared transaction. This
 protocol only aligns them if **all** writes pass through the pilot API (or all

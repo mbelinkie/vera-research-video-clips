@@ -90,3 +90,45 @@ describe("managed browser fetch boundary", () => {
     expect(onUnavailable).not.toHaveBeenCalled();
   });
 });
+
+describe("host laptop unavailable behind Cloudflare", () => {
+  it("treats Cloudflare gateway pages as unavailable but not our own JSON errors", async () => {
+    vi.stubEnv("PROD", true);
+    const { cloudFetch, hostUnreachable } = await import("./browser-api.ts");
+    const html = (status: number) =>
+      new Response("<html>Cloudflare tunnel error</html>", {
+        status,
+        headers: { "content-type": "text/html" },
+      });
+    const json = (status: number) =>
+      new Response(JSON.stringify({ error: { code: "x" } }), {
+        status,
+        headers: { "content-type": "application/json; charset=utf-8" },
+      });
+    for (const status of [502, 504, 521, 530])
+      expect(hostUnreachable(html(status))).toBe(true);
+    for (const response of [
+      html(500),
+      html(503),
+      json(502),
+      json(503),
+      json(200),
+    ])
+      expect(hostUnreachable(response)).toBe(false);
+    const onUnavailable = vi.fn();
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(html(530)));
+    await cloudFetch(
+      "/cloud-api/api/projects",
+      {},
+      { authorization: "", onUnavailable },
+    );
+    expect(onUnavailable).toHaveBeenCalledTimes(1);
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(json(503)));
+    await cloudFetch(
+      "/cloud-api/api/projects",
+      {},
+      { authorization: "", onUnavailable },
+    );
+    expect(onUnavailable).toHaveBeenCalledTimes(1);
+  });
+});

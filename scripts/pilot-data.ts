@@ -13,6 +13,7 @@ import {
   readFile,
   readdir,
   rename,
+  rm,
   rmdir,
 } from "node:fs/promises";
 import { join, dirname, isAbsolute, resolve, relative, sep } from "node:path";
@@ -575,6 +576,10 @@ export async function restorePilot(
       objects: manifest.objects.length,
       tables: Object.keys(snapshot.tableCounts).length,
     };
+  } catch (error) {
+    // Never leave a partial plaintext copy of transcripts behind (#53 review).
+    await rm(stage, { recursive: true, force: true });
+    throw error;
   } finally {
     await pool.end();
   }

@@ -22,7 +22,8 @@ debugging attempts, start a fresh task with the confirmed facts and a focused
 reproduction.
 
 For an **opt-in local Mac PostgreSQL/transcript-store pilot** (not friend-facing),
-see [the #50 data and backup operator guide](./docs/operations/mac-pilot-data.md).
+see [the #50 data and backup operator guide](./docs/operations/mac-pilot-data.md)
+and [the #53 friends-only hosting runbook](./docs/operations/mac-pilot-hosting.md).
 No service installation, live migration or external networking is performed by
 the application defaults.
 

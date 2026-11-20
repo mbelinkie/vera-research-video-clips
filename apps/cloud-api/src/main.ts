@@ -24,6 +24,16 @@ import {
 } from "@research-video/storage";
 
 import { authenticateDevBearer, createCloudApi } from "./app.ts";
+import {
+  cloudflareAccessVerifier,
+  createCloudflareAccessGuard,
+} from "./cloudflare-access.ts";
+import {
+  createOperatorApi,
+  DiskSpaceMonitor,
+  OperatorCounters,
+  PilotWriteGate,
+} from "./pilot-operations.ts";
 import { bootstrapManagedResearch } from "./managed-bootstrap.ts";
 
 const config = loadConfig();
@@ -118,8 +128,29 @@ const browserAuth =
         sessionAbsoluteMs: config.browserSessionAbsoluteMs,
       })
     : undefined;
+const disk = pilot
+  ? new DiskSpaceMonitor(
+      config.pilotObjectRoot!,
+      config.diskPauseBelowMb * 1024 * 1024,
+    )
+  : undefined;
+const gate = localObjects
+  ? new PilotWriteGate(config.pilotObjectRoot!, disk)
+  : undefined;
+const counters = new OperatorCounters();
+const ingressGuard =
+  config.cloudflareAccessTeamDomain && config.cloudflareAccessAud
+    ? createCloudflareAccessGuard(
+        cloudflareAccessVerifier({
+          teamDomain: config.cloudflareAccessTeamDomain,
+          audience: config.cloudflareAccessAud,
+        }),
+      )
+    : undefined;
 const app = createCloudApi({
   ...(browserAuth ? { browserAuth } : {}),
+  ...(ingressGuard ? { ingressGuard } : {}),
+  counters,
   catalog,
   authenticate: browserAuth
     ? (request) => browserAuth.authenticate(request)
@@ -131,6 +162,7 @@ const app = createCloudApi({
           store: objectStore,
           issuer: uploadUrlIssuer,
           objectRoot: config.pilotObjectRoot!,
+          ...(gate ? { gate } : {}),
         },
       }
     : {}),
@@ -150,9 +182,35 @@ try {
   await database.close();
   throw error;
 }
+// Loopback-only operator listener for status, backups and restore drills.
+// The Cloudflare tunnel must only ever target CLOUD_API_PORT.
+const operator = pilot
+  ? createOperatorApi({
+      port: config.operatorPort,
+      ...(gate ? { gate } : {}),
+      ...(disk ? { disk } : {}),
+      counters,
+      publicPort: config.cloudApiPort,
+      ...(config.browserPublicOrigin
+        ? { publicOrigin: config.browserPublicOrigin }
+        : {}),
+    })
+  : undefined;
+if (operator) {
+  try {
+    await operator.listen({ host: "127.0.0.1", port: config.operatorPort });
+  } catch (error) {
+    await app.close();
+    await database.close();
+    throw error;
+  }
+}
 for (const signal of ["SIGINT", "SIGTERM"] as const) {
   process.once(signal, () => {
     void (async () => {
+      // Stop admitting requests, let in-flight ones finish, then close the
+      // database pool so PostgreSQL sees a clean disconnect.
+      await operator?.close();
       await app.close();
       await database.close();
       process.exitCode = 0;

@@ -12,6 +12,7 @@
   ],
   "scripts": {
     "align:captions": "node --import tsx scripts/align-captions.ts",
+    "pilot": "node --import tsx scripts/pilot-host/cli.ts",
     "aws:deploy": "bash scripts/deploy-aws.sh",
     "build": "npm run typecheck && npm run build:web",
     "build:web": "vite build --config apps/web/vite.config.ts",
