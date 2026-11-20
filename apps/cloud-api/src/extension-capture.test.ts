@@ -208,6 +208,53 @@ describe("browser extension project capture ingress", () => {
     expect(conflict.statusCode, conflict.body).toBe(409);
   });
 
+  it("repairs missing pictures on the original quote and preserves existing revisions on retry", async () => {
+    const owner = await register("repair owner");
+    const projectId = await createProject(owner);
+    const input = captureBody(crypto.randomUUID());
+    const post = (payload: object) =>
+      cloud.inject({
+        method: "POST",
+        url: `/api/projects/${projectId}/extension-captures`,
+        headers: auth(owner),
+        payload,
+      });
+    const original = await post({
+      ...input,
+      passage: undefined,
+      quote: { text: input.quote.text },
+    });
+    expect(original.statusCode).toBe(201);
+    const receipt = original.json();
+    expect(receipt.missingPictures).toEqual(["passage"]);
+    const repair = {
+      ...input,
+      requestId: crypto.randomUUID(),
+      repairCaptureId: receipt.captureId,
+    };
+    expect(
+      (await post({ ...repair, quote: { text: "other passage" } })).statusCode,
+    ).toBe(409);
+    const saved = await post(repair);
+    expect(saved.statusCode, saved.body).toBe(201);
+    const result = saved.json();
+    expect(result).toMatchObject({
+      captureId: receipt.captureId,
+      itemId: receipt.itemId,
+      sourceId: receipt.sourceId,
+      missingPictures: [],
+    });
+    expect(result.assets).toContainEqual(receipt.assets[0]);
+    expect(result.assets).toHaveLength(2);
+    expect((await post(repair)).json()).toEqual(result);
+    const item = await cloud.inject({
+      method: "GET",
+      url: `/api/projects/${projectId}/items/${receipt.itemId}`,
+      headers: auth(owner),
+    });
+    expect(item.json().content.highlight).toEqual(input.quote.highlight);
+  });
+
   it("keeps page/audio captures itemless, reuses page sources, and denies outsiders", async () => {
     const owner = await register("page owner");
     const outsider = await register("page outsider");

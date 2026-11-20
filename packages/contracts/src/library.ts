@@ -586,6 +586,7 @@ const CapturePicture = z
   );
 const webCapture = {
   ...captureAction,
+  repairCaptureId: IdSchema.optional(),
   metadata: z
     .strictObject({ ...WebPageMetadataFields, url: CaptureUrl })
     .partial(),

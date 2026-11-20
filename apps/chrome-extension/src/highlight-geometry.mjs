@@ -23,6 +23,9 @@ export function highlightFromVisibleRects(rectangles, viewport, raster) {
   ) {
     throw new Error("Invalid highlight dimensions");
   }
+  // Chrome renders square pixels. Its visible capture can end above the
+  // layout viewport bottom, so scaling Y by that shorter height shifts text.
+  const scale = raster.width / viewport.width;
   const pixel = rectangles.map((rect) => {
     const { left, top, width, height } = rect ?? {};
     if (
@@ -38,10 +41,10 @@ export function highlightFromVisibleRects(rectangles, viewport, raster) {
         "The passage is not fully visible in the captured viewport",
       );
     }
-    const x1 = Math.floor((left * raster.width) / viewport.width);
-    const y1 = Math.floor((top * raster.height) / viewport.height);
-    const x2 = Math.ceil(((left + width) * raster.width) / viewport.width);
-    const y2 = Math.ceil(((top + height) * raster.height) / viewport.height);
+    const x1 = Math.floor(left * scale);
+    const y1 = Math.floor(top * scale);
+    const x2 = Math.ceil((left + width) * scale);
+    const y2 = Math.ceil((top + height) * scale);
     if (
       x1 < 0 ||
       y1 < 0 ||

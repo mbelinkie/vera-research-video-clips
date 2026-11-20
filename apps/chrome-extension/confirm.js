@@ -68,6 +68,7 @@ async function load() {
         byId("excerpt").textContent = draft.quote.text;
       }
       if (draft.kind === "quote" || draft.kind === "page") {
+        byId("repair").hidden = false;
         const missing = [];
         for (const [key, label] of [
           ["top", "Top of article"],
@@ -158,6 +159,16 @@ byId("save").onsubmit = async (event) => {
         notes: byId("notes").value,
       };
     }
+    if (draft.kind === "page" || draft.kind === "quote") {
+      const code = byId("repair-code").value.trim();
+      if (code) {
+        if (!/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/iu.test(code))
+          throw new Error(
+            "Check the picture repair code from your earlier save.",
+          );
+        body = { ...body, repairCaptureId: code };
+      }
+    }
     const receipt = await gateway(
       paired.origin,
       "projects/" + encodeURIComponent(projectId) + "/captures",
@@ -179,6 +190,19 @@ byId("save").onsubmit = async (event) => {
         projectName +
         ". " +
         stateMessage;
+    } else if (receipt.missingPictures?.length) {
+      status.textContent =
+        "Saved to " +
+        projectName +
+        ". Still missing: " +
+        receipt.missingPictures.join(", ") +
+        ". Capture the same page or passage again and enter this picture repair code: " +
+        receipt.captureId;
+    } else if (body.repairCaptureId) {
+      status.textContent =
+        "Both pictures are available on your earlier save in " +
+        projectName +
+        ".";
     } else status.textContent = "Saved to " + projectName + ".";
     complete = true;
     draft = undefined;

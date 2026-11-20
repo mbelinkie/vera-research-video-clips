@@ -582,6 +582,75 @@ export class ProjectLibrary {
     rasters: ExtensionCaptureRasters,
   ): Promise<ExtensionCaptureReceipt> {
     const input = ExtensionCaptureRequestSchema.parse(request);
+    if (input.kind !== "audio" && input.repairCaptureId) {
+      const originalId = input.repairCaptureId;
+      return this.write(actor, projectId, async (tx) => {
+        const original = (
+          await tx.query<{ source_id: string; item_id: string | null }>(
+            `SELECT c.source_id,c.item_id FROM extension_captures c
+           LEFT JOIN library_items i ON i.project_id=c.project_id AND i.id=c.item_id
+           WHERE c.project_id=$1 AND c.capture_id=$2 AND c.actor_id=$3 AND c.kind=$4 AND c.page_url=$5
+             AND (c.kind='page' OR i.content->>'text'=$6) FOR UPDATE OF c`,
+            [
+              projectId,
+              originalId,
+              actor.userId,
+              input.kind,
+              input.url,
+              input.kind === "quote" ? input.quote.text : null,
+            ],
+          )
+        ).rows[0];
+        if (!original)
+          throw new CatalogConflictError(
+            "The repair code does not match this capture.",
+          );
+        const current = await readExtensionCaptureReceipt(
+          tx,
+          projectId,
+          originalId,
+        );
+        const missing: ExtensionCaptureRasters = {};
+        for (const role of current.missingPictures) {
+          if (rasters[role]) missing[role] = rasters[role];
+        }
+        if (!Object.keys(missing).length) return current;
+        const refs = await keepExtensionCaptureAssets(
+          this.store,
+          projectId,
+          originalId,
+          missing,
+        );
+        await insertExtensionCaptureAssets(
+          tx,
+          projectId,
+          originalId,
+          original.source_id,
+          original.item_id ?? undefined,
+          refs,
+          input.url,
+          actor.userId,
+          this.now().toISOString(),
+        );
+        if (
+          original.item_id &&
+          missing.passage &&
+          input.kind === "quote" &&
+          input.quote.highlight
+        ) {
+          await tx.query(
+            `UPDATE library_items SET content=jsonb_set(content,'{highlight}',$3::jsonb), version=version+1,updated_at=$4 WHERE project_id=$1 AND id=$2`,
+            [
+              projectId,
+              original.item_id,
+              JSON.stringify(input.quote.highlight),
+              this.now().toISOString(),
+            ],
+          );
+        }
+        return readExtensionCaptureReceipt(tx, projectId, originalId);
+      });
+    }
     const captureId = input.requestId;
     const fingerprint = extensionCaptureFingerprint(input);
     const replay = async (tx: Session) => {

@@ -76,6 +76,7 @@ export type ExtensionCaptureReceipt = {
   itemId?: string;
   pageUrl?: string;
   assets: ExtensionCaptureAssetReceipt[];
+  missingPictures: ExtensionCaptureAssetRole[];
 };
 
 type Session = Pick<SqlDatabase, "query">;
@@ -287,15 +288,19 @@ export async function readExtensionCaptureReceipt(
   );
   const first = rows[0];
   if (!first) throw new CatalogNotFoundError("Extension capture not found.");
+  const assets = rows.filter((row) => row.role != null).map(mapAsset);
+  const expected: ExtensionCaptureAssetRole[] =
+    first.kind === "audio" ? [] : ["top", "passage"];
   return {
     captureId: String(first.capture_id),
     kind: first.kind as ExtensionCaptureRequest["kind"],
     sourceId: String(first.source_id),
     ...(first.item_id ? { itemId: String(first.item_id) } : {}),
     ...(first.page_url ? { pageUrl: String(first.page_url) } : {}),
-    assets: rows
-      .filter((row) => row.role !== null && row.role !== undefined)
-      .map(mapAsset),
+    assets,
+    missingPictures: expected.filter(
+      (role) => !assets.some((asset) => asset.role === role),
+    ),
   };
 }
 

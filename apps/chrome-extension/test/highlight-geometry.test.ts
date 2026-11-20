@@ -22,6 +22,23 @@ describe("browser-supplied quote geometry", () => {
     ]);
   });
 
+  it("keeps the line at its painted height when Chrome crops the viewport bottom", () => {
+    const cropped = { width: 1600, height: 1050 };
+    expect(
+      highlightFromVisibleRects(
+        [{ left: 100, top: 300, width: 80, height: 20 }],
+        viewport,
+        cropped,
+      ).pixels[0]?.y,
+    ).toBe(600);
+    expect(() =>
+      highlightFromVisibleRects(
+        [{ left: 100, top: 520, width: 80, height: 20 }],
+        viewport,
+        cropped,
+      ),
+    ).toThrow();
+  });
   it("retains separate rectangles for wrapped lines and rounds out fractional pixels", () => {
     const result = highlightFromVisibleRects(
       [

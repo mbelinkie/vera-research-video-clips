@@ -6,6 +6,8 @@ import {
   type Page,
 } from "@playwright/test";
 import { cp, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import sharp from "sharp";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
@@ -61,12 +63,9 @@ async function stageExtensionForChrome() {
     JSON.stringify(
       {
         ...stagedBase,
-        // Chrome's optional-host permission prompt is browser chrome and is
-        // not automatable through Playwright. The captureVisibleTab API also
-        // requires activeTab or <all_urls>; the disposable staging copy uses
-        // the latter so a synthetic local page can exercise the real capture
-        // code without a browser-chrome permission handoff.
-        host_permissions: ["<all_urls>"],
+        // Pregrant the synthetic Research server only. Source access still
+        // requires invoking the toolbar action in the target tab.
+        host_permissions: ["http://127.0.0.1/*"],
       },
       null,
       2,
@@ -84,10 +83,11 @@ async function launchDisposableChrome(extensionPath: string) {
   const options = {
     ...(executablePath ? { executablePath } : { channel: "chrome" }),
     headless: process.env.VERA_EXTENSION_HEADLESS === "1",
-    ignoreHTTPSErrors: true,
+    deviceScaleFactor: 2,
     args: [
       `--disable-extensions-except=${extensionPath}`,
       `--load-extension=${extensionPath}`,
+      "--enable-unsafe-extension-debugging",
       "--disable-sync",
       "--disable-background-networking",
       "--disable-component-update",
@@ -130,46 +130,73 @@ async function waitForConfirmation(context: BrowserContext, id: string) {
   throw new Error("The extension did not open its confirmation page");
 }
 
-// Playwright cannot click Chrome's browser toolbar or invoke a browser-level
-// command shortcut. Open the unpacked popup document and click its real action
-// button instead; the button sends the same runtime message used by the
-// toolbar popup, while the article remains the active tab for activeTab.
+// Chrome for Testing runs the toolbar action against the actual source tab.
+// The helper extension view clicks the button in Chrome's native action popup.
 async function triggerPopupCapture(
   article: Page,
   context: BrowserContext,
   id: string,
   kind: "quote" | "page" = "quote",
 ) {
-  const popup = await context.newPage();
+  const helper = await context.newPage();
+  const browserCdp = await context.browser()!.newBrowserCDPSession();
   try {
-    await popup.goto(`chrome-extension://${id}/popup.html`);
-    const confirmationPromise = waitForConfirmation(context, id);
-    // Page.bringToFront is the CDP operation that changes Chrome's active
-    // tab; Playwright's page helper only changes the automation target here.
-    const articleCdp = await context.newCDPSession(article);
-    await articleCdp.send("Page.bringToFront");
-    // A direct Playwright click would activate this synthetic popup tab and
-    // revoke the article's activeTab context. Dispatch the same popup button
-    // handler while the CDP-selected article remains active; manual browser
-    // chrome checks cover the toolbar/context-menu/shortcut gesture itself.
-    await popup.evaluate((captureKind) => {
-      const button = document.querySelector<HTMLButtonElement>(
+    await helper.goto(`chrome-extension://${id}/popup.html`);
+    await article.bringToFront();
+    const { targetInfos } = await browserCdp.send("Target.getTargets", {
+      filter: [{ type: "tab" }],
+    });
+    const targetInfo = targetInfos.find(
+      (target) => target.url === article.url(),
+    );
+    if (!targetInfo)
+      throw new Error("The synthetic article tab is unavailable.");
+    await browserCdp.send("Extensions.triggerAction", {
+      id,
+      targetId: targetInfo.targetId,
+    });
+    await helper.waitForFunction((captureKind) => {
+      const extension = (
+        window as unknown as {
+          chrome: {
+            extension: { getViews(options: { type: string }): Window[] };
+          };
+        }
+      ).chrome.extension;
+      const popup = extension.getViews({ type: "popup" })[0];
+      if (popup?.document.readyState !== "complete") return false;
+      const button = popup.document.querySelector<HTMLButtonElement>(
         `button[data-kind="${captureKind}"]`,
       );
-      if (!button) throw new Error("The extension popup action is missing");
+      if (!button) return false;
       button.click();
+      return true;
     }, kind);
     try {
-      return await confirmationPromise;
-    } catch (error) {
-      const status = await popup.locator("#status").textContent();
+      return await waitForConfirmation(context, id);
+    } catch {
+      const state = await helper.evaluate(async () => {
+        const api = (
+          window as unknown as {
+            chrome: {
+              runtime: {
+                sendMessage(
+                  input: object,
+                ): Promise<{ status?: { message?: string } }>;
+              };
+            };
+          }
+        ).chrome;
+        return (await api.runtime.sendMessage({ type: "vera.capture.status" }))
+          .status?.message;
+      });
       throw new Error(
-        `The extension did not open its confirmation page (${status?.trim() || "no popup status"})`,
-        { cause: error },
+        `Chrome did not open ${kind} confirmation. ${state ?? "No capture status."}`,
       );
     }
   } finally {
-    await popup.close().catch(() => undefined);
+    await browserCdp.detach();
+    await helper.close().catch(() => undefined);
   }
 }
 
@@ -309,7 +336,7 @@ test.describe("Research #79 real Chrome synthetic capture", () => {
       await article.goto(`${fixture.origin}/login`, {
         waitUntil: "domcontentloaded",
       });
-      await article.goto(fixture.articleUrl, { waitUntil: "domcontentloaded" });
+      await expect(article).toHaveURL(fixture.articleUrl);
       const originalScrollY = await article.evaluate(() => window.scrollY);
       const expectedSelection = await article
         .locator('[data-fixture="quote"]')
@@ -325,18 +352,15 @@ test.describe("Research #79 real Chrome synthetic capture", () => {
       expect(expectedSelection.text === FIXTURE_QUOTE).toBe(true);
       expect(expectedSelection.rectangleCount >= 2).toBe(true);
 
-      const postRequests: Array<{ url: string; body: RecordValue }> = [];
-      article.on("request", (request) => {
+      let capturePosts = 0;
+      context.on("request", (request) => {
         if (
           request.method() !== "POST" ||
-          !request.url().includes("extension-captures")
+          !request.url().endsWith("/captures")
         ) {
           return;
         }
-        postRequests.push({
-          url: request.url(),
-          body: record(request.postDataJSON()),
-        });
+        capturePosts++;
       });
 
       await article.locator('[data-fixture="quote"]').selectText();
@@ -349,12 +373,13 @@ test.describe("Research #79 real Chrome synthetic capture", () => {
         .waitForEvent("close", { timeout: 5_000 })
         .catch(() => undefined);
       await new Promise((resolvePromise) => setTimeout(resolvePromise, 300));
-      expect(postRequests.length).toBe(0);
+      expect(capturePosts).toBe(0);
 
       await article.locator('[data-fixture="quote"]').selectText();
       const confirmation = await triggerPopupCapture(article, context, id);
       const confirmationUrl = new URL(confirmation.url());
-      expect(confirmationUrl.origin).toBe(`chrome-extension://${id}`);
+      expect(confirmationUrl.protocol).toBe("chrome-extension:");
+      expect(confirmationUrl.hostname).toBe(id);
       expect(confirmationUrl.pathname).toBe("/confirm.html");
       expect(confirmationUrl.hash.length > 1).toBe(true);
       await expect(
@@ -386,7 +411,7 @@ test.describe("Research #79 real Chrome synthetic capture", () => {
       const request = await requestPromise;
       const requestBody = record(request.postDataJSON());
       const response = await request.response();
-      expect(response?.ok()).toBe(true);
+      expect(response?.status()).toBe(201);
 
       const quote = record(requestBody.quote);
       const surroundingWords = record(quote.surroundingWords);
@@ -413,12 +438,92 @@ test.describe("Research #79 real Chrome synthetic capture", () => {
       expect(validatePicture(passage)).toBe(true);
       expect(validateRectangles(highlight.rectangles)).toBe(true);
 
+      const receipt = await response!.json();
+      const projectId = new URL(request.url()).pathname.split("/")[4];
+      const readBase =
+        destinationUrl.origin +
+        "/cloud-api/api/projects/" +
+        projectId +
+        "/extension-captures/" +
+        receipt.captureId;
+      const stored = await context.request.get(readBase);
+      expect(stored.status()).toBe(200);
+      const manifest = await stored.json();
+      expect(manifest.assets).toHaveLength(2);
+      for (const asset of manifest.assets) {
+        const read = await context.request.get(
+          readBase +
+            "/assets/" +
+            asset.role +
+            "?revisionId=" +
+            asset.revisionId,
+        );
+        expect(read.status()).toBe(200);
+        const data = await read.body();
+        expect(
+          createHash("sha256").update(data).digest("hex") === asset.sha256,
+        ).toBe(true);
+        const submitted = asset.role === "top" ? top : passage;
+        expect(data.equals(Buffer.from(String(submitted.data), "base64"))).toBe(
+          true,
+        );
+        if (asset.role === "passage") {
+          const { data: rgb, info } = await sharp(data)
+            .removeAlpha()
+            .raw()
+            .toBuffer({ resolveWithObject: true });
+          // The synthetic article uses magenta ink only for the selected words.
+          // Each stored line rectangle must actually contain that ink.
+          for (const box of asset.pixelRectangles) {
+            let ink = 0;
+            for (let y = box.y; y < box.y + box.height; y++) {
+              for (let x = box.x; x < box.x + box.width; x++) {
+                const i = (y * info.width + x) * info.channels;
+                if (rgb[i]! > 160 && rgb[i + 1]! < 80 && rgb[i + 2]! > 150)
+                  ink++;
+              }
+            }
+            expect(ink).toBeGreaterThan(0);
+          }
+          expect(asset.pixelRectangles.length).toBe(
+            expectedSelection.rectangleCount,
+          );
+        }
+      }
+
       const articleRequests = fixture.requests.filter(
         (path) => path === "/article",
       );
       expect(articleRequests.length).toBe(1);
       const endingScrollY = await article.evaluate(() => window.scrollY);
       expect(Math.abs(endingScrollY - originalScrollY)).toBeLessThanOrEqual(1);
+      await confirmation
+        .getByRole("button", { name: "Close", exact: true })
+        .click();
+      await article.evaluate(() => window.getSelection()?.removeAllRanges());
+      const pageConfirmation = await triggerPopupCapture(
+        article,
+        context,
+        id,
+        "page",
+      );
+      await chooseProject(pageConfirmation, projectName);
+      const savedPage = pageConfirmation.waitForResponse(
+        (result) =>
+          result.request().method() === "POST" &&
+          result.url().endsWith("/captures"),
+      );
+      await pageConfirmation
+        .getByRole("button", { name: "Save page", exact: true })
+        .click();
+      const pageResponse = await savedPage;
+      expect(pageResponse.status()).toBe(201);
+      const pageReceipt = await pageResponse.json();
+      expect(pageReceipt.sourceId).toBe(receipt.sourceId);
+      expect(pageReceipt.itemId).toBeUndefined();
+      expect(
+        pageReceipt.assets.map((asset: { role: string }) => asset.role).sort(),
+      ).toEqual(["passage", "top"]);
     } finally {
       await context.close();
       if (cleanupProfile) await rm(profile, { recursive: true, force: true });

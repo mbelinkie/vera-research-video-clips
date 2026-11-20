@@ -37,6 +37,7 @@ export function registerChromeConnection(
       code: string;
       expires: number;
       attempts: number;
+      address: string;
     }
   >();
   const prune = () => {
@@ -93,7 +94,11 @@ export function registerChromeConnection(
           .strictObject({ digest: hexKey })
           .parse(request.body);
         prune();
-        if (pending.size >= 128)
+        if (
+          pending.size >= 128 ||
+          [...pending.values()].filter((entry) => entry.address === request.ip)
+            .length >= 12
+        )
           fail(
             429,
             "Too many connections are pending. Try again in five minutes.",
@@ -106,6 +111,7 @@ export function registerChromeConnection(
           code,
           expires: Date.now() + 5 * minute,
           attempts: 0,
+          address: request.ip,
         });
         return { requestId, code };
       });

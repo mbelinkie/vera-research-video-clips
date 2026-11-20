@@ -23,4 +23,6 @@ The confirmation window shows the destination project before you save. **Cancel*
 
 Submitting the same video again gives you a fresh comment field. In the same project, each deliberate save can add a separate comment or timestamp to the same source. Open the batch in Research or look under **Ready for review** to see the comments together with their authors. Research keeps a checked playback position as elapsed milliseconds on that source comment. You can save a position by itself, including 0:00.
 
+If Chrome cannot capture a picture, the confirmation shows which view is missing. After saving, keep the picture repair code. Capture the same page or exact quote again, choose the original project, and enter the code under **Add missing pictures to an earlier save**. Research adds the available pictures to the original item.
+
 Pictures reflect what Chrome can display in the active tab. Review their previews before saving. For a PDF, use Research’s PDF workflow.

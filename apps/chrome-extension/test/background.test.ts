@@ -303,6 +303,23 @@ describe("capture worker", () => {
     expect(draft.quote.highlight.rectangles).toHaveLength(1);
   }, 10_000);
 
+  it("can save quote text when Chrome declines a screenshot", async () => {
+    const fixture = createFixture();
+    fixture.chrome.tabs.captureVisibleTab.mockRejectedValueOnce(
+      new Error("capture unavailable"),
+    );
+    await loadWorker(fixture.chrome);
+    const start = await runtimeMessage(
+      fixture,
+      { type: "vera.capture.start", kind: "quote" },
+      { url: fixture.chrome.runtime.getURL("popup.html") },
+    );
+    expect(start.ok).toBe(true);
+    const draft = await readDraft(fixture, start, 100);
+    expect(draft).not.toHaveProperty("top");
+    expect(draft.passage).toBeDefined();
+    expect(draft.quote.text).toBeTruthy();
+  });
   it("rejects a viewport change before attaching a screenshot", async () => {
     let identityCalls = 0;
     const fixture = createFixture({

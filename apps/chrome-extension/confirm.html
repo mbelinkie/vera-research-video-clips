@@ -42,6 +42,20 @@
               placeholder="Separate topics with commas" /></label
           ><label>Note<textarea id="notes" maxlength="20000"></textarea></label>
         </div>
+        <details id="repair" hidden>
+          <summary>Add missing pictures to an earlier save</summary>
+          <label
+            >Picture repair code<input
+              id="repair-code"
+              maxlength="36"
+              spellcheck="false"
+              autocomplete="off"
+          /></label>
+          <p>
+            Use the code from your earlier save in this project. This adds
+            available pictures to that item and keeps its text and notes.
+          </p>
+        </details>
         <button id="submit">Save</button>
       </fieldset>
     </form>

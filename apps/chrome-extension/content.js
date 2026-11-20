@@ -129,36 +129,37 @@
   function firstMeta(selectors) {
     for (const selector of selectors) {
       const value = document.querySelector(selector)?.getAttribute("content");
-      if (value) return value;
+      if (value?.trim()) return value.trim();
     }
     return undefined;
   }
 
   function metadata() {
     const url = safePageUrl(location.href);
+    const author = cleanText(
+      firstMeta([
+        'meta[name="author"]',
+        'meta[property="article:author"]',
+        'meta[name="byline"]',
+      ])?.trim(),
+      300,
+    );
     const result = {
       title: cleanText(
         firstMeta([
           'meta[property="og:title"]',
           'meta[name="twitter:title"]',
-        ]) ?? document.title,
-        512,
+        ]) ?? document.title.trim(),
+        500,
       ),
-      authors: cleanText(
-        firstMeta([
-          'meta[name="author"]',
-          'meta[property="article:author"]',
-          'meta[name="byline"]',
-        ]),
-        512,
-      ),
+      authors: author ? [author] : undefined,
       publication: cleanText(
         firstMeta([
           'meta[property="og:site_name"]',
           'meta[name="application-name"]',
           'meta[name="publisher"]',
         ]),
-        512,
+        500,
       ),
       date: cleanText(
         firstMeta([
@@ -166,7 +167,7 @@
           'meta[name="date"]',
           'meta[name="pubdate"]',
         ]),
-        128,
+        100,
       ),
       ...(url ? { url } : {}),
     };
@@ -430,7 +431,7 @@
     return {
       url: safeSource,
       pageUrl: safePageUrl(location.href),
-      title: cleanText(document.title, 512) || "Untitled image",
+      title: cleanText(document.title.trim(), 500) || "Untitled image",
       ...(image?.alt ? { altText: cleanText(image.alt, 1_024) } : {}),
       ...(credit ? { credit: cleanText(credit, 1_024) } : {}),
       ...(image

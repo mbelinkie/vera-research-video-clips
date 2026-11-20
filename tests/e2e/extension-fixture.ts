@@ -67,6 +67,7 @@ function articleHtml() {
       main { width: 560px; margin: 0 auto; padding: 48px 24px 160px; }
       article { background: white; padding: 32px; box-shadow: 0 4px 20px rgb(0 0 0 / .12); }
       [data-fixture="quote"] { display: block; width: 250px; }
+      [data-fixture="quote"], [data-fixture="quote"]::selection { color: rgb(220,0,210); background: white; }
       img { display: block; width: 320px; height: 180px; image-rendering: pixelated; object-fit: cover; }
       .spacer { height: 180px; }
     </style>
@@ -145,7 +146,7 @@ export async function createSyntheticExtensionFixture(): Promise<SyntheticFixtur
   if (!address || typeof address === "string") {
     throw new Error("Synthetic fixture did not bind a TCP port");
   }
-  const origin = `http://127.0.0.1:${address.port}`;
+  const origin = `http://localhost:${address.port}`;
   return {
     origin,
     articleUrl: `${origin}/article?utm_source=synthetic`,

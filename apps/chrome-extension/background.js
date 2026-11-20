@@ -202,9 +202,16 @@ async function capturePng(context) {
     if (waitMs) await new Promise((resolve) => setTimeout(resolve, waitMs));
     await assertContext(context);
     lastScreenshotAt.set(context.windowId, Date.now());
-    dataUrl = await chromeApi().tabs.captureVisibleTab(context.windowId, {
-      format: "png",
-    });
+    try {
+      dataUrl = await chromeApi().tabs.captureVisibleTab(context.windowId, {
+        format: "png",
+      });
+    } catch {
+      // A restricted or unavailable screenshot still permits an explicitly
+      // confirmed text capture. Any changed document or tab must abort it.
+      await assertContext(context);
+      return undefined;
+    }
   } finally {
     release();
     if (screenshotTail.get(context.windowId) === current) {
@@ -268,7 +275,6 @@ async function openConfirmation(payload) {
       const popup = await chromeApi().windows.create({
         url,
         type: "popup",
-        populate: true,
         focused: true,
         width: 460,
         height: 760,
@@ -325,12 +331,13 @@ async function captureQuote(context) {
       throw new CaptureSafetyError(
         "The selected passage moved during screenshot capture",
       );
-    const raster = { width: passage.width, height: passage.height };
-    geometry = highlightFromVisibleRects(
-      selected.value.rectangles,
-      selected.value.viewport,
-      raster,
-    );
+    if (passage) {
+      geometry = highlightFromVisibleRects(
+        selected.value.rectangles,
+        selected.value.viewport,
+        passage,
+      );
+    }
     if (selected.value.navigationKey !== context.navigationKey) {
       throw new CaptureSafetyError(
         "The selected passage changed during screenshot capture",
@@ -341,11 +348,9 @@ async function captureQuote(context) {
         "The capture viewport changed; no screenshot was attached",
       );
     }
-  } catch (error) {
-    throw error;
   } finally {
     try {
-      await assertContext(context, false);
+      await assertContext(context);
       await sendContent(context.tabId, { type: "vera.capture.restore" });
     } catch (error) {
       if (isCaptureSafetyError(error)) throw error;
@@ -371,11 +376,9 @@ async function capturePage(context) {
     await assertContext(context);
     await sendContent(context.tabId, { type: "vera.capture.page-top" });
     top = await capturePng(context);
-  } catch (error) {
-    throw error;
   } finally {
     try {
-      await assertContext(context, false);
+      await assertContext(context);
       await sendContent(context.tabId, { type: "vera.capture.page-restore" });
     } catch (error) {
       if (isCaptureSafetyError(error)) throw error;
@@ -441,7 +444,7 @@ function captureAudio(context, sourceUrl, title) {
     requestId: context.requestId,
     url,
     pageUrl: context.url,
-    ...(title ? { title: String(title).slice(0, 512) } : {}),
+    ...(title?.trim() ? { title: title.trim().slice(0, 500) } : {}),
   };
 }
 
