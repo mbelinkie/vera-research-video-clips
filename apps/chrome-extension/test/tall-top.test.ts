@@ -229,7 +229,7 @@ describe("bounded screenshot top stitching", () => {
     expect(await pixel(result!, 100, 257)).toEqual(rowColor(257));
   });
 
-  it("appends only nested panel pixels, not repeated surrounding chrome", async () => {
+  it("inserts new rows at the panel edge and keeps the original pixels below", async () => {
     installCanvas();
     const result = await stitchTallTop(
       await screenshot(0),
@@ -242,9 +242,12 @@ describe("bounded screenshot top stitching", () => {
       VIEWPORT,
     );
     expect(result).toMatchObject({ width: WIDTH, height: 240 });
-    expect(await pixel(result!, 100, 160)).toEqual(rowColor(150));
-    expect(await pixel(result!, 100, 239)).toEqual(rowColor(229));
+    expect(await pixel(result!, 100, 149)).toEqual(rowColor(149));
+    expect(await pixel(result!, 100, 150)).toEqual(rowColor(150));
+    expect(await pixel(result!, 100, 229)).toEqual(rowColor(229));
     expect(await pixel(result!, 20, 200)).toEqual([255, 255, 255, 255]);
+    expect(await pixel(result!, 100, 230)).toEqual(rowColor(150));
+    expect(await pixel(result!, 20, 239)).toEqual(rowColor(159));
   });
 
   it("uses a single view for a shifted seam or out-of-range scroll", async () => {

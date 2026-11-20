@@ -748,20 +748,27 @@ test.describe("Research #95 taller top image in real Chrome", () => {
         const old = isPanel ? scroll.scrollTop : window.scrollY;
         if (isPanel) scroll.scrollTop = 0;
         else window.scrollTo(0, 0);
-        const panelBottom =
-          scroll.getBoundingClientRect().bottom - (isPanel ? 8 : 0);
+        const seam = isPanel
+          ? scroll.getBoundingClientRect().top +
+            scroll.clientTop +
+            scroll.clientHeight
+          : innerHeight;
         const bands = Array.from(
           document.querySelectorAll<HTMLElement>("[data-band]"),
-        ).map((element) => ({
-          y: element.getBoundingClientRect().top + 35,
-          rgb: getComputedStyle(element)
-            .backgroundColor.match(/\d+/g)!
-            .slice(0, 3)
-            .map(Number),
-        }));
+        ).map((element) => {
+          const { top, bottom } = element.getBoundingClientRect();
+          return {
+            top,
+            bottom,
+            rgb: getComputedStyle(element)
+              .backgroundColor.match(/\d+/g)!
+              .slice(0, 3)
+              .map(Number),
+          };
+        });
         if (isPanel) scroll.scrollTop = old;
         else window.scrollTo(0, old);
-        return { bands, panelBottom };
+        return { bands, seam };
       }, mode === "panel");
       if (mode === "shift")
         await article.evaluate(async () => {
@@ -788,29 +795,33 @@ test.describe("Research #95 taller top image in real Chrome", () => {
         expect(countColor(top, [0, 140, 240], viewportPixels)).toBeGreaterThan(
           1000,
         );
-        // Check generated stripe colors across the seam, proving that the
-        // appended pixels progress through the article without repeats/gaps.
+        const seam = Math.round(positions.seam * scale);
+        const end = seam + top.info.height - viewportPixels;
+        const x = top.info.width / 2;
+        // Check the rows touching the join and the continuing article below it.
+        for (const y of [seam - 1, seam]) {
+          const band = positions.bands.find(
+            ({ top, bottom }) => top <= y / scale && y / scale < bottom,
+          );
+          expect(band).toBeDefined();
+          expect(colorAt(top, x, y)).toEqual(band?.rgb);
+        }
         const stripeSamples = positions.bands
           .map((band) => ({
             ...band,
-            rasterY:
-              scale *
-              (band.y <= positions.panelBottom || mode === "document"
-                ? band.y
-                : 720 + band.y - positions.panelBottom),
+            y: Math.round(((band.top + band.bottom) / 2) * scale),
           }))
-          .filter(
-            (band) =>
-              band.rasterY > viewportPixels + 15 * scale &&
-              band.rasterY < top.info.height - 15 * scale,
-          );
+          .filter((band) => band.y > seam && band.y < end);
         expect(stripeSamples.length).toBeGreaterThanOrEqual(2);
         for (const band of stripeSamples)
-          expect(colorAt(top, top.info.width / 2, band.rasterY)).toEqual(
-            band.rgb,
-          );
-        // The green sticky header belongs only to the initial viewport.
-        expect(countColor(top, [12, 240, 28], viewportPixels)).toBe(0);
+          expect(colorAt(top, x, band.y)).toEqual(band.rgb);
+        const sticky = [12, 240, 28];
+        expect(countColor(top, sticky)).toBeGreaterThan(0);
+        expect(countColor(top, sticky, seam)).toBe(0);
+        if (mode === "panel") {
+          // The original bottom border follows the last inserted article row.
+          expect(colorAt(top, x, end)).toEqual([17, 17, 17]);
+        }
       } else {
         expect(top.info.height).toBe(viewportPixels);
       }

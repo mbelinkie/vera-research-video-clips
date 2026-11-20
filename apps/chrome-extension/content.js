@@ -228,11 +228,13 @@
       };
     }
     const rect = element.getBoundingClientRect();
+    const left = rect.left + element.clientLeft;
+    const top = rect.top + element.clientTop;
     return {
-      left: Math.max(0, rect.left),
-      top: Math.max(0, rect.top),
-      right: Math.min(window.innerWidth, rect.right),
-      bottom: Math.min(window.innerHeight, rect.bottom),
+      left: Math.max(0, left),
+      top: Math.max(0, top),
+      right: Math.min(window.innerWidth, left + element.clientWidth),
+      bottom: Math.min(window.innerHeight, top + element.clientHeight),
     };
   }
 
@@ -338,9 +340,11 @@
       element = element.parentElement
     ) {
       const { overflowX, overflowY } = getComputedStyle(element);
+      const scrollsVertically =
+        element.scrollHeight > element.clientHeight &&
+        scrollable.test(overflowY);
       if (
-        (element.scrollHeight > element.clientHeight &&
-          scrollable.test(overflowY)) ||
+        scrollsVertically ||
         (element.scrollWidth > element.clientWidth &&
           scrollable.test(overflowX))
       ) {
@@ -348,6 +352,7 @@
           element,
           left: element.scrollLeft,
           top: element.scrollTop,
+          scrollsVertically,
         });
       }
     }
@@ -417,7 +422,12 @@
       Math.abs(window.scrollY) < 1 &&
       scrollContainers.every(({ element }) => Math.abs(element.scrollTop) < 1);
     topCaptureState = null;
-    if (atTop) startTopCapture(scrollContainers[0]?.element ?? null);
+    if (atTop) {
+      const panel = scrollContainers.find(
+        ({ scrollsVertically }) => scrollsVertically,
+      );
+      startTopCapture(panel?.element ?? null);
+    }
     return { atTop };
   }
 
@@ -525,9 +535,10 @@
   }
 
   async function pageTop() {
-    const preferred = document.querySelector(
-      "article,[itemprop='articleBody'],main,[role='main']",
-    );
+    const preferred =
+      document.querySelector("[itemprop='articleBody']") ??
+      document.querySelector("article") ??
+      document.querySelector("main,[role='main']");
     const element = scrollableArticlePanel(preferred);
     pageScrollState = {
       x: window.scrollX,
