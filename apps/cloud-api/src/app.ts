@@ -43,6 +43,7 @@ import {
   FinalizeTranscriptRequestSchema,
   GrantProjectMemberByEmailSchema,
   HealthResponseSchema,
+  PublishedEnglishTranscriptSchema,
   WorkerClaimRequestSchema,
   WorkerFailureRequestSchema,
   WorkerCreateTranscriptUploadRequestSchema,
@@ -83,6 +84,9 @@ export interface CloudApiDependencies {
 const IdParamsSchema = z.object({ projectId: z.uuid() });
 const ProjectMemberParamsSchema = IdParamsSchema.extend({ userId: z.uuid() });
 const ProjectVideoParamsSchema = IdParamsSchema.extend({ videoId: z.uuid() });
+const PublishedTranscriptParamsSchema = IdParamsSchema.extend({
+  youtubeVideoId: z.string().regex(/^[A-Za-z0-9_-]{11}$/u),
+});
 const ProjectClipParamsSchema = IdParamsSchema.extend({ clipId: z.uuid() });
 const ProjectSourceParamsSchema = IdParamsSchema.extend({ sourceId: z.uuid() });
 const ProjectItemParamsSchema = IdParamsSchema.extend({ itemId: z.uuid() });
@@ -283,10 +287,24 @@ export function createCloudApi(
         },
       );
       local.get("/__objects/:token", async (request, reply) => {
+        if (browserAuth) reply.header("cache-control", "no-store");
         const token = z
           .object({ token: z.string() })
           .parse(request.params).token;
         const capability = issuer.verify(token, "GET");
+        if (browserAuth) {
+          const [namespace, projectId] = capability.key.split("/");
+          const project = z.uuid().safeParse(projectId);
+          if (namespace !== "projects" || !project.success)
+            return reply.code(404).send({ error: "Object version not found" });
+          await catalog.getOwnMembership(
+            await authenticate(request),
+            project.data,
+          );
+          reply
+            .header("content-disposition", "attachment")
+            .header("x-content-type-options", "nosniff");
+        }
         const found = await store.get(capability.key, capability.versionId);
         if (!found)
           return reply.code(404).send({ error: "Object version not found" });
@@ -636,6 +654,7 @@ export function createCloudApi(
   });
 
   app.get("/api/projects/:projectId/clips.csv", async (request, reply) => {
+    reply.header("cache-control", "no-store");
     const { projectId } = IdParamsSchema.parse(request.params);
     const csv = await catalog.exportClipCandidatesCsv(
       await authenticate(request),
@@ -933,7 +952,8 @@ export function createCloudApi(
 
   app.get(
     "/api/projects/:projectId/videos/:videoId/transcripts/active",
-    async (request) => {
+    async (request, reply) => {
+      if (browserAuth) reply.header("cache-control", "no-store");
       const { projectId, videoId } = ProjectVideoParamsSchema.parse(
         request.params,
       );
@@ -941,6 +961,22 @@ export function createCloudApi(
         await authenticate(request),
         projectId,
         videoId,
+      );
+    },
+  );
+
+  app.get(
+    "/api/projects/:projectId/transcripts/english/:youtubeVideoId",
+    async (request, reply) => {
+      reply.header("cache-control", "no-store");
+      const { projectId, youtubeVideoId } =
+        PublishedTranscriptParamsSchema.parse(request.params);
+      return PublishedEnglishTranscriptSchema.parse(
+        await catalog.readPublishedEnglishTranscript(
+          await authenticate(request),
+          projectId,
+          youtubeVideoId,
+        ),
       );
     },
   );
