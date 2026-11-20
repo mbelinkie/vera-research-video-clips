@@ -74,8 +74,7 @@ describe("HTTP transcript artifact downloader", () => {
       objectVersionId: randomUUID(),
       byteSize: 2,
       sha256: createHash("sha256").update("{}").digest("hex"),
-      downloadUrl:
-        `https://api.example.test/api/projects/${randomUUID()}/videos/${randomUUID()}/transcripts/${randomUUID()}/artifacts/manifest`,
+      downloadUrl: `https://api.example.test/api/projects/${randomUUID()}/videos/${randomUUID()}/transcripts/${randomUUID()}/artifacts/manifest`,
     };
 
     try {
