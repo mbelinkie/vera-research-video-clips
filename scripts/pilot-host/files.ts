@@ -97,11 +97,35 @@ export class RotatingLog {
 }
 
 /** Atomic JSON state write (temp file + rename) so status never reads half a file. */
+/**
+ * Atomic, durable JSON state write: the temp file is fsynced before the
+ * rename and the directory after it, so a power cut keeps either the old or
+ * the new state, never neither.
+ */
 export async function writeState(path: string, value: unknown): Promise<void> {
   await mkdir(dirname(path), { recursive: true, mode: 0o700 });
   const temp = join(dirname(path), `.${Date.now()}-${process.pid}.tmp`);
-  await writeFile(temp, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
+  const handle = await open(
+    temp,
+    constants.O_WRONLY |
+      constants.O_CREAT |
+      constants.O_EXCL |
+      constants.O_NOFOLLOW,
+    0o600,
+  );
+  try {
+    await handle.writeFile(`${JSON.stringify(value, null, 2)}\n`);
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
   await rename(temp, path);
+  const dir = await open(dirname(path), constants.O_RDONLY);
+  try {
+    await dir.sync();
+  } finally {
+    await dir.close();
+  }
 }
 
 export async function readState<T>(path: string): Promise<T | undefined> {

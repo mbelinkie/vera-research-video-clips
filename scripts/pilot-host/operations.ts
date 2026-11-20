@@ -18,7 +18,7 @@ import {
   statfs,
 } from "node:fs/promises";
 import { connect } from "node:net";
-import { homedir } from "node:os";
+import { homedir, uptime } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 
@@ -152,13 +152,25 @@ export async function notify(title: string, message: string): Promise<void> {
 }
 
 /** Single-run lock so an overlapping schedule can never run twice at once. */
+/**
+ * Single-run lock so an overlapping schedule can never run twice at once.
+ * The lock records the holder's full identity (pid, start time, boot), so a
+ * lock left by a killed run is taken over, but a reused pid is not mistaken
+ * for a live holder. Staging folders left by killed runs of the same job are
+ * removed once the lock is held.
+ */
 async function withLock<T>(
   s: HostSettings,
-  name: string,
+  name: "backup" | "drill",
   work: () => Promise<T>,
 ): Promise<T> {
   await ensurePrivateDir(join(s.home, "state"));
   const path = join(s.home, "state", `${name}.lock`);
+  const me: GateOwner = {
+    pid: process.pid,
+    startedAtMs: Date.now() - process.uptime() * 1000,
+    bootAtMs: bootTimeMs(),
+  };
   const take = async () => {
     const handle = await open(
       path,
@@ -168,29 +180,33 @@ async function withLock<T>(
         constants.O_NOFOLLOW,
       0o600,
     );
-    await handle.writeFile(String(process.pid));
-    await handle.close();
+    try {
+      await handle.writeFile(JSON.stringify(me));
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
   };
   try {
     await take();
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-    const holder = Number((await readState<number>(path)) ?? 0);
-    let alive = false;
-    try {
-      if (holder > 0) {
-        process.kill(holder, 0);
-        alive = true;
-      }
-    } catch {
-      alive = false;
-    }
-    if (alive)
-      throw new Error(`Another ${name} is already running (pid ${holder})`);
+    const holder = await readState<GateOwner>(path);
+    if (
+      holder &&
+      typeof holder === "object" &&
+      (await ownerStillRunning(holder))
+    )
+      throw new Error(`Another ${name} is already running (pid ${holder.pid})`);
     await rm(path, { force: true });
     await take();
   }
   try {
+    // Leftovers from killed runs hold unencrypted working copies; remove them.
+    const stagingRoot = join(s.home, "staging");
+    for (const entry of await readdir(stagingRoot).catch(() => [] as string[]))
+      if (entry.startsWith(`${name}-`))
+        await rm(join(stagingRoot, entry), { recursive: true, force: true });
     return await work();
   } finally {
     await rm(path, { force: true });
@@ -233,15 +249,44 @@ async function assertDestination(s: HostSettings): Promise<void> {
 const gateOwnerFile = (s: HostSettings) =>
   join(s.home, "state", "backup-gate-owner.json");
 
-function processAlive(pid: number): boolean {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
+export type GateOwner = { pid: number; startedAtMs: number; bootAtMs: number };
+
+/** When this Mac last booted (to within a second or two). */
+export const bootTimeMs = () => Date.now() - uptime() * 1000;
+
+/** Start time of a running process, or undefined if it isn't running. */
+export async function processStartMs(pid: number): Promise<number | undefined> {
+  if (!Number.isInteger(pid) || pid <= 0) return undefined;
   try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    // EPERM means the process exists but belongs to someone else.
-    return (error as NodeJS.ErrnoException).code === "EPERM";
+    // etime: [[dd-]hh:]mm:ss elapsed since the process started.
+    const { stdout } = await run("ps", ["-o", "etime=", "-p", String(pid)]);
+    const match = /^\s*(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)\s*$/u.exec(stdout);
+    if (!match) return undefined;
+    const [, d, h, m, sec] = match;
+    const elapsed =
+      ((Number(d ?? 0) * 24 + Number(h ?? 0)) * 60 + Number(m)) * 60 +
+      Number(sec);
+    return Date.now() - elapsed * 1000;
+  } catch {
+    return undefined;
   }
+}
+
+/**
+ * True only if the recorded owner is the very same process, still running:
+ * same boot, same pid AND the same start time. A pid reused after a reboot or
+ * by an unrelated program does not count.
+ */
+export async function ownerStillRunning(
+  owner: GateOwner,
+  startOf: (pid: number) => Promise<number | undefined> = processStartMs,
+  bootAt: () => number = bootTimeMs,
+): Promise<boolean> {
+  if (Math.abs(bootAt() - owner.bootAtMs) > 120_000) return false;
+  const started = await startOf(owner.pid);
+  return (
+    started !== undefined && Math.abs(started - owner.startedAtMs) <= 5_000
+  );
 }
 
 /**
@@ -254,18 +299,24 @@ function processAlive(pid: number): boolean {
 export async function clearStaleBackupGate(
   s: HostSettings,
   log: (line: string) => Promise<void>,
-  options: { waitMs?: number; pollMs?: number } = {},
+  options: {
+    waitMs?: number;
+    pollMs?: number;
+    stillRunning?: (owner: GateOwner) => Promise<boolean>;
+  } = {},
 ): Promise<void> {
+  const stillRunning =
+    options.stillRunning ?? ((owner) => ownerStillRunning(owner));
   const gate = pilotBackupGatePath(s.objectRoot);
   const deadline = Date.now() + (options.waitMs ?? 30 * 60_000);
   for (;;) {
     if (!(await lstat(gate).catch(() => undefined))) return;
-    const owner = await readState<{ pid: number }>(gateOwnerFile(s));
+    const owner = await readState<GateOwner>(gateOwnerFile(s));
     if (!owner)
       throw new Error(
         "A backup write gate exists with no recorded owner; finish or remove that manual backup first",
       );
-    if (!processAlive(owner.pid)) {
+    if (!(await stillRunning(owner))) {
       await rmdir(gate);
       await rm(gateOwnerFile(s), { force: true });
       await log(
@@ -308,10 +359,13 @@ export async function runBackup(
       // PostgreSQL dump + exact pinned transcript objects + checksummed manifest.
       // Record who owns the write gate, so a backup killed mid-way (power
       // loss, SIGKILL) leaves a gate that `run-api` can prove is stale.
-      await writeState(gateOwnerFile(s), {
+      // Durable before the gate exists (writeState fsyncs file and folder).
+      const owner: GateOwner = {
         pid: process.pid,
-        at: now.toISOString(),
-      });
+        startedAtMs: Date.now() - process.uptime() * 1000,
+        bootAtMs: bootTimeMs(),
+      };
+      await writeState(gateOwnerFile(s), owner);
       try {
         await backupPilot(s.pgUrl, s.objectRoot, join(staging, "backup"), {
           offline: options.offline ?? false,
@@ -664,6 +718,10 @@ export async function collectStatus(
   )
     problems.push(
       `Latest restore drill FAILED: ${drill.lastFailure.message ?? "unknown error"}`,
+    );
+  if (diagnostics?.maintenance?.writesBlocked)
+    problems.push(
+      "Saving is paused by a backup write gate (normal for a few seconds during a backup)",
     );
   if (diagnostics?.maintenance?.diskPaused)
     problems.push("Saving is paused: disk nearly full");

@@ -6,7 +6,7 @@
  * See docs/operations/mac-pilot-hosting.md.
  */
 import { execFile, spawn } from "node:child_process";
-import { access, writeFile } from "node:fs/promises";
+import { access, rename, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -166,13 +166,25 @@ async function runApi(): Promise<number> {
   await writeState(startsFile, {
     starts: [...starts, new Date().toISOString()].slice(-50),
   });
-  return supervise({
-    name: "Research API",
-    command: process.execPath,
-    args: ["--import", "tsx", "apps/cloud-api/src/main.ts"],
-    env: childEnv,
-    log,
-  });
+  // A backup killed while the API keeps running would otherwise leave saving
+  // paused until the next restart. Re-check every minute; only a gate whose
+  // recorded owner is provably gone is ever removed.
+  const gateSweep = setInterval(() => {
+    void clearStaleBackupGate(settings, (line) => log.write(line), {
+      waitMs: 0,
+    }).catch(() => undefined);
+  }, 60_000);
+  try {
+    return await supervise({
+      name: "Research API",
+      command: process.execPath,
+      args: ["--import", "tsx", "apps/cloud-api/src/main.ts"],
+      env: childEnv,
+      log,
+    });
+  } finally {
+    clearInterval(gateSweep);
+  }
 }
 
 /**
@@ -183,6 +195,7 @@ async function runApi(): Promise<number> {
 async function pilotApiIsOrigin(
   operatorPort: number,
   publicOrigin: string,
+  publicPort: number,
 ): Promise<boolean> {
   try {
     const response = await fetch(
@@ -190,8 +203,12 @@ async function pilotApiIsOrigin(
       { signal: AbortSignal.timeout(2_000), redirect: "error" },
     );
     if (!response.ok) return false;
-    const body = (await response.json()) as { publicOrigin?: unknown };
-    return body.publicOrigin === publicOrigin;
+    const body = (await response.json()) as {
+      publicOrigin?: unknown;
+      publicPort?: unknown;
+    };
+    // Same origin AND the same port the tunnel config points at.
+    return body.publicOrigin === publicOrigin && body.publicPort === publicPort;
   } catch {
     return false;
   }
@@ -208,7 +225,11 @@ async function runTunnel(): Promise<number> {
   await ensurePrivateDir(join(settings.home, "logs"));
   const log = new RotatingLog(join(settings.home, "logs", "tunnel.log"));
   const isOrigin = () =>
-    pilotApiIsOrigin(config.operatorPort, config.browserPublicOrigin!);
+    pilotApiIsOrigin(
+      config.operatorPort,
+      config.browserPublicOrigin!,
+      config.cloudApiPort,
+    );
   // Never forward friends to whatever happens to hold the port.
   if (!(await isOrigin())) {
     await log.write(
@@ -223,7 +244,7 @@ async function runTunnel(): Promise<number> {
       "tunnel",
       "--no-autoupdate",
       "--config",
-      join(settings.home, "cloudflared.yml"),
+      await writeTunnelConfig(env, settings),
       "run",
     ],
     env: childEnvFrom({}),
@@ -321,8 +342,15 @@ async function install(flags: Set<string>) {
   }
 }
 
-async function tunnelConfig() {
-  const { env, settings } = await loadEnv();
+/**
+ * Renders cloudflared.yml from the validated env. run-tunnel calls this on
+ * every start, so the tunnel can never follow a stale saved file to a port
+ * other than the pilot's own.
+ */
+async function writeTunnelConfig(
+  env: Record<string, string>,
+  settings: { home: string; metricsPort: number },
+): Promise<string> {
   const config = assertFriendFacing({ PATH: process.env.PATH ?? "", ...env });
   const need = (name: string) => {
     const value = env[name];
@@ -342,7 +370,15 @@ async function tunnelConfig() {
     accessAud: config.cloudflareAccessAud!,
   });
   const path = join(settings.home, "cloudflared.yml");
-  await writeFile(path, text, { mode: 0o600 });
+  const temp = `${path}.${process.pid}.tmp`;
+  await writeFile(temp, text, { mode: 0o600 });
+  await rename(temp, path);
+  return path;
+}
+
+async function tunnelConfig() {
+  const { env, settings } = await loadEnv();
+  const path = await writeTunnelConfig(env, settings);
   process.stdout.write(`Wrote ${path}\n`);
 }
 
@@ -475,6 +511,7 @@ export async function main(argv: string[]): Promise<number> {
         !(await pilotApiIsOrigin(
           config.operatorPort,
           config.browserPublicOrigin!,
+          config.cloudApiPort,
         ))
       )
         throw new Error(

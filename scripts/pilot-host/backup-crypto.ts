@@ -21,7 +21,15 @@ import {
   timingSafeEqual,
 } from "node:crypto";
 import { constants } from "node:fs";
-import { lstat, open, rename, rm, type FileHandle } from "node:fs/promises";
+import {
+  link,
+  lstat,
+  open,
+  rename,
+  rm,
+  unlink,
+  type FileHandle,
+} from "node:fs/promises";
 import { dirname } from "node:path";
 
 export const BACKUP_MAGIC = Buffer.from("VERABK01", "ascii");
@@ -106,13 +114,33 @@ export async function syncDirectory(path: string): Promise<void> {
 /**
  * Publishes a finished `.partial` file under its final name without ever
  * replacing an existing file, then syncs the directory entry.
+ *
+ * A hard link is created atomically and fails with EEXIST if the name is
+ * taken, so no race can replace a backup. Only on a volume that cannot hard
+ * link (for example an exFAT external drive) does it fall back to
+ * check-then-rename; there the single-run lock and random backup names keep
+ * the remaining window theoretical.
  */
 export async function publishNoReplace(
   partial: string,
   destination: string,
 ): Promise<void> {
-  await assertAbsent(destination);
-  await rename(partial, destination);
+  try {
+    await link(partial, destination);
+    await unlink(partial);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "EEXIST")
+      throw new BackupCryptoError(`Refusing to replace ${destination}`);
+    if (
+      !["ENOTSUP", "EPERM", "EXDEV", "EOPNOTSUPP", "ENOSYS"].includes(
+        code ?? "",
+      )
+    )
+      throw error;
+    await assertAbsent(destination);
+    await rename(partial, destination);
+  }
   await syncDirectory(dirname(destination));
 }
 

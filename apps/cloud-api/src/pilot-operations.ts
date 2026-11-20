@@ -149,6 +149,8 @@ export function createOperatorApi(options: {
   counters: OperatorCounters;
   disk?: DiskSpaceMonitor;
   publicOrigin?: string;
+  /** The tunnel-facing port this process serves, so the tunnel can verify it. */
+  publicPort?: number;
 }): FastifyInstance {
   const app = Fastify({ logger: false });
   const allowedHosts = new Set([
@@ -182,6 +184,7 @@ export function createOperatorApi(options: {
     pid: process.pid,
     node: process.version,
     publicOrigin: options.publicOrigin ?? null,
+    publicPort: options.publicPort ?? null,
     process: options.counters.snapshot(),
     maintenance: options.gate ? await options.gate.status() : null,
     disk: options.disk

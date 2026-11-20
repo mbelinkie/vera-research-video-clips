@@ -190,6 +190,7 @@ const operator = pilot
       ...(gate ? { gate } : {}),
       ...(disk ? { disk } : {}),
       counters,
+      publicPort: config.cloudApiPort,
       ...(config.browserPublicOrigin
         ? { publicOrigin: config.browserPublicOrigin }
         : {}),

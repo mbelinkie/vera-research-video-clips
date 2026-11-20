@@ -30,6 +30,8 @@ import { renderPlist } from "../../scripts/pilot-host/launchd.ts";
 import {
   clearStaleBackupGate,
   collectStatus,
+  ownerStillRunning,
+  processStartMs,
   destinationKind,
   formatStatus,
   hostSettings,
@@ -395,6 +397,8 @@ describe("stale backup write gate", () => {
     // A pid that cannot exist on macOS.
     await writeState(join(root, "home", "state", "backup-gate-owner.json"), {
       pid: 99_999_999,
+      startedAtMs: Date.now(),
+      bootAtMs: Date.now() - 3_600_000,
     });
     const lines: string[] = [];
     await clearStaleBackupGate(settings, async (line) => {
@@ -413,12 +417,15 @@ describe("stale backup write gate", () => {
     ).rejects.toThrow("no recorded owner");
     expect((await stat(gate(root))).isDirectory()).toBe(true);
     await writeState(join(root, "home", "state", "backup-gate-owner.json"), {
-      pid: process.pid, // alive
+      pid: process.pid,
+      startedAtMs: Date.now(),
+      bootAtMs: Date.now(),
     });
     await expect(
       clearStaleBackupGate(settings, async () => undefined, {
         waitMs: 50,
         pollMs: 10,
+        stillRunning: async () => true,
       }),
     ).rejects.toThrow("still holding the write gate");
     expect((await stat(gate(root))).isDirectory()).toBe(true);
@@ -427,5 +434,53 @@ describe("stale backup write gate", () => {
   it("does nothing when there is no gate", async () => {
     const root = await newRoot();
     await clearStaleBackupGate(settingsFor(root), async () => undefined);
+  });
+});
+
+describe("backup owner identity", () => {
+  const owner = { pid: 4242, startedAtMs: 1_000_000, bootAtMs: 500_000 };
+  it("is the same process only with the same boot, pid and start time", async () => {
+    expect(
+      await ownerStillRunning(
+        owner,
+        async () => 1_002_000,
+        () => 500_500,
+      ),
+    ).toBe(true);
+  });
+  it("treats a reused pid (different start time) as not running", async () => {
+    expect(
+      await ownerStillRunning(
+        owner,
+        async () => 9_000_000,
+        () => 500_500,
+      ),
+    ).toBe(false);
+  });
+  it("treats any owner from a previous boot as not running", async () => {
+    expect(
+      await ownerStillRunning(
+        owner,
+        async () => 1_000_000,
+        () => 9_000_000,
+      ),
+    ).toBe(false);
+  });
+  it("treats a pid that isn't running as not running", async () => {
+    expect(
+      await ownerStillRunning(
+        owner,
+        async () => undefined,
+        () => 500_500,
+      ),
+    ).toBe(false);
+  });
+  it("reads this process's real start time from the OS", async () => {
+    const started = await processStartMs(process.pid);
+    expect(started).toBeDefined();
+    expect(
+      Math.abs(started! - (Date.now() - process.uptime() * 1000)),
+    ).toBeLessThan(5_000);
+    expect(await processStartMs(99_999_999)).toBeUndefined();
   });
 });
