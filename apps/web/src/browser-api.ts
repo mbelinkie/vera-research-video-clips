@@ -33,6 +33,24 @@ export type BrowserSession =
       user: { id: string; displayName: string } | null;
     };
 
+/**
+ * The pilot runs on the host's laptop behind Cloudflare. While it sleeps or is
+ * offline, Cloudflare itself answers with a gateway error page (502/504 or a
+ * 52x/530 status) instead of our JSON. Treat that as "host unavailable", not
+ * as an application error. Our own JSON errors (for example a 503 while a
+ * backup briefly pauses saving) are left to the caller.
+ */
+export function hostUnreachable(response: Response): boolean {
+  const gateway =
+    response.status === 502 ||
+    response.status === 504 ||
+    (response.status >= 520 && response.status <= 530);
+  return (
+    gateway &&
+    !(response.headers.get("content-type") ?? "").includes("application/json")
+  );
+}
+
 export async function cloudFetch(
   path: string,
   init: RequestInit,
@@ -59,7 +77,10 @@ export async function cloudFetch(
       credentials: "same-origin",
       headers,
     });
-    if ((browserMode || managedResearch) && response.status === 401)
+    if (
+      (browserMode || managedResearch) &&
+      (response.status === 401 || hostUnreachable(response))
+    )
       auth.onUnavailable?.();
     return response;
   } catch (error) {

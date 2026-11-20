@@ -208,7 +208,35 @@ describe("browser BFF configuration boundary", () => {
     COGNITO_DOMAIN: "https://vera.auth.us-east-1.amazoncognito.com",
     COGNITO_CLIENT_ID: "test-client",
     COGNITO_CLIENT_SECRET: "test-only-not-real",
+    CF_ACCESS_TEAM_DOMAIN: "https://vera-test.cloudflareaccess.com",
+    CF_ACCESS_AUD: "a".repeat(64),
   };
+  it("requires Cloudflare Access verification for a friend-facing pilot", () => {
+    const withoutAccess: Record<string, string> = { ...valid };
+    delete withoutAccess.CF_ACCESS_TEAM_DOMAIN;
+    delete withoutAccess.CF_ACCESS_AUD;
+    expect(() => loadConfig(withoutAccess)).toThrow(
+      "requires CF_ACCESS_TEAM_DOMAIN and CF_ACCESS_AUD",
+    );
+    for (const team of [
+      "http://vera-test.cloudflareaccess.com",
+      "https://vera-test.cloudflareaccess.com/",
+      "https://*.cloudflareaccess.com",
+      "https://evil.example",
+      "https://vera-test.cloudflareaccess.com.evil.example",
+    ])
+      expect(() =>
+        loadConfig({ ...valid, CF_ACCESS_TEAM_DOMAIN: team }),
+      ).toThrow("CF_ACCESS_TEAM_DOMAIN");
+    expect(() => loadConfig({ ...valid, CF_ACCESS_AUD: "short" })).toThrow(
+      "CF_ACCESS_AUD",
+    );
+    expect(() => loadConfig({ ...valid, OPERATOR_PORT: "43111" })).toThrow(
+      "OPERATOR_PORT must differ",
+    );
+    expect(loadConfig(valid).operatorPort).toBe(43_114);
+    expect(loadConfig(valid).diskPauseBelowMb).toBe(2_048);
+  });
   it("requires explicit browser auth for production", () => {
     expect(() => loadConfig({ NODE_ENV: "production" })).toThrow(
       "Production cloud API requires browser BFF mode",

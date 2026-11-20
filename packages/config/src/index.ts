@@ -29,6 +29,10 @@ export const AppConfigSchema = z
     cognitoClientId: z.string().trim().min(1).optional(),
     cognitoClientSecret: z.string().min(1).optional(),
     trustedProxyPeers: z.array(LoopbackHostSchema),
+    cloudflareAccessTeamDomain: z.string().optional(),
+    cloudflareAccessAud: z.string().optional(),
+    operatorPort: PortSchema,
+    diskPauseBelowMb: z.coerce.number().int().min(256).max(1_048_576),
     browserSessionIdleMs: z.coerce.number().int().min(60_000).max(3_600_000),
     browserSessionAbsoluteMs: z.coerce
       .number()
@@ -163,6 +167,47 @@ export const AppConfigSchema = z
           "Idle timeout cannot exceed absolute timeout",
         );
     }
+    if (config.operatorPort === config.cloudApiPort)
+      reject("operatorPort", "OPERATOR_PORT must differ from CLOUD_API_PORT");
+    const accessConfigured =
+      config.cloudflareAccessTeamDomain !== undefined ||
+      config.cloudflareAccessAud !== undefined;
+    if (accessConfigured) {
+      let teamOk = false;
+      try {
+        const team = new URL(config.cloudflareAccessTeamDomain ?? "");
+        teamOk =
+          team.protocol === "https:" &&
+          team.origin === config.cloudflareAccessTeamDomain &&
+          /^[a-z0-9-]+\.cloudflareaccess\.com$/u.test(team.hostname);
+      } catch {
+        // Rejected below.
+      }
+      if (!teamOk)
+        reject(
+          "cloudflareAccessTeamDomain",
+          "CF_ACCESS_TEAM_DOMAIN must be a bare https://<team>.cloudflareaccess.com origin",
+        );
+      if (!/^[0-9a-f]{64}$/u.test(config.cloudflareAccessAud ?? ""))
+        reject(
+          "cloudflareAccessAud",
+          "CF_ACCESS_AUD must be the Access application's 64-character audience tag",
+        );
+      if (config.cloudAuthMode !== "browser")
+        reject(
+          "cloudflareAccessAud",
+          "Cloudflare Access verification requires browser BFF mode",
+        );
+    }
+    if (
+      config.nodeEnv === "production" &&
+      config.runtimeMode === "mac-pilot" &&
+      !accessConfigured
+    )
+      reject(
+        "cloudflareAccessAud",
+        "A friend-facing Mac pilot requires CF_ACCESS_TEAM_DOMAIN and CF_ACCESS_AUD",
+      );
     if (config.nodeEnv === "production" && config.runtimeMode !== "mac-pilot") {
       context.addIssue({
         code: "custom",
@@ -354,6 +399,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     trustedProxyPeers: (env.TRUSTED_PROXY_PEERS ?? "127.0.0.1,::1")
       .split(",")
       .map((value) => value.trim()),
+    cloudflareAccessTeamDomain: env.CF_ACCESS_TEAM_DOMAIN,
+    cloudflareAccessAud: env.CF_ACCESS_AUD,
+    operatorPort: env.OPERATOR_PORT ?? 43_114,
+    diskPauseBelowMb: env.PILOT_DISK_PAUSE_BELOW_MB ?? 2_048,
     browserSessionIdleMs: env.BROWSER_SESSION_IDLE_MS ?? 1_800_000,
     browserSessionAbsoluteMs: env.BROWSER_SESSION_ABSOLUTE_MS ?? 28_800_000,
     cloudApiPort: env.CLOUD_API_PORT ?? 43_111,

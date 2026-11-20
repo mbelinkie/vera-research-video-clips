@@ -134,7 +134,7 @@ function App() {
     clearPrivateState();
     setSession(undefined);
     setSessionIssue(
-      "Session expired or Mac unavailable. Retry the connection or sign in again.",
+      "Research is unavailable or your session ended. It runs on the host's laptop, which may be asleep or offline; your saved work is safe. Try again later, or sign in again.",
     );
   }, [clearPrivateState]);
   const loseManagedConnection = useCallback(() => {
