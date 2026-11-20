@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
   ApiErrorSchema,
@@ -10,7 +10,18 @@ import {
 } from "@research-video/contracts";
 
 import { cloudFetch } from "./browser-api.ts";
-import type { Crop } from "./still-crop-geometry.ts";
+import {
+  containedImageRect,
+  drawnCrop,
+  minimumPointerCrop,
+  movedCrop,
+  normalizedPoint,
+  resizedCrop,
+  type Corner,
+  type Crop,
+  type Point,
+  type Rect,
+} from "./still-crop-geometry.ts";
 
 type StillsWorkspaceProps = {
   authorization: string;
@@ -35,10 +46,33 @@ type Draft = {
 };
 
 type AssetState = {
+  itemId?: string;
   displayUrl?: string;
   loading: boolean;
   unavailable: boolean;
 };
+
+type CropGesture = {
+  pointerId: number;
+  mode: "draw" | "move" | "resize";
+  corner?: Corner;
+  start: Point;
+  original: Crop;
+  minimum: Point;
+  previewUrl: string;
+  targetId: string;
+  projectId: string;
+};
+
+function rasterBounds(image: HTMLImageElement): Rect | undefined {
+  if (!image.complete || !image.naturalWidth || !image.naturalHeight)
+    return undefined;
+  const box = image.getBoundingClientRect();
+  return containedImageRect(
+    { left: box.left, top: box.top, width: box.width, height: box.height },
+    { width: image.naturalWidth, height: image.naturalHeight },
+  );
+}
 
 const emptyCrop: Crop = { x: 0, y: 0, width: 1, height: 1 };
 
@@ -238,6 +272,14 @@ export function StillsWorkspace({
   const [pageSourceId, setPageSourceId] = useState("");
   const [crop, setCrop] = useState<Crop>(emptyCrop);
   const [cropTargetId, setCropTargetId] = useState("");
+  const cropPreviewRef = useRef<HTMLDivElement>(null);
+  const cropImageRef = useRef<HTMLImageElement>(null);
+  const cropSurfaceRef = useRef<HTMLDivElement>(null);
+  const cropGesture = useRef<CropGesture | null>(null);
+  const [cropLayout, setCropLayout] = useState<{
+    url: string;
+    bounds: Rect;
+  }>();
   const [formBusy, setFormBusy] = useState(false);
   const [formMessage, setFormMessage] = useState<string>();
   const [formError, setFormError] = useState<string>();
@@ -269,7 +311,15 @@ export function StillsWorkspace({
     : undefined;
   const selectedPreviewUrl = assetState.displayUrl;
   const cropTarget = items.find((item) => item.id === cropTargetId);
-  const cropPreviewUrl = cropTargetId ? selectedPreviewUrl : filePreviewUrl;
+  const cropPreviewUrl = cropTargetId
+    ? assetState.itemId === cropTargetId && !assetState.loading
+      ? selectedPreviewUrl
+      : undefined
+    : filePreviewUrl;
+  const cropBounds =
+    cropPreviewUrl && cropLayout?.url === cropPreviewUrl
+      ? cropLayout.bounds
+      : undefined;
   const currentSourceForForm = pageSources.find(
     (source) => source.id === pageSourceId,
   );
@@ -399,7 +449,11 @@ export function StillsWorkspace({
     const controller = new AbortController();
     let active = true;
     let objectUrl: string | undefined;
-    setAssetState({ loading: true, unavailable: false });
+    setAssetState({
+      itemId: selectedItem.id,
+      loading: true,
+      unavailable: false,
+    });
     void (async () => {
       try {
         const response = await cloudFetch(
@@ -417,6 +471,7 @@ export function StillsWorkspace({
         objectUrl = URL.createObjectURL(blob);
         if (active)
           setAssetState({
+            itemId: selectedItem.id,
             displayUrl: objectUrl,
             loading: false,
             unavailable: false,
@@ -424,7 +479,11 @@ export function StillsWorkspace({
         else URL.revokeObjectURL(objectUrl);
       } catch (error) {
         if (active && !(error instanceof Error && error.name === "AbortError"))
-          setAssetState({ loading: false, unavailable: true });
+          setAssetState({
+            itemId: selectedItem.id,
+            loading: false,
+            unavailable: true,
+          });
       }
       if (!knownSource && active) {
         try {
@@ -477,7 +536,212 @@ export function StillsWorkspace({
       : undefined,
   );
   const selectedSourceName = sourceLabel(selectedSource ?? selectedItemSource);
+
+  const measureCropPreview = useCallback(() => {
+    const image = cropImageRef.current;
+    const preview = cropPreviewRef.current;
+    const raster = image && rasterBounds(image);
+    if (!preview || !raster || !cropPreviewUrl) {
+      setCropLayout(undefined);
+      return;
+    }
+    const outer = preview.getBoundingClientRect();
+    // Absolute children are positioned from the preview's padding edge, not
+    // its outer border. The raster is also letterboxed *within* the img.
+    const bounds = {
+      left: raster.left - outer.left - preview.clientLeft,
+      top: raster.top - outer.top - preview.clientTop,
+      width: raster.width,
+      height: raster.height,
+    };
+    setCropLayout((previous) =>
+      previous?.url === cropPreviewUrl &&
+      previous.bounds.left === bounds.left &&
+      previous.bounds.top === bounds.top &&
+      previous.bounds.width === bounds.width &&
+      previous.bounds.height === bounds.height
+        ? previous
+        : { url: cropPreviewUrl, bounds },
+    );
+  }, [cropPreviewUrl]);
+
+  useEffect(() => {
+    measureCropPreview();
+    const image = cropImageRef.current;
+    const preview = cropPreviewRef.current;
+    if (!image || !preview || !cropPreviewUrl) return;
+    const observer =
+      typeof ResizeObserver === "undefined"
+        ? undefined
+        : new ResizeObserver(measureCropPreview);
+    observer?.observe(image);
+    observer?.observe(preview);
+    window.addEventListener("resize", measureCropPreview);
+    window.addEventListener("scroll", measureCropPreview, true);
+    return () => {
+      observer?.disconnect();
+      window.removeEventListener("resize", measureCropPreview);
+      window.removeEventListener("scroll", measureCropPreview, true);
+    };
+  }, [cropPreviewUrl, measureCropPreview]);
+
+  function abandonCropGesture() {
+    const active = cropGesture.current;
+    cropGesture.current = null;
+    if (active && cropSurfaceRef.current?.hasPointerCapture(active.pointerId))
+      cropSurfaceRef.current.releasePointerCapture(active.pointerId);
+  }
+
+  // Never let a captured pointer from the previous saved item/asset update the
+  // next item's crop. If the same draft loses its asset, restore its snapshot.
+  useEffect(() => {
+    const active = cropGesture.current;
+    if (
+      active &&
+      (active.previewUrl !== cropPreviewUrl ||
+        active.targetId !== cropTargetId ||
+        active.projectId !== projectId)
+    ) {
+      abandonCropGesture();
+      if (active.targetId === cropTargetId && active.projectId === projectId)
+        setCrop(active.original);
+    }
+  }, [cropPreviewUrl, cropTargetId, projectId]);
+
+  useEffect(
+    () => () => {
+      // No state update after unmount, and no pointer capture left behind.
+      const active = cropGesture.current;
+      cropGesture.current = null;
+      if (active && cropSurfaceRef.current?.hasPointerCapture(active.pointerId))
+        cropSurfaceRef.current.releasePointerCapture(active.pointerId);
+    },
+    [],
+  );
+
+  function gestureCrop(
+    active: CropGesture,
+    event: React.PointerEvent<HTMLDivElement>,
+  ): Crop | undefined {
+    const image = cropImageRef.current;
+    const raster = image && rasterBounds(image);
+    const point =
+      raster && normalizedPoint({ x: event.clientX, y: event.clientY }, raster);
+    if (!point) return undefined;
+    if (active.mode === "draw")
+      return drawnCrop(active.start, point, active.minimum);
+    if (active.mode === "move")
+      return movedCrop(active.original, {
+        x: point.x - active.start.x,
+        y: point.y - active.start.y,
+      });
+    return active.corner
+      ? resizedCrop(active.original, active.corner, point, active.minimum)
+      : undefined;
+  }
+
+  function currentCropGesture(active: CropGesture) {
+    return (
+      active.previewUrl === cropPreviewUrl &&
+      active.targetId === cropTargetId &&
+      active.projectId === projectId
+    );
+  }
+
+  function handleCropPointerDown(event: React.PointerEvent<HTMLDivElement>) {
+    if (
+      event.button !== 0 ||
+      !event.isPrimary ||
+      cropGesture.current ||
+      formBusy ||
+      !cropPreviewUrl ||
+      !cropBounds
+    )
+      return;
+    const image = cropImageRef.current;
+    const raster = image && rasterBounds(image);
+    const start =
+      raster && normalizedPoint({ x: event.clientX, y: event.clientY }, raster);
+    const minimum =
+      raster &&
+      image &&
+      minimumPointerCrop(
+        { width: image.naturalWidth, height: image.naturalHeight },
+        raster,
+      );
+    if (!start || !minimum) return;
+
+    const target = event.target instanceof HTMLElement ? event.target : null;
+    const cornerName =
+      target?.closest<HTMLElement>("[data-crop-corner]")?.dataset.cropCorner;
+    const corner = (["nw", "ne", "sw", "se"] as string[]).includes(
+      cornerName ?? "",
+    )
+      ? (cornerName as Corner)
+      : undefined;
+    const inside = Boolean(target?.closest(".stills-crop-box"));
+    const full =
+      crop.x === 0 && crop.y === 0 && crop.width === 1 && crop.height === 1;
+    const mode = corner
+      ? "resize"
+      : full || !inside || Boolean(cropError(crop))
+        ? "draw"
+        : "move";
+    const active: CropGesture = {
+      pointerId: event.pointerId,
+      mode,
+      ...(corner ? { corner } : {}),
+      start,
+      original: crop,
+      minimum,
+      previewUrl: cropPreviewUrl,
+      targetId: cropTargetId,
+      projectId,
+    };
+    try {
+      event.currentTarget.setPointerCapture(event.pointerId);
+    } catch {
+      return;
+    }
+    cropGesture.current = active;
+    event.preventDefault();
+  }
+
+  function handleCropPointerMove(event: React.PointerEvent<HTMLDivElement>) {
+    const active = cropGesture.current;
+    if (!active || active.pointerId !== event.pointerId) return;
+    if (!currentCropGesture(active)) {
+      abandonCropGesture();
+      return;
+    }
+    const next = gestureCrop(active, event);
+    if (next) {
+      setCrop(next);
+      setFormError(undefined);
+    } else if (active.mode === "draw") {
+      // A transient tiny drag must never replace the original valid selection.
+      setCrop(active.original);
+    }
+  }
+
+  function finishCropPointer(
+    event: React.PointerEvent<HTMLDivElement>,
+    commit: boolean,
+  ) {
+    const active = cropGesture.current;
+    if (!active || active.pointerId !== event.pointerId) return;
+    if (!currentCropGesture(active)) {
+      abandonCropGesture();
+      return;
+    }
+    const next = commit ? gestureCrop(active, event) : undefined;
+    abandonCropGesture();
+    setCrop(next ?? active.original);
+    if (next) setFormError(undefined);
+  }
+
   function resetForm() {
+    abandonCropGesture();
     lastSave.current = null;
     setDraft(emptyDraft());
     setFile(undefined);
@@ -498,6 +762,7 @@ export function StillsWorkspace({
   function updateCrop(field: keyof Crop, rawValue: string) {
     const value = Number(rawValue);
     if (!Number.isFinite(value)) return;
+    abandonCropGesture();
     setCrop((current) => ({
       ...current,
       [field]: Math.min(1, Math.max(0, value)),
@@ -507,6 +772,7 @@ export function StillsWorkspace({
 
   function openCrop(item: LibraryItem) {
     if (item.kind !== "still") return;
+    abandonCropGesture();
     setSelectedItemId(item.id);
     setCropTargetId(item.id);
     setImportMode("page_picture");
@@ -524,6 +790,7 @@ export function StillsWorkspace({
   }
 
   function handleFile(event: React.ChangeEvent<HTMLInputElement>) {
+    abandonCropGesture();
     const next = event.currentTarget.files?.[0];
     setFile(next);
     setFormError(undefined);
@@ -1245,23 +1512,76 @@ export function StillsWorkspace({
             </label>
             {importMode === "page_picture" || cropTarget ? (
               <div className="stills-crop-editor">
-                <div className="stills-crop-preview">
+                <div className="stills-crop-preview" ref={cropPreviewRef}>
                   {cropPreviewUrl ? (
                     <>
-                      <img src={cropPreviewUrl} alt={formPreviewAlt} />
-                      <span
-                        className="stills-crop-box"
-                        style={{
-                          left: `${crop.x * 100}%`,
-                          top: `${crop.y * 100}%`,
-                          width: `${crop.width * 100}%`,
-                          height: `${crop.height * 100}%`,
-                        }}
-                        aria-hidden="true"
+                      <img
+                        ref={cropImageRef}
+                        src={cropPreviewUrl}
+                        alt={formPreviewAlt}
+                        onLoad={measureCropPreview}
+                        onError={() => setCropLayout(undefined)}
                       />
+                      {cropBounds ? (
+                        <div
+                          ref={cropSurfaceRef}
+                          className="stills-crop-surface"
+                          aria-hidden="true"
+                          style={{
+                            left: cropBounds.left,
+                            top: cropBounds.top,
+                            width: cropBounds.width,
+                            height: cropBounds.height,
+                            pointerEvents: formBusy ? "none" : undefined,
+                          }}
+                          onPointerDown={handleCropPointerDown}
+                          onPointerMove={handleCropPointerMove}
+                          onPointerUp={(event) =>
+                            finishCropPointer(event, true)
+                          }
+                          onPointerCancel={(event) =>
+                            finishCropPointer(event, false)
+                          }
+                          onLostPointerCapture={(event) =>
+                            finishCropPointer(event, false)
+                          }
+                        >
+                          <div
+                            className="stills-crop-box"
+                            data-full={
+                              crop.x === 0 &&
+                              crop.y === 0 &&
+                              crop.width === 1 &&
+                              crop.height === 1
+                            }
+                            style={{
+                              left: `${crop.x * 100}%`,
+                              top: `${crop.y * 100}%`,
+                              width: `${crop.width * 100}%`,
+                              height: `${crop.height * 100}%`,
+                            }}
+                          >
+                            {(["nw", "ne", "sw", "se"] as const).map(
+                              (corner) => (
+                                <span
+                                  className="stills-crop-handle"
+                                  data-crop-corner={corner}
+                                  key={corner}
+                                />
+                              ),
+                            )}
+                          </div>
+                        </div>
+                      ) : null}
                     </>
                   ) : (
-                    <span>Choose an image to preview the crop.</span>
+                    <span>
+                      {cropTarget
+                        ? assetState.loading
+                          ? "Loading saved still preview…"
+                          : "Saved still preview unavailable."
+                        : "Choose an image to preview the crop."}
+                    </span>
                   )}
                 </div>
                 <div
@@ -1269,8 +1589,9 @@ export function StillsWorkspace({
                   aria-describedby="stills-crop-help"
                 >
                   <p id="stills-crop-help">
-                    Crop coordinates are normalized to the oriented image. Use
-                    arrow keys or type values from 0 to 1.
+                    Drag on the image to draw a crop, drag inside to move, or
+                    drag a corner to resize. Coordinates are normalized to the
+                    oriented image; use arrow keys or type values from 0 to 1.
                   </p>
                   {(["x", "y", "width", "height"] as const).map((field) => (
                     <label key={field}>
