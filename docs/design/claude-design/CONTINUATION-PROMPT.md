@@ -229,4 +229,3 @@ The interrupted agent's last progress report was:
 4. If blockers remain, draft one concise correction prompt for Claude that
    includes reproduction steps and acceptance criteria. Do not send it without
    explicit user authorization.
-

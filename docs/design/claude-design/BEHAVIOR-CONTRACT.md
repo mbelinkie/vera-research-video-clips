@@ -382,7 +382,7 @@ Transcript state and keep all semantic data available when visually combined.
   and allow it to wrap naturally.
 - For a non-English speech clip, show the original-language excerpt first, then
   its English companion immediately below under `Translation from {source
-  language}`. This simplified language presentation replaces the earlier
+language}`. This simplified language presentation replaces the earlier
   two-column **Original language** / **English translation** details block but
   does not change either canonical stored role or export behavior. If a distinct
   Workspace preferred-language snapshot was retained, keep any viewer-context
