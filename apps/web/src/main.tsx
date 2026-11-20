@@ -138,7 +138,7 @@ function App() {
     setResolvedTranscript(undefined);
     setVideoId(undefined);
     setSelection(undefined);
-    window.history.pushState(
+    window.history.replaceState(
       {},
       "",
       sourceReceiptReturnTo(
@@ -153,7 +153,7 @@ function App() {
     const next = new URL(window.location.href);
     next.searchParams.delete("projectId");
     next.searchParams.delete("sourceId");
-    window.history.pushState(
+    window.history.replaceState(
       {},
       "",
       `${next.pathname}${next.search}${next.hash}`,
@@ -922,6 +922,7 @@ function App() {
 
       {sourceReceipt && projectId === sourceReceipt.projectId ? (
         <YouTubeSourceView
+          key={`${sourceReceipt.projectId}/${sourceReceipt.sourceId}`}
           receipt={sourceReceipt}
           authorization={authorization}
           {...(csrfToken ? { csrfToken } : {})}
@@ -1525,12 +1526,13 @@ function App() {
         }}
         onOpenSource={(sourceId) => openSourceReceipt(projectId, sourceId)}
         onOpenVideo={(canonicalUrl) => {
+          if (sourceReceipt) closeSourceReceipt();
           loadVideoUrl(canonicalUrl);
           window.scrollTo({ top: 0, behavior: "smooth" });
         }}
         onProjectChange={(nextProjectId) => {
           if (sourceReceipt && sourceReceipt.projectId !== nextProjectId)
-            setSourceReceipt(undefined);
+            closeSourceReceipt();
           setProjectId(nextProjectId);
         }}
         onProjectsChange={setProjects}

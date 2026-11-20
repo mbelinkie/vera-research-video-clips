@@ -240,6 +240,9 @@ async function readSnapshot(pool: Pool) {
       ...(schemaVersions.includes("0060_chrome_capture_connections")
         ? ["chrome_capture_connections", "chrome_video_submissions"]
         : []),
+      ...(schemaVersions.includes("0061_youtube_source_moments")
+        ? ["youtube_source_moments"]
+        : []),
     ];
     for (const table of snapshotTables) {
       const result = await client.query<{ total: string }>(

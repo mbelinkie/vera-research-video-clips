@@ -160,7 +160,11 @@ it("isolates the capture gateway from the managed browser credential", () => {
     method: "POST",
     headers: { origin: extension, "sec-fetch-site": "cross-site" },
   };
+  const lookup =
+    "/extension/v1/projects/5075b418-978c-4117-a2b3-798bbc9b1213/youtube-source";
   expect(request(options).nextCalled).toBe(true);
+  expect(request({ ...options, path: lookup }).nextCalled).toBe(true);
+  expect(request({ ...options, path: lookup, method: "GET" }).status).toBe(403);
   for (const headers of [
     { origin: "https://other.example" },
     { host: "other.example" },
@@ -170,6 +174,13 @@ it("isolates the capture gateway from the managed browser credential", () => {
     expect(
       request({ ...options, headers: { ...options.headers, ...headers } })
         .status,
+    ).toBe(403);
+    expect(
+      request({
+        ...options,
+        path: lookup,
+        headers: { ...options.headers, ...headers },
+      }).status,
     ).toBe(403);
   }
   expect(

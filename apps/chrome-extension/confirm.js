@@ -57,6 +57,16 @@ function freshRequestId() {
   return globalThis.crypto?.randomUUID?.() ?? requestId;
 }
 
+function syncYouTubeSubmit() {
+  if (draft?.kind !== "youtube") return;
+  reason.disabled = note.disabled = !projects.value;
+  byId("submit").disabled =
+    !projects.value ||
+    (time.checked
+      ? !Number.isSafeInteger(sampledPlayheadMs)
+      : reasonHydration.get(projects.value) === "pending");
+}
+
 function youtubeMode(isMoment) {
   if (!draft || draft.kind !== "youtube") return;
   byId("video-reason").hidden = isMoment;
@@ -64,6 +74,7 @@ function youtubeMode(isMoment) {
   byId("submit").textContent = isMoment
     ? "Save moment at " + formatTime(sampledPlayheadMs)
     : "Save video";
+  syncYouTubeSubmit();
 }
 
 function rememberProjectDraft() {
@@ -88,6 +99,7 @@ async function prefillYouTubeReason(projectId) {
     return;
   }
   reasonHydration.set(projectId, "pending");
+  syncYouTubeSubmit();
   try {
     const result = await gateway(
       paired.origin,
@@ -109,11 +121,20 @@ async function prefillYouTubeReason(projectId) {
     reasonRevision++;
     reasonHydration.set(projectId, "ready");
   } catch (error) {
-    reasonHydration.set(projectId, "failed");
-    if (generation === prefillGeneration && projects.value === projectId)
+    if (
+      generation === prefillGeneration &&
+      projects.value === projectId &&
+      reasonRevision === revision &&
+      !reasonDirty.get(projectId)
+    ) {
+      reasonHydration.set(projectId, "failed");
       status.textContent =
         (error instanceof Error ? error.message : "") +
-        " You can still save this video.";
+        " Refresh projects to try again, or edit the reason explicitly.";
+      byId("retry").hidden = false;
+    }
+  } finally {
+    syncYouTubeSubmit();
   }
 }
 
@@ -126,6 +147,7 @@ async function probeYouTubeTime() {
   const generation = ++timeModeGeneration;
   time.disabled = true;
   timeText.textContent = "Reading current time…";
+  syncYouTubeSubmit();
   timeProbePromise = (async () => {
     let result;
     try {
@@ -173,6 +195,7 @@ reason.oninput = () => {
     reasonDrafts.set(activeProjectId, reason.value);
     reasonDirty.set(activeProjectId, true);
     reasonHydration.set(activeProjectId, "dirty");
+    syncYouTubeSubmit();
   }
 };
 note.oninput = () => {
@@ -181,6 +204,7 @@ note.oninput = () => {
 projects.onchange = () => {
   rememberProjectDraft();
   setProjectDraft(projects.value);
+  syncYouTubeSubmit();
   void prefillYouTubeReason(projects.value);
 };
 
@@ -261,18 +285,19 @@ async function load() {
         ? list[0].id
         : "";
     projects.value = preferred;
-    if (draft.kind === "youtube" && preferred) {
+    if (draft.kind === "youtube") {
       setProjectDraft(preferred);
       if (previousProject === preferred && previousReason)
         reason.value = previousReason;
       if (previousProject === preferred && previousNote)
         note.value = previousNote;
-      await prefillYouTubeReason(preferred);
     }
     byId("fields").disabled = false;
     byId("retry").hidden = true;
     status.textContent = "Connected to " + paired.origin;
     projects.focus();
+    syncYouTubeSubmit();
+    void prefillYouTubeReason(preferred);
   } catch (error) {
     status.textContent = error.message;
     byId("retry").hidden = false;

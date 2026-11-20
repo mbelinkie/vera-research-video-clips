@@ -76,12 +76,13 @@
   }
 
   function pageIdentity() {
+    const youtube = youtubeIdentity();
     return {
       url: safePageUrl(location.href),
       navigationKey: navigationKey(),
       viewport: { width: window.innerWidth, height: window.innerHeight },
       scroll: { x: window.scrollX, y: window.scrollY },
-      youtube: youtubeIdentity(),
+      ...(youtube ? { youtube } : {}),
     };
   }
 

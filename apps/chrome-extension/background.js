@@ -367,7 +367,6 @@ function youtubeSessionValue(record) {
       tabId: context.tabId,
       windowId: context.windowId,
       url: context.url,
-      navigationKey: context.navigationKey,
       documentId: context.documentId,
       youtubeIdentity: context.youtubeIdentity
         ? {
@@ -407,6 +406,7 @@ async function forgetYouTubeRecord(requestIdValue) {
 }
 
 async function restoreYouTubeRecord(requestIdValue) {
+  if (!pendingKey(requestIdValue)) return undefined;
   const current = pending.get(requestIdValue);
   if (current) return current;
   const storage = youtubeSessionStorage();
@@ -610,19 +610,25 @@ function captureAudio(context, sourceUrl, title) {
 async function captureYouTube(context) {
   const url = normalizeYouTubeUrl(context.url);
   if (!url) throw new Error("This is not a supported YouTube video URL");
-  context.documentId = await injectContent(context.tabId, true);
-  const identity = await sendContent(
-    context.tabId,
-    {
-      type: "vera.capture.identity",
-    },
-    context.documentId,
-  );
-  context.navigationKey = identity.value.navigationKey;
-  context.viewport = identity.value.viewport;
-  context.youtubeIdentity = identity.value.youtube ?? null;
-  context.url = url;
-  await assertContext(context, true, false);
+  try {
+    context.documentId = await injectContent(context.tabId);
+    if (context.documentId) {
+      const { value } = await sendContent(
+        context.tabId,
+        { type: "vera.capture.identity" },
+        context.documentId,
+      );
+      // Use the sanitized YouTube identity when this capture outlives the worker.
+      context.youtubeIdentity = value.youtube ?? null;
+      if (context.youtubeIdentity) {
+        context.url = url;
+        await assertContext(context, true, false);
+      }
+    }
+  } catch {
+    // The original normalized URL is still available for a general save.
+    context.youtubeIdentity = null;
+  }
   return {
     kind: "youtube",
     requestId: context.requestId,
@@ -643,7 +649,10 @@ async function startCapture({ kind, tabId, sourceUrl, title }) {
   else if (kind === "audio") payload = captureAudio(context, sourceUrl, title);
   else if (kind === "youtube") payload = await captureYouTube(context);
   else throw new Error("Unknown capture action");
-  await openConfirmation(payload, kind === "youtube" ? context : undefined);
+  await openConfirmation(
+    payload,
+    kind === "youtube" && context.youtubeIdentity ? context : undefined,
+  );
   rememberStatus({
     scope: "global",
     ok: true,
@@ -775,7 +784,8 @@ async function sampleYouTube(requestIdValue, sender) {
   if (!record || record.payload.kind !== "youtube" || !record.sampleContext)
     return { ok: false, error: YOUTUBE_TIME_UNAVAILABLE };
   if (record.sampleResult) return record.sampleResult;
-  if (!record.documentId) return { ok: false, error: YOUTUBE_TIME_UNAVAILABLE };
+  if (!record.documentId || !record.sampleContext.documentId)
+    return { ok: false, error: YOUTUBE_TIME_UNAVAILABLE };
   if (record.samplePromise) return record.samplePromise;
   record.samplePromise = (async () => {
     const context = record.sampleContext;

@@ -142,10 +142,11 @@ export function YouTubeSourceView({
   ]);
 
   function seekMoment(timecodeMs: number) {
-    setCurrentMs(timecodeMs);
-    pendingSeekRef.current = timecodeMs;
     if (playerRef.current?.seekTo(timecodeMs)) {
+      setCurrentMs(timecodeMs);
       pendingSeekRef.current = undefined;
+    } else {
+      pendingSeekRef.current = timecodeMs;
     }
   }
 
@@ -160,11 +161,11 @@ export function YouTubeSourceView({
 
   return (
     <section
-      className="loader youtube-source-view"
+      className="loader"
       aria-label="YouTube source view"
       data-testid="youtube-source-view"
     >
-      <div className="section-heading youtube-source-header">
+      <div className="section-heading">
         <div>
           <h2>{details?.title ?? "YouTube source"}</h2>
           {projectName ? <p className="muted">Project: {projectName}</p> : null}
@@ -186,7 +187,7 @@ export function YouTubeSourceView({
       ) : null}
       {details && videoId ? (
         <div className="batch-grid">
-          <div className="youtube-source-records">
+          <div className="batch-list">
             <section
               className="queue-card youtube-source-record"
               aria-label="Shared source reason"
@@ -195,8 +196,8 @@ export function YouTubeSourceView({
               <h3>Shared source reason</h3>
               {details.reason ? (
                 <>
-                  <p className="source-reason-text">{details.reason.text}</p>
-                  <p className="muted source-reason-attribution">
+                  <p>{details.reason.text}</p>
+                  <p className="muted">
                     Last edited by {details.reason.updatedByName} ·{" "}
                     {new Date(details.reason.updatedAt).toLocaleString()}
                   </p>
@@ -209,12 +210,9 @@ export function YouTubeSourceView({
               className="queue-card youtube-source-record"
               aria-label="Saved moments"
             >
-              <h3>
-                Saved moments{" "}
-                <span className="count-badge">{details.moments.length}</span>
-              </h3>
+              <h3>Saved moments</h3>
               {details.moments.length ? (
-                <div className="source-moment-list">
+                <div className="batch-list">
                   {details.moments.map((moment) => (
                     <button
                       type="button"
@@ -223,7 +221,7 @@ export function YouTubeSourceView({
                       data-testid="youtube-source-moment"
                       data-moment-id={moment.id}
                       data-timecode-ms={moment.timecodeMs}
-                      aria-label={`Seek to moment at ${formatMomentTime(moment.timecodeMs)}`}
+                      aria-label={`Seek to moment at ${formatMomentTime(moment.timecodeMs)}. ${moment.note ?? "No note"}. Saved by ${moment.authorName}`}
                       onClick={() => seekMoment(moment.timecodeMs)}
                     >
                       <time dateTime={`PT${moment.timecodeMs / 1_000}S`}>
@@ -252,11 +250,6 @@ export function YouTubeSourceView({
             <div className="video-details source-playback-details">
               <p className="eyebrow">Playback position</p>
               <strong>{formatMomentTime(currentMs)}</strong>
-              <p className="muted">
-                Select a saved moment to revisit its exact source time. If
-                YouTube playback is unavailable, the exact timecodes remain
-                available above.
-              </p>
             </div>
           </div>
         </div>

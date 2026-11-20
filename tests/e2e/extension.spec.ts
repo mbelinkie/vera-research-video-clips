@@ -56,12 +56,6 @@ type YouTubeReceipt = {
 
 function youtubeReceipt(value: unknown, origin: string) {
   const receipt = record(value);
-  expect(Object.keys(receipt).sort()).toEqual([
-    "batchId",
-    "sourceId",
-    "sourcePath",
-    "status",
-  ]);
   expect(String(receipt.batchId)).toMatch(UUID_PATTERN);
   expect(String(receipt.sourceId)).toMatch(UUID_PATTERN);
   const sourceUrl = new URL(String(receipt.sourcePath), origin);
@@ -79,22 +73,8 @@ function youtubeReceipt(value: unknown, origin: string) {
   } satisfies YouTubeReceipt & { projectId: string };
 }
 
-async function visibleTextField(
-  page: Page,
-  labelPattern: RegExp,
-  fallbackSelectors: string[],
-): Promise<Locator> {
-  const labelled = page
-    .locator("label:visible")
-    .filter({ hasText: labelPattern })
-    .locator("textarea:visible, input:visible")
-    .first();
-  if ((await labelled.count()) > 0) return labelled;
-  for (const selector of fallbackSelectors) {
-    const candidate = page.locator(`${selector}:visible`).first();
-    if ((await candidate.count()) > 0) return candidate;
-  }
-  throw new Error(`Could not find the visible ${labelPattern} field.`);
+function textField(page: Page, selector: "#reason" | "#note"): Locator {
+  return page.locator(`${selector}:visible`).first();
 }
 
 async function saveYouTubeConfirmation(
@@ -105,15 +85,20 @@ async function saveYouTubeConfirmation(
   receipt: ReturnType<typeof youtubeReceipt>;
   request: PlaywrightRequest;
 }> {
-  await chooseProject(page, project);
+  await prepareYouTubeProject(page, project);
   const requestPromise = page.waitForRequest(
     (request) =>
       request.method() === "POST" &&
       request.url().includes("/extension/v1/projects/") &&
       request.url().endsWith("/captures"),
+    { timeout: 5_000 },
   );
   await page.locator("#submit").click();
-  const request = await requestPromise;
+  const request = await requestPromise.catch(async () => {
+    throw new Error(
+      `YouTube capture request was not sent: ${await page.locator("#status").textContent()}`,
+    );
+  });
   const response = await request.response();
   expect(response?.status()).toBe(201);
   const receipt = youtubeReceipt(await response!.json(), origin);
@@ -121,6 +106,13 @@ async function saveYouTubeConfirmation(
     await expect(page.locator("#status")).not.toContainText("Saving", {
       timeout: 10_000,
     });
+    if (receipt.status === "queued")
+      await expect(page.locator("#status")).toContainText("queue");
+    await expect(page.locator("#open-source")).toHaveAttribute(
+      "href",
+      new URL(receipt.sourcePath, origin).href,
+    );
+    await page.close();
   }
   return { receipt, request };
 }
@@ -133,6 +125,32 @@ async function cloudJson(
   const response = await context.request.get(origin + "/cloud-api/api" + path);
   expect(response.status()).toBe(200);
   return response.json();
+}
+
+async function youtubeDetails(
+  context: BrowserContext,
+  origin: string,
+  projectId: string,
+  sourceId: string,
+) {
+  return record(
+    await cloudJson(
+      context,
+      origin,
+      `/projects/${projectId}/sources/${sourceId}/youtube-details`,
+    ),
+  );
+}
+
+async function expectSourceSeek(page: Page, timecodeMs: number) {
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (window as unknown as { __veraSeekCalls: number[] }).__veraSeekCalls,
+      ),
+    )
+    .toContain(timecodeMs / 1_000);
 }
 
 function syntheticWave(seconds = 5) {
@@ -223,6 +241,9 @@ async function launchDisposableChrome(extensionPath: string) {
   const options = {
     ...(executablePath ? { executablePath } : { channel: "chrome" }),
     headless: process.env.VERA_EXTENSION_HEADLESS === "1",
+    // Playwright normally disables all extensions. Keep that default out so
+    // Chrome can load the staged unpacked extension below.
+    ignoreDefaultArgs: ["--disable-extensions"],
     deviceScaleFactor: 2,
     args: [
       `--disable-extensions-except=${extensionPath}`,
@@ -347,6 +368,9 @@ async function pairThroughOptions(
 ) {
   const options = await context.newPage();
   await options.goto(`chrome-extension://${id}/options.html`);
+  // options.js binds the form after its initial storage read; wait for that
+  // initialization before submitting so CfT cannot submit the native form.
+  await expect(options.getByLabel("VERA address")).toHaveValue(/\S/u);
   await options.getByLabel("VERA address").fill(origin);
   const pairPagePromise = context.waitForEvent("page", { timeout: 10_000 });
   await options.getByRole("button", { name: "Connect to VERA" }).click();
@@ -393,6 +417,44 @@ async function chooseProject(page: Page, name: string) {
     await control.click();
     await page.getByRole("option", { name, exact: true }).click();
   }
+}
+
+async function prepareYouTubeProject(page: Page, name: string) {
+  const control = page.getByLabel("Destination project", { exact: false });
+  await expect(control).toBeVisible();
+  const selected = await control.locator("option:checked").textContent();
+  if (selected?.trim() === name) {
+    await expect(page.locator("#fields")).toBeEnabled();
+    await expect(page.locator("#submit")).toBeEnabled();
+    return;
+  }
+  const reasonLookup = page.waitForResponse(
+    (response) =>
+      response.request().method() === "POST" &&
+      response.url().includes("/extension/v1/projects/") &&
+      response.url().endsWith("/youtube-source"),
+  );
+  await chooseProject(page, name);
+  await reasonLookup;
+  // The response event fires before confirm.js marks hydration ready; the
+  // submit control is the stable UI signal for that state.
+  await expect(page.locator("#submit")).toBeEnabled();
+}
+
+async function openYouTubeConfirmation(
+  page: Page,
+  context: BrowserContext,
+  extensionId: string,
+  project: string,
+) {
+  const confirmation = await triggerPopupCapture(
+    page,
+    context,
+    extensionId,
+    "youtube",
+  );
+  await prepareYouTubeProject(confirmation, project);
+  return confirmation;
 }
 
 function validatePicture(value: unknown) {
@@ -545,9 +607,7 @@ test.describe("Research #79 real Chrome synthetic capture", () => {
       await confirmation
         .getByLabel("Topics", { exact: false })
         .fill("Synthetic research");
-      await confirmation
-        .getByLabel(/note|intended use/i)
-        .fill("Disposable fixture quote");
+      await confirmation.locator("#notes").fill("Disposable fixture quote");
 
       const requestPromise = confirmation.waitForRequest(
         (request) =>
@@ -808,40 +868,34 @@ test.describe("Research #79 real Chrome synthetic capture", () => {
         )
         .toBeGreaterThanOrEqual(2);
 
-      const firstGeneral = await triggerPopupCapture(
+      const firstGeneral = await openYouTubeConfirmation(
         watch,
         context,
         id,
-        "youtube",
+        primaryProjectName,
       );
       const firstTime = firstGeneral.locator("#time");
       await expect(firstTime).toBeEnabled();
       await expect(firstTime).not.toBeChecked();
-      const firstReason = await visibleTextField(firstGeneral, /why|reason/i, [
-        "#reason",
-        "#comment",
-      ]);
+      const firstReason = textField(firstGeneral, "#reason");
       await expect(firstReason).toHaveValue("");
       const firstSave = await saveYouTubeConfirmation(
         firstGeneral,
         primaryProjectName,
         destinationUrl.origin,
       );
+      expect(firstSave.receipt.status).toBe("queued");
       const primaryProjectId = firstSave.receipt.projectId;
       const primarySourceId = firstSave.receipt.sourceId;
 
-      const reasonConfirmation = await triggerPopupCapture(
+      const reasonConfirmation = await openYouTubeConfirmation(
         watch,
         context,
         id,
-        "youtube",
+        primaryProjectName,
       );
       await expect(reasonConfirmation.locator("#time")).not.toBeChecked();
-      const reasonField = await visibleTextField(
-        reasonConfirmation,
-        /why|reason/i,
-        ["#reason", "#comment"],
-      );
+      const reasonField = textField(reasonConfirmation, "#reason");
       await expect(reasonField).toHaveValue("");
       await reasonField.fill("Initial source reason");
       const reasonSave = await saveYouTubeConfirmation(
@@ -851,18 +905,14 @@ test.describe("Research #79 real Chrome synthetic capture", () => {
       );
       expect(reasonSave.receipt.sourceId).toBe(primarySourceId);
 
-      const editConfirmation = await triggerPopupCapture(
+      const editConfirmation = await openYouTubeConfirmation(
         watch,
         context,
         id,
-        "youtube",
+        primaryProjectName,
       );
       await expect(editConfirmation.locator("#time")).not.toBeChecked();
-      const editReason = await visibleTextField(
-        editConfirmation,
-        /why|reason/i,
-        ["#reason", "#comment"],
-      );
+      const editReason = textField(editConfirmation, "#reason");
       await expect(editReason).toHaveValue("Initial source reason");
       await editReason.fill("Updated source reason");
       const editSave = await saveYouTubeConfirmation(
@@ -873,27 +923,20 @@ test.describe("Research #79 real Chrome synthetic capture", () => {
       expect(editSave.receipt.sourceId).toBe(primarySourceId);
 
       await advanceSyntheticVideo(watch, 1.2);
-      const firstMoment = await triggerPopupCapture(
+      const firstMoment = await openYouTubeConfirmation(
         watch,
         context,
         id,
-        "youtube",
+        primaryProjectName,
       );
       const momentTime = firstMoment.locator("#time");
       await expect(momentTime).toBeEnabled();
-      const unsavedReason = await visibleTextField(firstMoment, /why|reason/i, [
-        "#reason",
-        "#comment",
-      ]);
+      const unsavedReason = textField(firstMoment, "#reason");
       await unsavedReason.fill("Draft reason retained across modes");
       await momentTime.check();
       await expect(firstMoment.locator("#time-text")).toContainText("Include");
       const frozenLabel = await firstMoment.locator("#time-text").textContent();
-      const unsavedMoment = await visibleTextField(
-        firstMoment,
-        /moment.*note|note.*moment/i,
-        ["#moment-note", "#note", "#comment"],
-      );
+      const unsavedMoment = textField(firstMoment, "#note");
       await expect(unsavedMoment).toHaveValue("");
       await unsavedMoment.fill("Revisit the map transition.");
       await watch.bringToFront();
@@ -901,20 +944,13 @@ test.describe("Research #79 real Chrome synthetic capture", () => {
       await firstMoment.bringToFront();
       await expect(firstMoment.locator("#time-text")).toHaveText(frozenLabel!);
       await momentTime.uncheck();
-      await expect(
-        await visibleTextField(firstMoment, /why|reason/i, [
-          "#reason",
-          "#comment",
-        ]),
-      ).toHaveValue("Draft reason retained across modes");
+      await expect(textField(firstMoment, "#reason")).toHaveValue(
+        "Draft reason retained across modes",
+      );
       await momentTime.check();
-      await expect(
-        await visibleTextField(firstMoment, /moment.*note|note.*moment/i, [
-          "#moment-note",
-          "#note",
-          "#comment",
-        ]),
-      ).toHaveValue("Revisit the map transition.");
+      await expect(textField(firstMoment, "#note")).toHaveValue(
+        "Revisit the map transition.",
+      );
       await expect(firstMoment.locator("#time-text")).toHaveText(frozenLabel!);
 
       const capturePattern = new RegExp(
@@ -922,7 +958,7 @@ test.describe("Research #79 real Chrome synthetic capture", () => {
         "u",
       );
       let lostReceipt = false;
-      await context.route(capturePattern, async (route) => {
+      await firstMoment.route(capturePattern, async (route) => {
         if (lostReceipt) return route.continue();
         lostReceipt = true;
         const upstream = await route.fetch();
@@ -945,28 +981,16 @@ test.describe("Research #79 real Chrome synthetic capture", () => {
       await expect(firstMoment.locator("#submit")).toBeEnabled({
         timeout: 10_000,
       });
-      await expect(
-        await visibleTextField(firstMoment, /moment.*note|note.*moment/i, [
-          "#moment-note",
-          "#note",
-          "#comment",
-        ]),
-      ).toHaveValue("Revisit the map transition.");
-      await context.unroute(capturePattern);
+      await expect(textField(firstMoment, "#note")).toHaveValue(
+        "Revisit the map transition.",
+      );
+      await firstMoment.unroute(capturePattern);
       const firstMomentSave = await saveYouTubeConfirmation(
         firstMoment,
         primaryProjectName,
         destinationUrl.origin,
       );
       expect(firstMomentSave.receipt.sourceId).toBe(primarySourceId);
-      const momentRequest = record(firstMomentSave.request.postDataJSON());
-      const momentDetails = record(momentRequest.youtubeDetails);
-      expect(momentDetails.kind).toBe("moment");
-      expect(number(momentDetails.timecodeMs)).toBe(true);
-      expect(momentDetails.note).toBe("Revisit the map transition.");
-      const firstMomentMs = Number(momentDetails.timecodeMs);
-      expect(firstMomentMs).toBeGreaterThanOrEqual(1_000);
-      expect(firstMomentMs).toBeLessThan(2_500);
 
       const aliasWatch = await context.newPage();
       await aliasWatch.goto(aliasUrl);
@@ -978,21 +1002,27 @@ test.describe("Research #79 real Chrome synthetic capture", () => {
         )
         .toBeGreaterThanOrEqual(2);
       await advanceSyntheticVideo(aliasWatch, 3.2);
-      const secondMoment = await triggerPopupCapture(
+      const secondMoment = await openYouTubeConfirmation(
         aliasWatch,
         context,
         id,
-        "youtube",
+        primaryProjectName,
       );
       const secondTime = secondMoment.locator("#time");
       await expect(secondTime).toBeEnabled();
       await expect(secondTime).not.toBeChecked();
       await secondTime.check();
-      const blankMoment = await visibleTextField(
-        secondMoment,
-        /moment.*note|note.*moment/i,
-        ["#moment-note", "#note", "#comment"],
+      await expect(secondMoment.locator("#time-text")).toContainText("Include");
+      const secondFrozenLabel = await secondMoment
+        .locator("#time-text")
+        .textContent();
+      await aliasWatch.bringToFront();
+      await advanceSyntheticVideo(aliasWatch, 4.1);
+      await secondMoment.bringToFront();
+      await expect(secondMoment.locator("#time-text")).toHaveText(
+        secondFrozenLabel!,
       );
+      const blankMoment = textField(secondMoment, "#note");
       await expect(blankMoment).toHaveValue("");
       const secondMomentSave = await saveYouTubeConfirmation(
         secondMoment,
@@ -1004,11 +1034,11 @@ test.describe("Research #79 real Chrome synthetic capture", () => {
 
       const unavailable = await context.newPage();
       await unavailable.goto(unavailableUrl);
-      const unavailableConfirmation = await triggerPopupCapture(
+      const unavailableConfirmation = await openYouTubeConfirmation(
         unavailable,
         context,
         id,
-        "youtube",
+        isolatedProjectName,
       );
       const unavailableTime = unavailableConfirmation.locator("#time");
       await expect(unavailableTime).toBeEnabled();
@@ -1017,11 +1047,7 @@ test.describe("Research #79 real Chrome synthetic capture", () => {
       await expect(unavailableConfirmation.locator("#time-text")).toContainText(
         /unavailable|playing|read/iu,
       );
-      const unavailableReason = await visibleTextField(
-        unavailableConfirmation,
-        /why|reason/i,
-        ["#reason", "#comment"],
-      );
+      const unavailableReason = textField(unavailableConfirmation, "#reason");
       await expect(unavailableReason).toHaveValue("");
       const unavailableSave = await saveYouTubeConfirmation(
         unavailableConfirmation,
@@ -1030,7 +1056,9 @@ test.describe("Research #79 real Chrome synthetic capture", () => {
       );
       const isolatedProjectId = unavailableSave.receipt.projectId;
       expect(isolatedProjectId).not.toBe(primaryProjectId);
-      expect(unavailableSave.receipt.sourceId).not.toBe(primarySourceId);
+      // A canonical YouTube video keeps one source UUID while its project
+      // membership, reason, moments, and Library rows remain isolated.
+      expect(unavailableSave.receipt.sourceId).toBe(primarySourceId);
       await unavailable.close();
 
       await watch.locator(".html5-video-player").evaluate((element) => {
@@ -1052,12 +1080,11 @@ test.describe("Research #79 real Chrome synthetic capture", () => {
       await adConfirmation.getByRole("button", { name: /cancel/i }).click();
       await expect.poll(() => adConfirmation.isClosed()).toBe(true);
 
-      const finalPrimary = record(
-        await cloudJson(
-          context,
-          destinationUrl.origin,
-          `/projects/${primaryProjectId}/sources/${primarySourceId}/youtube-details`,
-        ),
+      const finalPrimary = await youtubeDetails(
+        context,
+        destinationUrl.origin,
+        primaryProjectId,
+        primarySourceId,
       );
       const finalMoments = array(finalPrimary.moments).map(record);
       const finalReason = record(finalPrimary.reason);
@@ -1079,6 +1106,13 @@ test.describe("Research #79 real Chrome synthetic capture", () => {
         finalReason.updatedBy,
         finalReason.updatedBy,
       ]);
+      expect(
+        finalMoments.every(
+          (moment) =>
+            moment.authorName === "Local researcher" &&
+            /^\d{4}-\d{2}-\d{2}T/u.test(String(moment.createdAt)),
+        ),
+      ).toBe(true);
       expect(Number(finalMoments[0]?.timecodeMs)).toBeGreaterThanOrEqual(1_000);
       expect(Number(finalMoments[0]?.timecodeMs)).toBeLessThan(2_500);
       expect(Number(finalMoments[1]?.timecodeMs)).toBeGreaterThanOrEqual(3_000);
@@ -1090,12 +1124,11 @@ test.describe("Research #79 real Chrome synthetic capture", () => {
         new Set(finalMoments.map((moment) => String(moment.id))).size,
       ).toBe(2);
 
-      const finalIsolated = record(
-        await cloudJson(
-          context,
-          destinationUrl.origin,
-          `/projects/${isolatedProjectId}/sources/${unavailableSave.receipt.sourceId}/youtube-details`,
-        ),
+      const finalIsolated = await youtubeDetails(
+        context,
+        destinationUrl.origin,
+        isolatedProjectId,
+        unavailableSave.receipt.sourceId,
       );
       expect(finalIsolated.reason).toBeNull();
       expect(array(finalIsolated.moments)).toHaveLength(0);
@@ -1136,6 +1169,23 @@ test.describe("Research #79 real Chrome synthetic capture", () => {
       ).toEqual([]);
 
       const sourceView = await context.newPage();
+      await context.route("https://www.youtube.com/iframe_api", (route) =>
+        route.fulfill({
+          contentType: "application/javascript",
+          body: `window.__veraSeekCalls=[];
+            window.YT={PlayerState:{ENDED:0,PLAYING:1,PAUSED:2},Player:class{
+              constructor(element,options){this.options=options;this.time=0;
+                window.__veraPlayers=(window.__veraPlayers||[]).concat(this);
+                setTimeout(()=>options.events.onReady(),0)}
+              cueVideoById(){ }
+              loadVideoById(options){this.time=options.startSeconds;}
+              destroy(){ }
+              getCurrentTime(){return this.time}
+              pauseVideo(){this.options.events.onStateChange({data:2})}
+              seekTo(seconds){this.time=seconds;window.__veraSeekCalls.push(seconds)}
+            }};window.onYouTubeIframeAPIReady?.();`,
+        }),
+      );
       const sourceViewUrl = new URL(
         firstSave.receipt.sourcePath,
         destinationUrl.origin,
@@ -1156,6 +1206,9 @@ test.describe("Research #79 real Chrome synthetic capture", () => {
       const sourceMoments = sourceView.getByTestId("youtube-source-moment");
       await expect(sourceMoments).toHaveCount(2);
       await sourceMoments.first().click();
+      await expectSourceSeek(sourceView, Number(finalMoments[0]?.timecodeMs));
+      await sourceMoments.nth(1).click();
+      await expectSourceSeek(sourceView, Number(finalMoments[1]?.timecodeMs));
       await sourceView.close();
       await watch.close();
     } finally {

@@ -66,6 +66,8 @@ function createFixture(
     onCapture?: () => void;
     unknownConfirmationTab?: boolean;
     contentUrl?: string;
+    sessionStore?: Record<string, unknown>;
+    missingDocumentId?: boolean;
   } = {},
 ) {
   const runtimeOnMessage = event();
@@ -81,6 +83,7 @@ function createFixture(
   let nextConfirmationTabId = 100;
   const extensionId = "a".repeat(32);
   const captureTimes: number[] = [];
+  const sessionStore = options.sessionStore ?? {};
   const chrome: any = {
     runtime: {
       getURL: (file: string) => `chrome-extension://${extensionId}/${file}`,
@@ -188,9 +191,11 @@ function createFixture(
       }),
     },
     scripting: {
-      executeScript: vi.fn(async () => [
-        { frameId: 0, documentId: "source-document" },
-      ]),
+      executeScript: vi.fn(async () =>
+        options.missingDocumentId
+          ? []
+          : [{ frameId: 0, documentId: "source-document" }],
+      ),
     },
     contextMenus: {
       removeAll: vi.fn((callback: () => void) => callback()),
@@ -202,6 +207,15 @@ function createFixture(
       local: {
         set: vi.fn(async () => undefined),
         get: vi.fn(async () => ({})),
+      },
+      session: {
+        set: vi.fn(async (value: Record<string, unknown>) => {
+          Object.assign(sessionStore, value);
+        }),
+        get: vi.fn(async (key: string) => ({ [key]: sessionStore[key] })),
+        remove: vi.fn(async (key: string) => {
+          delete sessionStore[key];
+        }),
       },
     },
     action: {
@@ -217,6 +231,7 @@ function createFixture(
     tabsOnActivated,
     tabsById,
     captureTimes,
+    sessionStore,
     setActiveTab(tab: Tab) {
       activeTab = tab;
     },
@@ -461,6 +476,70 @@ describe("capture worker", () => {
     );
     expect(sampled.ok).toBe(false);
     expect(sampled.error).toContain("unavailable");
+  });
+
+  it("leaves general YouTube capture available when Chrome cannot provide a document ID", async () => {
+    const fixture = createFixture({
+      missingDocumentId: true,
+      activeTab: {
+        ...source,
+        url: "https://www.youtube.com/watch?v=M7lc1UVf-VE",
+      },
+    });
+    await loadWorker(fixture.chrome);
+    const start = await runtimeMessage(
+      fixture,
+      { type: "vera.capture.start", kind: "youtube" },
+      { url: fixture.chrome.runtime.getURL("popup.html") },
+    );
+    expect(start.ok).toBe(true);
+    await readDraft(fixture, start, 100);
+    const confirmationUrl = fixture.chrome.windows.create.mock.calls[0][0].url;
+    const sampled = await runtimeMessage(
+      fixture,
+      { type: "vera.capture.youtube-playhead", requestId: start.requestId },
+      confirmationSender(confirmationUrl, 100),
+    );
+    expect(sampled.ok).toBe(false);
+    expect(sampled.error).toContain("unavailable");
+  });
+
+  it("restores a YouTube sample binding after worker suspension without raw navigation data", async () => {
+    const sessionStore: Record<string, unknown> = {};
+    const first = createFixture({
+      sessionStore,
+      activeTab: {
+        ...source,
+        url: "https://www.youtube.com/watch?v=M7lc1UVf-VE",
+      },
+    });
+    await loadWorker(first.chrome);
+    const start = await runtimeMessage(
+      first,
+      { type: "vera.capture.start", kind: "youtube" },
+      { url: first.chrome.runtime.getURL("popup.html") },
+    );
+    const confirmation =
+      await first.chrome.windows.create.mock.results.at(-1)?.value;
+    await readDraft(first, start, 100);
+    const saved = Object.values(sessionStore)[0] as Record<string, any>;
+    expect(saved.sampleContext.navigationKey).toBeUndefined();
+    expect(JSON.stringify(saved)).not.toContain("authToken");
+
+    const second = createFixture({
+      sessionStore,
+      activeTab: {
+        ...source,
+        url: "https://www.youtube.com/watch?v=M7lc1UVf-VE",
+      },
+    });
+    await loadWorker(second.chrome);
+    const sampled = await runtimeMessage(
+      second,
+      { type: "vera.capture.youtube-playhead", requestId: start.requestId },
+      confirmationSender(confirmation.tabs[0].url, 100),
+    );
+    expect(sampled).toEqual({ ok: true, playheadMs: 193001 });
   });
 
   it("returns an explicit CORS failure and binds a confirmation tab that races creation", async () => {

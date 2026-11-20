@@ -1574,33 +1574,6 @@ h1 {
   padding: 0.6rem 1rem;
 }
 
-.youtube-source-header {
-  margin-bottom: 18px;
-}
-
-.youtube-source-header h2 {
-  margin-bottom: 6px;
-}
-
-.youtube-source-records {
-  display: grid;
-  align-content: start;
-  gap: 14px;
-}
-
-.source-reason-text {
-  margin-bottom: 10px;
-}
-
-.source-reason-attribution {
-  margin-bottom: 0;
-}
-
-.source-moment-list {
-  display: grid;
-  gap: 7px;
-}
-
 .source-moment {
   display: grid;
   grid-template-columns: max-content minmax(0, 1fr);

@@ -37,6 +37,7 @@ async function runConfirmation(
   options: {
     draft?: Record<string, unknown>;
     sourceReason?: string | null;
+    delayReason?: Promise<void>;
     captureResponses?: Array<unknown | Error>;
   } = {},
 ) {
@@ -57,7 +58,8 @@ async function runConfirmation(
   const gateway = vi.fn(
     async (_origin: string, path: string, body: unknown) => {
       if (path === "projects") return [{ id: "project", name: "Editorial" }];
-      if (path.endsWith("/youtube-source"))
+      if (path.endsWith("/youtube-source")) {
+        await options.delayReason;
         return {
           sourceId: "source-id",
           reason:
@@ -70,6 +72,7 @@ async function runConfirmation(
                   updatedAt: "2026-11-20T00:00:00.000Z",
                 },
         };
+      }
       captures.push(body);
       const response = options.captureResponses?.[captureIndex++];
       if (response instanceof Error) throw response;
@@ -131,6 +134,18 @@ it("prefills and explicitly clears a general YouTube reason", async () => {
     url: "https://www.youtube.com/watch?v=M7lc1UVf-VE",
     youtubeDetails: { kind: "general", reason: "" },
   });
+});
+
+it("waits for the selected project's reason before enabling an untouched general save", async () => {
+  let finishLookup!: () => void;
+  const delayReason = new Promise<void>((resolve) => {
+    finishLookup = resolve;
+  });
+  const fixture = await runConfirmation({ delayReason });
+  expect(fixture.byId("submit").disabled).toBe(true);
+  finishLookup();
+  await vi.waitFor(() => expect(fixture.byId("submit").disabled).toBe(false));
+  expect(fixture.byId("reason").value).toBe("Compare this video.");
 });
 
 it("samples a frozen time once and sends a separate moment note", async () => {
