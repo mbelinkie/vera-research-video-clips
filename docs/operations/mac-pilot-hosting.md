@@ -21,7 +21,7 @@ friend's browser ──HTTPS──► Cloudflare Access (invite list: emails)
                          Cloudflare Tunnel (outbound-only from the Mac;
                                │            no router ports are opened)
                                ▼
-  Mac: cloudflared ──► 127.0.0.1:43111  Research API + built website
+  Mac: cloudflared ──► 127.0.0.1:43211  Research API + built website
                         │   1. verifies the Access token again (fails closed)
                         │   2. Cognito browser session (#51)
                         │   3. project membership on every request (#49/#52)
@@ -36,6 +36,14 @@ Defense in depth on the public path: Cloudflare Access at the edge,
 the API validating it again with the Access signing keys, then Cognito and
 project permissions. Removing or misconfiguring the Access application
 therefore locks everyone out instead of exposing the sign-in page.
+
+The pilot uses its own port (`CLOUD_API_PORT=43211`); the tools refuse the
+development default 43111. The tunnel runs under a supervisor that starts
+`cloudflared` only after confirming, on the operator port, that the pilot API
+(with the expected public origin) is what's running, and stops it within
+about a minute if that stops being true. The development bearer API also
+refuses any request carrying Cloudflare tunnel headers. Together these mean a
+development server can never end up behind the tunnel.
 
 Every request through the tunnel arrives from `127.0.0.1`, so "loopback" no
 longer proves a request is local. That is why maintenance and diagnostics
@@ -53,8 +61,8 @@ command line or log.
 | -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `check`                                | Preflight: settings valid, website built, PostgreSQL tools present, backup key private, destination present.                                                                                                        |
 | `status` (`--json`)                    | Friends can reach it now? API, PostgreSQL, tunnel, restarts in 24h, Access/sign-in failure counts, last good backup and drill, free disk, and a "Needs attention" list. Exit code 2 when something needs attention. |
-| `connect`                              | Starts the tunnel. Invited friends can reach Research while the Mac is awake.                                                                                                                                       |
-| `disconnect`                           | **Stops outside access immediately.** Research keeps running locally.                                                                                                                                               |
+| `connect`                              | Starts the tunnel (refuses unless the pilot API is running). Invited friends can reach Research while the Mac is awake.                                                                                             |
+| `disconnect`                           | **Stops outside access immediately**, and confirms the tunnel job is gone before saying so. Research keeps running locally.                                                                                         |
 | `stop` / `start`                       | Stops tunnel and API / starts the API (local only; friends still need `connect`).                                                                                                                                   |
 | `backup`                               | Takes a consistent backup now (see below).                                                                                                                                                                          |
 | `drill`                                | Restores the newest off-device backup into a throwaway database and checks it.                                                                                                                                      |
@@ -75,7 +83,13 @@ command line or log.
   crash-safe (#50: transactional catalog, fsync'd atomic object publish), so a
   power loss or lid close cannot leave a half-published transcript.
 - Sleep simply pauses everything; on wake `cloudflared` reconnects on its own.
-- API logs rotate at 5 MB, keeping 5 files, under `logs/` in the pilot home.
+- API and tunnel logs rotate at 5 MB, keeping 5 files each, under `logs/` in
+  the pilot home.
+- **Interrupted backup:** a backup killed mid-way (power loss) can leave the
+  "saves paused" marker behind. On start, the API waits for a running backup,
+  and removes a leftover marker only when the backup that recorded owning it
+  is no longer running. A marker with no recorded owner (a manual backup) is
+  left alone and reported.
 - **Disk guard:** when free space on the transcript volume drops below
   `PILOT_DISK_PAUSE_BELOW_MB` (default 2 GB), saving is refused with a clear
   message while reading keeps working. `status` reports it.
@@ -94,7 +108,10 @@ Nightly at `PILOT_BACKUP_HOUR` (default 3 am), with reduced CPU/disk priority:
    per-file key from the master key). Tampering, truncation, reordering or the
    wrong key is detected; nothing is restored from a damaged file.
 3. Copied to `PILOT_BACKUP_DESTINATION` (default: an iCloud Drive folder, so it
-   leaves the Mac), then **re-read and fully verified** at the destination.
+   leaves the Mac) as `vera-research-<UTC time>-<random>.verabk`, never
+   replacing an existing file, with the folder entry flushed to disk, then
+   **re-read and fully verified** at the destination before anything is
+   pruned.
 4. Retention: newest 3, plus one per day for 14 days, one per ISO week for 8
    weeks and one per month for 12 months. Only exact backup file names are
    ever deleted.
@@ -161,7 +178,7 @@ None of these were done by #53. Each needs your explicit go-ahead.
 ## Security boundaries (unchanged guarantees)
 
 - No router port forwarding; the tunnel is outbound-only and forwards one
-  exact hostname to `127.0.0.1:43111`. Everything else gets 404.
+  exact hostname to `127.0.0.1:43211`. Everything else gets 404.
 - PostgreSQL, the operator port and `/local-agent` are never reachable
   through the tunnel. Forwarded headers are only accepted from loopback
   (#51), and the operator port refuses them entirely.

@@ -164,6 +164,24 @@ export function createCloudApi(
   const { catalog, authenticate, browserAuth } = dependencies;
   const { ingressGuard, counters } = dependencies;
   if (ingressGuard) app.addHook("onRequest", ingressGuard);
+  if (!browserAuth) {
+    // Development/managed bearer auth trusts the caller's claimed identity, so
+    // it must never serve anything that arrived through a Cloudflare tunnel
+    // (for example if a dev server ever took the pilot's port).
+    app.addHook("onRequest", async (request) => {
+      if (
+        Object.keys(request.headers).some((name) =>
+          /^cf-(?:connecting-ip|ray|visitor|access-jwt-assertion|ipcountry)$/u.test(
+            name.toLowerCase(),
+          ),
+        )
+      )
+        throw Object.assign(new Error("Request not permitted."), {
+          statusCode: 403,
+          code: "tunnel_refused",
+        });
+    });
+  }
   if (counters) {
     app.addHook("onSend", async (request, reply, payload) => {
       let errorCode: string | undefined;

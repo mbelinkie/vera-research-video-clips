@@ -308,3 +308,37 @@ describe("disk-space pause", () => {
     expect(await gate.status()).toMatchObject({ writesBlocked: true });
   });
 });
+
+describe("development bearer API behind a tunnel", () => {
+  it("refuses any request that carries Cloudflare tunnel headers", async () => {
+    const app = createCloudApi({
+      catalog: {
+        listProjects: vi.fn(async () => []),
+      } as unknown as SharedProjectCatalog,
+      authenticate: async () => ({
+        userId: randomUUID(),
+        externalSubject: "forged-by-a-friend",
+      }),
+    });
+    try {
+      for (const header of [
+        "cf-connecting-ip",
+        "cf-ray",
+        "cf-visitor",
+        "cf-access-jwt-assertion",
+      ]) {
+        const response = await app.inject({
+          method: "GET",
+          url: "/api/projects",
+          headers: { host: "research.example.com", [header]: "x" },
+        });
+        expect(response.statusCode).toBe(403);
+        expect(response.json().error.code).toBe("tunnel_refused");
+      }
+      const local = await app.inject({ method: "GET", url: "/api/projects" });
+      expect(local.statusCode).toBe(200);
+    } finally {
+      await app.close();
+    }
+  });
+});

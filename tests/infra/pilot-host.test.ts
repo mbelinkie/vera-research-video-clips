@@ -28,6 +28,7 @@ import {
 } from "../../scripts/pilot-host/files.ts";
 import { renderPlist } from "../../scripts/pilot-host/launchd.ts";
 import {
+  clearStaleBackupGate,
   collectStatus,
   destinationKind,
   formatStatus,
@@ -117,6 +118,15 @@ describe("encrypted backup files", () => {
     await expect(
       encryptFile(join(root, "in"), join(root, "enc"), key),
     ).rejects.toThrow();
+    // A finished file with the target name is never replaced either.
+    await writeFile(join(root, "done"), "existing verified backup");
+    await expect(
+      encryptFile(join(root, "in"), join(root, "done"), key),
+    ).rejects.toThrow("Refusing to replace");
+    expect(await readFile(join(root, "done"), "utf8")).toBe(
+      "existing verified backup",
+    );
+    expect(await readdir(root)).not.toContain("done.partial");
     await createKeyFile(join(root, "key"));
     await expect(createKeyFile(join(root, "key"))).rejects.toThrow();
     expect((await readKeyFile(join(root, "key"))).length).toBe(32);
@@ -127,16 +137,21 @@ describe("encrypted backup files", () => {
 
 describe("backup retention", () => {
   it("names backups sortably and parses only exact names", () => {
-    const name = backupName(new Date("2026-11-20T03:15:07.123Z"));
-    expect(name).toBe("vera-research-20261120T031507Z.verabk");
+    const name = backupName(new Date("2026-11-20T03:15:07.123Z"), "0a1b2c3d");
+    expect(name).toBe("vera-research-20261120T031507Z-0a1b2c3d.verabk");
+    // Two backups in the same second get different names.
+    const at = new Date("2026-11-20T03:15:07Z");
+    expect(backupName(at)).not.toBe(backupName(at));
     expect(parseBackupName(name)?.toISOString()).toBe(
       "2026-11-20T03:15:07.000Z",
     );
     for (const bad of [
       `${name}.partial`,
-      "vera-research-20261340T031507Z.verabk",
+      "vera-research-20261340T031507Z-0a1b2c3d.verabk",
+      "vera-research-20261120T031507Z.verabk",
+      "vera-research-20261120T031507Z-0A1B2C3D.verabk",
       "notes.txt",
-      "../vera-research-20261120T031507Z.verabk",
+      "../vera-research-20261120T031507Z-0a1b2c3d.verabk",
     ])
       expect(parseBackupName(bad)).toBeUndefined();
   });
@@ -172,7 +187,7 @@ describe("tunnel configuration", () => {
     tunnelId: "6ff42ae2-765d-4adf-8112-31c55c1551ef",
     credentialsFile: "/Users/test/.cloudflared/6ff42ae2.json",
     hostname: "research.example.com",
-    originPort: 43_111,
+    originPort: 43_211,
     operatorPort: 43_114,
     metricsPort: 43_113,
     accessTeamName: "vera-test",
@@ -180,7 +195,7 @@ describe("tunnel configuration", () => {
   };
   it("forwards one exact hostname to loopback, blocks operator paths and ends in 404", () => {
     const text = renderTunnelConfig(settings);
-    expect(text).toContain("service: http://127.0.0.1:43111");
+    expect(text).toContain("service: http://127.0.0.1:43211");
     expect(text).not.toContain("43114");
     expect(text).toContain(
       "path: ^/(cloud-api/)?__(maintenance|operator)(/|$)",
@@ -198,7 +213,7 @@ describe("tunnel configuration", () => {
       { hostname: "research.example.com\nservice: http://evil" },
       { tunnelId: "not-a-uuid" },
       { credentialsFile: "relative.json" },
-      { operatorPort: 43_111 },
+      { operatorPort: 43_211 },
       { originPort: 80 },
       { accessAud: "short" },
     ])
@@ -217,8 +232,6 @@ describe("launchd jobs", () => {
     logDir: "/Users/test/Library/Application Support/VERA Research Pilot/logs",
     path: "/Applications/Postgres.app/Contents/Versions/18/bin:/usr/bin:/bin",
     cloudflaredPath: "/usr/local/bin/cloudflared",
-    tunnelConfig:
-      "/Users/test/Library/Application Support/VERA Research Pilot/cloudflared.yml",
     backupHour: 3,
     drillWeekday: 0,
   };
@@ -230,7 +243,10 @@ describe("launchd jobs", () => {
     expect(api).toContain("<key>PILOT_ENV_FILE</key>");
     expect(api).not.toMatch(/PASSWORD|SECRET|PILOT_PG_URL/u);
     const tunnel = renderPlist("tunnel", settings);
-    expect(tunnel).toContain("<string>--no-autoupdate</string>");
+    // The tunnel runs under the supervisor that checks the pilot API is the origin.
+    expect(tunnel).toContain("<string>run-tunnel</string>");
+    expect(tunnel).toContain("<key>PILOT_CLOUDFLARED</key>");
+    expect(tunnel).toContain("<key>KeepAlive</key><true/>");
     const backup = renderPlist("backup", settings);
     expect(backup).toContain("<key>StartCalendarInterval</key>");
     expect(backup).toContain("<key>LowPriorityIO</key><true/>");
@@ -357,5 +373,59 @@ describe("status report", () => {
     expect(text).toContain("Friends can reach it right now: NO");
     expect(text).toContain("No uptime guarantee");
     expect(text).toContain("Needs attention");
+  });
+});
+
+describe("stale backup write gate", () => {
+  const settingsFor = (root: string) =>
+    hostSettings({
+      PILOT_HOME: join(root, "home"),
+      PILOT_PG_URL: "postgresql://a:b@127.0.0.1:5432/vera",
+      PILOT_OBJECT_ROOT: join(root, "objects"),
+      PILOT_BACKUP_DESTINATION: "/Volumes/VERA-test-backups",
+      PILOT_BACKUP_KEY_FILE: join(root, "home", "backup.key"),
+    });
+  const gate = (root: string) =>
+    join(root, "objects", ".vera-backup-writes-blocked");
+
+  it("removes a gate left by a backup process that no longer exists", async () => {
+    const root = await newRoot();
+    await mkdir(gate(root), { recursive: true });
+    const settings = settingsFor(root);
+    // A pid that cannot exist on macOS.
+    await writeState(join(root, "home", "state", "backup-gate-owner.json"), {
+      pid: 99_999_999,
+    });
+    const lines: string[] = [];
+    await clearStaleBackupGate(settings, async (line) => {
+      lines.push(line);
+    });
+    await expect(stat(gate(root))).rejects.toThrow();
+    expect(lines.join("")).toContain("removed a stale backup write gate");
+  });
+
+  it("waits for a live backup and never removes a gate with no recorded owner", async () => {
+    const root = await newRoot();
+    await mkdir(gate(root), { recursive: true });
+    const settings = settingsFor(root);
+    await expect(
+      clearStaleBackupGate(settings, async () => undefined),
+    ).rejects.toThrow("no recorded owner");
+    expect((await stat(gate(root))).isDirectory()).toBe(true);
+    await writeState(join(root, "home", "state", "backup-gate-owner.json"), {
+      pid: process.pid, // alive
+    });
+    await expect(
+      clearStaleBackupGate(settings, async () => undefined, {
+        waitMs: 50,
+        pollMs: 10,
+      }),
+    ).rejects.toThrow("still holding the write gate");
+    expect((await stat(gate(root))).isDirectory()).toBe(true);
+  });
+
+  it("does nothing when there is no gate", async () => {
+    const root = await newRoot();
+    await clearStaleBackupGate(settingsFor(root), async () => undefined);
   });
 });

@@ -21,7 +21,8 @@ import {
   timingSafeEqual,
 } from "node:crypto";
 import { constants } from "node:fs";
-import { open, rename, rm, type FileHandle } from "node:fs/promises";
+import { lstat, open, rename, rm, type FileHandle } from "node:fs/promises";
+import { dirname } from "node:path";
 
 export const BACKUP_MAGIC = Buffer.from("VERABK01", "ascii");
 const HEADER_BYTES = 40;
@@ -86,6 +87,35 @@ async function openNew(path: string): Promise<FileHandle> {
   );
 }
 
+/** Fails if `path` already exists; used before every publishing rename. */
+export async function assertAbsent(path: string): Promise<void> {
+  const existing = await lstat(path).catch(() => undefined);
+  if (existing) throw new BackupCryptoError(`Refusing to replace ${path}`);
+}
+
+/** Makes a just-renamed directory entry durable (survives power loss). */
+export async function syncDirectory(path: string): Promise<void> {
+  const handle = await open(path, constants.O_RDONLY);
+  try {
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+
+/**
+ * Publishes a finished `.partial` file under its final name without ever
+ * replacing an existing file, then syncs the directory entry.
+ */
+export async function publishNoReplace(
+  partial: string,
+  destination: string,
+): Promise<void> {
+  await assertAbsent(destination);
+  await rename(partial, destination);
+  await syncDirectory(dirname(destination));
+}
+
 /**
  * Encrypts `source` into a brand-new `destination`. Writes to
  * `destination.partial` first and renames only after an fsync, so a crash
@@ -140,7 +170,7 @@ export async function encryptFile(
     await output.sync();
     await output.close();
     output = undefined;
-    await rename(partial, destination);
+    await publishNoReplace(partial, destination);
   } catch (error) {
     await output?.close().catch(() => undefined);
     await rm(partial, { force: true });
@@ -221,7 +251,7 @@ export async function decryptFile(
       await output.sync();
       await output.close();
       output = undefined;
-      await rename(partial, destination);
+      await publishNoReplace(partial, destination);
     }
     return { plaintextBytes };
   } catch (error) {

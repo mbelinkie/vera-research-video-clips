@@ -6,7 +6,12 @@
  * each of the last 12 months. Only files that match the exact backup name are
  * ever considered, so nothing else in the destination folder can be deleted.
  */
-export const BACKUP_NAME = /^vera-research-(\d{8}T\d{6}Z)\.verabk$/u;
+import { randomBytes } from "node:crypto";
+
+// The random suffix keeps two backups in the same second (or two Macs sharing
+// one destination) from ever choosing the same name.
+export const BACKUP_NAME =
+  /^vera-research-(\d{8}T\d{6}Z)-([0-9a-f]{8})\.verabk$/u;
 
 export type RetentionPolicy = {
   keepNewest: number;
@@ -21,21 +26,25 @@ export const DEFAULT_RETENTION: RetentionPolicy = {
   monthly: 12,
 };
 
-export function backupName(at: Date): string {
+export function backupName(
+  at: Date,
+  suffix = randomBytes(4).toString("hex"),
+): string {
+  if (!/^[0-9a-f]{8}$/u.test(suffix)) throw new Error("Invalid backup suffix");
   const stamp = at
     .toISOString()
     .replace(/[-:]/gu, "")
     .replace(/\.\d{3}Z$/u, "Z");
-  return `vera-research-${stamp}.verabk`;
+  return `vera-research-${stamp}-${suffix}.verabk`;
 }
 
 export function parseBackupName(name: string): Date | undefined {
   const match = BACKUP_NAME.exec(name);
-  if (!match?.[1]) return undefined;
+  if (!match?.[1] || !match[2]) return undefined;
   const s = match[1];
   const iso = `${s.slice(0, 4)}-${s.slice(4, 6)}-${s.slice(6, 8)}T${s.slice(9, 11)}:${s.slice(11, 13)}:${s.slice(13, 15)}Z`;
   const date = new Date(iso);
-  return Number.isNaN(date.getTime()) || backupName(date) !== name
+  return Number.isNaN(date.getTime()) || backupName(date, match[2]) !== name
     ? undefined
     : date;
 }

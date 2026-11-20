@@ -26,6 +26,7 @@ import {
   collectStatus,
   destinationKind,
   formatStatus,
+  clearStaleBackupGate,
   hostSettings,
   recoverBackup,
   runBackup,
@@ -40,6 +41,7 @@ const defaultEnvFile = join(
   "Library/Application Support/VERA Research Pilot/pilot.env",
 );
 const agentsDir = join(homedir(), "Library/LaunchAgents");
+const DEV_API_PORT = 43_111;
 
 async function loadEnv() {
   const envFile = process.env.PILOT_ENV_FILE ?? defaultEnvFile;
@@ -66,46 +68,42 @@ function assertFriendFacing(env: Record<string, string>) {
     throw new Error(
       "The pilot env file must select NODE_ENV=production, VERA_RUNTIME_MODE=mac-pilot, CLOUD_AUTH_MODE=browser and Cloudflare Access",
     );
+  // The development API defaults to 43111 and trusts bearer identities. The
+  // tunnel must point at a port a development server never uses.
+  if (config.cloudApiPort === DEV_API_PORT)
+    throw new Error(
+      `Set CLOUD_API_PORT to a dedicated pilot port (for example 43211), not the development default ${DEV_API_PORT}`,
+    );
   return config;
 }
 
-async function runApi(): Promise<number> {
-  const { env, settings } = await loadEnv();
-  const childEnv: Record<string, string> = {
-    PATH: process.env.PATH ?? "/usr/bin:/bin",
-    HOME: homedir(),
-    LANG: process.env.LANG ?? "en_US.UTF-8",
-    ...env,
-  };
-  assertFriendFacing(childEnv);
-  await access(join(repoRoot, "dist/web/index.html")).catch(() => {
-    throw new Error(
-      "Built website missing: run `npm run build:web` before starting the pilot",
-    );
-  });
-  await ensurePrivateDir(join(settings.home, "logs"));
-  const startsFile = join(settings.home, "state", "api-starts.json");
-  const starts =
-    (await readState<{ starts: string[] }>(startsFile))?.starts ?? [];
-  await writeState(startsFile, {
-    starts: [...starts, new Date().toISOString()].slice(-50),
-  });
-  const log = new RotatingLog(join(settings.home, "logs", "api.log"));
+/**
+ * Runs one child under this process, pipes its output into a size-capped
+ * rotating log, forwards SIGTERM for a clean shutdown and exits non-zero on
+ * an unrequested exit so launchd restarts it.
+ */
+async function supervise(options: {
+  name: string;
+  command: string;
+  args: string[];
+  env: Record<string, string>;
+  log: RotatingLog;
+  /** Optional watchdog: return false to stop the child (exit 1). */
+  healthy?: () => Promise<boolean>;
+}): Promise<number> {
+  const { log } = options;
   await log.write(
-    `[${new Date().toISOString()}] starting Research API (pid ${process.pid})\n`,
+    `[${new Date().toISOString()}] starting ${options.name} (supervisor pid ${process.pid})\n`,
   );
-  const child = spawn(
-    process.execPath,
-    ["--import", "tsx", "apps/cloud-api/src/main.ts"],
-    {
-      cwd: repoRoot,
-      env: childEnv,
-      stdio: ["ignore", "pipe", "pipe"],
-    },
-  );
+  const child = spawn(options.command, options.args, {
+    cwd: repoRoot,
+    env: options.env,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
   child.stdout.on("data", (chunk: Buffer) => void log.write(chunk));
   child.stderr.on("data", (chunk: Buffer) => void log.write(chunk));
   let stopping = false;
+  let unhealthy = false;
   const stop = () => {
     if (stopping) return;
     stopping = true;
@@ -115,15 +113,123 @@ async function runApi(): Promise<number> {
   };
   process.once("SIGTERM", stop);
   process.once("SIGINT", stop);
-  const code = await new Promise<number>((done) =>
+  let failures = 0;
+  const watchdog = options.healthy
+    ? setInterval(() => {
+        void options.healthy!().then((ok) => {
+          failures = ok ? 0 : failures + 1;
+          if (failures >= 3 && !stopping) {
+            unhealthy = true;
+            void log.write(
+              `[${new Date().toISOString()}] ${options.name}: health check failed 3 times; stopping\n`,
+            );
+            stop();
+          }
+        });
+      }, 20_000)
+    : undefined;
+  const code = await new Promise<number>((done) => {
+    child.once("error", () => done(1));
     child.once("exit", (exitCode, signal) =>
       done(exitCode ?? (signal ? 1 : 0)),
-    ),
-  );
+    );
+  });
+  if (watchdog) clearInterval(watchdog);
   await log.write(
-    `[${new Date().toISOString()}] Research API exited (${code}${stopping ? ", requested" : ""})\n`,
+    `[${new Date().toISOString()}] ${options.name} exited (${code}${stopping && !unhealthy ? ", requested" : ""})\n`,
   );
-  return stopping ? 0 : code || 1;
+  return stopping && !unhealthy ? 0 : code || 1;
+}
+
+const childEnvFrom = (env: Record<string, string>): Record<string, string> => ({
+  PATH: process.env.PATH ?? "/usr/bin:/bin",
+  HOME: homedir(),
+  LANG: process.env.LANG ?? "en_US.UTF-8",
+  ...env,
+});
+
+async function runApi(): Promise<number> {
+  const { env, settings } = await loadEnv();
+  const childEnv = childEnvFrom(env);
+  assertFriendFacing(childEnv);
+  await access(join(repoRoot, "dist/web/index.html")).catch(() => {
+    throw new Error(
+      "Built website missing: run `npm run build:web` before starting the pilot",
+    );
+  });
+  await ensurePrivateDir(join(settings.home, "logs"));
+  const log = new RotatingLog(join(settings.home, "logs", "api.log"));
+  await clearStaleBackupGate(settings, (line) => log.write(line));
+  const startsFile = join(settings.home, "state", "api-starts.json");
+  const starts =
+    (await readState<{ starts: string[] }>(startsFile))?.starts ?? [];
+  await writeState(startsFile, {
+    starts: [...starts, new Date().toISOString()].slice(-50),
+  });
+  return supervise({
+    name: "Research API",
+    command: process.execPath,
+    args: ["--import", "tsx", "apps/cloud-api/src/main.ts"],
+    env: childEnv,
+    log,
+  });
+}
+
+/**
+ * True only when the friends-only pilot API (not a development server) is
+ * the one answering on this Mac: its loopback operator port is up and reports
+ * the expected public origin.
+ */
+async function pilotApiIsOrigin(
+  operatorPort: number,
+  publicOrigin: string,
+): Promise<boolean> {
+  try {
+    const response = await fetch(
+      `http://127.0.0.1:${operatorPort}/__operator/diagnostics`,
+      { signal: AbortSignal.timeout(2_000), redirect: "error" },
+    );
+    if (!response.ok) return false;
+    const body = (await response.json()) as { publicOrigin?: unknown };
+    return body.publicOrigin === publicOrigin;
+  } catch {
+    return false;
+  }
+}
+
+async function runTunnel(): Promise<number> {
+  const { env, settings } = await loadEnv();
+  const config = assertFriendFacing(childEnvFrom(env));
+  const cloudflared = env.PILOT_CLOUDFLARED ?? process.env.PILOT_CLOUDFLARED;
+  if (!cloudflared?.startsWith("/"))
+    throw new Error(
+      "PILOT_CLOUDFLARED must be the absolute path to cloudflared",
+    );
+  await ensurePrivateDir(join(settings.home, "logs"));
+  const log = new RotatingLog(join(settings.home, "logs", "tunnel.log"));
+  const isOrigin = () =>
+    pilotApiIsOrigin(config.operatorPort, config.browserPublicOrigin!);
+  // Never forward friends to whatever happens to hold the port.
+  if (!(await isOrigin())) {
+    await log.write(
+      `[${new Date().toISOString()}] tunnel not started: the pilot API is not running on this Mac\n`,
+    );
+    return 1; // launchd retries after its throttle interval
+  }
+  return supervise({
+    name: "Cloudflare tunnel",
+    command: cloudflared,
+    args: [
+      "tunnel",
+      "--no-autoupdate",
+      "--config",
+      join(settings.home, "cloudflared.yml"),
+      "run",
+    ],
+    env: childEnvFrom({}),
+    log,
+    healthy: isOrigin,
+  });
 }
 
 async function launchctl(args: string[]) {
@@ -139,10 +245,28 @@ async function load(job: PilotJob) {
     },
   );
 }
-async function unload(job: PilotJob) {
-  await launchctl(["bootout", `${domain()}/${labelFor(job)}`]).catch(
-    () => undefined,
+async function isLoaded(job: PilotJob): Promise<boolean> {
+  return run("launchctl", ["print", `${domain()}/${labelFor(job)}`]).then(
+    () => true,
+    () => false,
   );
+}
+/** Stops a job and proves it is gone; only "was not loaded" is tolerated. */
+async function unload(job: PilotJob) {
+  try {
+    await launchctl(["bootout", `${domain()}/${labelFor(job)}`]);
+  } catch (error) {
+    const text = String((error as { stderr?: unknown }).stderr ?? error);
+    if (
+      !/No such process|Could not find|not find specified service/iu.test(text)
+    )
+      throw new Error(`Could not stop ${labelFor(job)}: ${text.trim()}`);
+  }
+  for (let attempt = 0; attempt < 20; attempt++) {
+    if (!(await isLoaded(job))) return;
+    await new Promise((done) => setTimeout(done, 500));
+  }
+  throw new Error(`${labelFor(job)} is still loaded; it may still be running`);
 }
 
 async function install(flags: Set<string>) {
@@ -175,7 +299,6 @@ async function install(flags: Set<string>) {
       .filter(Boolean)
       .join(":"),
     cloudflaredPath: cloudflared,
-    tunnelConfig: join(settings.home, "cloudflared.yml"),
     backupHour: Number(env.PILOT_BACKUP_HOUR ?? 3),
     drillWeekday: Number(env.PILOT_DRILL_WEEKDAY ?? 0),
   };
@@ -291,6 +414,8 @@ export async function main(argv: string[]): Promise<number> {
   switch (command) {
     case "run-api":
       return runApi();
+    case "run-tunnel":
+      return runTunnel();
     case "backup": {
       const { settings } = await loadEnv();
       const result = await runBackup(settings, new Date(), {
@@ -343,12 +468,24 @@ export async function main(argv: string[]): Promise<number> {
     case "backup-key":
       await backupKey(rest[0]);
       return 0;
-    case "connect":
+    case "connect": {
+      const { env } = await loadEnv();
+      const config = assertFriendFacing(childEnvFrom(env));
+      if (
+        !(await pilotApiIsOrigin(
+          config.operatorPort,
+          config.browserPublicOrigin!,
+        ))
+      )
+        throw new Error(
+          "The pilot API is not running on this Mac; run `npm run pilot -- start` first",
+        );
       await load("tunnel");
       process.stdout.write(
         "Tunnel started: invited friends can reach Research while this Mac is awake.\n",
       );
       return 0;
+    }
     case "disconnect":
       await unload("tunnel");
       process.stdout.write(

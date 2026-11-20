@@ -12,8 +12,8 @@ import {
   lstat,
   open,
   readdir,
-  rename,
   rm,
+  rmdir,
   stat,
   statfs,
 } from "node:fs/promises";
@@ -25,7 +25,13 @@ import { promisify } from "node:util";
 import { Pool } from "pg";
 
 import { backupPilot, restorePilot } from "../pilot-data.ts";
-import { decryptFile, encryptFile, readKeyFile } from "./backup-crypto.ts";
+import {
+  decryptFile,
+  encryptFile,
+  publishNoReplace,
+  readKeyFile,
+} from "./backup-crypto.ts";
+import { pilotBackupGatePath } from "../../packages/db-cloud/src/maintenance.ts";
 import { ensurePrivateDir, readState, writeState } from "./files.ts";
 import { labelFor, PILOT_JOBS, type PilotJob } from "./launchd.ts";
 import { backupName, backupsToPrune, parseBackupName } from "./retention.ts";
@@ -224,6 +230,57 @@ async function assertDestination(s: HostSettings): Promise<void> {
     );
 }
 
+const gateOwnerFile = (s: HostSettings) =>
+  join(s.home, "state", "backup-gate-owner.json");
+
+function processAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    // EPERM means the process exists but belongs to someone else.
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+/**
+ * Called by `run-api` before starting. A backup that was killed mid-way can
+ * leave the #50 write gate behind, which would stop the API from ever
+ * starting. Waits for a live backup to finish; removes the gate only when our
+ * own backup recorded owning it and that process is gone. A gate with no
+ * recorded owner (someone ran pilot-data by hand) is never removed.
+ */
+export async function clearStaleBackupGate(
+  s: HostSettings,
+  log: (line: string) => Promise<void>,
+  options: { waitMs?: number; pollMs?: number } = {},
+): Promise<void> {
+  const gate = pilotBackupGatePath(s.objectRoot);
+  const deadline = Date.now() + (options.waitMs ?? 30 * 60_000);
+  for (;;) {
+    if (!(await lstat(gate).catch(() => undefined))) return;
+    const owner = await readState<{ pid: number }>(gateOwnerFile(s));
+    if (!owner)
+      throw new Error(
+        "A backup write gate exists with no recorded owner; finish or remove that manual backup first",
+      );
+    if (!processAlive(owner.pid)) {
+      await rmdir(gate);
+      await rm(gateOwnerFile(s), { force: true });
+      await log(
+        `[${new Date().toISOString()}] removed a stale backup write gate left by stopped backup pid ${owner.pid}\n`,
+      );
+      return;
+    }
+    if (Date.now() > deadline)
+      throw new Error(
+        "A backup is still holding the write gate after 30 minutes",
+      );
+    await new Promise((done) => setTimeout(done, options.pollMs ?? 5_000));
+  }
+}
+
 export type BackupResult = {
   name: string;
   bytes: number;
@@ -249,10 +306,20 @@ export async function runBackup(
       await ensurePrivateDir(staging);
       // #50 protocol: write gate, drain via the loopback operator port,
       // PostgreSQL dump + exact pinned transcript objects + checksummed manifest.
-      await backupPilot(s.pgUrl, s.objectRoot, join(staging, "backup"), {
-        offline: options.offline ?? false,
-        apiOrigin: `http://127.0.0.1:${s.operatorPort}`,
+      // Record who owns the write gate, so a backup killed mid-way (power
+      // loss, SIGKILL) leaves a gate that `run-api` can prove is stale.
+      await writeState(gateOwnerFile(s), {
+        pid: process.pid,
+        at: now.toISOString(),
       });
+      try {
+        await backupPilot(s.pgUrl, s.objectRoot, join(staging, "backup"), {
+          offline: options.offline ?? false,
+          apiOrigin: `http://127.0.0.1:${s.operatorPort}`,
+        });
+      } finally {
+        await rm(gateOwnerFile(s), { force: true });
+      }
       await tar(["-C", staging, "-cf", join(staging, "archive.tar"), "backup"]);
       const name = backupName(now);
       const encrypted = join(staging, name);
@@ -264,7 +331,9 @@ export async function runBackup(
       const handle = await open(partial, "r+");
       await handle.sync();
       await handle.close();
-      await rename(partial, target);
+      // Never replaces an existing backup; the directory entry is synced
+      // before anything is pruned or success is recorded.
+      await publishNoReplace(partial, target);
       // Re-read the off-device copy: hash and every authenticated record.
       if ((await sha256File(target)) !== sha256)
         throw new Error("Off-device copy does not match the encrypted backup");
@@ -380,6 +449,11 @@ export async function runRestoreDrill(
         target.toString(),
         join(staging, "restored-objects"),
       );
+      // Clean up BEFORE claiming success: a drill that leaves a full restored
+      // copy behind is a failure, not a pass.
+      await admin.query(`DROP DATABASE "${database}" WITH (FORCE)`);
+      created = false;
+      await rm(staging, { recursive: true, force: true });
       await recordRun(
         s,
         "drill",
@@ -388,18 +462,22 @@ export async function runRestoreDrill(
       );
       return { backup: name, database, bytes: plaintextBytes };
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
+      let message = error instanceof Error ? error.message : String(error);
+      if (created && admin) {
+        try {
+          await admin.query(
+            `DROP DATABASE IF EXISTS "${database}" WITH (FORCE)`,
+          );
+          created = false;
+        } catch {
+          message += ` (and the disposable database ${database} could not be removed; drop it manually)`;
+        }
+      }
       await recordRun(s, "drill", { ok: false, message }, now);
       await notify("VERA Research restore drill FAILED", message);
-      throw error;
+      throw new Error(message, { cause: error });
     } finally {
-      if (admin) {
-        if (created)
-          await admin
-            .query(`DROP DATABASE IF EXISTS "${database}" WITH (FORCE)`)
-            .catch(() => undefined);
-        await admin.end();
-      }
+      await admin?.end().catch(() => undefined);
       await rm(staging, { recursive: true, force: true });
     }
   });

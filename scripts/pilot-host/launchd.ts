@@ -24,7 +24,6 @@ export type LaunchdSettings = {
   /** PATH for jobs; must include PostgreSQL client tools and cloudflared. */
   path: string;
   cloudflaredPath: string;
-  tunnelConfig: string;
   backupHour: number;
   drillWeekday: number;
 };
@@ -47,7 +46,6 @@ function assertSafe(settings: LaunchdSettings): void {
     "envFile",
     "logDir",
     "cloudflaredPath",
-    "tunnelConfig",
   ] as const)
     if (!settings[name].startsWith("/"))
       throw new Error(`launchd setting ${name} must be an absolute path`);
@@ -77,17 +75,11 @@ export function renderPlist(job: PilotJob, settings: LaunchdSettings): string {
     `${settings.repoRoot}/scripts/pilot-host/cli.ts`,
     command,
   ];
-  const program =
-    job === "tunnel"
-      ? [
-          settings.cloudflaredPath,
-          "tunnel",
-          "--no-autoupdate",
-          "--config",
-          settings.tunnelConfig,
-          "run",
-        ]
-      : host(job === "api" ? "run-api" : job);
+  // The tunnel also runs under our supervisor: it only forwards while the
+  // pilot API is confirmed behind it, and its logs are size-capped.
+  const program = host(
+    job === "api" ? "run-api" : job === "tunnel" ? "run-tunnel" : job,
+  );
   const always = job === "api" || job === "tunnel";
   const schedule =
     job === "backup"
@@ -95,8 +87,8 @@ export function renderPlist(job: PilotJob, settings: LaunchdSettings): string {
       : job === "drill"
         ? `<key>StartCalendarInterval</key><dict><key>Weekday</key><integer>${settings.drillWeekday}</integer><key>Hour</key><integer>${(settings.backupHour + 1) % 24}</integer><key>Minute</key><integer>15</integer></dict>`
         : "";
-  // The API and backup jobs rotate their own logs; launchd only captures
-  // early crashes. cloudflared logs are small and rotated by `pilot status`.
+  // The API and tunnel supervisors write size-capped rotating logs; launchd's
+  // own file only captures supervisor start-up errors and backup summaries.
   const log = `${settings.logDir}/${job}.launchd.log`;
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -105,7 +97,7 @@ export function renderPlist(job: PilotJob, settings: LaunchdSettings): string {
 <key>Label</key><string>${labelFor(job)}</string>
 <key>ProgramArguments</key>${array(program)}
 <key>WorkingDirectory</key><string>${escapeXml(settings.repoRoot)}</string>
-<key>EnvironmentVariables</key><dict><key>PATH</key><string>${escapeXml(settings.path)}</string><key>PILOT_ENV_FILE</key><string>${escapeXml(settings.envFile)}</string></dict>
+<key>EnvironmentVariables</key><dict><key>PATH</key><string>${escapeXml(settings.path)}</string><key>PILOT_ENV_FILE</key><string>${escapeXml(settings.envFile)}</string><key>PILOT_CLOUDFLARED</key><string>${escapeXml(settings.cloudflaredPath)}</string></dict>
 <key>StandardOutPath</key><string>${escapeXml(log)}</string>
 <key>StandardErrorPath</key><string>${escapeXml(log)}</string>
 <key>Umask</key><integer>63</integer>
