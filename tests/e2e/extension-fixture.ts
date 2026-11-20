@@ -43,16 +43,20 @@ function tallArticleHtml(mode: "document" | "panel" | "short" | "shift") {
   return `<!doctype html><html lang="en"><head><meta charset="utf-8">
     <title>Tall synthetic ${mode} article</title><style>
     html,body { margin:0; background:#eee; font-family:sans-serif; }
-    main { box-sizing:border-box; ${nested ? "width:660px;height:calc(100vh - 100px);margin:55px auto 0;overflow-y:auto;border:8px solid #111;" : "width:100%;"} }
+    [data-fixture="scroll-root"] { box-sizing:border-box; ${nested ? "width:660px;height:calc(100vh - 100px);margin:55px auto 0;overflow-y:auto;border:8px solid #111;" : "width:100%;"} }
     article { background:#fff; }
     .sticky {position:sticky;top:0;height:42px;background:rgb(12,240,28);z-index:2}
     h1 {box-sizing:border-box;margin:0;height:65px;background:rgb(0,140,240);color:white}
+    .quote-scroll {overflow-x:auto}
+    .quote-scroll::after {content:"";display:block;width:850px;height:1px}
     .quote {width:270px;color:rgb(220,0,210);font-size:20px;line-height:30px}
     .quote::selection {background:rgb(0,255,0);color:rgb(220,0,210)}
     .shifted [data-band] {filter:hue-rotate(130deg)}
     .shifted::after {content:"";position:fixed;inset:0;background:rgb(255,0,0);z-index:9999;pointer-events:none}
     </style></head><body>
-    <main data-fixture="scroll-root"><article>
+    <main${nested ? "" : ' data-fixture="scroll-root"'}>
+    ${nested ? '<div data-fixture="scroll-root">' : ""}
+    <article>
     <div class="sticky" data-fixture="sticky"></div>
     ${
       mode === "short"
@@ -61,8 +65,10 @@ function tallArticleHtml(mode: "document" | "panel" | "short" | "shift") {
        <h1 data-fixture="low-headline">Headline below the fold</h1>
        ${bands.slice(bands.indexOf('<div data-band="12"'))}`
     }
+    ${nested ? '<div class="quote-scroll">' : ""}
     <p class="quote" data-fixture="tall-quote">${FIXTURE_QUOTE}</p>
-    </article></main>
+    ${nested ? "</div>" : ""}
+    </article>${nested ? "</div>" : ""}</main>
     ${mode === "shift" ? `<script>addEventListener('scroll',()=>{if(window.scrollY>0)document.body.classList.add('shifted')});</script>` : ""}
     </body></html>`;
 }

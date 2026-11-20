@@ -149,10 +149,23 @@ export async function stitchTallTop(first, second, step, viewport) {
     if (!stableOverlap(outputContext, secondContext, rect, shift, scale)) {
       return undefined;
     }
-    // For a nested scrolling panel, don't duplicate adjacent fixed headers,
-    // sidebars or footers in the appended strip.
+    // Insert the continuation before the original bottom border and footer.
+    const belowPanel = first.height - bottomPx;
+    if (belowPanel > 0) {
+      outputContext.drawImage(
+        firstBitmap,
+        0,
+        bottomPx,
+        first.width,
+        belowPanel,
+        0,
+        bottomPx + shift,
+        first.width,
+        belowPanel,
+      );
+    }
     outputContext.fillStyle = "#fff";
-    outputContext.fillRect(0, first.height, first.width, shift);
+    outputContext.fillRect(0, bottomPx, first.width, shift);
     outputContext.drawImage(
       secondBitmap,
       x,
@@ -160,7 +173,7 @@ export async function stitchTallTop(first, second, step, viewport) {
       rightPx - x,
       shift,
       x,
-      first.height,
+      bottomPx,
       rightPx - x,
       shift,
     );
