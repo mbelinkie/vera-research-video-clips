@@ -209,6 +209,8 @@ byId("save").onsubmit = async (event) => {
     byId("cancel").textContent = "Close";
     byId("settings").hidden = true;
     byId("cancel").focus();
+    if (body.kind === "quote" && !receipt.missingPictures?.length)
+      setTimeout(() => window.close(), 900);
   } catch (error) {
     status.textContent = error.message;
     byId("retry").hidden = false;

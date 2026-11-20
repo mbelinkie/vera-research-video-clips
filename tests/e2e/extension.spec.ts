@@ -497,9 +497,7 @@ test.describe("Research #79 real Chrome synthetic capture", () => {
       expect(articleRequests.length).toBe(1);
       const endingScrollY = await article.evaluate(() => window.scrollY);
       expect(Math.abs(endingScrollY - originalScrollY)).toBeLessThanOrEqual(1);
-      await confirmation
-        .getByRole("button", { name: "Close", exact: true })
-        .click();
+      await expect.poll(() => confirmation.isClosed()).toBe(true);
       await article.evaluate(() => window.getSelection()?.removeAllRanges());
       const pageConfirmation = await triggerPopupCapture(
         article,
