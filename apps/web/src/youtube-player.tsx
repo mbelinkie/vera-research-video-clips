@@ -56,6 +56,7 @@ type YouTubePlayerProps = {
   videoId: string;
   onTimeChange(milliseconds: number): void;
   onRangeInterrupted(): void;
+  onReady?: () => void;
 };
 
 let apiPromise: Promise<YouTubeNamespace> | undefined;
@@ -101,7 +102,7 @@ export const YouTubePlayer = forwardRef<
   YouTubePlayerHandle,
   YouTubePlayerProps
 >(function YouTubePlayer(
-  { videoId, onRangeInterrupted, onTimeChange },
+  { videoId, onRangeInterrupted, onReady, onTimeChange },
   forwardedRef,
 ) {
   const mountRef = useRef<HTMLDivElement>(null);
@@ -174,7 +175,10 @@ export const YouTubePlayer = forwardRef<
             origin: window.location.origin,
           },
           events: {
-            onReady: () => setState("ready"),
+            onReady: () => {
+              setState("ready");
+              onReady?.();
+            },
             onStateChange: (event) => {
               playingRef.current = event.data === youtube.PlayerState.PLAYING;
               pausedRef.current = event.data === youtube.PlayerState.PAUSED;
@@ -206,7 +210,7 @@ export const YouTubePlayer = forwardRef<
       playerRef.current?.destroy();
       playerRef.current = undefined;
     };
-  }, [onTimeChange, videoId]);
+  }, [onReady, onTimeChange, videoId]);
 
   return (
     <div className="player-frame" data-player-state={state}>

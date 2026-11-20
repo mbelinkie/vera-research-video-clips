@@ -35,6 +35,7 @@ type BatchWorkspaceProps = {
   csrfToken?: string | undefined;
   onAuthUnavailable?: () => void;
   onAuthorizationChange(value: string): void;
+  onOpenSource?: (sourceId: string) => void;
   onOpenVideo(canonicalUrl: string): void;
   onProjectChange(projectId: string): void;
   onProjectsChange(projects: Project[]): void;
@@ -50,6 +51,7 @@ export function BatchWorkspace({
   csrfToken,
   onAuthUnavailable,
   onAuthorizationChange,
+  onOpenSource,
   onOpenVideo,
   onProjectChange,
   onProjectsChange,
@@ -681,6 +683,15 @@ export function BatchWorkspace({
                       <option value="reviewed">Reviewed</option>
                       <option value="skipped">Skipped</option>
                     </select>
+                    {item.catalogVideoId && onOpenSource ? (
+                      <button
+                        type="button"
+                        data-testid="open-youtube-source"
+                        onClick={() => onOpenSource(item.catalogVideoId!)}
+                      >
+                        Open source
+                      </button>
+                    ) : null}
                     {item.canonicalUrl ? (
                       <button
                         type="button"

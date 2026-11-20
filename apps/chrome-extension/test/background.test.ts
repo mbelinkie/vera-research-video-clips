@@ -40,12 +40,22 @@ function event(): Event {
 function identity(tab: Tab = source) {
   const url = new URL(tab.url);
   url.searchParams.delete("authToken");
-  return {
+  const value = {
     url: url.toString(),
     navigationKey: "fixture-navigation",
     viewport: { width: 800, height: 600 },
     scroll: { x: 17, y: 240 },
   };
+  if (url.hostname.endsWith("youtube.com"))
+    return {
+      ...value,
+      youtube: {
+        videoId: url.searchParams.get("v"),
+        navigationKey: "fixture-navigation",
+        videoKey: 1,
+      },
+    };
+  return value;
 }
 
 function createFixture(
@@ -177,7 +187,11 @@ function createFixture(
         return { id: 2, tabs: options.unknownConfirmationTab ? [] : [tab] };
       }),
     },
-    scripting: { executeScript: vi.fn(async () => undefined) },
+    scripting: {
+      executeScript: vi.fn(async () => [
+        { frameId: 0, documentId: "source-document" },
+      ]),
+    },
     contextMenus: {
       removeAll: vi.fn((callback: () => void) => callback()),
       create: vi.fn(),
@@ -392,7 +406,7 @@ describe("capture worker", () => {
     expect(draft.pageUrl).toBe(target.url);
   });
 
-  it("keeps an optional locally measured YouTube playhead", async () => {
+  it("defers YouTube playhead sampling until the confirmation checks time", async () => {
     const fixture = createFixture({
       activeTab: {
         ...source,
@@ -407,11 +421,18 @@ describe("capture worker", () => {
       { url: fixture.chrome.runtime.getURL("popup.html") },
     );
     const draft = await readDraft(fixture, start, 100);
-    expect(draft.playheadMs).toBe(193001);
+    expect(draft).not.toHaveProperty("playheadMs");
     expect(fixture.chrome.tabs.captureVisibleTab).not.toHaveBeenCalled();
+    const confirmationUrl = fixture.chrome.windows.create.mock.calls[0][0].url;
+    const sampled = await runtimeMessage(
+      fixture,
+      { type: "vera.capture.youtube-playhead", requestId: start.requestId },
+      confirmationSender(confirmationUrl, 100),
+    );
+    expect(sampled).toEqual({ ok: true, playheadMs: 193001 });
   });
 
-  it("omits the YouTube playhead when no local video measurement is available", async () => {
+  it("keeps general YouTube capture available when time sampling is refused", async () => {
     const fixture = createFixture({
       activeTab: {
         ...source,
@@ -432,6 +453,14 @@ describe("capture worker", () => {
     );
     const draft = await readDraft(fixture, start, 100);
     expect(draft).not.toHaveProperty("playheadMs");
+    const confirmationUrl = fixture.chrome.windows.create.mock.calls[0][0].url;
+    const sampled = await runtimeMessage(
+      fixture,
+      { type: "vera.capture.youtube-playhead", requestId: start.requestId },
+      confirmationSender(confirmationUrl, 100),
+    );
+    expect(sampled.ok).toBe(false);
+    expect(sampled.error).toContain("unavailable");
   });
 
   it("returns an explicit CORS failure and binds a confirmation tab that races creation", async () => {

@@ -2,6 +2,7 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { PGlite } from "@electric-sql/pglite";
 import { afterEach, describe, expect, it } from "vitest";
 import { SharedProjectCatalog } from "@research-video/catalog";
+import type { YouTubeCaptureDetails } from "@research-video/contracts";
 import { runCloudMigrations } from "@research-video/db-cloud";
 import { MemoryTranscriptObjectStore } from "@research-video/storage";
 import { createCloudApi } from "../app.ts";
@@ -670,4 +671,211 @@ it("pairs once with same-origin consent, then queues an attributed video from Ch
   expect((await post(path, client, video)).statusCode).toBe(403);
   expect((await post("/extension/v1/disconnect", client)).statusCode).toBe(200);
   expect((await post(projects, client)).statusCode).toBe(401);
+}, 60_000);
+
+it("keeps one project reason and independent YouTube moments across replays", async () => {
+  const { db, login, inject } = await setup();
+  const extOrigin = "chrome-extension://" + "a".repeat(32);
+  const projectsPath = "/extension/v1/projects";
+  const post = (
+    url: string,
+    headers: Record<string, string>,
+    payload: object,
+  ) => inject({ method: "POST", url, headers, payload });
+  async function member(identity: TestIdentity, displayName: string) {
+    const session = await login(identity);
+    const web = { origin, cookie: session.cookie, "x-vera-csrf": session.csrf };
+    const registered = await post("/api/session/register", web, {
+      displayName,
+    });
+    expect(registered.statusCode, registered.body).toBe(200);
+    const key = randomBytes(32);
+    const pair = await post(
+      "/extension/v1/pair",
+      { origin: extOrigin },
+      { digest: createHash("sha256").update(key).digest("hex") },
+    );
+    expect(pair.statusCode, pair.body).toBe(200);
+    const approved = await post("/api/extension-connections", web, pair.json());
+    expect(approved.statusCode, approved.body).toBe(200);
+    return {
+      web,
+      client: { origin: extOrigin, "x-vera-capture-key": key.toString("hex") },
+      cookie: session.cookie,
+      userId: registered.json<{ id: string }>().id,
+    };
+  }
+  const alice = await member("alice", "Researcher Alice");
+  const bob = await member("bob", "Researcher Bob");
+  async function project(name: string) {
+    const response = await post("/api/projects", alice.web, { name });
+    expect(response.statusCode, response.body).toBe(201);
+    return response.json<{ id: string }>().id;
+  }
+  const projectId = await project("Project with moments");
+  const otherId = await project("Other project");
+  const itemPath = projectsPath + "/" + projectId;
+  const path = itemPath + "/captures";
+  const lookup = itemPath + "/youtube-source";
+  const url = "https://www.youtube.com/watch?v=M7lc1UVf-VE";
+  const alias = "https://youtu.be/M7lc1UVf-VE?t=20";
+  const capture = (youtubeDetails: YouTubeCaptureDetails) => ({
+    kind: "youtube",
+    requestId: randomUUID(),
+    url,
+    youtubeDetails,
+  });
+
+  expect((await post(lookup, alice.client, { url })).json()).toEqual({
+    reason: null,
+    sourceId: null,
+  });
+  expect((await post(lookup, bob.client, { url })).statusCode).toBe(403);
+  const blank = await post(
+    path,
+    alice.client,
+    capture({ kind: "general", reason: "" }),
+  );
+  expect(blank.statusCode, blank.body).toBe(201);
+  const receipt = blank.json<{ sourceId: string; batchId: string }>();
+  const base = "/api/projects/" + projectId;
+  const sourcePath = base + "/sources/" + receipt.sourceId;
+  expect(blank.json().sourcePath).toBe(
+    `/?projectId=${projectId}&sourceId=${receipt.sourceId}`,
+  );
+  const detailsPath = sourcePath + "/youtube-details";
+  const read = async (url: string, cookie = alice.cookie) => {
+    const result = await inject({ method: "GET", url, headers: { cookie } });
+    expect(result.statusCode, result.body).toBe(200);
+    return result.json();
+  };
+  expect(await read(detailsPath)).toMatchObject({
+    sourceId: receipt.sourceId,
+    url,
+    reason: null,
+    moments: [],
+  });
+  const first = capture({ kind: "general", reason: "Look at the opening" });
+  expect((await post(path, alice.client, first)).json()).toEqual(blank.json());
+  expect(
+    (await post(lookup, alice.client, { url: alias })).json(),
+  ).toMatchObject({
+    sourceId: receipt.sourceId,
+    reason: { text: "Look at the opening", updatedBy: alice.userId },
+  });
+  const grant = await post(base + "/members/by-email", alice.web, {
+    email: "bob@example.com",
+    role: "editor",
+  });
+  expect(grant.statusCode, grant.body).toBe(204);
+  const unchanged = capture({ kind: "general", reason: "Look at the opening" });
+  expect((await post(path, bob.client, unchanged)).statusCode).toBe(201);
+  expect((await read(detailsPath)).reason.updatedBy).toBe(alice.userId);
+  const edit = capture({ kind: "general", reason: "Use the interview" });
+  expect(
+    (await post(path, bob.client, { ...edit, url: alias })).json(),
+  ).toEqual(blank.json());
+  expect(
+    (await post(path, alice.client, { ...first, url: alias })).json(),
+  ).toEqual(blank.json());
+  const reason = (await read(detailsPath, bob.cookie)).reason;
+  expect(reason).toMatchObject({
+    text: "Use the interview",
+    updatedBy: bob.userId,
+    updatedByName: "Researcher Bob",
+  });
+  const moment = capture({
+    kind: "moment",
+    timecodeMs: 252345,
+    note: "Interview",
+  });
+  const replies = await Promise.all([
+    post(path, alice.client, moment),
+    post(path, alice.client, { ...moment, url: alias }),
+  ]);
+  for (const reply of replies) expect(reply.json()).toEqual(blank.json());
+  const timeOnly = capture({ kind: "moment", timecodeMs: 0, note: "" });
+  expect((await post(path, bob.client, timeOnly)).json()).toEqual(blank.json());
+  expect(
+    (
+      await post(path, alice.client, {
+        ...moment,
+        youtubeDetails: {
+          kind: "moment",
+          timecodeMs: 252346,
+          note: "Interview",
+        },
+      })
+    ).statusCode,
+  ).toBe(409);
+  expect(await read(detailsPath)).toMatchObject({
+    reason,
+    moments: [
+      {
+        timecodeMs: 0,
+        note: null,
+        authorId: bob.userId,
+        authorName: "Researcher Bob",
+      },
+      {
+        timecodeMs: 252345,
+        note: "Interview",
+        authorId: alice.userId,
+        authorName: "Researcher Alice",
+      },
+    ],
+  });
+  expect(await read(sourcePath + "/comments")).toEqual([]);
+  expect((await db.query("SELECT id FROM library_items")).rows).toHaveLength(0);
+  expect(
+    (await db.query("SELECT id FROM transcription_batches")).rows,
+  ).toHaveLength(1);
+
+  expect(
+    (
+      await post(
+        projectsPath + "/" + otherId + "/youtube-source",
+        alice.client,
+        { url },
+      )
+    ).json(),
+  ).toEqual({
+    reason: null,
+    sourceId: null,
+  });
+  expect(
+    (
+      await inject({
+        method: "GET",
+        url: detailsPath.replace(projectId, otherId),
+        headers: { cookie: alice.cookie },
+      })
+    ).statusCode,
+  ).toBe(404);
+  const otherCapture = await post(
+    projectsPath + "/" + otherId + "/captures",
+    alice.client,
+    timeOnly,
+  );
+  expect(otherCapture.statusCode, otherCapture.body).toBe(201);
+  expect(otherCapture.json().sourceId).toBe(receipt.sourceId);
+  expect(await read(detailsPath.replace(projectId, otherId))).toMatchObject({
+    reason: null,
+    moments: [{ timecodeMs: 0, note: null, authorId: alice.userId }],
+  });
+  expect((await read(detailsPath)).moments).toHaveLength(2);
+  await db.query(
+    "UPDATE project_members SET role='viewer' WHERE project_id=$1 AND user_id=$2",
+    [projectId, bob.userId],
+  );
+  expect((await read(detailsPath, bob.cookie)).reason).toEqual(reason);
+  expect((await post(lookup, bob.client, { url })).statusCode).toBe(403);
+  expect((await post(path, bob.client, edit)).statusCode).toBe(403);
+  const cleared = await post(
+    path,
+    alice.client,
+    capture({ kind: "general", reason: "" }),
+  );
+  expect(cleared.statusCode, cleared.body).toBe(201);
+  expect((await read(detailsPath)).reason).toBeNull();
 }, 60_000);

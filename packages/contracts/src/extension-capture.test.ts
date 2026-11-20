@@ -70,4 +70,39 @@ describe("browser captures", () => {
       expect(capture.safeParse(value).success).toBe(false);
     }
   });
+
+  it("requires an exact elapsed time for a moment and keeps the two save kinds distinct", () => {
+    const video = {
+      kind: "youtube",
+      requestId,
+      url: "https://www.youtube.com/watch?v=M7lc1UVf-VE",
+    };
+    for (const youtubeDetails of [
+      { kind: "general", reason: "" },
+      { kind: "general", reason: "x".repeat(200) },
+      { kind: "moment", timecodeMs: 0, note: "" },
+      { kind: "moment", timecodeMs: 0 },
+    ])
+      expect(
+        ExtensionDraftSchema.safeParse({ ...video, youtubeDetails }).success,
+      ).toBe(true);
+    for (const youtubeDetails of [
+      { kind: "general", reason: "x".repeat(201) },
+      { kind: "general", reason: "", timecodeMs: 0 },
+      { kind: "moment", note: "" },
+      { kind: "moment", timecodeMs: -1, note: "" },
+      { kind: "moment", timecodeMs: 12.5, note: "" },
+      { kind: "moment", timecodeMs: 12, note: "\0" },
+    ])
+      expect(
+        ExtensionDraftSchema.safeParse({ ...video, youtubeDetails }).success,
+      ).toBe(false);
+    expect(
+      ExtensionDraftSchema.safeParse({
+        ...video,
+        timecodeMs: 0,
+        youtubeDetails: { kind: "general", reason: "" },
+      }).success,
+    ).toBe(false);
+  });
 });

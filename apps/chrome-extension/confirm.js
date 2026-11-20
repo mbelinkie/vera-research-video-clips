@@ -1,21 +1,42 @@
 import { connection, gateway } from "./connect.js";
+
 const byId = (id) => document.getElementById(id);
 const names = {
   quote: "Save quote",
   page: "Save page",
   still: "Save as still",
   audio: "Save audio",
-  youtube: "Queue video",
+  youtube: "Save video",
 };
 const status = byId("status");
 const projects = byId("project");
+const reason = byId("reason");
+const note = byId("note");
+const time = byId("time");
+const timeText = byId("time-text");
 const requestId = location.hash.slice(1);
-let draft,
-  paired,
-  busy = false,
-  complete = false;
+let draft;
+let paired;
+let busy = false;
+let complete = false;
+let writeRequestId = requestId;
+let attemptedIntent;
+let sampledPlayheadMs;
+let timeProbeAttempted = false;
+let timeProbePromise;
+let timeModeGeneration = 0;
+let activeProjectId = "";
+let reasonRevision = 0;
+const reasonDrafts = new Map();
+const reasonDirty = new Map();
+const reasonHydration = new Map();
+const intentRequestIds = new Map();
+const noteDrafts = new Map();
+let prefillGeneration = 0;
+
 byId("cancel").onclick = () => window.close();
 byId("settings").onclick = () => chrome.runtime.openOptionsPage();
+
 function picture(title, src) {
   const figure = document.createElement("figure");
   const caption = document.createElement("figcaption");
@@ -26,8 +47,148 @@ function picture(title, src) {
   figure.append(img, caption);
   byId("images").append(figure);
 }
+
+function formatTime(milliseconds) {
+  const seconds = Math.floor(milliseconds / 1000);
+  return Math.floor(seconds / 60) + ":" + String(seconds % 60).padStart(2, "0");
+}
+
+function freshRequestId() {
+  return globalThis.crypto?.randomUUID?.() ?? requestId;
+}
+
+function youtubeMode(isMoment) {
+  if (!draft || draft.kind !== "youtube") return;
+  byId("video-reason").hidden = isMoment;
+  byId("moment-note-field").hidden = !isMoment;
+  byId("submit").textContent = isMoment
+    ? "Save moment at " + formatTime(sampledPlayheadMs)
+    : "Save video";
+}
+
+function rememberProjectDraft() {
+  if (!activeProjectId || !draft || draft.kind !== "youtube") return;
+  reasonDrafts.set(activeProjectId, reason.value);
+  noteDrafts.set(activeProjectId, note.value);
+}
+
+function setProjectDraft(projectId) {
+  activeProjectId = projectId;
+  reason.value = reasonDrafts.get(projectId) ?? "";
+  note.value = noteDrafts.get(projectId) ?? "";
+  reasonRevision++;
+}
+
+async function prefillYouTubeReason(projectId) {
+  if (!projectId || !draft || draft.kind !== "youtube") return;
+  const generation = ++prefillGeneration;
+  const revision = reasonRevision;
+  if (reasonDirty.get(projectId)) {
+    reasonHydration.set(projectId, "dirty");
+    return;
+  }
+  reasonHydration.set(projectId, "pending");
+  try {
+    const result = await gateway(
+      paired.origin,
+      "projects/" + encodeURIComponent(projectId) + "/youtube-source",
+      { url: draft.url },
+      paired.key,
+    );
+    if (
+      generation !== prefillGeneration ||
+      projects.value !== projectId ||
+      reasonRevision !== revision ||
+      reasonDirty.get(projectId)
+    )
+      return;
+    const text =
+      typeof result?.reason?.text === "string" ? result.reason.text : "";
+    reasonDrafts.set(projectId, text);
+    reason.value = text;
+    reasonRevision++;
+    reasonHydration.set(projectId, "ready");
+  } catch (error) {
+    reasonHydration.set(projectId, "failed");
+    if (generation === prefillGeneration && projects.value === projectId)
+      status.textContent =
+        (error instanceof Error ? error.message : "") +
+        " You can still save this video.";
+  }
+}
+
+async function probeYouTubeTime() {
+  if (timeProbeAttempted) {
+    if (Number.isSafeInteger(sampledPlayheadMs)) youtubeMode(true);
+    return;
+  }
+  if (timeProbePromise) return timeProbePromise;
+  const generation = ++timeModeGeneration;
+  time.disabled = true;
+  timeText.textContent = "Reading current time…";
+  timeProbePromise = (async () => {
+    let result;
+    try {
+      result = await chrome.runtime.sendMessage({
+        type: "vera.capture.youtube-playhead",
+        requestId,
+      });
+    } catch {
+      result = {
+        ok: false,
+        error:
+          "Time unavailable. Reopen the capture once the source video can be verified.",
+      };
+    }
+    timeProbeAttempted = true;
+    timeProbePromise = undefined;
+    const playheadMs = result?.ok ? result.playheadMs : undefined;
+    if (Number.isSafeInteger(playheadMs) && playheadMs >= 0) {
+      sampledPlayheadMs = playheadMs;
+      time.disabled = false;
+      timeText.textContent = "Include " + formatTime(playheadMs);
+      if (time.checked && generation === timeModeGeneration) youtubeMode(true);
+      return;
+    }
+    sampledPlayheadMs = undefined;
+    time.checked = false;
+    time.disabled = true;
+    timeText.textContent =
+      result?.error ||
+      "Time unavailable. Reopen the capture once the source video can be verified.";
+    youtubeMode(false);
+  })();
+  return timeProbePromise;
+}
+
+time.onchange = () => {
+  timeModeGeneration++;
+  if (time.checked) return probeYouTubeTime();
+  if (Number.isSafeInteger(sampledPlayheadMs)) youtubeMode(false);
+  return undefined;
+};
+reason.oninput = () => {
+  reasonRevision++;
+  if (activeProjectId) {
+    reasonDrafts.set(activeProjectId, reason.value);
+    reasonDirty.set(activeProjectId, true);
+    reasonHydration.set(activeProjectId, "dirty");
+  }
+};
+note.oninput = () => {
+  if (activeProjectId) noteDrafts.set(activeProjectId, note.value);
+};
+projects.onchange = () => {
+  rememberProjectDraft();
+  setProjectDraft(projects.value);
+  void prefillYouTubeReason(projects.value);
+};
+
 async function load() {
   byId("fields").disabled = true;
+  const previousProject = projects.value || activeProjectId;
+  const previousReason = reason.value;
+  const previousNote = note.value;
   try {
     if (!draft) {
       draft = await chrome.runtime.sendMessage({
@@ -42,8 +203,8 @@ async function load() {
         throw new Error(
           "This capture expired. Return to the source and capture it again.",
         );
-      // Missing picture messages are local UI state. Only capture fields go to VERA.
       delete draft.captureWarnings;
+      writeRequestId = draft.requestId;
       byId("heading").textContent = byId("submit").textContent =
         names[draft.kind];
       byId("source").textContent =
@@ -51,20 +212,10 @@ async function load() {
       if (draft.kind === "youtube") {
         byId("video-reason").hidden = false;
         byId("time-label").hidden = false;
-        const available =
-          Number.isSafeInteger(draft.playheadMs) && draft.playheadMs >= 0;
-        byId("time").disabled = !available;
-        if (available) {
-          const seconds = Math.floor(draft.playheadMs / 1000);
-          byId("time-text").textContent =
-            "Include " +
-            Math.floor(seconds / 60) +
-            ":" +
-            String(seconds % 60).padStart(2, "0");
-        } else {
-          byId("time-text").textContent =
-            "Time unavailable. Reopen capture once the video is playing.";
-        }
+        time.checked = false;
+        time.disabled = false;
+        timeText.textContent = "Capture current time";
+        youtubeMode(false);
       }
       if (draft.kind === "quote") {
         byId("quote-fields").hidden = false;
@@ -104,7 +255,20 @@ async function load() {
     for (const project of list)
       projects.add(new Option(project.name, project.id));
     if (!list.length) throw new Error("Your account has no writable projects.");
-    if (list.length === 1) projects.selectedIndex = 1;
+    const preferred = list.some((project) => project.id === previousProject)
+      ? previousProject
+      : list.length === 1
+        ? list[0].id
+        : "";
+    projects.value = preferred;
+    if (draft.kind === "youtube" && preferred) {
+      setProjectDraft(preferred);
+      if (previousProject === preferred && previousReason)
+        reason.value = previousReason;
+      if (previousProject === preferred && previousNote)
+        note.value = previousNote;
+      await prefillYouTubeReason(preferred);
+    }
     byId("fields").disabled = false;
     byId("retry").hidden = true;
     status.textContent = "Connected to " + paired.origin;
@@ -114,6 +278,7 @@ async function load() {
     byId("retry").hidden = false;
   }
 }
+
 byId("retry").onclick = () => void load();
 byId("save").onsubmit = async (event) => {
   event.preventDefault();
@@ -137,13 +302,44 @@ byId("save").onsubmit = async (event) => {
       );
     let body = draft;
     if (draft.kind === "youtube") {
-      const { playheadMs, ...video } = draft;
-      const comment = byId("comment").value.trim();
+      const details = time.checked
+        ? {
+            kind: "moment",
+            timecodeMs: sampledPlayheadMs,
+            note: note.value.trim(),
+          }
+        : { kind: "general", reason: reason.value.trim() };
+      if (
+        details.kind === "moment" &&
+        (!Number.isSafeInteger(details.timecodeMs) || details.timecodeMs < 0)
+      ) {
+        time.checked = false;
+        youtubeMode(false);
+        throw new Error(
+          "Time unavailable. Save the video without a timecode, or try again from the source tab.",
+        );
+      }
+      if (
+        details.kind === "general" &&
+        !reasonDirty.get(projectId) &&
+        reasonHydration.get(projectId) !== "ready"
+      )
+        throw new Error(
+          "The saved reason is not loaded yet. Retry the lookup or edit the reason explicitly.",
+        );
+      const intent = JSON.stringify({ projectId, url: draft.url, details });
+      if (!intentRequestIds.has(intent))
+        intentRequestIds.set(
+          intent,
+          attemptedIntent === undefined ? writeRequestId : freshRequestId(),
+        );
+      writeRequestId = intentRequestIds.get(intent);
+      attemptedIntent = intent;
       body = {
-        ...video,
-        ...(comment && { comment }),
-        ...(byId("time").checked &&
-          Number.isSafeInteger(playheadMs) && { timecodeMs: playheadMs }),
+        kind: "youtube",
+        requestId: writeRequestId,
+        url: draft.url,
+        youtubeDetails: details,
       };
     }
     if (draft.kind === "quote") {
@@ -180,6 +376,8 @@ byId("save").onsubmit = async (event) => {
       paired.key,
     );
     if (draft.kind === "youtube") {
+      const action =
+        body.youtubeDetails.kind === "moment" ? "Moment saved" : "Video saved";
       const stateMessage =
         receipt.status === "ready_for_review"
           ? "The transcript is ready for review."
@@ -188,12 +386,17 @@ byId("save").onsubmit = async (event) => {
             : ["blocked", "canceled"].includes(receipt.status)
               ? "Open the batch in Research to check its status."
               : "Transcription is in progress.";
-      const hasComment = Boolean(body.comment || body.timecodeMs !== undefined);
-      status.textContent =
-        (hasComment ? "Comment saved with the video in " : "Video saved in ") +
-        projectName +
-        ". " +
-        stateMessage;
+      status.textContent = action + " in " + projectName + ". " + stateMessage;
+      if (body.youtubeDetails.kind === "general") {
+        reasonDrafts.set(projectId, reason.value);
+        reasonDirty.set(projectId, false);
+        reasonHydration.set(projectId, "ready");
+      }
+      const link = byId("open-source");
+      if (link && receipt.sourcePath) {
+        link.href = new URL(receipt.sourcePath, paired.origin).href;
+        link.hidden = false;
+      }
     } else if (receipt.missingPictures?.length) {
       status.textContent =
         "Saved to " +
@@ -224,4 +427,5 @@ byId("save").onsubmit = async (event) => {
     byId("fields").disabled = complete;
   }
 };
+
 void load();

@@ -627,6 +627,46 @@ export const ExtensionCaptureRequestSchema = z.discriminatedUnion("kind", [
 export type ExtensionCaptureRequest = z.infer<
   typeof ExtensionCaptureRequestSchema
 >;
+
+export const YouTubeCaptureDetailsSchema = z.discriminatedUnion("kind", [
+  z.strictObject({
+    kind: z.literal("general"),
+    reason: TextSchema.trim().max(200),
+  }),
+  z.strictObject({
+    kind: z.literal("moment"),
+    timecodeMs: z.int().nonnegative(),
+    note: TextSchema.trim().max(2000).default(""),
+  }),
+]);
+export type YouTubeCaptureDetails = z.infer<typeof YouTubeCaptureDetailsSchema>;
+
+const YouTubeSourceReasonSchema = z.strictObject({
+  text: TextSchema.min(1).max(200),
+  updatedBy: IdSchema,
+  updatedByName: z.string(),
+  updatedAt: TimestampSchema,
+});
+export type YouTubeSourceReason = z.infer<typeof YouTubeSourceReasonSchema>;
+
+export const YouTubeSourceDetailsSchema = z.strictObject({
+  sourceId: IdSchema,
+  url: WebUrlSchema,
+  title: z.string(),
+  reason: YouTubeSourceReasonSchema.nullable(),
+  moments: z.array(
+    z.strictObject({
+      id: IdSchema,
+      timecodeMs: z.int().nonnegative(),
+      note: TextSchema.min(1).max(2000).nullable(),
+      authorId: IdSchema,
+      authorName: z.string(),
+      createdAt: TimestampSchema,
+    }),
+  ),
+});
+export type YouTubeSourceDetails = z.infer<typeof YouTubeSourceDetailsSchema>;
+
 export const ExtensionDraftSchema = z.discriminatedUnion("kind", [
   PageCapture,
   QuoteCapture,
@@ -641,11 +681,19 @@ export const ExtensionDraftSchema = z.discriminatedUnion("kind", [
     data: encodedBytes(20 * 1024 * 1024),
     mimeType: StillImageMimeSchema,
   }),
-  z.strictObject({
-    kind: z.literal("youtube"),
-    ...captureAction,
-    timecodeMs: z.int().nonnegative().optional(),
-    comment: TextSchema.trim().max(2000).optional(),
-  }),
+  z
+    .strictObject({
+      kind: z.literal("youtube"),
+      ...captureAction,
+      timecodeMs: z.int().nonnegative().optional(),
+      comment: TextSchema.trim().max(2000).optional(),
+      youtubeDetails: YouTubeCaptureDetailsSchema.optional(),
+    })
+    .refine(
+      (capture) =>
+        !capture.youtubeDetails ||
+        (capture.comment === undefined && capture.timecodeMs === undefined),
+      "A YouTube source save cannot also include a legacy comment.",
+    ),
 ]);
 export type ExtensionDraft = z.infer<typeof ExtensionDraftSchema>;
