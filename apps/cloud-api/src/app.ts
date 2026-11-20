@@ -527,6 +527,21 @@ export function createCloudApi(
   });
 
   app.get(
+    "/api/projects/:projectId/sources/:sourceId/youtube-details",
+    async (request, reply) => {
+      const { projectId, sourceId } = ProjectSourceParamsSchema.parse(
+        request.params,
+      );
+      reply.header("cache-control", "no-store");
+      return catalog.youtubeSourceDetails(
+        await authenticate(request),
+        projectId,
+        sourceId,
+      );
+    },
+  );
+
+  app.get(
     "/api/projects/:projectId/sources/:sourceId/comments",
     async (request) => {
       const { projectId, sourceId } = ProjectSourceParamsSchema.parse(

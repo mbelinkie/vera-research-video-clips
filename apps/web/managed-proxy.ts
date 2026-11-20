@@ -36,7 +36,7 @@ export function managedResearchGuard(settings: ManagedProxySettings) {
         ) &&
         request.headers.authorization === undefined &&
         request.headers.cookie === undefined &&
-        /^\/extension\/v1\/(?:pair|projects|disconnect|projects\/[a-f0-9-]{36}\/captures)$/u.test(
+        /^\/extension\/v1\/(?:pair|projects|disconnect|projects\/[a-f0-9-]{36}\/(?:captures|youtube-source))$/u.test(
           path,
         )
       )

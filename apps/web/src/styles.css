@@ -1573,3 +1573,37 @@ h1 {
   width: fit-content;
   padding: 0.6rem 1rem;
 }
+
+.source-moment {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 12px;
+  width: 100%;
+  padding: 10px;
+  border: 1px solid #343a44;
+  border-radius: 8px;
+  color: #ece9e2;
+  text-align: left;
+  background: #181b21;
+}
+
+.source-moment:hover,
+.source-moment:focus-visible {
+  border-color: #c49b50;
+}
+
+.source-moment time {
+  color: #d8bd86;
+  font-variant-numeric: tabular-nums;
+}
+
+.source-moment span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.source-moment small {
+  display: block;
+  margin-top: 4px;
+  color: #777e8b;
+}

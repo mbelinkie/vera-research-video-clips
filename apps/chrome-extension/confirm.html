@@ -19,18 +19,25 @@
           </select></label
         >
         <label id="video-reason" hidden
-          >Why is this video worth a look? (optional)<textarea
-            id="comment"
-            maxlength="2000"
-            placeholder="A moment, a timestamp, or what caught your attention"
+          >Why this? (optional)<textarea
+            id="reason"
+            maxlength="200"
+            placeholder="Why is this video worth a look?"
           ></textarea>
         </label>
         <label hidden id="time-label"
           ><span
             ><input type="checkbox" id="time" />
-            <span id="time-text">Include current time</span></span
+            <span id="time-text">Timecode</span></span
           ></label
         >
+        <label id="moment-note-field" hidden
+          >Moment note (optional)<textarea
+            id="note"
+            maxlength="2000"
+            placeholder="What should you revisit here?"
+          ></textarea>
+        </label>
         <div id="quote-fields" hidden>
           <label>Speaker name<input id="speaker" maxlength="300" /></label
           ><label
@@ -60,6 +67,9 @@
       </fieldset>
     </form>
     <p role="status" id="status"></p>
+    <a id="open-source" hidden target="_blank" rel="noopener"
+      >Open source in Research</a
+    >
     <button id="settings">Settings</button>
     <button id="retry" hidden>Refresh projects</button>
     <button id="cancel">Cancel</button>

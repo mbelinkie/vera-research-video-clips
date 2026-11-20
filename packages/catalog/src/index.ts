@@ -30,6 +30,7 @@ import {
   UserSchema,
   VideoSchema,
   WorkerLeaseSchema,
+  YouTubeSourceDetailsSchema,
   type ActiveTranscriptBundle,
   type AuthenticatedActor,
   type BatchOptions,
@@ -59,6 +60,8 @@ import {
   type WorkerLease,
   type WorkerFailureRequest,
   type WorkerProgressStage,
+  type YouTubeCaptureDetails,
+  type YouTubeSourceReason,
 } from "@research-video/contracts";
 import {
   MemoryStagedUploadUrlIssuer,
@@ -102,6 +105,7 @@ export interface CreateClaimedTranscriptUploadInput {
 
 export interface CreateTranscriptionBatchInput {
   chromeRequestId?: string;
+  youtubeDetails?: YouTubeCaptureDetails;
   submissionComment?: string;
   timecodeMs?: number;
   projectId: string;
@@ -172,6 +176,19 @@ const videoCommentColumns = `s.id,s.source_id AS "sourceId",s.comment AS text,s.
   s.created_at AS "createdAt",s.created_by AS "authorId",u.display_name AS "authorName"`;
 const videoCommentSource = `FROM chrome_video_submissions s JOIN users u ON s.created_by=u.id
   WHERE (s.comment IS NOT NULL OR s.timecode_ms IS NOT NULL)`;
+const youtubeReasonColumns = `s.youtube_reason, s.youtube_reason_updated_by,
+  s.youtube_reason_updated_at, editor.display_name AS editor_name`;
+
+function youtubeReason(row: DbRow | undefined): YouTubeSourceReason | null {
+  if (!row?.youtube_reason) return null;
+  return {
+    text: String(row.youtube_reason),
+    updatedBy: String(row.youtube_reason_updated_by),
+    updatedAt: iso(row.youtube_reason_updated_at),
+    updatedByName: String(row.editor_name),
+  };
+}
+
 const batchItemWithComment = `SELECT bi.*, b.name AS batch_name, preview.total AS comment_count, preview.comments
     FROM transcription_batch_items bi JOIN transcription_batches b ON b.id=bi.batch_id
     LEFT JOIN LATERAL (
@@ -1133,12 +1150,26 @@ export class SharedProjectCatalog {
     await this.authorize(actor, input.projectId, "write");
     let batchId: string = randomUUID();
     const createdAt = this.now().toISOString();
+    const details = input.youtubeDetails;
+    const detailsFingerprint = details
+      ? createHash("sha256")
+          .update(
+            JSON.stringify(
+              details.kind === "general"
+                ? [details.kind, details.reason]
+                : [details.kind, details.timecodeMs, details.note],
+            ),
+          )
+          .digest("hex")
+      : null;
     async function recordSubmission(tx: CatalogQuery, sourceId: string) {
+      const id = randomUUID();
       await tx.query(
-        `INSERT INTO chrome_video_submissions(id,project_id,source_id,created_by,request_id,batch_id,comment,timecode_ms)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+        `INSERT INTO chrome_video_submissions(
+          id,project_id,source_id,created_by,request_id,batch_id,comment,timecode_ms,source_details_fingerprint
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
         [
-          randomUUID(),
+          id,
           input.projectId,
           sourceId,
           actor.userId,
@@ -1146,8 +1177,31 @@ export class SharedProjectCatalog {
           batchId,
           input.submissionComment ?? null,
           input.timecodeMs ?? null,
+          detailsFingerprint,
         ],
       );
+      if (details?.kind === "general" && details.reason !== undefined) {
+        await tx.query(
+          `UPDATE library_sources
+           SET youtube_reason=$3, youtube_reason_updated_by=$4,
+             youtube_reason_updated_at=clock_timestamp(), version=version+1
+           WHERE project_id=$1 AND id=$2 AND youtube_reason IS DISTINCT FROM $3`,
+          [input.projectId, sourceId, details.reason || null, actor.userId],
+        );
+      } else if (details?.kind === "moment") {
+        await tx.query(
+          `INSERT INTO youtube_source_moments(id,project_id,source_id,timecode_ms,note,created_by,created_at)
+           VALUES ($1,$2,$3,$4,$5,$6,clock_timestamp())`,
+          [
+            id,
+            input.projectId,
+            sourceId,
+            details.timecodeMs,
+            details.note || null,
+            actor.userId,
+          ],
+        );
+      }
     }
     await catalogTransaction(this.database, async (tx) => {
       if (input.chromeRequestId) {
@@ -1168,8 +1222,10 @@ export class SharedProjectCatalog {
           youtube_video_id: string;
           comment: string | null;
           timecode_ms: string | null;
+          source_details_fingerprint: string | null;
         }>(
-          `SELECT s.batch_id,v.youtube_video_id,s.comment,s.timecode_ms::text FROM chrome_video_submissions s
+          `SELECT s.batch_id,v.youtube_video_id,s.comment,s.timecode_ms::text,s.source_details_fingerprint
+           FROM chrome_video_submissions s
            JOIN videos v ON v.id=s.source_id WHERE s.project_id=$1 AND s.created_by=$2 AND s.request_id=$3`,
           [input.projectId, actor.userId, input.chromeRequestId],
         );
@@ -1179,6 +1235,7 @@ export class SharedProjectCatalog {
           if (
             saved.youtube_video_id !== videoId ||
             saved.comment !== (input.submissionComment ?? null) ||
+            saved.source_details_fingerprint !== detailsFingerprint ||
             saved.timecode_ms !==
               (input.timecodeMs === undefined ? null : String(input.timecodeMs))
           )
@@ -1443,6 +1500,67 @@ export class SharedProjectCatalog {
       createdAt: iso(row.createdAt),
       timecodeMs: row.timecodeMs === null ? null : Number(row.timecodeMs),
     }));
+  }
+
+  async lookupYouTubeSource(
+    actor: AuthenticatedActor,
+    projectId: string,
+    videoId: string,
+  ) {
+    await this.authorize(actor, projectId, "write");
+    const { rows } = await this.database.query<DbRow>(
+      `SELECT s.id, ${youtubeReasonColumns}
+       FROM library_sources s
+       JOIN videos v ON v.id=s.id
+       LEFT JOIN users editor ON editor.id=s.youtube_reason_updated_by
+       WHERE s.project_id=$1 AND s.kind='youtube' AND v.youtube_video_id=$2`,
+      [projectId, videoId],
+    );
+    const row = rows[0];
+    return {
+      sourceId: row ? String(row.id) : null,
+      reason: youtubeReason(row),
+    };
+  }
+
+  async youtubeSourceDetails(
+    actor: AuthenticatedActor,
+    projectId: string,
+    sourceId: string,
+  ) {
+    const source = await this.library.getSource(actor, projectId, sourceId);
+    if (source.kind !== "youtube" || !source.sourceIdentity)
+      throw new CatalogNotFoundError("YouTube source not found.");
+    const { rows: reasons } = await this.database.query<DbRow>(
+      `SELECT ${youtubeReasonColumns}
+       FROM library_sources s
+       LEFT JOIN users editor ON editor.id=s.youtube_reason_updated_by
+       WHERE s.project_id=$1 AND s.id=$2`,
+      [projectId, sourceId],
+    );
+    const { rows: moments } = await this.database.query<DbRow>(
+      `SELECT m.id,m.timecode_ms,m.note,m.created_by,m.created_at,u.display_name
+       FROM youtube_source_moments m JOIN users u ON u.id=m.created_by
+       WHERE m.project_id=$1 AND m.source_id=$2
+       ORDER BY m.timecode_ms,m.id`,
+      [projectId, sourceId],
+    );
+    return YouTubeSourceDetailsSchema.parse({
+      sourceId,
+      url: source.sourceIdentity.canonicalUrl,
+      title:
+        source.bibliography.title?.value ??
+        source.sourceIdentity.providerMediaId,
+      reason: youtubeReason(reasons[0]),
+      moments: moments.map((row) => ({
+        id: row.id,
+        timecodeMs: Number(row.timecode_ms),
+        note: row.note,
+        authorId: row.created_by,
+        authorName: row.display_name,
+        createdAt: iso(row.created_at),
+      })),
+    });
   }
 
   async listReviewInbox(

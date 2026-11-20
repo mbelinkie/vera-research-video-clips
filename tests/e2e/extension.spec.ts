@@ -3,7 +3,9 @@ import {
   expect,
   test,
   type BrowserContext,
+  type Locator,
   type Page,
+  type Request as PlaywrightRequest,
 } from "@playwright/test";
 import { cp, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
@@ -39,6 +41,162 @@ function array(value: unknown): unknown[] {
 
 function number(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value);
+}
+
+const FIXTURE_YOUTUBE_ID = "M7lc1UVf-VE";
+const UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+
+type YouTubeReceipt = {
+  batchId: string;
+  status: string;
+  sourceId: string;
+  sourcePath: string;
+};
+
+function youtubeReceipt(value: unknown, origin: string) {
+  const receipt = record(value);
+  expect(String(receipt.batchId)).toMatch(UUID_PATTERN);
+  expect(String(receipt.sourceId)).toMatch(UUID_PATTERN);
+  const sourceUrl = new URL(String(receipt.sourcePath), origin);
+  expect(sourceUrl.pathname).toBe("/");
+  const projectId = sourceUrl.searchParams.get("projectId");
+  const sourceId = sourceUrl.searchParams.get("sourceId");
+  expect(projectId).toMatch(UUID_PATTERN);
+  expect(sourceId).toBe(receipt.sourceId);
+  return {
+    batchId: String(receipt.batchId),
+    status: String(receipt.status),
+    sourceId: String(receipt.sourceId),
+    sourcePath: String(receipt.sourcePath),
+    projectId: projectId!,
+  } satisfies YouTubeReceipt & { projectId: string };
+}
+
+function textField(page: Page, selector: "#reason" | "#note"): Locator {
+  return page.locator(`${selector}:visible`).first();
+}
+
+async function saveYouTubeConfirmation(
+  page: Page,
+  project: string,
+  origin: string,
+): Promise<{
+  receipt: ReturnType<typeof youtubeReceipt>;
+  request: PlaywrightRequest;
+}> {
+  await prepareYouTubeProject(page, project);
+  const requestPromise = page.waitForRequest(
+    (request) =>
+      request.method() === "POST" &&
+      request.url().includes("/extension/v1/projects/") &&
+      request.url().endsWith("/captures"),
+    { timeout: 5_000 },
+  );
+  await page.locator("#submit").click();
+  const request = await requestPromise.catch(async () => {
+    throw new Error(
+      `YouTube capture request was not sent: ${await page.locator("#status").textContent()}`,
+    );
+  });
+  const response = await request.response();
+  expect(response?.status()).toBe(201);
+  const receipt = youtubeReceipt(await response!.json(), origin);
+  if (!(await page.isClosed())) {
+    await expect(page.locator("#status")).not.toContainText("Saving", {
+      timeout: 10_000,
+    });
+    if (receipt.status === "queued")
+      await expect(page.locator("#status")).toContainText("queue");
+    await expect(page.locator("#open-source")).toHaveAttribute(
+      "href",
+      new URL(receipt.sourcePath, origin).href,
+    );
+    await page.close();
+  }
+  return { receipt, request };
+}
+
+async function cloudJson(
+  context: BrowserContext,
+  origin: string,
+  path: string,
+) {
+  const response = await context.request.get(origin + "/cloud-api/api" + path);
+  expect(response.status()).toBe(200);
+  return response.json();
+}
+
+async function youtubeDetails(
+  context: BrowserContext,
+  origin: string,
+  projectId: string,
+  sourceId: string,
+) {
+  return record(
+    await cloudJson(
+      context,
+      origin,
+      `/projects/${projectId}/sources/${sourceId}/youtube-details`,
+    ),
+  );
+}
+
+async function expectSourceSeek(page: Page, timecodeMs: number) {
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (window as unknown as { __veraSeekCalls: number[] }).__veraSeekCalls,
+      ),
+    )
+    .toContain(timecodeMs / 1_000);
+}
+
+function syntheticWave(seconds = 5) {
+  // Silent PCM gives Chrome a deterministic, seekable media clock without a
+  // network request or a real YouTube media asset.
+  const wave = Buffer.alloc(44 + seconds * 8_000 * 2);
+  wave.write("RIFF", 0);
+  wave.writeUInt32LE(wave.length - 8, 4);
+  wave.write("WAVEfmt ", 8);
+  wave.writeUInt32LE(16, 16);
+  wave.writeUInt16LE(1, 20);
+  wave.writeUInt16LE(1, 22);
+  wave.writeUInt32LE(8_000, 24);
+  wave.writeUInt32LE(16_000, 28);
+  wave.writeUInt16LE(2, 32);
+  wave.writeUInt16LE(16, 34);
+  wave.write("data", 36);
+  wave.writeUInt32LE(wave.length - 44, 40);
+  return wave;
+}
+
+function syntheticYouTubeHtml(wave: Buffer, withVideo = true) {
+  const media = `data:audio/wav;base64,${wave.toString("base64")}`;
+  return `<!doctype html><title>Synthetic YouTube source</title>
+    <main><h1>Authorized synthetic YouTube fixture</h1>
+      <div class="html5-video-player">
+        ${withVideo ? `<video id="synthetic-video" width="320" height="180" muted playsinline src="${media}"></video>` : ""}
+        <div class="ytp-ad-player-overlay" hidden></div>
+      </div>
+    </main>`;
+}
+
+async function advanceSyntheticVideo(page: Page, seconds: number) {
+  const player = page.locator("video");
+  await player.evaluate((video: HTMLVideoElement, target) => {
+    video.muted = true;
+    video.currentTime = target;
+  }, seconds);
+  await expect
+    .poll(() => player.evaluate((video: HTMLVideoElement) => video.readyState))
+    .toBeGreaterThanOrEqual(2);
+  await player.evaluate((video: HTMLVideoElement) => video.play());
+  await expect
+    .poll(() => player.evaluate((video: HTMLVideoElement) => video.currentTime))
+    .toBeGreaterThan(seconds + 0.05);
+  await player.evaluate((video: HTMLVideoElement) => video.pause());
 }
 
 async function stageExtensionForChrome() {
@@ -83,6 +241,9 @@ async function launchDisposableChrome(extensionPath: string) {
   const options = {
     ...(executablePath ? { executablePath } : { channel: "chrome" }),
     headless: process.env.VERA_EXTENSION_HEADLESS === "1",
+    // Playwright normally disables all extensions. Keep that default out so
+    // Chrome can load the staged unpacked extension below.
+    ignoreDefaultArgs: ["--disable-extensions"],
     deviceScaleFactor: 2,
     args: [
       `--disable-extensions-except=${extensionPath}`,
@@ -207,6 +368,9 @@ async function pairThroughOptions(
 ) {
   const options = await context.newPage();
   await options.goto(`chrome-extension://${id}/options.html`);
+  // options.js binds the form after its initial storage read; wait for that
+  // initialization before submitting so CfT cannot submit the native form.
+  await expect(options.getByLabel("VERA address")).toHaveValue(/\S/u);
   await options.getByLabel("VERA address").fill(origin);
   const pairPagePromise = context.waitForEvent("page", { timeout: 10_000 });
   await options.getByRole("button", { name: "Connect to VERA" }).click();
@@ -253,6 +417,44 @@ async function chooseProject(page: Page, name: string) {
     await control.click();
     await page.getByRole("option", { name, exact: true }).click();
   }
+}
+
+async function prepareYouTubeProject(page: Page, name: string) {
+  const control = page.getByLabel("Destination project", { exact: false });
+  await expect(control).toBeVisible();
+  const selected = await control.locator("option:checked").textContent();
+  if (selected?.trim() === name) {
+    await expect(page.locator("#fields")).toBeEnabled();
+    await expect(page.locator("#submit")).toBeEnabled();
+    return;
+  }
+  const reasonLookup = page.waitForResponse(
+    (response) =>
+      response.request().method() === "POST" &&
+      response.url().includes("/extension/v1/projects/") &&
+      response.url().endsWith("/youtube-source"),
+  );
+  await chooseProject(page, name);
+  await reasonLookup;
+  // The response event fires before confirm.js marks hydration ready; the
+  // submit control is the stable UI signal for that state.
+  await expect(page.locator("#submit")).toBeEnabled();
+}
+
+async function openYouTubeConfirmation(
+  page: Page,
+  context: BrowserContext,
+  extensionId: string,
+  project: string,
+) {
+  const confirmation = await triggerPopupCapture(
+    page,
+    context,
+    extensionId,
+    "youtube",
+  );
+  await prepareYouTubeProject(confirmation, project);
+  return confirmation;
 }
 
 function validatePicture(value: unknown) {
@@ -405,9 +607,7 @@ test.describe("Research #79 real Chrome synthetic capture", () => {
       await confirmation
         .getByLabel("Topics", { exact: false })
         .fill("Synthetic research");
-      await confirmation
-        .getByLabel(/note|intended use/i)
-        .fill("Disposable fixture quote");
+      await confirmation.locator("#notes").fill("Disposable fixture quote");
 
       const requestPromise = confirmation.waitForRequest(
         (request) =>
@@ -554,29 +754,12 @@ test.describe("Research #79 real Chrome synthetic capture", () => {
       ).toEqual(["passage", "top"]);
       await pageConfirmation.getByRole("button", { name: "Close" }).click();
 
-      const watchUrl = "https://www.youtube.com/watch?v=VeraTest079";
-      // Five seconds of silent 8 kHz mono PCM give Chrome a real, seekable clock.
-      const wave = Buffer.alloc(44 + 5 * 8_000 * 2);
-      wave.write("RIFF", 0);
-      wave.writeUInt32LE(wave.length - 8, 4);
-      wave.write("WAVEfmt ", 8);
-      wave.writeUInt32LE(16, 16);
-      wave.writeUInt16LE(1, 20);
-      wave.writeUInt16LE(1, 22);
-      wave.writeUInt32LE(8_000, 24);
-      wave.writeUInt32LE(16_000, 28);
-      wave.writeUInt16LE(2, 32);
-      wave.writeUInt16LE(16, 34);
-      wave.write("data", 36);
-      wave.writeUInt32LE(wave.length - 44, 40);
+      const watchUrl = `https://www.youtube.com/watch?v=${FIXTURE_YOUTUBE_ID}`;
+      const wave = syntheticWave();
       await context.route(watchUrl, (route) =>
         route.fulfill({
           contentType: "text/html",
-          body: `<!doctype html><title>Synthetic YouTube player</title>
-            <div class="html5-video-player">
-              <video width="320" height="180" src="data:audio/wav;base64,${wave.toString("base64")}"></video>
-              <div class="ytp-ad-player-overlay" hidden></div>
-            </div>`,
+          body: syntheticYouTubeHtml(wave),
         }),
       );
       const watch = await context.newPage();
@@ -604,11 +787,13 @@ test.describe("Research #79 real Chrome synthetic capture", () => {
         id,
         "youtube",
       );
-      const time = videoConfirmation.getByRole("checkbox", {
-        name: "Include 0:03",
-      });
+      const time = videoConfirmation.locator("#time");
       await expect(time).toBeEnabled();
       await expect(time).not.toBeChecked();
+      await time.check();
+      await expect(videoConfirmation.locator("#time-text")).toHaveText(
+        "Include 0:03",
+      );
       await videoConfirmation.getByRole("button", { name: "Cancel" }).click();
       await expect.poll(() => videoConfirmation.isClosed()).toBe(true);
 
@@ -621,9 +806,411 @@ test.describe("Research #79 real Chrome synthetic capture", () => {
         id,
         "youtube",
       );
+      const adTime = adConfirmation.locator("#time");
+      await expect(adTime).toBeEnabled();
+      await adTime.check();
+      await expect(adTime).toBeDisabled();
+    } finally {
+      await context.close();
+      if (cleanupProfile) await rm(profile, { recursive: true, force: true });
+      await rm(stagedExtensionPath, { recursive: true, force: true });
+    }
+  });
+
+  test("saves an attributed YouTube reason and independent source moments", async () => {
+    test.setTimeout(180_000);
+    test.skip(
+      process.env.VERA_EXTENSION_CREATE_PROJECT !== "1",
+      "The #101 acceptance flow creates two disposable managed projects; set VERA_EXTENSION_CREATE_PROJECT=1.",
+    );
+    if (!projectName)
+      throw new Error("A disposable fixture project is required");
+    const destinationUrl = new URL(destination!);
+    if (!/^(127\.0\.0\.1|localhost)$/.test(destinationUrl.hostname)) {
+      throw new Error(
+        "The real Chrome fixture only permits a loopback destination origin",
+      );
+    }
+    const primaryProjectName = `${projectName} moments`;
+    const isolatedProjectName = `${projectName} isolated`;
+    const stagedExtensionPath = await stageExtensionForChrome();
+    const { context, profile, cleanupProfile } =
+      await launchDisposableChrome(stagedExtensionPath);
+    try {
+      const id = await extensionId(context);
+      if (process.env.VERA_EXTENSION_PAIR === "1")
+        await pairThroughOptions(context, id, destinationUrl.origin);
+      await ensureProject(context, destinationUrl.origin, primaryProjectName);
+      await ensureProject(context, destinationUrl.origin, isolatedProjectName);
+
+      const wave = syntheticWave();
+      const watchUrl = `https://www.youtube.com/watch?v=${FIXTURE_YOUTUBE_ID}`;
+      const unavailableUrl = `${watchUrl}&fixture=unavailable`;
+      const aliasUrl = `https://youtu.be/${FIXTURE_YOUTUBE_ID}?fixture=alias`;
+      const watchPattern =
+        /https:\/\/(?:www\.youtube\.com\/watch|youtu\.be\/)[^\s]+/u;
+      await context.route(watchPattern, async (route) => {
+        const requestUrl = new URL(route.request().url());
+        const unavailable =
+          requestUrl.searchParams.get("fixture") === "unavailable";
+        await route.fulfill({
+          contentType: "text/html",
+          body: syntheticYouTubeHtml(wave, !unavailable),
+        });
+      });
+
+      const watch = await context.newPage();
+      await watch.goto(watchUrl);
+      const player = watch.locator("video");
+      await expect
+        .poll(() =>
+          player.evaluate((video: HTMLVideoElement) => video.readyState),
+        )
+        .toBeGreaterThanOrEqual(2);
+
+      const firstGeneral = await openYouTubeConfirmation(
+        watch,
+        context,
+        id,
+        primaryProjectName,
+      );
+      const firstTime = firstGeneral.locator("#time");
+      await expect(firstTime).toBeEnabled();
+      await expect(firstTime).not.toBeChecked();
+      const firstReason = textField(firstGeneral, "#reason");
+      await expect(firstReason).toHaveValue("");
+      const firstSave = await saveYouTubeConfirmation(
+        firstGeneral,
+        primaryProjectName,
+        destinationUrl.origin,
+      );
+      expect(firstSave.receipt.status).toBe("queued");
+      const primaryProjectId = firstSave.receipt.projectId;
+      const primarySourceId = firstSave.receipt.sourceId;
+
+      const reasonConfirmation = await openYouTubeConfirmation(
+        watch,
+        context,
+        id,
+        primaryProjectName,
+      );
+      await expect(reasonConfirmation.locator("#time")).not.toBeChecked();
+      const reasonField = textField(reasonConfirmation, "#reason");
+      await expect(reasonField).toHaveValue("");
+      await reasonField.fill("Initial source reason");
+      const reasonSave = await saveYouTubeConfirmation(
+        reasonConfirmation,
+        primaryProjectName,
+        destinationUrl.origin,
+      );
+      expect(reasonSave.receipt.sourceId).toBe(primarySourceId);
+
+      const editConfirmation = await openYouTubeConfirmation(
+        watch,
+        context,
+        id,
+        primaryProjectName,
+      );
+      await expect(editConfirmation.locator("#time")).not.toBeChecked();
+      const editReason = textField(editConfirmation, "#reason");
+      await expect(editReason).toHaveValue("Initial source reason");
+      await editReason.fill("Updated source reason");
+      const editSave = await saveYouTubeConfirmation(
+        editConfirmation,
+        primaryProjectName,
+        destinationUrl.origin,
+      );
+      expect(editSave.receipt.sourceId).toBe(primarySourceId);
+
+      await advanceSyntheticVideo(watch, 1.2);
+      const firstMoment = await openYouTubeConfirmation(
+        watch,
+        context,
+        id,
+        primaryProjectName,
+      );
+      const momentTime = firstMoment.locator("#time");
+      await expect(momentTime).toBeEnabled();
+      const unsavedReason = textField(firstMoment, "#reason");
+      await unsavedReason.fill("Draft reason retained across modes");
+      await momentTime.check();
+      await expect(firstMoment.locator("#time-text")).toContainText("Include");
+      const frozenLabel = await firstMoment.locator("#time-text").textContent();
+      const unsavedMoment = textField(firstMoment, "#note");
+      await expect(unsavedMoment).toHaveValue("");
+      await unsavedMoment.fill("Revisit the map transition.");
+      await watch.bringToFront();
+      await advanceSyntheticVideo(watch, 2.2);
+      await firstMoment.bringToFront();
+      await expect(firstMoment.locator("#time-text")).toHaveText(frozenLabel!);
+      await momentTime.uncheck();
+      await expect(textField(firstMoment, "#reason")).toHaveValue(
+        "Draft reason retained across modes",
+      );
+      await momentTime.check();
+      await expect(textField(firstMoment, "#note")).toHaveValue(
+        "Revisit the map transition.",
+      );
+      await expect(firstMoment.locator("#time-text")).toHaveText(frozenLabel!);
+
+      const capturePattern = new RegExp(
+        `${destinationUrl.origin.replace(/[.*+?^${}()|[\\]\\]/g, "\\$&")}/extension/v1/projects/[^/]+/captures$`,
+        "u",
+      );
+      let lostReceipt = false;
+      await firstMoment.route(capturePattern, async (route) => {
+        if (lostReceipt) return route.continue();
+        lostReceipt = true;
+        const upstream = await route.fetch();
+        const headers = { ...upstream.headers() };
+        delete headers["content-length"];
+        await route.fulfill({
+          status: upstream.status(),
+          headers,
+          body: "not-json",
+        });
+      });
+      const lostRequestPromise = firstMoment.waitForRequest(
+        (request) =>
+          request.method() === "POST" && request.url().endsWith("/captures"),
+      );
+      await firstMoment.locator("#submit").click();
+      const lostRequest = await lostRequestPromise;
+      expect(lostReceipt).toBe(true);
+      expect((await lostRequest.response())?.status()).toBe(201);
+      await expect(firstMoment.locator("#submit")).toBeEnabled({
+        timeout: 10_000,
+      });
+      await expect(textField(firstMoment, "#note")).toHaveValue(
+        "Revisit the map transition.",
+      );
+      await firstMoment.unroute(capturePattern);
+      const firstMomentSave = await saveYouTubeConfirmation(
+        firstMoment,
+        primaryProjectName,
+        destinationUrl.origin,
+      );
+      expect(firstMomentSave.receipt.sourceId).toBe(primarySourceId);
+
+      const aliasWatch = await context.newPage();
+      await aliasWatch.goto(aliasUrl);
+      await expect
+        .poll(() =>
+          aliasWatch
+            .locator("video")
+            .evaluate((video: HTMLVideoElement) => video.readyState),
+        )
+        .toBeGreaterThanOrEqual(2);
+      await advanceSyntheticVideo(aliasWatch, 3.2);
+      const secondMoment = await openYouTubeConfirmation(
+        aliasWatch,
+        context,
+        id,
+        primaryProjectName,
+      );
+      const secondTime = secondMoment.locator("#time");
+      await expect(secondTime).toBeEnabled();
+      await expect(secondTime).not.toBeChecked();
+      await secondTime.check();
+      await expect(secondMoment.locator("#time-text")).toContainText("Include");
+      const secondFrozenLabel = await secondMoment
+        .locator("#time-text")
+        .textContent();
+      await aliasWatch.bringToFront();
+      await advanceSyntheticVideo(aliasWatch, 4.1);
+      await secondMoment.bringToFront();
+      await expect(secondMoment.locator("#time-text")).toHaveText(
+        secondFrozenLabel!,
+      );
+      const blankMoment = textField(secondMoment, "#note");
+      await expect(blankMoment).toHaveValue("");
+      const secondMomentSave = await saveYouTubeConfirmation(
+        secondMoment,
+        primaryProjectName,
+        destinationUrl.origin,
+      );
+      expect(secondMomentSave.receipt.sourceId).toBe(primarySourceId);
+      await aliasWatch.close();
+
+      const unavailable = await context.newPage();
+      await unavailable.goto(unavailableUrl);
+      const unavailableConfirmation = await openYouTubeConfirmation(
+        unavailable,
+        context,
+        id,
+        isolatedProjectName,
+      );
+      const unavailableTime = unavailableConfirmation.locator("#time");
+      await expect(unavailableTime).toBeEnabled();
+      await unavailableTime.check();
+      await expect(unavailableTime).toBeDisabled();
+      await expect(unavailableConfirmation.locator("#time-text")).toContainText(
+        /unavailable|playing|read/iu,
+      );
+      const unavailableReason = textField(unavailableConfirmation, "#reason");
+      await expect(unavailableReason).toHaveValue("");
+      const unavailableSave = await saveYouTubeConfirmation(
+        unavailableConfirmation,
+        isolatedProjectName,
+        destinationUrl.origin,
+      );
+      const isolatedProjectId = unavailableSave.receipt.projectId;
+      expect(isolatedProjectId).not.toBe(primaryProjectId);
+      // A canonical YouTube video keeps one source UUID while its project
+      // membership, reason, moments, and Library rows remain isolated.
+      expect(unavailableSave.receipt.sourceId).toBe(primarySourceId);
+      await unavailable.close();
+
+      await watch.locator(".html5-video-player").evaluate((element) => {
+        element.classList.add("ad-showing");
+      });
+      const adConfirmation = await triggerPopupCapture(
+        watch,
+        context,
+        id,
+        "youtube",
+      );
+      const adTime = adConfirmation.locator("#time");
+      await expect(adTime).toBeEnabled();
+      await adTime.check();
+      await expect(adTime).toBeDisabled();
+      await expect(adConfirmation.locator("#time-text")).toContainText(
+        /unavailable|ad|playing|read/iu,
+      );
+      await adConfirmation.getByRole("button", { name: /cancel/i }).click();
+      await expect.poll(() => adConfirmation.isClosed()).toBe(true);
+
+      const finalPrimary = await youtubeDetails(
+        context,
+        destinationUrl.origin,
+        primaryProjectId,
+        primarySourceId,
+      );
+      const finalMoments = array(finalPrimary.moments).map(record);
+      const finalReason = record(finalPrimary.reason);
+      expect(finalPrimary.sourceId).toBe(primarySourceId);
+      expect(finalPrimary.url).toBe(
+        `https://www.youtube.com/watch?v=${FIXTURE_YOUTUBE_ID}`,
+      );
+      expect(finalPrimary.title).toEqual(expect.any(String));
+      expect(finalReason.text).toBe("Updated source reason");
+      expect(finalReason.updatedBy).toMatch(UUID_PATTERN);
+      expect(finalReason.updatedByName).toBe("Local researcher");
+      expect(finalReason.updatedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/u);
+      expect(finalMoments).toHaveLength(2);
+      expect(finalMoments.map((moment) => moment.note)).toEqual([
+        "Revisit the map transition.",
+        null,
+      ]);
+      expect(finalMoments.map((moment) => moment.authorId)).toEqual([
+        finalReason.updatedBy,
+        finalReason.updatedBy,
+      ]);
+      expect(
+        finalMoments.every(
+          (moment) =>
+            moment.authorName === "Local researcher" &&
+            /^\d{4}-\d{2}-\d{2}T/u.test(String(moment.createdAt)),
+        ),
+      ).toBe(true);
+      expect(Number(finalMoments[0]?.timecodeMs)).toBeGreaterThanOrEqual(1_000);
+      expect(Number(finalMoments[0]?.timecodeMs)).toBeLessThan(2_500);
+      expect(Number(finalMoments[1]?.timecodeMs)).toBeGreaterThanOrEqual(3_000);
+      expect(Number(finalMoments[1]?.timecodeMs)).toBeLessThan(4_500);
+      expect(
+        finalMoments.every((moment) => UUID_PATTERN.test(String(moment.id))),
+      ).toBe(true);
+      expect(
+        new Set(finalMoments.map((moment) => String(moment.id))).size,
+      ).toBe(2);
+
+      const finalIsolated = await youtubeDetails(
+        context,
+        destinationUrl.origin,
+        isolatedProjectId,
+        unavailableSave.receipt.sourceId,
+      );
+      expect(finalIsolated.reason).toBeNull();
+      expect(array(finalIsolated.moments)).toHaveLength(0);
+
+      const primarySources = array(
+        await cloudJson(
+          context,
+          destinationUrl.origin,
+          `/projects/${primaryProjectId}/sources?kind=youtube&limit=100&offset=0`,
+        ),
+      );
+      const isolatedSources = array(
+        await cloudJson(
+          context,
+          destinationUrl.origin,
+          `/projects/${isolatedProjectId}/sources?kind=youtube&limit=100&offset=0`,
+        ),
+      );
+      expect(primarySources).toHaveLength(1);
+      expect(isolatedSources).toHaveLength(1);
+      expect(record(primarySources[0]).id).toBe(primarySourceId);
+      expect(record(isolatedSources[0]).id).toBe(
+        unavailableSave.receipt.sourceId,
+      );
+      expect(
+        await cloudJson(
+          context,
+          destinationUrl.origin,
+          `/projects/${primaryProjectId}/items?sourceId=${primarySourceId}&limit=100&offset=0`,
+        ),
+      ).toEqual([]);
+      expect(
+        await cloudJson(
+          context,
+          destinationUrl.origin,
+          `/projects/${isolatedProjectId}/items?sourceId=${unavailableSave.receipt.sourceId}&limit=100&offset=0`,
+        ),
+      ).toEqual([]);
+
+      const sourceView = await context.newPage();
+      await context.route("https://www.youtube.com/iframe_api", (route) =>
+        route.fulfill({
+          contentType: "application/javascript",
+          body: `window.__veraSeekCalls=[];
+            window.YT={PlayerState:{ENDED:0,PLAYING:1,PAUSED:2},Player:class{
+              constructor(element,options){this.options=options;this.time=0;
+                window.__veraPlayers=(window.__veraPlayers||[]).concat(this);
+                setTimeout(()=>options.events.onReady(),0)}
+              cueVideoById(){ }
+              loadVideoById(options){this.time=options.startSeconds;}
+              destroy(){ }
+              getCurrentTime(){return this.time}
+              pauseVideo(){this.options.events.onStateChange({data:2})}
+              seekTo(seconds){this.time=seconds;window.__veraSeekCalls.push(seconds)}
+            }};window.onYouTubeIframeAPIReady?.();`,
+        }),
+      );
+      const sourceViewUrl = new URL(
+        firstSave.receipt.sourcePath,
+        destinationUrl.origin,
+      );
+      await sourceView.goto(sourceViewUrl.toString(), {
+        waitUntil: "domcontentloaded",
+      });
+      await expect(sourceView).toHaveURL(
+        new RegExp(
+          `projectId=${primaryProjectId}.*sourceId=${primarySourceId}`,
+          "u",
+        ),
+      );
+      await expect(sourceView.getByTestId("youtube-source-view")).toBeVisible();
       await expect(
-        adConfirmation.getByRole("checkbox", { name: /time unavailable/i }),
-      ).toBeDisabled();
+        sourceView.getByTestId("youtube-source-reason"),
+      ).toContainText("Updated source reason");
+      const sourceMoments = sourceView.getByTestId("youtube-source-moment");
+      await expect(sourceMoments).toHaveCount(2);
+      await sourceMoments.first().click();
+      await expectSourceSeek(sourceView, Number(finalMoments[0]?.timecodeMs));
+      await sourceMoments.nth(1).click();
+      await expectSourceSeek(sourceView, Number(finalMoments[1]?.timecodeMs));
+      await sourceView.close();
+      await watch.close();
     } finally {
       await context.close();
       if (cleanupProfile) await rm(profile, { recursive: true, force: true });

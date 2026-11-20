@@ -16,6 +16,7 @@ import { ingestChromeCapture } from "./extension-capture.ts";
 
 const originPattern = /^chrome-extension:\/\/[a-p]{32}$/u;
 const hexKey = z.string().regex(/^[0-9a-f]{64}$/u);
+const captureProjectParams = z.object({ projectId: z.uuid() });
 const minute = 60_000;
 function fail(statusCode: number, message: string): never {
   throw Object.assign(new Error(message), {
@@ -135,6 +136,24 @@ export function registerChromeConnection(
           ({ id, name }) => ({ id, name }),
         );
       });
+      gateway.post(
+        "/projects/:projectId/youtube-source",
+        { bodyLimit: 8 * 1024 },
+        async (request) => {
+          const { actor } = await authenticate(request);
+          const { projectId } = captureProjectParams.parse(request.params);
+          const { url } = z
+            .strictObject({ url: z.url().max(4096) })
+            .parse(request.body);
+          let videoId: string;
+          try {
+            videoId = normalizeYouTubeUrl(url).videoId;
+          } catch {
+            fail(400, "Select a YouTube video.");
+          }
+          return catalog.lookupYouTubeSource(actor, projectId, videoId);
+        },
+      );
       gateway.post("/disconnect", async (request) => {
         const { actor, digest } = await authenticate(request);
         await catalog.disconnectChrome(actor, digest);
@@ -156,9 +175,7 @@ export function registerChromeConnection(
           bodyLimit: 29 * 1024 * 1024,
           onRequest: async (request) => {
             const { actor } = await authenticate(request);
-            const { projectId } = z
-              .object({ projectId: z.uuid() })
-              .parse(request.params);
+            const { projectId } = captureProjectParams.parse(request.params);
             await catalog.authorizeSourceWrite(actor, projectId);
             if (admitted.size >= 2)
               fail(429, "Other captures are saving. Try again shortly.");
@@ -229,13 +246,22 @@ export function registerChromeConnection(
                 timecodeMs: draft.timecodeMs,
               }),
               ...(draft.comment && { submissionComment: draft.comment }),
+              ...(draft.youtubeDetails && {
+                youtubeDetails: draft.youtubeDetails,
+              }),
             });
+            const item = result.items.find(
+              (entry) =>
+                entry.youtubeVideoId === preflight.items[0]?.youtubeVideoId,
+            );
+            const sourceId = item?.catalogVideoId;
             return reply.code(201).send({
               batchId: result.batch.id,
-              status: result.items.find(
-                (item) =>
-                  item.youtubeVideoId === preflight.items[0]?.youtubeVideoId,
-              )?.state,
+              status: item?.state,
+              ...(sourceId && {
+                sourceId,
+                sourcePath: `/?${new URLSearchParams({ projectId, sourceId })}`,
+              }),
             });
           }
           return reply

@@ -54,6 +54,12 @@ import {
   VirtualTranscript,
   type TranscriptSeekPrecision,
 } from "./virtual-transcript.tsx";
+import {
+  parseYouTubeSourceReceipt,
+  sourceReceiptReturnTo,
+  YouTubeSourceView,
+  type SourceReceipt,
+} from "./youtube-source-view.tsx";
 
 const demoVideoId = "M7lc1UVf-VE";
 const demoUrl = `https://www.youtube.com/watch?v=${demoVideoId}`;
@@ -75,6 +81,9 @@ function formatPreciseTime(milliseconds: number) {
 }
 
 function App() {
+  const [sourceReceipt, setSourceReceipt] = useState<SourceReceipt | undefined>(
+    () => parseYouTubeSourceReceipt(window.location.search),
+  );
   const [url, setUrl] = useState(explicitFixture ? demoUrl : "");
   const [videoId, setVideoId] = useState<string>();
   const [loadRequest, setLoadRequest] = useState<{
@@ -118,9 +127,44 @@ function App() {
     : session?.authenticated
       ? session.csrfToken
       : undefined;
+
+  function openSourceReceipt(nextProjectId: string, sourceId: string) {
+    const receipt = parseYouTubeSourceReceipt(
+      `?projectId=${encodeURIComponent(nextProjectId)}&sourceId=${encodeURIComponent(sourceId)}`,
+    );
+    if (!receipt) return;
+    setSourceReceipt(receipt);
+    setProjectId(receipt.projectId);
+    setLoadRequest(undefined);
+    setResolvedTranscript(undefined);
+    setVideoId(undefined);
+    setSelection(undefined);
+    window.history.replaceState(
+      {},
+      "",
+      sourceReceiptReturnTo(
+        window.location.pathname,
+        `?projectId=${encodeURIComponent(receipt.projectId)}&sourceId=${encodeURIComponent(receipt.sourceId)}`,
+      ),
+    );
+  }
+
+  function closeSourceReceipt() {
+    setSourceReceipt(undefined);
+    const next = new URL(window.location.href);
+    next.searchParams.delete("projectId");
+    next.searchParams.delete("sourceId");
+    window.history.replaceState(
+      {},
+      "",
+      `${next.pathname}${next.search}${next.hash}`,
+    );
+  }
+
   const clearPrivateState = useCallback(() => {
     setProjects([]);
     setProjectId("");
+    setSourceReceipt(undefined);
     setLoggedClipId(undefined);
     setLoggedExportRequestId(undefined);
     setSelection(undefined);
@@ -229,7 +273,9 @@ function App() {
     }
   }
   const [projects, setProjects] = useState<Project[]>([]);
-  const [projectId, setProjectId] = useState("");
+  const [projectId, setProjectId] = useState(
+    () => sourceReceipt?.projectId ?? "",
+  );
   const [creatingProject, setCreatingProject] = useState(false);
   const [newProjectName, setNewProjectName] = useState("");
   const [newProjectDescription, setNewProjectDescription] = useState("");
@@ -842,7 +888,16 @@ function App() {
                 Sign in using your administrator-invited Cognito account. There
                 is no public signup.
               </p>
-              <a href="/cloud-api/auth/login">Sign in</a>
+              <a
+                href={`/cloud-api/auth/login?returnTo=${encodeURIComponent(
+                  sourceReceiptReturnTo(
+                    window.location.pathname,
+                    window.location.search,
+                  ),
+                )}`}
+              >
+                Sign in
+              </a>
             </>
           ) : (
             <>
@@ -901,8 +956,24 @@ function App() {
         </div>
       )}
 
+      {sourceReceipt && projectId === sourceReceipt.projectId ? (
+        <YouTubeSourceView
+          key={`${sourceReceipt.projectId}/${sourceReceipt.sourceId}`}
+          receipt={sourceReceipt}
+          authorization={authorization}
+          {...(csrfToken ? { csrfToken } : {})}
+          projectName={
+            projects.find((project) => project.id === projectId)?.name ?? ""
+          }
+          onAuthUnavailable={
+            managedResearch ? loseManagedConnection : loseSession
+          }
+          onClose={closeSourceReceipt}
+        />
+      ) : null}
       <form
         className="loader"
+        hidden={Boolean(sourceReceipt && projectId === sourceReceipt.projectId)}
         onSubmit={(event) => {
           event.preventDefault();
           loadVideo();
@@ -927,7 +998,11 @@ function App() {
         </p>
       </form>
 
-      <section className="workspace" aria-label="Research workspace">
+      <section
+        className="workspace"
+        hidden={Boolean(sourceReceipt && projectId === sourceReceipt.projectId)}
+        aria-label="Research workspace"
+      >
         <article className="panel transcript-panel">
           <div className="panel-heading">
             <div>
@@ -1488,14 +1563,20 @@ function App() {
         onAuthorizationChange={(value) => {
           setDevAuthorization(value);
           setProjects([]);
-          setProjectId("");
+          setProjectId(sourceReceipt?.projectId ?? "");
           setProjectMessage(undefined);
         }}
+        onOpenSource={(sourceId) => openSourceReceipt(projectId, sourceId)}
         onOpenVideo={(canonicalUrl) => {
+          if (sourceReceipt) closeSourceReceipt();
           loadVideoUrl(canonicalUrl);
           window.scrollTo({ top: 0, behavior: "smooth" });
         }}
-        onProjectChange={setProjectId}
+        onProjectChange={(nextProjectId) => {
+          if (sourceReceipt && sourceReceipt.projectId !== nextProjectId)
+            closeSourceReceipt();
+          setProjectId(nextProjectId);
+        }}
         onProjectsChange={setProjects}
         projectId={projectId}
         projects={projects}

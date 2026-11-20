@@ -20,6 +20,7 @@ const lastScreenshotAt = new Map();
 const MEDIA_PATH =
   /\.(?:aac|aiff?|flac|m4a|m4v|mp3|mp4|mpeg|oga|ogg|opus|wav|webm)(?:$|[?#])/i;
 const SCREENSHOT_INTERVAL_MS = 550;
+const YOUTUBE_SESSION_PREFIX = "veraYoutubeCapture:";
 
 class CaptureSafetyError extends Error {
   constructor(message) {
@@ -106,6 +107,15 @@ function sameViewport(left, right) {
   );
 }
 
+function sameSourceUrl(contextUrl, currentUrl, youtube) {
+  if (youtube) {
+    const expected = normalizeYouTubeUrl(contextUrl);
+    const current = normalizeYouTubeUrl(currentUrl);
+    return Boolean(expected && current && expected === current);
+  }
+  return safePageUrl(currentUrl) === contextUrl;
+}
+
 async function captureContext(tabId, requireActive) {
   const tab = requireActive ? await activeTab(tabId) : await sourceTab(tabId);
   const url = safePageUrl(tab.url ?? "");
@@ -117,6 +127,8 @@ async function captureContext(tabId, requireActive) {
     url,
     navigationKey: null,
     viewport: null,
+    documentId: null,
+    youtubeIdentity: null,
     activationEpoch: activationEpoch.get(tab.windowId) ?? 0,
   };
 }
@@ -133,26 +145,32 @@ async function assertContext(
   if (
     tab.windowId !== context.windowId ||
     current.windowId !== context.windowId ||
-    safePageUrl(tab.url ?? "") !== context.url ||
-    safePageUrl(current.url ?? "") !== context.url
+    !sameSourceUrl(context.url, tab.url ?? "", context.youtubeIdentity) ||
+    !sameSourceUrl(context.url, current.url ?? "", context.youtubeIdentity)
   ) {
     throw new CaptureSafetyError(
       "The capture tab changed; no screenshot was attached",
     );
   }
   if (
+    !context.youtubeIdentity &&
     (activationEpoch.get(context.windowId) ?? 0) !== context.activationEpoch
   ) {
     throw new CaptureSafetyError("The capture tab was switched during capture");
   }
   let identity;
-  if (checkContent && context.navigationKey) {
-    identity = await sendContent(context.tabId, {
-      type: "vera.capture.identity",
-    });
+  if (checkContent && (context.navigationKey || context.youtubeIdentity)) {
+    identity = await sendContent(
+      context.tabId,
+      {
+        type: "vera.capture.identity",
+      },
+      context.documentId,
+    );
     if (
       !identity?.ok ||
-      identity.value.navigationKey !== context.navigationKey
+      (!context.youtubeIdentity &&
+        identity.value.navigationKey !== context.navigationKey)
     ) {
       throw new CaptureSafetyError(
         "The capture page navigated; no screenshot was attached",
@@ -166,19 +184,43 @@ async function assertContext(
         "The capture viewport changed; no screenshot was attached",
       );
     }
+    if (
+      context.youtubeIdentity &&
+      !sameYouTubeIdentity(
+        context.youtubeIdentity,
+        identity.value.youtube ?? null,
+      )
+    ) {
+      throw new CaptureSafetyError(
+        "The YouTube video changed; no capture was attached",
+      );
+    }
   }
   return { tab, identity: identity?.value };
 }
 
-async function injectContent(tabId) {
-  await chromeApi().scripting.executeScript({
-    target: { tabId },
+async function injectContent(tabId, requireDocument = false) {
+  const result = await chromeApi().scripting.executeScript({
+    target: requireDocument ? { tabId, frameIds: [0] } : { tabId },
     files: ["content.js"],
   });
+  const top = Array.isArray(result)
+    ? (result.find((entry) => entry?.frameId === 0) ?? result[0])
+    : undefined;
+  const documentId = top?.documentId;
+  if (requireDocument && typeof documentId !== "string")
+    throw new CaptureSafetyError(
+      "The source page could not be verified. Reopen the capture and try again.",
+    );
+  return typeof documentId === "string" ? documentId : null;
 }
 
-async function sendContent(tabId, message) {
-  const response = await chromeApi().tabs.sendMessage(tabId, message);
+async function sendContent(tabId, message, documentId) {
+  const response = await chromeApi().tabs.sendMessage(
+    tabId,
+    message,
+    ...(typeof documentId === "string" ? [{ documentId }] : []),
+  );
   if (!response?.ok)
     throw new Error(response?.error || "The page did not respond");
   return response;
@@ -277,12 +319,13 @@ function quotePayload(request, core, top, passage) {
   return result;
 }
 
-async function openConfirmation(payload) {
+async function openConfirmation(payload, sampleContext) {
   const id = payload.requestId;
   const url = chromeApi().runtime.getURL(`confirm.html#${id}`);
   const expiresAt = Date.now() + PENDING_CAPTURE_TTL_MS;
   const record = {
     payload,
+    sampleContext,
     expiresAt,
     expectedUrl: url,
     confirmTabId: null,
@@ -291,8 +334,10 @@ async function openConfirmation(payload) {
   pending.set(id, record);
   const timer = setTimeout(() => {
     const current = pending.get(id);
-    if (current === record && current.expiresAt <= Date.now())
+    if (current === record && current.expiresAt <= Date.now()) {
       pending.delete(id);
+      void forgetYouTubeRecord(id);
+    }
   }, PENDING_CAPTURE_TTL_MS + 100);
   record.timer = timer;
   try {
@@ -313,6 +358,7 @@ async function openConfirmation(payload) {
       const tab = await chromeApi().tabs.create({ url, active: true });
       record.confirmTabId = tab?.id ?? null;
     }
+    if (sampleContext) await persistYouTubeRecord(record);
   } catch (error) {
     clearTimeout(timer);
     pending.delete(id);
@@ -324,6 +370,112 @@ async function openConfirmation(payload) {
     message: "Ready for confirmation",
   });
   return id;
+}
+
+function youtubeSessionStorage() {
+  return chromeApi().storage?.session;
+}
+
+function youtubeSessionKey(requestIdValue) {
+  return YOUTUBE_SESSION_PREFIX + requestIdValue;
+}
+
+function youtubeSessionValue(record) {
+  const context = record.sampleContext;
+  return {
+    requestId: record.payload.requestId,
+    url: record.payload.url,
+    expiresAt: record.expiresAt,
+    expectedUrl: record.expectedUrl,
+    confirmTabId: record.confirmTabId,
+    documentId: record.documentId,
+    sampleContext: {
+      tabId: context.tabId,
+      windowId: context.windowId,
+      url: context.url,
+      documentId: context.documentId,
+      youtubeIdentity: context.youtubeIdentity
+        ? {
+            videoId: context.youtubeIdentity.videoId,
+            navigationKey: context.youtubeIdentity.navigationKey,
+            videoKey: context.youtubeIdentity.videoKey,
+          }
+        : null,
+    },
+  };
+}
+
+async function persistYouTubeRecord(record) {
+  if (!record.sampleContext) return;
+  const storage = youtubeSessionStorage();
+  if (!storage?.set) return;
+  try {
+    await storage.set({
+      [youtubeSessionKey(record.payload.requestId)]:
+        youtubeSessionValue(record),
+    });
+  } catch {
+    // A missing session area should only make timecode unavailable after a
+    // worker restart. The general save remains usable in the confirmation UI.
+  }
+}
+
+async function forgetYouTubeRecord(requestIdValue) {
+  const storage = youtubeSessionStorage();
+  if (!storage?.remove) return;
+  try {
+    await storage.remove(youtubeSessionKey(requestIdValue));
+  } catch {
+    // Best effort: the short-lived entry is still bounded by its expiry.
+  }
+}
+
+async function restoreYouTubeRecord(requestIdValue) {
+  if (!pendingKey(requestIdValue)) return undefined;
+  const current = pending.get(requestIdValue);
+  if (current) return current;
+  const storage = youtubeSessionStorage();
+  if (!storage?.get) return undefined;
+  let stored;
+  try {
+    stored = (await storage.get(youtubeSessionKey(requestIdValue)))?.[
+      youtubeSessionKey(requestIdValue)
+    ];
+  } catch {
+    return undefined;
+  }
+  if (
+    !stored ||
+    stored.requestId !== requestIdValue ||
+    typeof stored.expiresAt !== "number" ||
+    stored.expiresAt < Date.now() ||
+    !stored.sampleContext
+  ) {
+    if (stored) void forgetYouTubeRecord(requestIdValue);
+    return undefined;
+  }
+  const record = {
+    payload: {
+      kind: "youtube",
+      requestId: requestIdValue,
+      url: stored.url,
+    },
+    sampleContext: stored.sampleContext,
+    expiresAt: stored.expiresAt,
+    expectedUrl: stored.expectedUrl,
+    confirmTabId: stored.confirmTabId ?? null,
+    documentId: stored.documentId ?? null,
+  };
+  record.timer = setTimeout(
+    () => {
+      if (pending.get(requestIdValue) === record)
+        pending.delete(requestIdValue);
+      void forgetYouTubeRecord(requestIdValue);
+    },
+    Math.max(0, stored.expiresAt - Date.now()) + 100,
+  );
+  pending.set(requestIdValue, record);
+  return record;
 }
 
 async function captureQuote(context) {
@@ -483,26 +635,29 @@ function captureAudio(context, sourceUrl, title) {
 async function captureYouTube(context) {
   const url = normalizeYouTubeUrl(context.url);
   if (!url) throw new Error("This is not a supported YouTube video URL");
-  await injectContent(context.tabId);
-  const identity = await sendContent(context.tabId, {
-    type: "vera.capture.identity",
-  });
-  context.navigationKey = identity.value.navigationKey;
-  context.viewport = identity.value.viewport;
-  await assertContext(context, true, false);
-  const playhead = (
-    await sendContent(context.tabId, {
-      type: "vera.capture.youtube-playhead",
-    })
-  ).value;
-  await assertContext(context, true, false);
+  try {
+    context.documentId = await injectContent(context.tabId);
+    if (context.documentId) {
+      const { value } = await sendContent(
+        context.tabId,
+        { type: "vera.capture.identity" },
+        context.documentId,
+      );
+      // Use the sanitized YouTube identity when this capture outlives the worker.
+      context.youtubeIdentity = value.youtube ?? null;
+      if (context.youtubeIdentity) {
+        context.url = url;
+        await assertContext(context, true, false);
+      }
+    }
+  } catch {
+    // The original normalized URL is still available for a general save.
+    context.youtubeIdentity = null;
+  }
   return {
     kind: "youtube",
     requestId: context.requestId,
     url,
-    ...(Number.isSafeInteger(playhead) && playhead >= 0
-      ? { playheadMs: playhead }
-      : {}),
   };
 }
 
@@ -519,7 +674,10 @@ async function startCapture({ kind, tabId, sourceUrl, title }) {
   else if (kind === "audio") payload = captureAudio(context, sourceUrl, title);
   else if (kind === "youtube") payload = await captureYouTube(context);
   else throw new Error("Unknown capture action");
-  await openConfirmation(payload);
+  await openConfirmation(
+    payload,
+    kind === "youtube" && context.youtubeIdentity ? context : undefined,
+  );
   rememberStatus({
     scope: "global",
     ok: true,
@@ -611,6 +769,90 @@ chromeApi().commands.onCommand.addListener((command) => {
   );
 });
 
+function confirmationRecord(id, sender) {
+  const record = pendingKey(id) ? pending.get(id) : undefined;
+  const tabId = sender?.tab?.id;
+  if (
+    !record ||
+    Date.now() > record.expiresAt ||
+    sender?.frameId !== 0 ||
+    tabId === undefined ||
+    (record.confirmTabId !== null && tabId !== record.confirmTabId) ||
+    sender.url !== record.expectedUrl
+  )
+    return undefined;
+  if (record.documentId && sender.documentId !== record.documentId)
+    return undefined;
+  if (record.confirmTabId === null) record.confirmTabId = tabId;
+  if (record.documentId === null && typeof sender.documentId === "string")
+    record.documentId = sender.documentId;
+  if (record.sampleContext) void persistYouTubeRecord(record);
+  return record;
+}
+
+const YOUTUBE_TIME_UNAVAILABLE =
+  "Time unavailable. Reopen the capture once the source video can be verified.";
+
+function sameYouTubeIdentity(expected, actual) {
+  return Boolean(
+    expected &&
+    actual &&
+    expected.videoId === actual.videoId &&
+    expected.navigationKey === actual.navigationKey &&
+    (expected.videoKey == null || expected.videoKey === actual.videoKey),
+  );
+}
+
+async function sampleYouTube(requestIdValue, sender) {
+  await restoreYouTubeRecord(requestIdValue);
+  const record = confirmationRecord(requestIdValue, sender);
+  if (!record || record.payload.kind !== "youtube" || !record.sampleContext)
+    return { ok: false, error: YOUTUBE_TIME_UNAVAILABLE };
+  if (record.sampleResult) return record.sampleResult;
+  if (!record.documentId || !record.sampleContext.documentId)
+    return { ok: false, error: YOUTUBE_TIME_UNAVAILABLE };
+  if (record.samplePromise) return record.samplePromise;
+  record.samplePromise = (async () => {
+    const context = record.sampleContext;
+    try {
+      await assertContext(context, true, false);
+      const response = await sendContent(
+        context.tabId,
+        {
+          type: "vera.capture.youtube-playhead",
+          youtubeIdentity: context.youtubeIdentity,
+        },
+        context.documentId,
+      );
+      const sample = response?.value;
+      await assertContext(context, true, false);
+      const playheadMs =
+        typeof sample === "number" ? sample : sample?.playheadMs;
+      if (!Number.isSafeInteger(playheadMs) || playheadMs < 0)
+        throw new CaptureSafetyError(YOUTUBE_TIME_UNAVAILABLE);
+      if (
+        context.youtubeIdentity &&
+        sample?.identity &&
+        !sameYouTubeIdentity(context.youtubeIdentity, sample.identity)
+      )
+        throw new CaptureSafetyError(
+          "The YouTube video changed; timecode is unavailable.",
+        );
+      return { ok: true, playheadMs };
+    } catch (error) {
+      return {
+        ok: false,
+        error:
+          error instanceof CaptureSafetyError
+            ? error.message
+            : YOUTUBE_TIME_UNAVAILABLE,
+      };
+    }
+  })();
+  record.sampleResult = await record.samplePromise;
+  return record.sampleResult;
+}
+
 chromeApi().runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!message || typeof message.type !== "string") return undefined;
   if (message.type === "vera.capture.start") {
@@ -654,33 +896,27 @@ chromeApi().runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
     return true;
   }
+  if (message.type === "vera.capture.youtube-playhead") {
+    void sampleYouTube(message.requestId, sender).then(sendResponse);
+    return true;
+  }
   if (message.type !== "vera.capture.read") return undefined;
 
   const id = message.requestId;
-  const record = pendingKey(id) ? pending.get(id) : undefined;
-  const tabId = sender.tab?.id;
-  const senderUrl = sender.url;
-  const valid =
-    record &&
-    Date.now() <= record.expiresAt &&
-    sender.frameId === 0 &&
-    tabId !== undefined &&
-    (record.confirmTabId === null || tabId === record.confirmTabId) &&
-    senderUrl === record.expectedUrl;
-  if (!valid) {
-    sendResponse(null);
-    return false;
-  }
-  if (record.documentId && sender.documentId !== record.documentId) {
-    sendResponse(null);
-    return false;
-  }
-  if (record.confirmTabId === null) record.confirmTabId = tabId;
-  record.documentId = sender.documentId ?? null;
-  pending.delete(id);
-  clearTimeout(record.timer);
-  sendResponse(record.payload);
-  return false;
+  void (async () => {
+    await restoreYouTubeRecord(id);
+    const record = confirmationRecord(id, sender);
+    if (!record) {
+      sendResponse(null);
+      return;
+    }
+    if (record.payload.kind !== "youtube") {
+      pending.delete(id);
+      clearTimeout(record.timer);
+    }
+    sendResponse(record.payload);
+  })();
+  return true;
 });
 
 chromeApi().tabs.onRemoved?.addListener((tabId) => {
@@ -688,6 +924,7 @@ chromeApi().tabs.onRemoved?.addListener((tabId) => {
     if (record.confirmTabId === tabId) {
       clearTimeout(record.timer);
       pending.delete(id);
+      void forgetYouTubeRecord(id);
     }
   }
 });

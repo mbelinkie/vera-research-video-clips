@@ -31,10 +31,23 @@
   let quoteState = null;
   let pageScrollState = null;
   let topCaptureState = null;
+  const youtubeVideoKeys = new WeakMap();
+  let nextYoutubeVideoKey = 1;
 
   function navigationKey() {
     const navigation = performance.getEntriesByType("navigation")[0];
     return `${location.href}|${performance.timeOrigin}|${navigation?.type ?? "unknown"}`;
+  }
+
+  function youtubeNavigationKey() {
+    const navigation = performance.getEntriesByType("navigation")[0];
+    const value = `${safePageUrl(location.href) ?? ""}|${performance.timeOrigin}|${navigation?.type ?? "unknown"}`;
+    let hash = 2166136261;
+    for (let index = 0; index < value.length; index++) {
+      hash ^= value.charCodeAt(index);
+      hash = Math.imul(hash, 16777619);
+    }
+    return (hash >>> 0).toString(16).padStart(8, "0");
   }
 
   function safePageUrl(value) {
@@ -64,11 +77,13 @@
   }
 
   function pageIdentity() {
+    const youtube = youtubeIdentity();
     return {
       url: safePageUrl(location.href),
       navigationKey: navigationKey(),
       viewport: { width: window.innerWidth, height: window.innerHeight },
       scroll: { x: window.scrollX, y: window.scrollY },
+      ...(youtube ? { youtube } : {}),
     };
   }
 
@@ -489,10 +504,24 @@
     );
   }
 
-  async function youtubePlayhead() {
-    if (location.pathname.startsWith("/shorts/")) return null;
-    await stablePaint();
-    const candidates = [...document.querySelectorAll("video")]
+  function youtubeVideoId() {
+    const host = location.hostname.toLowerCase();
+    if (host === "youtu.be") return location.pathname.split("/")[1] || null;
+    if (
+      host !== "youtube.com" &&
+      host !== "www.youtube.com" &&
+      host !== "m.youtube.com"
+    )
+      return null;
+    if (location.pathname.startsWith("/shorts/"))
+      return location.pathname.split("/")[2] || null;
+    return new URL(location.href).searchParams.get("v") || null;
+  }
+
+  function youtubeVideoCandidates() {
+    if (!youtubeVideoId() || location.pathname.startsWith("/shorts/"))
+      return [];
+    return [...document.querySelectorAll("video")]
       .map((video) => ({
         video,
         rect: video.getBoundingClientRect(),
@@ -512,13 +541,61 @@
           right.rect.width * right.rect.height -
           left.rect.width * left.rect.height,
       );
+  }
+
+  function selectedYouTubeVideo() {
+    const candidates = youtubeVideoCandidates();
     if (!candidates.length) return null;
     if (candidates.length > 1) {
       const largest = candidates[0].rect.width * candidates[0].rect.height;
       const second = candidates[1].rect.width * candidates[1].rect.height;
       if (largest < second * 1.5) return null;
     }
-    const { video } = candidates[0];
+    return candidates[0];
+  }
+
+  function youtubeIdentity(video = selectedYouTubeVideo()?.video) {
+    const videoId = youtubeVideoId();
+    if (!videoId) return null;
+    const identity = {
+      videoId,
+      navigationKey: youtubeNavigationKey(),
+      videoKey: null,
+    };
+    if (!video) return identity;
+    let videoKey = youtubeVideoKeys.get(video);
+    if (!videoKey) {
+      videoKey = nextYoutubeVideoKey++;
+      youtubeVideoKeys.set(video, videoKey);
+    }
+    identity.videoKey = videoKey;
+    const source = video.currentSrc || video.src;
+    if (typeof source === "string" && source.length <= 2_048)
+      identity.source = source;
+    return identity;
+  }
+
+  function sameYouTubeIdentity(expected, actual) {
+    return Boolean(
+      expected &&
+      actual &&
+      expected.videoId === actual.videoId &&
+      expected.navigationKey === actual.navigationKey &&
+      (expected.videoKey == null || expected.videoKey === actual.videoKey) &&
+      (expected.source == null ||
+        actual.source == null ||
+        expected.source === actual.source),
+    );
+  }
+
+  async function youtubePlayhead(expectedIdentity) {
+    if (location.pathname.startsWith("/shorts/")) return null;
+    await stablePaint();
+    const selected = selectedYouTubeVideo();
+    if (!selected) return null;
+    const { video } = selected;
+    const beforeIdentity = youtubeIdentity(video);
+    if (!sameYouTubeIdentity(expectedIdentity, beforeIdentity)) return null;
     const first = video.currentTime;
     await new Promise((resolve) => requestAnimationFrame(resolve));
     const second = video.currentTime;
@@ -528,9 +605,11 @@
       isShowingYouTubeAd(video)
     )
       return null;
+    const afterIdentity = youtubeIdentity(video);
+    if (!sameYouTubeIdentity(beforeIdentity, afterIdentity)) return null;
     const playheadMs = Math.floor(second * 1000);
     return Number.isSafeInteger(playheadMs) && playheadMs >= 0
-      ? playheadMs
+      ? { playheadMs, identity: afterIdentity }
       : null;
   }
 
@@ -686,7 +765,10 @@
         case "vera.capture.page":
           return { ok: true, value: pageData() };
         case "vera.capture.youtube-playhead":
-          return { ok: true, value: await youtubePlayhead() };
+          return {
+            ok: true,
+            value: await youtubePlayhead(message.youtubeIdentity),
+          };
         case "vera.capture.page-top":
           return { ok: true, value: await pageTop() };
         case "vera.capture.top-next":
