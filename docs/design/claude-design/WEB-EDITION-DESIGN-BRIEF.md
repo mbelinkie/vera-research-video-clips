@@ -170,7 +170,7 @@ separately capability-gated.
   **Log clip**.
 - The Web action set is **Log clip** and **Copy**.
 - Do not show disabled or decorative versions of `Export + log` or `Export
-  only`.
+only`.
 - Do not expose companion-window, pin, or always-on-top controls.
 - An unlogged selection cannot be handed to Desktop. If the user wants to
   export the selected range, explain that they must log it first.
