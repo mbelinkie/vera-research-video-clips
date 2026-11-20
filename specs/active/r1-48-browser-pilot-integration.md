@@ -73,9 +73,15 @@ restore. Verify denial and recoverable errors at the boundary users reach.
   migrations, last-Owner races across separate connections, and the encrypted
   backup, restore and tamper checks. The backup destination was a separate
   temporary directory on the same host.
-- All 15 desktop workspace browser tests passed. Formatting and type-checking
-  passed during `npm run check`. The test process reported two cloud API test
-  failures and was stopped at the checkpoint before printing full diagnostics.
+- All 15 desktop workspace browser tests passed. The signed-object test now
+  verifies that an anonymous browser receives 401 and a current member can
+  still read the pinned bytes while the backup gate blocks writes.
+- With a private, nonsymlinked `TMPDIR` on macOS, `npm run check` passed
+  formatting and type-checking. Vitest reported 389 passed, four opt-in tests
+  skipped and two 15-second timeouts (worker lease and transcript finalization).
+  Both timed-out cases passed on an isolated rerun with a 30-second local
+  timeout. The web build and the six local and 15 cloud migration checks
+  passed when run separately. CI retains its normal timeout.
 
 ## Review checkpoint
 
@@ -85,7 +91,7 @@ current roles after revocation, and whether the existing auth, restart and
 restore boundaries leave a release-blocking gap. Share only sanitized source
 and diff excerpts. The Claude CLI window starts November 20 at 5:35 AM Eastern.
 Resume by running the one authorized consultation and resolving confirmed
-findings, then finish the local check and start protected GitHub Test CI.
+findings. Re-run the standard check and start protected GitHub Test CI.
 
 ## Producer live acceptance
 
