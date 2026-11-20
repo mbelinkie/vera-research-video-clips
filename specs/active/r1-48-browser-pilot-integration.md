@@ -83,15 +83,18 @@ restore. Verify denial and recoverable errors at the boundary users reach.
   timeout. The web build and the six local and 15 cloud migration checks
   passed when run separately. CI retains its normal timeout.
 
-## Review checkpoint
+## Source review
 
-The issue remains open and claimed. The local revision is ready for a bounded
-review of whether the published transcript and signed downloads enforce
-current roles after revocation, and whether the existing auth, restart and
-restore boundaries leave a release-blocking gap. Share only sanitized source
-and diff excerpts. The Claude CLI window starts November 20 at 5:35 AM Eastern.
-Resume by running the one authorized consultation and resolving confirmed
-findings. Re-run the standard check and start protected GitHub Test CI.
+The single read-only Claude consultation on November 20 reviewed
+`3006d0057b8d` using sanitized source excerpts and found no confirmed code
+blockers. The published transcript and signed object routes check current
+membership on subsequent requests. Browser auth and object responses use
+`no-store`. The Chromium walkthrough reused the same signed URL after
+revocation and received 403. Sessions require a fresh sign-in after a restart.
+
+A restore can bring back memberships from the snapshot date, including a
+grant that was later revoked. The recovery runbook now requires operators
+to reconcile restored memberships before reopening remote access.
 
 ## Producer live acceptance
 
@@ -100,7 +103,8 @@ findings. Re-run the standard check and start protected GitHub Test CI.
    and logout URLs. Confirm that protected API responses bypass shared caches.
 2. Confirm an encrypted backup reaches the approved off-device destination.
    Recover the key from its separate location and restore into a fresh database
-   and object directory.
+   and object directory. Reconcile the restored membership list with current
+   approvals before restoring remote access.
 3. Have an administrator provision test accounts. Observe two invited users
    sign in on separate outside-network browsers. Register a profile and create
    a project. Confirm that an Owner can share only with a registered account
