@@ -441,6 +441,11 @@ export const ActiveTranscriptBundleSchema = z.object({
   downloads: z.array(TranscriptDownloadTargetSchema).min(2),
 });
 
+export const PublishedEnglishTranscriptSchema = z.object({
+  transcriptVersionId: IdSchema,
+  transcript: NormalizedTranscriptSchema,
+});
+
 export const TranscriptionItemStateSchema = z.enum([
   "draft",
   "preflight",

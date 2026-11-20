@@ -148,10 +148,17 @@ type Member = {
   verifiedEmail: string | null;
 };
 
-async function selectFixtureRange(page: import("@playwright/test").Page) {
-  await page.goto("/?fixture=english-word");
+async function openPublishedTranscript(
+  page: import("@playwright/test").Page,
+  videoId: string,
+) {
+  await page.route("https://www.youtube.com/**", (route) => route.abort());
+  await page.getByLabel("YouTube URL or video ID").fill(videoId);
   await page.getByRole("button", { name: "Load video" }).click();
   await expect(page.getByTestId("transcript-window-row")).toHaveCount(2);
+}
+
+async function selectTranscriptRange(page: import("@playwright/test").Page) {
   await page.evaluate(() => {
     const words = Array.from(
       document.querySelectorAll<HTMLElement>("[data-transcript-token-id]"),
@@ -203,6 +210,18 @@ test("owner sharing preserves role boundaries, clip durability, stale writes, re
 
     const editor = await signIn(editorContext, "bob");
     const viewer = await signIn(viewerContext, "carol");
+    const { videoId, transcriptUrl } = await json<{
+      videoId: string;
+      transcriptUrl: string;
+    }>(
+      await api(
+        ownerContext,
+        `/__fixture/projects/${projectId}/transcript`,
+        "POST",
+      ),
+    );
+    const transcriptPath = `/cloud-api/api/projects/${projectId}/transcripts/english/${videoId}`;
+    const csvPath = `/cloud-api/api/projects/${projectId}/clips.csv`;
     let editorClipPayload: Record<string, unknown> | undefined;
     editor.on("request", (request) => {
       const requestUrl = new URL(request.url());
@@ -214,6 +233,9 @@ test("owner sharing preserves role boundaries, clip durability, stale writes, re
     });
 
     // A signed-in nonmember cannot infer project membership or clips.
+    for (const path of [transcriptPath, transcriptUrl, csvPath]) {
+      expect((await api(viewerContext, path)).status()).toBe(403);
+    }
     expect(
       (
         await api(
@@ -316,13 +338,14 @@ test("owner sharing preserves role boundaries, clip durability, stale writes, re
     await expect(owner.getByText("Changed bob to editor.")).toBeVisible();
 
     await expect(editor.getByLabel("Target project")).toHaveValue(projectId);
-    await selectFixtureRange(editor);
+    await openPublishedTranscript(editor, videoId);
+    await selectTranscriptRange(editor);
     await editor.getByRole("button", { name: "Queue / log only" }).click();
     await expect(
       editor.getByText(/Logged to Members acceptance/),
     ).toBeVisible();
     expect(editorClipPayload).toMatchObject({
-      video: { youtubeVideoId: "M7lc1UVf-VE" },
+      video: { youtubeVideoId: videoId },
       selection: expect.any(Object),
       englishText: expect.any(String),
     });
@@ -345,6 +368,13 @@ test("owner sharing preserves role boundaries, clip durability, stale writes, re
     // membership or append a project record.
     await viewer.getByRole("button", { name: "Refresh projects" }).click();
     await expect(viewer.getByLabel("Target project")).toHaveValue(projectId);
+    await openPublishedTranscript(viewer, videoId);
+    const viewerDownload = await api(viewerContext, transcriptUrl);
+    expect(viewerDownload.status()).toBe(200);
+    expect(viewerDownload.headers()["cache-control"]).toBe("no-store");
+    const viewerCsv = await api(viewerContext, csvPath);
+    expect(viewerCsv.status()).toBe(200);
+    expect(viewerCsv.headers()["cache-control"]).toBe("no-store");
     const viewerMembership = await json<{ membership: Member }>(
       await api(
         viewerContext,
@@ -399,6 +429,9 @@ test("owner sharing preserves role boundaries, clip durability, stale writes, re
     await expect(
       owner.getByText("Removed carol from the project."),
     ).toBeVisible();
+    for (const path of [transcriptPath, transcriptUrl, csvPath]) {
+      expect((await api(viewerContext, path)).status()).toBe(403);
+    }
     expect(
       (
         await api(
