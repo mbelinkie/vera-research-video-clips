@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+  <meta charset="utf-8" /><meta
+    name="viewport"
+    content="width=device-width,initial-scale=1"
+  /><title>Save to VERA</title
+  ><link rel="stylesheet" href="popup.css" />
+  <main>
+    <h1 id="heading">Save to VERA</h1>
+    <p id="source"></p>
+    <blockquote id="excerpt" hidden></blockquote>
+    <div id="images"></div>
+    <p id="capture-warning" role="note"></p>
+    <form id="save">
+      <fieldset id="fields" disabled>
+        <label
+          >Destination project<select id="project" required>
+            <option value="">Choose a project</option>
+          </select></label
+        >
+        <label id="video-reason" hidden
+          >Why is this video worth a look? (optional)<textarea
+            id="comment"
+            maxlength="2000"
+            placeholder="A moment, a timestamp, or what caught your attention"
+          ></textarea>
+        </label>
+        <label hidden id="time-label"
+          ><span
+            ><input type="checkbox" id="time" />
+            <span id="time-text">Include current time</span></span
+          ></label
+        >
+        <div id="quote-fields" hidden>
+          <label>Speaker name<input id="speaker" maxlength="300" /></label
+          ><label
+            >Speaker title<input id="speaker-title" maxlength="500" /></label
+          ><label
+            >Topics
+            <input
+              id="topics"
+              placeholder="Separate topics with commas" /></label
+          ><label>Note<textarea id="notes" maxlength="20000"></textarea></label>
+        </div>
+        <details id="repair" hidden>
+          <summary>Add missing pictures to an earlier save</summary>
+          <label
+            >Picture repair code<input
+              id="repair-code"
+              maxlength="36"
+              spellcheck="false"
+              autocomplete="off"
+          /></label>
+          <p>
+            Use the code from your earlier save in this project. This adds
+            available pictures to that item and keeps its text and notes.
+          </p>
+        </details>
+        <button id="submit">Save</button>
+      </fieldset>
+    </form>
+    <p role="status" id="status"></p>
+    <button id="settings">Settings</button>
+    <button id="retry" hidden>Refresh projects</button>
+    <button id="cancel">Cancel</button>
+  </main>
+  <script type="module" src="confirm.js"></script>
+</html>

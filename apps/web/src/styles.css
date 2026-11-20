@@ -1545,3 +1545,31 @@ h1 {
     flex-direction: column;
   }
 }
+
+.submission-comment {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.chrome-pair {
+  max-width: 38rem;
+  margin: 8vh auto;
+  padding: 1.5rem;
+}
+.chrome-pair form {
+  display: grid;
+  gap: 1rem;
+}
+.chrome-pair label {
+  display: grid;
+  gap: 0.4rem;
+}
+.chrome-pair input {
+  max-width: 13rem;
+  font-variant-numeric: tabular-nums;
+  padding: 0.6rem;
+}
+.chrome-pair button {
+  width: fit-content;
+  padding: 0.6rem 1rem;
+}

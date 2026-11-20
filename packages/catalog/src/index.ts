@@ -74,6 +74,8 @@ export {
 import { catalogTransaction, ProjectLibrary } from "./project-library.ts";
 import { addTopics } from "./topics.ts";
 
+export * from "./extension-assets.ts";
+
 export class TranscriptIntegrityError extends Error {
   readonly statusCode = 422;
   readonly code = "transcript_integrity_failed";
@@ -96,6 +98,9 @@ export interface CreateClaimedTranscriptUploadInput {
 }
 
 export interface CreateTranscriptionBatchInput {
+  chromeRequestId?: string;
+  submissionComment?: string;
+  timecodeMs?: number;
   projectId: string;
   name: string;
   options: BatchOptions;
@@ -159,6 +164,18 @@ function memberFields(row: DbRow) {
     updatedAt: iso(row.updated_at),
   };
 }
+
+const videoCommentColumns = `s.id,s.source_id AS "sourceId",s.comment AS text,s.timecode_ms AS "timecodeMs",
+  s.created_at AS "createdAt",s.created_by AS "authorId",u.display_name AS "authorName"`;
+const videoCommentSource = `FROM chrome_video_submissions s JOIN users u ON s.created_by=u.id
+  WHERE (s.comment IS NOT NULL OR s.timecode_ms IS NOT NULL)`;
+const batchItemWithComment = `SELECT bi.*, b.name AS batch_name, preview.total AS comment_count, preview.comments
+    FROM transcription_batch_items bi JOIN transcription_batches b ON b.id=bi.batch_id
+    LEFT JOIN LATERAL (
+      SELECT max(c.total) AS total,jsonb_agg(to_jsonb(c)-'total' ORDER BY c."createdAt",c.id) AS comments
+      FROM (SELECT ${videoCommentColumns},count(*) OVER () AS total ${videoCommentSource}
+        AND s.project_id=b.project_id AND s.source_id=bi.catalog_video_id ORDER BY s.created_at,s.id LIMIT 3) c
+    ) preview ON true`;
 
 export class SharedProjectCatalog {
   readonly library: ProjectLibrary;
@@ -269,15 +286,68 @@ export class SharedProjectCatalog {
     return this.getProject(actor, id);
   }
 
-  async listProjects(actor: AuthenticatedActor): Promise<Project[]> {
+  async connectChrome(
+    actor: AuthenticatedActor,
+    connection: {
+      id: string;
+      digest: string;
+      origin: string;
+      expiresAt: Date;
+    },
+  ) {
+    await this.requireRegistered(actor);
+    await this.database.query(
+      `INSERT INTO chrome_capture_connections(id, key_digest, extension_origin, user_id, expires_at)
+       VALUES ($1,$2,$3,$4,$5)`,
+      [
+        connection.id,
+        connection.digest,
+        connection.origin,
+        actor.userId,
+        connection.expiresAt.toISOString(),
+      ],
+    );
+  }
+
+  async chromeActor(
+    origin: string,
+    digest: string,
+  ): Promise<AuthenticatedActor | undefined> {
+    const result = await this.database.query<{
+      user_id: string;
+      external_subject: string;
+    }>(
+      `SELECT u.id AS user_id, u.external_subject FROM chrome_capture_connections c
+       JOIN users u ON u.id=c.user_id
+       WHERE c.key_digest=$1 AND c.extension_origin=$2 AND c.expires_at > now()`,
+      [digest, origin],
+    );
+    const user = result.rows[0];
+    return (
+      user && { userId: user.user_id, externalSubject: user.external_subject }
+    );
+  }
+
+  async disconnectChrome(actor: AuthenticatedActor, digest?: string) {
+    await this.requireRegistered(actor);
+    await this.database.query(
+      "DELETE FROM chrome_capture_connections WHERE user_id=$1 AND ($2::text IS NULL OR key_digest=$2)",
+      [actor.userId, digest ?? null],
+    );
+  }
+
+  async listProjects(
+    actor: AuthenticatedActor,
+    writableOnly = false,
+  ): Promise<Project[]> {
     await this.requireRegistered(actor);
     const result = await this.database.query<DbRow>(
       `SELECT p.id, p.name, p.description, p.version, p.created_at, p.updated_at
        FROM projects p
        JOIN project_members pm ON pm.project_id = p.id
-       WHERE pm.user_id = $1
+       WHERE pm.user_id = $1 AND (NOT $2::boolean OR pm.role IN ('owner','editor','researcher'))
        ORDER BY p.updated_at DESC`,
-      [actor.userId],
+      [actor.userId, writableOnly],
     );
     return result.rows.map(mapProject);
   }
@@ -1058,15 +1128,88 @@ export class SharedProjectCatalog {
     input: CreateTranscriptionBatchInput,
   ): Promise<CreateTranscriptionBatchResponse> {
     await this.authorize(actor, input.projectId, "write");
-    const batchId = randomUUID();
+    let batchId: string = randomUUID();
     const createdAt = this.now().toISOString();
-    await this.transaction(async () => {
-      await this.database.query(
+    async function recordSubmission(tx: CatalogQuery, sourceId: string) {
+      await tx.query(
+        `INSERT INTO chrome_video_submissions(id,project_id,source_id,created_by,request_id,batch_id,comment,timecode_ms)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+        [
+          randomUUID(),
+          input.projectId,
+          sourceId,
+          actor.userId,
+          input.chromeRequestId,
+          batchId,
+          input.submissionComment ?? null,
+          input.timecodeMs ?? null,
+        ],
+      );
+    }
+    await catalogTransaction(this.database, async (tx) => {
+      if (input.chromeRequestId) {
+        const member = await tx.query(
+          "SELECT 1 FROM project_members WHERE project_id=$1 AND user_id=$2 AND role IN ('owner','editor','researcher') FOR SHARE",
+          [input.projectId, actor.userId],
+        );
+        if (!member.rows.length)
+          throw new AuthorizationError("Write access is required.");
+        // Serialize captures in this project, including distinct users submitting
+        // one video simultaneously. Both their notes must join the same source.
+        await tx.query(
+          "SELECT pg_advisory_xact_lock(hashtextextended($1,79))",
+          [input.projectId],
+        );
+        const prior = await tx.query<{
+          batch_id: string;
+          youtube_video_id: string;
+          comment: string | null;
+          timecode_ms: string | null;
+        }>(
+          `SELECT s.batch_id,v.youtube_video_id,s.comment,s.timecode_ms::text FROM chrome_video_submissions s
+           JOIN videos v ON v.id=s.source_id WHERE s.project_id=$1 AND s.created_by=$2 AND s.request_id=$3`,
+          [input.projectId, actor.userId, input.chromeRequestId],
+        );
+        const saved = prior.rows[0];
+        const videoId = input.items[0]?.youtubeVideoId;
+        if (saved) {
+          if (
+            saved.youtube_video_id !== videoId ||
+            saved.comment !== (input.submissionComment ?? null) ||
+            saved.timecode_ms !==
+              (input.timecodeMs === undefined ? null : String(input.timecodeMs))
+          )
+            throw new CatalogConflictError(
+              "This capture was already used for a different submission.",
+            );
+          batchId = saved.batch_id;
+          return;
+        }
+        const previous = await tx.query<{
+          batch_id: string;
+          source_id: string;
+        }>(
+          `SELECT bi.batch_id,bi.catalog_video_id AS source_id FROM transcription_batch_items bi
+           JOIN transcription_batches b ON b.id=bi.batch_id
+           JOIN library_sources src ON src.project_id=b.project_id AND src.id=bi.catalog_video_id
+           WHERE b.project_id=$1 AND bi.youtube_video_id=$2 AND bi.state NOT IN ('canceled','blocked')
+           ORDER BY (bi.state='ready_for_review') DESC,bi.created_at DESC,bi.id LIMIT 1`,
+          [input.projectId, videoId],
+        );
+        if (previous.rows[0]) {
+          batchId = previous.rows[0].batch_id;
+          await recordSubmission(tx, previous.rows[0].source_id);
+          return;
+        }
+        if (input.items[0]?.status === "metadata-failed")
+          throw Object.assign(new Error("Video details are unavailable."), {
+            statusCode: 422,
+          });
+      }
+      await tx.query(
         `INSERT INTO transcription_batches
-           (id, project_id, name, target_language, execution_location,
-            transcription_profile, source_policy, priority, created_by,
-            version, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 1, $10, $10)`,
+           (id,project_id,name,target_language,execution_location,transcription_profile,source_policy,priority,created_by,version,created_at,updated_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,1,$10,$10)`,
         [
           batchId,
           input.projectId,
@@ -1080,7 +1223,6 @@ export class SharedProjectCatalog {
           createdAt,
         ],
       );
-
       for (const item of input.items) {
         let catalogVideoId = item.catalogVideoId;
         if (
@@ -1090,6 +1232,7 @@ export class SharedProjectCatalog {
           ["ready", "existing-transcript"].includes(item.status)
         ) {
           catalogVideoId = await this.upsertProjectVideo(
+            tx,
             input.projectId,
             item,
             createdAt,
@@ -1102,7 +1245,7 @@ export class SharedProjectCatalog {
           catalogVideoId &&
           input.options.sourcePolicy !== "force-generate"
         ) {
-          const active = await this.database.query<DbRow>(
+          const active = await tx.query<DbRow>(
             `SELECT active_transcript_version_id
              FROM project_videos
              WHERE project_id = $1 AND video_id = $2`,
@@ -1134,13 +1277,13 @@ export class SharedProjectCatalog {
             input.options.sourcePolicy,
             "schema-1",
           ].join(":");
-          const existingJob = await this.database.query<DbRow>(
+          const existingJob = await tx.query<DbRow>(
             "SELECT id FROM jobs WHERE idempotency_key = $1",
             [idempotencyKey],
           );
           jobId = String(existingJob.rows[0]?.id ?? randomUUID());
           if (!existingJob.rows[0]) {
-            await this.database.query(
+            await tx.query(
               `INSERT INTO jobs
                  (id, project_id, kind, state, idempotency_key, attempt,
                   payload, created_at, updated_at)
@@ -1172,7 +1315,7 @@ export class SharedProjectCatalog {
           state = "blocked";
         }
 
-        await this.database.query(
+        await tx.query(
           `INSERT INTO transcription_batch_items
              (id, batch_id, input_index, raw_input, youtube_video_id,
               canonical_url, catalog_video_id, active_transcript_version_id,
@@ -1207,6 +1350,8 @@ export class SharedProjectCatalog {
             createdAt,
           ],
         );
+        if (input.chromeRequestId && catalogVideoId)
+          await recordSubmission(tx, catalogVideoId);
       }
     });
     return this.getTranscriptionBatch(actor, input.projectId, batchId);
@@ -1226,8 +1371,7 @@ export class SharedProjectCatalog {
     if (!batch)
       throw new CatalogNotFoundError("Transcription batch not found.");
     const itemResult = await this.database.query<DbRow>(
-      `SELECT * FROM transcription_batch_items
-       WHERE batch_id = $1 ORDER BY input_index`,
+      `${batchItemWithComment} WHERE bi.batch_id=$1 ORDER BY bi.input_index`,
       [batchId],
     );
     const items = itemResult.rows.map(mapBatchItem);
@@ -1279,15 +1423,32 @@ export class SharedProjectCatalog {
     return TranscriptionBatchListResponseSchema.parse({ batches });
   }
 
+  async videoComments(
+    actor: AuthenticatedActor,
+    projectId: string,
+    sourceId: string,
+    offset: number,
+  ) {
+    await this.library.getSource(actor, projectId, sourceId);
+    const { rows } = await this.database.query<DbRow>(
+      `SELECT ${videoCommentColumns} ${videoCommentSource} AND s.project_id=$1 AND s.source_id=$2
+       ORDER BY s.created_at,s.id LIMIT 50 OFFSET $3`,
+      [projectId, sourceId, offset],
+    );
+    return rows.map((row) => ({
+      ...row,
+      createdAt: iso(row.createdAt),
+      timecodeMs: row.timecodeMs === null ? null : Number(row.timecodeMs),
+    }));
+  }
+
   async listReviewInbox(
     actor: AuthenticatedActor,
     projectId: string,
   ): Promise<ReviewInboxResponse> {
     await this.authorize(actor, projectId, "read");
     const result = await this.database.query<DbRow>(
-      `SELECT bi.*, b.name AS batch_name
-       FROM transcription_batch_items bi
-       JOIN transcription_batches b ON b.id = bi.batch_id
+      `${batchItemWithComment}
        WHERE b.project_id = $1 AND bi.state = 'ready_for_review'
        ORDER BY
          CASE bi.review_status
@@ -1317,9 +1478,7 @@ export class SharedProjectCatalog {
     let updated: DbRow | undefined;
     await this.transaction(async () => {
       const selected = await this.database.query<DbRow>(
-        `SELECT bi.*, b.name AS batch_name
-         FROM transcription_batch_items bi
-         JOIN transcription_batches b ON b.id = bi.batch_id
+        `${batchItemWithComment}
          WHERE bi.id = $1 AND b.project_id = $2
          FOR UPDATE OF bi`,
         [itemId, projectId],
@@ -1343,7 +1502,7 @@ export class SharedProjectCatalog {
          RETURNING *`,
         [command.reviewStatus, updatedAt, itemId],
       );
-      updated = { ...result.rows[0], batch_name: item.batch_name };
+      updated = { ...item, ...result.rows[0] };
     });
     return mapReviewInboxItem(updated!);
   }
@@ -2217,11 +2376,12 @@ export class SharedProjectCatalog {
   }
 
   private async upsertProjectVideo(
+    tx: CatalogQuery,
     projectId: string,
     item: BatchPreflightItem,
     now: string,
   ): Promise<string> {
-    const stored = await this.database.query<{ id: string }>(
+    const stored = await tx.query<{ id: string }>(
       `INSERT INTO videos
          (id, youtube_video_id, canonical_url, title, channel, duration_ms,
           source_language, created_at, updated_at)
@@ -2245,7 +2405,7 @@ export class SharedProjectCatalog {
       ],
     );
     const id = stored.rows[0]!.id;
-    await this.database.query(
+    await tx.query(
       `INSERT INTO project_videos
          (project_id, video_id, version, created_at, updated_at)
        VALUES ($1, $2, 1, $3, $3)
@@ -2489,6 +2649,10 @@ function mapVideo(row: DbRow | undefined): Video {
 function mapBatchItem(row: DbRow): TranscriptionBatchItem {
   return TranscriptionBatchItemSchema.parse({
     id: row.id,
+    ...(Number(row.comment_count) > 0 && {
+      videoCommentCount: Number(row.comment_count),
+      videoComments: row.comments,
+    }),
     batchId: row.batch_id,
     inputIndex: Number(row.input_index),
     input: row.raw_input,

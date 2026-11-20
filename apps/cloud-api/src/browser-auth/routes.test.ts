@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { PGlite } from "@electric-sql/pglite";
 import { afterEach, describe, expect, it } from "vitest";
 import { SharedProjectCatalog } from "@research-video/catalog";
@@ -71,6 +71,9 @@ async function setup() {
     catalog,
     authenticate: (request) => auth.authenticate(request),
     browserAuth: auth,
+    videoMetadataProvider: {
+      resolve: async (videoId) => ({ videoId, title: "Synthetic video" }),
+    },
   });
   apps.push(app);
   const inject = (options: {
@@ -494,3 +497,177 @@ describe("browser BFF and catalog authorization", () => {
     expect((await login("alice")).state.registered).toBe(false);
   }, 60_000);
 });
+
+it("pairs once with same-origin consent, then queues an attributed video from Chrome with no VERA cookie", async () => {
+  const { db, login, inject } = await setup();
+  const alice = await login("alice");
+  const web = { origin, cookie: alice.cookie, "x-vera-csrf": alice.csrf };
+  const post = (
+    url: string,
+    headers: Record<string, string>,
+    payload: object = {},
+  ) => inject({ method: "POST", url, headers, payload });
+  expect(
+    (await post("/api/session/register", web, { displayName: "Researcher" }))
+      .statusCode,
+  ).toBe(200);
+  const project = (
+    await post("/api/projects", web, { name: "Documentary" })
+  ).json<{ id: string }>();
+  const key = randomBytes(32);
+  const extOrigin = "chrome-extension://" + "a".repeat(32);
+  const client = {
+    origin: extOrigin,
+    "x-vera-capture-key": key.toString("hex"),
+  };
+  const projects = "/extension/v1/projects";
+  const pair = (
+    await post(
+      "/extension/v1/pair",
+      { origin: extOrigin },
+      { digest: createHash("sha256").update(key).digest("hex") },
+    )
+  ).json();
+  expect((await post(projects, client)).statusCode).toBe(401);
+  for (const headers of [
+    { ...web, origin: extOrigin },
+    { ...web, "x-vera-csrf": "wrong" },
+  ]) {
+    expect(
+      (await post("/api/extension-connections", headers, pair)).statusCode,
+    ).toBe(403);
+  }
+  expect(
+    (
+      await post("/api/extension-connections", web, {
+        ...pair,
+        code: "invalid",
+      })
+    ).statusCode,
+  ).toBe(400);
+  expect((await post("/api/extension-connections", web, pair)).statusCode).toBe(
+    200,
+  );
+  expect((await post("/api/extension-connections", web, pair)).statusCode).toBe(
+    403,
+  );
+  expect((await post(projects, client)).json()).toEqual([
+    { id: project.id, name: "Documentary" },
+  ]);
+  expect(
+    (
+      await post(projects, {
+        ...client,
+        origin: "chrome-extension://" + "b".repeat(32),
+      })
+    ).statusCode,
+  ).toBe(401);
+  expect(
+    (await post(projects, { ...client, cookie: alice.cookie })).statusCode,
+  ).toBe(403);
+  expect(
+    (await post("/api/projects", client, { name: "Not allowed" })).statusCode,
+  ).toBe(403);
+  const path = projects + "/" + project.id + "/captures";
+  const video = {
+    kind: "youtube",
+    requestId: randomUUID(),
+    url: "https://www.youtube.com/watch?v=M7lc1UVf-VE",
+    comment: "01:42 — the camera shows the original sign.",
+  };
+  const [queued, simultaneous] = await Promise.all([
+    post(path, client, video),
+    post(path, client, video),
+  ]);
+  expect(simultaneous.json()).toEqual(queued.json());
+  expect(queued.statusCode, queued.body).toBe(201);
+  expect(queued.json().status).toBe("queued");
+  expect((await post(path, client, video)).json()).toEqual(queued.json());
+  expect(
+    (await post(path, client, { ...video, comment: "changed" })).statusCode,
+  ).toBe(409);
+  const read = async (url: string) =>
+    (
+      await inject({ method: "GET", url, headers: { cookie: alice.cookie } })
+    ).json();
+  const base = "/api/projects/" + project.id;
+  const { items } = await read(
+    base + "/transcription-batches/" + queued.json().batchId,
+  );
+  expect(items[0].videoComments).toMatchObject([
+    { text: video.comment, timecodeMs: null, authorName: "Researcher" },
+  ]);
+  const commentsPath =
+    base + "/sources/" + items[0].catalogVideoId + "/comments";
+  const second = {
+    ...video,
+    requestId: randomUUID(),
+    comment: "Interview starts here.",
+    timecodeMs: 490012,
+  };
+  const secondSave = await post(path, client, second);
+  expect(secondSave.json()).toEqual(queued.json());
+  expect((await post(path, client, second)).json()).toEqual(queued.json());
+  const timestampOnly = await post(path, client, {
+    kind: video.kind,
+    url: video.url,
+    requestId: randomUUID(),
+    timecodeMs: 0,
+  });
+  expect(timestampOnly.json()).toEqual(queued.json());
+  expect(
+    (
+      await post(path, client, {
+        kind: video.kind,
+        url: video.url,
+        requestId: randomUUID(),
+      })
+    ).json(),
+  ).toEqual(queued.json());
+  const comments = await read(commentsPath);
+  expect(comments).toMatchObject([
+    { text: video.comment, timecodeMs: null },
+    { text: second.comment, timecodeMs: 490012 },
+    { text: null, timecodeMs: 0 },
+  ]);
+  expect(
+    comments.every(
+      (comment: { sourceId: string }) =>
+        comment.sourceId === items[0].catalogVideoId,
+    ),
+  ).toBe(true);
+  expect(await read(commentsPath + "?offset=2")).toEqual(comments.slice(2));
+  expect(
+    (await db.query("SELECT id FROM transcription_batches")).rows,
+  ).toHaveLength(1);
+  expect(
+    (await db.query("SELECT id FROM library_sources WHERE kind='youtube'"))
+      .rows,
+  ).toHaveLength(1);
+  expect((await db.query("SELECT id FROM jobs")).rows).toHaveLength(1);
+  await db.query(
+    "UPDATE transcription_batch_items SET state='ready_for_review' WHERE batch_id=$1",
+    [queued.json().batchId],
+  );
+  const entry = (await read(base + "/review-inbox")).items[0];
+  expect(entry.videoCommentCount).toBe(3);
+  expect(entry.videoComments).toMatchObject(
+    comments.map(
+      (comment: { sourceId: string; timecodeMs: number | null }) => ({
+        sourceId: comment.sourceId,
+        timecodeMs: comment.timecodeMs,
+      }),
+    ),
+  );
+  expect(
+    entry.videoComments.map((comment: { id: string }) => comment.id),
+  ).toEqual(comments.map((comment: { id: string }) => comment.id));
+  await db.query(
+    "UPDATE project_members SET role='viewer' WHERE project_id=$1",
+    [project.id],
+  );
+  expect((await post(projects, client)).json()).toEqual([]);
+  expect((await post(path, client, video)).statusCode).toBe(403);
+  expect((await post("/extension/v1/disconnect", client)).statusCode).toBe(200);
+  expect((await post(projects, client)).statusCode).toBe(401);
+}, 60_000);

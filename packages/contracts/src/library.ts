@@ -563,3 +563,89 @@ export type UpdateItemRequest = z.infer<typeof UpdateItemRequestSchema>;
 export type LibraryItem = z.infer<typeof LibraryItemSchema>;
 export type SourceListQuery = z.infer<typeof SourceListQuerySchema>;
 export type ItemListQuery = z.infer<typeof ItemListQuerySchema>;
+
+// A browser capture supplies the rendered article and image bytes. Its URLs
+// identify provenance and are never instructions to fetch the signed-in page.
+const CaptureUrl = StillProvenanceUrlSchema;
+const captureAction = { requestId: IdSchema, url: CaptureUrl };
+const encodedBytes = (max: number) =>
+  z
+    .string()
+    .min(4)
+    .max(4 * Math.ceil(max / 3))
+    .pipe(z.base64());
+const CapturePicture = z
+  .strictObject({
+    data: encodedBytes(8 * 1024 * 1024),
+    width: z.int().min(1).max(16384),
+    height: z.int().min(1).max(16384),
+  })
+  .refine(
+    ({ width, height }) => width * height <= 25_000_000,
+    "Picture exceeds pixel limit.",
+  );
+const webCapture = {
+  ...captureAction,
+  repairCaptureId: IdSchema.optional(),
+  metadata: z
+    .strictObject({ ...WebPageMetadataFields, url: CaptureUrl })
+    .partial(),
+  articleText: ExcerptSchema.optional(),
+  top: CapturePicture.optional(),
+  passage: CapturePicture.optional(),
+};
+const PageCapture = z.strictObject({ kind: z.literal("page"), ...webCapture });
+const QuoteCapture = z
+  .strictObject({
+    kind: z.literal("quote"),
+    ...webCapture,
+    quote: QuoteContentSchema.pick({
+      text: true,
+      speaker: true,
+      speakerTitle: true,
+      surroundingWords: true,
+      highlight: true,
+    }),
+    topics: TopicsSchema.default([]),
+    notes: NotesSchema.default(""),
+  })
+  .refine(
+    (capture) => !capture.quote.highlight || capture.passage,
+    "A highlight requires its passage picture.",
+  );
+const AudioCapture = z.strictObject({
+  kind: z.literal("audio"),
+  ...captureAction,
+  pageUrl: CaptureUrl,
+  title: TitleSchema.optional(),
+});
+export const ExtensionCaptureRequestSchema = z.discriminatedUnion("kind", [
+  PageCapture,
+  QuoteCapture,
+  AudioCapture,
+]);
+export type ExtensionCaptureRequest = z.infer<
+  typeof ExtensionCaptureRequestSchema
+>;
+export const ExtensionDraftSchema = z.discriminatedUnion("kind", [
+  PageCapture,
+  QuoteCapture,
+  AudioCapture,
+  z.strictObject({
+    kind: z.literal("still"),
+    ...captureAction,
+    pageUrl: CaptureUrl,
+    title: TitleSchema,
+    altText: TextSchema.max(2000).optional(),
+    credit: BibliographyFields.credit.shape.value.optional(),
+    data: encodedBytes(20 * 1024 * 1024),
+    mimeType: StillImageMimeSchema,
+  }),
+  z.strictObject({
+    kind: z.literal("youtube"),
+    ...captureAction,
+    timecodeMs: z.int().nonnegative().optional(),
+    comment: TextSchema.trim().max(2000).optional(),
+  }),
+]);
+export type ExtensionDraft = z.infer<typeof ExtensionDraftSchema>;

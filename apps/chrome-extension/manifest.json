@@ -1,0 +1,37 @@
+{
+  "manifest_version": 3,
+  "name": "VERA Research Capture",
+  "version": "0.1.0",
+  "description": "Send deliberately selected research captures to a signed-in VERA project.",
+  "action": {
+    "default_title": "Capture in VERA",
+    "default_popup": "popup.html"
+  },
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "permissions": ["activeTab", "contextMenus", "scripting", "storage"],
+  "commands": {
+    "log-quote": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+Y",
+        "mac": "MacCtrl+Shift+Y"
+      },
+      "description": "Log the selected quote in VERA"
+    },
+    "save-page": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+U",
+        "mac": "MacCtrl+Shift+U"
+      },
+      "description": "Save the current page in VERA"
+    }
+  },
+  "options_page": "options.html",
+  "optional_host_permissions": [
+    "https://*/*",
+    "http://localhost/*",
+    "http://127.0.0.1/*"
+  ]
+}

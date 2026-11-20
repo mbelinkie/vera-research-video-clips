@@ -5,6 +5,8 @@ import {
   BatchPreflightResponseSchema,
   CreateTranscriptionBatchResponseSchema,
   ProjectSchema,
+  VideoCommentSchema,
+  type VideoComment,
   ReviewInboxResponseSchema,
   TranscriptionBatchListResponseSchema,
   type BatchPreflightResponse,
@@ -104,6 +106,13 @@ export function BatchWorkspace({
     [inputsText],
   );
 
+  async function loadComments(sourceId: string, offset: number) {
+    return VideoCommentSchema.array().parse(
+      await request(
+        `/api/projects/${projectId}/sources/${sourceId}/comments?offset=${offset}`,
+      ),
+    );
+  }
   async function request(path: string, init: RequestInit = {}) {
     const response = await cloudFetch(
       `${apiRoot}${path}`,
@@ -630,6 +639,7 @@ export function BatchWorkspace({
               {selectedBatch && selectedBatch.batch.projectId === projectId ? (
                 <BatchDetail
                   batch={selectedBatch}
+                  loadComments={loadComments}
                   busy={busy}
                   onControl={controlBatch}
                 />
@@ -648,6 +658,11 @@ export function BatchWorkspace({
                   <div className="review-item" key={item.id}>
                     <div>
                       <strong>{item.title ?? item.youtubeVideoId}</strong>
+                      <VideoComments
+                        key={item.id}
+                        item={item}
+                        load={loadComments}
+                      />
                       <span>
                         {item.batchName}
                         {item.channel ? ` · ${item.channel}` : ""}
@@ -731,10 +746,12 @@ function PreflightTable({ preflight }: { preflight: BatchPreflightResponse }) {
 
 function BatchDetail({
   batch,
+  loadComments,
   busy,
   onControl,
 }: {
   batch: CreateTranscriptionBatchResponse;
+  loadComments: (sourceId: string, offset: number) => Promise<VideoComment[]>;
   busy: boolean;
   onControl(action: TranscriptionBatchControlRequest["action"]): void;
 }) {
@@ -794,6 +811,11 @@ function BatchDetail({
               <tr key={item.id}>
                 <td>
                   {item.title ?? item.input}
+                  <VideoComments
+                    key={item.id}
+                    item={item}
+                    load={loadComments}
+                  />
                   {item.error ? <small>{safeBatchError(item)}</small> : null}
                 </td>
                 <td>{item.state}</td>
@@ -818,4 +840,59 @@ function safeBatchError(
 
 function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : "Unexpected request failure.";
+}
+
+function VideoComments({
+  item,
+  load,
+}: {
+  item: CreateTranscriptionBatchResponse["items"][number];
+  load: (sourceId: string, offset: number) => Promise<VideoComment[]>;
+}) {
+  const [older, setOlder] = useState<VideoComment[]>([]);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const comments = [...(item.videoComments ?? []), ...older];
+  if (!comments.length) return null;
+  async function more() {
+    if (!item.catalogVideoId || busy) return;
+    setBusy(true);
+    setError("");
+    try {
+      const page = await load(item.catalogVideoId, comments.length);
+      setOlder((previous) => [...previous, ...page]);
+    } catch {
+      setError("Comments could not be loaded.");
+    } finally {
+      setBusy(false);
+    }
+  }
+  return (
+    <div aria-label="Video comments">
+      {comments.map((comment) => {
+        const { timecodeMs } = comment;
+        const sec = Math.floor((timecodeMs ?? 0) / 1000);
+        return (
+          <p className="submission-comment" key={comment.id}>
+            <strong>{comment.authorName}</strong>
+            {" · "}
+            {timecodeMs !== null && (
+              <>
+                <time dateTime={`PT${timecodeMs / 1000}S`}>
+                  {Math.floor(sec / 60)}:{String(sec % 60).padStart(2, "0")}
+                </time>{" "}
+              </>
+            )}
+            {comment.text}
+          </p>
+        );
+      })}
+      {comments.length < (item.videoCommentCount ?? 0) && (
+        <button type="button" disabled={busy} onClick={() => void more()}>
+          More comments
+        </button>
+      )}
+      {error && <p role="status">{error}</p>}
+    </div>
+  );
 }
