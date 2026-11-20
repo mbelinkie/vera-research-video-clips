@@ -382,10 +382,21 @@
     };
   }
 
+  function isShowingYouTubeAd(video) {
+    if (video.closest(".ad-showing")) return true;
+    const player = video.closest(".html5-video-player");
+    // YouTube can leave a hidden ad overlay in the player during normal playback.
+    return [...(player?.querySelectorAll(".ytp-ad-player-overlay") ?? [])].some(
+      (overlay) =>
+        overlay.checkVisibility({
+          opacityProperty: true,
+          visibilityProperty: true,
+        }),
+    );
+  }
+
   async function youtubePlayhead() {
     if (location.pathname.startsWith("/shorts/")) return null;
-    if (document.querySelector(".ad-showing, .ytp-ad-player-overlay"))
-      return null;
     await stablePaint();
     const candidates = [...document.querySelectorAll("video")]
       .map((video) => ({
@@ -400,7 +411,7 @@
           video.currentTime >= 0 &&
           rect.width > 0 &&
           rect.height > 0 &&
-          !video.closest(".ad-showing, .ytp-ad-player-overlay"),
+          !isShowingYouTubeAd(video),
       )
       .sort(
         (left, right) =>
@@ -413,10 +424,16 @@
       const second = candidates[1].rect.width * candidates[1].rect.height;
       if (largest < second * 1.5) return null;
     }
-    const first = candidates[0].video.currentTime;
+    const { video } = candidates[0];
+    const first = video.currentTime;
     await new Promise((resolve) => requestAnimationFrame(resolve));
-    const second = candidates[0].video.currentTime;
-    if (!Number.isFinite(second) || Math.abs(second - first) > 0.5) return null;
+    const second = video.currentTime;
+    if (
+      !Number.isFinite(second) ||
+      Math.abs(second - first) > 0.5 ||
+      isShowingYouTubeAd(video)
+    )
+      return null;
     const playheadMs = Math.floor(second * 1000);
     return Number.isSafeInteger(playheadMs) && playheadMs >= 0
       ? playheadMs

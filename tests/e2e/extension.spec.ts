@@ -136,7 +136,7 @@ async function triggerPopupCapture(
   article: Page,
   context: BrowserContext,
   id: string,
-  kind: "quote" | "page" = "quote",
+  kind: "quote" | "page" | "youtube" = "quote",
 ) {
   const helper = await context.newPage();
   const browserCdp = await context.browser()!.newBrowserCDPSession();
@@ -310,7 +310,7 @@ test.describe("Research #79 real Chrome synthetic capture", () => {
     await fixture?.close();
   });
 
-  test("captures an authenticated wrapped quote without a server refetch", async () => {
+  test("captures an authenticated quote, page and YouTube playhead", async () => {
     if (!projectName)
       throw new Error("A disposable fixture project is required");
     const destinationUrl = new URL(destination!);
@@ -552,6 +552,78 @@ test.describe("Research #79 real Chrome synthetic capture", () => {
       expect(
         pageReceipt.assets.map((asset: { role: string }) => asset.role).sort(),
       ).toEqual(["passage", "top"]);
+      await pageConfirmation.getByRole("button", { name: "Close" }).click();
+
+      const watchUrl = "https://www.youtube.com/watch?v=VeraTest079";
+      // Five seconds of silent 8 kHz mono PCM give Chrome a real, seekable clock.
+      const wave = Buffer.alloc(44 + 5 * 8_000 * 2);
+      wave.write("RIFF", 0);
+      wave.writeUInt32LE(wave.length - 8, 4);
+      wave.write("WAVEfmt ", 8);
+      wave.writeUInt32LE(16, 16);
+      wave.writeUInt16LE(1, 20);
+      wave.writeUInt16LE(1, 22);
+      wave.writeUInt32LE(8_000, 24);
+      wave.writeUInt32LE(16_000, 28);
+      wave.writeUInt16LE(2, 32);
+      wave.writeUInt16LE(16, 34);
+      wave.write("data", 36);
+      wave.writeUInt32LE(wave.length - 44, 40);
+      await context.route(watchUrl, (route) =>
+        route.fulfill({
+          contentType: "text/html",
+          body: `<!doctype html><title>Synthetic YouTube player</title>
+            <div class="html5-video-player">
+              <video width="320" height="180" src="data:audio/wav;base64,${wave.toString("base64")}"></video>
+              <div class="ytp-ad-player-overlay" hidden></div>
+            </div>`,
+        }),
+      );
+      const watch = await context.newPage();
+      await watch.goto(watchUrl);
+      const player = watch.locator("video");
+      await expect
+        .poll(() =>
+          player.evaluate((video: HTMLVideoElement) => video.readyState),
+        )
+        .toBeGreaterThanOrEqual(2);
+      await player.evaluate((video: HTMLVideoElement) => {
+        video.currentTime = 3.125;
+      });
+      await expect
+        .poll(() =>
+          player.evaluate(
+            (video: HTMLVideoElement) =>
+              !video.seeking && video.readyState >= 2,
+          ),
+        )
+        .toBe(true);
+      const videoConfirmation = await triggerPopupCapture(
+        watch,
+        context,
+        id,
+        "youtube",
+      );
+      const time = videoConfirmation.getByRole("checkbox", {
+        name: "Include 0:03",
+      });
+      await expect(time).toBeEnabled();
+      await expect(time).not.toBeChecked();
+      await videoConfirmation.getByRole("button", { name: "Cancel" }).click();
+      await expect.poll(() => videoConfirmation.isClosed()).toBe(true);
+
+      await watch.locator(".html5-video-player").evaluate((element) => {
+        element.classList.add("ad-showing");
+      });
+      const adConfirmation = await triggerPopupCapture(
+        watch,
+        context,
+        id,
+        "youtube",
+      );
+      await expect(
+        adConfirmation.getByRole("checkbox", { name: /time unavailable/i }),
+      ).toBeDisabled();
     } finally {
       await context.close();
       if (cleanupProfile) await rm(profile, { recursive: true, force: true });

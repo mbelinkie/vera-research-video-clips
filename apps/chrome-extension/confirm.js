@@ -48,19 +48,23 @@ async function load() {
         names[draft.kind];
       byId("source").textContent =
         (draft.metadata?.title || draft.title || "") + " " + draft.url;
-      byId("video-reason").hidden = draft.kind !== "youtube";
-      if (
-        draft.kind === "youtube" &&
-        Number.isSafeInteger(draft.playheadMs) &&
-        draft.playheadMs >= 0
-      ) {
-        const seconds = Math.floor(draft.playheadMs / 1000);
+      if (draft.kind === "youtube") {
+        byId("video-reason").hidden = false;
         byId("time-label").hidden = false;
-        byId("time-text").textContent =
-          "Include " +
-          Math.floor(seconds / 60) +
-          ":" +
-          String(seconds % 60).padStart(2, "0");
+        const available =
+          Number.isSafeInteger(draft.playheadMs) && draft.playheadMs >= 0;
+        byId("time").disabled = !available;
+        if (available) {
+          const seconds = Math.floor(draft.playheadMs / 1000);
+          byId("time-text").textContent =
+            "Include " +
+            Math.floor(seconds / 60) +
+            ":" +
+            String(seconds % 60).padStart(2, "0");
+        } else {
+          byId("time-text").textContent =
+            "Time unavailable. Reopen capture once the video is playing.";
+        }
       }
       if (draft.kind === "quote") {
         byId("quote-fields").hidden = false;
