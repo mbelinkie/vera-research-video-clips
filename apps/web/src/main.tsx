@@ -14,6 +14,7 @@ import {
   ExportPresetSnapshotSchema,
   ExportRequestSchema,
   ProjectSchema,
+  PublishedEnglishTranscriptSchema,
   type ClipCandidate,
   type NormalizedTranscript,
   type Project,
@@ -369,6 +370,39 @@ function App() {
     async function hydrate() {
       try {
         setResolvedTranscript(undefined);
+        if (browserMode) {
+          setTranscriptStatus("Opening the published English transcript.");
+          const response = await cloudFetch(
+            `/cloud-api/api/projects/${projectId}/transcripts/english/${loadRequest!.videoId}`,
+            { signal: controller.signal },
+            auth,
+          );
+          if (!active()) return;
+          if (response.status === 404) {
+            setTranscriptStatus(
+              "This project has no published English transcript for this video.",
+            );
+            return;
+          }
+          if (!response.ok) throw new Error("Research request failed.");
+          const { transcript } = PublishedEnglishTranscriptSchema.parse(
+            await response.json(),
+          );
+          if (
+            transcript.track.videoId !== loadRequest!.videoId ||
+            transcript.track.kind !== "english"
+          )
+            throw new Error("Published transcript identity mismatch.");
+          if (active()) {
+            setResolvedTranscript({
+              requestId: loadRequest!.id,
+              projectId,
+              transcript,
+            });
+            setTranscriptStatus("Verified English transcript ready.");
+          }
+          return;
+        }
         setTranscriptStatus("Submitting the video for transcript review.");
         const initial = readBatch(
           await requestJson(
@@ -423,7 +457,9 @@ function App() {
       } catch {
         if (active())
           setTranscriptStatus(
-            "Unable to load a verified transcript. Check the local Research service and retry.",
+            browserMode
+              ? "Unable to open the published transcript. Check project access and retry."
+              : "Unable to load a verified transcript. Check the local Research service and retry.",
           );
       }
     }
@@ -1076,7 +1112,13 @@ function App() {
           ) : (
             <div className="empty-state">
               <span className="step">01</span>
-              <h2>{videoId ? "Preparing transcript" : "Load a video"}</h2>
+              <h2>
+                {videoId
+                  ? browserMode
+                    ? "Published transcript"
+                    : "Preparing transcript"
+                  : "Load a video"}
+              </h2>
               <p>
                 {videoId
                   ? transcriptStatus ||

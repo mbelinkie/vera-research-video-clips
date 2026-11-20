@@ -20,13 +20,58 @@ const AUDIO_BYTES = Buffer.from("synthetic-audio-fixture", "utf8");
 
 export type SyntheticFixture = {
   origin: string;
+  destinationOrigin: string;
   articleUrl: string;
   imageUrl: string;
   audioUrl: string;
   youtubeUrl: string;
   requests: string[];
+  captures: unknown[];
   close: () => Promise<void>;
 };
+
+// Deliberately generated bands make duplicate content and missing strips
+// distinguishable by their *pixels* rather than by an image's dimensions.
+function tallArticleHtml(mode: "document" | "panel" | "short" | "shift") {
+  const nested = mode === "panel";
+  const bands = Array.from({ length: mode === "short" ? 2 : 36 }, (_, i) => {
+    const r = (35 + i * 37) % 220;
+    const g = (45 + i * 53) % 220;
+    const b = (55 + i * 61) % 220;
+    return `<div data-band="${i}" style="background:rgb(${r},${g},${b});height:70px"></div>`;
+  }).join("");
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8">
+    <title>Tall synthetic ${mode} article</title><style>
+    html,body { margin:0; background:#eee; font-family:sans-serif; }
+    [data-fixture="scroll-root"] { box-sizing:border-box; ${nested ? "width:660px;height:calc(100vh - 100px);margin:55px auto 0;overflow-y:auto;border:8px solid #111;" : "width:100%;"} }
+    article { background:#fff; }
+    .sticky {position:sticky;top:0;height:42px;background:rgb(12,240,28);z-index:2}
+    h1 {box-sizing:border-box;margin:0;height:65px;background:rgb(0,140,240);color:white}
+    .quote-scroll {overflow-x:auto}
+    .quote-scroll::after {content:"";display:block;width:850px;height:1px}
+    .quote {width:270px;color:rgb(220,0,210);font-size:20px;line-height:30px}
+    .quote::selection {background:rgb(0,255,0);color:rgb(220,0,210)}
+    .shifted [data-band] {filter:hue-rotate(130deg)}
+    .shifted::after {content:"";position:fixed;inset:0;background:rgb(255,0,0);z-index:9999;pointer-events:none}
+    </style></head><body>
+    <main${nested ? "" : ' data-fixture="scroll-root"'}>
+    ${nested ? '<div data-fixture="scroll-root">' : ""}
+    <article>
+    <div class="sticky" data-fixture="sticky"></div>
+    ${
+      mode === "short"
+        ? '<h1 data-fixture="low-headline">Short article</h1>'
+        : `${bands.slice(0, bands.indexOf('<div data-band="12"'))}
+       <h1 data-fixture="low-headline">Headline below the fold</h1>
+       ${bands.slice(bands.indexOf('<div data-band="12"'))}`
+    }
+    ${nested ? '<div class="quote-scroll">' : ""}
+    <p class="quote" data-fixture="tall-quote">${FIXTURE_QUOTE}</p>
+    ${nested ? "</div>" : ""}
+    </article>${nested ? "</div>" : ""}</main>
+    ${mode === "shift" ? `<script>addEventListener('scroll',()=>{if(window.scrollY>0)document.body.classList.add('shifted')});</script>` : ""}
+    </body></html>`;
+}
 
 function write(
   response: ServerResponse,
@@ -104,9 +149,41 @@ function youtubeHtml() {
 
 export async function createSyntheticExtensionFixture(): Promise<SyntheticFixture> {
   const requests: string[] = [];
+  const captures: unknown[] = [];
   const server = createServer((request: IncomingMessage, response) => {
     const url = new URL(request.url ?? "/", "http://127.0.0.1");
     requests.push(url.pathname);
+    if (
+      request.method === "POST" &&
+      url.pathname === "/extension/v1/projects"
+    ) {
+      write(
+        response,
+        200,
+        JSON.stringify([
+          { id: "synthetic-project", name: "Synthetic project" },
+        ]),
+        "application/json",
+      );
+      return;
+    }
+    if (
+      request.method === "POST" &&
+      url.pathname === "/extension/v1/projects/synthetic-project/captures"
+    ) {
+      const chunks: Buffer[] = [];
+      request.on("data", (chunk: Buffer) => chunks.push(chunk));
+      request.on("end", () => {
+        captures.push(JSON.parse(Buffer.concat(chunks).toString("utf8")));
+        write(
+          response,
+          200,
+          JSON.stringify({ captureId: "synthetic-capture" }),
+          "application/json",
+        );
+      });
+      return;
+    }
     if (request.method === "HEAD") {
       response.writeHead(200, { "cache-control": "no-store" });
       response.end();
@@ -127,6 +204,16 @@ export async function createSyntheticExtensionFixture(): Promise<SyntheticFixtur
         return;
       }
       write(response, 200, articleHtml(), "text/html; charset=utf-8");
+      return;
+    }
+    const tall = /^\/tall-(document|panel|short|shift)$/.exec(url.pathname);
+    if (tall) {
+      write(
+        response,
+        200,
+        tallArticleHtml(tall[1] as "document" | "panel" | "short" | "shift"),
+        "text/html; charset=utf-8",
+      );
       return;
     }
     if (url.pathname === "/fixture-image.png") {
@@ -152,11 +239,13 @@ export async function createSyntheticExtensionFixture(): Promise<SyntheticFixtur
   const origin = `http://localhost:${address.port}`;
   return {
     origin,
+    destinationOrigin: `http://127.0.0.1:${address.port}`,
     articleUrl: `${origin}/article?utm_source=synthetic`,
     imageUrl: `${origin}/fixture-image.png`,
     audioUrl: `${origin}/fixture-audio.mp3`,
     youtubeUrl: `${origin}/watch?v=synthetic-video`,
     requests,
+    captures,
     close: async () => {
       server.close();
       await once(server, "close");

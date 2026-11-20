@@ -1218,3 +1218,290 @@ test.describe("Research #79 real Chrome synthetic capture", () => {
     }
   });
 });
+
+// #95 acceptance uses the same actual unpacked-extension popup, but has a
+// completely local project endpoint so it never needs an account or live page.
+test.describe("Research #95 taller top image in real Chrome", () => {
+  test.skip(
+    !enabled,
+    "Set VERA_EXTENSION_REAL_CHROME=1 for real Chrome acceptance.",
+  );
+  test.describe.configure({ mode: "serial" });
+  test.setTimeout(90_000);
+
+  let fixture: SyntheticFixture;
+  test.beforeAll(async () => {
+    fixture = await createSyntheticExtensionFixture();
+  });
+  test.afterAll(async () => {
+    await fixture?.close();
+  });
+
+  async function browser() {
+    const staged = await stageExtensionForChrome();
+    const chrome = await launchDisposableChrome(staged);
+    const id = await extensionId(chrome.context);
+    const settings = await chrome.context.newPage();
+    await settings.goto(`chrome-extension://${id}/options.html`);
+    await settings.evaluate(async (origin) => {
+      await (
+        window as unknown as {
+          chrome: { storage: { local: { set(value: object): Promise<void> } } };
+        }
+      ).chrome.storage.local.set({
+        connection: { origin, key: "fixture-only-key" },
+      });
+    }, fixture.destinationOrigin);
+    await settings.close();
+    return {
+      context: chrome.context,
+      id,
+      async close() {
+        await chrome.context.close();
+        if (chrome.cleanupProfile)
+          await rm(chrome.profile, { recursive: true, force: true });
+        await rm(staged, { recursive: true, force: true });
+      },
+    };
+  }
+
+  async function imageFromConfirmation(
+    page: Page,
+    role: "Top of article" | "Passage view",
+  ) {
+    const image = page.locator(`#images img[alt="${role}"]`);
+    await expect(image).toHaveAttribute("src", /^data:image\/png;base64,/);
+    const src = await image.getAttribute("src");
+    if (!src) throw new Error(`Missing ${role} screenshot`);
+    const bytes = Buffer.from(src.split(",")[1]!, "base64");
+    const { data, info } = await sharp(bytes)
+      .removeAlpha()
+      .raw()
+      .toBuffer({ resolveWithObject: true });
+    return { data, info, bytes };
+  }
+
+  function colorAt(
+    image: Awaited<ReturnType<typeof imageFromConfirmation>>,
+    x: number,
+    y: number,
+  ) {
+    const { info, data } = image;
+    const index = (Math.round(y) * info.width + Math.round(x)) * info.channels;
+    return Array.from(data.subarray(index, index + 3));
+  }
+
+  function countColor(
+    image: Awaited<ReturnType<typeof imageFromConfirmation>>,
+    expected: number[],
+    fromY = 0,
+  ) {
+    let pixels = 0;
+    for (let y = fromY; y < image.info.height; y++) {
+      for (let x = 0; x < image.info.width; x++) {
+        if (
+          expected.every(
+            (channel, i) =>
+              image.data[
+                (y * image.info.width + x) * image.info.channels + i
+              ] === channel,
+          )
+        )
+          pixels++;
+      }
+    }
+    return pixels;
+  }
+
+  async function pageCapture(mode: "document" | "panel" | "short" | "shift") {
+    const chrome = await browser();
+    try {
+      const article = await chrome.context.newPage();
+      await article.setViewportSize({ width: 1280, height: 720 });
+      await article.goto(`${fixture.origin}/tall-${mode}`);
+      const scroller = article.locator('[data-fixture="scroll-root"]');
+      const original = mode === "panel" ? 160 : mode === "short" ? 0 : 220;
+      if (mode === "panel")
+        await scroller.evaluate((element, top) => {
+          element.scrollTop = top;
+        }, original);
+      else await article.evaluate((top) => window.scrollTo(0, top), original);
+      // Read band geometry at article top. For a panel, the stitched strip
+      // starts at the panel's bottom edge, not at the window's bottom edge.
+      const positions = await article.evaluate((isPanel) => {
+        const scroll = document.querySelector<HTMLElement>(
+          '[data-fixture="scroll-root"]',
+        )!;
+        const old = isPanel ? scroll.scrollTop : window.scrollY;
+        if (isPanel) scroll.scrollTop = 0;
+        else window.scrollTo(0, 0);
+        const seam = isPanel
+          ? scroll.getBoundingClientRect().top +
+            scroll.clientTop +
+            scroll.clientHeight
+          : innerHeight;
+        const bands = Array.from(
+          document.querySelectorAll<HTMLElement>("[data-band]"),
+        ).map((element) => {
+          const { top, bottom } = element.getBoundingClientRect();
+          return {
+            top,
+            bottom,
+            rgb: getComputedStyle(element)
+              .backgroundColor.match(/\d+/g)!
+              .slice(0, 3)
+              .map(Number),
+          };
+        });
+        if (isPanel) scroll.scrollTop = old;
+        else window.scrollTo(0, old);
+        return { bands, seam };
+      }, mode === "panel");
+      if (mode === "shift")
+        await article.evaluate(async () => {
+          // Clear the mutation only after the geometry sampling scroll settles.
+          await new Promise<void>((resolve) =>
+            requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
+          );
+          document.body.classList.remove("shifted");
+        });
+      const confirmation = await triggerPopupCapture(
+        article,
+        chrome.context,
+        chrome.id,
+        "page",
+      );
+      const top = await imageFromConfirmation(confirmation, "Top of article");
+      const scale = top.info.width / 1280;
+      const viewportPixels = 720 * scale;
+      expect([1280, 2560]).toContain(top.info.width);
+      if (mode === "document" || mode === "panel") {
+        expect(top.info.height).toBeGreaterThan(viewportPixels);
+        expect(top.info.height).toBeLessThanOrEqual(viewportPixels * 2);
+        // The low headline is present only in the *added* capture region.
+        expect(countColor(top, [0, 140, 240], viewportPixels)).toBeGreaterThan(
+          1000,
+        );
+        const seam = Math.round(positions.seam * scale);
+        const end = seam + top.info.height - viewportPixels;
+        const x = top.info.width / 2;
+        // Check the rows touching the join and the continuing article below it.
+        for (const y of [seam - 1, seam]) {
+          const band = positions.bands.find(
+            ({ top, bottom }) => top <= y / scale && y / scale < bottom,
+          );
+          expect(band).toBeDefined();
+          expect(colorAt(top, x, y)).toEqual(band?.rgb);
+        }
+        const stripeSamples = positions.bands
+          .map((band) => ({
+            ...band,
+            y: Math.round(((band.top + band.bottom) / 2) * scale),
+          }))
+          .filter((band) => band.y > seam && band.y < end);
+        expect(stripeSamples.length).toBeGreaterThanOrEqual(2);
+        for (const band of stripeSamples)
+          expect(colorAt(top, x, band.y)).toEqual(band.rgb);
+        const sticky = [12, 240, 28];
+        expect(countColor(top, sticky)).toBeGreaterThan(0);
+        expect(countColor(top, sticky, seam)).toBe(0);
+        if (mode === "panel") {
+          // The original bottom border follows the last inserted article row.
+          expect(colorAt(top, x, end)).toEqual([17, 17, 17]);
+        }
+      } else {
+        expect(top.info.height).toBe(viewportPixels);
+      }
+      const ending =
+        mode === "panel"
+          ? await scroller.evaluate((element) => element.scrollTop)
+          : await article.evaluate(() => window.scrollY);
+      expect(ending).toBe(original);
+      await confirmation.getByRole("button", { name: "Cancel" }).click();
+    } finally {
+      await chrome.close();
+    }
+  }
+
+  test("low headline and seamless document scroll", async () =>
+    pageCapture("document"));
+  test("nested article scroll and nonduplicated sticky header", async () =>
+    pageCapture("panel"));
+  test("short document retains one-screen fallback", async () =>
+    pageCapture("short"));
+  test("shifting document rejects a mismatched seam", async () =>
+    pageCapture("shift"));
+
+  test("saved quote keeps clean passage pixels, rectangles, scroll and selection", async () => {
+    const chrome = await browser();
+    try {
+      const article = await chrome.context.newPage();
+      await article.setViewportSize({ width: 1280, height: 720 });
+      await article.goto(`${fixture.origin}/tall-panel`);
+      const quote = article.locator('[data-fixture="tall-quote"]');
+      await quote.evaluate((element) =>
+        element.scrollIntoView({ block: "center", behavior: "instant" }),
+      );
+      const scroller = article.locator('[data-fixture="scroll-root"]');
+      const original = await scroller.evaluate((element) => element.scrollTop);
+      expect(original).toBeGreaterThan(500);
+      await quote.selectText();
+      const confirmation = await triggerPopupCapture(
+        article,
+        chrome.context,
+        chrome.id,
+        "quote",
+      );
+      const top = await imageFromConfirmation(confirmation, "Top of article");
+      const viewportPixels = (720 * top.info.width) / 1280;
+      expect(top.info.height).toBeGreaterThan(viewportPixels);
+      expect(countColor(top, [0, 140, 240], viewportPixels)).toBeGreaterThan(
+        1000,
+      );
+      const passage = await imageFromConfirmation(confirmation, "Passage view");
+      expect(passage.info.height).toBe(viewportPixels);
+      expect(countColor(passage, [0, 255, 0])).toBe(0);
+      await chooseProject(confirmation, "Synthetic project");
+      const before = fixture.captures.length;
+      await confirmation
+        .getByRole("button", { name: "Save quote", exact: true })
+        .click();
+      await expect.poll(() => fixture.captures.length).toBe(before + 1);
+      const saved = record(fixture.captures.at(-1));
+      const rectangles = array(
+        record(record(saved.quote).highlight).rectangles,
+      );
+      expect(saved.kind).toBe("quote");
+      expect(record(saved.quote).text).toBe(FIXTURE_QUOTE);
+      expect(validateRectangles(rectangles)).toBe(true);
+      expect(record(saved.passage).height).toBe(passage.info.height);
+      expect(record(saved.top).height).toBe(top.info.height);
+      for (const item of rectangles) {
+        const rect = record(item);
+        const left = Math.floor(Number(rect.x) * passage.info.width);
+        const right = Math.ceil(
+          (Number(rect.x) + Number(rect.width)) * passage.info.width,
+        );
+        const upper = Math.floor(Number(rect.y) * passage.info.height);
+        const lower = Math.ceil(
+          (Number(rect.y) + Number(rect.height)) * passage.info.height,
+        );
+        let magenta = 0;
+        for (let y = upper; y < lower; y++)
+          for (let x = left; x < right; x++) {
+            const [r, g, b] = colorAt(passage, x, y);
+            if (r! > 160 && g! < 80 && b! > 150) magenta++;
+          }
+        expect(magenta).toBeGreaterThan(0);
+      }
+      expect(await scroller.evaluate((element) => element.scrollTop)).toBe(
+        original,
+      );
+      expect(
+        await article.evaluate(() => window.getSelection()?.toString()),
+      ).toBe(FIXTURE_QUOTE);
+    } finally {
+      await chrome.close();
+    }
+  });
+});

@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { gunzipSync } from "node:zlib";
 
 import type { PGlite } from "@electric-sql/pglite";
 import {
@@ -14,7 +15,9 @@ import {
   ClipCandidateSchema,
   CreateTranscriptionBatchResponseSchema,
   ExportRequestSchema,
+  FinalizedObjectSchema,
   JobSchema,
+  NormalizedTranscriptSchema,
   ProjectMemberSchema,
   ProjectMemberDetailsSchema,
   ProjectSchema,
@@ -2371,6 +2374,89 @@ export class SharedProjectCatalog {
     catalogVideoId: string,
   ): Promise<ActiveTranscriptBundle> {
     await this.authorize(actor, projectId, "read");
+    const { manifest, manifestObject } =
+      await this.readActiveTranscriptManifest(projectId, catalogVideoId);
+    const descriptors = [manifestObject, ...manifest.artifacts].map(
+      (artifact) => {
+        if (!artifact.objectVersionId) {
+          throw new TranscriptIntegrityError(
+            "Active transcript artifact does not pin an object version.",
+          );
+        }
+        return { ...artifact, objectVersionId: artifact.objectVersionId };
+      },
+    );
+    const downloads = await Promise.all(
+      descriptors.map(async (artifact) => ({
+        ...artifact,
+        downloadUrl: await this.uploadUrlIssuer.issueGetUrl({
+          objectKey: artifact.objectKey,
+          objectVersionId: artifact.objectVersionId,
+          expiresInSeconds: 15 * 60,
+        }),
+      })),
+    );
+    return ActiveTranscriptBundleSchema.parse({
+      transcriptVersionId: manifest.id.toLowerCase(),
+      manifest,
+      manifestObject,
+      downloads,
+    });
+  }
+
+  async readPublishedEnglishTranscript(
+    actor: AuthenticatedActor,
+    projectId: string,
+    youtubeVideoId: string,
+  ) {
+    const states = await this.findProjectVideoTranscriptStates(
+      actor,
+      projectId,
+      [youtubeVideoId],
+    );
+    const video = states.get(youtubeVideoId);
+    if (!video?.activeTranscriptVersionId)
+      throw new CatalogNotFoundError("No active transcript found.");
+    try {
+      const { manifest } = await this.readActiveTranscriptManifest(
+        projectId,
+        video.catalogVideoId,
+      );
+      const english = FinalizedObjectSchema.parse(
+        manifest.artifacts.find(
+          (artifact) => artifact.type === "english-normalized",
+        ),
+      );
+      const bytes = await this.verifyObject(english);
+      const decoded = english.objectKey.endsWith(".gz")
+        ? gunzipSync(bytes, { maxOutputLength: 64 * 1024 * 1024 })
+        : bytes;
+      const transcript = NormalizedTranscriptSchema.parse(
+        JSON.parse(new TextDecoder().decode(decoded)),
+      );
+      if (
+        manifest.videoId !== youtubeVideoId ||
+        transcript.track.videoId !== youtubeVideoId ||
+        transcript.track.kind !== "english" ||
+        transcript.track.version !== manifest.version ||
+        transcript.track.schemaVersion !== manifest.normalizationSchemaVersion
+      )
+        throw new TranscriptIntegrityError(
+          "Published transcript identity mismatch.",
+        );
+      return { transcriptVersionId: manifest.id.toLowerCase(), transcript };
+    } catch (error) {
+      if (error instanceof CatalogNotFoundError) throw error;
+      throw new TranscriptIntegrityError(
+        "Could not verify the published English transcript.",
+      );
+    }
+  }
+
+  private async readActiveTranscriptManifest(
+    projectId: string,
+    catalogVideoId: string,
+  ) {
     const result = await this.database.query<DbRow>(
       `SELECT tv.id, tv.manifest_object_key, tv.manifest_object_version_id,
               tv.manifest_sha256, ta.byte_size
@@ -2394,32 +2480,15 @@ export class SharedProjectCatalog {
     const manifest = TranscriptManifestSchema.parse(
       JSON.parse(new TextDecoder().decode(bytes)),
     );
-    const descriptors = [manifestObject, ...manifest.artifacts].map(
-      (artifact) => {
-        if (!artifact.objectVersionId) {
-          throw new TranscriptIntegrityError(
-            "Active transcript artifact does not pin an object version.",
-          );
-        }
-        return { ...artifact, objectVersionId: artifact.objectVersionId };
-      },
-    );
-    const downloads = await Promise.all(
-      descriptors.map(async (artifact) => ({
-        ...artifact,
-        downloadUrl: await this.uploadUrlIssuer.issueGetUrl({
-          objectKey: artifact.objectKey,
-          objectVersionId: artifact.objectVersionId,
-          expiresInSeconds: 15 * 60,
-        }),
-      })),
-    );
-    return ActiveTranscriptBundleSchema.parse({
-      transcriptVersionId: String(row.id),
-      manifest,
-      manifestObject,
-      downloads,
-    });
+    if (
+      manifest.id.toLowerCase() !== String(row.id) ||
+      manifest.projectId.toLowerCase() !== projectId.toLowerCase() ||
+      manifest.catalogVideoId.toLowerCase() !== catalogVideoId.toLowerCase()
+    )
+      throw new TranscriptIntegrityError(
+        "Active transcript identity mismatch.",
+      );
+    return { manifest, manifestObject };
   }
 
   private async verifyObject(descriptor: {

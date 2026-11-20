@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { readdirSync } from "node:fs";
 import { Pool } from "pg";
 import { afterAll, describe, expect, it } from "vitest";
 
@@ -49,7 +50,12 @@ describe.skipIf(!permitted)(
         runCloudMigrations(first),
         runCloudMigrations(second),
       ]);
-      expect(left.length + right.length).toBe(11);
+      const expected = readdirSync(new URL("../migrations/", import.meta.url))
+        .filter((name) => /^\d+_.+\.sql$/.test(name))
+        .map((name) => name.slice(0, -4))
+        .sort();
+      expect([...left, ...right].sort()).toEqual(expected);
+      expect(left.length === 0 || right.length === 0).toBe(true);
       expect(await runCloudMigrations(second)).toEqual([]);
 
       const catalog = new SharedProjectCatalog(

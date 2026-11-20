@@ -133,6 +133,9 @@ your password manager. If the Mac is lost and the key isn't saved elsewhere,
 
 ### Disaster recovery (new or repaired Mac)
 
+Keep the tunnel disconnected throughout recovery. If it is running, use
+`npm run pilot -- disconnect` before restoring.
+
 1. Install Postgres.app and create the pilot and drill roles (setup step 2).
 2. Restore the code checkout and `pilot.env`, and put the saved key back into
    `PILOT_BACKUP_KEY_FILE` (`chmod 600`).
@@ -145,6 +148,12 @@ your password manager. If the Mac is lost and the key isn't saved elsewhere,
    `vera_pilot`: `REASSIGN OWNED BY vera_drill TO vera_pilot;`
 5. Point `PILOT_OBJECT_ROOT` at the new folder, run `npm run pilot -- check`,
    then `start`. Rehearsed on 2026-11-20 against PostgreSQL 18 (see PR).
+6. Keep remote access closed while reconciling the restored project
+   memberships with the Producer's current approvals. A backup predating a
+   revocation or role change contains the old grant. Verify that those changes
+   are reapplied and that the affected accounts are denied the corresponding
+   access before making the pilot available to friends again. If the current
+   grants cannot be verified, keep remote access closed.
 
 ## Going live: Producer checklist
 
