@@ -48,21 +48,54 @@ describe("local Intel desktop package boundary", () => {
     expect(player).toContain(
       'sandbox="allow-scripts allow-same-origin allow-presentation"',
     );
+    expect(player).toContain(
+      'referrerPolicy="strict-origin-when-cross-origin"',
+    );
     expect(player).toContain("event.origin !== playerOrigin");
+    expect(player).toContain(
+      "event.source !== iframeRef.current?.contentWindow",
+    );
+    expect(player).toContain("target.postMessage(");
+    expect(player).toContain("playerOrigin,");
     expect(main).toContain("script-src 'self';");
     expect(main).not.toMatch(/script-src[^;]*https:/u);
   });
 
   it("identifies bounded YouTube player requests with the installed app ID", () => {
     expect(playerAppId).toBe(forgeBundleId);
-    expect(playerIdentification).toContain(
-      '"https://www.youtube-nocookie.com/*"',
+    expect(playerIdentification).toMatch(
+      /urls:\s*\[\s*"https:\/\/www\.youtube\.com\/\*",\s*"https:\/\/www\.youtube-nocookie\.com\/\*"\s*\]/u,
     );
-    expect(playerIdentification).toContain('"https://www.youtube.com/*"');
     expect(playerIdentification).toContain("Referer = youtubePlayerReferer");
-    expect(main).toContain(
-      "installYouTubePlayerIdentification(session.defaultSession)",
+  });
+
+  it("installs identification once on the default session before the first load", () => {
+    const hook = "installYouTubePlayerIdentification(session.defaultSession)";
+    const ready = main.indexOf("app.whenReady()");
+    const install = main.indexOf(hook);
+    const firstWindow = main.indexOf("mainWindow = createMainWindow();");
+    const initialLoad = main.indexOf(
+      'await mainWindow.loadURL("rvc://app/index.html")',
     );
+    const activate = main.indexOf('app.on("activate", () => {');
+
+    expect(ready).toBeGreaterThan(-1);
+    expect(install).toBeGreaterThan(ready);
+    expect(firstWindow).toBeGreaterThan(install);
+    expect(initialLoad).toBeGreaterThan(firstWindow);
+    expect(activate).toBeGreaterThan(initialLoad);
+    expect(main.split(hook)).toHaveLength(2);
+
+    const activation = main.slice(activate, main.indexOf("\n  });", activate));
+    expect(activation).toContain("mainWindow = createMainWindow();");
+    expect(activation).toContain(
+      'void mainWindow.loadURL("rvc://app/index.html")',
+    );
+    expect(activation).not.toContain("installYouTubePlayerIdentification");
+    expect(main).toContain(
+      'app.on("window-all-closed", () => {\n    mainWindow = undefined;\n    if (process.platform !== "darwin") app.quit();',
+    );
+    expect(main).not.toMatch(/partition:\s*["']/u);
   });
 
   it("hardens BrowserWindow and obtains the child-owned port over private IPC", () => {

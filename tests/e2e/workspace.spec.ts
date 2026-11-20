@@ -287,6 +287,10 @@ test.beforeEach(async ({ page }) => {
             let message;
             try { message = JSON.parse(event.data); } catch { return; }
             window.__receivedPlayerCommands.push(message);
+            if (message.event === "listening") {
+              event.source.postMessage(JSON.stringify({ event: "onReady" }), event.origin);
+              return;
+            }
             if (message.event !== "command") return;
             if (message.func === "seekTo") {
               window.__fixtureCurrentTime = Number(message.args?.[0] ?? 0);
@@ -1779,6 +1783,62 @@ async function mockNavigationWorkspace(
     },
   };
 }
+
+test("waits for the YouTube player to acknowledge its readiness", async ({
+  page,
+}) => {
+  await mockNavigationWorkspace(page);
+  await page.route("https://www.youtube-nocookie.com/embed/**", (route) =>
+    route.fulfill({
+      contentType: "text/html",
+      body: `<!doctype html><body><script>
+        document.body.dataset.listens = "0";
+        window.addEventListener("message", ({ data, source, origin }) => {
+          const { event, func } = JSON.parse(data);
+          if (event === "listening") {
+            const attempts = Number(document.body.dataset.listens) + 1;
+            document.body.dataset.listens = String(attempts);
+            if (attempts === 2) {
+              document.body.dataset.ready = "true";
+              source.postMessage(JSON.stringify({ event: "onReady" }), origin);
+            }
+          }
+          if (event === "command" && !document.body.dataset.ready) {
+            document.body.dataset.earlyCommand = func;
+          }
+          if (func === "getDuration" && document.body.dataset.ready) {
+            source.postMessage(JSON.stringify({ info: { duration: 120 } }), origin);
+          }
+          if (func === "playVideo" || func === "pauseVideo") {
+            source.postMessage(JSON.stringify({ info: { playerState: func === "playVideo" ? 1 : 2 } }), origin);
+          }
+        });
+      </script>`,
+    }),
+  );
+  await page.goto("/");
+  await page
+    .getByLabel("Development session credential")
+    .fill(`Bearer ${navigationUserId}|fixture:web`);
+  await page.getByRole("button", { name: "Connect" }).click();
+  await page
+    .getByLabel("YouTube URL or video ID")
+    .fill(directVideo.canonicalUrl);
+  await page.getByRole("button", { name: "Load video" }).click();
+
+  const player = page.frameLocator('iframe[title="YouTube video player"]');
+  await expect(player.locator("body")).toHaveAttribute("data-ready", "true");
+  await expect(player.locator("body")).not.toHaveAttribute(
+    "data-early-command",
+    /./u,
+  );
+  await expect(page.getByText(/Duration: 2:00/u)).toBeVisible();
+  await page.getByRole("button", { name: "Play video", exact: true }).click();
+  await page.getByRole("button", { name: "Pause video", exact: true }).click();
+  await expect(
+    page.getByRole("button", { name: "Play video", exact: true }),
+  ).toBeEnabled();
+});
 
 test("plays exact transcript words from their stored timestamp", async ({
   page,

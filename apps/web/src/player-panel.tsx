@@ -69,6 +69,7 @@ export function PlayerPanel({
     <aside className="panel video-panel">
       {videoId ? (
         <YouTubePlayer
+          key={videoId}
           ref={playerRef}
           videoId={videoId}
           onTimeChange={onTimeChange}

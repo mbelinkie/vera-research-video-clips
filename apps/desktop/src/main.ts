@@ -176,6 +176,11 @@ if (!app.requestSingleInstanceLock()) {
       });
   });
 
+  app.on("window-all-closed", () => {
+    mainWindow = undefined;
+    if (process.platform !== "darwin") app.quit();
+  });
+
   void app.whenReady().then(async () => {
     const userData = app.getPath("userData");
     notificationCoordinator = new DesktopNotificationCoordinator(

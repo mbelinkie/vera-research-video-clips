@@ -23,6 +23,7 @@ type YouTubePlayerProps = {
 };
 
 const playerOrigin = "https://www.youtube-nocookie.com";
+const pollIntervalMs = 250;
 
 /**
  * The privileged desktop renderer never imports YouTube JavaScript. Commands
@@ -37,8 +38,14 @@ export const YouTubePlayer = forwardRef<
   forwardedRef,
 ) {
   const iframeRef = useRef<HTMLIFrameElement>(null);
+  const loadedRef = useRef(false);
+  const readyRef = useRef(false);
   const playingRef = useRef(false);
-  const latestTimeMs = useRef(0);
+  const pendingSeek = useRef<number | undefined>(undefined);
+  const pendingPlayback = useRef<"playVideo" | "pauseVideo" | undefined>(
+    undefined,
+  );
+  const [playing, setPlaying] = useState(false);
   const [state, setState] = useState<"loading" | "ready" | "error">("loading");
   const source = useMemo(() => {
     const parameters = new URLSearchParams({
@@ -63,17 +70,26 @@ export const YouTubePlayer = forwardRef<
     forwardedRef,
     () => ({
       seekTo(milliseconds) {
-        latestTimeMs.current = milliseconds;
-        if (!command("seekTo", [milliseconds / 1_000, true])) return false;
+        if (!iframeRef.current?.contentWindow || state === "error")
+          return false;
+        if (readyRef.current) command("seekTo", [milliseconds / 1_000, true]);
+        else pendingSeek.current = milliseconds;
         onTimeChange(milliseconds);
         return true;
       },
-      play: () => command("playVideo"),
-      pause: () => command("pauseVideo"),
-      requestDuration: () => command("getDuration"),
+      play: () => setPlayback("playVideo"),
+      pause: () => setPlayback("pauseVideo"),
+      requestDuration: () => readyRef.current && command("getDuration"),
     }),
-    [onTimeChange],
+    [onTimeChange, state],
   );
+
+  function setPlayback(action: "playVideo" | "pauseVideo"): boolean {
+    if (!iframeRef.current?.contentWindow || state === "error") return false;
+    if (readyRef.current) return command(action);
+    pendingPlayback.current = action;
+    return true;
+  }
 
   useEffect(() => {
     onDurationChange(undefined);
@@ -88,16 +104,37 @@ export const YouTubePlayer = forwardRef<
         return;
       }
       const message = parsePlayerMessage(event.data);
-      if (!message) return;
+      if (!loadedRef.current || !message) return;
+      if (message.event === "onError") {
+        loadedRef.current = false;
+        readyRef.current = false;
+        setState("error");
+        return;
+      }
+      if (!readyRef.current) {
+        if (
+          message.event !== "onReady" &&
+          message.event !== "initialDelivery"
+        ) {
+          return;
+        }
+        readyRef.current = true;
+        setState("ready");
+        const seek = pendingSeek.current;
+        const playback = pendingPlayback.current;
+        pendingSeek.current = undefined;
+        pendingPlayback.current = undefined;
+        if (seek !== undefined) command("seekTo", [seek / 1_000, true]);
+        if (playback) command(playback);
+      }
       const playerState = message.info?.playerState;
       if (typeof playerState === "number") {
         playingRef.current = playerState === 1;
-        setState("ready");
+        setPlaying(playingRef.current);
       }
       const seconds = message.info?.currentTime;
       if (typeof seconds === "number" && Number.isFinite(seconds)) {
-        latestTimeMs.current = Math.max(0, Math.round(seconds * 1_000));
-        onTimeChange(latestTimeMs.current);
+        onTimeChange(Math.max(0, Math.round(seconds * 1_000)));
       }
       const durationSeconds = message.info?.duration;
       if (
@@ -114,65 +151,94 @@ export const YouTubePlayer = forwardRef<
 
   useEffect(() => {
     const interval = window.setInterval(() => {
+      if (!loadedRef.current) return;
+      if (!readyRef.current) {
+        // The iframe document can load before YouTube starts accepting commands.
+        iframeRef.current?.contentWindow?.postMessage(
+          JSON.stringify({ event: "listening" }),
+          playerOrigin,
+        );
+        return;
+      }
       if (playingRef.current) command("getCurrentTime");
       command("getDuration");
-    }, 250);
+    }, pollIntervalMs);
     return () => window.clearInterval(interval);
   });
 
   return (
-    <div className="player-frame" data-player-state={state}>
-      <iframe
-        ref={iframeRef}
-        className="player-mount"
-        src={source}
-        title="YouTube video player"
-        sandbox="allow-scripts allow-same-origin allow-presentation"
-        allow="encrypted-media; fullscreen; picture-in-picture"
-        allowFullScreen
-        referrerPolicy="strict-origin-when-cross-origin"
-        onLoad={() => {
-          setState("ready");
-          iframeRef.current?.contentWindow?.postMessage(
-            JSON.stringify({ event: "listening" }),
-            playerOrigin,
-          );
-          command("getDuration");
-        }}
-        onError={() => setState("error")}
-      />
-      {state !== "ready" ? (
-        <div className="player-status" role="status">
-          {state === "error" ? "Player unavailable" : "Loading YouTube player…"}
-        </div>
-      ) : null}
-    </div>
+    <>
+      <div className="player-frame" data-player-state={state}>
+        <iframe
+          ref={iframeRef}
+          className="player-mount"
+          src={source}
+          title="YouTube video player"
+          sandbox="allow-scripts allow-same-origin allow-presentation"
+          allow="encrypted-media; fullscreen; picture-in-picture"
+          allowFullScreen
+          referrerPolicy="strict-origin-when-cross-origin"
+          onLoad={() => {
+            loadedRef.current = true;
+            readyRef.current = false;
+            playingRef.current = false;
+            setPlaying(false);
+            setState("loading");
+          }}
+          onError={() => {
+            loadedRef.current = false;
+            readyRef.current = false;
+            setState("error");
+          }}
+        />
+        {state !== "ready" ? (
+          <div className="player-status" role="status">
+            {state === "error"
+              ? "Player unavailable"
+              : "Loading YouTube player…"}
+          </div>
+        ) : null}
+      </div>
+      <button
+        type="button"
+        className="quiet-button"
+        disabled={state !== "ready"}
+        onClick={() => setPlayback(playing ? "pauseVideo" : "playVideo")}
+      >
+        {playing ? "Pause video" : "Play video"}
+      </button>
+    </>
   );
 });
 
 function parsePlayerMessage(value: unknown):
   | {
-      info?: {
-        playerState?: unknown;
-        currentTime?: unknown;
-        duration?: unknown;
-      };
+      event: unknown;
+      info:
+        | {
+            playerState?: unknown;
+            currentTime?: unknown;
+            duration?: unknown;
+          }
+        | undefined;
     }
   | undefined {
   try {
     const parsed =
       typeof value === "string" ? (JSON.parse(value) as unknown) : value;
     if (typeof parsed !== "object" || parsed === null) return undefined;
-    const info = (parsed as { info?: unknown }).info;
-    return typeof info === "object" && info !== null
-      ? {
-          info: info as {
-            playerState?: unknown;
-            currentTime?: unknown;
-            duration?: unknown;
-          },
-        }
-      : {};
+    const { event, info } = parsed as { event?: unknown; info?: unknown };
+    return {
+      event,
+      info:
+        typeof info === "object" && info !== null
+          ? (info as {
+              playerState?: unknown;
+              currentTime?: unknown;
+              duration?: unknown;
+            })
+          : undefined,
+    };
   } catch {
     return undefined;
   }
