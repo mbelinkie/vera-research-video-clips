@@ -37,6 +37,7 @@ import "./styles.css";
 import { ChromePairing } from "./chrome-pairing.tsx";
 import { BatchWorkspace } from "./batch-workspace.tsx";
 import { StillsWorkspace } from "./stills-workspace.tsx";
+import { TypedQuotesWorkspace } from "./typed-quotes-workspace.tsx";
 import {
   browserMode,
   cloudFetch,
@@ -1582,6 +1583,21 @@ function App() {
         projects={projects}
       />
       <StillsWorkspace
+        key={JSON.stringify([
+          projectId,
+          authorization,
+          session?.authenticated ? session.user?.id : null,
+        ])}
+        authorization={authorization}
+        browserSession={browserMode || managedResearch}
+        csrfToken={csrfToken}
+        onAuthUnavailable={
+          managedResearch ? loseManagedConnection : loseSession
+        }
+        projectId={projectId}
+        projects={projects}
+      />
+      <TypedQuotesWorkspace
         key={JSON.stringify([
           projectId,
           authorization,
