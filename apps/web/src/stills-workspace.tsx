@@ -10,6 +10,7 @@ import {
 } from "@research-video/contracts";
 
 import { cloudFetch } from "./browser-api.ts";
+import type { Crop } from "./still-crop-geometry.ts";
 
 type StillsWorkspaceProps = {
   authorization: string;
@@ -21,7 +22,6 @@ type StillsWorkspaceProps = {
 };
 
 type ImportMode = "url" | "file" | "page_picture";
-type Crop = { x: number; y: number; width: number; height: number };
 type Draft = {
   title: string;
   topics: string;
@@ -117,7 +117,12 @@ function cropError(crop: Crop) {
     return "Crop coordinates must be numbers.";
   if (crop.width <= 0 || crop.height <= 0)
     return "Crop width and height must be greater than zero.";
-  if (crop.x + crop.width > 1 || crop.y + crop.height > 1)
+  if (
+    crop.x < 0 ||
+    crop.y < 0 ||
+    crop.x + crop.width > 1 ||
+    crop.y + crop.height > 1
+  )
     return "Crop must stay within the image (0–1 normalized coordinates).";
   return undefined;
 }
