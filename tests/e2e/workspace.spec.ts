@@ -6594,6 +6594,12 @@ test("does not render an older delayed batch selection in the same project", asy
   const delayedBatchA = new Promise<void>((resolve) => {
     releaseBatchA = resolve;
   });
+  let delayNextAllWorklist = true;
+  let delayedRefreshStarted = false;
+  let releaseDelayedRefresh: (() => void) | undefined;
+  const delayedRefresh = new Promise<void>((resolve) => {
+    releaseDelayedRefresh = resolve;
+  });
   const batch = (id: string, name: string) => ({
     id,
     projectId,
@@ -6716,6 +6722,14 @@ test("does not render an older delayed batch selection in the same project", asy
     const keywordCatalog = defaultProjectKeywordCatalog(path);
     if (keywordCatalog) return route.fulfill({ json: keywordCatalog });
     if (path.includes("/worklist")) {
+      if (
+        new URL(route.request().url()).searchParams.get("view") === "all" &&
+        delayNextAllWorklist
+      ) {
+        delayNextAllWorklist = false;
+        delayedRefreshStarted = true;
+        await delayedRefresh;
+      }
       return route.fulfill({ json: { items: [], total: 0 } });
     }
     return route.fulfill({ status: 404, json: { error: "not found" } });
@@ -6736,6 +6750,21 @@ test("does not render an older delayed batch selection in the same project", asy
   ).toHaveCount(0);
   await expect(page.getByText("Older delayed language gate")).toHaveCount(0);
   await expect(batchBButton).toHaveClass(/selected/);
+
+  // A polling refresh captures B as the preferred listed batch, but must not
+  // replace a later manual A selection when its worklist response arrives last.
+  await page
+    .locator('[aria-label="Worklist views"]')
+    .getByRole("button", { name: "All", exact: true })
+    .click();
+  await expect.poll(() => delayedRefreshStarted).toBe(true);
+  const batchAButton = page.getByRole("button", { name: /Batch A delayed/ });
+  await batchAButton.click();
+  await expect(batchAButton).toHaveClass(/selected/);
+  releaseDelayedRefresh?.();
+  await page.waitForTimeout(300);
+  await expect(batchAButton).toHaveClass(/selected/);
+  await expect(batchBButton).not.toHaveClass(/selected/);
 });
 
 test("keeps a newer batch selected when an older language confirmation completes", async ({
