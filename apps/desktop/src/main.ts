@@ -75,6 +75,7 @@ import {
   shouldRunTranscriptionWorker,
 } from "./desktop-setup-policy.ts";
 import { LocalAgentEndpointRegistry } from "./local-agent-endpoint.ts";
+import { waitForLocalAgentReady } from "./local-agent-readiness.ts";
 import {
   DesktopNotificationCoordinator,
   FileDesktopNotificationStore,
@@ -1573,57 +1574,6 @@ async function readTrustedWorkerConfiguration(input: {
   const snapshot = await snapshotResponse.json();
   const paths = parseTrustedRuntimePaths(await runtimeResponse.json());
   return resolveWorkerConfiguration(snapshot, paths);
-}
-
-async function waitForLocalAgentReady(
-  child: UtilityProcess,
-  reportPort: (port: number) => void,
-  clearPort: (port: number) => void,
-): Promise<void> {
-  const port = await new Promise<number>((resolvePort, rejectPort) => {
-    const cleanup = () => {
-      clearTimeout(timeout);
-      child.removeListener("message", onMessage);
-      child.removeListener("error", onFailure);
-      child.removeListener("exit", onExit);
-    };
-    const onFailure = () => {
-      cleanup();
-      rejectPort(new Error("Local service failed before readiness."));
-    };
-    const onExit = () => onFailure();
-    const onMessage = (message: unknown) => {
-      if (
-        typeof message !== "object" ||
-        message === null ||
-        Object.keys(message).length !== 2 ||
-        (message as { type?: unknown }).type !== "local-agent-ready" ||
-        !Number.isSafeInteger((message as { port?: unknown }).port) ||
-        Number((message as { port: number }).port) < 1 ||
-        Number((message as { port: number }).port) > 65_535
-      ) {
-        return;
-      }
-      cleanup();
-      const port = (message as { port: number }).port;
-      reportPort(port);
-      resolvePort(port);
-    };
-    const timeout = setTimeout(() => {
-      cleanup();
-      rejectPort(new Error("Local service health check timed out."));
-    }, 10_000);
-    child.on("message", onMessage);
-    child.once("error", onFailure);
-    child.once("exit", onExit);
-  });
-  try {
-    const response = await fetch(`http://127.0.0.1:${port}/health`);
-    if (!response.ok) throw new Error("Local service health check failed.");
-  } catch (error) {
-    clearPort(port);
-    throw error;
-  }
 }
 
 function contentType(extension: string): string {

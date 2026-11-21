@@ -246,6 +246,8 @@ export function BatchWorkspace({
     "Connect with a development session credential to load your projects.",
   );
   const requestGeneration = useRef(0);
+  const projectRefreshGeneration = useRef(0);
+  const lastAppliedRefreshGeneration = useRef(0);
   const batchRequestGeneration = useRef(0);
   const createBatchInFlight = useRef(false);
   const timedImportGeneration = useRef(0);
@@ -426,6 +428,8 @@ export function BatchWorkspace({
   ) {
     if (!targetProjectId || !authorization) return;
     const generation = requestGeneration.current;
+    const refreshGeneration = ++projectRefreshGeneration.current;
+    const selectionGeneration = batchRequestGeneration.current;
     try {
       const [
         listed,
@@ -467,7 +471,15 @@ export function BatchWorkspace({
         "payload" in commentNoticeResult
           ? ClipCommentNoticePageSchema.parse(commentNoticeResult.payload)
           : undefined;
-      if (!isCurrentRequest(generation, targetProjectId)) return;
+      if (
+        !isCurrentRequest(generation, targetProjectId) ||
+        refreshGeneration < lastAppliedRefreshGeneration.current
+      )
+        return;
+      // A slower poll may still publish while a newer one is pending. Only
+      // discard it after newer data actually arrived, to avoid starvation on
+      // connections slower than the polling interval.
+      lastAppliedRefreshGeneration.current = refreshGeneration;
       setBatchList(parsedList);
       setReviewItems(parsedInbox.items);
       setWorklist(parsedWorklist);
@@ -489,6 +501,9 @@ export function BatchWorkspace({
             [...current].filter((videoId) => availableVideoIds.has(videoId)),
           ),
       );
+      // A manual batch choice made while this refresh was in flight wins over
+      // the older preferred ID captured by the polling callback.
+      if (selectionGeneration !== batchRequestGeneration.current) return;
       const selectedId = selectTranscriptionBatchId(
         showBatchHistory
           ? parsedList.batches
@@ -503,11 +518,16 @@ export function BatchWorkspace({
       if (selectedId) await loadBatch(targetProjectId, selectedId, generation);
       else {
         if (!isCurrentRequest(generation, targetProjectId)) return;
+        // Discard a pending hidden-batch detail after its action is resolved.
+        batchRequestGeneration.current += 1;
         setSelectedBatch(undefined);
         setSelectedBatchId("");
       }
     } catch (error) {
-      if (isCurrentRequest(generation, targetProjectId))
+      if (
+        isCurrentRequest(generation, targetProjectId) &&
+        refreshGeneration === projectRefreshGeneration.current
+      )
         setMessage(errorMessage(error));
     }
   }
@@ -527,6 +547,11 @@ export function BatchWorkspace({
     )
       return;
     const parsed = CreateTranscriptionBatchResponseSchema.parse(payload);
+    if (
+      parsed.batch.projectId !== targetProjectId ||
+      parsed.batch.id !== batchId
+    )
+      throw new Error("Batch does not match the selected project or request.");
     if (selectedBatchId !== batchId) {
       timedImportGeneration.current += 1;
       setTimedImportDrafts({});

@@ -990,6 +990,14 @@ describe("one-shot local export runtime", () => {
         inspector,
         root,
       );
+      // Establish the intended concurrent-ready condition before entering the
+      // coordinator. Two independently scheduled FFmpeg discovery subprocess
+      // groups can finish outside its short join window on a loaded runner.
+      // Still discover real installed capabilities and validate both requests.
+      const discoveredCapabilities =
+        await new FfmpegCapabilityDiscoveryProvider({
+          executable: ffmpegPath,
+        }).discover();
       const dependencies = {
         queue,
         sourceProvider,
@@ -997,9 +1005,7 @@ describe("one-shot local export runtime", () => {
         renderer,
         thumbnailExtractor,
         thumbnailInspector,
-        capabilityProvider: new FfmpegCapabilityDiscoveryProvider({
-          executable: ffmpegPath,
-        }),
+        capabilityProvider: { discover: async () => discoveredCapabilities },
         sharedSourceCoordinator: coordinator,
         dataRoot: root,
       };

@@ -53,6 +53,84 @@ describe("action-required transcription batch selection", () => {
       ),
     ).toBe("manual-one");
   });
+
+  it("uses only the first exact language gate with a batch ID in canonical order", () => {
+    expect(
+      selectTranscriptionBatchId(
+        [{ batch: { id: "manual" } }],
+        [
+          { processing: { state: "queued", batchId: "unrelated" } },
+          { processing: { state: "needs_language_confirmation" } },
+          {
+            processing: { state: "needs_translation", batchId: "translation" },
+          },
+          {
+            processing: {
+              state: "needs_language_confirmation",
+              batchId: "first-exact-gate",
+            },
+          },
+          {
+            processing: {
+              state: "needs_language_confirmation",
+              batchId: "second-exact-gate",
+            },
+          },
+        ],
+        "stale-hidden-batch",
+      ),
+    ).toBe("first-exact-gate");
+  });
+
+  it("does not expose unrelated hidden batches when no exact gate remains", () => {
+    expect(
+      selectTranscriptionBatchId(
+        [],
+        [
+          { processing: { state: "queued", batchId: "old-hidden" } },
+          { processing: { state: "ready", batchId: "another-hidden" } },
+          { processing: { state: "needs_language_confirmation" } },
+        ],
+        "old-hidden",
+      ),
+    ).toBeUndefined();
+  });
+
+  it("falls back to the first listed batch when a stale selection disappears", () => {
+    expect(
+      selectTranscriptionBatchId(
+        [{ batch: { id: "first-listed" } }, { batch: { id: "second-listed" } }],
+        [],
+        "no-longer-listed",
+      ),
+    ).toBe("first-listed");
+  });
+
+  it("keeps a selected listed batch ahead of several hidden language gates", () => {
+    expect(
+      selectTranscriptionBatchId(
+        [
+          { batch: { id: "first-listed" } },
+          { batch: { id: "selected-listed" } },
+        ],
+        [
+          {
+            processing: {
+              state: "needs_language_confirmation",
+              batchId: "hidden-one",
+            },
+          },
+          {
+            processing: {
+              state: "needs_language_confirmation",
+              batchId: "hidden-two",
+            },
+          },
+        ],
+        "selected-listed",
+      ),
+    ).toBe("selected-listed");
+  });
 });
 
 describe("selected-video transcript retry", () => {

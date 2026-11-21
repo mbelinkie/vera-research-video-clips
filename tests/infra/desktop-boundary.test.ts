@@ -16,6 +16,10 @@ const player = readFileSync(
   "utf8",
 );
 const main = readFileSync(new URL("apps/desktop/src/main.ts", root), "utf8");
+const localAgentReadiness = readFileSync(
+  new URL("apps/desktop/src/local-agent-readiness.ts", root),
+  "utf8",
+);
 const playerIdentification = readFileSync(
   new URL("apps/desktop/src/youtube-player-identification.ts", root),
   "utf8",
@@ -103,7 +107,14 @@ describe("local Intel desktop package boundary", () => {
     expect(main).toContain("nodeIntegration: false");
     expect(main).toContain("sandbox: true");
     expect(main).toContain('environment.LOCAL_AGENT_PORT = "0"');
-    expect(main).toContain('child.on("message", onMessage)');
+    expect(main).toContain(
+      'import { waitForLocalAgentReady } from "./local-agent-readiness.ts";',
+    );
+    expect(main).toMatch(/waitForLocalAgentReady\(\s*child,/u);
+    expect(localAgentReadiness).toContain('child.on("message", onMessage)');
+    expect(localAgentReadiness).toContain('"local-agent-ready"');
+    expect(localAgentReadiness).toContain("reportPort(port)");
     expect(main).not.toContain("reserveLoopbackPort");
+    expect(localAgentReadiness).not.toContain("reserveLoopbackPort");
   });
 });
