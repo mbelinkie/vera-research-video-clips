@@ -57,7 +57,7 @@ Open **VERA Producer Controls** from Applications (a helper runs
 working when the website or tunnel is down, and drives the commands below:
 guided setup, status, Open/Pause access, backups, recovery tests, a restore
 test with membership comparison, and the #48 acceptance walkthrough. See
-[Research #107](../../specs/active/research-107-producer-controls.md).
+[Research #107](../../specs/completed/research-107-producer-controls.md).
 `npm run controls -- --demo` shows the same screens with example data.
 
 ## Commands (`npm run pilot -- <command>`)

@@ -100,7 +100,7 @@ to reconcile restored memberships before reopening remote access.
 
 Run this walkthrough from **VERA Producer Controls** (#107). The step-by-step
 panel instructions are in
-[Research #107 → Revised #48 Producer live acceptance](research-107-producer-controls.md#revised-48-producer-live-acceptance-using-producer-controls).
+[Research #107 → Revised #48 Producer live acceptance](../completed/research-107-producer-controls.md#revised-48-producer-live-acceptance-using-producer-controls).
 The panel records each check and observation and produces the approval comment.
 The gates below are unchanged.
 

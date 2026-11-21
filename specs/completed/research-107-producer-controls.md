@@ -188,3 +188,44 @@ The gates are unchanged.
 7. **Sign off.** Enter your name, press **Approve #48 live acceptance**, then
    **Copy comment** and post it on #48. Close #48 only after that comment is
    posted. #99 go-live stays separate.
+
+## Completion
+
+- **Accepted:** the Producer approved the design on 2026-11-21
+  ([#107 comment](https://github.com/mbelinkie/vera-research-video-clips/issues/107#issuecomment-7058177096)).
+  #107 is Done. At the Producer's direction it was relabelled from
+  `model:sol` to `model:opus`.
+- **Commits:** `3b5aebf` (Producer Controls), merged in
+  [PR #117](https://github.com/mbelinkie/vera-research-video-clips/pull/117)
+  as `2497d65`.
+- **Decisions:**
+  - Working panel rather than design-only (Producer direction).
+  - Separate loopback process that wraps the existing `npm run pilot`
+    controls.
+  - Open access is gated server-side on all nine setup steps, including a
+    recovery test within 8 days; Pause access is never gated.
+  - The restore test takes the key from the password manager through a
+    native macOS dialog.
+  - Database accounts are created through Postgres.app's local
+    administrator.
+  - The public #48 comment withholds the pilot address and emails.
+- **Files changed:**
+  - `scripts/producer-controls/` (new)
+  - `tests/infra/producer-controls.test.ts` (new)
+  - `scripts/pilot-host/cli.ts` (exports `assertFriendFacing`)
+  - `package.json` (`controls` script)
+  - this spec, the #48 spec and the Mac pilot runbook
+- **Checks:** `npm run check` passed with a non-symlinked `TMPDIR`:
+  formatting, typecheck, 442 passed / 4 skipped, web build, and local and
+  cloud migrations valid. The 37 Producer Controls tests pass. CI on PR #117
+  passed.
+- **Compatibility:** no schema, migration or contract change. The new tool is
+  opt-in and runs only when the Producer launches it.
+- **Remaining risks, covered by #48 live acceptance:** not yet exercised for
+  real:
+  - a restore test against a real backup;
+  - Create database accounts against Postgres.app;
+  - the Cloudflare Access and Cognito probes against real providers;
+  - a screen-reader pass.
+- **Follow-ups:** read-only phone status ([#108](https://github.com/mbelinkie/vera-research-video-clips/issues/108));
+  #48 live acceptance; #99 go-live.
