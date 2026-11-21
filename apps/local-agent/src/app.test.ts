@@ -1107,6 +1107,32 @@ describe("local agent", () => {
     });
   });
 
+  it("keeps non-transcript not-found operations fail-closed and path-free", async () => {
+    const app = createLocalAgent({
+      resolveClipLibrary: async () => {
+        throw Object.assign(
+          new Error("Clip not found at /private/cache?token=secret"),
+          { statusCode: 404, code: "not_found" },
+        );
+      },
+    });
+    apps.add(app);
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/projects/019fbb95-cd76-7920-93fa-e23ba755e391/clip-library",
+      headers: { authorization: "Bearer fixture-session" },
+    });
+    expect(response.statusCode).toBe(404);
+    expect(response.json()).toMatchObject({
+      error: { message: "This operation is not available." },
+      operationFailure: {
+        operation: "clip_library",
+        failureClass: "authorization_denied",
+      },
+    });
+    expect(response.body).not.toMatch(/private|cache|token|secret/i);
+  });
+
   it("accepts an offline-review capability only on the trusted desktop transcript hop", async () => {
     const secret = "s".repeat(64);
     const capability = "c".repeat(43);

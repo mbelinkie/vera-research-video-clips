@@ -32,4 +32,27 @@ describe("desktopToolSearchPath", () => {
       desktopToolSearchPath([ytDlp, "whisper-cli"], inherited).split(delimiter),
     ).toEqual([dirname(ytDlp), resolve("/", "usr", "bin")]);
   });
+
+  it("keeps the inherited executable search limited with absent and relative tools", () => {
+    const ytDlp = resolve("/", "trusted", "bin", "yt-dlp");
+    const ffmpeg = resolve("/", "trusted", "bin", "ffmpeg");
+    const inherited = [
+      "",
+      resolve("/", "usr", "bin"),
+      "",
+      resolve("/", "bin"),
+    ].join(delimiter);
+
+    expect(
+      desktopToolSearchPath(
+        ["", "node", "./ffmpeg", ytDlp, ffmpeg],
+        inherited,
+      ).split(delimiter),
+    ).toEqual([
+      dirname(ytDlp),
+      resolve("/", "usr", "bin"),
+      resolve("/", "bin"),
+    ]);
+    expect(desktopToolSearchPath(["node", "./ffmpeg"], undefined)).toBe("");
+  });
 });
