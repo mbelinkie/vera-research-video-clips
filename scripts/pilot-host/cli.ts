@@ -57,7 +57,7 @@ async function loadEnv() {
 }
 
 /** The friend-facing API must be production, Mac pilot, browser auth and Access. */
-function assertFriendFacing(env: Record<string, string>) {
+export function assertFriendFacing(env: Record<string, string>) {
   const config = loadConfig(env);
   if (
     config.nodeEnv !== "production" ||

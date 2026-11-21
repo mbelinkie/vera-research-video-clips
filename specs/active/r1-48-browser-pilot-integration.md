@@ -98,6 +98,12 @@ to reconcile restored memberships before reopening remote access.
 
 ## Producer live acceptance
 
+Run this walkthrough from **VERA Producer Controls** (#107). The step-by-step
+panel instructions are in
+[Research #107 → Revised #48 Producer live acceptance](research-107-producer-controls.md#revised-48-producer-live-acceptance-using-producer-controls).
+The panel records each check and observation and produces the approval comment.
+The gates below are unchanged.
+
 1. Approve and follow the pilot runbook for FileVault, loopback PostgreSQL, the
    exact HTTPS origin, Cloudflare Access and Tunnel, and the Cognito callback
    and logout URLs. Confirm that protected API responses bypass shared caches.
