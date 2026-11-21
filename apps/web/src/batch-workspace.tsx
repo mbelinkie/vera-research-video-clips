@@ -519,7 +519,10 @@ export function BatchWorkspace({
         setSelectedBatchId("");
       }
     } catch (error) {
-      if (isCurrentRequest(generation, targetProjectId))
+      if (
+        isCurrentRequest(generation, targetProjectId) &&
+        refreshGeneration === projectRefreshGeneration.current
+      )
         setMessage(errorMessage(error));
     }
   }
