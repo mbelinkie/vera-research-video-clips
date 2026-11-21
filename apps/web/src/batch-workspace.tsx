@@ -247,6 +247,7 @@ export function BatchWorkspace({
   );
   const requestGeneration = useRef(0);
   const projectRefreshGeneration = useRef(0);
+  const lastAppliedRefreshGeneration = useRef(0);
   const batchRequestGeneration = useRef(0);
   const createBatchInFlight = useRef(false);
   const timedImportGeneration = useRef(0);
@@ -472,9 +473,13 @@ export function BatchWorkspace({
           : undefined;
       if (
         !isCurrentRequest(generation, targetProjectId) ||
-        refreshGeneration !== projectRefreshGeneration.current
+        refreshGeneration < lastAppliedRefreshGeneration.current
       )
         return;
+      // A slower poll may still publish while a newer one is pending. Only
+      // discard it after newer data actually arrived, to avoid starvation on
+      // connections slower than the polling interval.
+      lastAppliedRefreshGeneration.current = refreshGeneration;
       setBatchList(parsedList);
       setReviewItems(parsedInbox.items);
       setWorklist(parsedWorklist);
