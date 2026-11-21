@@ -38,6 +38,7 @@ describe("cloud migrations", () => {
       "0059_extension_capture_assets",
       "0060_chrome_capture_connections",
       "0061_youtube_source_moments",
+      "0062_library_reference_pictures",
     ]);
     expect(await runCloudMigrations(database)).toEqual([]);
     const result = await database.query<{ table_name: string }>(
