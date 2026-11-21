@@ -50,6 +50,16 @@ longer proves a request is local. That is why maintenance and diagnostics
 moved to the separate operator port, why the public port no longer serves
 `/__maintenance/*`, and why the tunnel config also 404s those paths.
 
+## Producer Controls (no Terminal)
+
+Open **VERA Producer Controls** from Applications (a helper runs
+`npm run controls -- install-app` once). It runs on this Mac only, keeps
+working when the website or tunnel is down, and drives the commands below:
+guided setup, status, Open/Pause access, backups, recovery tests, a restore
+test with membership comparison, and the #48 acceptance walkthrough. See
+[Research #107](../../specs/active/research-107-producer-controls.md).
+`npm run controls -- --demo` shows the same screens with example data.
+
 ## Commands (`npm run pilot -- <command>`)
 
 All commands read the private env file at
