@@ -690,6 +690,10 @@ const webVttFixture = new URL(
   "../../../tests/fixtures/transcripts/caption-sample.vtt",
   import.meta.url,
 );
+const rollingAutoCaptionFixture = new URL(
+  "../../../tests/fixtures/transcripts/youtube-auto-rolling.vtt",
+  import.meta.url,
+);
 
 const segments: TranscriptSegment[] = [
   {
@@ -1005,6 +1009,58 @@ describe("WebVTT normalization", () => {
       { ordinal: 0, startMs: 0, endMs: 1_000, text: "First line" },
       { ordinal: 1, startMs: 1_010, endMs: 2_000, text: "Second line" },
     ]);
+  });
+
+  it("merges YouTube automatic rolling caption windows into spoken lines", async () => {
+    const contents = await readFile(rollingAutoCaptionFixture);
+    const transcript = await normalizeWebVttCaption({
+      contents,
+      videoId: "M7lc1UVf-VE",
+      language: "en",
+      source: "youtube-auto",
+      provider: "yt-dlp",
+    });
+
+    // Each spoken line appears once. A repeated line that carries inline
+    // timing tags is newly spoken (the speaker repeated it) and is retained.
+    expect(
+      transcript.segments.map(({ startMs, endMs, text }) => ({
+        startMs,
+        endMs,
+        text,
+      })),
+    ).toEqual([
+      { startMs: 1_000, endMs: 3_000, text: "alpha bravo charlie" },
+      { startMs: 3_010, endMs: 5_000, text: "delta echo foxtrot" },
+      { startMs: 5_010, endMs: 7_000, text: "delta echo foxtrot" },
+      { startMs: 7_010, endMs: 9_000, text: "golf" },
+    ]);
+    expect(transcript.tokens.map((token) => token.text)).toEqual([
+      "alpha",
+      "bravo",
+      "charlie",
+      "delta",
+      "echo",
+      "foxtrot",
+      "delta",
+      "echo",
+      "foxtrot",
+      "golf",
+    ]);
+    expect(transcript.track.timingPrecision).toBe("cue");
+  });
+
+  it("keeps rolling-window repeats in manual captions untouched", async () => {
+    const contents = await readFile(rollingAutoCaptionFixture);
+    const transcript = await normalizeWebVttCaption({
+      contents,
+      videoId: "M7lc1UVf-VE",
+      language: "en",
+      source: "youtube-manual",
+      provider: "yt-dlp",
+    });
+
+    expect(transcript.segments).toHaveLength(7);
   });
 
   it.each([
