@@ -612,11 +612,18 @@ export type WebVttNormalizationInput = {
   version?: number;
 };
 
+type ParsedCueLine = {
+  text: string;
+  /** The raw line carried inline `<hh:mm:ss.mmm>` word timestamps. */
+  hasInlineTiming: boolean;
+};
+
 type ParsedCue = {
   inputOrdinal: number;
   startMs: number;
   endMs: number;
   text: string;
+  lines: ParsedCueLine[];
 };
 
 const maxWebVttBytes = 20 * 1024 * 1024;
@@ -626,12 +633,19 @@ export async function normalizeWebVttCaption(
   input: WebVttNormalizationInput,
 ): Promise<NormalizedTranscript> {
   const contents = decodeWebVtt(input.contents);
-  const cues = parseWebVtt(contents).toSorted(
+  const sortedCues = parseWebVtt(contents).toSorted(
     (left, right) =>
       left.startMs - right.startMs ||
       left.endMs - right.endMs ||
       left.inputOrdinal - right.inputOrdinal,
   );
+  const cues =
+    input.source === "youtube-auto"
+      ? mergeRollingAutoCaptionCues(sortedCues)
+      : sortedCues;
+  if (cues.length === 0) {
+    throw new WebVttNormalizationError("WebVTT input contains no usable cues.");
+  }
   const canonicalCues = cues.map(({ startMs, endMs, text }) => ({
     startMs,
     endMs,
@@ -1928,12 +1942,13 @@ function parseWebVtt(input: string): ParsedCue[] {
         `WebVTT cue ${cueNumber} must end after it starts.`,
       );
     }
-    const text = normalizeCueText(blockLines.slice(timingIndex + 1));
+    const lines = normalizeCueLines(blockLines.slice(timingIndex + 1));
+    const text = lines.map((line) => line.text).join("\n");
     // YouTube automatic captions emit empty transition cues between rolling
     // lines. They carry no transcript content, so ignore them while retaining
     // strict validation for timing and for files with no usable cues at all.
     if (!text) continue;
-    cues.push({ inputOrdinal: cues.length, startMs, endMs, text });
+    cues.push({ inputOrdinal: cues.length, startMs, endMs, text, lines });
   }
   if (cues.length === 0) {
     throw new WebVttNormalizationError("WebVTT input contains no usable cues.");
@@ -1959,16 +1974,64 @@ function parseWebVttTimestamp(timestamp: string) {
   return total;
 }
 
-function normalizeCueText(lines: readonly string[]) {
+const inlineTimestampTag = /<(?:\d{2,}:)?[0-5]\d:[0-5]\d\.\d{3}>/u;
+
+function normalizeCueLines(lines: readonly string[]): ParsedCueLine[] {
   return lines
-    .map((line) =>
-      decodeCueEntities(line.replaceAll(/<[^>]*>/gu, ""))
+    .map((line) => ({
+      text: decodeCueEntities(line.replaceAll(/<[^>]*>/gu, ""))
         .replaceAll(/[\t ]+/gu, " ")
         .trim(),
-    )
-    .filter(Boolean)
-    .join("\n")
-    .trim();
+      hasInlineTiming: inlineTimestampTag.test(line),
+    }))
+    .filter((line) => line.text.length > 0);
+}
+
+/**
+ * YouTube automatic captions are a rolling two-line display: every window
+ * repeats the previously displayed line above the newly spoken one, and a
+ * ~10 ms "settle" cue repeats the new line alone. Keeping those windows
+ * verbatim stores each spoken line about three times.
+ *
+ * A window's leading lines are dropped when they match the trailing lines of
+ * the previous raw cue's display; a cue left with nothing new is a settle cue
+ * and is dropped. A line carrying inline word timestamps is always newly
+ * spoken, so a speaker's genuine repetition is retained. Cue timing is the
+ * provider's window timing and remains `cue` precision.
+ */
+function mergeRollingAutoCaptionCues(cues: readonly ParsedCue[]): ParsedCue[] {
+  const merged: ParsedCue[] = [];
+  let previousDisplay: readonly ParsedCueLine[] = [];
+  for (const cue of cues) {
+    let carried = 0;
+    for (
+      let length = Math.min(cue.lines.length, previousDisplay.length);
+      length > 0;
+      length -= 1
+    ) {
+      const head = cue.lines.slice(0, length);
+      const tail = previousDisplay.slice(previousDisplay.length - length);
+      if (
+        head.every(
+          (line, index) =>
+            !line.hasInlineTiming && line.text === tail[index]!.text,
+        )
+      ) {
+        carried = length;
+        break;
+      }
+    }
+    previousDisplay = cue.lines;
+    const lines = cue.lines.slice(carried);
+    if (lines.length === 0) continue;
+    merged.push({
+      ...cue,
+      inputOrdinal: merged.length,
+      lines,
+      text: lines.map((line) => line.text).join("\n"),
+    });
+  }
+  return merged;
 }
 
 function decodeCueEntities(text: string) {
