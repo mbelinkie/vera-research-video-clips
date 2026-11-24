@@ -6,6 +6,8 @@ Read `PROJECT_GUIDE.md` for how this project is built and verified.
 
 Enroll product designs in [#692](https://github.com/mbelinkie/vera-script-to-timeline/issues/692)
 and follow the [shipped verification procedure](https://github.com/mbelinkie/vera-script-to-timeline/blob/main/docs/CLAUDE_DESIGN_STORY_PLAYBOOK.md#shipped-product-verification).
+File confirmed defects in GitHub Issues and classify them before manual Ready or
+claim in the Research Project. Follow the [filing and readiness policy](https://github.com/mbelinkie/vera-script-to-timeline/blob/main/docs/ISSUE_FILING.md).
 
 ## Branches and delivery
 
