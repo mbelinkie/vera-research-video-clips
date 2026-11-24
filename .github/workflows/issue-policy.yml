@@ -1,0 +1,35 @@
+name: Issue policy
+
+on:
+  issues:
+    types: [opened, reopened, labeled]
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/issue-policy.yml"
+      - "scripts/issue-policy.mjs"
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: issue-policy-${{ github.event.issue.number || 'setup' }}
+  queue: max
+
+jobs:
+  reconcile:
+    if: >-
+      github.event_name == 'push' ||
+      github.event.action != 'labeled' ||
+      contains(fromJSON('["type:design", "owner:claude", "design:prod-pending"]'), github.event.label.name)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Reconcile issue policy
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/issue-policy.mjs
