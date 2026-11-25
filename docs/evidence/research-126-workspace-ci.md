@@ -266,3 +266,55 @@ Local Linux verification with locked Playwright/Chromium and
 - Prettier and git diff --check pass. Actual GitHub execution and the full
   existing gate remain for phase 4; the Ubuntu dependency installation step
   was not executed locally because locked Chromium was already installed.
+
+## Phase 4 — browser verification complete; aggregate gate blocked
+
+On `bf155e9`, using the locked Chromium and the same isolated CI settings:
+
+- Exact required Workspace command, one worker: **17 passed, 1.4m,
+  exit 0** (`workspace-phase4-serial.log`).
+- Combined Workspace, Stills and Typed Quotes specs with `--workers=2`:
+  **37 passed, 1 failed, 3.3m, exit 1**. All 21 adjacent cases passed;
+  the long Workspace case `maps transcript text selection to stable source
+and export bounds` exceeded its existing 30-second whole-test budget
+  while filling the project description. The failure snapshot shows the
+  field present, with the project name already filled. Trace timings show
+  multiple preceding ordinary actions took approximately 1–4 seconds each.
+  This is consistent with resource contention, not evidence that the field
+  is missing; the same case passed in the serial run. The failure and trace
+  are retained in the ticket folder. No retries, timeouts or assertions were
+  loosened to conceal it.
+- Independent complete Workspace run with `--workers=2`: **17 passed,
+  1.4m, exit 0** (`workspace-phase4-parallel-only.log`). This repeats the
+  timed-out case successfully without any test or timeout change; the
+  initial combined-run failure remains recorded.
+- Whole code diff reviewed: only test fixtures/assertions and Playwright/CI
+  configuration changed. There is no changed product data-integrity guard
+  to mutate. The phase 3 synthetic failing assertion is the negative test
+  for the added CI step; it was restored before committing. No product
+  code, auth configuration, or live service was changed.
+- A disposable Ubuntu checkout of the committed tree was prepared using
+  locked offline dependencies with lifecycle scripts omitted and system
+  Node 24.19.0. The full `CI=true npm run check` was started as an
+  unprivileged user because two baseline cleanup tests deliberately remove
+  directory write permissions (root bypasses that condition). The earlier
+  redundant root gate was interrupted after the browser results. The
+  unprivileged gate passed formatting and typecheck. Vitest reported
+  `packages/catalog/src/index.test.ts (83 tests | 11 failed) 894155ms`.
+  The cloud API file and the two permission-sensitive cleanup cases that
+  failed at baseline passed in this run. The catalog, cloud API, local-agent
+  and media sources/tests are unchanged relative to the pinned baseline.
+  After the configured 25-minute budget was exceeded, the verified own
+  Vitest process tree was terminated; the exact command session exited 143
+  after 1,538.6 seconds. The partial output is retained in
+  `check-phase4-nonroot.log`. No final Vitest totals were produced, and the
+  subsequent build and migration steps were not reached. This is not a
+  green aggregate gate; additional catalog failures are not individually
+  classified without the final failure summaries.
+
+The actual GitHub Check on the published final SHA is not verified locally;
+the Conductor owns publishing and observing the required check. The original
+audit's exact eight failures and the historical desktop-only coverage gaps
+remain limitations, as recorded above. No production/live-app verification
+is claimed. Delivery remains blocked until a clean full gate and the actual
+required GitHub Check are recorded.
