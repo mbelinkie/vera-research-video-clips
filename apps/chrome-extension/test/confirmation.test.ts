@@ -104,6 +104,7 @@ async function runConfirmation(
       document: { getElementById: byId },
       window: {},
       location: { hash: "#" + requestId },
+      URL,
       Option: class {},
       crypto: { randomUUID: () => "fresh-request-id" },
       chrome: {
@@ -184,6 +185,80 @@ it("samples a frozen time once and sends a separate moment note", async () => {
       ([message]) => message.type === "vera.capture.youtube-playhead",
     ),
   ).toHaveLength(1);
+});
+
+it.each(["rejects", "resolves"] as const)(
+  "keeps the completed moment save unchanged when the pending reason lookup %s",
+  async (outcome) => {
+    let finishLookup!: () => void;
+    let failLookup!: (error: Error) => void;
+    const delayReason = new Promise<void>((resolve, reject) => {
+      finishLookup = resolve;
+      failLookup = reject;
+    });
+    const fixture = await runConfirmation({ delayReason });
+    const lookupIndex = fixture.gateway.mock.calls.findIndex(([, path]) =>
+      path.endsWith("/youtube-source"),
+    );
+    expect(lookupIndex).toBeGreaterThanOrEqual(0);
+    const lookup = fixture.gateway.mock.results[lookupIndex]!.value;
+    expect(fixture.byId("submit").disabled).toBe(true);
+    fixture.byId("time").checked = true;
+    await fixture.byId("time").onchange!();
+    expect(fixture.byId("submit").disabled).toBe(false);
+    fixture.byId("note").value = "A moment to revisit";
+    fixture.byId("note").oninput!();
+    await fixture.byId("save").onsubmit!({ preventDefault() {} });
+    expect(fixture.captures).toHaveLength(1);
+    expect(fixture.captures[0]).toMatchObject({
+      youtubeDetails: {
+        kind: "moment",
+        timecodeMs: 193001,
+        note: "A moment to revisit",
+      },
+    });
+    const savedStatus =
+      "Moment saved in Editorial. The video is in the transcription queue.";
+    expect(fixture.byId("status").textContent).toBe(savedStatus);
+    expect(fixture.byId("retry").hidden).toBe(true);
+    expect(fixture.byId("fields").disabled).toBe(true);
+    expect(fixture.byId("reason").value).toBe("");
+    if (outcome === "rejects") {
+      failLookup(new Error("Lookup failed"));
+      await expect(lookup).rejects.toThrow("Lookup failed");
+    } else {
+      finishLookup();
+      await expect(lookup).resolves.toMatchObject({
+        reason: { text: "Compare this video." },
+      });
+    }
+    expect(fixture.byId("status").textContent).toBe(savedStatus);
+    expect(fixture.byId("retry").hidden).toBe(true);
+    expect(fixture.byId("reason").value).toBe("");
+    expect(fixture.byId("fields").disabled).toBe(true);
+    expect(fixture.captures).toHaveLength(1);
+  },
+);
+
+it("still reports a reason lookup failure before saving and allows an explicit reason edit", async () => {
+  let failLookup!: (error: Error) => void;
+  const delayReason = new Promise<void>((_resolve, reject) => {
+    failLookup = reject;
+  });
+  const fixture = await runConfirmation({ delayReason });
+  failLookup(new Error("Lookup failed"));
+  await vi.waitFor(() => expect(fixture.byId("retry").hidden).toBe(false));
+  expect(fixture.byId("status").textContent).toContain("Refresh projects");
+  fixture.byId("reason").value = "Explicit reason";
+  fixture.byId("reason").oninput!();
+  await fixture.byId("save").onsubmit!({ preventDefault() {} });
+  expect(fixture.captures[0]).toMatchObject({
+    youtubeDetails: { kind: "general", reason: "Explicit reason" },
+  });
+  expect(fixture.byId("status").textContent).toContain(
+    "Video saved in Editorial",
+  );
+  expect(fixture.byId("retry").hidden).toBe(true);
 });
 
 it("restores separate reason and moment drafts across mode switches", async () => {
