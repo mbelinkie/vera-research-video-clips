@@ -1,7 +1,44 @@
 import { expect, test, type Page } from "@playwright/test";
+import {
+  CreateClipCandidateRequestSchema,
+  CreateClipExportRequestSchema,
+  CreateExportOnlyRequestSchema,
+} from "@research-video/contracts";
 import { normalizeTranscriptFixture } from "@research-video/transcript";
 import captionFixture from "../fixtures/transcripts/auto-word-timed.json" with { type: "json" };
 import englishFixture from "../fixtures/transcripts/english-word.json" with { type: "json" };
+
+const unexpectedPageErrors = new WeakMap<Page, string[]>();
+
+test.beforeEach(async ({ page }) => {
+  const errors: string[] = [];
+  unexpectedPageErrors.set(page, errors);
+  page.on("pageerror", (error) => errors.push(error.message));
+  // Specific synthetic routes registered by each test take precedence.
+  // No unhandled API request may reach a backend, even if one is running.
+  const isBackend = (url: URL) =>
+    url.pathname.startsWith("/cloud-api/") ||
+    url.pathname.startsWith("/local-agent/");
+  await page.route(
+    (url) => url.origin !== "http://127.0.0.1:43112" || isBackend(url),
+    (route) => {
+      const url = new URL(route.request().url());
+      if (url.origin !== "http://127.0.0.1:43112") return route.abort();
+      return route.fulfill({ status: 404, json: {} });
+    },
+  );
+});
+
+test.afterEach(({ page }) => {
+  expect(unexpectedPageErrors.get(page)).toEqual([]);
+});
+
+async function waitForHostedPlayer(page: Page) {
+  await expect(page.locator(".player-frame")).toHaveAttribute(
+    "data-player-state",
+    "ready",
+  );
+}
 
 const liveProject = "019fbb95-cd76-7920-93fa-e23ba755ee40";
 const secondProject = "019fbb95-cd76-7920-93fa-e23ba755ee48";
@@ -265,6 +302,7 @@ for (const source of ["caption", "asr", "failed"] as const) {
       await expect(
         page.getByText(/test fixture—not|Navigation fixture for the API demo/),
       ).toHaveCount(0);
+      await waitForHostedPlayer(page);
       if (source === "caption") {
         await page.getByRole("button", { name: "closely" }).click();
         await expect(
@@ -486,6 +524,7 @@ test.beforeEach(async ({ page }) => {
           events: {
             onReady(): void;
             onStateChange(event: { data: number }): void;
+            onError(event: { data: number }): void;
           };
         },
       ) {
@@ -512,6 +551,9 @@ test.beforeEach(async ({ page }) => {
           __lastSeekSeconds: options.startSeconds,
           __playCalls: Number(Reflect.get(window, "__playCalls") ?? 0) + 1,
         });
+      }
+      getDuration() {
+        return 4000; // synthetic duration includes the last timed-caption cue
       }
       getCurrentTime() {
         return this.currentTime;
@@ -552,6 +594,7 @@ test("loads a canonical YouTube video and seeks from its transcript", async ({
   await page.getByRole("button", { name: "Load video" }).click();
   await expect(page.getByText("word timing", { exact: true })).toBeVisible();
   await expect(page.getByTestId("transcript-window-row")).toHaveCount(2);
+  await waitForHostedPlayer(page);
   await page.getByRole("button", { name: "any word", exact: true }).click();
 
   await expect(page.getByText("Word requested 0:02.")).toBeVisible();
@@ -1002,7 +1045,27 @@ test("timed auto-caption fixture seeks exact starts and retains derived-end sele
       path === `/cloud-api/api/projects/${projectId}/clips` &&
       route.request().method() === "POST"
     ) {
-      const body = route.request().postDataJSON();
+      const body = CreateClipCandidateRequestSchema.parse(
+        route.request().postDataJSON(),
+      );
+      expect(body.languageEvidence).toMatchObject({
+        schemaVersion: 2,
+        native: {
+          role: "native",
+          language: "en",
+          trackId: captionFixture.track.id,
+          trackVersion: 1,
+        },
+        english: {
+          role: "english",
+          language: "en",
+          trackId: captionFixture.track.id,
+          trackVersion: 1,
+        },
+      });
+      expect(body.languageEvidence?.english.text).toContain(
+        "closely now please",
+      );
       loggedSelection = body.selection;
       return route.fulfill({
         status: 201,
@@ -1012,7 +1075,7 @@ test("timed auto-caption fixture seeks exact starts and retains derived-end sele
           catalogVideoId: "019fbb95-cd76-7920-93fa-e23ba755ee43",
           video: body.video,
           selection: body.selection,
-          englishText: body.englishText,
+          languageEvidence: body.languageEvidence,
           notes: body.notes,
           tags: body.tags,
           researchStatus: "candidate",
@@ -1026,7 +1089,9 @@ test("timed auto-caption fixture seeks exact starts and retains derived-end sele
     }
     if (path.endsWith("/exports") && route.request().method() === "POST") {
       loggedExportRequests += 1;
-      const body = route.request().postDataJSON();
+      const body = CreateClipExportRequestSchema.parse(
+        route.request().postDataJSON(),
+      );
       return route.fulfill({
         status: 201,
         json: {
@@ -1042,6 +1107,7 @@ test("timed auto-caption fixture seeks exact starts and retains derived-end sele
           },
           selection: loggedSelection,
           sourceLanguageClass: body.sourceLanguageClass,
+          sourceRights: body.sourceRights,
           preset: body.preset,
           state: "queued",
           createdAt: now,
@@ -1058,7 +1124,9 @@ test("timed auto-caption fixture seeks exact starts and retains derived-end sele
     return route.fulfill({ status: 404, json: { error: "not found" } });
   });
   await page.route("**/local-agent/api/exports", async (route) => {
-    const body = route.request().postDataJSON();
+    const body = CreateExportOnlyRequestSchema.parse(
+      route.request().postDataJSON(),
+    );
     exportedSelection = body.selection;
     return route.fulfill({
       status: 201,
@@ -1069,6 +1137,7 @@ test("timed auto-caption fixture seeks exact starts and retains derived-end sele
         video: body.video,
         selection: body.selection,
         sourceLanguageClass: body.sourceLanguageClass,
+        sourceRights: body.sourceRights,
         preset: body.preset,
         state: "queued",
         createdAt: now,
@@ -1086,6 +1155,7 @@ test("timed auto-caption fixture seeks exact starts and retains derived-end sele
     "title",
     "Exact caption word start 11.840s; derived end (estimate) 12.030s",
   );
+  await waitForHostedPlayer(page);
   await page.getByRole("button", { name: "closely" }).click();
   await expect(
     page.getByText(/Exact caption start requested 11.840s/),
@@ -1236,6 +1306,7 @@ test("updates a running preview when the selected passage changes", async ({
         }>,
     );
 
+  await waitForHostedPlayer(page);
   await selectRange("closely", "please");
   const panel = page.getByLabel("Clip selection");
   await expect(panel).toContainText("Transcript selection: 11.840s–13.100s");
@@ -1317,14 +1388,34 @@ test("maps transcript text selection to stable source and export bounds", async 
         return route.fulfill({ json: loggedClip ? [loggedClip] : [] });
       }
       clipPostCount += 1;
-      const body = request.postDataJSON();
+      const body = CreateClipCandidateRequestSchema.parse(
+        request.postDataJSON(),
+      );
+      expect(body.languageEvidence).toMatchObject({
+        schemaVersion: 2,
+        native: {
+          role: "native",
+          language: "en",
+          trackId: englishFixture.track.id,
+          trackVersion: 1,
+        },
+        english: {
+          role: "english",
+          language: "en",
+          trackId: englishFixture.track.id,
+          trackVersion: 1,
+        },
+      });
+      expect(body.languageEvidence?.english.text).toContain(
+        "fixture has accurate word timing. Click any word",
+      );
       loggedClip = {
         id: "019fbb95-cd76-7920-93fa-e23ba755ee42",
         projectId: createdProjectId,
         catalogVideoId: "019fbb95-cd76-7920-93fa-e23ba755ee43",
         video: body.video,
         selection: body.selection,
-        englishText: body.englishText,
+        languageEvidence: body.languageEvidence,
         notes: body.notes,
         tags: ["Opening", "Person: Ada"],
         researchStatus: "candidate",
@@ -1369,7 +1460,7 @@ test("maps transcript text selection to stable source and export bounds", async 
       `/cloud-api/api/projects/${createdProjectId}/clips/019fbb95-cd76-7920-93fa-e23ba755ee42/exports`
     ) {
       loggedExportPostCount += 1;
-      const body = request.postDataJSON();
+      const body = CreateClipExportRequestSchema.parse(request.postDataJSON());
       return route.fulfill({
         status: 201,
         json: {
@@ -1383,21 +1474,9 @@ test("maps transcript text selection to stable source and export bounds", async 
             canonicalUrl: "https://www.youtube.com/watch?v=M7lc1UVf-VE",
             title: "YouTube IFrame API demo",
           },
-          selection: body.selection ?? {
-            trackId: "019fbb95-cd76-7920-93fa-e23ba755e301",
-            transcriptVersion: 1,
-            firstSegmentId: "019fbb95-cd76-7920-93fa-e23ba755e311",
-            lastSegmentId: "019fbb95-cd76-7920-93fa-e23ba755e312",
-            firstTokenId: "019fbb95-cd76-7920-93fa-e23ba755e322",
-            lastTokenId: "019fbb95-cd76-7920-93fa-e23ba755e326",
-            transcriptStartMs: 300,
-            transcriptEndMs: 2_900,
-            exportStartMs: 0,
-            exportEndMs: 3_400,
-            text: "fixture has accurate word timing. Click any word",
-            timingPrecision: "word",
-          },
+          selection: loggedClip?.selection,
           sourceLanguageClass: body.sourceLanguageClass,
+          sourceRights: body.sourceRights,
           preset: body.preset,
           state: "queued",
           createdAt: now,
@@ -1415,7 +1494,9 @@ test("maps transcript text selection to stable source and export bounds", async 
   });
   await page.route("**/local-agent/api/exports", async (route) => {
     exportOnlyPostCount += 1;
-    const body = route.request().postDataJSON();
+    const body = CreateExportOnlyRequestSchema.parse(
+      route.request().postDataJSON(),
+    );
     return route.fulfill({
       status: 201,
       json: {
@@ -1425,6 +1506,7 @@ test("maps transcript text selection to stable source and export bounds", async 
         video: body.video,
         selection: body.selection,
         sourceLanguageClass: body.sourceLanguageClass,
+        sourceRights: body.sourceRights,
         preset: body.preset,
         state: "queued",
         createdAt: now,
@@ -1435,6 +1517,8 @@ test("maps transcript text selection to stable source and export bounds", async 
   await page.goto("/?fixture=english-word");
   await page.getByRole("button", { name: "Load video" }).click();
 
+  await waitForHostedPlayer(page);
+  await expect(page.getByTestId("transcript-window-row")).toHaveCount(2);
   await page.evaluate(() => {
     const anchor = Array.from(
       document.querySelectorAll<HTMLElement>("[data-transcript-token-id]"),

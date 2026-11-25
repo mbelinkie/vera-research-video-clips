@@ -43,3 +43,10 @@ jobs:
           /usr/local/bin/ffmpeg -version | head -n 1
       - name: Format, typecheck, tests, build and migration checks
         run: npm run check
+      - name: Install locked Playwright Chromium
+        run: npx --no-install playwright install --with-deps chromium
+      - name: Workspace browser tests
+        run: npm run test:e2e -- tests/e2e/workspace.spec.ts --project=chromium
+        env:
+          VITE_BROWSER_AUTH: "false"
+          VITE_MANAGED_RESEARCH: "false"
