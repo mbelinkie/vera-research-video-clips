@@ -685,7 +685,11 @@ describe("project Library API", () => {
     expect(item).toMatchObject({
       sourceId: source.id,
       kind: "clip",
-      content: { startMs: 0, endMs: 3_400, text: itemInput.clip.selection.text },
+      content: {
+        startMs: 0,
+        endMs: 3_400,
+        text: itemInput.clip.selection.text,
+      },
       notes: itemInput.clip.notes,
       topics: itemInput.clip.tags,
     });
@@ -746,8 +750,7 @@ describe("project Library API", () => {
       // the hosted API needs the identity, provider and comment schema that
       // the pilot added before the Library, so 0001-0009 alone cannot serve it.
       const filenames = (await readdir(migrations)).filter(
-        (filename) =>
-          /^\d{4}_.*\.sql$/u.test(filename) && filename < "0053_",
+        (filename) => /^\d{4}_.*\.sql$/u.test(filename) && filename < "0053_",
       );
       expect(filenames.length).toBeGreaterThan(0);
       expect(filenames).not.toContain("0053_project_library.sql");

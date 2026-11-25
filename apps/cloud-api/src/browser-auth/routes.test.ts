@@ -647,21 +647,17 @@ it("pairs once with same-origin consent, then queues an attributed video from Ch
   expect(await read(commentsPath + "?offset=2")).toEqual(comments.slice(2));
   const videoPath = base + "/videos/" + items[0].catalogVideoId;
   const gate = await read(videoPath + "/language-gate");
-  const confirmation = await post(
-    videoPath + "/language-decisions",
-    web,
-    {
-      idempotencyKey: "chrome-queue:confirm-en",
-      expectedDecisionVersion: gate.decision?.decisionVersion ?? 0,
-      resolvedLanguage: "en",
-      basis: "user_confirmation",
-      ...(gate.providerEvidence?.id
-        ? { evidenceId: gate.providerEvidence.id }
-        : {}),
-      batchItemId: items[0].id,
-      expectedBatchItemVersion: items[0].version,
-    },
-  );
+  const confirmation = await post(videoPath + "/language-decisions", web, {
+    idempotencyKey: "chrome-queue:confirm-en",
+    expectedDecisionVersion: gate.decision?.decisionVersion ?? 0,
+    resolvedLanguage: "en",
+    basis: "user_confirmation",
+    ...(gate.providerEvidence?.id
+      ? { evidenceId: gate.providerEvidence.id }
+      : {}),
+    batchItemId: items[0].id,
+    expectedBatchItemVersion: items[0].version,
+  });
   expect(confirmation.statusCode, confirmation.body).toBe(200);
   expect(
     (await read(base + "/transcription-batches/" + queued.json().batchId))
