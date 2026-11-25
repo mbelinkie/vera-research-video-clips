@@ -7,11 +7,43 @@ import fixture from "../../../tests/fixtures/transcripts/spanish-bilingual.json"
 import { translateCanonicalTranscript } from "./index.ts";
 import {
   AwsTranslationProvider,
+  createAwsTranslationProviderAdapterFactory,
   createTranslationProvider,
   splitForAmazonTranslate,
 } from "./translation-aws.ts";
 
 describe("AwsTranslationProvider", () => {
+  it("preflights its pinned language table without sending transcript text", async () => {
+    const sender = vi.fn();
+    const provider = new AwsTranslationProvider({
+      region: "us-east-1",
+      sender,
+    });
+
+    expect(provider.checkLanguagePair("ko-KR", "en-US")).toMatchObject({
+      state: "supported",
+      provider: "amazon-translate",
+      operation: "translation",
+      sourceLanguage: "ko-KR",
+      targetLanguage: "en-US",
+      version: expect.any(String),
+    });
+    expect(provider.checkLanguagePair("dz", "en")).toMatchObject({
+      state: "unsupported",
+      sourceLanguage: "dz",
+      targetLanguage: "en",
+      reason: "language_not_supported",
+    });
+    await expect(
+      provider.translate({
+        sourceLanguage: "dz",
+        targetLanguage: "en",
+        segments: [{ id: "segment-1", text: "fixture text" }],
+      }),
+    ).rejects.toMatchObject({ code: "provider_execution_failed" });
+    expect(sender).not.toHaveBeenCalled();
+  });
+
   it("is opt-in and sends only segment text through the AWS adapter", async () => {
     const sender = vi.fn(async () => ({
       TranslatedText: "This is a short example.",
@@ -50,6 +82,31 @@ describe("AwsTranslationProvider", () => {
       },
       undefined,
     );
+  });
+
+  it("keeps the Amazon registry factory descriptor safe while retaining historical provenance", async () => {
+    const sender = vi.fn(async () => ({ TranslatedText: "Hello" }));
+    const factory = createAwsTranslationProviderAdapterFactory({
+      region: "us-east-1",
+      terminologyName: "essay-terms",
+      sender,
+    });
+
+    expect(factory.descriptor).toMatchObject({
+      id: "amazon-translate",
+      service: "translation",
+      state: "enabled",
+    });
+    expect(factory.descriptor).not.toHaveProperty("region");
+    expect(factory.descriptor).not.toHaveProperty("terminologyName");
+    expect(factory.descriptor).not.toHaveProperty("sender");
+    await expect(
+      factory.create().translate({
+        sourceLanguage: "es",
+        targetLanguage: "en",
+        segments: [{ id: "segment-1", text: "Hola" }],
+      }),
+    ).resolves.toMatchObject({ provider: "amazon-translate" });
   });
 
   it("keeps every request below the service byte limit", async () => {

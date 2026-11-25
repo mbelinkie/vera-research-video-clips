@@ -1,6 +1,12 @@
-# Project outline
+# Project outline — historical snapshot
 
-This is the short execution map. `PROJECT_GUIDE.md` contains the authoritative product, architecture, data, security, and acceptance details.
+> **Live roadmap moved to GitHub on 2026-08-28.** This file preserves the prior
+> execution map and acceptance history. Do not infer current priority, status,
+> ownership, dependencies, or model routing from the checkboxes below. Use the
+> **VERA Research Roadmap** configured in `.github/vera-roadmap.json`.
+
+This was the short execution map. `PROJECT_GUIDE.md` remains authoritative for
+product, architecture, data, security, and acceptance details.
 
 ## Delivery workflow
 
@@ -33,16 +39,42 @@ In a shared project, load or batch-submit YouTube videos, reuse an online Englis
 - `Queue / log only` requires a visible project and never starts export work.
 - `Export + log` requires a visible project, creates the durable log entry first, then requests a job.
 - `Export only` creates a durable local technical job but no project clip/log/spreadsheet entry.
-- Both logging actions accept optional multiline usage notes and reusable project-scoped free-form tags, committed atomically with the clip and available to search/filter and CSV/Sheets.
+- Both logging actions accept optional multiline usage notes and reusable project-scoped free-form tags, committed atomically with the clip and available to search/filter, CSV, and optional external catalog projections.
+- A completed export record is not sufficient proof that package bytes are still reachable; reusable artifacts are resolved by immutable manifest/hash identity and verified locators.
+- The immutable logged-export success-result ID is `artifactVersionId`; every
+  re-export creates a new request, package, and artifact version without
+  overwriting history.
+- Direct Clip Library exports and script-driven exports use the same durable request, worker, and immutable artifact boundaries.
 - Export actions use selectable named conversion presets and supported per-export overrides.
 - Every render job stores an immutable resolved-settings snapshot so later preset edits cannot change queued work or retries.
 - Foreign/mixed/unknown-language clips always get clip-relative original and English-translation SRTs; confirmed-English clips get an English SRT by default and may explicitly omit sidecar files.
 - A full authorized source may be downloaded behind the scenes, but only into isolated job-scoped scratch storage; reuse it for active dependent work and verify deletion before the job is complete.
 - Never log to a hidden or implicit project; a preselected project must remain visible and changeable.
 - Preserve original and English tracks, provenance, version, and timing precision.
+- Treat transcript language preference as personal account state. Resolve
+  equivalent native/English tracks first, then verified immutable translations
+  derived directly from the original track for any supported BCP-47 target.
+- Every new logged clip freezes schema-version-2 native and English language
+  evidence plus a distinct preferred-language role when required; preference
+  changes never rewrite existing clips.
 - Use stable IDs and integer source-video milliseconds.
 - Never regenerate or replace a completed version silently.
+- Recommend 10 GB free without using it as a global gate. Heavy operations
+  preflight known input/output plus a 2 GB reserve; unknown source size warns and
+  is rechecked after acquisition, while browsing/review/logging stay available.
+- M7 delivers Research Video Clips on the current Intel macOS 15 workstation as
+  a locally built Electron `.app` that retains the authenticated loopback local-
+  agent boundary and needs no terminal for ordinary use.
+- M8 turns the M7-validated application into signed, self-updating macOS 15+
+  Universal and Windows 11 23H2+ x64 releases for remote testers.
 - Keep platform, media, transcription, translation, alignment, object storage, dispatch, and sync details behind adapters.
+- Local Whisper and signed-catalog Argos are the default transcription and
+  translation providers. Cloud providers are opaque registered adapters with
+  provider-specific consent, approval, launch grants, pricing, and provenance;
+  a failure may fall back only to the corresponding local provider.
+- Desktops consume immutable signed local-model catalog releases and exact
+  mirrored bytes, never the mutable upstream Argos feed. Compatible packs can
+  be enabled, disabled, revoked, or rolled back without rebuilding the app.
 
 ## Main workflows
 
@@ -73,6 +105,18 @@ Open project -> create named batch -> paste URLs/import CSV
   -> upload/finalize shared transcript versions
   -> ready items enter Ready for review
   -> failed/blocked items retain useful remediation + retry
+```
+
+### Later clip export and authoring handoff
+
+```text
+Open project -> Clips -> search/filter logged clips -> select one or many
+  -> choose resolved preset -> request durable export batch
+  -> verify immutable packages and independent status
+  -> reveal/retry/re-export as needed
+  -> scriptwriting client searches by stable clip ID
+       -> compatible reachable package? verify + reuse
+       -> locator missing? relink and verify, or request durable re-export
 ```
 
 ## Build order
@@ -121,7 +165,7 @@ Milestone 1 completed 2026-08-01. The development CloudFormation stack provision
 
 Gate: a long local/shared transcript is fast and drives navigation without regeneration.
 
-Milestone 2 completed 2026-08-01. URL normalization, provider-backed metadata persistence/listing, canonical transcript validation, shared-first verified-cache reuse, compressed artifact parsing, and transactional SQLite indexing are implemented behind the local-agent boundary. The workspace uses a windowed segment renderer, exact timed-word seeking with honest cue fallback, playback-driven active segment/token state, follow controls, and literal search with next/previous navigation. The labeled fixture drives the real player wrapper, arbitrary videos never receive fabricated transcript text, a 10,000-segment window test stays bounded, and a second shared resolution reuses the verified cache without downloading again.
+Milestone 2 completed 2026-08-01; word click-to-play refined 2026-08-25. URL normalization, provider-backed metadata persistence/listing, canonical transcript validation, shared-first verified-cache reuse, compressed artifact parsing, and transactional SQLite indexing are implemented behind the local-agent boundary. The workspace uses a windowed segment renderer; token activation seeks and plays from exact stored word timing or an honestly labeled playback-only estimate within a cue. The same ephemeral bounds drive active-word highlighting without changing cue-level selections, exports, or transcript bytes; cue timestamps and other navigation remain seek-only. Follow controls and literal search with next/previous navigation remain intact. The labeled fixture drives the real player wrapper, arbitrary videos never receive fabricated transcript text, a 10,000-segment window test stays bounded, and a second shared resolution reuses the verified cache without downloading again.
 
 ### 3. Batch transcript resolution
 
@@ -133,6 +177,11 @@ Milestone 2 completed 2026-08-01. URL normalization, provider-backed metadata pe
 - [x] Normalize acquired WebVTT into deterministic canonical tracks: preserve unambiguous YouTube automatic-caption word starts and label their derived ends; manual and translated captions remain cue timed.
 - [x] Add a provider-neutral, time-linked translation adapter with an opt-in Amazon Translate implementation.
 - [x] Add opt-in authorized audio acquisition and multilingual speech-to-text adapters.
+- [x] Add a provider-neutral cloud registry, provider-specific grants/metering,
+  and dynamic account/admin/batch provider controls.
+- [x] Add the administrator-governed Argos source/evaluation/catalog lifecycle,
+  signed release-bound downloads, durable local installs/leases, and local-first
+  direct or English-hub execution.
 - [x] Add opt-in local acoustic word alignment for supported captioned and speech-recognized transcripts (#47).
 - [x] Persist item preflight/stage/review state, attempts, errors, options, idempotency keys, and shared job links.
 - [x] Add authenticated atomic claim, expiring lease, heartbeat stages, stale-attempt rejection, and expiry recovery in the shared catalog/API.
@@ -172,6 +221,23 @@ Twelfth slice completed 2026-08-01. Projects now have authorized batch discovery
 
 Thirteenth slice completed 2026-08-01. The batch creation surface now imports CSV through the established Papa Parse library behind a bounded helper. Files are limited to 2 MB, 50 columns, and the existing 500-item batch ceiling; malformed quoting fails closed, recognized URL headers are suggested, ambiguous multi-column files require an explicit column choice, and headerless one-column lists work. Applying an import only replaces the editable URL list and invalidates stale preflight—nothing is submitted until the researcher runs the normal authorized preflight. Empty rows are reported, duplicates remain for server-side labeling, and unit plus browser tests cover quoted fields, embedded newlines, malformed files, bounds, explicit application, and preflight handoff.
 
+Fourteenth slice completed 2026-08-27. Language services now use opaque
+provider IDs and backend adapter factories; Amazon Translate and Amazon
+Transcribe are initial adapters rather than contract assumptions. Provider
+access, disclosures, launch grants, account preferences, operations, cleanup,
+and usage are provider-specific and durable. Platform administrators can
+discover and evaluate exact Argos package bytes, enable only hard-safe versions
+(or audit an advisory override), and publish immutable Ed25519-signed catalog
+releases. Workers and the local agent persist verified catalogs, installations,
+and leases in SQLite, accept only current-release-bound downloads for new
+installs, execute a direct or exactly two-leg English route locally, retain
+installed models offline, and delete revoked bytes after leases drain. Local is
+the default; explicit cloud failure restarts the whole source locally once and
+never selects another cloud vendor. Focused provider/control-plane tests,
+typecheck, both migration suites, the production web build, and all aggregate
+test assertions passed; separately authorized live-provider, real-pack, and
+packaged-platform smoke checks remain release validation.
+
 ### 4. Selection + clip queue
 
 - [x] Map DOM selection to stable token ranges.
@@ -188,6 +254,18 @@ Thirteenth slice completed 2026-08-01. The batch creation surface now imports CS
 
 Gate: logging requires a visible project and atomically preserves entered notes/tags; queue-only starts no media work; export-only creates no project/shared log entry or project research metadata.
 
+PL-01 completed 2026-08-20. Account language preferences normalize general
+BCP-47 tags and default to English. Exact verified non-English derivatives are
+reused local-first, then from the authorized project store, before one
+direct-from-original provider request; publication leaves the active
+source-plus-English transcript unchanged. A deterministic Romanian/English/
+Spanish proof exercises time-stable language views and search, strict
+three-role logging through API/database/reload/CSV, second-workstation reuse,
+offline evidence replay, and later preference changes without historical
+mutation. New clip writes use strict language-evidence schema version 2 while
+legacy version-1 reads remain conservative. Preferred display/logging does not
+produce preferred SRT artifacts.
+
 ### 5. Clip export
 
 The **narrow foreground logged-clip cutting path (#20)** now has a documented
@@ -197,50 +275,254 @@ integration and guard-mutation checks. Real rights-cleared Mac playback and
 source verification remain to be accepted. This does **not** close the broader
 queued M5 worker, preset, recovery or full milestone acceptance items below.
 
-- [ ] M5-01: authorized full-source acquisition and verified job-scoped scratch lifecycle (`specs/active/M5-01-authorized-source-acquisition-and-scratch-lifecycle.md`).
-- [ ] Acquire the full authorized source when needed into isolated job-scoped scratch storage.
+- [x] M5-01: authorized full-source acquisition and verified job-scoped scratch lifecycle (`specs/completed/M5-01-authorized-source-acquisition-and-scratch-lifecycle.md`).
+- [x] Acquire the full authorized source when needed into isolated job-scoped scratch storage.
 - [ ] Group active same-source exports where practical so one download can cut many requested ranges.
-- [ ] Delete and verify source cleanup after success, failure, or cancellation.
+- [x] Delete and verify source cleanup after success, failure, or cancellation.
 - [ ] Add cleanup retries plus an abandoned-scratch sweeper/lifecycle backstop for worker crashes.
-- [ ] Validate bounds and inspect input with FFprobe.
-- [ ] Add named personal/project conversion presets and immutable preset versions.
-- [ ] Add project/global defaults plus per-export overrides.
-- [ ] Add capability-aware settings for container, codecs, quality/bitrate, dimensions/frame rate, audio, subtitle embedding, padding, output, and supported acceleration.
-- [ ] Add `Omit subtitle files for English-language clips`, default off; snapshot it in presets/jobs and apply it only when source language is confidently English.
-- [ ] Store the fully resolved settings snapshot on every export job and retry.
-- [ ] Re-encode using an editing-friendly H.264/AAC MP4 default plus supported alternative settings.
-- [ ] Generate and validate a clip-specific English SRT by default for English-language exports; omit sidecars only through the explicit checkbox.
-- [ ] For foreign/mixed/unknown-language clips, always derive both original-language and translated-English SRTs even if the selected preset carries the English-only omission preference.
-- [ ] Trim/clamp cues to actual padded export bounds, zero-base timestamps, and block completion when required subtitles are missing or mismatched.
-- [ ] Add optional embedded soft subtitle track.
-- [ ] Generate thumbnail, metadata JSON, and manifest.
-- [ ] Use staging plus atomic completion.
-- [ ] Add progress, retry, safe cancellation, and batch export.
+- [x] M5-02: inspect verified local source with provider-neutral FFprobe and
+  persist duration-clamped resolved bounds (`specs/completed/M5-02-ffprobe-inspection-and-resolved-export-bounds.md`).
+- [x] Validate bounds and inspect input with FFprobe.
+- [x] M5-03: render and FFprobe-verify one resolved H.264/AAC MP4 range in
+  private attempt staging (`specs/completed/M5-03-ffmpeg-adapter-and-verified-single-range-render.md`).
+- [x] M5-04: derive, re-parse, and pair-validate one confirmed-English
+  clip-relative SRT in private attempt staging
+  (`specs/completed/M5-04-verified-confirmed-english-subtitle-sidecar-staging.md`).
+- [x] M5-05: derive, re-parse, and pair-validate required clip-relative
+  original-language and translated-English SRTs for foreign/mixed/unknown
+  snapshots in private attempt staging
+  (`specs/completed/M5-05-verified-foreign-language-bilingual-subtitle-sidecar-staging.md`).
+- [x] M5-06: honor a confirmed-English snapshot's explicit sidecar omission
+  after verified temporary-MP4 staging, without transcript lookup or staged SRT,
+  and retain only safe omission provenance
+  (`specs/completed/M5-06-verified-confirmed-english-subtitle-omission-staging.md`).
+- [x] M5-07: atomically promote only the already validated MP4 plus exact
+  language-policy sidecars into a deterministic sanitized local package,
+  re-verify safe artifact provenance, and complete only after source cleanup
+  succeeds (`specs/completed/M5-07-verified-final-clip-package-promotion.md`).
+- [x] M5-08: compose the existing local export lifecycle into one explicit,
+  authorization-confirmed `export:run-once` command and prove the complete
+  export-only media/package path with repository-owned fixture media plus real
+  FFmpeg/FFprobe (`specs/completed/M5-08-local-export-runtime-composition-and-real-tool-smoke.md`).
+- [x] M5-09: promote one verified `manifest.json` provenance record inside every
+  clip package before it becomes visible, recording source identity, subtitle
+  policy, resolved bounds, FFprobe/FFmpeg versions, and each artifact's size and
+  SHA-256 (`specs/completed/M5-09-verified-clip-package-manifest.md`).
+- [x] M5-10: stage and verify a descriptive `clip-<id>.json` metadata sidecar,
+  include its hash in the manifest, and retain legacy manifest readers
+  (`specs/completed/M5-10-verified-clip-metadata-sidecar.md`).
+- [x] M5-11: derive a bounded midpoint JPEG from the verified rendered clip,
+  independently inspect it, and require it during atomic package finalization
+  (`specs/completed/M5-11-verified-clip-thumbnail-artifact.md`).
+- [x] M5-12: add authorized personal/project conversion preset catalogs with
+  append-only immutable versions, fixed-version defaults, optimistic updates,
+  idempotent commands, and exact saved-snapshot selection
+  (`specs/completed/M5-12-versioned-conversion-preset-catalogs.md`).
+- [x] M5-13: resolve application/default/preset/override settings through an
+  authoritative preview, snapshot deterministic fingerprints on requests and
+  jobs, and reject stale, changed, unsupported, or unavailable settings before
+  acquisition (`specs/completed/M5-13-resolved-export-settings-and-capability-validation.md`).
+- [x] M5-14A: render and FFprobe-verify the bounded software matrix of H.264
+  High/AAC MP4, HEVC Main/AAC MKV, and ProRes 422/PCM MOV, with installed
+  capability discovery, dynamic package roles, and backward-readable manifest/
+  metadata v2 (`specs/completed/M5-14A-capability-driven-alternative-rendering-and-ffprobe-conformance.md`).
+- [x] Add `Omit subtitle files for English-language clips`, default off;
+  snapshot it in presets/jobs and apply it only when source language is
+  confidently English.
+- [x] Store the fully resolved settings snapshot on every export job and retry.
+- [x] Re-encode using an editing-friendly H.264/AAC MP4 default plus the two
+  verified alternative families.
+- [x] Generate and validate a clip-specific English SRT by default for
+  confirmed-English exports; an explicit immutable confirmed-English omission
+  snapshot stages no SRT, while foreign/mixed/unknown requests continue to use
+  the mandatory bilingual path.
+- [x] For foreign/mixed/unknown-language clips, always derive both original-language and translated-English SRTs even if the selected preset carries the English-only omission preference.
+- [x] Trim/clamp required sidecar cues to actual padded export bounds, zero-base timestamps, and block this staging lifecycle when required subtitles are missing or mismatched.
+- [x] M5-14B: add one optional embedded English soft subtitle track without
+  replacing any language-policy sidecar, with fixed MP4/MOV `mov_text` and MKV
+  `subrip` mappings, exact English snapshots, and FFprobe conformance
+  (`specs/completed/M5-14B-optional-embedded-english-soft-subtitles.md`).
+- [x] M5-15: persist one local worker identity/epoch, advertise only the typed
+  installed complete renderer profile to the authorized cloud catalog, and read
+  project-authorized compatible-worker availability without delivering work
+  (`specs/completed/M5-15-registered-local-worker-capability-advertisement.md`).
+- [x] M5-16: atomically reserve one exact compatible queued logged export for an
+  active actor-owned project-member worker, import it two-phase into the existing
+  local queue, and recover lost acceptance or reject stale generations without
+  starting media work
+  (`specs/completed/M5-16-authorized-logged-export-delivery-to-local-worker.md`).
+- [x] M5-17: execute one already accepted logged export through the existing
+  local processor and atomically reconcile one immutable sanitized success with
+  exact-replay recovery
+  (`specs/completed/M5-17-execute-and-reconcile-logged-export-success.md`).
+- [x] M5-18: reconcile one persisted terminal-safe accepted logged-export
+  failure through exact pinned authorization, verified absent/deleted scratch,
+  immutable success/failure exclusion, and exact-replay recovery
+  (`specs/completed/M5-18-reconcile-accepted-logged-export-failure.md`).
+- [x] M5-19: safely recover cleanup failures and bounded abandoned deterministic
+  source scratch with exact-child deletion, durable SQLite claims, legacy-layout
+  manual handling, and package/failure recovery
+  (`specs/completed/M5-19-cleanup-recovery-and-abandoned-source-scratch-sweeper.md`).
+- [x] M5-20: create one immutable linear retry child for an exact terminal failed
+  logged export, copy the persisted request/settings snapshots exactly, preserve
+  all parent failure/delivery evidence, and recover exact/concurrent replay
+  without orphan jobs
+  (`specs/completed/M5-20-immutable-retry-of-terminal-failed-logged-export.md`).
+- [x] M5-21: bind accepted logged work to one exact durable execution lease,
+  authorize queued/accepted/executing cancellation, cooperatively terminate the
+  existing processor and child processes, verify exact cleanup, and reconcile
+  one immutable canceled result mutually exclusive with success/failure
+  (`specs/completed/M5-21-safe-cancellation-and-execution-ownership.md`).
+- [x] M5-22: persist one strict monotonic progress snapshot for the exact logged
+  execution, publish it through authenticated heartbeats, reconcile it across
+  restart, and expose only sanitized project-authorized request progress
+  (`specs/completed/M5-22-durable-exact-execution-progress.md`).
+- [x] M5-23: atomically create bounded idempotent logged-export batches as
+  independent immutable child requests, preserve membership across retry,
+  derive sanitized current-leaf status, and prove sibling isolation
+  (`specs/completed/M5-23-durable-batch-export-and-sibling-isolation.md`).
+- [x] Generate and verify thumbnail, metadata JSON, and manifest.
+- [x] Use private staging plus exact-artifact validation and atomic completion.
+- [x] Execute accepted logged requests through the existing local processor and
+  reconcile immutable results with the shared catalog.
+- [x] M5-24: group compatible active logged batch siblings around one durable
+  local source lifecycle while preserving independent execution, progress,
+  staging, package, cancellation, and terminal state; delete only after exact
+  final release (`specs/completed/M5-24-durable-same-source-grouping.md`).
+- [x] M5-25: prove an exact 30-second foreign-language range with a documented
+  rights-cleared synthetic source, exact original/English track versions,
+  boundary-trimmed SRTs, real FFmpeg/FFprobe conformance, package hashes, replay,
+  and verified source deletion
+  (`specs/completed/M5-25-deterministic-30-second-foreign-fixture-gate.md`).
+- [x] M5-26: run one opt-in, explicitly user-authorized foreign-language YouTube
+  range through the existing executor; verify exact bilingual SRT provenance,
+  media/package hashes, source deletion, redacted evidence, and full temporary
+  workspace removal
+  (`specs/completed/M5-26-opt-in-authorized-live-youtube-smoke.md`).
+- [x] M5-27: close the final release matrix with direct real-tool
+  confirmed-English default/omission evidence, queued preset-revision snapshot
+  immutability, the complete behavior map, a clean 270-test aggregate gate,
+  24 local/19 cloud migrations, and four browser flows
+  (`specs/completed/M5-27-final-milestone-5-release-matrix.md`).
 
-Gate: representative presets produce the requested FFprobe properties, queued jobs survive preset edits unchanged, English clips get an SRT by default and can explicitly omit it, foreign/mixed/unknown clips always get original plus translated-English SRTs, a 30-second foreign-language range produces only cues within that 30-second clip, a real authorized smoke test succeeds, and no full source media remains after any terminal path.
+Gate: representative presets produce the requested FFprobe properties, queued jobs survive preset edits unchanged, English clips get an SRT by default and can explicitly omit it, foreign/mixed/unknown clips always get original plus translated-English SRTs, a 30-second foreign-language range produces only cues within that 30-second clip, a real authorized smoke test succeeds, and no full source media remains after any terminal path. M5-08 proves the local export-only composition path with authorized repository fixture media; M5-17 and M5-18 prove exact idempotent cloud success/failure reconciliation for one accepted logged request; M5-19 proves bounded local cleanup recovery without inferring legacy random-layout scratch paths; M5-20 proves immutable linear retry of terminal failed logged exports; M5-21 proves exact execution ownership, safe cancellation, real child termination, and immutable three-way terminal exclusion; M5-22 proves durable exact-execution progress, local/cloud restart reconciliation, and sanitized project reads; M5-23 proves atomic batch composition, retry-leaf membership, mixed sibling status, and one existing executor per item; M5-24 proves one durable shared-source lifecycle with independent child processing and exact last-release deletion; M5-25 proves the exact 30-second foreign bilingual fixture, package hashes, replay, and cleanup; M5-26 proves the explicitly authorized real-source path, bilingual range evidence, redacted result, and whole-workspace cleanup; M5-27 records the complete clean release matrix and closes the two final direct-evidence gaps. The Milestone 5 exit gate is complete.
 
-### 6. Google Sheets
+### 6. Project Clip Library + authoring handoff
 
-- [ ] Configure OAuth and bind a sheet per project.
-- [ ] Keep project ID/name explicit in rows.
-- [ ] Upsert rows by stable clip ID.
-- [ ] Define cloud-owned and sheet-editable fields.
-- [ ] Add export-preset selection and resolve it into a job snapshot when a sheet request is claimed.
-- [ ] Add `Request Export` checkbox/menu action.
-- [ ] Poll requested rows locally or use a hosted relay.
-- [ ] Claim requests idempotently.
-- [ ] Write status/errors/artifact links back.
-- [ ] Add conflict and sync-event logs.
+- [x] M6-01 artifact identity/history: use the immutable M5 logged-export
+      success-result ID as `artifactVersionId`, expose completed history, and add
+      diagnostic-only `selection_action | clip_library | authoring_build`
+      request origin.
+- [x] M6-02 local roots/locators: migrate configured roots and verified relative
+      package locators, safely backfill M5 packages, and prove macOS/Windows
+      containment without sending local paths to the cloud.
+- [x] M6-03 restart-safe Clip Library: add bounded search/filter/pagination,
+      merge cloud history with distinct local availability, cache authorized
+      snapshots, and reconstruct selections/progress/retry state after restart.
+- [x] M6-04 export operations: compose M5 individual/batch behavior, show one
+      immutable settings snapshot per clip, and run storage preflight over unique
+      sources, outputs, active update/checkpoint reserve, and a 2 GB margin.
+- [x] M6-05 artifact recovery: implement verified locator-ID-only reveal/open/
+      verify/relink and explicit `reusable_local | missing | invalid |
+      incompatible | remote_only | needs_export` resolution; preserve old
+      versions across re-export.
+- [x] M6-06 authoring handoff: expose the same authorized clip/history/
+      compatibility/export APIs and return a verified local descriptor only to
+      an online-authorized same-workstation client.
+- [x] M6-07 M7 handoff: add sanitized operation failures/correlation IDs plus
+      drain/quiescence and prove restart recovery for every durable job state.
 
-Gate: one sheet action requests exactly one export and status returns to the same row.
+Gate: three clips from two videos can be searched, storage-preflighted, and
+submitted as one restart-safe batch; same-source acquisition is shared without
+coupling sibling progress/failure/retry/cancel; immutable artifact history stays
+separate from local availability; missing, relinked, tampered, incompatible, and
+re-exported packages resolve correctly; a simulated same-workstation authoring
+client reuses or requests through the same executor; diagnostics contain no
+paths or sensitive content; and low disk blocks only the affected heavy
+operation.
 
-### 7. Research + capacity expansion
+Google Sheets is optional later catalog publishing, not an export control
+surface. Keep CSV; begin with one-way stable-ID publishing only if collaboration
+usage justifies it, and defer selective notes/tags sync until field ownership and
+conflict behavior are proven.
 
-- [ ] Bookmarks, timeline markers, and segment notes.
+### 7. Local desktop completion + personal validation
+
+- [ ] M7-01 production cloud/auth: deploy the ECS Fargate, RDS PostgreSQL,
+      Cognito PKCE, S3/SQS, TLS, secrets, backups, alarms, and least-privilege
+      production boundary; keep PGlite for tests and run Amazon Translate only
+      behind the authenticated project API with explicit opt-in.
+- [x] M7-02 local Intel Mac Electron app: build an unsigned x64 macOS 15 `.app`,
+      harden the renderer/preload boundary, protect OAuth with Keychain-backed
+      `safeStorage`, retain the authenticated loopback agent, and supervise the
+      local agent plus transcription/export workers.
+- [x] M7-03 terminal-free first run/readiness: guide login, projects, roots,
+      rights/privacy, providers, and translation consent; detect or Finder-select
+      installed FFmpeg/FFprobe, yt-dlp, and whisper-cli; download or select and
+      checksum-verify the pinned model; expose `ComponentHealth` and
+      `ReadinessReport` without globally blocking lightweight work.
+- [x] M7-04 complete transcript integration: hydrate verified local/shared
+      transcripts for arbitrary supported videos instead of fixtures only;
+      automatically supervise caption/audio/Whisper/translation/publication and
+      expose progress, retry/cancel, degraded states, review readiness, and all
+      language views without a manual worker command.
+- [ ] M7-05 complete export integration: automatically register/heartbeat the
+      local export worker and claim/process logged plus export-only work; replace
+      manual register, claim/process, one-shot, and `curl` operations with UI
+      rights confirmation while preserving every M5/M6 export, Clip Library,
+      artifact, retry, cancellation, and recovery boundary.
+- [ ] M7-06 personal dogfood/iteration: install and use the local `.app` against
+      the real cloud with authorized English and foreign-language sources; fix
+      blockers and retain restart, degraded-state, low-space, cleanup, and
+      persistence evidence.
+
+Gate: the locally built Intel macOS `.app` completes project creation, real
+transcript resolution/transcription/translation, review, all three selection
+actions, Clip Library operations, and real export/recovery without a terminal,
+manually launched service, development credential, or manual API call. Signing,
+updating, public documentation/reporting, remote installation, cross-platform
+packaging, and independent QA are not M7 exit requirements.
+
+### 8. Signed cross-platform pilot distribution + independent QA
+
+- [ ] M8-01 release identity/dependencies: add semantic build identity, release
+      channels, reproducible manifests, checksums, SBOM, licenses/notices, and
+      signed platform-specific tool/model packs.
+- [ ] M8-02 signed packaging/GitHub publication: produce and verify notarized
+      macOS 15+ Universal DMG/ZIP artifacts and Azure-signed Windows 11 x64
+      Squirrel artifacts from approved tags, then publish public GitHub Releases.
+- [ ] M8-03 updates/recovery/removal: expose `checking | available |
+      downloading | ready | installing | current | failed`, install on quit
+      after M6 quiescence, enforce minimum version only by signed policy,
+      checkpoint/migrate/recover data, and contain reinstall/uninstall/reset.
+- [ ] M8-04 diagnostics/reporting: add previewed bounded support bundles and
+      authenticated `bug | feedback | suggestion` reports with consented
+      contact, default-off diagnostics, durable SQS delivery, and idempotent
+      private `mbelinkie/youtube-clip-converter-feedback` issues.
+- [ ] M8-05 documentation/QA kit: bundle and publish version-matched help; prepare
+      isolated Cognito accounts/projects, fixtures, an authorized-real-source
+      slot, teardown automation, severity rubric, templates, and evidence rules.
+- [ ] M8-06 independent release QA: execute clean install, N-1-to-N update, core
+      workflow, degraded states, reporting, recovery, and uninstall on macOS
+      Apple Silicon, macOS Intel, and Windows 11 x64; fix/retest through newer
+      signed pilot releases and retain the final decision record.
+
+Gate: OPS-01 is complete; all three independent profiles pass with no open
+critical/high defects; the signed updater preserves and drains durable work;
+in-app reports reach private triage exactly once without prohibited content;
+and final artifacts/checksums, help version, QA evidence, teardown, known
+issues, and the release decision are retained.
+
+### 9. Research + capacity expansion
+
+- [x] Project-shared point bookmarks with optional searchable notes and offline
+      replay.
+- [ ] Richer timeline overlays and transcript-segment notes.
 - [ ] Fuzzy/regex/cross-video/semantic search.
 - [ ] Optional AI summaries, quotes, arguments, and B-roll suggestions.
 - [ ] Deploy AWS Batch GPU workers when hosted capacity is justified.
-- [ ] Add autoscaling, priorities, spend controls, and completion notifications.
+- [ ] Add autoscaling, priorities, and spend controls.
+- [x] Add opt-in desktop workflow outcomes and direct-mention notifications.
 - [ ] Add cloud clip storage and richer real-time collaboration only after shared transcripts/batches stabilize.
 
 ## Canonical domains
@@ -266,6 +548,8 @@ Project
             -> WorkerLease
   -> ClipCandidate
        -> ExportJob (optional)
+            -> LoggedExportDelivery (reservation generation + acceptance)
+            -> ArtifactVersion (immutable logged-export success result)
   -> ExportPreset
        -> ExportPresetVersion
   -> IntegrationBinding
@@ -273,8 +557,26 @@ Project
 
 LocalWorkspace
   -> VerifiedTranscriptCache
+  -> CachedClipLibrarySnapshot
+  -> ConfiguredArtifactRoot
+       -> ArtifactLocator (verified local availability)
+            -> ArtifactVersion (identity reference only)
   -> SyncOutbox
   -> LocalProcessHistory
+
+DesktopInstallation
+  -> ComponentHealth
+       -> ReadinessReport
+  -> BuildIdentity
+  -> UpdateState
+       -> SignedReleasePolicy
+       -> LocalUpdateCheckpoint
+  -> SupportBundleManifest
+
+AuthenticatedUser
+  -> FeedbackReport
+       -> FeedbackDelivery
+            -> PrivateGitHubIssue (triage authority)
 
 SelectionSnapshot
   -> ExportJob (logged clip optional)
@@ -286,6 +588,7 @@ SelectionSnapshot
 
 ```text
 apps/web         UI, player, transcript/batch/review interaction
+apps/desktop     Electron lifecycle/auth/update/supervision shell
 apps/local-agent loopback API, local cache/tools/exports
 apps/cloud-api   auth, projects, manifests, batches, presigning/finalize
 apps/worker      local or hosted acquisition/transcription pipeline
@@ -309,11 +612,41 @@ infra/aws        storage, API, database, queues, identity, monitoring
 - URL normalization and caption-source precedence.
 - Batch preflight dedupe, sibling failure isolation, pause/retry, and review transitions.
 - Duplicate queue delivery and expired worker-lease recovery.
+- Logged-export delivery authorization, exact capability eligibility, atomic
+  reservation, two-phase local acceptance, duplicate replay, lost-response
+  recovery, and stale-generation rejection before processor work.
+- Accepted logged-export success requires the current actor-owned worker/epoch,
+  live registration, current membership, exact request/settings/media/subtitle
+  provenance, immutable sanitized results, and idempotent recovery across both
+  local-complete/cloud-call and cloud-commit/response-loss windows.
+- Accepted logged-export failure requires the authenticated original worker
+  owner, current membership, exact pinned delivery credentials, persisted
+  bounded error/attempt evidence, and either no started source attempt or one
+  exact verified-deleted scratch row. Expiry/revocation/newer registration epoch
+  may report existing terminal evidence but may not execute old accepted work;
+  cleanup failure stays actionable and success/failure cannot coexist.
+- Retrying an accepted terminal failure requires current project write access,
+  preserves the exact parent request/job/delivery/failure evidence and immutable
+  settings snapshots, creates one linear child with a monotonic ordinal, and is
+  exact-replay/concurrency safe without orphan jobs or branching.
 - Word/cue/estimated timing lookup and bilingual preservation.
 - Transcript selection to source/export bounds.
 - Queue creation without export side effects.
 - Project enforcement for both logging actions.
+- Preferred-language resolution reuses verified local/shared derivatives before
+  one direct-from-original provider request, remains target-language-generic,
+  and exposes provider capability failures without a mislabeled fallback.
+- New clip logs atomically preserve exact native/English/optional-preferred
+  evidence across reload, offline replay, queue search, and CSV; legacy reads do
+  not invent track provenance.
 - Atomic note/tag persistence for both logging actions, project-scoped tag deduplication, offline replay, and collaborator edits.
+- Flat clip comments remain independently versioned from Clip description/tags,
+  use stable author snapshots and body-free tombstones, enforce own-author and
+  Owner/Administrator moderation authority, paginate deterministically, and
+  replay exact create/edit/delete commands without leaking deleted content.
+- Optional first-comment logging shares the clip's transaction and request
+  fingerprint: exact replay returns one clip/comment pair, divergent replay
+  conflicts, and an invalid source-time anchor rolls back the entire log.
 - Export-only creation without a project clip or spreadsheet row.
 - Conversion-preset precedence, capability validation, and immutable job snapshots.
 - Representative preset outputs verified with FFprobe.
@@ -324,9 +657,187 @@ infra/aws        storage, API, database, queues, identity, monitoring
 - One source acquisition can serve multiple active clip ranges, then is deleted.
 - Source scratch is absent after success, failure, and cancellation; crash recovery retries and exposes cleanup failure.
 - SRT trim/clip-relative shift and FFmpeg fixture validation.
-- CSV/Sheets reconciliation by project and stable clip ID.
+- CSV/optional catalog projection reconciliation by project and stable clip ID.
+- Artifact resolution verifies the exact clip/export snapshot, package manifest,
+  required files, hashes, compatibility, and current locator availability.
+- Relocated artifacts are accepted only after verified relink; missing or invalid
+  locators fall back to a new immutable export request without overwriting history.
+- Direct and simulated authoring requests deduplicate through the same export
+  boundary and reuse compatible verified packages.
 - End-to-end batch -> shared transcript -> second workstation -> review -> select -> log/export.
 
-## Next action
+## Historical next-action snapshot
 
-Begin Milestone 5 with authorized source acquisition, isolated scratch cleanup, and an FFprobe/FFmpeg export worker. Add optional alignment only where timing evidence requires it.
+Milestones 1–6, M7-04, and the deterministic M7-05 export baseline are complete.
+M7-01's real production AWS change-set and acceptance remain an explicit
+external prerequisite. On 2026-08-25, a separate approximately $11/month
+single-instance development stack supplied real Cognito managed login and an
+HTTPS PGlite API for personal dogfood. Its memory object-store/queue adapters
+are intentionally non-durable and do not complete M7-01. PUNCH-001 completed on
+2026-08-24: versioned language decisions,
+conflict/capability gates, strict immutable timed bilingual import, bounded
+side-by-side review, explicit activation, two-workstation verified-cache reuse,
+and corrected clip/export provenance are implemented and verified. PUNCH-006
+slice 1 also completed on 2026-08-24: the workspace now has bounded typed
+shell/ingest, transcript, player, selection, command, batch/worklist, and Clip
+Library seams behind unchanged browser behavior. PUNCH-003 slice 1 completed on
+2026-08-24: stable normalized handles, explicit project kind/visibility,
+Owner/Administrator/Researcher authority, safe Editor/Viewer migration,
+membership-bounded summaries, concurrent collision/replay behavior, and the
+correct one-Owner migration constraint are implemented and verified. PUNCH-004
+slice 1 completed on 2026-08-24: direct and bulk ingest now converge on one
+canonical project-video row with independent durable member flags, safe replay
+and restore, bounded authorized flagger/processing/transcript/clip aggregates,
+optimistic own-flag commands, migration backfill, and a real Workbench read
+surface independent of transcription batch-item identity. PUNCH-004 slice 2
+also completed on 2026-08-24: renewable soft claims, explicit audited takeover,
+independent priority and Administrator-only completion policy, append-only
+review cycles, transcript/no-transcript completion basis, reasoned reopen,
+transactional role checks, exact replay, and concurrent completion now flow
+through the real canonical Workbench routes without changing processing or
+flags. PUNCH-004 slice 3 completed on 2026-08-24: optimistic individual/bulk
+dismissal and restore preserve every research record, Queue/Reviewed/Dismissed
+reads stay independent, queued/active transcription cancellation is
+dependency-aware and heartbeat-rechecked, and safe per-user review/triage
+receipts drive `New for you`, bounded activity, and idempotent mark-seen in the
+real Workbench. Migration 0030 backfills Active without fabricated history and
+current reads hide removed-member identities while retaining durable audit.
+PUNCH-004 slice 4 completed on 2026-08-24: hosted batches persist an independent
+Pending/Approved/Revoked axis, current Owners/Administrators approve or revoke
+with optimistic exact replay, and catalog queue reservation/delivery plus worker
+claim all enforce the current decision without replacing the existing job.
+Migration 0031 leaves local work automatic, pauses historical active hosted
+batches as Pending, preserves canceled state, and fabricates no authority.
+PUNCH-004 slice 5 completed on 2026-08-24: project-local Automatic/Paused policy,
+optimistic exact replay, automatic direct caption-first composition, bounded
+50-video resume catch-up, membership-bounded workload estimates, and policy
+checks at dispatch reservation/delivery plus worker claim now flow through the
+real Workbench. Migration 0032 safely defaults historical projects to Automatic
+and historical batches to Manual without fabricated policy actors.
+PUNCH-003 slice 2 and PUNCH-004 slice 6 completed on 2026-08-24: expiring
+handle-addressed invitation decisions/revocation, actor-scoped transactional
+replay, bounded open discovery plus explicit Researcher join, one-way personal
+conversion, shared visibility, role administration, ownership transfer, and
+sanitized governance events now flow through the real cloud catalog/API and
+Project Settings. Current authority is rechecked under lock, exactly one Owner
+survives concurrent transfer, removed members immediately lose worklist,
+comment, activity, processing-policy, and all other project reads, and existing
+explicit Administrator approval remains the supported paid-hosted gate. Cloud
+migration 0040, strict contract/API tests, the concurrent catalog matrix, and
+the full Project Settings browser flow are verified. PUNCH-003 and PUNCH-004
+are complete; optional monetary budget and idle/overnight OS policy modes remain
+later configurable enhancements.
+PUNCH-005 slice 1 completed on 2026-08-24: project-scoped approved positive
+literal keywords and exact-language aliases, Researcher suggestions,
+Owner/Administrator decisions, normalized deduplication, optimistic/exact
+replay, migration 0033, and the real Workbench governance path are verified.
+PUNCH-005 slice 2 completed on 2026-08-24: deterministic exact-language
+Unicode matching, linked-track time-overlap dedupe, exact lease-bound input,
+private immutable checksummed evidence, current/stale summaries, a real scan
+worker, replay/reclaim authorization, active-transcript replacement, and
+second-client pinned reuse are verified through migration 0034 and the
+aggregate repository gate. PUNCH-005 slice 3 completed on 2026-08-24: stable
+Promising/No matches/Processing/Action needed groups, exact filters and sorts,
+summary-level per-keyword counts, lazy checksum/size/schema/input-verified
+bounded context, honest click-to-seek/highlight, current/prior evidence,
+scan-completed activity receipts, and confirmed all-or-nothing bulk priority
+are implemented through migration 0035. The complete 11-flow browser file and
+606-test aggregate network-free gate pass. PUNCH-005 is complete. Post-punch
+keyword/alias maintenance and own-pending withdrawal completed on 2026-08-24
+through cloud migration 0041, exact optimistic/idempotent catalog commands, and
+the real Project Settings flow. Disabled vocabulary remains reserved, the
+last-enabled-alias invariant is enforced, and every effective catalog mutation
+stales prior summaries and queues replacement scans. Explicit hosted
+project-budget accounting, idle/overnight OS scheduling, and broader
+notification policy remain separate later work.
+Project-shared point bookmarks completed on 2026-08-24 through cloud migration
+0042 and local migration 0034. Current members can create/read bare or
+titled/noted point markers without a transcript; creators edit, archive, and
+restore their own records while Owners/Administrators may moderate state but
+not rewrite another member's text. Authorized bounded video/project reads,
+Unicode literal search, stable pagination, optimistic/idempotent commands,
+cross-video open/seek, and transcript-version independence are implemented.
+The account-scoped local cache and ordered outbox survive restart and response
+loss, retain stale/authorization conflicts with entered text, and surface
+queued/conflict state in the internally scrolling player panel. The gate passed
+652 Vitest tests with 4 optional skips, 19 one-worker Playwright flows,
+typecheck, web/desktop builds, 34 local migrations, and 42 cloud migrations.
+Opt-in desktop workflow and direct-mention notifications completed on
+2026-08-24 through cloud migration 0043 and local migration 0035. Stable,
+recipient-unique events cover the first terminal transcription-batch summary,
+transcription action-needed states, logged-export outcomes, local export-only
+outcomes, and existing direct mentions only. Payloads use bounded sanitized
+labels and validated navigation identities without bodies, transcripts,
+errors, paths, URLs, credentials, or artifact locators. One account-scoped,
+device-local setting defaults off, records `enabledAt`, persists a bounded
+delivered ledger, polls cloud/local feeds without overlap only while signed in,
+and stops on sign-out. Validated native-notification clicks route to the exact
+authorized batch/video, clip/request, local export surface, or clip/comment;
+removed projects fall back safely and browser development performs no native
+call. The gate passed 667 Vitest tests with 4 optional skips, all 19 one-worker
+Playwright flows, typecheck, web/desktop builds, 35 local migrations, and 43
+cloud migrations.
+PUNCH-002 and all PUNCH-006 slices completed on 2026-08-24:
+VERA — Research Video Clips now has authoritative grouped project summaries,
+membership-revalidated account-scoped recency, role-aware project destinations,
+an unread badge, separated account preferences, readable full BCP-47 labels, a
+real Bulk add handoff, bounded persisted Workbench dimensions, a separate Clip
+Library destination, and deterministic 1440×900/narrow browser geometry. Clip
+opening now resolves compatible immutable artifacts and freshly verifies bytes
+before local open, otherwise opens and loops the exact authorized source range.
+Visible Back/recent navigation restores playhead, language view, query/match,
+and exact safe selections from bounded account/project-private state while
+discarding removed identities and stale transcript selections. The 15-flow
+workspace browser file, 606-test aggregate suite, desktop build, and both
+migration gates pass. PUNCH-006 is complete.
+PUNCH-008 slice 1 foundation completed on 2026-08-24: flat chronological clip
+comments now have stable author snapshots, optional exact source-time anchors,
+optimistic versions, body-free author/moderation tombstones, bounded cursors,
+stable command receipts, safe sync events, and current-role authorization.
+Clip creation stores a canonical request fingerprint and atomically creates an
+optional first comment; exact and concurrent replay produce one pair while
+divergent evidence conflicts. The existing notes field remains compatible but
+is presented as Clip description / intended use, and the logging panel exposes
+the optional first comment separately. Cloud migration 0036 adds the comment
+and command authorities. The focused browser flow, desktop build, 36 cloud and
+30 local migrations, and 610-test aggregate suite pass. Mentions, follows,
+PUNCH-008 collaboration and PUNCH-010 Topics completed on 2026-08-24: stable
+member mentions, follows, deduplicated body-free notices, authorized comment
+search/activity and separate CSV, ordered restart-safe local replay with
+retained conflicts, and paginated authoring live reads now compose the flat
+comment authority. Existing clip tags are presented as the sole canonical
+Topics facet with suggestions, chips, match-any/match-all filtering, grouping,
+and authorized authoring retrieval. Explicit build snapshots freeze clip
+ID/version, canonical Topic labels, and only promoted active comment versions;
+later edits/deletions cannot mutate exact replay. Cloud migration 0039 and local
+migration 0033 add the missing durable authorities without copying existing
+tags, fabricating notices, or making export-only work eligible.
+PUNCH-007 completed on 2026-08-24: exact player in/out controls and guarded
+`I`/`O` produce immutable player-originated ranges with explicit Speech, No
+speech, or Transcript unavailable status. Verified overlapping transcript
+evidence attaches only by explicit action. Context and current-actor no-speech
+attestation are enforced atomically with the optional first comment; batch,
+retry, restart, and cloud success paths preserve the exact selection. Required
+no-speech sidecars are one-newline, zero-cue artifacts, while unsupported
+speech/unavailable exports fail before render. Log clip is primary and the two
+other effects remain explicit menu commands. Cloud migration 0037, local
+migration 0031, 625 aggregate tests, 16 browser flows, typecheck, migration
+gates, and desktop build pass. PUNCH-008 and PUNCH-010 are complete.
+The deterministic core punch-list sequence is complete: PUNCH-001 through
+PUNCH-008 and PUNCH-010 have completed specs and final aggregate evidence.
+PLATFORM-001 also completed the provider-neutral source-identity and official
+YouTube-search foundation with explicit candidate-to-preflight handoff; it does
+not complete the remaining PUNCH-009 social/AI candidates. Post-punch keyword
+maintenance and shared point bookmarks are complete in FEATURE-001 and
+FEATURE-002. Opt-in desktop workflow and direct-mention notifications are
+complete in FEATURE-003. Richer timelines, transcript-segment notes, remote
+push/email delivery, full activity mirroring, and delivery while fully quit
+remain deferred.
+
+Dogfood the freshly packaged unsigned Intel macOS app across the deterministic
+workflow and record any discovered defect as a new bounded spec. M7-06
+production-cloud/live-source evidence still requires its separately authorized
+AWS/Cognito, model, quota, and source-rights inputs. PUNCH-009 expansion and M8
+signing, updater, diagnostics, documentation, and independent-QA work require
+deliberate new scope; do not infer permission from the completed platform
+foundation.

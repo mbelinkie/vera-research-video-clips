@@ -27,6 +27,7 @@ const proxySettings = {
 
 export default defineConfig({
   root: fileURLToPath(new URL(".", import.meta.url)),
+  base: "./",
   plugins: [
     react(),
     ...(managed ? [managedResearchPlugin(proxySettings)] : []),

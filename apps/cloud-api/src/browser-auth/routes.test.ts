@@ -187,9 +187,14 @@ describe("browser BFF and catalog authorization", () => {
     expect((await read(bob, "/my-membership")).statusCode).toBe(403);
     expect((await grant(alice, "BOB@EXAMPLE.COM")).statusCode).toBe(204);
     expect((await read(bob, "/my-membership")).json()).toMatchObject({
-      membership: { role: "editor" },
+      membership: { role: "researcher" },
     });
-    expect((await read(bob, "/members")).statusCode).toBe(403);
+    // Migration 0027's roster lets any reader list members, but only Owners
+    // receive verified addresses.
+    const bobRoster = await read(bob, "/members");
+    expect(bobRoster.statusCode).toBe(200);
+    expect(bobRoster.body).not.toContain("example.com");
+    expect(bobRoster.body).not.toContain("verifiedEmail");
     expect((await grant(bob, "missing@example.com")).statusCode).toBe(403);
     const roster = await read(alice, "/members");
     expect(roster.json()).toEqual(
@@ -197,7 +202,7 @@ describe("browser BFF and catalog authorization", () => {
         expect.objectContaining({
           displayName: "Bob",
           verifiedEmail: "bob@example.com",
-          role: "editor",
+          role: "researcher",
         }),
       ]),
     );
@@ -582,7 +587,9 @@ it("pairs once with same-origin consent, then queues an attributed video from Ch
   ]);
   expect(simultaneous.json()).toEqual(queued.json());
   expect(queued.statusCode, queued.body).toBe(201);
-  expect(queued.json().status).toBe("queued");
+  // The pilot's language gate holds the Chrome-queued video until a member
+  // confirms its language; the queue is reached through that confirmation.
+  expect(queued.json().status).toBe("needs_language_confirmation");
   expect((await post(path, client, video)).json()).toEqual(queued.json());
   expect(
     (await post(path, client, { ...video, comment: "changed" })).statusCode,
@@ -638,6 +645,24 @@ it("pairs once with same-origin consent, then queues an attributed video from Ch
     ),
   ).toBe(true);
   expect(await read(commentsPath + "?offset=2")).toEqual(comments.slice(2));
+  const videoPath = base + "/videos/" + items[0].catalogVideoId;
+  const gate = await read(videoPath + "/language-gate");
+  const confirmation = await post(videoPath + "/language-decisions", web, {
+    idempotencyKey: "chrome-queue:confirm-en",
+    expectedDecisionVersion: gate.decision?.decisionVersion ?? 0,
+    resolvedLanguage: "en",
+    basis: "user_confirmation",
+    ...(gate.providerEvidence?.id
+      ? { evidenceId: gate.providerEvidence.id }
+      : {}),
+    batchItemId: items[0].id,
+    expectedBatchItemVersion: items[0].version,
+  });
+  expect(confirmation.statusCode, confirmation.body).toBe(200);
+  expect(
+    (await read(base + "/transcription-batches/" + queued.json().batchId))
+      .items[0].state,
+  ).toBe("queued");
   expect(
     (await db.query("SELECT id FROM transcription_batches")).rows,
   ).toHaveLength(1);

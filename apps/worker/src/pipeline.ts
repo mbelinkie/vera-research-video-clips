@@ -1,10 +1,11 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { access, mkdir, mkdtemp, rm, rmdir } from "node:fs/promises";
 import { join } from "node:path";
 
 import {
   ActiveTranscriptBundleSchema,
   FinalizedObjectSchema,
+  NormalizedTranscriptSchema,
   TranscriptManifestSchema,
   TranscriptSourcePlanSchema,
   TranscriptUploadGrantSchema,
@@ -12,15 +13,29 @@ import {
   WorkerCreateTranscriptUploadRequestSchema,
   WorkerFinalizeTranscriptRequestSchema,
   type ActiveTranscriptBundle,
+  type ClaimedTranscriptionJob,
+  type CloudTranslationConsent,
+  type DerivedTranslation,
+  type DerivedTranslationIdentity,
   type FinalizedObject,
+  type LanguageCapabilityResult,
+  type ProviderLanguageEvidence,
   type NormalizedTranscript,
   type TranscriptArtifact,
   type TranscriptManifest,
   type TranscriptUploadGrant,
+  type TranscriptionExecutionPolicy,
+  type WorkerTranslateTranscriptResponse,
+} from "@research-video/contracts";
+import {
+  languagesEquivalent,
+  normalizeLanguageTag,
 } from "@research-video/contracts";
 import type { MediaAcquisitionProvider } from "@research-video/media";
 import {
+  ProviderExecutionError,
   TranscriptSourceResolver,
+  gateCaptionLanguage,
   translateCanonicalTranscript,
   type CaptionProvider,
   type SpeechToTextProvider,
@@ -30,9 +45,10 @@ import { normalizeAcquiredCaption } from "@research-video/providers/captions-loc
 import { AlignmentShutdownUnconfirmedError } from "@research-video/providers/alignment-local";
 import { transcriptToSrt } from "@research-video/transcript";
 
-import type {
-  TranscriptionExecutionContext,
-  TranscriptionJobExecutor,
+import {
+  ActionableLanguageGateError,
+  type TranscriptionExecutionContext,
+  type TranscriptionJobExecutor,
 } from "./worker.ts";
 
 type UploadArtifactType = Exclude<TranscriptArtifact["type"], "manifest">;
@@ -68,7 +84,27 @@ export type TranscriptPipelineOptions = {
   media?: MediaAcquisitionProvider;
   speechToText?: SpeechToTextProvider;
   alignment?: TranscriptAlignmentProvider;
+  resolveCloudSpeechToText?: (
+    providerId: string,
+    context: {
+      grantId?: string;
+      operationId: string;
+      attempt: number;
+      policy: TranscriptionExecutionPolicy;
+    },
+  ) =>
+    | SpeechToTextProvider
+    | undefined
+    | Promise<SpeechToTextProvider | undefined>;
+  finishCloudSpeechToText?: (input: {
+    operationId: string;
+    attempt: number;
+    state: "succeeded" | "failed";
+    quantity?: number;
+    sanitizedFailureCode?: string;
+  }) => Promise<void>;
   translation?: TranslationProvider;
+  claimedTranslation?: ClaimedTranslationClient;
   publication: TranscriptPublicationClient;
   scratchRoot: string;
   now?: () => Date;
@@ -82,6 +118,79 @@ export interface TranscriptAlignmentProvider {
     scratchDirectory: string;
     signal: AbortSignal;
   }): Promise<NormalizedTranscript>;
+}
+
+export interface ClaimedTranslationClient {
+  translate(input: {
+    jobId: string;
+    attempt: number;
+    consent: CloudTranslationConsent;
+    uploadId: string;
+    sourceArtifact: FinalizedObject & { type: "original-normalized" };
+    targetLanguage: string;
+    signal?: AbortSignal;
+  }): Promise<WorkerTranslateTranscriptResponse>;
+}
+
+export interface DerivedTranslationPublicationClient {
+  publish(input: {
+    identity: DerivedTranslationIdentity;
+    idempotencyKey: string;
+    transcript: NormalizedTranscript;
+  }): Promise<DerivedTranslation>;
+}
+
+export async function executeDerivedTranslation(input: {
+  identity: DerivedTranslationIdentity;
+  idempotencyKey: string;
+  original: NormalizedTranscript;
+  translation: TranslationProvider;
+  publication: DerivedTranslationPublicationClient;
+  signal?: AbortSignal;
+}): Promise<DerivedTranslation> {
+  const original = NormalizedTranscriptSchema.parse(input.original);
+  if (
+    original.track.id !== input.identity.originalTrackId ||
+    original.track.contentSha256 !== input.identity.originalContentSha256
+  ) {
+    throw new TranscriptPipelineError(
+      "The preferred translation job does not match its original track snapshot.",
+    );
+  }
+  if (
+    languagesEquivalent(
+      original.track.language,
+      input.identity.targetLanguage,
+    ) ||
+    languagesEquivalent(input.identity.targetLanguage, "en")
+  ) {
+    throw new TranscriptPipelineError(
+      "Supplemental translation work requires a distinct non-English target.",
+    );
+  }
+  const transcript = await translateCanonicalTranscript(
+    input.translation,
+    original,
+    input.identity.targetLanguage,
+    input.signal,
+  );
+  if (
+    transcript.track.kind !== "translation" ||
+    transcript.track.sourceTrackId !== original.track.id ||
+    !languagesEquivalent(
+      transcript.track.language,
+      input.identity.targetLanguage,
+    )
+  ) {
+    throw new TranscriptPipelineError(
+      "The translation provider returned the wrong preferred track.",
+    );
+  }
+  return input.publication.publish({
+    identity: input.identity,
+    idempotencyKey: input.idempotencyKey,
+    transcript,
+  });
 }
 
 export class TranscriptPipelineError extends Error {
@@ -133,6 +242,12 @@ export function createTranscriptPipelineExecutor(
         "The current review workflow requires an English target transcript.",
       );
     }
+    if (
+      payload.languageDecision &&
+      !["confirmed", "unverified"].includes(payload.languageDecision.status)
+    ) {
+      throw new ActionableLanguageGateError();
+    }
     await mkdir(options.scratchRoot, { recursive: true, mode: 0o700 });
     const scratch = await mkdtemp(
       join(options.scratchRoot, `${claimed.job.id}-a${claimed.lease.attempt}-`),
@@ -140,33 +255,85 @@ export function createTranscriptPipelineExecutor(
     let cleaned = false;
     let retainScratch = false;
     try {
-      const source = await resolveSourceTranscript(
+      const resolvedSource = await resolveSourceTranscript(
         options,
+        claimed,
         payload,
         scratch,
         context,
         join(options.scratchRoot, `.alignment-${claimed.job.id}`),
+        now,
       );
-      const english = await resolveEnglishTranscript(
-        options.translation,
-        source,
-        payload.targetLanguage,
-        context,
-      );
-      await context.setStage("uploading");
+      const source = resolvedSource.transcript;
       const lineageId = await stableUuid(
-        `lineage:${claimed.job.projectId}:${payload.catalogVideoId}:${source.track.language}:${payload.targetLanguage}`,
+        `lineage:${claimed.job.projectId}:${payload.catalogVideoId}:${source.track.language}:${payload.targetLanguage}:${languageDecisionIdentity(payload.languageDecision)}`,
       );
-      const version = 1;
-      const artifacts = artifactPayloads(source, english);
+      const requiresTranslation =
+        primaryLanguage(source.track.language) !==
+        primaryLanguage(payload.targetLanguage);
+      const artifactTypes: UploadArtifactType[] = requiresTranslation
+        ? [
+            "original-normalized",
+            "original-srt",
+            "english-normalized",
+            "english-srt",
+          ]
+        : ["english-normalized", "english-srt"];
       const grant = await options.publication.createUpload(claimed.job.id, {
         attempt: claimed.lease.attempt,
         lineageId,
-        version,
-        artifactTypes: artifacts.map((artifact) => artifact.type),
+        version: 1,
+        artifactTypes,
       });
+      const version = grant.version;
       const finalizedArtifacts: FinalizedObject[] = [];
+      let uploadedTranslationSource:
+        (FinalizedObject & { type: "original-normalized" }) | undefined;
+      if (
+        requiresTranslation &&
+        payload.translationConsent &&
+        options.claimedTranslation
+      ) {
+        const artifact = await options.publication.upload(
+          requiredTarget(grant, "original-normalized"),
+          encodeJson(source),
+          "application/json",
+        );
+        if (artifact.type !== "original-normalized") {
+          throw new TranscriptPipelineError(
+            "Publication adapter returned the wrong translation source artifact type.",
+          );
+        }
+        uploadedTranslationSource = {
+          ...artifact,
+          type: "original-normalized",
+        };
+      }
+      const resolvedEnglish = await resolveEnglishTranscript(
+        options,
+        claimed,
+        payload,
+        source,
+        grant.uploadId,
+        uploadedTranslationSource,
+        context,
+      );
+      const english = resolvedEnglish.transcript;
+      await context.setStage("uploading");
+      const artifacts = artifactPayloads(source, english);
+      if (uploadedTranslationSource) {
+        finalizedArtifacts.push(uploadedTranslationSource);
+      }
+      finalizedArtifacts.push(...resolvedEnglish.serverArtifacts);
+      const serverArtifactTypes = new Set<UploadArtifactType>(
+        resolvedEnglish.serverArtifacts.map((artifact) => artifact.type),
+      );
       for (const artifact of artifacts) {
+        if (
+          artifact.type === uploadedTranslationSource?.type ||
+          serverArtifactTypes.has(artifact.type)
+        )
+          continue;
         const target = requiredTarget(grant, artifact.type);
         finalizedArtifacts.push(
           await options.publication.upload(
@@ -177,7 +344,7 @@ export function createTranscriptPipelineExecutor(
         );
       }
       const transcriptVersionId = await stableUuid(
-        `transcript-version:${claimed.job.id}:${source.track.contentSha256}:${english.track.contentSha256}`,
+        `transcript-version:${claimed.job.id}:${source.track.contentSha256}:${english.track.contentSha256}:${languageDecisionIdentity(payload.languageDecision)}`,
       );
       const manifest = TranscriptManifestSchema.parse({
         schemaVersion: 1,
@@ -196,6 +363,9 @@ export function createTranscriptPipelineExecutor(
         jobId: claimed.job.id,
         createdBy: claimed.lease.workerId,
         createdAt: now().toISOString(),
+        ...(payload.languageDecision
+          ? { languageDecision: payload.languageDecision }
+          : {}),
         artifacts: finalizedArtifacts,
       });
       const manifestBytes = encodeJson(manifest);
@@ -229,10 +399,12 @@ export function createTranscriptPipelineExecutor(
 
 async function resolveSourceTranscript(
   options: TranscriptPipelineOptions,
+  claimed: ClaimedTranscriptionJob,
   payload: ReturnType<typeof TranscriptionJobPayloadSchema.parse>,
   scratch: string,
   context: TranscriptionExecutionContext,
   attemptMarker: string,
+  now: () => Date,
 ) {
   await context.setStage("resolving");
   const resolver = new TranscriptSourceResolver(
@@ -249,14 +421,64 @@ async function resolveSourceTranscript(
 
   if (plan.strategy === "caption" && options.captions) {
     let transcript: NormalizedTranscript | undefined;
+    const captionGate = gateCaptionLanguage({
+      track: plan.track,
+      ...(payload.creatorReportedLanguage
+        ? { creatorLanguage: payload.creatorReportedLanguage }
+        : {}),
+      ...(payload.languageDecision
+        ? { confirmedDecision: payload.languageDecision }
+        : {}),
+    });
+    const translationCapability = translationCapabilityFor(
+      options,
+      plan.sourceLanguage,
+      payload.targetLanguage,
+      payload.languageDecision,
+    );
+    await context.recordSourcePlan(plan);
+    const observed = await observeLanguageEvidence(
+      context,
+      claimed,
+      payload,
+      {
+        source: "caption",
+        provider: "caption-discovery",
+        reportedLanguage: normalizeLanguageTag(plan.sourceLanguage),
+        trackFingerprint: trackFingerprint(plan.track),
+        captionKind: plan.track.kind,
+      },
+      translationCapability,
+      now,
+    );
+    if (
+      captionGate.state !== "accepted" ||
+      (translationCapability && translationCapability.state !== "supported") ||
+      observed.gate.state !== "ready"
+    ) {
+      throw new ActionableLanguageGateError();
+    }
     try {
       await context.setStage("acquiring");
-      const caption = await options.captions.acquire(
-        payload.youtubeVideoId,
-        plan.track,
-        scratch,
-        context.signal,
-      );
+      let caption:
+        | Awaited<ReturnType<NonNullable<typeof options.captions>["acquire"]>>
+        | undefined;
+      let acquisitionError: unknown;
+      for (let attempt = 1; attempt <= 2; attempt += 1) {
+        try {
+          caption = await options.captions.acquire(
+            payload.youtubeVideoId,
+            plan.track,
+            scratch,
+            context.signal,
+          );
+          break;
+        } catch (error) {
+          if (context.signal.aborted) throw context.signal.reason;
+          acquisitionError = error;
+        }
+      }
+      if (!caption) throw acquisitionError;
       transcript = await normalizeAcquiredCaption(caption);
     } catch (error) {
       if (context.signal.aborted) throw context.signal.reason;
@@ -268,34 +490,81 @@ async function resolveSourceTranscript(
       });
     }
     if (transcript) {
-      await context.recordSourcePlan(plan);
-      return alignSourceTranscript(
-        options.alignment,
-        transcript,
-        async () => {
-          if (!options.media)
-            throw new TranscriptPipelineError(
-              "Local word alignment requires an audio acquisition provider.",
+      // The source plan was recorded before the language gate above.
+      return {
+        transcript: await alignSourceTranscript(
+          options.alignment,
+          transcript,
+          async () => {
+            if (!options.media)
+              throw new TranscriptPipelineError(
+                "Local word alignment requires an audio acquisition provider.",
+              );
+            const audio = await options.media.acquireAuthorizedSource(
+              payload.youtubeVideoId,
+              scratch,
+              context.signal,
             );
-          const audio = await options.media.acquireAuthorizedSource(
-            payload.youtubeVideoId,
-            scratch,
-            context.signal,
-          );
-          return audio.scratchPath;
-        },
-        scratch,
-        context,
-        attemptMarker,
-      );
+            return audio.scratchPath;
+          },
+          scratch,
+          context,
+          attemptMarker,
+        ),
+      };
     }
   }
 
   await context.recordSourcePlan(plan);
   // Caption-only installations must still claim and publish captioned videos.
   // Missing fallback is terminal, not an infinite standby or fake transcript.
-  if (!options.media || !options.speechToText)
+  // Cloud-policy jobs may run without a local recognizer; the local one is
+  // then only needed for the explicit local fallback.
+  if (
+    !options.media ||
+    (!options.speechToText &&
+      payload.transcriptionExecutionPolicy?.execution !== "cloud")
+  )
     throw new LocalRecognizerUnavailableError();
+  const confirmedLanguage = confirmedLanguageFrom(payload);
+  if (!confirmedLanguage) {
+    await observeLanguageEvidence(
+      context,
+      claimed,
+      payload,
+      {
+        source: "speech_detection",
+        provider: "speech-to-text",
+      },
+      undefined,
+      now,
+    );
+    throw new ActionableLanguageGateError();
+  } else {
+    const speechToText = await speechToTextForPolicy(options, claimed, payload);
+    const speechCapability = speechCapabilityFor(
+      speechToText,
+      confirmedLanguage,
+    );
+    const observed = await observeLanguageEvidence(
+      context,
+      claimed,
+      payload,
+      {
+        source: "speech_detection",
+        provider: speechCapability.provider,
+      },
+      undefined,
+      now,
+      speechCapability,
+    );
+    if (
+      speechCapability.state !== "supported" ||
+      observed.gate.state !== "ready"
+    ) {
+      throw new ActionableLanguageGateError();
+    }
+  }
   await context.setStage("acquiring");
   const media = await options.media.acquireAuthorizedSource(
     payload.youtubeVideoId,
@@ -303,19 +572,115 @@ async function resolveSourceTranscript(
     context.signal,
   );
   await context.setStage("transcribing");
-  const transcript = await options.speechToText.transcribe({
+  const selectedSpeechToText = await speechToTextForPolicy(
+    options,
+    claimed,
+    payload,
+  );
+  const transcriptionInput = {
     videoId: payload.youtubeVideoId,
     inputPath: media.scratchPath,
+    ...(confirmedLanguage ? { language: confirmedLanguage } : {}),
     signal: context.signal,
-  });
-  return alignSourceTranscript(
-    options.alignment,
-    transcript,
-    async () => media.scratchPath,
-    scratch,
-    context,
-    attemptMarker,
+  };
+  let transcript: NormalizedTranscript;
+  try {
+    transcript = await selectedSpeechToText.transcribe(transcriptionInput);
+    if (payload.transcriptionExecutionPolicy?.execution === "cloud") {
+      await options.finishCloudSpeechToText?.({
+        operationId: claimed.job.id,
+        attempt: claimed.lease.attempt,
+        state: "succeeded",
+        quantity:
+          Math.max(...transcript.segments.map((segment) => segment.endMs), 0) /
+          1_000,
+      });
+    }
+  } catch (error) {
+    if (
+      !(error instanceof ProviderExecutionError) ||
+      payload.transcriptionExecutionPolicy?.execution !== "cloud" ||
+      payload.transcriptionExecutionPolicy.fallback !== "local"
+    ) {
+      throw error;
+    }
+    await options.finishCloudSpeechToText?.({
+      operationId: claimed.job.id,
+      attempt: claimed.lease.attempt,
+      state: "failed",
+      sanitizedFailureCode: error.code,
+    });
+    // A cloud failure restarts transcription for the whole locally acquired
+    // source; partial provider output is never merged into the canonical track.
+    if (!options.speechToText) throw new LocalRecognizerUnavailableError();
+    transcript = await options.speechToText.transcribe(transcriptionInput);
+  }
+  const translationCapability = translationCapabilityFor(
+    options,
+    transcript.track.language,
+    payload.targetLanguage,
+    payload.languageDecision,
   );
+  const observed = await observeLanguageEvidence(
+    context,
+    claimed,
+    payload,
+    {
+      source: "speech_detection",
+      provider: transcript.track.provider,
+      reportedLanguage: normalizeLanguageTag(transcript.track.language),
+      trackFingerprint: transcript.track.contentSha256,
+    },
+    translationCapability,
+    now,
+  );
+  if (
+    (translationCapability && translationCapability.state !== "supported") ||
+    observed.gate.state !== "ready"
+  ) {
+    throw new ActionableLanguageGateError();
+  }
+  return {
+    transcript: await alignSourceTranscript(
+      options.alignment,
+      transcript,
+      async () => media.scratchPath,
+      scratch,
+      context,
+      attemptMarker,
+    ),
+  };
+}
+
+async function speechToTextForPolicy(
+  options: TranscriptPipelineOptions,
+  claimed: ClaimedTranscriptionJob,
+  payload: ReturnType<typeof TranscriptionJobPayloadSchema.parse>,
+): Promise<SpeechToTextProvider> {
+  const policy = payload.transcriptionExecutionPolicy;
+  if (!policy || policy.execution === "local") {
+    if (!options.speechToText) throw new LocalRecognizerUnavailableError();
+    return options.speechToText;
+  }
+  if (!policy.providerId) {
+    throw new TranscriptPipelineError(
+      "The cloud transcription policy is missing its provider identifier.",
+    );
+  }
+  const provider = await options.resolveCloudSpeechToText?.(policy.providerId, {
+    ...(payload.transcriptionGrantId
+      ? { grantId: payload.transcriptionGrantId }
+      : {}),
+    operationId: claimed.job.id,
+    attempt: claimed.lease.attempt,
+    policy,
+  });
+  if (!provider) {
+    throw new TranscriptPipelineError(
+      `The selected cloud transcription provider (${policy.providerId}) is unavailable on this worker.`,
+    );
+  }
+  return provider;
 }
 
 async function alignSourceTranscript(
@@ -359,26 +724,179 @@ async function alignSourceTranscript(
 }
 
 async function resolveEnglishTranscript(
-  translation: TranslationProvider | undefined,
+  options: TranscriptPipelineOptions,
+  claimed: ClaimedTranscriptionJob,
+  payload: ReturnType<typeof TranscriptionJobPayloadSchema.parse>,
   source: NormalizedTranscript,
-  targetLanguage: string,
+  uploadId: string,
+  uploadedSource:
+    (FinalizedObject & { type: "original-normalized" }) | undefined,
   context: TranscriptionExecutionContext,
 ) {
   if (
-    primaryLanguage(source.track.language) === primaryLanguage(targetLanguage)
+    primaryLanguage(source.track.language) ===
+    primaryLanguage(payload.targetLanguage)
   ) {
-    return source;
+    return { transcript: source, serverArtifacts: [] };
   }
-  if (!translation) {
+  if (payload.translationConsent && options.claimedTranslation) {
+    await context.setStage("translating");
+    if (!uploadedSource) {
+      throw new TranscriptPipelineError(
+        "Cloud translation requires a verified uploaded source artifact.",
+      );
+    }
+    try {
+      const published = await options.claimedTranslation.translate({
+        jobId: claimed.job.id,
+        attempt: claimed.lease.attempt,
+        consent: payload.translationConsent,
+        uploadId,
+        sourceArtifact: uploadedSource,
+        targetLanguage: payload.targetLanguage,
+        signal: context.signal,
+      });
+      return {
+        transcript: published.transcript,
+        serverArtifacts: [
+          published.normalizedArtifact,
+          published.subtitleArtifact,
+        ],
+      };
+    } catch (error) {
+      if (context.signal?.aborted || !options.translation) throw error;
+      // A cloud failure discards all remote partial output and makes exactly one
+      // local attempt. It never selects a second cloud provider.
+      return {
+        transcript: await translateCanonicalTranscript(
+          options.translation,
+          source,
+          payload.targetLanguage,
+          context.signal,
+        ),
+        serverArtifacts: [],
+      };
+    }
+  }
+  if (!options.translation) {
     throw new LocalTranslationUnavailableError();
   }
   await context.setStage("translating");
-  return translateCanonicalTranscript(
-    translation,
-    source,
-    targetLanguage,
-    context.signal,
-  );
+  return {
+    transcript: await translateCanonicalTranscript(
+      options.translation,
+      source,
+      payload.targetLanguage,
+      context.signal,
+    ),
+    serverArtifacts: [],
+  };
+}
+
+function confirmedLanguageFrom(
+  payload: ReturnType<typeof TranscriptionJobPayloadSchema.parse>,
+) {
+  return payload.languageDecision?.status === "confirmed"
+    ? payload.languageDecision.resolvedLanguage
+    : undefined;
+}
+
+function speechCapabilityFor(
+  provider: SpeechToTextProvider,
+  language: string,
+): LanguageCapabilityResult {
+  if (provider.checkLanguageSupport) {
+    return provider.checkLanguageSupport(language);
+  }
+  return {
+    state: "unknown",
+    provider: "speech-to-text",
+    operation: "speech_to_text",
+    sourceLanguage: normalizeLanguageTag(language),
+    reason: "capability_not_advertised",
+  };
+}
+
+function translationCapabilityFor(
+  options: TranscriptPipelineOptions,
+  sourceLanguage: string,
+  targetLanguage: string,
+  decision: ReturnType<
+    typeof TranscriptionJobPayloadSchema.parse
+  >["languageDecision"],
+): LanguageCapabilityResult | undefined {
+  if (languagesEquivalent(sourceLanguage, targetLanguage)) return undefined;
+  if (options.translation?.checkLanguagePair) {
+    return options.translation.checkLanguagePair(
+      sourceLanguage,
+      targetLanguage,
+    );
+  }
+  if (!decision || decision.status !== "confirmed") return undefined;
+  return {
+    state: "unknown",
+    provider: "translation-provider",
+    operation: "translation",
+    sourceLanguage: normalizeLanguageTag(sourceLanguage),
+    targetLanguage: normalizeLanguageTag(targetLanguage),
+    reason: "capability_not_advertised",
+  };
+}
+
+async function observeLanguageEvidence(
+  context: TranscriptionExecutionContext,
+  claimed: ClaimedTranscriptionJob,
+  payload: ReturnType<typeof TranscriptionJobPayloadSchema.parse>,
+  evidence: Omit<
+    ProviderLanguageEvidence,
+    "id" | "projectId" | "videoId" | "jobId" | "attempt" | "createdAt"
+  >,
+  translationCapability: LanguageCapabilityResult | undefined,
+  now: () => Date,
+  speechCapability?: LanguageCapabilityResult,
+) {
+  return context.observeLanguageEvidence({
+    attempt: claimed.lease.attempt,
+    evidence: {
+      id: randomUUID(),
+      projectId: claimed.job.projectId!,
+      videoId: payload.catalogVideoId,
+      ...evidence,
+      jobId: claimed.job.id,
+      attempt: claimed.lease.attempt,
+      createdAt: now().toISOString(),
+    },
+    ...(speechCapability ? { speechCapability } : {}),
+    ...(translationCapability ? { translationCapability } : {}),
+  });
+}
+
+function trackFingerprint(track: {
+  id: string;
+  language: string;
+  kind: "manual" | "automatic";
+  translatable: boolean;
+  downloadAccess: "available" | "authorization-required" | "unavailable";
+}) {
+  return createHash("sha256")
+    .update(
+      JSON.stringify({
+        id: track.id,
+        language: track.language,
+        kind: track.kind,
+        translatable: track.translatable,
+        downloadAccess: track.downloadAccess,
+      }),
+    )
+    .digest("hex");
+}
+
+function languageDecisionIdentity(
+  decision: ReturnType<
+    typeof TranscriptionJobPayloadSchema.parse
+  >["languageDecision"],
+) {
+  return JSON.stringify(decision ?? null);
 }
 
 function artifactPayloads(
@@ -463,6 +981,10 @@ export class HttpTranscriptPublicationClient implements TranscriptPublicationCli
   readonly #baseUrl: URL;
   readonly #authorization: string;
   readonly #fetcher: typeof fetch;
+  readonly #memoryTargets = new Map<
+    string,
+    { jobId: string; attempt: number; uploadId: string }
+  >();
 
   constructor(options: {
     baseUrl: string;
@@ -488,7 +1010,17 @@ export class HttpTranscriptPublicationClient implements TranscriptPublicationCli
       `/api/transcription-jobs/${encodeURIComponent(jobId)}/transcript-uploads`,
       body,
     );
-    return TranscriptUploadGrantSchema.parse(response);
+    const grant = TranscriptUploadGrantSchema.parse(response);
+    for (const target of grant.targets) {
+      if (new URL(target.uploadUrl).protocol === "memory-upload:") {
+        this.#memoryTargets.set(target.objectKey, {
+          jobId,
+          attempt: input.attempt,
+          uploadId: grant.uploadId,
+        });
+      }
+    }
+    return grant;
   }
 
   async upload(
@@ -496,6 +1028,27 @@ export class HttpTranscriptPublicationClient implements TranscriptPublicationCli
     bytes: Uint8Array,
     contentType: string,
   ): Promise<FinalizedObject> {
+    if (new URL(target.uploadUrl).protocol === "memory-upload:") {
+      const context = this.#memoryTargets.get(target.objectKey);
+      if (!context) {
+        throw new TranscriptPipelineError(
+          "Memory transcript upload target is missing its claimed-job context.",
+        );
+      }
+      return FinalizedObjectSchema.parse(
+        await this.api(
+          `/api/transcription-jobs/${encodeURIComponent(context.jobId)}/transcript-uploads/${encodeURIComponent(context.uploadId)}/artifacts`,
+          {
+            attempt: context.attempt,
+            type: target.type,
+            objectKey: target.objectKey,
+            contentType,
+            bytesBase64: Buffer.from(bytes).toString("base64"),
+            sha256: createHash("sha256").update(bytes).digest("hex"),
+          },
+        ),
+      );
+    }
     const response = await this.#fetcher(target.uploadUrl, {
       method: "PUT",
       headers: { "content-type": contentType },
@@ -531,12 +1084,17 @@ export class HttpTranscriptPublicationClient implements TranscriptPublicationCli
     },
   ) {
     const body = WorkerFinalizeTranscriptRequestSchema.parse(input);
-    return ActiveTranscriptBundleSchema.parse(
+    const finalized = ActiveTranscriptBundleSchema.parse(
       await this.api(
         `/api/transcription-jobs/${encodeURIComponent(jobId)}/finalize`,
         body,
       ),
     );
+    for (const [objectKey, context] of this.#memoryTargets) {
+      if (context.uploadId === input.uploadId)
+        this.#memoryTargets.delete(objectKey);
+    }
+    return finalized;
   }
 
   private async api(path: string, body: unknown) {

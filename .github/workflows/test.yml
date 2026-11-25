@@ -28,5 +28,18 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      - name: Provide FFmpeg paths required by checkpoint integration tests
+        run: |
+          if ! command -v ffmpeg || ! command -v ffprobe; then
+            sudo apt-get update -qq
+            sudo apt-get install -y ffmpeg
+          fi
+          for tool in ffmpeg ffprobe; do
+            path="$(command -v "$tool")"
+            if [ "$path" != "/usr/local/bin/$tool" ]; then
+              sudo ln -sfn "$path" "/usr/local/bin/$tool"
+            fi
+          done
+          /usr/local/bin/ffmpeg -version | head -n 1
       - name: Format, typecheck, tests, build and migration checks
         run: npm run check

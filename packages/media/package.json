@@ -8,6 +8,8 @@
     "./still-images": "./src/still-images.ts"
   },
   "dependencies": {
+    "@research-video/contracts": "0.1.0",
+    "@research-video/export-settings": "0.1.0",
     "sharp": "0.35.5"
   }
 }

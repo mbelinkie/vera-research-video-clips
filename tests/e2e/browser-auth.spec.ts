@@ -284,7 +284,7 @@ test("owner sharing preserves role boundaries, clip durability, stale writes, re
     ).toEqual(
       expect.arrayContaining([
         ["alice@example.test", "owner"],
-        ["bob@example.test", "editor"],
+        ["bob@example.test", "researcher"],
         ["carol@example.test", "viewer"],
       ]),
     );
@@ -304,7 +304,7 @@ test("owner sharing preserves role boundaries, clip durability, stale writes, re
       ),
     );
     expect(editorMembership.membership).toMatchObject({
-      role: "editor",
+      role: "researcher",
       userId: bobMember.userId,
     });
 
@@ -347,8 +347,13 @@ test("owner sharing preserves role boundaries, clip durability, stale writes, re
     expect(editorClipPayload).toMatchObject({
       video: { youtubeVideoId: videoId },
       selection: expect.any(Object),
-      englishText: expect.any(String),
+      languageEvidence: {
+        schemaVersion: 2,
+        native: { role: "native" },
+        english: { role: "english", text: expect.any(String) },
+      },
     });
+    expect(editorClipPayload).not.toHaveProperty("englishText");
     await owner.reload();
     await expect(owner.getByLabel("Target project")).toHaveValue(projectId);
     await expect(
@@ -359,7 +364,13 @@ test("owner sharing preserves role boundaries, clip durability, stale writes, re
     );
     expect(ownerClips).toHaveLength(1);
     expect(ownerClips[0]?.id).toMatch(/^[0-9a-f-]{36}$/i);
-    expect(ownerClips[0]?.englishText).toBe(editorClipPayload?.englishText);
+    expect(ownerClips[0]?.englishText).toBe(
+      (
+        editorClipPayload?.languageEvidence as {
+          english: { text: string };
+        }
+      ).english.text,
+    );
     await expect(
       owner.getByText(ownerClips[0]!.englishText, { exact: true }),
     ).toBeVisible();
@@ -395,11 +406,19 @@ test("owner sharing preserves role boundaries, clip durability, stale writes, re
       },
     );
     expect(viewerWrite.status()).toBe(403);
-    expect(
-      (
-        await api(viewerContext, `/cloud-api/api/projects/${projectId}/members`)
-      ).status(),
-    ).toBe(403);
+    // A viewer may read the flat roster but never the owner-only identity
+    // details (display name and verified email).
+    const viewerRoster = await api(
+      viewerContext,
+      `/cloud-api/api/projects/${projectId}/members`,
+    );
+    expect(viewerRoster.status()).toBe(200);
+    for (const member of await json<Array<Record<string, unknown>>>(
+      viewerRoster,
+    )) {
+      expect(member).not.toHaveProperty("verifiedEmail");
+      expect(member).not.toHaveProperty("displayName");
+    }
     expect(
       (
         await api(
@@ -465,11 +484,17 @@ test("owner sharing preserves role boundaries, clip durability, stale writes, re
     expect(
       transferred.find((member) => member.userId === bobMember.userId)?.role,
     ).toBe("owner");
-    expect(
-      (
-        await api(ownerContext, `/cloud-api/api/projects/${projectId}/members`)
-      ).status(),
-    ).toBe(403);
+    // The former owner is now an Editor: flat roster only, no owner details.
+    const formerOwnerRoster = await api(
+      ownerContext,
+      `/cloud-api/api/projects/${projectId}/members`,
+    );
+    expect(formerOwnerRoster.status()).toBe(200);
+    for (const member of await json<Array<Record<string, unknown>>>(
+      formerOwnerRoster,
+    )) {
+      expect(member).not.toHaveProperty("verifiedEmail");
+    }
   } finally {
     await ownerContext.close();
     await editorContext.close();

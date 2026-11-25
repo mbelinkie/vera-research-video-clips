@@ -1,26 +1,42 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 import type {
   TranscriptSegment,
   TranscriptToken,
 } from "@research-video/contracts";
-import { transcriptVirtualWindow } from "@research-video/transcript";
-import type { TranscriptSelectionBoundary } from "@research-video/transcript";
+import {
+  transcriptNavigationTokens,
+  transcriptVirtualWindow,
+} from "@research-video/transcript";
+import type {
+  TranscriptSearchOccurrence,
+  TranscriptSelectionBoundary,
+} from "@research-video/transcript";
 
 const rowHeight = 76;
 const viewportHeight = 500;
 
-export type TranscriptSeekPrecision = "word" | "cue" | "caption-start";
+export type TranscriptSeekPrecision =
+  "word" | "cue" | "caption-start" | "estimated";
 
 type VirtualTranscriptProps = {
   segments: readonly TranscriptSegment[];
   tokens: readonly TranscriptToken[];
   activeSegmentId?: string;
   activeTokenId?: string;
+  searchMatches?: readonly TranscriptSearchOccurrence[];
+  activeSearchMatchId?: string;
   selectedTokenIds?: ReadonlySet<string>;
   follow: boolean;
   onFollowSuspended(): void;
   onSeek(milliseconds: number, precision: TranscriptSeekPrecision): void;
+  /** Precision-aware token activation (hosted app); takes priority over onPlayFromToken. */
+  onActivateToken?:
+    | ((milliseconds: number, precision: TranscriptSeekPrecision) => void)
+    | undefined;
+  onPlayFromToken?:
+    | ((milliseconds: number, precision: "word" | "estimated") => void)
+    | undefined;
   onSelect(
     anchor: TranscriptSelectionBoundary,
     focus: TranscriptSelectionBoundary,
@@ -32,10 +48,14 @@ export function VirtualTranscript({
   tokens,
   activeSegmentId,
   activeTokenId,
+  searchMatches = [],
+  activeSearchMatchId,
   selectedTokenIds,
   follow,
   onFollowSuspended,
   onSeek,
+  onPlayFromToken,
+  onActivateToken,
   onSelect,
 }: VirtualTranscriptProps) {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -49,6 +69,40 @@ export function VirtualTranscript({
     }
     return grouped;
   }, [tokens]);
+  const navigationTargets = useMemo(
+    () =>
+      new Map(
+        transcriptNavigationTokens(segments, tokens).map((token) => [
+          token.id,
+          token,
+        ]),
+      ),
+    [segments, tokens],
+  );
+  function activateToken(
+    token: TranscriptToken,
+    segment: TranscriptSegment,
+    navigationTarget: {
+      startMs: number;
+      timingPrecision: "word" | "estimated";
+    },
+  ) {
+    if (!onActivateToken && onPlayFromToken) {
+      onPlayFromToken(
+        navigationTarget.startMs,
+        navigationTarget.timingPrecision,
+      );
+      return;
+    }
+    const precision: TranscriptSeekPrecision =
+      token.startMs === undefined
+        ? "cue"
+        : token.endTiming === "derived"
+          ? "caption-start"
+          : "word";
+    (onActivateToken ?? onSeek)(token.startMs ?? segment.startMs, precision);
+  }
+
   const virtualWindow = transcriptVirtualWindow({
     itemCount: segments.length,
     scrollTop,
@@ -58,6 +112,9 @@ export function VirtualTranscript({
   const rendered = segments.slice(
     virtualWindow.startIndex,
     virtualWindow.endIndex,
+  );
+  const activeSearchMatch = searchMatches.find(
+    (match) => match.id === activeSearchMatchId,
   );
 
   useEffect(() => {
@@ -72,6 +129,19 @@ export function VirtualTranscript({
     );
     containerRef.current.scrollTo({ top: nextScrollTop, behavior: "smooth" });
   }, [activeSegmentId, follow, segments]);
+
+  useEffect(() => {
+    if (!activeSearchMatch || !containerRef.current) return;
+    const matchIndex = segments.findIndex(
+      (segment) => segment.id === activeSearchMatch.startSegmentId,
+    );
+    if (matchIndex < 0) return;
+    const nextScrollTop = Math.max(
+      0,
+      matchIndex * rowHeight - viewportHeight / 2 + rowHeight / 2,
+    );
+    containerRef.current.scrollTo({ top: nextScrollTop, behavior: "smooth" });
+  }, [activeSearchMatch, segments]);
 
   return (
     <div
@@ -111,6 +181,14 @@ export function VirtualTranscript({
         >
           {rendered.map((segment) => {
             const segmentTokens = tokensBySegment.get(segment.id) ?? [];
+            const searchRanges = searchMatches
+              .flatMap((match) =>
+                match.ranges
+                  .filter((range) => range.segmentId === segment.id)
+                  .map((range) => ({ ...range, matchId: match.id })),
+              )
+              .toSorted((left, right) => left.startOffset - right.startOffset);
+            let tokenTextCursor = 0;
             return (
               <div
                 key={segment.id}
@@ -128,58 +206,67 @@ export function VirtualTranscript({
                 </button>
                 <span className="transcript-text">
                   {segmentTokens.length > 0 ? (
-                    segmentTokens.map((token, index) => (
-                      <span key={token.id}>
-                        {index > 0 ? " " : null}
-                        <span
-                          role="button"
-                          tabIndex={0}
-                          data-transcript-segment-id={segment.id}
-                          data-transcript-token-id={token.id}
-                          data-alignment-status={token.alignmentStatus}
-                          aria-label={`${token.text}${token.alignmentStatus === "unaligned" ? ", unaligned, cue timing only" : ""}`}
-                          className={`transcript-token${activeTokenId === token.id ? " active" : ""}${selectedTokenIds?.has(token.id) ? " selected" : ""}${token.alignmentStatus === "unaligned" ? " unaligned" : ""}`}
-                          title={
-                            token.alignmentStatus === "unaligned"
-                              ? "Unaligned word · cue timing"
-                              : token.startMs === undefined
-                                ? "Cue-level timing"
-                                : token.endTiming === "derived"
-                                  ? `Exact caption word start ${(token.startMs / 1_000).toFixed(3)}s; derived end (estimate) ${(token.endMs! / 1_000).toFixed(3)}s`
-                                  : `Word timing ${(token.startMs / 1_000).toFixed(3)}s`
-                          }
-                          onClick={() => {
-                            if (!window.getSelection()?.isCollapsed) return;
-                            onSeek(
-                              token.startMs ?? segment.startMs,
-                              token.startMs === undefined
-                                ? "cue"
-                                : token.endTiming === "derived"
-                                  ? "caption-start"
-                                  : "word",
-                            );
-                          }}
-                          onKeyDown={(event) => {
-                            if (event.key !== "Enter" && event.key !== " ")
-                              return;
-                            event.preventDefault();
-                            onSeek(
-                              token.startMs ?? segment.startMs,
-                              token.startMs === undefined
-                                ? "cue"
-                                : token.endTiming === "derived"
-                                  ? "caption-start"
-                                  : "word",
-                            );
-                          }}
-                        >
-                          {token.text}
+                    segmentTokens.map((token, index) => {
+                      const navigationTarget = navigationTargets.get(token.id)!;
+                      const tokenOffset = segment.text.indexOf(
+                        token.text,
+                        tokenTextCursor,
+                      );
+                      const tokenStart =
+                        tokenOffset < 0 ? tokenTextCursor : tokenOffset;
+                      const tokenEnd = tokenStart + token.text.length;
+                      tokenTextCursor = tokenEnd;
+                      const tokenMatches = searchRanges.filter(
+                        (range) =>
+                          range.startOffset < tokenEnd &&
+                          range.endOffset > tokenStart,
+                      );
+                      const activeSearch = tokenMatches.some(
+                        (range) => range.matchId === activeSearchMatchId,
+                      );
+                      return (
+                        <span key={token.id}>
+                          {index > 0 ? " " : null}
+                          <span
+                            role="button"
+                            tabIndex={0}
+                            data-transcript-segment-id={segment.id}
+                            data-transcript-token-id={token.id}
+                            data-alignment-status={token.alignmentStatus}
+                            aria-label={`${token.text}${token.alignmentStatus === "unaligned" ? ", unaligned, cue timing only" : ""}`}
+                            className={`transcript-token${activeTokenId === token.id ? " active" : ""}${selectedTokenIds?.has(token.id) ? " selected" : ""}${token.alignmentStatus === "unaligned" ? " unaligned" : ""}${tokenMatches.length ? " search-match" : ""}${activeSearch ? " active-search-match" : ""}`}
+                            title={
+                              navigationTarget.timingPrecision === "estimated"
+                                ? `Estimated word position ${formatTime(navigationTarget.startMs)}`
+                                : token.startMs === undefined
+                                  ? "Cue-level timing"
+                                  : token.endTiming === "derived"
+                                    ? `Exact caption word start ${(token.startMs / 1_000).toFixed(3)}s; derived end (estimate) ${(token.endMs! / 1_000).toFixed(3)}s`
+                                    : `Word timing ${(token.startMs / 1_000).toFixed(3)}s`
+                            }
+                            onClick={() => {
+                              if (!window.getSelection()?.isCollapsed) return;
+                              activateToken(token, segment, navigationTarget);
+                            }}
+                            onKeyDown={(event) => {
+                              if (event.key !== "Enter" && event.key !== " ")
+                                return;
+                              event.preventDefault();
+                              activateToken(token, segment, navigationTarget);
+                            }}
+                          >
+                            {token.text}
+                          </span>
                         </span>
-                      </span>
-                    ))
+                      );
+                    })
                   ) : (
                     <span data-transcript-segment-id={segment.id}>
-                      {segment.text}
+                      {highlightedTranscriptText(
+                        segment.text,
+                        searchRanges,
+                        activeSearchMatchId,
+                      )}
                     </span>
                   )}
                 </span>
@@ -190,6 +277,35 @@ export function VirtualTranscript({
       </div>
     </div>
   );
+}
+
+function highlightedTranscriptText(
+  text: string,
+  ranges: readonly {
+    startOffset: number;
+    endOffset: number;
+    matchId: string;
+  }[],
+  activeMatchId: string | undefined,
+) {
+  if (!ranges.length) return text;
+  const parts: ReactNode[] = [];
+  let cursor = 0;
+  for (const range of ranges) {
+    if (range.startOffset > cursor)
+      parts.push(text.slice(cursor, range.startOffset));
+    parts.push(
+      <mark
+        key={`${range.matchId}:${range.startOffset}`}
+        className={range.matchId === activeMatchId ? "active-search-match" : ""}
+      >
+        {text.slice(range.startOffset, range.endOffset)}
+      </mark>,
+    );
+    cursor = Math.max(cursor, range.endOffset);
+  }
+  if (cursor < text.length) parts.push(text.slice(cursor));
+  return parts;
 }
 
 function selectionBoundaryFromNode(

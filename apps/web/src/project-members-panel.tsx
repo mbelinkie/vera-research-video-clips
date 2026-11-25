@@ -34,10 +34,14 @@ function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : "Membership request failed.";
 }
 
+function isEditorRole(role: ProjectMember["role"]) {
+  return role === "editor" || role === "researcher";
+}
+
 function roleLabel(role: ProjectMember["role"]) {
-  return role === "researcher"
-    ? "Researcher (legacy)"
-    : role.slice(0, 1).toUpperCase() + role.slice(1);
+  // The membership store keeps the hosted Editor write role as Researcher.
+  if (role === "researcher") return "Editor";
+  return role.slice(0, 1).toUpperCase() + role.slice(1);
 }
 
 export function ProjectMembersPanel({
@@ -358,32 +362,30 @@ export function ProjectMembersPanel({
                       </span>
                       {!isOwner ? (
                         <div className="member-actions">
-                          {member.role !== "researcher" ? (
+                          {member.role !== "administrator" ? (
                             <button
                               type="button"
                               disabled={busy}
                               onClick={() =>
                                 void changeRole(
                                   member,
-                                  member.role === "editor"
+                                  isEditorRole(member.role)
                                     ? "viewer"
                                     : "editor",
                                 )
                               }
                             >
                               Make{" "}
-                              {member.role === "editor" ? "Viewer" : "Editor"}
+                              {isEditorRole(member.role) ? "Viewer" : "Editor"}
                             </button>
                           ) : null}
-                          {member.role !== "researcher" ? (
-                            <button
-                              type="button"
-                              disabled={busy}
-                              onClick={() => void transfer(member)}
-                            >
-                              Transfer ownership
-                            </button>
-                          ) : null}
+                          <button
+                            type="button"
+                            disabled={busy}
+                            onClick={() => void transfer(member)}
+                          >
+                            Transfer ownership
+                          </button>
                           <button
                             type="button"
                             className="danger-action"

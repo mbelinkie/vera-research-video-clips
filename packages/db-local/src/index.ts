@@ -1,21 +1,140 @@
 import { readdirSync, readFileSync } from "node:fs";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { basename, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 
 import {
   CreateExportOnlyRequestSchema,
+  ExportSourceRightsSnapshotSchema,
+  ArtifactLocatorSummarySchema,
+  ArtifactRootSummarySchema,
+  ClipLibraryPageSchema,
+  ClipLibraryQuerySchema,
+  OfflineProjectBookmarkCommandSchema,
+  NotificationFeedPageSchema,
+  NotificationFeedQuerySchema,
+  ProjectBookmarkPageSchema,
+  ProjectBookmarkQuerySchema,
+  ProjectBookmarkSchema,
+  DesktopSetupSchema,
+  ExportObservedMediaPropertiesSchema,
   ExportRequestSchema,
+  LoggedExportDeliverySchema,
+  LoggedExportFailureResultSchema,
+  LoggedExportCanceledResultSchema,
+  LoggedExportExecutionSchema,
+  LoggedExportProgressSnapshotSchema,
+  LoggedExportSuccessResultSchema,
   NormalizedTranscriptSchema,
+  ResolvedExportSettingsSnapshotSchema,
+  LocalComponentReferenceSchema,
+  SetupSelectionTargetSchema,
+  SetupSnapshotSchema,
+  languagesEquivalent,
+  primaryLanguage,
+  sanitizeLoggedExportFailureCode,
+  sanitizeLoggedExportFailureMessage,
+  sanitizeNotificationLabel,
   type CreateExportOnlyRequest,
+  type ArtifactAvailabilityState,
+  type ArtifactLocatorSummary,
+  type ArtifactRootSummary,
+  type ArtifactStoragePlatform,
+  type ArtifactVerificationFailureClass,
+  type ArtifactVersionSummary,
+  type ClipLibraryPage,
+  type ClipLibraryQuery,
+  type OfflineProjectBookmarkCommand,
+  type OfflineProjectBookmarkCommandType,
+  type NotificationFeedPage,
+  type NotificationFeedQuery,
+  type ProjectBookmark,
+  type ProjectBookmarkPage,
+  type ProjectBookmarkQuery,
+  type DesktopSetup,
+  type DerivedTranslationIdentity,
   type ExportRequest,
+  type LoggedExportDelivery,
+  type LoggedExportFailureResult,
+  type LoggedExportCanceledResult,
+  type LoggedExportExecution,
+  type LoggedExportProgressSnapshot,
+  type LoggedExportProgressStage,
+  type LoggedExportSuccessResult,
+  type NoSpeechAttestation,
+  type ExportObservedMediaProperties,
+  type ResolvedExportSettingsSnapshot,
   type NormalizedTranscript,
+  type LocalComponentReference,
+  type SetupSelectionTarget,
+  type SetupSnapshot,
+  type SourceIdentityV1,
 } from "@research-video/contracts";
+import {
+  resolveExportSettings,
+  canonicalJson,
+  resolvedPresetForCompatibility,
+  sha256Fingerprint,
+} from "@research-video/export-settings";
 
 const defaultMigrationDirectory = fileURLToPath(
   new URL("../migrations", import.meta.url),
 );
+
+const SourceScratchLayoutVersion = 2;
+const SharedSourceScratchLayoutVersion = 3;
+const LoggedExportProgressStageRank: Record<LoggedExportProgressStage, number> =
+  {
+    preparing: 1,
+    acquiring_source: 2,
+    inspecting_source: 3,
+    rendering: 4,
+    validating_media: 5,
+    building_thumbnail: 6,
+    building_subtitles: 7,
+    packaging: 8,
+    cleaning_source: 9,
+    local_complete: 10,
+  };
+const SourceScratchCleanupClaimLeaseMs = 5 * 60 * 1_000;
+const MaxSourceScratchCleanupClaims = 25;
+
+const localExportRequestSelect = `SELECT er.*, j.state,
+  j.payload_json AS job_payload_json,
+  ssa.duration_ms AS media_duration_ms,
+  ssa.container_format AS media_container_format,
+  ssa.video_codec AS media_video_codec,
+  ssa.audio_codec AS media_audio_codec,
+  ssa.ffprobe_version AS media_ffprobe_version,
+  er.rendered_duration_ms,
+  er.rendered_container_format,
+  er.rendered_video_codec,
+  er.rendered_audio_codec,
+  er.rendered_ffprobe_version,
+  er.rendered_ffmpeg_version,
+  er.rendered_conformance_schema_version,
+  er.rendered_settings_sha256,
+  er.rendered_observed_properties_json,
+  er.rendered_source_attempt,
+  er.rendered_validated_at,
+  er.subtitle_omission_policy,
+  er.subtitle_omission_source_attempt,
+  er.subtitle_omission_validated_at,
+  er.english_subtitle_track_id,
+  er.english_subtitle_track_version,
+  er.english_subtitle_cue_count,
+  er.english_subtitle_byte_size,
+  er.english_subtitle_content_sha256,
+  er.english_subtitle_start_ms,
+  er.english_subtitle_end_ms,
+  er.english_subtitle_source_attempt,
+  er.english_subtitle_validated_at,
+  er.subtitle_tracks_snapshot_json
+  FROM export_requests er
+  JOIN jobs j ON j.id = er.job_id
+  LEFT JOIN source_scratch_assets ssa
+    ON ssa.job_id = er.job_id AND ssa.attempt = er.resolved_source_attempt`;
 
 export function openLocalDatabase(filename: string): DatabaseSync {
   const database = new DatabaseSync(filename);
@@ -28,6 +147,10 @@ export function runLocalMigrations(
   database: DatabaseSync,
   migrationDirectory = defaultMigrationDirectory,
 ): string[] {
+  database.function("legacy_export_settings_fingerprint", (value) => {
+    const digest = createHash("md5").update(String(value)).digest("hex");
+    return `${digest}${digest}`;
+  });
   database.exec(`
     CREATE TABLE IF NOT EXISTS schema_migrations (
       version TEXT PRIMARY KEY,
@@ -70,31 +193,171 @@ export function runLocalMigrations(
   return newlyApplied;
 }
 
+/**
+ * Stores only a hash of a volatile desktop login capability. It is deliberately
+ * separate from transcript bytes so multiple authorized login sessions can
+ * reuse one immutable cache bundle without sharing an authority record.
+ */
+export class LocalTranscriptCacheAuthorizationRepository {
+  constructor(
+    private readonly database: DatabaseSync,
+    private readonly now: () => Date = () => new Date(),
+  ) {}
+
+  authorize(input: {
+    projectId: string;
+    catalogVideoId: string;
+    transcriptVersionId: string;
+    authorizationScopeSha256: string;
+  }): void {
+    this.database
+      .prepare(
+        `INSERT INTO verified_transcript_cache_authorizations
+           (project_id, video_id, transcript_version_id,
+            authorization_scope_sha256, authorized_at)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT (
+           project_id, video_id, transcript_version_id,
+           authorization_scope_sha256
+         ) DO UPDATE SET authorized_at = excluded.authorized_at`,
+      )
+      .run(
+        input.projectId,
+        input.catalogVideoId,
+        input.transcriptVersionId,
+        requireAuthorizationScopeSha256(input.authorizationScopeSha256),
+        this.now().toISOString(),
+      );
+  }
+
+  hasAuthorization(input: {
+    projectId: string;
+    catalogVideoId: string;
+    transcriptVersionId: string;
+    authorizationScopeSha256: string;
+  }): boolean {
+    return Boolean(
+      this.database
+        .prepare(
+          `SELECT 1 FROM verified_transcript_cache_authorizations
+           WHERE project_id = ? AND video_id = ? AND transcript_version_id = ?
+             AND authorization_scope_sha256 = ? LIMIT 1`,
+        )
+        .get(
+          input.projectId,
+          input.catalogVideoId,
+          input.transcriptVersionId,
+          requireAuthorizationScopeSha256(input.authorizationScopeSha256),
+        ),
+    );
+  }
+
+  revokeScope(authorizationScopeSha256: string): void {
+    this.database
+      .prepare(
+        `DELETE FROM verified_transcript_cache_authorizations
+         WHERE authorization_scope_sha256 = ?`,
+      )
+      .run(requireAuthorizationScopeSha256(authorizationScopeSha256));
+  }
+}
+
+function requireAuthorizationScopeSha256(value: string): string {
+  if (!/^[a-f0-9]{64}$/u.test(value)) {
+    throw new RangeError("Transcript cache authorization scope is invalid.");
+  }
+  return value;
+}
+
+function parseLocalNotificationCursor(value: string): {
+  createdAt: string;
+  id: string;
+} {
+  try {
+    const parsed = JSON.parse(Buffer.from(value, "base64url").toString("utf8"));
+    if (
+      typeof parsed.createdAt !== "string" ||
+      !Number.isFinite(Date.parse(parsed.createdAt)) ||
+      typeof parsed.id !== "string" ||
+      !/^[0-9a-f-]{36}$/iu.test(parsed.id)
+    ) {
+      throw new Error("invalid");
+    }
+    return parsed;
+  } catch {
+    throw new RangeError("Local notification cursor is invalid.");
+  }
+}
+
 export class LocalExportQueue {
   constructor(
     private readonly database: DatabaseSync,
     private readonly now: () => Date = () => new Date(),
   ) {}
 
-  createExportOnly(input: CreateExportOnlyRequest): ExportRequest {
+  createExportOnly(
+    input: CreateExportOnlyRequest,
+    resolvedSettingsSnapshot?: ResolvedExportSettingsSnapshot,
+    notificationAccountScopeSha256?: string,
+  ): ExportRequest {
     const request = CreateExportOnlyRequestSchema.parse(input);
+    const sourceRights = requireExactSourceRightsSnapshot(
+      request.sourceRights,
+      request.video.youtubeVideoId,
+    );
     const idempotencyKey = `export-only:${request.idempotencyKey}`;
     const existing = this.database
       .prepare(
-        `SELECT er.*, j.state
-         FROM export_requests er
-         JOIN jobs j ON j.id = er.job_id
+        `${localExportRequestSelect}
          WHERE j.idempotency_key = ?`,
       )
       .get(idempotencyKey) as Record<string, unknown> | undefined;
-    if (existing) return mapLocalExportRequest(existing);
+    if (existing) {
+      this.assertExactSourceRightsSnapshot(existing, sourceRights);
+      if (
+        notificationAccountScopeSha256 &&
+        existing.notification_account_scope_sha256 !==
+          notificationAccountScopeSha256
+      ) {
+        throw new LocalExportLifecycleError(
+          "This export command belongs to another signed-in account.",
+          "export_notification_account_conflict",
+        );
+      }
+      return this.mapRequest(existing);
+    }
+
+    const accountScope = notificationAccountScopeSha256
+      ? requireAuthorizationScopeSha256(notificationAccountScopeSha256)
+      : undefined;
 
     const requestId = randomUUID();
     const jobId = randomUUID();
     const now = this.now().toISOString();
+    const resolved =
+      resolvedSettingsSnapshot ??
+      (request.preset
+        ? resolveExportSettings({
+            context: "export_only",
+            sourceLanguageClass: request.sourceLanguageClass,
+            legacyPreset: request.preset,
+            resolvedAt: now,
+          }).snapshot
+        : undefined);
+    if (!resolved) {
+      throw new LocalExportLifecycleError(
+        "Catalog export creation requires an authoritative resolved settings snapshot.",
+        "resolved_export_settings_required",
+      );
+    }
+    const preset = resolvedPresetForCompatibility(resolved);
     const videoSnapshot = JSON.stringify(request.video);
     const selectionSnapshot = JSON.stringify(request.selection);
-    const presetSnapshot = JSON.stringify(request.preset);
+    const presetSnapshot = JSON.stringify(preset);
+    const resolvedSettingsSnapshotJson = JSON.stringify(resolved);
+    const subtitleTracksSnapshot = request.subtitleTracks
+      ? JSON.stringify(request.subtitleTracks)
+      : null;
     this.database.exec("BEGIN IMMEDIATE;");
     try {
       this.database
@@ -110,21 +373,35 @@ export class LocalExportQueue {
           JSON.stringify({
             exportRequestId: requestId,
             mode: "export_only",
+            requestOrigin: request.requestOrigin ?? "selection_action",
             video: request.video,
             selection: request.selection,
             sourceLanguageClass: request.sourceLanguageClass,
-            preset: request.preset,
+            sourceRights,
+            preset,
+            resolvedSettingsSnapshot: resolved,
           }),
           now,
           now,
         );
+      const originColumn = this.hasRequestOriginColumn();
+      const sourceRightsColumn = this.hasSourceRightsConfirmationColumn();
+      const notificationScopeColumn = this.hasNotificationAccountScopeColumn();
       this.database
         .prepare(
           `INSERT INTO export_requests
              (id, job_id, mode, video_snapshot_json,
               selection_snapshot_json, source_language_class,
-              preset_snapshot_json, created_at, updated_at)
-           VALUES (?, ?, 'export_only', ?, ?, ?, ?, ?, ?)`,
+              preset_snapshot_json, resolved_settings_snapshot_json,
+              subtitle_tracks_snapshot_json
+              ${notificationScopeColumn ? ", notification_account_scope_sha256" : ""}
+              ${sourceRightsColumn ? ", source_rights_confirmation_json" : ""}
+              ${originColumn ? ", request_origin" : ""},
+              created_at, updated_at)
+           VALUES (?, ?, 'export_only', ?, ?, ?, ?, ?, ?
+             ${notificationScopeColumn ? ", ?" : ""}
+             ${sourceRightsColumn ? ", ?" : ""}
+             ${originColumn ? ", ?" : ""}, ?, ?)`,
         )
         .run(
           requestId,
@@ -133,6 +410,13 @@ export class LocalExportQueue {
           selectionSnapshot,
           request.sourceLanguageClass,
           presetSnapshot,
+          resolvedSettingsSnapshotJson,
+          subtitleTracksSnapshot,
+          ...(notificationScopeColumn ? [accountScope ?? null] : []),
+          ...(sourceRightsColumn ? [JSON.stringify(sourceRights)] : []),
+          ...(originColumn
+            ? [request.requestOrigin ?? "selection_action"]
+            : []),
           now,
           now,
         );
@@ -144,46 +428,5708 @@ export class LocalExportQueue {
     return this.get(requestId)!;
   }
 
-  get(requestId: string): ExportRequest | undefined {
-    const row = this.database
+  listNotificationFeed(
+    accountScopeSha256: string,
+    input: NotificationFeedQuery,
+  ): NotificationFeedPage {
+    const scope = requireAuthorizationScopeSha256(accountScopeSha256);
+    const query = NotificationFeedQuerySchema.parse(input);
+    const terminal = this.database
       .prepare(
-        `SELECT er.*, j.state
+        `SELECT er.id, er.video_snapshot_json, j.attempt, j.state, j.updated_at
          FROM export_requests er
          JOIN jobs j ON j.id = er.job_id
+         WHERE er.cloud_delivery_id IS NULL
+           AND er.notification_account_scope_sha256 = ?
+           AND j.state IN ('complete', 'failed', 'needs_user_action')`,
+      )
+      .all(scope) as Array<{
+      id: string;
+      video_snapshot_json: string;
+      attempt: number;
+      state: string;
+      updated_at: string;
+    }>;
+    for (const row of terminal) {
+      const status = row.state === "complete" ? "completed" : "action_needed";
+      const sourceKey = `${row.id}:attempt:${Number(row.attempt)}:${status}`;
+      const video = JSON.parse(row.video_snapshot_json) as { title?: unknown };
+      this.database
+        .prepare(
+          `INSERT INTO local_export_notification_receipts
+             (id, export_request_id, account_scope_sha256, source_key, status,
+              source_label, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT (account_scope_sha256, source_key) DO NOTHING`,
+        )
+        .run(
+          randomUUID(),
+          row.id,
+          scope,
+          sourceKey,
+          status,
+          sanitizeNotificationLabel(video.title ?? "Untitled source"),
+          row.updated_at,
+        );
+    }
+
+    const cursor = query.cursor
+      ? parseLocalNotificationCursor(query.cursor)
+      : undefined;
+    const rows = this.database
+      .prepare(
+        `SELECT * FROM local_export_notification_receipts
+         WHERE account_scope_sha256 = ?
+           AND (? IS NULL OR created_at >= ?)
+           AND (? IS NULL OR created_at < ? OR (created_at = ? AND id < ?))
+         ORDER BY created_at DESC, id DESC
+         LIMIT ?`,
+      )
+      .all(
+        scope,
+        query.since ?? null,
+        query.since ?? null,
+        cursor?.createdAt ?? null,
+        cursor?.createdAt ?? null,
+        cursor?.createdAt ?? null,
+        cursor?.id ?? null,
+        query.limit + 1,
+      ) as Array<{
+      id: string;
+      export_request_id: string;
+      status: "completed" | "action_needed";
+      source_label: string;
+      created_at: string;
+    }>;
+    const hasMore = rows.length > query.limit;
+    const page = rows.slice(0, query.limit);
+    const last = page.at(-1);
+    return NotificationFeedPageSchema.parse({
+      events: page.map((row) => ({
+        id: row.id,
+        kind: "local_export_terminal",
+        status: row.status,
+        sourceLabel: sanitizeNotificationLabel(row.source_label),
+        navigation: {
+          kind: "local_export",
+          requestId: row.export_request_id,
+        },
+        createdAt: row.created_at,
+      })),
+      ...(hasMore && last
+        ? {
+            nextCursor: Buffer.from(
+              JSON.stringify({ createdAt: last.created_at, id: last.id }),
+            ).toString("base64url"),
+          }
+        : {}),
+      fetchedAt: this.now().toISOString(),
+    });
+  }
+
+  importLoggedDeliveryPending(input: LoggedExportDelivery): ExportRequest {
+    const delivery = LoggedExportDeliverySchema.parse(input);
+    const request = delivery.request;
+    const sourceRights = request.sourceRights
+      ? requireExactSourceRightsSnapshot(
+          request.sourceRights,
+          request.video.youtubeVideoId,
+        )
+      : undefined;
+    const physicalMode = "export_only";
+    this.database.exec("BEGIN IMMEDIATE;");
+    try {
+      const existing = this.database
+        .prepare(
+          `${localExportRequestSelect}
+           WHERE er.id = ? OR er.cloud_delivery_id = ?`,
+        )
+        .get(request.id, delivery.deliveryId) as
+        Record<string, unknown> | undefined;
+      if (existing) {
+        try {
+          this.assertExactLoggedDelivery(existing, delivery);
+          const replay = this.mapRequest(existing);
+          this.database.exec("COMMIT;");
+          return replay;
+        } catch (error) {
+          if (
+            !(error instanceof LocalLoggedExportDeliveryConflictError) ||
+            String(existing.cloud_delivery_state) !== "pending_acceptance" ||
+            String(existing.cloud_delivery_id) !== delivery.deliveryId ||
+            delivery.generation <= Number(existing.cloud_delivery_generation) ||
+            !this.sameImmutableLoggedRequest(existing, delivery)
+          ) {
+            throw error;
+          }
+          this.deletePendingLoggedRequestRows(
+            String(existing.id),
+            String(existing.job_id),
+          );
+        }
+      }
+
+      this.database
+        .prepare(
+          `INSERT INTO jobs
+             (id, project_id, kind, state, idempotency_key, attempt,
+              payload_json, created_at, updated_at)
+           VALUES (?, NULL, 'export', 'claimed', ?, 0, ?, ?, ?)`,
+        )
+        .run(
+          request.jobId,
+          `logged-delivery:${request.id}`,
+          JSON.stringify({
+            exportRequestId: request.id,
+            mode: "logged",
+            ...(request.requestOrigin
+              ? { requestOrigin: request.requestOrigin }
+              : {}),
+            projectId: request.projectId,
+            clipId: request.clipId,
+            video: request.video,
+            selection: request.selection,
+            sourceLanguageClass: request.sourceLanguageClass,
+            ...(sourceRights ? { sourceRights } : {}),
+            ...(request.subtitleTracks
+              ? { subtitleTracks: request.subtitleTracks }
+              : {}),
+            preset: request.preset,
+            resolvedSettingsSnapshot: request.resolvedSettingsSnapshot,
+            ...(delivery.sourceGroup
+              ? { sourceGroup: delivery.sourceGroup }
+              : {}),
+          }),
+          request.createdAt,
+          request.updatedAt,
+        );
+      const originColumn = this.hasRequestOriginColumn();
+      const sourceRightsColumn = this.hasSourceRightsConfirmationColumn();
+      this.database
+        .prepare(
+          `INSERT INTO export_requests
+             (id, job_id, mode, video_snapshot_json, selection_snapshot_json,
+              source_language_class, preset_snapshot_json,
+              resolved_settings_snapshot_json, subtitle_tracks_snapshot_json
+              ${sourceRightsColumn ? ", source_rights_confirmation_json" : ""},
+              cloud_project_id, cloud_clip_id, cloud_delivery_id,
+              cloud_delivery_generation, cloud_reservation_token,
+              cloud_worker_id, cloud_worker_epoch, cloud_reserved_at,
+              cloud_reservation_expires_at, cloud_delivery_state
+              ${originColumn ? ", request_origin" : ""},
+              created_at, updated_at)
+           VALUES ($id, $jobId, $mode, $video, $selection, $sourceLanguage,
+                   $preset, $resolved, $subtitleTracks
+                   ${sourceRightsColumn ? ", $sourceRights" : ""},
+                   $projectId, $clipId,
+                   $deliveryId, $generation, $reservationToken, $workerId,
+                   $workerEpoch, $reservedAt, $reservationExpiresAt,
+                   'pending_acceptance'
+                   ${originColumn ? ", $requestOrigin" : ""},
+                   $createdAt, $updatedAt)`,
+        )
+        .run({
+          $id: request.id,
+          $jobId: request.jobId,
+          $mode: physicalMode,
+          $video: JSON.stringify(request.video),
+          $selection: JSON.stringify(request.selection),
+          $sourceLanguage: request.sourceLanguageClass,
+          $preset: JSON.stringify(request.preset),
+          $resolved: JSON.stringify(request.resolvedSettingsSnapshot),
+          $subtitleTracks: request.subtitleTracks
+            ? JSON.stringify(request.subtitleTracks)
+            : null,
+          ...(sourceRightsColumn
+            ? {
+                $sourceRights: sourceRights
+                  ? JSON.stringify(sourceRights)
+                  : null,
+              }
+            : {}),
+          $projectId: request.projectId!,
+          $clipId: request.clipId!,
+          $deliveryId: delivery.deliveryId,
+          $generation: delivery.generation,
+          $reservationToken: delivery.reservationToken,
+          $workerId: delivery.workerId,
+          $workerEpoch: delivery.workerEpoch,
+          $reservedAt: delivery.reservedAt,
+          $reservationExpiresAt: delivery.reservationExpiresAt,
+          ...(originColumn
+            ? { $requestOrigin: request.requestOrigin ?? null }
+            : {}),
+          $createdAt: request.createdAt,
+          $updatedAt: request.updatedAt,
+        });
+      this.database.exec("COMMIT;");
+    } catch (error) {
+      this.database.exec("ROLLBACK;");
+      throw error;
+    }
+    return this.get(request.id)!;
+  }
+
+  activateLoggedDelivery(input: LoggedExportDelivery): ExportRequest {
+    const delivery = LoggedExportDeliverySchema.parse(input);
+    if (delivery.status !== "accepted") {
+      throw new LocalLoggedExportDeliveryConflictError(
+        "Only a cloud-accepted delivery can become runnable locally.",
+      );
+    }
+    const acceptedAt = delivery.acceptedAt!;
+    const existing = this.database
+      .prepare(`${localExportRequestSelect} WHERE er.id = ?`)
+      .get(delivery.request.id) as Record<string, unknown> | undefined;
+    if (!existing) throw new LocalExportRequestNotFoundError();
+    this.assertExactLoggedDelivery(existing, delivery);
+    this.database.exec("BEGIN IMMEDIATE;");
+    try {
+      const activated = this.database
+        .prepare(
+          `UPDATE export_requests
+           SET cloud_delivery_state = 'accepted', cloud_accepted_at = ?,
+               updated_at = ?
+           WHERE id = ? AND cloud_delivery_state = 'pending_acceptance'
+             AND cloud_delivery_id = ? AND cloud_delivery_generation = ?
+             AND cloud_reservation_token = ?`,
+        )
+        .run(
+          acceptedAt,
+          acceptedAt,
+          delivery.request.id,
+          delivery.deliveryId,
+          delivery.generation,
+          delivery.reservationToken,
+        );
+      if (activated.changes === 1) {
+        this.database
+          .prepare(
+            `UPDATE jobs SET state = 'queued', updated_at = ?
+             WHERE id = ? AND state = 'claimed'`,
+          )
+          .run(acceptedAt, delivery.request.jobId);
+      } else if (String(existing.cloud_delivery_state) !== "accepted") {
+        throw new LocalLoggedExportDeliveryConflictError(
+          "The pending local delivery no longer matches the cloud acceptance.",
+        );
+      }
+      this.database.exec("COMMIT;");
+    } catch (error) {
+      this.database.exec("ROLLBACK;");
+      throw error;
+    }
+    return this.get(delivery.request.id)!;
+  }
+
+  rejectPendingLoggedDelivery(input: LoggedExportDelivery): void {
+    const delivery = LoggedExportDeliverySchema.parse(input);
+    const existing = this.database
+      .prepare(`${localExportRequestSelect} WHERE er.id = ?`)
+      .get(delivery.request.id) as Record<string, unknown> | undefined;
+    if (!existing) return;
+    this.assertExactLoggedDelivery(existing, delivery);
+    if (String(existing.cloud_delivery_state) === "accepted") {
+      throw new LocalLoggedExportDeliveryConflictError(
+        "An accepted local delivery cannot be rejected.",
+      );
+    }
+    this.removePendingLoggedRequest(
+      delivery.request.id,
+      delivery.request.jobId,
+    );
+  }
+
+  getPendingLoggedDelivery(): LoggedExportDelivery | undefined {
+    const row = this.database
+      .prepare(
+        `${localExportRequestSelect}
+         WHERE er.cloud_delivery_state = 'pending_acceptance'
+         ORDER BY er.created_at, er.id LIMIT 1`,
+      )
+      .get() as Record<string, unknown> | undefined;
+    if (!row) return undefined;
+    return LoggedExportDeliverySchema.parse({
+      deliveryId: row.cloud_delivery_id,
+      generation: Number(row.cloud_delivery_generation),
+      reservationToken: row.cloud_reservation_token,
+      workerId: row.cloud_worker_id,
+      workerEpoch: Number(row.cloud_worker_epoch),
+      status: "reserved",
+      reservedAt: row.cloud_reserved_at,
+      reservationExpiresAt: row.cloud_reservation_expires_at,
+      ...sourceGroupFromLocalRow(row),
+      request: this.mapRequest(row),
+    });
+  }
+
+  getAcceptedLoggedDelivery(
+    requestId: string,
+  ): LoggedExportDelivery | undefined {
+    const row = this.database
+      .prepare(
+        `${localExportRequestSelect}
+         WHERE er.id = ? AND er.cloud_delivery_state = 'accepted'`,
+      )
+      .get(requestId) as Record<string, unknown> | undefined;
+    if (!row || !row.cloud_accepted_at) return undefined;
+    return LoggedExportDeliverySchema.parse({
+      deliveryId: row.cloud_delivery_id,
+      generation: Number(row.cloud_delivery_generation),
+      reservationToken: row.cloud_reservation_token,
+      workerId: row.cloud_worker_id,
+      workerEpoch: Number(row.cloud_worker_epoch),
+      status: "accepted",
+      reservedAt: row.cloud_reserved_at,
+      reservationExpiresAt: row.cloud_reservation_expires_at,
+      acceptedAt: row.cloud_accepted_at,
+      ...sourceGroupFromLocalRow(row),
+      request: this.mapRequest(row),
+    });
+  }
+
+  activateLoggedExecution(input: LoggedExportExecution): LoggedExportExecution {
+    const execution = LoggedExportExecutionSchema.parse(input);
+    const accepted = this.getAcceptedLoggedDelivery(execution.requestId);
+    if (
+      !accepted ||
+      accepted.workerId !== execution.workerId ||
+      accepted.workerEpoch !== execution.workerEpoch
+    ) {
+      throw new LocalExportLifecycleError(
+        "The cloud execution does not match this accepted delivery.",
+        "logged_export_execution_ownership_mismatch",
+      );
+    }
+    const row = this.database
+      .prepare(
+        `SELECT cloud_execution_id, cloud_execution_attempt,
+                cloud_execution_lease_token, cloud_execution_started_at
+         FROM export_requests WHERE id = ?`,
+      )
+      .get(execution.requestId) as Record<string, unknown> | undefined;
+    if (!row) throw new LocalExportRequestNotFoundError();
+    if (row.cloud_execution_id) {
+      const existing = this.getLoggedExecution(execution.requestId);
+      if (
+        !existing ||
+        existing.executionId !== execution.executionId ||
+        existing.requestId !== execution.requestId ||
+        existing.attempt !== execution.attempt ||
+        existing.workerId !== execution.workerId ||
+        existing.workerEpoch !== execution.workerEpoch ||
+        existing.leaseToken !== execution.leaseToken ||
+        existing.startedAt !== execution.startedAt
+      ) {
+        throw new LocalExportLifecycleError(
+          "The cloud execution conflicts with persisted local ownership.",
+          "logged_export_execution_conflict",
+        );
+      }
+      this.recordLoggedExecutionHeartbeat(execution);
+      return this.getLoggedExecution(execution.requestId)!;
+    }
+    const job = this.database
+      .prepare("SELECT attempt, state FROM jobs WHERE id = ?")
+      .get(accepted.request.jobId) as
+      { attempt: number; state: string } | undefined;
+    if (!job || Number(job.attempt) !== 0 || job.state !== "queued") {
+      throw new LocalExportLifecycleError(
+        "The local request is not ready to adopt its first execution.",
+        "logged_export_execution_state_conflict",
+      );
+    }
+    const result = this.database
+      .prepare(
+        `UPDATE export_requests
+         SET cloud_execution_id = ?, cloud_execution_attempt = ?,
+             cloud_execution_lease_token = ?, cloud_execution_started_at = ?,
+             cloud_execution_heartbeat_at = ?, cloud_execution_expires_at = ?,
+             cloud_cancel_requested_at = ?, updated_at = ?
+         WHERE id = ? AND cloud_execution_id IS NULL`,
+      )
+      .run(
+        execution.executionId,
+        execution.attempt,
+        execution.leaseToken,
+        execution.startedAt,
+        execution.heartbeatAt,
+        execution.expiresAt,
+        execution.cancelRequestedAt ?? null,
+        execution.heartbeatAt,
+        execution.requestId,
+      );
+    if (result.changes !== 1) {
+      throw new LocalExportLifecycleError(
+        "The local execution could not be persisted.",
+        "logged_export_execution_conflict",
+      );
+    }
+    return this.getLoggedExecution(execution.requestId)!;
+  }
+
+  getLoggedExecution(requestId: string): LoggedExportExecution | undefined {
+    const row = this.database
+      .prepare(
+        `SELECT cloud_execution_id, cloud_execution_attempt,
+                cloud_execution_lease_token, cloud_execution_started_at,
+                cloud_execution_heartbeat_at, cloud_execution_expires_at,
+                cloud_cancel_requested_at, cloud_worker_id, cloud_worker_epoch
+         FROM export_requests
+         WHERE id = ? AND cloud_execution_id IS NOT NULL`,
+      )
+      .get(requestId) as Record<string, unknown> | undefined;
+    if (!row) return undefined;
+    return LoggedExportExecutionSchema.parse({
+      executionId: row.cloud_execution_id,
+      requestId,
+      attempt: Number(row.cloud_execution_attempt),
+      workerId: row.cloud_worker_id,
+      workerEpoch: Number(row.cloud_worker_epoch),
+      leaseToken: row.cloud_execution_lease_token,
+      startedAt: row.cloud_execution_started_at,
+      heartbeatAt: row.cloud_execution_heartbeat_at,
+      expiresAt: row.cloud_execution_expires_at,
+      ...(row.cloud_cancel_requested_at
+        ? { cancelRequestedAt: row.cloud_cancel_requested_at }
+        : {}),
+    });
+  }
+
+  getLoggedExportProgress(
+    requestId: string,
+  ): LoggedExportProgressSnapshot | undefined {
+    const execution = this.getLoggedExecution(requestId);
+    if (!execution) return undefined;
+    const row = this.database
+      .prepare(
+        `SELECT local_progress_sequence, local_progress_stage,
+                local_progress_basis_points, local_progress_updated_at
+         FROM export_requests
+         WHERE id = ? AND local_progress_sequence IS NOT NULL`,
+      )
+      .get(requestId) as Record<string, unknown> | undefined;
+    if (!row) return undefined;
+    return LoggedExportProgressSnapshotSchema.parse({
+      schemaVersion: 1,
+      executionId: execution.executionId,
+      requestId,
+      attempt: execution.attempt,
+      sequence: Number(row.local_progress_sequence),
+      stage: row.local_progress_stage,
+      basisPoints: Number(row.local_progress_basis_points),
+      updatedAt: row.local_progress_updated_at,
+    });
+  }
+
+  recordLoggedExportProgress(
+    requestId: string,
+    stage: LoggedExportProgressStage,
+    basisPoints: number,
+  ): LoggedExportProgressSnapshot {
+    const execution = this.getLoggedExecution(requestId);
+    const request = this.get(requestId);
+    if (!execution || !request || request.mode !== "logged") {
+      throw new LocalExportLifecycleError(
+        "Durable progress requires one exact logged export execution.",
+        "logged_export_execution_required",
+      );
+    }
+    if (
+      !Number.isInteger(basisPoints) ||
+      basisPoints < 0 ||
+      basisPoints > 10_000
+    ) {
+      throw new LocalExportLifecycleError(
+        "Logged export progress is outside its bounded range.",
+        "logged_export_progress_invalid",
+      );
+    }
+    const current = this.getLoggedExportProgress(requestId);
+    const rank = LoggedExportProgressStageRank[stage];
+    if (
+      current &&
+      (rank < LoggedExportProgressStageRank[current.stage] ||
+        basisPoints < current.basisPoints)
+    ) {
+      throw new LocalExportLifecycleError(
+        "Logged export progress cannot move backward.",
+        "logged_export_progress_regression",
+      );
+    }
+    if (
+      current &&
+      current.stage === stage &&
+      current.basisPoints === basisPoints
+    ) {
+      return current;
+    }
+    const now = this.now().toISOString();
+    const sequence = (current?.sequence ?? 0) + 1;
+    const updated = this.database
+      .prepare(
+        `UPDATE export_requests
+         SET local_progress_sequence = ?, local_progress_stage = ?,
+             local_progress_stage_rank = ?, local_progress_basis_points = ?,
+             local_progress_updated_at = ?, updated_at = ?
+         WHERE id = ? AND cloud_execution_id = ?
+           AND cloud_execution_attempt = ?`,
+      )
+      .run(
+        sequence,
+        stage,
+        rank,
+        basisPoints,
+        now,
+        now,
+        requestId,
+        execution.executionId,
+        execution.attempt,
+      );
+    if (updated.changes !== 1) {
+      throw new LocalExportLifecycleError(
+        "Logged export progress lost exact execution ownership.",
+        "logged_export_execution_ownership_mismatch",
+      );
+    }
+    return this.getLoggedExportProgress(requestId)!;
+  }
+
+  reconcileLoggedExportProgress(
+    input: LoggedExportProgressSnapshot,
+  ): LoggedExportProgressSnapshot {
+    const progress = LoggedExportProgressSnapshotSchema.parse(input);
+    const execution = this.getLoggedExecution(progress.requestId);
+    const request = this.get(progress.requestId);
+    if (
+      !execution ||
+      !request ||
+      request.mode !== "logged" ||
+      execution.executionId !== progress.executionId ||
+      execution.attempt !== progress.attempt
+    ) {
+      throw new LocalExportLifecycleError(
+        "Cloud progress does not belong to the exact local execution.",
+        "logged_export_progress_ownership_mismatch",
+      );
+    }
+    const current = this.getLoggedExportProgress(progress.requestId);
+    if (current && progress.sequence < current.sequence) return current;
+    if (current && progress.sequence === current.sequence) {
+      if (
+        current.stage === progress.stage &&
+        current.basisPoints === progress.basisPoints &&
+        current.updatedAt === progress.updatedAt
+      ) {
+        return current;
+      }
+      throw new LocalExportLifecycleError(
+        "A progress sequence can only replay its original snapshot.",
+        "logged_export_progress_conflict",
+      );
+    }
+    const rank = LoggedExportProgressStageRank[progress.stage];
+    if (
+      current &&
+      (rank < LoggedExportProgressStageRank[current.stage] ||
+        progress.basisPoints < current.basisPoints ||
+        Date.parse(progress.updatedAt) < Date.parse(current.updatedAt))
+    ) {
+      throw new LocalExportLifecycleError(
+        "Cloud progress cannot move local progress backward.",
+        "logged_export_progress_regression",
+      );
+    }
+    const updated = this.database
+      .prepare(
+        `UPDATE export_requests
+         SET local_progress_sequence = ?, local_progress_stage = ?,
+             local_progress_stage_rank = ?, local_progress_basis_points = ?,
+             local_progress_updated_at = ?, updated_at = ?
+         WHERE id = ? AND cloud_execution_id = ?
+           AND cloud_execution_attempt = ?`,
+      )
+      .run(
+        progress.sequence,
+        progress.stage,
+        rank,
+        progress.basisPoints,
+        progress.updatedAt,
+        progress.updatedAt,
+        progress.requestId,
+        progress.executionId,
+        progress.attempt,
+      );
+    if (updated.changes !== 1) {
+      throw new LocalExportLifecycleError(
+        "Cloud progress lost exact local execution ownership.",
+        "logged_export_progress_ownership_mismatch",
+      );
+    }
+    return this.getLoggedExportProgress(progress.requestId)!;
+  }
+
+  recordLoggedExecutionHeartbeat(input: LoggedExportExecution): void {
+    const execution = LoggedExportExecutionSchema.parse(input);
+    const existing = this.getLoggedExecution(execution.requestId);
+    if (
+      !existing ||
+      existing.executionId !== execution.executionId ||
+      existing.attempt !== execution.attempt ||
+      existing.workerId !== execution.workerId ||
+      existing.workerEpoch !== execution.workerEpoch ||
+      existing.leaseToken !== execution.leaseToken ||
+      existing.startedAt !== execution.startedAt
+    ) {
+      throw new LocalExportLifecycleError(
+        "The execution heartbeat does not match local ownership.",
+        "logged_export_execution_ownership_mismatch",
+      );
+    }
+    const updated = this.database
+      .prepare(
+        `UPDATE export_requests
+         SET cloud_execution_heartbeat_at = ?, cloud_execution_expires_at = ?,
+             cloud_cancel_requested_at = COALESCE(cloud_cancel_requested_at, ?),
+             updated_at = ?
+         WHERE id = ? AND cloud_execution_id = ?
+           AND cloud_execution_lease_token = ?`,
+      )
+      .run(
+        execution.heartbeatAt,
+        execution.expiresAt,
+        execution.cancelRequestedAt ?? null,
+        execution.heartbeatAt,
+        execution.requestId,
+        execution.executionId,
+        execution.leaseToken,
+      );
+    if (updated.changes !== 1) throw new LocalExportLifecycleError();
+  }
+
+  recordLoggedExportNotStartedCancellation(
+    requestId: string,
+    reason: "user_requested" | "execution_lease_lost",
+    cancelRequestedAt?: string,
+  ): void {
+    const request = this.get(requestId);
+    if (!request || request.mode !== "logged")
+      throw new LocalExportRequestNotFoundError();
+    const now = this.now().toISOString();
+    this.database.exec("BEGIN IMMEDIATE;");
+    try {
+      const updated = this.database
+        .prepare(
+          `UPDATE export_requests
+           SET cloud_cancel_requested_at = COALESCE(cloud_cancel_requested_at, ?),
+               local_cancellation_reason = ?,
+               local_canceled_at = ?, updated_at = ?
+           WHERE id = ? AND local_cancellation_reason IS NULL`,
+        )
+        .run(cancelRequestedAt ?? null, reason, now, now, requestId);
+      const job = this.database
+        .prepare(
+          `UPDATE jobs SET state = 'canceled', updated_at = ?
+           WHERE id = ? AND state = 'queued' AND attempt = 0`,
+        )
+        .run(now, request.jobId);
+      if (updated.changes !== 1 || job.changes !== 1) {
+        throw new LocalExportLifecycleError(
+          "The local accepted request is no longer cancelable before execution.",
+          "logged_export_cancellation_state_conflict",
+        );
+      }
+      this.database.exec("COMMIT;");
+    } catch (error) {
+      this.database.exec("ROLLBACK;");
+      throw error;
+    }
+  }
+
+  recordLoggedExportPersistedFailureCancellation(
+    requestId: string,
+    reason: "user_requested" | "execution_lease_lost",
+    cancelRequestedAt?: string,
+  ): void {
+    const request = this.get(requestId);
+    if (!request || request.mode !== "logged") {
+      throw new LocalExportRequestNotFoundError();
+    }
+    const row = this.database
+      .prepare(
+        `SELECT j.state, j.attempt, er.cloud_execution_id,
+                er.cloud_execution_attempt
+         FROM export_requests er JOIN jobs j ON j.id = er.job_id
+         WHERE er.id = ?`,
+      )
+      .get(requestId) as
+      | {
+          state: string;
+          attempt: number;
+          cloud_execution_id: string | null;
+          cloud_execution_attempt: number | null;
+        }
+      | undefined;
+    if (!row || row.state !== "needs_user_action") {
+      throw new LocalExportLifecycleError(
+        "Only one persisted nonterminal failure can yield to cancellation.",
+        "logged_export_cancellation_state_conflict",
+      );
+    }
+    const attempt = Number(row.attempt);
+    if (attempt === 0) {
+      const count = this.database
+        .prepare(
+          "SELECT count(*) AS count FROM source_scratch_assets WHERE job_id = ?",
+        )
+        .get(request.jobId) as { count: number };
+      if (Number(count.count) !== 0) {
+        throw new LocalExportLifecycleError(
+          "Not-started failure cancellation has inconsistent scratch evidence.",
+          "logged_export_cancellation_cleanup_inconsistent",
+        );
+      }
+    } else {
+      const scratch = this.getSourceAttempt(request.jobId, attempt);
+      if (
+        !row.cloud_execution_id ||
+        Number(row.cloud_execution_attempt) !== attempt ||
+        !scratch ||
+        scratch.lifecycleState !== "deleted" ||
+        !scratch.deletedAt
+      ) {
+        throw new LocalExportLifecycleError(
+          "Failed work cannot yield to cancellation until exact source cleanup is verified.",
+          "logged_export_cancellation_cleanup_incomplete",
+        );
+      }
+    }
+    const now = this.now().toISOString();
+    this.database.exec("BEGIN IMMEDIATE;");
+    try {
+      const canceled = this.database
+        .prepare(
+          `UPDATE export_requests
+           SET cloud_cancel_requested_at = COALESCE(cloud_cancel_requested_at, ?),
+               local_cancellation_reason = ?, local_canceled_at = ?, updated_at = ?
+           WHERE id = ? AND local_cancellation_reason IS NULL`,
+        )
+        .run(cancelRequestedAt ?? null, reason, now, now, requestId);
+      const job = this.database
+        .prepare(
+          `UPDATE jobs
+           SET state = 'canceled', payload_json = json_remove(payload_json, '$.lastError'),
+               updated_at = ?
+           WHERE id = ? AND state = 'needs_user_action' AND attempt = ?`,
+        )
+        .run(now, request.jobId, attempt);
+      if (canceled.changes !== 1 || job.changes !== 1) {
+        throw new LocalExportLifecycleError(
+          "Persisted failure cancellation lost its exact local state.",
+          "logged_export_cancellation_state_conflict",
+        );
+      }
+      this.database.exec("COMMIT;");
+    } catch (error) {
+      this.database.exec("ROLLBACK;");
+      throw error;
+    }
+  }
+
+  buildLoggedExportSuccessResult(requestId: string): LoggedExportSuccessResult {
+    const request = this.get(requestId);
+    if (!request || request.mode !== "logged") {
+      throw new LocalExportRequestNotFoundError();
+    }
+    if (
+      request.state !== "complete" ||
+      !request.projectId ||
+      !request.clipId ||
+      !request.resolvedExportBounds ||
+      !request.renderedMediaProvenance ||
+      !request.thumbnailProvenance ||
+      !request.finalArtifacts
+    ) {
+      throw new LocalExportLifecycleError(
+        "Only a verified, cleanup-complete logged export can be reconciled.",
+        "logged_export_result_not_complete",
+      );
+    }
+    const artifacts = [...request.finalArtifacts].sort((left, right) =>
+      left.role < right.role ? -1 : left.role > right.role ? 1 : 0,
+    );
+    const subtitleSidecars = request.subtitleSidecars
+      ? [...request.subtitleSidecars].sort((left, right) =>
+          left.role < right.role ? -1 : left.role > right.role ? 1 : 0,
+        )
+      : undefined;
+    const result = LoggedExportSuccessResultSchema.safeParse({
+      schemaVersion: 1,
+      requestId: request.id,
+      jobId: request.jobId,
+      projectId: request.projectId,
+      clipId: request.clipId,
+      sourceLanguageClass: request.sourceLanguageClass,
+      ...(request.noSpeechAttestation
+        ? { noSpeechAttestation: request.noSpeechAttestation }
+        : {}),
+      resolvedExportBounds: request.resolvedExportBounds,
+      renderedMediaProvenance: request.renderedMediaProvenance,
+      thumbnailProvenance: request.thumbnailProvenance,
+      ...(request.subtitleOmissionProvenance
+        ? {
+            subtitleOmissionProvenance: request.subtitleOmissionProvenance,
+          }
+        : {}),
+      ...(request.englishSubtitleProvenance
+        ? { englishSubtitleProvenance: request.englishSubtitleProvenance }
+        : {}),
+      ...(subtitleSidecars ? { subtitleSidecars } : {}),
+      artifacts,
+    });
+    if (!result.success) {
+      throw new LocalExportLifecycleError(
+        "Completed local export provenance is not safe to reconcile.",
+        "logged_export_result_invalid",
+      );
+    }
+    return result.data;
+  }
+
+  buildLoggedExportFailureResult(requestId: string): LoggedExportFailureResult {
+    const request = this.get(requestId);
+    if (!request || request.mode !== "logged") {
+      throw new LocalExportRequestNotFoundError();
+    }
+    if (!this.getAcceptedLoggedDelivery(requestId)) {
+      throw new LocalExportLifecycleError(
+        "Only an accepted logged delivery can reconcile a failure.",
+        "logged_export_delivery_not_accepted",
+      );
+    }
+    if (request.state !== "needs_user_action") {
+      throw new LocalExportLifecycleError(
+        "No persisted local failure is ready for reconciliation.",
+        "logged_export_failure_not_recorded",
+      );
+    }
+    if (request.finalArtifacts?.length) {
+      throw new LocalExportLifecycleError(
+        "A request with finalized package provenance cannot reconcile as failed.",
+        "logged_export_failure_has_package",
+      );
+    }
+    if (!request.projectId || !request.clipId) {
+      throw new LocalExportLifecycleError(
+        "Logged export failure identity is incomplete.",
+        "logged_export_failure_identity_invalid",
+      );
+    }
+
+    const job = this.database
+      .prepare("SELECT state, attempt, payload_json FROM jobs WHERE id = ?")
+      .get(request.jobId) as
+      { state: string; attempt: number; payload_json: string } | undefined;
+    if (!job || job.state !== "needs_user_action") {
+      throw new LocalExportLifecycleError(
+        "Persisted local failure state is inconsistent.",
+        "logged_export_failure_state_invalid",
+      );
+    }
+    const payload = JSON.parse(job.payload_json) as Record<string, unknown>;
+    const lastError = payload.lastError as
+      { code?: unknown; message?: unknown } | undefined;
+    if (
+      !lastError ||
+      typeof lastError.code !== "string" ||
+      typeof lastError.message !== "string"
+    ) {
+      throw new LocalExportLifecycleError(
+        "Persisted local failure error evidence is missing.",
+        "logged_export_failure_error_missing",
+      );
+    }
+
+    const attempt = Number(job.attempt);
+    if (!Number.isSafeInteger(attempt) || attempt < 0) {
+      throw new LocalExportLifecycleError(
+        "Persisted local failure attempt is invalid.",
+        "logged_export_failure_attempt_invalid",
+      );
+    }
+    const scratchRows = this.database
+      .prepare(
+        `SELECT attempt, lifecycle_state, deleted_at
+         FROM source_scratch_assets
+         WHERE job_id = ? ORDER BY attempt`,
+      )
+      .all(request.jobId) as {
+      attempt: number;
+      lifecycle_state: string;
+      deleted_at: string | null;
+    }[];
+
+    let sourceCleanup: LoggedExportFailureResult["sourceCleanup"];
+    if (attempt === 0) {
+      if (scratchRows.length !== 0) {
+        throw new LocalExportLifecycleError(
+          "A not-started failure cannot have source scratch provenance.",
+          "logged_export_failure_cleanup_inconsistent",
+        );
+      }
+      sourceCleanup = { lifecycle: "not_started" };
+    } else {
+      const source = scratchRows[0];
+      if (
+        scratchRows.length !== 1 ||
+        !source ||
+        Number(source.attempt) !== attempt ||
+        source.lifecycle_state !== "deleted" ||
+        !source.deleted_at
+      ) {
+        throw new LocalExportLifecycleError(
+          "Source cleanup is incomplete; resolve deletion before reconciling the processing failure.",
+          "logged_export_failure_cleanup_incomplete",
+        );
+      }
+      sourceCleanup = {
+        lifecycle: "deleted",
+        deletedAt: String(source.deleted_at),
+      };
+    }
+
+    return LoggedExportFailureResultSchema.parse({
+      schemaVersion: 1,
+      requestId: request.id,
+      jobId: request.jobId,
+      projectId: request.projectId,
+      clipId: request.clipId,
+      error: {
+        code: sanitizeLoggedExportFailureCode(lastError.code),
+        message: sanitizeLoggedExportFailureMessage(lastError.message),
+      },
+      attempt,
+      sourceCleanup,
+    });
+  }
+
+  buildLoggedExportCanceledResult(
+    requestId: string,
+  ): LoggedExportCanceledResult {
+    const request = this.get(requestId);
+    if (
+      !request ||
+      request.mode !== "logged" ||
+      !request.projectId ||
+      !request.clipId
+    ) {
+      throw new LocalExportRequestNotFoundError();
+    }
+    if (!this.getAcceptedLoggedDelivery(requestId)) {
+      throw new LocalExportLifecycleError(
+        "Only an accepted logged delivery can reconcile cancellation.",
+        "logged_export_delivery_not_accepted",
+      );
+    }
+    const row = this.database
+      .prepare(
+        `SELECT j.state, j.attempt, er.local_cancellation_reason,
+                er.local_canceled_at, er.cloud_execution_id,
+                er.cloud_execution_attempt
+         FROM export_requests er JOIN jobs j ON j.id = er.job_id
          WHERE er.id = ?`,
       )
       .get(requestId) as Record<string, unknown> | undefined;
-    return row ? mapLocalExportRequest(row) : undefined;
+    if (
+      !row ||
+      row.state !== "canceled" ||
+      !row.local_cancellation_reason ||
+      !row.local_canceled_at
+    ) {
+      throw new LocalExportLifecycleError(
+        "No verified local cancellation is ready for reconciliation.",
+        "logged_export_cancellation_not_recorded",
+      );
+    }
+    if (request.finalArtifacts?.length) {
+      throw new LocalExportLifecycleError(
+        "Canceled work cannot retain finalized package provenance.",
+        "logged_export_cancellation_has_package",
+      );
+    }
+    const attempt = Number(row.attempt);
+    let sourceCleanup: LoggedExportCanceledResult["sourceCleanup"];
+    if (attempt === 0) {
+      const count = this.database
+        .prepare(
+          "SELECT count(*) AS count FROM source_scratch_assets WHERE job_id = ?",
+        )
+        .get(request.jobId) as { count: number };
+      if (Number(count.count) !== 0) {
+        throw new LocalExportLifecycleError(
+          "Not-started cancellation has inconsistent execution evidence.",
+          "logged_export_cancellation_cleanup_inconsistent",
+        );
+      }
+      sourceCleanup = { lifecycle: "not_started" };
+    } else {
+      const scratch = this.database
+        .prepare(
+          `SELECT lifecycle_state, deleted_at FROM source_scratch_assets
+           WHERE job_id = ? AND attempt = ?`,
+        )
+        .get(request.jobId, attempt) as
+        { lifecycle_state: string; deleted_at: string | null } | undefined;
+      if (
+        !scratch ||
+        scratch.lifecycle_state !== "deleted" ||
+        !scratch.deleted_at ||
+        Number(row.cloud_execution_attempt) !== attempt ||
+        !row.cloud_execution_id
+      ) {
+        throw new LocalExportLifecycleError(
+          "Canceled source cleanup is incomplete.",
+          "logged_export_cancellation_cleanup_incomplete",
+        );
+      }
+      sourceCleanup = { lifecycle: "deleted", deletedAt: scratch.deleted_at };
+    }
+    return LoggedExportCanceledResultSchema.parse({
+      schemaVersion: 1,
+      requestId,
+      jobId: request.jobId,
+      projectId: request.projectId,
+      clipId: request.clipId,
+      reason: row.local_cancellation_reason,
+      attempt,
+      sourceCleanup,
+      ...(row.cloud_execution_id
+        ? {
+            executionId: row.cloud_execution_id,
+            executionAttempt: Number(row.cloud_execution_attempt),
+          }
+        : {}),
+    });
+  }
+
+  get(requestId: string): ExportRequest | undefined {
+    const row = this.database
+      .prepare(
+        `${localExportRequestSelect}
+         WHERE er.id = ?`,
+      )
+      .get(requestId) as Record<string, unknown> | undefined;
+    return row ? this.mapRequest(row) : undefined;
+  }
+
+  getByIdempotencyKey(idempotencyKey: string): ExportRequest | undefined {
+    const row = this.database
+      .prepare(`${localExportRequestSelect} WHERE j.idempotency_key = ?`)
+      .get(`export-only:${idempotencyKey}`) as
+      Record<string, unknown> | undefined;
+    return row ? this.mapRequest(row) : undefined;
+  }
+
+  /**
+   * Returns only a confirmed projectless request that the local scheduler may
+   * begin. Logged deliveries, recovery/cleanup states, and historical rows
+   * without durable source-rights evidence are intentionally excluded.
+   */
+  getNextRunnableExportOnly(): ExportRequest | undefined {
+    const row = this.database
+      .prepare(
+        `${localExportRequestSelect}
+         WHERE er.mode = 'export_only'
+           AND er.cloud_delivery_id IS NULL
+           AND er.source_rights_confirmation_json IS NOT NULL
+           AND j.state = 'queued'
+         ORDER BY er.created_at ASC, er.id ASC LIMIT 1`,
+      )
+      .get() as Record<string, unknown> | undefined;
+    return row ? this.mapRequest(row) : undefined;
+  }
+
+  /**
+   * Finds the oldest cloud-accepted delivery that has not yet had its durable
+   * terminal result acknowledged. Processing is excluded so restart recovery
+   * first settles scratch/lease evidence instead of racing a live attempt.
+   */
+  getNextRunnableAcceptedLoggedDelivery(): LoggedExportDelivery | undefined {
+    const row = this.database
+      .prepare(
+        `${localExportRequestSelect}
+         WHERE er.cloud_delivery_state = 'accepted'
+           AND er.cloud_terminal_reconciled_at IS NULL
+           AND j.state IN ('queued', 'needs_user_action', 'complete', 'canceled')
+         ORDER BY er.created_at ASC, er.id ASC LIMIT 1`,
+      )
+      .get() as Record<string, unknown> | undefined;
+    if (!row || !row.cloud_accepted_at) return undefined;
+    return LoggedExportDeliverySchema.parse({
+      deliveryId: row.cloud_delivery_id,
+      generation: Number(row.cloud_delivery_generation),
+      reservationToken: row.cloud_reservation_token,
+      workerId: row.cloud_worker_id,
+      workerEpoch: Number(row.cloud_worker_epoch),
+      status: "accepted",
+      reservedAt: row.cloud_reserved_at,
+      reservationExpiresAt: row.cloud_reservation_expires_at,
+      acceptedAt: row.cloud_accepted_at,
+      ...sourceGroupFromLocalRow(row),
+      request: this.mapRequest(row),
+    });
+  }
+
+  markLoggedExportReconciled(
+    requestId: string,
+    outcome: LocalLoggedExportTerminalOutcome,
+    reconciledAt = this.now().toISOString(),
+  ): LocalLoggedExportTerminalReconciliation {
+    assertUtcTimestamp(reconciledAt, "Cloud terminal reconciliation time");
+    const request = this.get(requestId);
+    if (!request || request.mode !== "logged") {
+      throw new LocalExportRequestNotFoundError();
+    }
+    if (!this.getAcceptedLoggedDelivery(requestId)) {
+      throw new LocalExportLifecycleError(
+        "Only an accepted logged delivery can record cloud reconciliation.",
+        "logged_export_delivery_not_accepted",
+      );
+    }
+    const expectedState =
+      outcome === "success"
+        ? "complete"
+        : outcome === "failure"
+          ? "needs_user_action"
+          : "canceled";
+    if (request.state !== expectedState) {
+      throw new LocalExportLifecycleError(
+        "The requested cloud terminal outcome does not match durable local state.",
+        "logged_export_terminal_outcome_state_conflict",
+      );
+    }
+    const existing = this.database
+      .prepare(
+        `SELECT cloud_terminal_outcome, cloud_terminal_reconciled_at
+         FROM export_requests WHERE id = ?`,
+      )
+      .get(requestId) as
+      | {
+          cloud_terminal_outcome: string | null;
+          cloud_terminal_reconciled_at: string | null;
+        }
+      | undefined;
+    if (!existing) throw new LocalExportRequestNotFoundError();
+    if (
+      existing.cloud_terminal_outcome !== null ||
+      existing.cloud_terminal_reconciled_at !== null
+    ) {
+      if (
+        existing.cloud_terminal_outcome === outcome &&
+        existing.cloud_terminal_reconciled_at === reconciledAt
+      ) {
+        return { outcome, reconciledAt };
+      }
+      throw new LocalExportLifecycleError(
+        "The logged export already has different immutable cloud terminal reconciliation evidence.",
+        "logged_export_terminal_reconciliation_conflict",
+      );
+    }
+    const updated = this.database
+      .prepare(
+        `UPDATE export_requests
+         SET cloud_terminal_outcome = ?, cloud_terminal_reconciled_at = ?
+         WHERE id = ? AND cloud_delivery_state = 'accepted'
+           AND cloud_terminal_outcome IS NULL
+           AND cloud_terminal_reconciled_at IS NULL`,
+      )
+      .run(outcome, reconciledAt, requestId);
+    if (updated.changes !== 1) {
+      throw new LocalExportLifecycleError(
+        "Cloud terminal reconciliation lost exact local ownership.",
+        "logged_export_terminal_reconciliation_conflict",
+      );
+    }
+    return { outcome, reconciledAt };
   }
 
   list(): ExportRequest[] {
     return (
       this.database
         .prepare(
-          `SELECT er.*, j.state
-           FROM export_requests er
-           JOIN jobs j ON j.id = er.job_id
+          `${localExportRequestSelect}
            ORDER BY er.created_at DESC, er.id
            LIMIT 500`,
         )
         .all() as Record<string, unknown>[]
-    ).map(mapLocalExportRequest);
+    ).map((row) => this.mapRequest(row));
+  }
+
+  getRuntimeQuiescenceEvidence(): LocalRuntimeQuiescenceEvidence {
+    const durable = this.database
+      .prepare(
+        `SELECT
+           COALESCE(SUM(CASE WHEN er.cloud_delivery_state = 'pending_acceptance'
+             THEN 1 ELSE 0 END), 0) AS pending_acceptance,
+           COALESCE(SUM(CASE WHEN er.cloud_delivery_state = 'accepted'
+             AND er.cloud_execution_id IS NULL
+             AND j.state = 'queued'
+             THEN 1 ELSE 0 END), 0) AS accepted,
+           COALESCE(SUM(CASE WHEN er.cloud_execution_id IS NOT NULL
+             AND j.state IN ('queued', 'processing')
+             THEN 1 ELSE 0 END), 0) AS executing,
+           COALESCE(SUM(CASE WHEN er.cloud_delivery_id IS NOT NULL
+             AND j.state = 'complete' THEN 1 ELSE 0 END), 0) AS complete,
+           COALESCE(SUM(CASE WHEN er.cloud_delivery_id IS NOT NULL
+             AND j.state = 'failed' THEN 1 ELSE 0 END), 0) AS failed,
+           COALESCE(SUM(CASE WHEN er.cloud_delivery_id IS NOT NULL
+             AND j.state = 'canceled' THEN 1 ELSE 0 END), 0) AS canceled,
+           COALESCE(SUM(CASE WHEN er.cloud_delivery_id IS NOT NULL
+             AND j.state = 'needs_user_action' THEN 1 ELSE 0 END), 0)
+             AS needs_attention,
+           COALESCE(SUM(CASE WHEN er.cloud_delivery_id IS NOT NULL
+             AND j.state = 'processing' THEN 1 ELSE 0 END), 0)
+             AS recovery_required
+         FROM export_requests er
+         JOIN jobs j ON j.id = er.job_id`,
+      )
+      .get() as Record<string, number>;
+    const scratch = this.database
+      .prepare(
+        `SELECT
+           (SELECT COUNT(*) FROM source_scratch_assets
+              WHERE lifecycle_state != 'deleted') +
+           (SELECT COUNT(*) FROM logged_export_source_groups
+              WHERE lifecycle_state != 'deleted') AS active_source_lifecycles`,
+      )
+      .get() as { active_source_lifecycles: number };
+    return {
+      pendingAcceptance: Number(durable.pending_acceptance),
+      accepted: Number(durable.accepted),
+      executing: Number(durable.executing),
+      complete: Number(durable.complete),
+      failed: Number(durable.failed),
+      canceled: Number(durable.canceled),
+      needsAttention: Number(durable.needs_attention),
+      recoveryRequired: Number(durable.recovery_required),
+      activeSourceLifecycleCount: Number(scratch.active_source_lifecycles),
+    };
+  }
+
+  getVerifiedEnglishTranscript(input: {
+    trackId: string;
+    trackVersion: number;
+    videoId: string;
+  }): NormalizedTranscript | undefined {
+    return new LocalTranscriptIndex(this.database).findExactEnglish(input);
+  }
+
+  getVerifiedOriginalTranscript(input: {
+    trackId: string;
+    trackVersion: number;
+    videoId: string;
+  }): NormalizedTranscript | undefined {
+    return new LocalTranscriptIndex(this.database).findExactOriginal(input);
+  }
+
+  beginSourceAcquisition(
+    requestId: string,
+    _options: { requireLoggedExecution?: boolean } = {},
+  ): LocalExportSourceAttempt {
+    const request = this.get(requestId);
+    if (!request) throw new LocalExportRequestNotFoundError();
+    if (request.state === "complete") {
+      throw new LocalExportLifecycleError(
+        "A completed export cannot acquire a new source.",
+        "export_already_complete",
+      );
+    }
+    this.assertExportDeliveryAccepted(requestId);
+    const now = this.now().toISOString();
+    const expiresAt = new Date(
+      this.now().getTime() + 24 * 60 * 60 * 1_000,
+    ).toISOString();
+    const attempt = this.database
+      .prepare("SELECT attempt, state FROM jobs WHERE id = ?")
+      .get(request.jobId) as { attempt: number; state: string };
+    if (!["queued", "needs_user_action"].includes(attempt.state)) {
+      throw new LocalExportLifecycleError(
+        "This export already has active or terminal local work.",
+        "export_execution_state_conflict",
+      );
+    }
+    const execution =
+      request.mode === "logged"
+        ? this.getLoggedExecution(requestId)
+        : undefined;
+    if (request.mode === "logged" && !execution) {
+      throw new LocalExportLifecycleError(
+        "This accepted logged export has no durable cloud execution lease.",
+        "logged_export_execution_required",
+      );
+    }
+    const nextAttempt = execution?.attempt ?? attempt.attempt + 1;
+    if (execution && (attempt.attempt !== 0 || attempt.state !== "queued")) {
+      throw new LocalExportLifecycleError(
+        "Local execution attempt does not match its cloud ownership.",
+        "logged_export_execution_attempt_mismatch",
+      );
+    }
+    this.database.exec("BEGIN IMMEDIATE;");
+    try {
+      this.database
+        .prepare(
+          `UPDATE jobs
+           SET state = 'processing', attempt = ?, updated_at = ?
+           WHERE id = ?`,
+        )
+        .run(nextAttempt, now, request.jobId);
+      this.database
+        .prepare(
+          `INSERT INTO source_scratch_assets
+             (id, job_id, attempt, lifecycle_state, scratch_layout_version,
+              created_at, expires_at, updated_at)
+           VALUES (?, ?, ?, 'acquiring', ?, ?, ?, ?)`,
+        )
+        .run(
+          randomUUID(),
+          request.jobId,
+          nextAttempt,
+          SourceScratchLayoutVersion,
+          now,
+          expiresAt,
+          now,
+        );
+      this.database.exec("COMMIT;");
+    } catch (error) {
+      this.database.exec("ROLLBACK;");
+      throw error;
+    }
+    return { request, attempt: nextAttempt };
+  }
+
+  createLoggedExportSourceGroup(input: {
+    groupId: string;
+    compatibilityKey: string;
+    acquisitionProfileFingerprint: string;
+    members: readonly {
+      requestId: string;
+      jobId: string;
+      attempt: number;
+    }[];
+  }): LocalLoggedExportSourceGroup {
+    if (
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u.test(
+        input.groupId,
+      ) ||
+      !/^[a-f0-9]{64}$/u.test(input.compatibilityKey) ||
+      !/^[a-f0-9]{64}$/u.test(input.acquisitionProfileFingerprint) ||
+      input.members.length < 2 ||
+      new Set(input.members.map((member) => member.requestId)).size !==
+        input.members.length
+    ) {
+      throw new LocalExportLifecycleError(
+        "Shared source group membership is invalid.",
+        "logged_export_source_group_invalid",
+      );
+    }
+    const first = this.getAcceptedLoggedDelivery(input.members[0]!.requestId);
+    if (!first?.sourceGroup) {
+      throw new LocalExportLifecycleError(
+        "Shared source grouping requires one accepted batch delivery.",
+        "logged_export_source_group_ineligible",
+      );
+    }
+    const now = this.now().toISOString();
+    const expiresAt = new Date(
+      this.now().getTime() + 24 * 60 * 60 * 1_000,
+    ).toISOString();
+    this.database.exec("BEGIN IMMEDIATE;");
+    try {
+      const existing = this.database
+        .prepare(
+          "SELECT * FROM logged_export_source_groups WHERE compatibility_key = ?",
+        )
+        .get(input.compatibilityKey) as Record<string, unknown> | undefined;
+      if (existing) {
+        const members = this.database
+          .prepare(
+            `SELECT export_request_id, job_id, attempt
+             FROM logged_export_source_group_members
+             WHERE group_id = ? ORDER BY export_request_id`,
+          )
+          .all(String(existing.id)) as Record<string, unknown>[];
+        const expected = [...input.members]
+          .map(
+            (member) => `${member.requestId}:${member.jobId}:${member.attempt}`,
+          )
+          .sort();
+        const actual = members
+          .map(
+            (member) =>
+              `${String(member.export_request_id)}:${String(member.job_id)}:${Number(member.attempt)}`,
+          )
+          .sort();
+        if (
+          String(existing.id) !== input.groupId ||
+          canonicalJson(expected) !== canonicalJson(actual)
+        ) {
+          throw new LocalExportLifecycleError(
+            "Shared source group replay conflicts with durable membership.",
+            "logged_export_source_group_conflict",
+          );
+        }
+        this.database.exec("COMMIT;");
+        return mapLocalLoggedExportSourceGroup(existing);
+      }
+
+      const insertMember = this.database.prepare(
+        `INSERT INTO logged_export_source_group_members
+           (group_id, export_request_id, job_id, attempt, execution_id,
+            batch_item_id, lifecycle_state, joined_at)
+         VALUES (?, ?, ?, ?, ?, ?, 'joined', ?)`,
+      );
+      this.database
+        .prepare(
+          `INSERT INTO logged_export_source_groups
+             (id, compatibility_key, project_id, batch_id, youtube_video_id,
+              source_provider, provider_media_id, canonical_url,
+              acquisition_profile_fingerprint, worker_id, worker_epoch,
+              lifecycle_state, created_at, expires_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'acquiring', ?, ?, ?)`,
+        )
+        .run(
+          input.groupId,
+          input.compatibilityKey,
+          first.request.projectId!,
+          first.sourceGroup.batchId,
+          first.request.video.youtubeVideoId,
+          "youtube",
+          first.request.video.youtubeVideoId,
+          first.request.video.canonicalUrl,
+          input.acquisitionProfileFingerprint,
+          first.workerId,
+          first.workerEpoch,
+          now,
+          expiresAt,
+          now,
+        );
+      for (const member of input.members) {
+        const delivery = this.getAcceptedLoggedDelivery(member.requestId);
+        const execution = this.getLoggedExecution(member.requestId);
+        const request = delivery?.request;
+        if (
+          !delivery?.sourceGroup ||
+          !request ||
+          request.jobId !== member.jobId ||
+          request.projectId !== first.request.projectId ||
+          request.video.youtubeVideoId !== first.request.video.youtubeVideoId ||
+          request.video.canonicalUrl !== first.request.video.canonicalUrl ||
+          delivery.sourceGroup.batchId !== first.sourceGroup.batchId ||
+          delivery.workerId !== first.workerId ||
+          delivery.workerEpoch !== first.workerEpoch ||
+          !execution ||
+          execution.attempt !== member.attempt ||
+          execution.workerId !== delivery.workerId ||
+          execution.workerEpoch !== delivery.workerEpoch ||
+          Boolean(execution.cancelRequestedAt) ||
+          Date.parse(execution.expiresAt) <= this.now().getTime()
+        ) {
+          throw new LocalExportLifecycleError(
+            "Shared source group member ownership is incompatible.",
+            "logged_export_source_group_ineligible",
+          );
+        }
+        const scratch = this.database
+          .prepare(
+            `UPDATE source_scratch_assets
+             SET source_group_id = ?, scratch_layout_version = ?, updated_at = ?
+             WHERE job_id = ? AND attempt = ? AND lifecycle_state = 'acquiring'
+               AND source_group_id IS NULL AND cleanup_claim_token IS NULL`,
+          )
+          .run(
+            input.groupId,
+            SharedSourceScratchLayoutVersion,
+            now,
+            member.jobId,
+            member.attempt,
+          );
+        if (scratch.changes !== 1) {
+          throw new LocalExportLifecycleError(
+            "Shared source group member scratch ownership changed.",
+            "logged_export_source_group_conflict",
+          );
+        }
+        insertMember.run(
+          input.groupId,
+          member.requestId,
+          member.jobId,
+          member.attempt,
+          execution.executionId,
+          delivery.sourceGroup.batchItemId,
+          now,
+        );
+      }
+      this.database.exec("COMMIT;");
+    } catch (error) {
+      this.database.exec("ROLLBACK;");
+      throw error;
+    }
+    return this.getLoggedExportSourceGroup(input.groupId)!;
+  }
+
+  getLoggedExportSourceGroup(
+    groupId: string,
+  ): LocalLoggedExportSourceGroup | undefined {
+    const row = this.database
+      .prepare("SELECT * FROM logged_export_source_groups WHERE id = ?")
+      .get(groupId) as Record<string, unknown> | undefined;
+    return row ? mapLocalLoggedExportSourceGroup(row) : undefined;
+  }
+
+  getLoggedExportSourceGroupByCompatibilityKey(
+    compatibilityKey: string,
+  ): LocalLoggedExportSourceGroup | undefined {
+    const row = this.database
+      .prepare(
+        "SELECT * FROM logged_export_source_groups WHERE compatibility_key = ?",
+      )
+      .get(compatibilityKey) as Record<string, unknown> | undefined;
+    return row ? mapLocalLoggedExportSourceGroup(row) : undefined;
+  }
+
+  recordLoggedExportSourceGroupReady(
+    groupId: string,
+    source: {
+      provider: string;
+      sourceIdentity: string;
+      byteSize: number;
+      contentSha256: string;
+    },
+    inspection: {
+      durationMs: number;
+      containerFormat?: string;
+      videoCodec?: string;
+      audioCodec?: string;
+      ffprobeVersion?: string;
+    },
+  ): void {
+    const now = this.now().toISOString();
+    this.database.exec("BEGIN IMMEDIATE;");
+    try {
+      const group = this.database
+        .prepare(
+          `UPDATE logged_export_source_groups
+           SET lifecycle_state = 'ready', provider = ?, source_identity = ?,
+               byte_size = ?, content_sha256 = ?, duration_ms = ?,
+               container_format = ?, video_codec = ?, audio_codec = ?,
+               ffprobe_version = ?, ready_at = ?, updated_at = ?
+           WHERE id = ? AND lifecycle_state = 'acquiring'`,
+        )
+        .run(
+          source.provider,
+          source.sourceIdentity,
+          source.byteSize,
+          source.contentSha256,
+          inspection.durationMs,
+          safeProbeValue(inspection.containerFormat, 240),
+          safeProbeValue(inspection.videoCodec, 120),
+          safeProbeValue(inspection.audioCodec, 120),
+          safeProbeValue(inspection.ffprobeVersion, 120),
+          now,
+          now,
+          groupId,
+        );
+      if (group.changes !== 1) throw new LocalExportLifecycleError();
+      const assets = this.database
+        .prepare(
+          `UPDATE source_scratch_assets
+           SET provider = ?, source_identity = ?, byte_size = ?,
+               content_sha256 = ?, lifecycle_state = 'ready', ready_at = ?,
+               updated_at = ?
+           WHERE source_group_id = ? AND lifecycle_state = 'acquiring'
+             AND cleanup_claim_token IS NULL`,
+        )
+        .run(
+          source.provider,
+          source.sourceIdentity,
+          source.byteSize,
+          source.contentSha256,
+          now,
+          now,
+          groupId,
+        );
+      const expected = this.database
+        .prepare(
+          "SELECT count(*) AS count FROM logged_export_source_group_members WHERE group_id = ?",
+        )
+        .get(groupId) as { count: number };
+      if (assets.changes !== Number(expected.count))
+        throw new LocalExportLifecycleError();
+      this.database.exec("COMMIT;");
+    } catch (error) {
+      this.database.exec("ROLLBACK;");
+      throw error;
+    }
+  }
+
+  releaseLoggedExportSourceGroupMember(
+    groupId: string,
+    requestId: string,
+    outcome: "succeeded" | "failed" | "canceled",
+  ): boolean {
+    const now = this.now().toISOString();
+    this.database.exec("BEGIN IMMEDIATE;");
+    try {
+      const release = this.database
+        .prepare(
+          `UPDATE logged_export_source_group_members
+           SET lifecycle_state = 'released', outcome = ?, released_at = ?
+           WHERE group_id = ? AND export_request_id = ?
+             AND lifecycle_state = 'joined'`,
+        )
+        .run(outcome, now, groupId, requestId);
+      if (release.changes !== 1) {
+        const replay = this.database
+          .prepare(
+            `SELECT outcome FROM logged_export_source_group_members
+             WHERE group_id = ? AND export_request_id = ?
+               AND lifecycle_state IN ('released', 'settled')`,
+          )
+          .get(groupId, requestId) as { outcome?: string } | undefined;
+        if (replay?.outcome !== outcome) throw new LocalExportLifecycleError();
+      }
+      const remaining = this.database
+        .prepare(
+          `SELECT count(*) AS count FROM logged_export_source_group_members
+           WHERE group_id = ? AND lifecycle_state = 'joined'`,
+        )
+        .get(groupId) as { count: number };
+      this.database.exec("COMMIT;");
+      return Number(remaining.count) === 0;
+    } catch (error) {
+      this.database.exec("ROLLBACK;");
+      throw error;
+    }
+  }
+
+  recordLoggedExportSourceGroupCleanupStarted(groupId: string): void {
+    const now = this.now().toISOString();
+    this.database.exec("BEGIN IMMEDIATE;");
+    try {
+      const group = this.database
+        .prepare(
+          `UPDATE logged_export_source_groups
+           SET lifecycle_state = 'deleting', cleanup_started_at = ?, updated_at = ?
+           WHERE id = ? AND lifecycle_state IN ('acquiring', 'ready',
+             'acquisition_failed')
+             AND NOT EXISTS (
+               SELECT 1 FROM logged_export_source_group_members
+               WHERE group_id = ? AND lifecycle_state = 'joined'
+             )`,
+        )
+        .run(now, now, groupId, groupId);
+      if (group.changes !== 1) throw new LocalExportLifecycleError();
+      this.database
+        .prepare(
+          `UPDATE source_scratch_assets SET lifecycle_state = 'deleting',
+             cleanup_started_at = ?, updated_at = ?
+           WHERE source_group_id = ? AND lifecycle_state IN ('acquiring', 'ready')`,
+        )
+        .run(now, now, groupId);
+      this.database.exec("COMMIT;");
+    } catch (error) {
+      this.database.exec("ROLLBACK;");
+      throw error;
+    }
+  }
+
+  recordLoggedExportSourceGroupCleanupSucceeded(groupId: string): void {
+    const now = this.now().toISOString();
+    this.database.exec("BEGIN IMMEDIATE;");
+    try {
+      const group = this.database
+        .prepare(
+          `UPDATE logged_export_source_groups
+           SET lifecycle_state = 'deleted', deleted_at = ?, updated_at = ?,
+               cleanup_error_code = NULL, cleanup_error_message = NULL
+           WHERE id = ? AND lifecycle_state = 'deleting'`,
+        )
+        .run(now, now, groupId);
+      if (group.changes !== 1) throw new LocalExportLifecycleError();
+      this.database
+        .prepare(
+          `UPDATE source_scratch_assets
+           SET lifecycle_state = 'deleted', deleted_at = ?, updated_at = ?,
+               cleanup_error_code = NULL, cleanup_error_message = NULL
+           WHERE source_group_id = ? AND lifecycle_state = 'deleting'`,
+        )
+        .run(now, now, groupId);
+      const members = this.database
+        .prepare(
+          `SELECT member.job_id, member.attempt, member.outcome
+           FROM logged_export_source_group_members member
+           WHERE member.group_id = ? AND member.lifecycle_state = 'released'`,
+        )
+        .all(groupId) as Array<{
+        job_id: string;
+        attempt: number;
+        outcome: "succeeded" | "failed" | "canceled";
+      }>;
+      for (const member of members) {
+        const completePackage = this.hasCompleteFinalArtifactProvenance(
+          member.job_id,
+          member.attempt,
+        );
+        if (member.outcome === "succeeded" && !completePackage) {
+          throw new LocalExportLifecycleError(
+            "A successful shared-source member has incomplete package evidence.",
+            "final_artifact_provenance_invalid",
+          );
+        }
+        this.database
+          .prepare(
+            `UPDATE jobs SET state = ?, updated_at = ?
+             WHERE id = ? AND attempt = ? AND state = 'processing'`,
+          )
+          .run(
+            member.outcome === "succeeded" ? "complete" : "queued",
+            now,
+            member.job_id,
+            member.attempt,
+          );
+      }
+      this.database
+        .prepare(
+          `UPDATE logged_export_source_group_members
+           SET lifecycle_state = 'settled', settled_at = ?
+           WHERE group_id = ? AND lifecycle_state = 'released'`,
+        )
+        .run(now, groupId);
+      this.database.exec("COMMIT;");
+    } catch (error) {
+      this.database.exec("ROLLBACK;");
+      throw error;
+    }
+  }
+
+  recordLoggedExportSourceGroupCleanupFailed(
+    groupId: string,
+    message: string,
+  ): void {
+    const now = this.now().toISOString();
+    this.database.exec("BEGIN IMMEDIATE;");
+    try {
+      const group = this.database
+        .prepare(
+          `UPDATE logged_export_source_groups
+           SET lifecycle_state = 'cleanup_failed',
+               cleanup_error_code = 'source_cleanup_failed',
+               cleanup_error_message = ?, updated_at = ?
+           WHERE id = ? AND lifecycle_state IN ('acquiring', 'ready', 'deleting',
+             'acquisition_failed')`,
+        )
+        .run(safeLocalError(message), now, groupId);
+      if (group.changes !== 1) throw new LocalExportLifecycleError();
+      this.database
+        .prepare(
+          `UPDATE source_scratch_assets
+           SET lifecycle_state = 'cleanup_failed',
+               cleanup_error_code = 'source_cleanup_failed',
+               cleanup_error_message = ?, updated_at = ?
+           WHERE source_group_id = ? AND lifecycle_state != 'deleted'`,
+        )
+        .run(safeLocalError(message), now, groupId);
+      this.database
+        .prepare(
+          `UPDATE jobs SET state = 'needs_user_action', updated_at = ?,
+             payload_json = json_set(payload_json, '$.lastError',
+               json_object('code', 'source_cleanup_failed', 'message', ?))
+           WHERE id IN (
+             SELECT job_id FROM logged_export_source_group_members
+             WHERE group_id = ?
+           ) AND state IN ('queued', 'processing')`,
+        )
+        .run(now, safeLocalError(message), groupId);
+      this.database.exec("COMMIT;");
+    } catch (error) {
+      this.database.exec("ROLLBACK;");
+      throw error;
+    }
+  }
+
+  assertExportDeliveryAccepted(requestId: string): void {
+    const request = this.get(requestId);
+    if (!request) throw new LocalExportRequestNotFoundError();
+    const deliveryState = this.database
+      .prepare("SELECT cloud_delivery_state FROM export_requests WHERE id = ?")
+      .get(requestId) as { cloud_delivery_state?: string | null } | undefined;
+    if (
+      request.mode === "logged" &&
+      deliveryState?.cloud_delivery_state !== "accepted"
+    ) {
+      throw new LocalExportLifecycleError(
+        "This logged export is pending authoritative cloud delivery acceptance.",
+        "logged_export_delivery_not_accepted",
+      );
+    }
+  }
+
+  assertExactSourceRightsConfirmation(requestId: string): void {
+    const request = this.get(requestId);
+    if (!request) throw new LocalExportRequestNotFoundError();
+    requireExactSourceRightsSnapshot(
+      request.sourceRights,
+      request.video.youtubeVideoId,
+    );
+  }
+
+  recordSourceNotStartedFailure(
+    requestId: string,
+    code: string,
+    message: string,
+  ): void {
+    const request = this.get(requestId);
+    if (!request) throw new LocalExportRequestNotFoundError();
+    const now = this.now().toISOString();
+    this.database.exec("BEGIN IMMEDIATE;");
+    try {
+      this.markJobNeedsUserAction(request.jobId, code, message, now);
+      this.database.exec("COMMIT;");
+    } catch (error) {
+      this.database.exec("ROLLBACK;");
+      throw error;
+    }
+  }
+
+  recordSourceReady(
+    jobId: string,
+    attempt: number,
+    source: {
+      provider: string;
+      sourceIdentity: string;
+      byteSize: number;
+      contentSha256: string;
+    },
+  ): void {
+    const now = this.now().toISOString();
+    const result = this.database
+      .prepare(
+        `UPDATE source_scratch_assets
+         SET provider = ?, source_identity = ?, byte_size = ?, content_sha256 = ?,
+             lifecycle_state = 'ready', ready_at = ?, updated_at = ?
+         WHERE job_id = ? AND attempt = ? AND lifecycle_state = 'acquiring'
+           AND cleanup_claim_token IS NULL`,
+      )
+      .run(
+        source.provider,
+        source.sourceIdentity,
+        source.byteSize,
+        source.contentSha256,
+        now,
+        now,
+        jobId,
+        attempt,
+      );
+    if (result.changes !== 1) throw new LocalExportLifecycleError();
+  }
+
+  recordSourceInspection(
+    jobId: string,
+    attempt: number,
+    inspection: {
+      durationMs: number;
+      containerFormat?: string;
+      videoCodec?: string;
+      audioCodec?: string;
+      ffprobeVersion?: string;
+    },
+    resolvedBounds: { startMs: number; endMs: number },
+  ): void {
+    if (
+      !Number.isSafeInteger(inspection.durationMs) ||
+      inspection.durationMs <= 0 ||
+      !Number.isSafeInteger(resolvedBounds.startMs) ||
+      !Number.isSafeInteger(resolvedBounds.endMs) ||
+      resolvedBounds.startMs < 0 ||
+      resolvedBounds.endMs <= resolvedBounds.startMs ||
+      resolvedBounds.endMs > inspection.durationMs
+    ) {
+      throw new LocalExportLifecycleError(
+        "Resolved export bounds are invalid for the inspected source.",
+        "export_bounds_invalid",
+      );
+    }
+    const now = this.now().toISOString();
+    this.database.exec("BEGIN IMMEDIATE;");
+    try {
+      const source = this.database
+        .prepare(
+          `UPDATE source_scratch_assets
+           SET duration_ms = ?, container_format = ?, video_codec = ?, audio_codec = ?,
+               ffprobe_version = ?, updated_at = ?
+           WHERE job_id = ? AND attempt = ? AND lifecycle_state = 'ready'
+             AND cleanup_claim_token IS NULL`,
+        )
+        .run(
+          inspection.durationMs,
+          safeProbeValue(inspection.containerFormat, 240),
+          safeProbeValue(inspection.videoCodec, 120),
+          safeProbeValue(inspection.audioCodec, 120),
+          safeProbeValue(inspection.ffprobeVersion, 120),
+          now,
+          jobId,
+          attempt,
+        );
+      if (source.changes !== 1) throw new LocalExportLifecycleError();
+      const request = this.database
+        .prepare(
+          `UPDATE export_requests
+           SET resolved_export_start_ms = ?, resolved_export_end_ms = ?,
+               resolved_source_attempt = ?, resolved_at = ?, updated_at = ?
+           WHERE job_id = ?`,
+        )
+        .run(
+          resolvedBounds.startMs,
+          resolvedBounds.endMs,
+          attempt,
+          now,
+          now,
+          jobId,
+        );
+      if (request.changes !== 1) throw new LocalExportLifecycleError();
+      this.database.exec("COMMIT;");
+    } catch (error) {
+      this.database.exec("ROLLBACK;");
+      throw error;
+    }
+  }
+
+  recordSourceCleanupStarted(jobId: string, attempt: number): void {
+    const now = this.now().toISOString();
+    const result = this.database
+      .prepare(
+        `UPDATE source_scratch_assets
+         SET lifecycle_state = 'deleting', cleanup_started_at = ?, updated_at = ?
+         WHERE job_id = ? AND attempt = ?
+           AND lifecycle_state IN ('acquiring', 'ready')
+           AND cleanup_claim_token IS NULL`,
+      )
+      .run(now, now, jobId, attempt);
+    if (result.changes !== 1) throw new LocalExportLifecycleError();
+  }
+
+  recordRenderedOutputValidation(
+    jobId: string,
+    attempt: number,
+    inspection: {
+      durationMs: number;
+      containerFormat?: string;
+      videoCodec?: string;
+      audioCodec?: string;
+      ffprobeVersion?: string;
+      ffmpegVersion?: string;
+      verificationSchemaVersion: 1;
+      settingsSha256: string;
+      observedProperties?: ExportObservedMediaProperties;
+    },
+  ): void {
+    const observed = ExportObservedMediaPropertiesSchema.safeParse(
+      inspection.observedProperties,
+    );
+    const snapshotRow = this.database
+      .prepare(
+        `SELECT resolved_settings_snapshot_json
+         FROM export_requests
+         WHERE job_id = ? AND resolved_source_attempt = ?`,
+      )
+      .get(jobId, attempt) as
+      { resolved_settings_snapshot_json: string | null } | undefined;
+    let settingsSha256: string | undefined;
+    if (snapshotRow?.resolved_settings_snapshot_json) {
+      try {
+        const snapshot = ResolvedExportSettingsSnapshotSchema.parse(
+          JSON.parse(snapshotRow.resolved_settings_snapshot_json),
+        );
+        settingsSha256 = sha256Fingerprint(snapshot.settings);
+      } catch {
+        settingsSha256 = undefined;
+      }
+    }
+    if (
+      !Number.isSafeInteger(inspection.durationMs) ||
+      inspection.durationMs <= 0 ||
+      inspection.verificationSchemaVersion !== 1 ||
+      !/^[a-f0-9]{64}$/u.test(inspection.settingsSha256) ||
+      inspection.settingsSha256 !== settingsSha256 ||
+      !observed.success ||
+      observed.data.durationMs !== inspection.durationMs ||
+      !observed.data.ffprobeVersion ||
+      (inspection.videoCodec !== undefined &&
+        observed.data.video.codec !== inspection.videoCodec) ||
+      (inspection.audioCodec !== undefined &&
+        observed.data.audio.codec !== inspection.audioCodec) ||
+      inspection.ffprobeVersion !== observed.data.ffprobeVersion
+    ) {
+      throw new LocalExportLifecycleError(
+        "Rendered output provenance is invalid.",
+        "render_output_provenance_invalid",
+      );
+    }
+    const now = this.now().toISOString();
+    const result = this.database
+      .prepare(
+        `UPDATE export_requests
+         SET rendered_duration_ms = ?, rendered_container_format = ?,
+             rendered_video_codec = ?, rendered_audio_codec = ?,
+             rendered_ffprobe_version = ?, rendered_ffmpeg_version = ?,
+             rendered_conformance_schema_version = ?,
+             rendered_settings_sha256 = ?,
+             rendered_observed_properties_json = ?,
+             rendered_source_attempt = ?, rendered_validated_at = ?,
+             updated_at = ?
+         WHERE job_id = ? AND resolved_source_attempt = ?`,
+      )
+      .run(
+        inspection.durationMs,
+        safeProbeValue(inspection.containerFormat, 240),
+        safeProbeValue(inspection.videoCodec, 120),
+        safeProbeValue(inspection.audioCodec, 120),
+        safeProbeValue(inspection.ffprobeVersion, 120),
+        safeProbeValue(inspection.ffmpegVersion, 120),
+        inspection.verificationSchemaVersion,
+        inspection.settingsSha256,
+        JSON.stringify(observed.data),
+        attempt,
+        now,
+        now,
+        jobId,
+        attempt,
+      );
+    if (result.changes !== 1) throw new LocalExportLifecycleError();
+  }
+
+  recordThumbnailValidation(
+    jobId: string,
+    attempt: number,
+    thumbnail: { extractionTimeMs: number; width: number; height: number },
+  ): void {
+    if (
+      !Number.isSafeInteger(thumbnail.extractionTimeMs) ||
+      thumbnail.extractionTimeMs < 0 ||
+      !Number.isSafeInteger(thumbnail.width) ||
+      !Number.isSafeInteger(thumbnail.height) ||
+      thumbnail.width <= 0 ||
+      thumbnail.height <= 0 ||
+      thumbnail.width > 1_280 ||
+      thumbnail.height > 720 ||
+      thumbnail.width % 2 !== 0 ||
+      thumbnail.height % 2 !== 0
+    ) {
+      throw new LocalExportLifecycleError(
+        "Thumbnail provenance is invalid.",
+        "thumbnail_provenance_invalid",
+      );
+    }
+    const now = this.now().toISOString();
+    const result = this.database
+      .prepare(
+        `UPDATE export_requests
+         SET thumbnail_extraction_time_ms = ?, thumbnail_width = ?,
+             thumbnail_height = ?, thumbnail_source_attempt = ?,
+             thumbnail_validated_at = ?, updated_at = ?
+         WHERE job_id = ? AND resolved_source_attempt = ?
+           AND rendered_source_attempt = ?
+           AND rendered_duration_ms > ?`,
+      )
+      .run(
+        thumbnail.extractionTimeMs,
+        thumbnail.width,
+        thumbnail.height,
+        attempt,
+        now,
+        now,
+        jobId,
+        attempt,
+        attempt,
+        thumbnail.extractionTimeMs,
+      );
+    if (result.changes !== 1) {
+      throw new LocalExportLifecycleError(
+        "Thumbnail provenance does not match the rendered export.",
+        "thumbnail_provenance_invalid",
+      );
+    }
+  }
+
+  recordConfirmedEnglishSubtitleOmission(jobId: string, attempt: number): void {
+    const now = this.now().toISOString();
+    const result = this.database
+      .prepare(
+        `UPDATE export_requests
+         SET subtitle_omission_policy = ?, subtitle_omission_source_attempt = ?,
+             subtitle_omission_validated_at = ?, updated_at = ?
+         WHERE job_id = ? AND source_language_class = 'confirmed_english'
+           AND resolved_source_attempt = ? AND rendered_source_attempt = ?
+           AND json_extract(
+             resolved_settings_snapshot_json,
+             '$.settings.omitSubtitleFilesForConfirmedEnglish'
+           ) = 1`,
+      )
+      .run(
+        "confirmed_english_user_setting",
+        attempt,
+        now,
+        now,
+        jobId,
+        attempt,
+        attempt,
+      );
+    if (result.changes !== 1) {
+      throw new LocalExportLifecycleError(
+        "Confirmed-English subtitle omission provenance is invalid.",
+        "subtitle_omission_provenance_invalid",
+      );
+    }
+  }
+
+  recordEnglishSubtitleValidation(
+    jobId: string,
+    attempt: number,
+    sidecar: {
+      trackId: string;
+      trackVersion: number;
+      cueCount: number;
+      byteSize: number;
+      contentSha256: string;
+      startMs: number;
+      endMs: number;
+    },
+  ): void {
+    if (
+      !Number.isSafeInteger(sidecar.trackVersion) ||
+      sidecar.trackVersion <= 0 ||
+      !Number.isSafeInteger(sidecar.cueCount) ||
+      sidecar.cueCount <= 0 ||
+      !Number.isSafeInteger(sidecar.byteSize) ||
+      sidecar.byteSize <= 0 ||
+      !/^[a-f0-9]{64}$/u.test(sidecar.contentSha256) ||
+      !Number.isSafeInteger(sidecar.startMs) ||
+      !Number.isSafeInteger(sidecar.endMs) ||
+      sidecar.startMs < 0 ||
+      sidecar.endMs <= sidecar.startMs
+    ) {
+      throw new LocalExportLifecycleError(
+        "English subtitle provenance is invalid.",
+        "english_subtitle_provenance_invalid",
+      );
+    }
+    const now = this.now().toISOString();
+    const result = this.database
+      .prepare(
+        `UPDATE export_requests
+         SET english_subtitle_track_id = ?, english_subtitle_track_version = ?,
+             english_subtitle_cue_count = ?, english_subtitle_byte_size = ?,
+             english_subtitle_content_sha256 = ?, english_subtitle_start_ms = ?,
+             english_subtitle_end_ms = ?, english_subtitle_source_attempt = ?,
+             english_subtitle_validated_at = ?, updated_at = ?
+         WHERE job_id = ? AND resolved_source_attempt = ?
+           AND rendered_source_attempt = ?`,
+      )
+      .run(
+        sidecar.trackId,
+        sidecar.trackVersion,
+        sidecar.cueCount,
+        sidecar.byteSize,
+        sidecar.contentSha256,
+        sidecar.startMs,
+        sidecar.endMs,
+        attempt,
+        now,
+        now,
+        jobId,
+        attempt,
+        attempt,
+      );
+    if (result.changes !== 1) throw new LocalExportLifecycleError();
+  }
+
+  recordBilingualSubtitleValidation(
+    jobId: string,
+    attempt: number,
+    sidecars: readonly [
+      LocalSubtitleSidecarValidation,
+      LocalSubtitleSidecarValidation,
+    ],
+  ): void {
+    const roles = new Set(sidecars.map((sidecar) => sidecar.role));
+    if (
+      roles.size !== 2 ||
+      !roles.has("original") ||
+      !roles.has("english") ||
+      sidecars.some((sidecar) => !validSubtitleSidecar(sidecar))
+    ) {
+      throw new LocalExportLifecycleError(
+        "Bilingual subtitle provenance is invalid.",
+        "bilingual_subtitle_provenance_invalid",
+      );
+    }
+    const now = this.now().toISOString();
+    this.database.exec("BEGIN IMMEDIATE;");
+    try {
+      const request = this.database
+        .prepare(
+          `SELECT id FROM export_requests
+           WHERE job_id = ? AND resolved_source_attempt = ?
+             AND rendered_source_attempt = ?`,
+        )
+        .get(jobId, attempt, attempt) as { id: string } | undefined;
+      if (!request) throw new LocalExportLifecycleError();
+      const insert = this.database.prepare(
+        `INSERT INTO export_subtitle_sidecars
+           (export_request_id, role, language, track_id, track_version,
+            cue_count, byte_size, content_sha256, start_ms, end_ms,
+            source_attempt, validated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT (export_request_id, role) DO UPDATE SET
+           language = excluded.language, track_id = excluded.track_id,
+           track_version = excluded.track_version, cue_count = excluded.cue_count,
+           byte_size = excluded.byte_size, content_sha256 = excluded.content_sha256,
+           start_ms = excluded.start_ms, end_ms = excluded.end_ms,
+           source_attempt = excluded.source_attempt, validated_at = excluded.validated_at`,
+      );
+      for (const sidecar of sidecars) {
+        insert.run(
+          request.id,
+          sidecar.role,
+          safeSubtitleLanguage(sidecar.language),
+          sidecar.trackId,
+          sidecar.trackVersion,
+          sidecar.cueCount,
+          sidecar.byteSize,
+          sidecar.contentSha256,
+          sidecar.startMs,
+          sidecar.endMs,
+          attempt,
+          now,
+        );
+      }
+      this.database
+        .prepare("UPDATE export_requests SET updated_at = ? WHERE id = ?")
+        .run(now, request.id);
+      this.database.exec("COMMIT;");
+    } catch (error) {
+      this.database.exec("ROLLBACK;");
+      throw error;
+    }
+  }
+
+  recordNoSpeechSubtitleValidation(
+    jobId: string,
+    attempt: number,
+    sidecars: readonly LocalEmptySubtitleSidecarValidation[],
+  ): void {
+    const now = this.now().toISOString();
+    this.database.exec("BEGIN IMMEDIATE;");
+    try {
+      const request = this.database
+        .prepare(
+          `SELECT id, source_language_class, selection_snapshot_json
+           FROM export_requests
+           WHERE job_id = ? AND resolved_source_attempt = ?
+             AND rendered_source_attempt = ?`,
+        )
+        .get(jobId, attempt, attempt) as
+        | {
+            id: string;
+            source_language_class: string;
+            selection_snapshot_json: string;
+          }
+        | undefined;
+      if (!request) throw new LocalExportLifecycleError();
+      const selection = JSON.parse(request.selection_snapshot_json) as {
+        selectionType?: unknown;
+        speechStatus?: unknown;
+        noSpeechAttestation?: unknown;
+      };
+      const expectedRoles =
+        request.source_language_class === "confirmed_english"
+          ? ["english"]
+          : ["english", "original"];
+      const actualRoles = sidecars.map((sidecar) => sidecar.role).sort();
+      if (
+        selection.selectionType !== "player_time_range" ||
+        selection.speechStatus !== "no_speech" ||
+        !selection.noSpeechAttestation ||
+        sidecars.length !== expectedRoles.length ||
+        expectedRoles.some((role, index) => actualRoles[index] !== role) ||
+        sidecars.some(
+          (sidecar) =>
+            !validEmptySubtitleSidecar(sidecar) ||
+            canonicalJson(sidecar.noSpeechAttestation) !==
+              canonicalJson(selection.noSpeechAttestation),
+        )
+      ) {
+        throw new LocalExportLifecycleError(
+          "No-speech subtitle provenance is invalid.",
+          "no_speech_subtitle_provenance_invalid",
+        );
+      }
+      const insert = this.database.prepare(
+        `INSERT INTO export_empty_subtitle_sidecars
+           (export_request_id, role, language, empty_reason,
+            no_speech_attestation_json, cue_count, byte_size, content_sha256,
+            start_ms, end_ms, source_attempt, validated_at)
+         VALUES (?, ?, ?, 'attested_no_speech', ?, 0, ?, ?, 0, 0, ?, ?)
+         ON CONFLICT (export_request_id, role) DO UPDATE SET
+           language = excluded.language,
+           no_speech_attestation_json = excluded.no_speech_attestation_json,
+           byte_size = excluded.byte_size,
+           content_sha256 = excluded.content_sha256,
+           source_attempt = excluded.source_attempt,
+           validated_at = excluded.validated_at`,
+      );
+      for (const sidecar of sidecars) {
+        insert.run(
+          request.id,
+          sidecar.role,
+          safeSubtitleLanguage(sidecar.language),
+          canonicalJson(sidecar.noSpeechAttestation),
+          sidecar.byteSize,
+          sidecar.contentSha256,
+          attempt,
+          now,
+        );
+      }
+      this.database
+        .prepare("UPDATE export_requests SET updated_at = ? WHERE id = ?")
+        .run(now, request.id);
+      this.database.exec("COMMIT;");
+    } catch (error) {
+      this.database.exec("ROLLBACK;");
+      throw error;
+    }
+  }
+
+  recordFinalArtifactPromotion(
+    jobId: string,
+    attempt: number,
+    artifacts: readonly LocalFinalArtifactProvenance[],
+  ): void {
+    const roles = new Set(artifacts.map((artifact) => artifact.role));
+    if (
+      artifacts.length < 4 ||
+      artifacts.length > 6 ||
+      roles.size !== artifacts.length ||
+      [...roles].filter((role) =>
+        ["video_mp4", "video_mkv", "video_mov"].includes(role),
+      ).length !== 1 ||
+      !roles.has("clip_metadata_json") ||
+      !roles.has("thumbnail_jpg") ||
+      !roles.has("manifest_json") ||
+      artifacts.some((artifact) => !validFinalArtifact(artifact))
+    ) {
+      throw new LocalExportLifecycleError(
+        "Final artifact provenance is invalid.",
+        "final_artifact_provenance_invalid",
+      );
+    }
+    const packageIdentity = artifacts[0]?.packageIdentity;
+    if (
+      !packageIdentity ||
+      artifacts.some((a) => a.packageIdentity !== packageIdentity)
+    ) {
+      throw new LocalExportLifecycleError(
+        "Final artifacts must share one package identity.",
+        "final_artifact_provenance_invalid",
+      );
+    }
+    const now = this.now().toISOString();
+    this.database.exec("BEGIN IMMEDIATE;");
+    try {
+      const request = this.database
+        .prepare(
+          `SELECT id FROM export_requests
+           WHERE job_id = ? AND resolved_source_attempt = ?
+             AND rendered_source_attempt = ?
+             AND thumbnail_source_attempt = ?`,
+        )
+        .get(jobId, attempt, attempt, attempt) as { id: string } | undefined;
+      if (!request) throw new LocalExportLifecycleError();
+      const insert = this.database.prepare(
+        `INSERT INTO export_final_artifacts
+           (export_request_id, role, package_identity, byte_size,
+            content_sha256, source_attempt, validated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT (export_request_id, role) DO UPDATE SET
+           package_identity = excluded.package_identity,
+           byte_size = excluded.byte_size,
+           content_sha256 = excluded.content_sha256,
+           source_attempt = excluded.source_attempt,
+           validated_at = excluded.validated_at`,
+      );
+      for (const artifact of artifacts) {
+        insert.run(
+          request.id,
+          artifact.role,
+          artifact.packageIdentity,
+          artifact.byteSize,
+          artifact.contentSha256,
+          attempt,
+          artifact.validatedAt,
+        );
+      }
+      this.database
+        .prepare("UPDATE export_requests SET updated_at = ? WHERE id = ?")
+        .run(now, request.id);
+      this.database.exec("COMMIT;");
+    } catch (error) {
+      this.database.exec("ROLLBACK;");
+      throw error;
+    }
+  }
+
+  recordSourceCleanupSucceeded(jobId: string, attempt: number): void {
+    const now = this.now().toISOString();
+    this.database.exec("BEGIN IMMEDIATE;");
+    try {
+      const deleted = this.database
+        .prepare(
+          `UPDATE source_scratch_assets
+           SET lifecycle_state = 'deleted', deleted_at = ?, updated_at = ?,
+               cleanup_error_code = NULL, cleanup_error_message = NULL,
+               cleanup_claim_token = NULL, cleanup_claim_expires_at = NULL,
+               cleanup_claim_previous_lifecycle_state = NULL
+           WHERE job_id = ? AND attempt = ? AND lifecycle_state = 'deleting'
+             AND cleanup_claim_token IS NULL`,
+        )
+        .run(now, now, jobId, attempt);
+      if (deleted.changes !== 1) throw new LocalExportLifecycleError();
+      this.database
+        .prepare(
+          `UPDATE jobs SET state = CASE WHEN EXISTS (
+             SELECT 1 FROM export_final_artifacts efa
+             JOIN export_requests er ON er.id = efa.export_request_id
+             WHERE er.job_id = ? AND efa.source_attempt = ?
+           ) THEN 'complete' ELSE 'queued' END, updated_at = ?
+           WHERE id = ? AND state = 'processing'`,
+        )
+        .run(jobId, attempt, now, jobId);
+      this.recordExportOnlyNotification(jobId, "completed", now);
+      this.database.exec("COMMIT;");
+    } catch (error) {
+      this.database.exec("ROLLBACK;");
+      throw error;
+    }
+  }
+
+  recordSourceCleanupFailed(
+    jobId: string,
+    attempt: number,
+    message: string,
+  ): void {
+    const now = this.now().toISOString();
+    this.database.exec("BEGIN IMMEDIATE;");
+    try {
+      const result = this.database
+        .prepare(
+          `UPDATE source_scratch_assets
+           SET lifecycle_state = 'cleanup_failed', cleanup_error_code = 'source_cleanup_failed',
+               cleanup_error_message = ?, updated_at = ?,
+               cleanup_claim_token = NULL, cleanup_claim_expires_at = NULL,
+               cleanup_claim_previous_lifecycle_state = NULL
+           WHERE job_id = ? AND attempt = ?
+             AND lifecycle_state IN ('acquiring', 'ready', 'deleting')
+             AND cleanup_claim_token IS NULL`,
+        )
+        .run(safeLocalError(message), now, jobId, attempt);
+      if (result.changes !== 1) throw new LocalExportLifecycleError();
+      this.markJobNeedsUserAction(jobId, "source_cleanup_failed", message, now);
+      this.database.exec("COMMIT;");
+    } catch (error) {
+      this.database.exec("ROLLBACK;");
+      throw error;
+    }
+  }
+
+  /**
+   * Reserves a bounded set of deterministic-layout scratch rows for one-shot
+   * local recovery. The claim is a short durable lease rather than an in-memory
+   * lock so a restart cannot strand a row forever or let two sweepers settle it.
+   */
+  claimSourceScratchCleanup(limit: number): LocalSourceScratchCleanupClaim[] {
+    if (
+      !Number.isSafeInteger(limit) ||
+      limit <= 0 ||
+      limit > MaxSourceScratchCleanupClaims
+    ) {
+      throw new LocalExportLifecycleError(
+        "Source scratch cleanup limit is invalid.",
+        "source_scratch_cleanup_limit_invalid",
+      );
+    }
+    const claimedAt = this.now();
+    const now = claimedAt.toISOString();
+    const claimExpiresAt = new Date(
+      claimedAt.getTime() + SourceScratchCleanupClaimLeaseMs,
+    ).toISOString();
+    this.database.exec("BEGIN IMMEDIATE;");
+    try {
+      const candidates = this.database
+        .prepare(
+          `SELECT ssa.job_id, ssa.attempt
+           FROM source_scratch_assets ssa
+           JOIN jobs j ON j.id = ssa.job_id
+           WHERE ssa.scratch_layout_version = ?
+             AND (ssa.cleanup_claim_expires_at IS NULL
+                  OR ssa.cleanup_claim_expires_at <= ?)
+             AND (
+               ssa.lifecycle_state = 'cleanup_failed'
+               OR (
+                 ssa.lifecycle_state IN ('acquiring', 'ready', 'deleting')
+                 AND ssa.expires_at <= ?
+                 AND NOT (
+                   j.state = 'processing'
+                   AND j.attempt = ssa.attempt
+                   AND ssa.expires_at > ?
+                 )
+               )
+             )
+           ORDER BY
+             CASE WHEN ssa.lifecycle_state = 'cleanup_failed' THEN 0 ELSE 1 END,
+             ssa.expires_at,
+             ssa.updated_at,
+             ssa.job_id,
+             ssa.attempt
+           LIMIT ?`,
+        )
+        .all(SourceScratchLayoutVersion, now, now, now, limit) as Array<{
+        job_id: string;
+        attempt: number;
+      }>;
+      const claimed: LocalSourceScratchCleanupClaim[] = [];
+      const update = this.database.prepare(
+        `UPDATE source_scratch_assets
+         SET lifecycle_state = 'deleting', cleanup_started_at = ?,
+             cleanup_claim_token = ?, cleanup_claim_expires_at = ?,
+             cleanup_claim_previous_lifecycle_state = COALESCE(
+               cleanup_claim_previous_lifecycle_state, lifecycle_state
+             ),
+             updated_at = ?
+         WHERE job_id = ? AND attempt = ?
+           AND scratch_layout_version = ?
+           AND (cleanup_claim_expires_at IS NULL OR cleanup_claim_expires_at <= ?)
+           AND (
+             lifecycle_state = 'cleanup_failed'
+             OR (
+               lifecycle_state IN ('acquiring', 'ready', 'deleting')
+               AND expires_at <= ?
+               AND NOT EXISTS (
+                 SELECT 1
+                 FROM jobs
+                 WHERE jobs.id = source_scratch_assets.job_id
+                   AND jobs.state = 'processing'
+                   AND jobs.attempt = source_scratch_assets.attempt
+                   AND source_scratch_assets.expires_at > ?
+               )
+             )
+           )`,
+      );
+      for (const candidate of candidates) {
+        const claimToken = randomUUID();
+        const result = update.run(
+          now,
+          claimToken,
+          claimExpiresAt,
+          now,
+          candidate.job_id,
+          candidate.attempt,
+          SourceScratchLayoutVersion,
+          now,
+          now,
+          now,
+        );
+        if (result.changes === 1) {
+          claimed.push({
+            jobId: candidate.job_id,
+            attempt: Number(candidate.attempt),
+            claimToken,
+          });
+        }
+      }
+      this.database.exec("COMMIT;");
+      return claimed;
+    } catch (error) {
+      this.database.exec("ROLLBACK;");
+      throw error;
+    }
+  }
+
+  claimLoggedExportSourceGroupCleanup(
+    limit: number,
+    options: { recoverOrphanedJoined?: boolean } = {},
+  ): LocalLoggedExportSourceGroupCleanupClaim[] {
+    if (
+      !Number.isSafeInteger(limit) ||
+      limit <= 0 ||
+      limit > MaxSourceScratchCleanupClaims
+    ) {
+      throw new LocalExportLifecycleError(
+        "Source scratch cleanup limit is invalid.",
+        "source_scratch_cleanup_limit_invalid",
+      );
+    }
+    const claimedAt = this.now();
+    const now = claimedAt.toISOString();
+    const claimExpiresAt = new Date(
+      claimedAt.getTime() + SourceScratchCleanupClaimLeaseMs,
+    ).toISOString();
+    this.database.exec("BEGIN IMMEDIATE;");
+    try {
+      const candidates = this.database
+        .prepare(
+          `SELECT groups.id FROM logged_export_source_groups groups
+           WHERE (lifecycle_state = 'cleanup_failed'
+              OR (lifecycle_state IN ('acquiring', 'ready', 'deleting',
+                    'acquisition_failed') AND (
+                 expires_at <= ? OR ? = 1
+               )))
+           AND (cleanup_claim_expires_at IS NULL OR cleanup_claim_expires_at <= ?)
+           AND (? = 1 OR NOT EXISTS (
+             SELECT 1
+             FROM logged_export_source_group_members member
+             JOIN export_requests request
+               ON request.id = member.export_request_id
+             WHERE member.group_id = groups.id
+               AND member.lifecycle_state = 'joined'
+               AND request.cloud_execution_id = member.execution_id
+               AND request.cloud_execution_attempt = member.attempt
+               AND request.cloud_execution_expires_at > ?
+           ))
+           ORDER BY CASE WHEN lifecycle_state = 'cleanup_failed' THEN 0 ELSE 1 END,
+             expires_at, updated_at, id LIMIT ?`,
+        )
+        .all(
+          now,
+          options.recoverOrphanedJoined ? 1 : 0,
+          now,
+          options.recoverOrphanedJoined ? 1 : 0,
+          now,
+          limit,
+        ) as Array<{ id: string }>;
+      const claims: LocalLoggedExportSourceGroupCleanupClaim[] = [];
+      for (const candidate of candidates) {
+        const token = randomUUID();
+        const updated = this.database
+          .prepare(
+            `UPDATE logged_export_source_groups
+             SET lifecycle_state = 'deleting', cleanup_started_at = ?,
+                 cleanup_claim_token = ?, cleanup_claim_expires_at = ?,
+                 updated_at = ?
+             WHERE id = ? AND (
+               lifecycle_state = 'cleanup_failed'
+               OR (lifecycle_state IN ('acquiring', 'ready', 'deleting',
+                     'acquisition_failed') AND (
+                   expires_at <= ? OR ? = 1
+                 ))
+             ) AND (cleanup_claim_expires_at IS NULL
+                    OR cleanup_claim_expires_at <= ?)
+               AND (? = 1 OR NOT EXISTS (
+                 SELECT 1
+                 FROM logged_export_source_group_members member
+                 JOIN export_requests request
+                   ON request.id = member.export_request_id
+                 WHERE member.group_id = logged_export_source_groups.id
+                   AND member.lifecycle_state = 'joined'
+                   AND request.cloud_execution_id = member.execution_id
+                   AND request.cloud_execution_attempt = member.attempt
+                   AND request.cloud_execution_expires_at > ?
+               ))`,
+          )
+          .run(
+            now,
+            token,
+            claimExpiresAt,
+            now,
+            candidate.id,
+            now,
+            options.recoverOrphanedJoined ? 1 : 0,
+            now,
+            options.recoverOrphanedJoined ? 1 : 0,
+            now,
+          );
+        if (updated.changes !== 1) continue;
+        this.database
+          .prepare(
+            `UPDATE logged_export_source_group_members
+             SET lifecycle_state = 'released', outcome = 'failed', released_at = ?
+             WHERE group_id = ? AND lifecycle_state = 'joined'`,
+          )
+          .run(now, candidate.id);
+        this.database
+          .prepare(
+            `UPDATE source_scratch_assets
+             SET lifecycle_state = 'deleting', cleanup_started_at = ?, updated_at = ?
+             WHERE source_group_id = ? AND lifecycle_state != 'deleted'`,
+          )
+          .run(now, now, candidate.id);
+        claims.push({ groupId: candidate.id, claimToken: token });
+      }
+      this.database.exec("COMMIT;");
+      return claims;
+    } catch (error) {
+      this.database.exec("ROLLBACK;");
+      throw error;
+    }
+  }
+
+  completeLoggedExportSourceGroupCleanupClaim(
+    claim: LocalLoggedExportSourceGroupCleanupClaim,
+  ): LocalSourceScratchCleanupSettlement {
+    const now = this.now().toISOString();
+    this.database.exec("BEGIN IMMEDIATE;");
+    try {
+      const deleted = this.database
+        .prepare(
+          `UPDATE logged_export_source_groups
+           SET lifecycle_state = 'deleted', deleted_at = ?, updated_at = ?,
+               cleanup_error_code = NULL, cleanup_error_message = NULL,
+               cleanup_claim_token = NULL, cleanup_claim_expires_at = NULL
+           WHERE id = ? AND lifecycle_state = 'deleting'
+             AND cleanup_claim_token = ?`,
+        )
+        .run(now, now, claim.groupId, claim.claimToken);
+      if (deleted.changes !== 1) {
+        throw new LocalExportLifecycleError(
+          "Shared source cleanup claim is no longer current.",
+          "source_scratch_cleanup_claim_lost",
+        );
+      }
+      this.database
+        .prepare(
+          `UPDATE source_scratch_assets
+           SET lifecycle_state = 'deleted', deleted_at = ?, updated_at = ?,
+               cleanup_error_code = NULL, cleanup_error_message = NULL
+           WHERE source_group_id = ? AND lifecycle_state = 'deleting'`,
+        )
+        .run(now, now, claim.groupId);
+      this.database
+        .prepare(
+          `UPDATE logged_export_source_group_members
+           SET lifecycle_state = 'settled', settled_at = ?
+           WHERE group_id = ? AND lifecycle_state = 'released'`,
+        )
+        .run(now, claim.groupId);
+      const jobs = this.database
+        .prepare(
+          `SELECT jobs.id, jobs.attempt, jobs.payload_json, member.outcome
+           FROM jobs JOIN logged_export_source_group_members member
+             ON member.job_id = jobs.id
+           WHERE member.group_id = ?`,
+        )
+        .all(claim.groupId) as Array<{
+        id: string;
+        attempt: number;
+        payload_json: string;
+        outcome: "succeeded" | "failed" | "canceled";
+      }>;
+      let restoredComplete = false;
+      let markedNeedsUserAction = false;
+      for (const job of jobs) {
+        if (
+          job.outcome === "succeeded" &&
+          this.hasCompleteFinalArtifactProvenance(job.id, job.attempt)
+        ) {
+          this.database
+            .prepare(
+              `UPDATE jobs SET state = 'complete', updated_at = ?
+               WHERE id = ? AND attempt = ?`,
+            )
+            .run(now, job.id, job.attempt);
+          restoredComplete = true;
+        } else {
+          this.markJobNeedsUserAction(
+            job.id,
+            "source_scratch_abandoned",
+            "Expired shared source scratch was removed after interrupted local processing.",
+            now,
+          );
+          markedNeedsUserAction = true;
+        }
+      }
+      this.database.exec("COMMIT;");
+      return { restoredComplete, markedNeedsUserAction };
+    } catch (error) {
+      this.database.exec("ROLLBACK;");
+      throw error;
+    }
+  }
+
+  failLoggedExportSourceGroupCleanupClaim(
+    claim: LocalLoggedExportSourceGroupCleanupClaim,
+    message: string,
+  ): void {
+    const now = this.now().toISOString();
+    this.database.exec("BEGIN IMMEDIATE;");
+    try {
+      const failed = this.database
+        .prepare(
+          `UPDATE logged_export_source_groups
+           SET lifecycle_state = 'cleanup_failed',
+               cleanup_error_code = 'source_cleanup_failed',
+               cleanup_error_message = ?, cleanup_claim_token = NULL,
+               cleanup_claim_expires_at = NULL, updated_at = ?
+           WHERE id = ? AND lifecycle_state = 'deleting'
+             AND cleanup_claim_token = ?`,
+        )
+        .run(safeLocalError(message), now, claim.groupId, claim.claimToken);
+      if (failed.changes !== 1) {
+        throw new LocalExportLifecycleError(
+          "Shared source cleanup claim is no longer current.",
+          "source_scratch_cleanup_claim_lost",
+        );
+      }
+      this.database
+        .prepare(
+          `UPDATE source_scratch_assets
+           SET lifecycle_state = 'cleanup_failed',
+               cleanup_error_code = 'source_cleanup_failed',
+               cleanup_error_message = ?, updated_at = ?
+           WHERE source_group_id = ? AND lifecycle_state != 'deleted'`,
+        )
+        .run(safeLocalError(message), now, claim.groupId);
+      const jobs = this.database
+        .prepare(
+          `SELECT job_id FROM logged_export_source_group_members
+           WHERE group_id = ?`,
+        )
+        .all(claim.groupId) as Array<{ job_id: string }>;
+      for (const job of jobs) {
+        this.markJobNeedsUserAction(
+          job.job_id,
+          "source_cleanup_failed",
+          message,
+          now,
+        );
+      }
+      this.database.exec("COMMIT;");
+    } catch (error) {
+      this.database.exec("ROLLBACK;");
+      throw error;
+    }
+  }
+
+  countLegacySourceScratchRecoveryRows(): number {
+    const row = this.database
+      .prepare(
+        `SELECT count(*) AS count
+         FROM source_scratch_assets
+         WHERE scratch_layout_version IS NULL
+           AND lifecycle_state != 'deleted'`,
+      )
+      .get() as { count: number };
+    return Number(row.count);
+  }
+
+  completeSourceScratchCleanupClaim(
+    claim: LocalSourceScratchCleanupClaim,
+  ): LocalSourceScratchCleanupSettlement {
+    const now = this.now().toISOString();
+    this.database.exec("BEGIN IMMEDIATE;");
+    try {
+      const source = this.database
+        .prepare(
+          `SELECT cleanup_claim_previous_lifecycle_state
+           FROM source_scratch_assets
+           WHERE job_id = ? AND attempt = ?
+             AND scratch_layout_version = ?
+             AND cleanup_claim_token = ?`,
+        )
+        .get(
+          claim.jobId,
+          claim.attempt,
+          SourceScratchLayoutVersion,
+          claim.claimToken,
+        ) as
+        { cleanup_claim_previous_lifecycle_state: string | null } | undefined;
+      if (!source) {
+        throw new LocalExportLifecycleError(
+          "Source scratch cleanup claim is no longer current.",
+          "source_scratch_cleanup_claim_lost",
+        );
+      }
+      const deleted = this.database
+        .prepare(
+          `UPDATE source_scratch_assets
+           SET lifecycle_state = 'deleted', deleted_at = ?, updated_at = ?,
+               cleanup_error_code = NULL, cleanup_error_message = NULL,
+               cleanup_claim_token = NULL, cleanup_claim_expires_at = NULL,
+               cleanup_claim_previous_lifecycle_state = NULL
+           WHERE job_id = ? AND attempt = ?
+             AND scratch_layout_version = ?
+             AND cleanup_claim_token = ?`,
+        )
+        .run(
+          now,
+          now,
+          claim.jobId,
+          claim.attempt,
+          SourceScratchLayoutVersion,
+          claim.claimToken,
+        );
+      if (deleted.changes !== 1) {
+        throw new LocalExportLifecycleError(
+          "Source scratch cleanup claim is no longer current.",
+          "source_scratch_cleanup_claim_lost",
+        );
+      }
+      const job = this.database
+        .prepare("SELECT state, attempt, payload_json FROM jobs WHERE id = ?")
+        .get(claim.jobId) as
+        { state: string; attempt: number; payload_json: string } | undefined;
+      if (!job) throw new LocalExportLifecycleError();
+      const hasPackage = this.hasCompleteFinalArtifactProvenance(
+        claim.jobId,
+        claim.attempt,
+      );
+      let settlement: LocalSourceScratchCleanupSettlement = {
+        restoredComplete: false,
+        markedNeedsUserAction: false,
+      };
+      if (
+        hasPackage &&
+        (job.state === "needs_user_action" || job.state === "processing") &&
+        Number(job.attempt) === claim.attempt
+      ) {
+        const payload = parseLocalJobPayload(job.payload_json);
+        delete payload.lastError;
+        this.database
+          .prepare(
+            `UPDATE jobs
+             SET state = 'complete', payload_json = ?, updated_at = ?
+             WHERE id = ? AND state IN ('needs_user_action', 'processing')
+               AND attempt = ?`,
+          )
+          .run(JSON.stringify(payload), now, claim.jobId, claim.attempt);
+        this.recordExportOnlyNotification(claim.jobId, "completed", now);
+        settlement = { restoredComplete: true, markedNeedsUserAction: false };
+      } else if (
+        !hasPackage &&
+        Number(job.attempt) === claim.attempt &&
+        job.state === "processing"
+      ) {
+        this.markJobNeedsUserAction(
+          claim.jobId,
+          "source_scratch_abandoned",
+          "Expired source scratch was removed after interrupted local processing.",
+          now,
+        );
+        settlement = { restoredComplete: false, markedNeedsUserAction: true };
+      } else if (
+        !hasPackage &&
+        Number(job.attempt) === claim.attempt &&
+        job.state === "needs_user_action" &&
+        source.cleanup_claim_previous_lifecycle_state === "cleanup_failed"
+      ) {
+        this.markJobNeedsUserAction(
+          claim.jobId,
+          "source_scratch_cleanup_recovered",
+          "Source scratch cleanup completed after a prior cleanup failure.",
+          now,
+        );
+        settlement = { restoredComplete: false, markedNeedsUserAction: true };
+      }
+      this.database.exec("COMMIT;");
+      return settlement;
+    } catch (error) {
+      this.database.exec("ROLLBACK;");
+      throw error;
+    }
+  }
+
+  failSourceScratchCleanupClaim(
+    claim: LocalSourceScratchCleanupClaim,
+    message: string,
+  ): void {
+    const now = this.now().toISOString();
+    this.database.exec("BEGIN IMMEDIATE;");
+    try {
+      const failed = this.database
+        .prepare(
+          `UPDATE source_scratch_assets
+           SET lifecycle_state = 'cleanup_failed',
+               cleanup_error_code = 'source_cleanup_failed',
+               cleanup_error_message = ?, cleanup_claim_token = NULL,
+               cleanup_claim_expires_at = NULL,
+               cleanup_claim_previous_lifecycle_state = NULL, updated_at = ?
+           WHERE job_id = ? AND attempt = ?
+             AND scratch_layout_version = ?
+             AND cleanup_claim_token = ?`,
+        )
+        .run(
+          safeLocalError(message),
+          now,
+          claim.jobId,
+          claim.attempt,
+          SourceScratchLayoutVersion,
+          claim.claimToken,
+        );
+      if (failed.changes !== 1) {
+        throw new LocalExportLifecycleError(
+          "Source scratch cleanup claim is no longer current.",
+          "source_scratch_cleanup_claim_lost",
+        );
+      }
+      this.markJobNeedsUserAction(
+        claim.jobId,
+        "source_cleanup_failed",
+        message,
+        now,
+      );
+      this.database.exec("COMMIT;");
+    } catch (error) {
+      this.database.exec("ROLLBACK;");
+      throw error;
+    }
+  }
+
+  recordSourceAttemptFailure(
+    jobId: string,
+    attempt: number,
+    code: string,
+    message: string,
+  ): void {
+    const now = this.now().toISOString();
+    const asset = this.database
+      .prepare(
+        `SELECT lifecycle_state FROM source_scratch_assets
+         WHERE job_id = ? AND attempt = ?`,
+      )
+      .get(jobId, attempt) as { lifecycle_state: string } | undefined;
+    if (!asset) throw new LocalExportLifecycleError();
+    this.database.exec("BEGIN IMMEDIATE;");
+    try {
+      this.markJobNeedsUserAction(jobId, code, message, now);
+      this.database.exec("COMMIT;");
+    } catch (error) {
+      this.database.exec("ROLLBACK;");
+      throw error;
+    }
+  }
+
+  recordSourceAttemptCanceled(
+    jobId: string,
+    attempt: number,
+    reason: "user_requested" | "execution_lease_lost",
+  ): void {
+    const now = this.now().toISOString();
+    const source = this.database
+      .prepare(
+        `SELECT lifecycle_state, deleted_at FROM source_scratch_assets
+         WHERE job_id = ? AND attempt = ?`,
+      )
+      .get(jobId, attempt) as
+      { lifecycle_state: string; deleted_at: string | null } | undefined;
+    if (!source || source.lifecycle_state !== "deleted" || !source.deleted_at) {
+      throw new LocalExportLifecycleError(
+        "Cancellation cannot become terminal until source cleanup is verified.",
+        "logged_export_cancellation_cleanup_incomplete",
+      );
+    }
+    this.database.exec("BEGIN IMMEDIATE;");
+    try {
+      const request = this.database
+        .prepare(
+          `UPDATE export_requests
+           SET local_cancellation_reason = ?, local_canceled_at = ?, updated_at = ?
+           WHERE job_id = ? AND cloud_execution_attempt = ?
+             AND local_cancellation_reason IS NULL`,
+        )
+        .run(reason, now, now, jobId, attempt);
+      const job = this.database
+        .prepare(
+          `UPDATE jobs SET state = 'canceled', updated_at = ?
+           WHERE id = ? AND attempt = ? AND state IN ('queued', 'processing')`,
+        )
+        .run(now, jobId, attempt);
+      if (request.changes !== 1 || job.changes !== 1) {
+        throw new LocalExportLifecycleError(
+          "Local cancellation ownership changed before settlement.",
+          "logged_export_cancellation_state_conflict",
+        );
+      }
+      this.database.exec("COMMIT;");
+    } catch (error) {
+      this.database.exec("ROLLBACK;");
+      throw error;
+    }
+  }
+
+  recordCompletedAttemptCanceled(
+    requestId: string,
+    reason: "user_requested" | "execution_lease_lost",
+  ): void {
+    const request = this.get(requestId);
+    const execution = this.getLoggedExecution(requestId);
+    if (
+      !request ||
+      request.state !== "complete" ||
+      !execution ||
+      !request.finalArtifacts?.length
+    ) {
+      throw new LocalExportLifecycleError(
+        "Only one exact locally complete execution can lose the cloud terminal race.",
+        "logged_export_cancellation_state_conflict",
+      );
+    }
+    const source = this.getSourceAttempt(request.jobId, execution.attempt);
+    if (!source || source.lifecycleState !== "deleted" || !source.deletedAt) {
+      throw new LocalExportLifecycleError(
+        "Completed local work cannot be canceled until source deletion is verified.",
+        "logged_export_cancellation_cleanup_incomplete",
+      );
+    }
+    const now = this.now().toISOString();
+    this.database.exec("BEGIN IMMEDIATE;");
+    try {
+      this.database
+        .prepare(
+          "DELETE FROM export_final_artifacts WHERE export_request_id = ?",
+        )
+        .run(requestId);
+      this.database
+        .prepare(
+          `UPDATE export_requests
+           SET local_cancellation_reason = ?, local_canceled_at = ?, updated_at = ?
+           WHERE id = ? AND local_cancellation_reason IS NULL`,
+        )
+        .run(reason, now, now, requestId);
+      this.database
+        .prepare(
+          "UPDATE jobs SET state = 'canceled', updated_at = ? WHERE id = ? AND state = 'complete'",
+        )
+        .run(now, request.jobId);
+      this.database.exec("COMMIT;");
+    } catch (error) {
+      this.database.exec("ROLLBACK;");
+      throw error;
+    }
+  }
+
+  getSourceAttempt(
+    jobId: string,
+    attempt: number,
+  ): LocalSourceScratchAsset | undefined {
+    const row = this.database
+      .prepare(
+        `SELECT * FROM source_scratch_assets WHERE job_id = ? AND attempt = ?`,
+      )
+      .get(jobId, attempt) as Record<string, unknown> | undefined;
+    return row ? mapLocalSourceScratchAsset(row) : undefined;
+  }
+
+  private hasCompleteFinalArtifactProvenance(
+    jobId: string,
+    attempt: number,
+  ): boolean {
+    const artifacts = this.database
+      .prepare(
+        `SELECT er.id AS export_request_id, efa.role, efa.package_identity,
+                efa.byte_size, efa.content_sha256, efa.source_attempt,
+                efa.validated_at
+         FROM export_final_artifacts efa
+         JOIN export_requests er ON er.id = efa.export_request_id
+         WHERE er.job_id = ? AND efa.source_attempt = ?`,
+      )
+      .all(jobId, attempt) as Array<{
+      export_request_id: string;
+      role: string;
+      package_identity: string;
+      byte_size: number;
+      content_sha256: string;
+      source_attempt: number;
+      validated_at: string;
+    }>;
+    const roles = new Set(artifacts.map((artifact) => artifact.role));
+    const requestId = artifacts[0]?.export_request_id;
+    const packageIdentity = artifacts[0]?.package_identity;
+    const videoRoles = ["video_mp4", "video_mkv", "video_mov"];
+    const allowedRoles = new Set([
+      ...videoRoles,
+      "english_srt",
+      "original_srt",
+      "clip_metadata_json",
+      "thumbnail_jpg",
+      "manifest_json",
+    ]);
+    return (
+      artifacts.length >= 4 &&
+      artifacts.length <= 6 &&
+      roles.size === artifacts.length &&
+      Boolean(requestId) &&
+      packageIdentity === `clip-${requestId}` &&
+      artifacts.every(
+        (artifact) =>
+          artifact.export_request_id === requestId &&
+          artifact.package_identity === packageIdentity &&
+          Number(artifact.source_attempt) === attempt &&
+          allowedRoles.has(artifact.role) &&
+          validFinalArtifactFields({
+            packageIdentity: artifact.package_identity,
+            byteSize: Number(artifact.byte_size),
+            contentSha256: artifact.content_sha256,
+            sourceAttempt: Number(artifact.source_attempt),
+            validatedAt: artifact.validated_at,
+          }),
+      ) &&
+      videoRoles.filter((role) => roles.has(role)).length === 1 &&
+      roles.has("clip_metadata_json") &&
+      roles.has("thumbnail_jpg") &&
+      roles.has("manifest_json")
+    );
+  }
+
+  private mapRequest(row: Record<string, unknown>): ExportRequest {
+    const transcriptSidecars = this.database
+      .prepare(
+        `SELECT role, language, track_id, track_version, cue_count,
+                byte_size, content_sha256, start_ms, end_ms,
+                source_attempt, validated_at
+         FROM export_subtitle_sidecars
+         WHERE export_request_id = ? ORDER BY role`,
+      )
+      .all(String(row.id)) as Record<string, unknown>[];
+    const emptySidecars = this.hasEmptySubtitleSidecarTable()
+      ? (this.database
+          .prepare(
+            `SELECT role, language, empty_reason, no_speech_attestation_json,
+                    cue_count, byte_size, content_sha256, start_ms, end_ms,
+                    source_attempt, validated_at
+             FROM export_empty_subtitle_sidecars
+             WHERE export_request_id = ? ORDER BY role`,
+          )
+          .all(String(row.id)) as Record<string, unknown>[])
+      : [];
+    return mapLocalExportRequest(
+      row,
+      [...transcriptSidecars, ...emptySidecars].sort((left, right) =>
+        String(left.role).localeCompare(String(right.role)),
+      ),
+      this.database
+        .prepare(
+          `SELECT role, package_identity, byte_size, content_sha256,
+                  source_attempt, validated_at
+           FROM export_final_artifacts
+           WHERE export_request_id = ? ORDER BY role`,
+        )
+        .all(String(row.id)) as Record<string, unknown>[],
+    );
+  }
+
+  private hasRequestOriginColumn(): boolean {
+    return (
+      this.database
+        .prepare("PRAGMA table_info(export_requests)")
+        .all() as Array<{ name: string }>
+    ).some((column) => column.name === "request_origin");
+  }
+
+  private hasNotificationAccountScopeColumn(): boolean {
+    return (
+      this.database
+        .prepare("PRAGMA table_info(export_requests)")
+        .all() as Array<{ name: string }>
+    ).some((column) => column.name === "notification_account_scope_sha256");
+  }
+
+  private hasEmptySubtitleSidecarTable(): boolean {
+    return Boolean(
+      this.database
+        .prepare(
+          "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'export_empty_subtitle_sidecars'",
+        )
+        .get(),
+    );
+  }
+
+  private hasSourceRightsConfirmationColumn(): boolean {
+    return (
+      this.database
+        .prepare("PRAGMA table_info(export_requests)")
+        .all() as Array<{ name: string }>
+    ).some((column) => column.name === "source_rights_confirmation_json");
+  }
+
+  private assertExactSourceRightsSnapshot(
+    row: Record<string, unknown>,
+    incoming: ReturnType<typeof requireExactSourceRightsSnapshot>,
+  ): void {
+    if (
+      row.source_rights_confirmation_json === null ||
+      row.source_rights_confirmation_json === undefined
+    ) {
+      throw new LocalExportLifecycleError(
+        "The existing export request has no immutable source-rights confirmation.",
+        "source_rights_confirmation_conflict",
+      );
+    }
+    let existing: ReturnType<typeof requireExactSourceRightsSnapshot>;
+    try {
+      existing = requireExactSourceRightsSnapshot(
+        JSON.parse(String(row.source_rights_confirmation_json)),
+        incoming.youtubeVideoId,
+      );
+    } catch (error) {
+      if (error instanceof LocalExportLifecycleError) throw error;
+      throw new LocalExportLifecycleError(
+        "The existing export request has invalid immutable source-rights confirmation.",
+        "source_rights_confirmation_conflict",
+      );
+    }
+    if (canonicalJson(existing) !== canonicalJson(incoming)) {
+      throw new LocalExportLifecycleError(
+        "The existing export request has different immutable source-rights confirmation.",
+        "source_rights_confirmation_conflict",
+      );
+    }
+  }
+
+  private assertExactLoggedDelivery(
+    row: Record<string, unknown>,
+    delivery: LoggedExportDelivery,
+  ): void {
+    if (
+      !this.sameImmutableLoggedRequest(row, delivery) ||
+      String(row.cloud_delivery_id) !== delivery.deliveryId ||
+      Number(row.cloud_delivery_generation) !== delivery.generation ||
+      String(row.cloud_reservation_token) !== delivery.reservationToken ||
+      String(row.cloud_worker_id) !== delivery.workerId ||
+      Number(row.cloud_worker_epoch) !== delivery.workerEpoch ||
+      String(row.cloud_reserved_at) !== delivery.reservedAt ||
+      String(row.cloud_reservation_expires_at) !==
+        delivery.reservationExpiresAt ||
+      canonicalJson(sourceGroupFromLocalRow(row).sourceGroup ?? null) !==
+        canonicalJson(delivery.sourceGroup ?? null)
+    ) {
+      throw new LocalLoggedExportDeliveryConflictError(
+        "The logged export delivery conflicts with an existing immutable local request.",
+      );
+    }
+  }
+
+  private sameImmutableLoggedRequest(
+    row: Record<string, unknown>,
+    delivery: LoggedExportDelivery,
+  ): boolean {
+    const existing = this.mapRequest(row);
+    const immutableExisting = {
+      id: existing.id,
+      jobId: existing.jobId,
+      mode: existing.mode,
+      requestOrigin: existing.requestOrigin,
+      projectId: existing.projectId,
+      clipId: existing.clipId,
+      video: existing.video,
+      selection: existing.selection,
+      sourceLanguageClass: existing.sourceLanguageClass,
+      sourceRights: existing.sourceRights,
+      subtitleTracks: existing.subtitleTracks,
+      preset: existing.preset,
+      resolvedSettingsSnapshot: existing.resolvedSettingsSnapshot,
+      createdAt: existing.createdAt,
+    };
+    const request = delivery.request;
+    const immutableIncoming = {
+      id: request.id,
+      jobId: request.jobId,
+      mode: request.mode,
+      requestOrigin: request.requestOrigin,
+      projectId: request.projectId,
+      clipId: request.clipId,
+      video: request.video,
+      selection: request.selection,
+      sourceLanguageClass: request.sourceLanguageClass,
+      sourceRights: request.sourceRights,
+      subtitleTracks: request.subtitleTracks,
+      preset: request.preset,
+      resolvedSettingsSnapshot: request.resolvedSettingsSnapshot,
+      createdAt: request.createdAt,
+    };
+    return (
+      canonicalJson(immutableExisting) === canonicalJson(immutableIncoming)
+    );
+  }
+
+  private removePendingLoggedRequest(requestId: string, jobId: string): void {
+    this.database.exec("BEGIN IMMEDIATE;");
+    try {
+      this.deletePendingLoggedRequestRows(requestId, jobId);
+      this.database.exec("COMMIT;");
+    } catch (error) {
+      this.database.exec("ROLLBACK;");
+      throw error;
+    }
+  }
+
+  private deletePendingLoggedRequestRows(requestId: string, jobId: string) {
+    this.database
+      .prepare(
+        `DELETE FROM export_requests
+         WHERE id = ? AND cloud_delivery_state = 'pending_acceptance'`,
+      )
+      .run(requestId);
+    this.database
+      .prepare(
+        `DELETE FROM jobs WHERE id = ?
+         AND NOT EXISTS (SELECT 1 FROM export_requests WHERE job_id = jobs.id)`,
+      )
+      .run(jobId);
+  }
+
+  private markJobNeedsUserAction(
+    jobId: string,
+    code: string,
+    message: string,
+    now: string,
+  ) {
+    const job = this.database
+      .prepare("SELECT payload_json FROM jobs WHERE id = ?")
+      .get(jobId) as { payload_json: string } | undefined;
+    if (!job) throw new LocalExportLifecycleError();
+    const payload = JSON.parse(job.payload_json) as Record<string, unknown>;
+    payload.lastError = {
+      code: sanitizeLoggedExportFailureCode(code),
+      message: sanitizeLoggedExportFailureMessage(message),
+    };
+    this.database
+      .prepare(
+        `UPDATE jobs
+         SET state = 'needs_user_action', payload_json = ?, updated_at = ?
+         WHERE id = ?`,
+      )
+      .run(JSON.stringify(payload), now, jobId);
+    this.recordExportOnlyNotification(jobId, "action_needed", now);
+  }
+
+  private recordExportOnlyNotification(
+    jobId: string,
+    status: "completed" | "action_needed",
+    createdAt: string,
+  ): void {
+    const expectedState =
+      status === "completed" ? "complete" : "needs_user_action";
+    const row = this.database
+      .prepare(
+        `SELECT er.id AS export_request_id,
+                er.notification_account_scope_sha256 AS account_scope_sha256,
+                er.video_snapshot_json, j.attempt
+         FROM export_requests er
+         JOIN jobs j ON j.id = er.job_id
+         WHERE j.id = ? AND j.state = ?
+           AND er.cloud_delivery_id IS NULL
+           AND er.notification_account_scope_sha256 IS NOT NULL`,
+      )
+      .get(jobId, expectedState) as
+      | {
+          export_request_id: string;
+          account_scope_sha256: string;
+          video_snapshot_json: string;
+          attempt: number;
+        }
+      | undefined;
+    if (!row) return;
+    const video = JSON.parse(row.video_snapshot_json) as { title?: unknown };
+    const sourceKey = `${row.export_request_id}:attempt:${Number(row.attempt)}:${status}`;
+    this.database
+      .prepare(
+        `INSERT INTO local_export_notification_receipts
+           (id, export_request_id, account_scope_sha256, source_key, status,
+            source_label, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT (account_scope_sha256, source_key) DO NOTHING`,
+      )
+      .run(
+        randomUUID(),
+        row.export_request_id,
+        row.account_scope_sha256,
+        sourceKey,
+        status,
+        sanitizeNotificationLabel(video.title ?? "Untitled source"),
+        createdAt,
+      );
   }
 }
 
-function mapLocalExportRequest(row: Record<string, unknown>): ExportRequest {
+export type LocalExportSourceAttempt = {
+  request: ExportRequest;
+  attempt: number;
+};
+
+export type LocalLoggedExportTerminalOutcome =
+  "success" | "failure" | "canceled";
+
+export type LocalLoggedExportTerminalReconciliation = {
+  outcome: LocalLoggedExportTerminalOutcome;
+  reconciledAt: string;
+};
+
+export type LocalRuntimeQuiescenceEvidence = {
+  pendingAcceptance: number;
+  accepted: number;
+  executing: number;
+  complete: number;
+  failed: number;
+  canceled: number;
+  needsAttention: number;
+  recoveryRequired: number;
+  activeSourceLifecycleCount: number;
+};
+
+export type LocalLoggedExportSourceGroup = {
+  id: string;
+  compatibilityKey: string;
+  lifecycleState:
+    | "open"
+    | "acquiring"
+    | "ready"
+    | "deleting"
+    | "deleted"
+    | "acquisition_failed"
+    | "cleanup_failed";
+  projectId: string;
+  batchId: string;
+  youtubeVideoId: string;
+  sourceIdentity: SourceIdentityV1;
+  acquisitionProfileFingerprint: string;
+  workerId: string;
+  workerEpoch: number;
+  createdAt: string;
+  expiresAt: string;
+  readyAt?: string;
+  deletedAt?: string;
+};
+
+export type LocalSourceScratchCleanupClaim = {
+  jobId: string;
+  attempt: number;
+  claimToken: string;
+};
+
+export type LocalLoggedExportSourceGroupCleanupClaim = {
+  groupId: string;
+  claimToken: string;
+};
+
+export type LocalSourceScratchCleanupSettlement = {
+  restoredComplete: boolean;
+  markedNeedsUserAction: boolean;
+};
+
+type LocalSubtitleSidecarValidation = {
+  role: "original" | "english";
+  language: string;
+  trackId: string;
+  trackVersion: number;
+  cueCount: number;
+  byteSize: number;
+  contentSha256: string;
+  startMs: number;
+  endMs: number;
+};
+
+type LocalEmptySubtitleSidecarValidation = {
+  role: "original" | "english";
+  language: string;
+  emptyReason: "attested_no_speech";
+  noSpeechAttestation: NoSpeechAttestation;
+  cueCount: 0;
+  byteSize: number;
+  contentSha256: string;
+  startMs: 0;
+  endMs: 0;
+};
+
+type LocalFinalArtifactProvenance = {
+  role:
+    | "video_mp4"
+    | "video_mkv"
+    | "video_mov"
+    | "english_srt"
+    | "original_srt"
+    | "clip_metadata_json"
+    | "thumbnail_jpg"
+    | "manifest_json";
+  packageIdentity: string;
+  byteSize: number;
+  contentSha256: string;
+  sourceAttempt: number;
+  validatedAt: string;
+};
+
+export type LocalSourceScratchAsset = {
+  jobId: string;
+  attempt: number;
+  provider?: string;
+  sourceIdentity?: string;
+  byteSize?: number;
+  contentSha256?: string;
+  durationMs?: number;
+  containerFormat?: string;
+  videoCodec?: string;
+  audioCodec?: string;
+  ffprobeVersion?: string;
+  lifecycleState:
+    "acquiring" | "ready" | "deleting" | "deleted" | "cleanup_failed";
+  cleanupErrorCode?: string;
+  cleanupErrorMessage?: string;
+  deletedAt?: string;
+  expiresAt: string;
+  scratchLayoutVersion?: number;
+};
+
+export class LocalExportRequestNotFoundError extends Error {
+  readonly code = "export_request_not_found";
+  readonly statusCode = 404;
+
+  constructor() {
+    super("Export request not found.");
+  }
+}
+
+export class LocalLoggedExportDeliveryConflictError extends Error {
+  readonly code = "logged_export_delivery_conflict";
+  readonly statusCode = 409;
+
+  constructor(message: string) {
+    super(message);
+  }
+}
+
+export type LocalExportWorkerIdentity = {
+  workerId: string;
+  epoch: number;
+  advertisementFingerprint: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+/** Durable single-workstation identity used only for cloud worker registration. */
+export class LocalExportWorkerIdentityRepository {
+  constructor(
+    private readonly database: DatabaseSync,
+    private readonly now: () => Date = () => new Date(),
+  ) {}
+
+  get(): LocalExportWorkerIdentity | undefined {
+    const row = this.database
+      .prepare("SELECT * FROM local_export_worker_identity WHERE singleton = 1")
+      .get() as Record<string, unknown> | undefined;
+    return row ? mapLocalExportWorkerIdentity(row) : undefined;
+  }
+
+  prepareRegistration(
+    advertisementFingerprint: string,
+  ): LocalExportWorkerIdentity {
+    if (!/^[a-f0-9]{64}$/u.test(advertisementFingerprint)) {
+      throw new LocalExportLifecycleError(
+        "The local worker advertisement fingerprint is invalid.",
+        "invalid_worker_advertisement",
+      );
+    }
+    const current = this.get();
+    const now = this.now().toISOString();
+    if (!current) {
+      const identity: LocalExportWorkerIdentity = {
+        workerId: randomUUID(),
+        epoch: 1,
+        advertisementFingerprint,
+        createdAt: now,
+        updatedAt: now,
+      };
+      this.database
+        .prepare(
+          `INSERT INTO local_export_worker_identity
+             (singleton, worker_id, epoch, advertisement_fingerprint, created_at, updated_at)
+           VALUES (1, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          identity.workerId,
+          identity.epoch,
+          identity.advertisementFingerprint,
+          identity.createdAt,
+          identity.updatedAt,
+        );
+      return identity;
+    }
+    if (current.advertisementFingerprint === advertisementFingerprint)
+      return current;
+    const next = {
+      ...current,
+      epoch: current.epoch + 1,
+      advertisementFingerprint,
+      updatedAt: now,
+    };
+    this.database
+      .prepare(
+        `UPDATE local_export_worker_identity
+         SET epoch = ?, advertisement_fingerprint = ?, updated_at = ?
+         WHERE singleton = 1`,
+      )
+      .run(next.epoch, next.advertisementFingerprint, next.updatedAt);
+    return next;
+  }
+}
+
+/**
+ * Trusted-machine-only record.  Unlike `LocalComponentReference`, this type
+ * intentionally retains the validated path and identity needed by the local
+ * agent to recheck a reference before use.  It must not cross a renderer,
+ * cloud, diagnostic, or support boundary.
+ */
+export type TrustedLocalComponentReference = LocalComponentReference & {
+  absolutePath: string;
+  filesystemIdentity: string;
+  byteSize?: number;
+  contentSha256?: string;
+  validationEvidence: unknown;
+  state: "candidate" | "active" | "superseded";
+  activatedAt?: string;
+  supersededAt?: string;
+};
+
+export class LocalDesktopSetupRepository {
+  constructor(
+    private readonly database: DatabaseSync,
+    private readonly now: () => Date = () => new Date(),
+  ) {}
+
+  getSetup(): DesktopSetup | undefined {
+    const row = this.database
+      .prepare("SELECT * FROM desktop_setup WHERE singleton = 1")
+      .get() as Record<string, unknown> | undefined;
+    return row ? mapDesktopSetup(row) : undefined;
+  }
+
+  saveSetup(input: Omit<DesktopSetup, "updatedAt">): DesktopSetup {
+    const setup = DesktopSetupSchema.parse({
+      ...input,
+      updatedAt: this.now().toISOString(),
+    });
+    this.database
+      .prepare(
+        `INSERT INTO desktop_setup
+           (singleton, schema_version, rights_acknowledged, privacy_acknowledged,
+            worker_enabled, translation_consent, caption_provider, media_provider,
+            export_source_provider, speech_to_text_provider, translation_provider,
+            updated_at)
+         VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(singleton) DO UPDATE SET
+           schema_version = excluded.schema_version,
+           rights_acknowledged = excluded.rights_acknowledged,
+           privacy_acknowledged = excluded.privacy_acknowledged,
+           worker_enabled = excluded.worker_enabled,
+           translation_consent = excluded.translation_consent,
+           caption_provider = excluded.caption_provider,
+           media_provider = excluded.media_provider,
+           export_source_provider = excluded.export_source_provider,
+           speech_to_text_provider = excluded.speech_to_text_provider,
+           translation_provider = excluded.translation_provider,
+           updated_at = excluded.updated_at`,
+      )
+      .run(
+        setup.schemaVersion,
+        setup.rightsAcknowledged ? 1 : 0,
+        setup.privacyAcknowledged ? 1 : 0,
+        setup.workerEnabled ? 1 : 0,
+        setup.translationConsent ? 1 : 0,
+        setup.captionProvider,
+        setup.mediaProvider,
+        setup.exportSourceProvider,
+        setup.speechToTextProvider,
+        setup.translationProvider,
+        setup.updatedAt,
+      );
+    return setup;
+  }
+
+  recordValidatedCandidate(input: {
+    target: SetupSelectionTarget;
+    displayName: string;
+    absolutePath: string;
+    filesystemIdentity: string;
+    version?: string;
+    byteSize?: number;
+    contentSha256?: string;
+    validationEvidence: unknown;
+  }): LocalComponentReference {
+    const target = SetupSelectionTargetSchema.parse(input.target);
+    const now = this.now().toISOString();
+    const summary = LocalComponentReferenceSchema.parse({
+      id: randomUUID(),
+      target,
+      displayName: input.displayName,
+      ...(input.version ? { version: input.version } : {}),
+      validatedAt: now,
+    });
+    const absolutePath = requireBoundedLocalString(
+      input.absolutePath,
+      "Local component path",
+      4_096,
+    );
+    const filesystemIdentity = requireBoundedLocalString(
+      input.filesystemIdentity,
+      "Local component filesystem identity",
+      200,
+    );
+    const byteSize = input.byteSize;
+    if (
+      byteSize !== undefined &&
+      (!Number.isSafeInteger(byteSize) || byteSize < 0)
+    ) {
+      throw new LocalArtifactCatalogError(
+        "Local component byte size is invalid.",
+      );
+    }
+    const contentSha256 = input.contentSha256;
+    if (contentSha256 !== undefined && !/^[a-f0-9]{64}$/u.test(contentSha256)) {
+      throw new LocalArtifactCatalogError(
+        "Local component checksum is invalid.",
+      );
+    }
+    const validationEvidence = serializeValidationEvidence(
+      input.validationEvidence,
+    );
+    this.database
+      .prepare(
+        `INSERT INTO validated_local_component_references
+           (id, target, display_name, absolute_path, filesystem_identity, version,
+            byte_size, content_sha256, validation_evidence_json,
+            validation_schema_version, state, validated_at, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'candidate', ?, ?, ?)`,
+      )
+      .run(
+        summary.id,
+        summary.target,
+        summary.displayName,
+        absolutePath,
+        filesystemIdentity,
+        summary.version ?? null,
+        byteSize ?? null,
+        contentSha256 ?? null,
+        validationEvidence,
+        summary.validatedAt,
+        now,
+        now,
+      );
+    return summary;
+  }
+
+  /**
+   * Only a previously recorded, validated candidate can replace an active
+   * reference.  The transaction preserves the previous active reference if
+   * activation fails at any point.
+   */
+  activateValidatedCandidate(referenceId: string): LocalComponentReference {
+    const candidate = this.requireTrustedReference(referenceId);
+    if (candidate.state !== "candidate") {
+      throw new LocalArtifactCatalogError(
+        "Local component is not an activation candidate.",
+      );
+    }
+    const now = this.now().toISOString();
+    this.database.exec("BEGIN IMMEDIATE;");
+    try {
+      this.database
+        .prepare(
+          `UPDATE validated_local_component_references
+           SET state = 'superseded', superseded_at = ?, updated_at = ?
+           WHERE target = ? AND state = 'active'`,
+        )
+        .run(now, now, candidate.target);
+      const result = this.database
+        .prepare(
+          `UPDATE validated_local_component_references
+           SET state = 'active', activated_at = ?, updated_at = ?
+           WHERE id = ? AND state = 'candidate'`,
+        )
+        .run(now, now, referenceId);
+      if (result.changes !== 1) {
+        throw new LocalArtifactCatalogError(
+          "Local component activation changed unexpectedly.",
+        );
+      }
+      this.database.exec("COMMIT;");
+    } catch (error) {
+      this.database.exec("ROLLBACK;");
+      throw error;
+    }
+    return this.getActiveComponentReference(candidate.target)!;
+  }
+
+  getActiveComponentReference(
+    target: SetupSelectionTarget,
+  ): LocalComponentReference | undefined {
+    const row = this.database
+      .prepare(
+        `SELECT * FROM validated_local_component_references
+         WHERE target = ? AND state = 'active'`,
+      )
+      .get(SetupSelectionTargetSchema.parse(target)) as
+      Record<string, unknown> | undefined;
+    return row ? mapLocalComponentReference(row) : undefined;
+  }
+
+  getTrustedActiveComponentReference(
+    target: SetupSelectionTarget,
+  ): TrustedLocalComponentReference | undefined {
+    const row = this.database
+      .prepare(
+        `SELECT * FROM validated_local_component_references
+         WHERE target = ? AND state = 'active'`,
+      )
+      .get(SetupSelectionTargetSchema.parse(target)) as
+      Record<string, unknown> | undefined;
+    return row ? mapTrustedLocalComponentReference(row) : undefined;
+  }
+
+  listActiveComponentReferences(): LocalComponentReference[] {
+    return (
+      this.database
+        .prepare(
+          `SELECT * FROM validated_local_component_references
+           WHERE state = 'active' ORDER BY target`,
+        )
+        .all() as Record<string, unknown>[]
+    ).map(mapLocalComponentReference);
+  }
+
+  getSetupSnapshot(): SetupSnapshot {
+    return SetupSnapshotSchema.parse({
+      ...(this.getSetup() ? { setup: this.getSetup() } : {}),
+      activeComponents: this.listActiveComponentReferences(),
+    });
+  }
+
+  private requireTrustedReference(
+    referenceId: string,
+  ): TrustedLocalComponentReference {
+    const row = this.database
+      .prepare(
+        "SELECT * FROM validated_local_component_references WHERE id = ?",
+      )
+      .get(referenceId) as Record<string, unknown> | undefined;
+    if (!row)
+      throw new LocalArtifactCatalogError(
+        "Local component reference not found.",
+        404,
+      );
+    return mapTrustedLocalComponentReference(row);
+  }
+}
+
+export type LocalArtifactRootRecord = ArtifactRootSummary & {
+  absolutePath: string;
+  pathFingerprint: string;
+  filesystemIdentity: string;
+};
+
+export type LocalArtifactLocatorRecord = ArtifactLocatorSummary & {
+  relativePackagePath: string;
+  projectId: string;
+  clipId: string;
+  requestId: string;
+  packageIdentity: string;
+  resultFingerprint: string;
+};
+
+const LegacyFilesystemIdentityPattern = /^\d+:(\d+)$/u;
+const StableFilesystemIdentityPattern = /^v2:inode:(\d+):birth:(\d+)$/u;
+
+/**
+ * The first artifact-root format used `stat.dev:stat.ino`. APFS device numbers
+ * can change after a remount even when the same directory/inode remains in
+ * place. New roots therefore pin inode plus birth time. This compatibility
+ * check accepts only the one-way legacy-to-v2 transition with the same inode;
+ * two differing legacy identities or two differing v2 identities still fail
+ * closed.
+ */
+export function localFilesystemIdentitiesMatch(
+  stored: string,
+  observed: string,
+): boolean {
+  if (stored === observed) return true;
+  const storedLegacy = LegacyFilesystemIdentityPattern.exec(stored);
+  const observedStable = StableFilesystemIdentityPattern.exec(observed);
+  return Boolean(
+    storedLegacy?.[1] &&
+    observedStable?.[1] &&
+    storedLegacy[1] === observedStable[1],
+  );
+}
+
+export class LocalArtifactLocatorRepository {
+  constructor(
+    private readonly database: DatabaseSync,
+    private readonly now: () => Date = () => new Date(),
+  ) {}
+
+  configureRoot(input: {
+    label: string;
+    platform: ArtifactStoragePlatform;
+    absolutePath: string;
+    pathFingerprint: string;
+    filesystemIdentity: string;
+  }): ArtifactRootSummary {
+    const existing = this.database
+      .prepare(
+        `SELECT * FROM artifact_roots
+         WHERE platform = ? AND path_fingerprint = ?`,
+      )
+      .get(input.platform, input.pathFingerprint) as
+      Record<string, unknown> | undefined;
+    if (existing) {
+      const root = mapLocalArtifactRoot(existing);
+      if (
+        root.absolutePath !== input.absolutePath ||
+        !localFilesystemIdentitiesMatch(
+          root.filesystemIdentity,
+          input.filesystemIdentity,
+        )
+      ) {
+        throw new LocalArtifactCatalogError(
+          "Configured artifact root identity conflicts with an existing root.",
+        );
+      }
+      return toArtifactRootSummary(root);
+    }
+    const id = randomUUID();
+    const now = this.now().toISOString();
+    this.database
+      .prepare(
+        `INSERT INTO artifact_roots
+           (id, label, platform, absolute_path, path_fingerprint,
+            filesystem_identity, enabled, path_policy_version,
+            created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, 1, 1, ?, ?)`,
+      )
+      .run(
+        id,
+        input.label,
+        input.platform,
+        input.absolutePath,
+        input.pathFingerprint,
+        input.filesystemIdentity,
+        now,
+        now,
+      );
+    return toArtifactRootSummary(this.getRoot(id)!);
+  }
+
+  getRoot(rootId: string): LocalArtifactRootRecord | undefined {
+    const row = this.database
+      .prepare("SELECT * FROM artifact_roots WHERE id = ?")
+      .get(rootId) as Record<string, unknown> | undefined;
+    return row ? mapLocalArtifactRoot(row) : undefined;
+  }
+
+  listRoots(): ArtifactRootSummary[] {
+    return (
+      this.database
+        .prepare("SELECT * FROM artifact_roots ORDER BY created_at, id")
+        .all() as Record<string, unknown>[]
+    ).map((row) => toArtifactRootSummary(mapLocalArtifactRoot(row)));
+  }
+
+  setRootEnabled(rootId: string, enabled: boolean): ArtifactRootSummary {
+    const result = this.database
+      .prepare(
+        "UPDATE artifact_roots SET enabled = ?, updated_at = ? WHERE id = ?",
+      )
+      .run(enabled ? 1 : 0, this.now().toISOString(), rootId);
+    if (result.changes !== 1) {
+      throw new LocalArtifactCatalogError(
+        "Configured artifact root not found.",
+        404,
+      );
+    }
+    return toArtifactRootSummary(this.getRoot(rootId)!);
+  }
+
+  getLocator(
+    rootId: string,
+    artifactVersionId: string,
+  ): ArtifactLocatorSummary | undefined {
+    const row = this.database
+      .prepare(
+        `SELECT * FROM export_artifact_locators
+         WHERE root_id = ? AND artifact_version_id = ?`,
+      )
+      .get(rootId, artifactVersionId) as Record<string, unknown> | undefined;
+    return row ? mapArtifactLocator(row) : undefined;
+  }
+
+  getLocatorById(locatorId: string): LocalArtifactLocatorRecord | undefined {
+    const row = this.database
+      .prepare("SELECT * FROM export_artifact_locators WHERE id = ?")
+      .get(locatorId) as Record<string, unknown> | undefined;
+    return row ? mapArtifactLocatorRecord(row) : undefined;
+  }
+
+  listLocators(artifactVersionId?: string): ArtifactLocatorSummary[] {
+    const rows = artifactVersionId
+      ? this.database
+          .prepare(
+            `SELECT * FROM export_artifact_locators
+             WHERE artifact_version_id = ? ORDER BY checked_at DESC, id`,
+          )
+          .all(artifactVersionId)
+      : this.database
+          .prepare(
+            "SELECT * FROM export_artifact_locators ORDER BY checked_at DESC, id",
+          )
+          .all();
+    return (rows as Record<string, unknown>[]).map(mapArtifactLocator);
+  }
+
+  recordVerified(input: {
+    artifactVersionId: string;
+    rootId: string;
+    relativePackagePath: string;
+    platform: ArtifactStoragePlatform;
+    projectId: string;
+    clipId: string;
+    requestId: string;
+    packageIdentity: string;
+    manifestSha256: string;
+    manifestSchemaVersion: 1 | 2;
+    resultFingerprint: string;
+  }): ArtifactLocatorSummary {
+    const existing = this.getLocator(input.rootId, input.artifactVersionId);
+    const id = existing?.id ?? randomUUID();
+    const now = this.now().toISOString();
+    try {
+      const result = this.database
+        .prepare(
+          `INSERT INTO export_artifact_locators
+             (id, artifact_version_id, root_id, relative_package_path,
+              platform, project_id, clip_id, request_id, package_identity,
+              manifest_sha256, manifest_schema_version, result_fingerprint,
+              verification_schema_version, availability, failure_class,
+              checked_at, last_verified_at, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'verified', NULL,
+                   ?, ?, ?, ?)
+           ON CONFLICT(root_id, artifact_version_id) DO UPDATE SET
+             availability = 'verified', failure_class = NULL,
+             checked_at = excluded.checked_at,
+             last_verified_at = excluded.last_verified_at,
+             updated_at = excluded.updated_at
+           WHERE export_artifact_locators.relative_package_path = excluded.relative_package_path
+             AND export_artifact_locators.platform = excluded.platform
+             AND export_artifact_locators.project_id = excluded.project_id
+             AND export_artifact_locators.clip_id = excluded.clip_id
+             AND export_artifact_locators.request_id = excluded.request_id
+             AND export_artifact_locators.package_identity = excluded.package_identity
+             AND export_artifact_locators.manifest_sha256 = excluded.manifest_sha256
+             AND export_artifact_locators.manifest_schema_version = excluded.manifest_schema_version
+             AND export_artifact_locators.result_fingerprint = excluded.result_fingerprint`,
+        )
+        .run(
+          id,
+          input.artifactVersionId,
+          input.rootId,
+          input.relativePackagePath,
+          input.platform,
+          input.projectId,
+          input.clipId,
+          input.requestId,
+          input.packageIdentity,
+          input.manifestSha256,
+          input.manifestSchemaVersion,
+          input.resultFingerprint,
+          now,
+          now,
+          now,
+          now,
+        );
+      if (result.changes !== 1) throw new Error("locator identity conflict");
+    } catch {
+      throw new LocalArtifactCatalogError(
+        "Artifact locator identity conflicts with existing local evidence.",
+      );
+    }
+    return this.getLocator(input.rootId, input.artifactVersionId)!;
+  }
+
+  recordUnavailable(input: {
+    rootId: string;
+    artifactVersionId: string;
+    availability: Exclude<ArtifactAvailabilityState, "verified">;
+    failureClass: ArtifactVerificationFailureClass;
+  }): ArtifactLocatorSummary | undefined {
+    const now = this.now().toISOString();
+    const result = this.database
+      .prepare(
+        `UPDATE export_artifact_locators
+         SET availability = ?, failure_class = ?, checked_at = ?, updated_at = ?
+         WHERE root_id = ? AND artifact_version_id = ?`,
+      )
+      .run(
+        input.availability,
+        input.failureClass,
+        now,
+        now,
+        input.rootId,
+        input.artifactVersionId,
+      );
+    return result.changes === 1
+      ? this.getLocator(input.rootId, input.artifactVersionId)
+      : undefined;
+  }
+}
+
+export type CachedClipLibraryPage = {
+  query: ClipLibraryQuery;
+  page: ClipLibraryPage;
+  cachedAt: string;
+};
+
+export function clipLibraryAuthorizationScope(authorization: string): string {
+  return createHash("sha256").update(authorization).digest("hex");
+}
+
+function clipLibraryCacheKeys(query: ClipLibraryQuery) {
+  const parsed = ClipLibraryQuerySchema.parse(query);
+  return {
+    query: parsed,
+    queryFingerprint: sha256Fingerprint({
+      limit: parsed.limit,
+      query: parsed.query ?? null,
+      tag: parsed.tag ?? null,
+      researchStatus: parsed.researchStatus ?? null,
+      exportStatus: parsed.exportStatus ?? null,
+      completed: parsed.completed,
+    }),
+    cursorKey: parsed.cursor
+      ? createHash("sha256").update(parsed.cursor).digest("hex")
+      : "root",
+  };
+}
+
+export class LocalClipLibraryCacheRepository {
+  constructor(
+    private readonly database: DatabaseSync,
+    private readonly now: () => Date = () => new Date(),
+  ) {}
+
+  storePage(input: {
+    projectId: string;
+    authorizationScopeSha256: string;
+    query: ClipLibraryQuery;
+    page: ClipLibraryPage;
+  }): CachedClipLibraryPage {
+    const page = ClipLibraryPageSchema.parse(input.page);
+    if (page.projectId !== input.projectId) {
+      throw new LocalArtifactCatalogError(
+        "Clip Library page does not match the requested project.",
+      );
+    }
+    const keys = clipLibraryCacheKeys(input.query);
+    const cachedAt = this.now().toISOString();
+    const lastViewedSequence = this.nextViewSequence();
+    this.database
+      .prepare(
+        `INSERT INTO clip_library_cache_pages
+           (project_id, authorization_scope_sha256, query_fingerprint,
+           cursor_key, query_json, response_json, sync_cursor, cached_at,
+           last_viewed_at, last_viewed_sequence)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT (
+           project_id, authorization_scope_sha256, query_fingerprint, cursor_key
+         ) DO UPDATE SET
+           query_json = excluded.query_json,
+           response_json = excluded.response_json,
+           sync_cursor = excluded.sync_cursor,
+           cached_at = excluded.cached_at,
+           last_viewed_at = excluded.last_viewed_at,
+           last_viewed_sequence = excluded.last_viewed_sequence`,
+      )
+      .run(
+        input.projectId,
+        input.authorizationScopeSha256,
+        keys.queryFingerprint,
+        keys.cursorKey,
+        canonicalJson(keys.query),
+        canonicalJson(page),
+        page.syncCursor,
+        cachedAt,
+        cachedAt,
+        lastViewedSequence,
+      );
+    return { query: keys.query, page, cachedAt };
+  }
+
+  hasAuthorizationScope(authorizationScopeSha256: string): boolean {
+    return Boolean(
+      this.database
+        .prepare(
+          `SELECT 1 FROM clip_library_cache_pages
+           WHERE authorization_scope_sha256 = ? LIMIT 1`,
+        )
+        .get(authorizationScopeSha256),
+    );
+  }
+
+  getPage(input: {
+    projectId: string;
+    authorizationScopeSha256: string;
+    query: ClipLibraryQuery;
+  }): CachedClipLibraryPage | undefined {
+    const keys = clipLibraryCacheKeys(input.query);
+    const row = this.database
+      .prepare(
+        `SELECT query_json, response_json, cached_at
+         FROM clip_library_cache_pages
+         WHERE project_id = ? AND authorization_scope_sha256 = ?
+           AND query_fingerprint = ? AND cursor_key = ?`,
+      )
+      .get(
+        input.projectId,
+        input.authorizationScopeSha256,
+        keys.queryFingerprint,
+        keys.cursorKey,
+      ) as
+      | { query_json: string; response_json: string; cached_at: string }
+      | undefined;
+    if (row) {
+      this.database
+        .prepare(
+          `UPDATE clip_library_cache_pages
+           SET last_viewed_at = ?, last_viewed_sequence = ?
+           WHERE project_id = ? AND authorization_scope_sha256 = ?
+             AND query_fingerprint = ? AND cursor_key = ?`,
+        )
+        .run(
+          this.now().toISOString(),
+          this.nextViewSequence(),
+          input.projectId,
+          input.authorizationScopeSha256,
+          keys.queryFingerprint,
+          keys.cursorKey,
+        );
+      return {
+        query: ClipLibraryQuerySchema.parse(JSON.parse(row.query_json)),
+        page: ClipLibraryPageSchema.parse(JSON.parse(row.response_json)),
+        cachedAt: row.cached_at,
+      };
+    }
+    return undefined;
+  }
+
+  getLatestPage(
+    projectId: string,
+    authorizationScopeSha256: string,
+  ): CachedClipLibraryPage | undefined {
+    const row = this.database
+      .prepare(
+        `SELECT query_json, response_json, cached_at
+         FROM clip_library_cache_pages
+         WHERE project_id = ? AND authorization_scope_sha256 = ?
+         ORDER BY last_viewed_sequence DESC
+         LIMIT 1`,
+      )
+      .get(projectId, authorizationScopeSha256) as
+      | { query_json: string; response_json: string; cached_at: string }
+      | undefined;
+    return row
+      ? {
+          query: ClipLibraryQuerySchema.parse(JSON.parse(row.query_json)),
+          page: ClipLibraryPageSchema.parse(JSON.parse(row.response_json)),
+          cachedAt: row.cached_at,
+        }
+      : undefined;
+  }
+
+  findArtifactVersion(input: {
+    projectId: string;
+    authorizationScopeSha256: string;
+    clipId: string;
+    artifactVersionId: string;
+  }): ArtifactVersionSummary | undefined {
+    const rows = this.database
+      .prepare(
+        `SELECT response_json FROM clip_library_cache_pages
+         WHERE project_id = ? AND authorization_scope_sha256 = ?
+         ORDER BY last_viewed_sequence DESC`,
+      )
+      .all(input.projectId, input.authorizationScopeSha256) as Array<{
+      response_json: string;
+    }>;
+    for (const row of rows) {
+      const page = ClipLibraryPageSchema.parse(JSON.parse(row.response_json));
+      const entry = page.entries.find(
+        (candidate) => candidate.clip.id === input.clipId,
+      );
+      const version = entry?.recentArtifactVersions.find(
+        (candidate) => candidate.artifactVersionId === input.artifactVersionId,
+      );
+      if (version) return version;
+    }
+    return undefined;
+  }
+
+  replaceSelection(input: {
+    projectId: string;
+    authorizationScopeSha256: string;
+    pageClipIds: readonly string[];
+    selectedClipIds: readonly string[];
+  }): string[] {
+    const pageClipIds = [...new Set(input.pageClipIds)];
+    const selectedClipIds = [...new Set(input.selectedClipIds)].slice(0, 50);
+    const now = this.now().toISOString();
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      if (pageClipIds.length) {
+        this.database
+          .prepare(
+            `DELETE FROM clip_library_selected_clips
+             WHERE project_id = ? AND authorization_scope_sha256 = ?
+               AND clip_id IN (${pageClipIds.map(() => "?").join(", ")})`,
+          )
+          .run(input.projectId, input.authorizationScopeSha256, ...pageClipIds);
+      }
+      const insert = this.database.prepare(
+        `INSERT INTO clip_library_selected_clips
+           (project_id, authorization_scope_sha256, clip_id, selected_at)
+         VALUES (?, ?, ?, ?)`,
+      );
+      for (const clipId of selectedClipIds) {
+        insert.run(
+          input.projectId,
+          input.authorizationScopeSha256,
+          clipId,
+          now,
+        );
+      }
+      const completeSelection = this.listSelection(
+        input.projectId,
+        input.authorizationScopeSha256,
+      );
+      if (completeSelection.length > 50) {
+        throw new LocalArtifactCatalogError(
+          "Clip Library selection cannot exceed 50 clips.",
+        );
+      }
+      this.database.exec("COMMIT");
+      return completeSelection;
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  listSelection(projectId: string, authorizationScopeSha256: string): string[] {
+    return (
+      this.database
+        .prepare(
+          `SELECT clip_id FROM clip_library_selected_clips
+           WHERE project_id = ? AND authorization_scope_sha256 = ?
+           ORDER BY selected_at, clip_id`,
+        )
+        .all(projectId, authorizationScopeSha256) as { clip_id: string }[]
+    ).map((row) => row.clip_id);
+  }
+
+  listCachedClipIds(
+    projectId: string,
+    authorizationScopeSha256: string,
+  ): string[] {
+    const rows = this.database
+      .prepare(
+        `SELECT response_json FROM clip_library_cache_pages
+         WHERE project_id = ? AND authorization_scope_sha256 = ?`,
+      )
+      .all(projectId, authorizationScopeSha256) as { response_json: string }[];
+    return [
+      ...new Set(
+        rows.flatMap((row) =>
+          ClipLibraryPageSchema.parse(
+            JSON.parse(row.response_json),
+          ).entries.map((entry) => entry.clip.id),
+        ),
+      ),
+    ];
+  }
+
+  purgeScope(projectId: string, authorizationScopeSha256: string): void {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      this.database
+        .prepare(
+          `DELETE FROM clip_library_cache_pages
+           WHERE project_id = ? AND authorization_scope_sha256 = ?`,
+        )
+        .run(projectId, authorizationScopeSha256);
+      this.database
+        .prepare(
+          `DELETE FROM clip_library_selected_clips
+           WHERE project_id = ? AND authorization_scope_sha256 = ?`,
+        )
+        .run(projectId, authorizationScopeSha256);
+      this.database.exec("COMMIT");
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  purgeAuthorizationScope(authorizationScopeSha256: string): void {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      this.database
+        .prepare(
+          `DELETE FROM clip_library_cache_pages
+           WHERE authorization_scope_sha256 = ?`,
+        )
+        .run(authorizationScopeSha256);
+      this.database
+        .prepare(
+          `DELETE FROM clip_library_selected_clips
+           WHERE authorization_scope_sha256 = ?`,
+        )
+        .run(authorizationScopeSha256);
+      this.database.exec("COMMIT");
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  private nextViewSequence(): number {
+    const row = this.database
+      .prepare(
+        `SELECT coalesce(max(last_viewed_sequence), 0) + 1 AS next
+         FROM clip_library_cache_pages`,
+      )
+      .get() as { next: number };
+    return Number(row.next);
+  }
+}
+
+export interface LocalBookmarkOutboxRecord {
+  outboxId: string;
+  accountId: string;
+  projectId: string;
+  bookmarkId?: string;
+  commandType: OfflineProjectBookmarkCommandType;
+  idempotencyKey: string;
+  request: unknown;
+  state: "queued" | "conflict";
+  attempt: number;
+  nextAttemptAt?: string;
+  code?: string;
+  createdAt: string;
+}
+
+/** Account-scoped authorized cache plus ordered bookmark mutation outbox. */
+export class LocalProjectBookmarkRepository {
+  constructor(
+    private readonly database: DatabaseSync,
+    private readonly now: () => Date = () => new Date(),
+  ) {}
+
+  storeAuthorizedPage(input: {
+    authorizationScopeSha256: string;
+    projectId: string;
+    query: ProjectBookmarkQuery;
+    page: ProjectBookmarkPage;
+  }): { page: ProjectBookmarkPage; cachedAt: string } {
+    const query = ProjectBookmarkQuerySchema.parse(input.query);
+    const page = ProjectBookmarkPageSchema.parse(input.page);
+    if (page.projectId !== input.projectId) {
+      throw new LocalBookmarkOutboxError(
+        "Bookmark page does not match the requested project.",
+      );
+    }
+    const cachedAt = this.now().toISOString();
+    const fingerprint = bookmarkQueryFingerprint(query);
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const storeBookmark = this.database.prepare(
+        `INSERT INTO bookmark_cache
+           (authorized_account_id, project_id, bookmark_id, video_id,
+            payload_json, state, source_time_ms, cached_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT (authorized_account_id, project_id, bookmark_id)
+         DO UPDATE SET video_id = excluded.video_id,
+           payload_json = excluded.payload_json, state = excluded.state,
+           source_time_ms = excluded.source_time_ms,
+           cached_at = excluded.cached_at`,
+      );
+      for (const bookmark of page.items) {
+        storeBookmark.run(
+          input.authorizationScopeSha256,
+          input.projectId,
+          bookmark.id,
+          bookmark.videoId,
+          canonicalJson(bookmark),
+          bookmark.state,
+          bookmark.sourceTimeMs,
+          cachedAt,
+        );
+      }
+      this.database
+        .prepare(
+          `INSERT INTO bookmark_cache_reads
+             (authorized_account_id, project_id, query_fingerprint,
+              query_json, response_json, cached_at)
+           VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT (authorized_account_id, project_id, query_fingerprint)
+           DO UPDATE SET query_json = excluded.query_json,
+             response_json = excluded.response_json,
+             cached_at = excluded.cached_at`,
+        )
+        .run(
+          input.authorizationScopeSha256,
+          input.projectId,
+          fingerprint,
+          canonicalJson(query),
+          canonicalJson(page),
+          cachedAt,
+        );
+      this.database.exec("COMMIT");
+      return { page, cachedAt };
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  storeBookmark(input: {
+    authorizationScopeSha256: string;
+    bookmark: ProjectBookmark;
+  }): ProjectBookmark {
+    const bookmark = ProjectBookmarkSchema.parse(input.bookmark);
+    this.database
+      .prepare(
+        `INSERT INTO bookmark_cache
+           (authorized_account_id, project_id, bookmark_id, video_id,
+            payload_json, state, source_time_ms, cached_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT (authorized_account_id, project_id, bookmark_id)
+         DO UPDATE SET video_id = excluded.video_id,
+           payload_json = excluded.payload_json, state = excluded.state,
+           source_time_ms = excluded.source_time_ms,
+           cached_at = excluded.cached_at`,
+      )
+      .run(
+        input.authorizationScopeSha256,
+        bookmark.projectId,
+        bookmark.id,
+        bookmark.videoId,
+        canonicalJson(bookmark),
+        bookmark.state,
+        bookmark.sourceTimeMs,
+        this.now().toISOString(),
+      );
+    return bookmark;
+  }
+
+  getAuthorizedPage(input: {
+    authorizationScopeSha256: string;
+    projectId: string;
+    query: ProjectBookmarkQuery;
+  }): { page: ProjectBookmarkPage; cachedAt: string } | undefined {
+    const query = ProjectBookmarkQuerySchema.parse(input.query);
+    const row = this.database
+      .prepare(
+        `SELECT response_json, cached_at FROM bookmark_cache_reads
+         WHERE authorized_account_id = ? AND project_id = ?
+           AND query_fingerprint = ?`,
+      )
+      .get(
+        input.authorizationScopeSha256,
+        input.projectId,
+        bookmarkQueryFingerprint(query),
+      ) as { response_json: string; cached_at: string } | undefined;
+    return row
+      ? {
+          page: ProjectBookmarkPageSchema.parse(JSON.parse(row.response_json)),
+          cachedAt: row.cached_at,
+        }
+      : undefined;
+  }
+
+  enqueue(input: {
+    authorizationScopeSha256: string;
+    projectId: string;
+    bookmarkId?: string;
+    commandType: OfflineProjectBookmarkCommandType;
+    idempotencyKey: string;
+    request: unknown;
+  }): string {
+    const requestJson = canonicalJson(input.request);
+    const existing = this.database
+      .prepare(
+        `SELECT command_id, command_kind, bookmark_id, request_json
+         FROM bookmark_outbox
+         WHERE account_id = ? AND project_id = ? AND idempotency_key = ?`,
+      )
+      .get(
+        input.authorizationScopeSha256,
+        input.projectId,
+        input.idempotencyKey,
+      ) as
+      | {
+          command_id: string;
+          command_kind: string;
+          bookmark_id: string | null;
+          request_json: string;
+        }
+      | undefined;
+    const commandKind = bookmarkCommandKind(input.commandType);
+    if (existing) {
+      if (
+        existing.command_kind !== commandKind ||
+        existing.bookmark_id !== (input.bookmarkId ?? null) ||
+        existing.request_json !== requestJson
+      ) {
+        throw new LocalBookmarkOutboxError(
+          "Bookmark idempotency key was already used for another command.",
+        );
+      }
+      return existing.command_id;
+    }
+    const outboxId = randomUUID();
+    const now = this.now().toISOString();
+    this.database
+      .prepare(
+        `INSERT INTO bookmark_outbox
+           (command_id, account_id, project_id, bookmark_id, command_kind,
+            idempotency_key, request_json, state, attempt, next_attempt_at,
+            created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', 0, NULL, ?, ?)`,
+      )
+      .run(
+        outboxId,
+        input.authorizationScopeSha256,
+        input.projectId,
+        input.bookmarkId ?? null,
+        commandKind,
+        input.idempotencyKey,
+        requestJson,
+        now,
+        now,
+      );
+    return outboxId;
+  }
+
+  due(input: {
+    authorizationScopeSha256: string;
+    projectId: string;
+    limit?: number;
+  }): LocalBookmarkOutboxRecord[] {
+    const rows = this.database
+      .prepare(
+        `SELECT o.*, c.conflict_code
+         FROM bookmark_outbox o
+         LEFT JOIN bookmark_outbox_conflicts c ON c.command_id = o.command_id
+         WHERE o.account_id = ? AND o.project_id = ? AND o.state = 'queued'
+           AND (o.next_attempt_at IS NULL OR o.next_attempt_at <= ?)
+         ORDER BY o.sequence LIMIT ?`,
+      )
+      .all(
+        input.authorizationScopeSha256,
+        input.projectId,
+        this.now().toISOString(),
+        Math.min(100, Math.max(1, input.limit ?? 50)),
+      ) as Record<string, unknown>[];
+    return rows.map(mapLocalBookmarkOutboxRecord);
+  }
+
+  list(input: {
+    authorizationScopeSha256: string;
+    projectId: string;
+    limit?: number;
+  }): OfflineProjectBookmarkCommand[] {
+    const rows = this.database
+      .prepare(
+        `SELECT o.*, c.conflict_code
+         FROM bookmark_outbox o
+         LEFT JOIN bookmark_outbox_conflicts c ON c.command_id = o.command_id
+         WHERE o.account_id = ? AND o.project_id = ?
+         ORDER BY o.sequence LIMIT ?`,
+      )
+      .all(
+        input.authorizationScopeSha256,
+        input.projectId,
+        Math.min(100, Math.max(1, input.limit ?? 100)),
+      ) as Record<string, unknown>[];
+    return rows.map((row) =>
+      bookmarkOutboxSummary(mapLocalBookmarkOutboxRecord(row)),
+    );
+  }
+
+  get(outboxId: string): LocalBookmarkOutboxRecord | undefined {
+    const row = this.database
+      .prepare(
+        `SELECT o.*, c.conflict_code FROM bookmark_outbox o
+         LEFT JOIN bookmark_outbox_conflicts c ON c.command_id = o.command_id
+         WHERE o.command_id = ?`,
+      )
+      .get(outboxId) as Record<string, unknown> | undefined;
+    return row ? mapLocalBookmarkOutboxRecord(row) : undefined;
+  }
+
+  acknowledge(outboxId: string): void {
+    this.database
+      .prepare("DELETE FROM bookmark_outbox WHERE command_id = ?")
+      .run(outboxId);
+  }
+
+  retry(outboxId: string, baseDelayMs = 1_000): void {
+    const row = this.database
+      .prepare("SELECT attempt FROM bookmark_outbox WHERE command_id = ?")
+      .get(outboxId) as { attempt: number } | undefined;
+    if (!row) return;
+    const attempt = row.attempt + 1;
+    const nextAttemptAt = new Date(
+      this.now().getTime() + Math.min(baseDelayMs * 2 ** (attempt - 1), 60_000),
+    ).toISOString();
+    this.database
+      .prepare(
+        `UPDATE bookmark_outbox
+         SET attempt = ?, next_attempt_at = ?, updated_at = ?
+         WHERE command_id = ?`,
+      )
+      .run(attempt, nextAttemptAt, this.now().toISOString(), outboxId);
+  }
+
+  recordConflict(outboxId: string, code: string, message: string): void {
+    const row = this.get(outboxId);
+    if (!row) return;
+    const now = this.now().toISOString();
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      this.database
+        .prepare(
+          `UPDATE bookmark_outbox SET state = 'conflict', next_attempt_at = NULL,
+             updated_at = ? WHERE command_id = ?`,
+        )
+        .run(now, outboxId);
+      this.database
+        .prepare(
+          `INSERT INTO bookmark_outbox_conflicts
+             (command_id, conflict_code, conflict_message,
+              retained_request_json, created_at)
+           VALUES (?, ?, ?, ?, ?)
+           ON CONFLICT (command_id) DO UPDATE SET
+             conflict_code = excluded.conflict_code,
+             conflict_message = excluded.conflict_message,
+             retained_request_json = excluded.retained_request_json`,
+        )
+        .run(
+          outboxId,
+          code.slice(0, 160),
+          message.slice(0, 500),
+          canonicalJson(row.request),
+          now,
+        );
+      this.database.exec("COMMIT");
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  purgeScope(projectId: string, authorizationScopeSha256: string): void {
+    this.database
+      .prepare(
+        `DELETE FROM bookmark_cache_reads
+         WHERE authorized_account_id = ? AND project_id = ?`,
+      )
+      .run(authorizationScopeSha256, projectId);
+    this.database
+      .prepare(
+        `DELETE FROM bookmark_cache
+         WHERE authorized_account_id = ? AND project_id = ?`,
+      )
+      .run(authorizationScopeSha256, projectId);
+  }
+
+  purgeAuthorizationScope(authorizationScopeSha256: string): void {
+    this.database
+      .prepare(
+        "DELETE FROM bookmark_cache_reads WHERE authorized_account_id = ?",
+      )
+      .run(authorizationScopeSha256);
+    this.database
+      .prepare("DELETE FROM bookmark_cache WHERE authorized_account_id = ?")
+      .run(authorizationScopeSha256);
+  }
+}
+
+export class LocalBookmarkOutboxError extends Error {
+  readonly code = "bookmark_outbox_conflict";
+  readonly statusCode = 409;
+}
+
+function bookmarkQueryFingerprint(query: ProjectBookmarkQuery): string {
+  return createHash("sha256")
+    .update(canonicalJson(ProjectBookmarkQuerySchema.parse(query)))
+    .digest("hex");
+}
+
+function bookmarkCommandKind(
+  commandType: OfflineProjectBookmarkCommandType,
+): "create" | "update" | "archive" | "restore" {
+  return commandType.split(".")[1] as
+    "create" | "update" | "archive" | "restore";
+}
+
+function mapLocalBookmarkOutboxRecord(
+  row: Record<string, unknown>,
+): LocalBookmarkOutboxRecord {
+  const commandKind = String(row.command_kind) as
+    "create" | "update" | "archive" | "restore";
+  return {
+    outboxId: String(row.command_id),
+    accountId: String(row.account_id),
+    projectId: String(row.project_id),
+    ...(row.bookmark_id === null
+      ? {}
+      : { bookmarkId: String(row.bookmark_id) }),
+    commandType: `bookmark.${commandKind}.v1`,
+    idempotencyKey: String(row.idempotency_key),
+    request: JSON.parse(String(row.request_json)),
+    state: row.state === "conflict" ? "conflict" : "queued",
+    attempt: Number(row.attempt),
+    ...(row.next_attempt_at === null
+      ? {}
+      : { nextAttemptAt: String(row.next_attempt_at) }),
+    ...(row.conflict_code === null || row.conflict_code === undefined
+      ? {}
+      : { code: String(row.conflict_code) }),
+    createdAt: String(row.created_at),
+  };
+}
+
+function bookmarkOutboxSummary(
+  row: LocalBookmarkOutboxRecord,
+): OfflineProjectBookmarkCommand {
+  const request = row.request as Record<string, unknown>;
+  return OfflineProjectBookmarkCommandSchema.parse({
+    outboxId: row.outboxId,
+    commandType: row.commandType,
+    ...(row.bookmarkId ? { bookmarkId: row.bookmarkId } : {}),
+    ...(typeof request.videoId === "string"
+      ? { videoId: request.videoId }
+      : {}),
+    ...(typeof request.sourceTimeMs === "number"
+      ? { sourceTimeMs: request.sourceTimeMs }
+      : {}),
+    ...(request.title === null || typeof request.title === "string"
+      ? { title: request.title }
+      : {}),
+    ...(request.note === null || typeof request.note === "string"
+      ? { note: request.note }
+      : {}),
+    ...(typeof request.expectedVersion === "number"
+      ? { expectedVersion: request.expectedVersion }
+      : {}),
+    state: row.state,
+    ...(row.code ? { code: row.code } : {}),
+    createdAt: row.createdAt,
+  });
+}
+
+export class LocalArtifactCatalogError extends Error {
+  readonly code = "artifact_catalog_conflict";
+
+  constructor(
+    message: string,
+    readonly statusCode = 409,
+  ) {
+    super(message);
+  }
+}
+
+export class LocalExportLifecycleError extends Error {
+  readonly code: string = "export_source_lifecycle_conflict";
+  readonly statusCode = 409;
+
+  constructor(
+    message = "Export source lifecycle state changed; reload before retrying.",
+    code = "export_source_lifecycle_conflict",
+  ) {
+    super(message);
+    this.code = code;
+  }
+}
+
+function mapLocalExportWorkerIdentity(
+  row: Record<string, unknown>,
+): LocalExportWorkerIdentity {
+  return {
+    workerId: String(row.worker_id),
+    epoch: Number(row.epoch),
+    advertisementFingerprint: String(row.advertisement_fingerprint),
+    createdAt: String(row.created_at),
+    updatedAt: String(row.updated_at),
+  };
+}
+
+function mapDesktopSetup(row: Record<string, unknown>): DesktopSetup {
+  return DesktopSetupSchema.parse({
+    schemaVersion: Number(row.schema_version),
+    rightsAcknowledged: Boolean(row.rights_acknowledged),
+    privacyAcknowledged: Boolean(row.privacy_acknowledged),
+    workerEnabled: Boolean(row.worker_enabled),
+    translationConsent: Boolean(row.translation_consent),
+    captionProvider: row.caption_provider,
+    mediaProvider: row.media_provider,
+    exportSourceProvider: row.export_source_provider,
+    speechToTextProvider: row.speech_to_text_provider,
+    translationProvider: row.translation_provider,
+    updatedAt: row.updated_at,
+  });
+}
+
+function mapLocalComponentReference(
+  row: Record<string, unknown>,
+): LocalComponentReference {
+  return LocalComponentReferenceSchema.parse({
+    id: row.id,
+    target: row.target,
+    displayName: row.display_name,
+    ...(row.version ? { version: row.version } : {}),
+    validatedAt: row.validated_at,
+  });
+}
+
+function mapTrustedLocalComponentReference(
+  row: Record<string, unknown>,
+): TrustedLocalComponentReference {
+  const summary = mapLocalComponentReference(row);
+  let validationEvidence: unknown;
+  try {
+    validationEvidence = JSON.parse(String(row.validation_evidence_json));
+  } catch {
+    throw new LocalArtifactCatalogError(
+      "Stored local component validation evidence is invalid.",
+    );
+  }
+  const state = String(row.state);
+  if (state !== "candidate" && state !== "active" && state !== "superseded") {
+    throw new LocalArtifactCatalogError(
+      "Stored local component state is invalid.",
+    );
+  }
+  return {
+    ...summary,
+    absolutePath: requireBoundedLocalString(
+      String(row.absolute_path),
+      "Stored local component path",
+      4_096,
+    ),
+    filesystemIdentity: requireBoundedLocalString(
+      String(row.filesystem_identity),
+      "Stored local component filesystem identity",
+      200,
+    ),
+    ...(row.byte_size === null || row.byte_size === undefined
+      ? {}
+      : { byteSize: Number(row.byte_size) }),
+    ...(row.content_sha256
+      ? { contentSha256: String(row.content_sha256) }
+      : {}),
+    validationEvidence,
+    state,
+    ...(row.activated_at ? { activatedAt: String(row.activated_at) } : {}),
+    ...(row.superseded_at ? { supersededAt: String(row.superseded_at) } : {}),
+  };
+}
+
+function requireBoundedLocalString(
+  value: string,
+  label: string,
+  maximumLength: number,
+): string {
+  if (
+    !value ||
+    value.length > maximumLength ||
+    value.includes("\0") ||
+    value !== value.normalize("NFC")
+  ) {
+    throw new LocalArtifactCatalogError(`${label} is invalid.`);
+  }
+  return value;
+}
+
+function serializeValidationEvidence(value: unknown): string {
+  let serialized: string | undefined;
+  try {
+    serialized = JSON.stringify(value);
+  } catch {
+    throw new LocalArtifactCatalogError(
+      "Local component validation evidence is invalid.",
+    );
+  }
+  if (!serialized || Buffer.byteLength(serialized, "utf8") > 64 * 1_024) {
+    throw new LocalArtifactCatalogError(
+      "Local component validation evidence is invalid.",
+    );
+  }
+  try {
+    JSON.parse(serialized);
+  } catch {
+    throw new LocalArtifactCatalogError(
+      "Local component validation evidence is invalid.",
+    );
+  }
+  return serialized;
+}
+
+function mapLocalArtifactRoot(
+  row: Record<string, unknown>,
+): LocalArtifactRootRecord {
+  return {
+    id: String(row.id),
+    label: String(row.label),
+    platform: String(row.platform) as ArtifactStoragePlatform,
+    absolutePath: String(row.absolute_path),
+    pathFingerprint: String(row.path_fingerprint),
+    filesystemIdentity: String(row.filesystem_identity),
+    enabled: Boolean(row.enabled),
+    createdAt: String(row.created_at),
+    updatedAt: String(row.updated_at),
+  };
+}
+
+function toArtifactRootSummary(
+  root: LocalArtifactRootRecord,
+): ArtifactRootSummary {
+  return ArtifactRootSummarySchema.parse({
+    id: root.id,
+    label: root.label,
+    platform: root.platform,
+    enabled: root.enabled,
+    createdAt: root.createdAt,
+    updatedAt: root.updatedAt,
+  });
+}
+
+function mapArtifactLocator(
+  row: Record<string, unknown>,
+): ArtifactLocatorSummary {
+  return ArtifactLocatorSummarySchema.parse({
+    id: row.id,
+    artifactVersionId: row.artifact_version_id,
+    rootId: row.root_id,
+    platform: row.platform,
+    availability: row.availability,
+    manifestSha256: row.manifest_sha256,
+    manifestSchemaVersion: Number(row.manifest_schema_version),
+    checkedAt: row.checked_at,
+    lastVerifiedAt: row.last_verified_at,
+    ...(row.failure_class ? { failureClass: row.failure_class } : {}),
+  });
+}
+
+function mapArtifactLocatorRecord(
+  row: Record<string, unknown>,
+): LocalArtifactLocatorRecord {
+  return {
+    ...mapArtifactLocator(row),
+    relativePackagePath: String(row.relative_package_path),
+    projectId: String(row.project_id),
+    clipId: String(row.clip_id),
+    requestId: String(row.request_id),
+    packageIdentity: String(row.package_identity),
+    resultFingerprint: String(row.result_fingerprint),
+  };
+}
+
+function mapLocalLoggedExportSourceGroup(
+  row: Record<string, unknown>,
+): LocalLoggedExportSourceGroup {
+  return {
+    id: String(row.id),
+    compatibilityKey: String(row.compatibility_key),
+    lifecycleState: String(
+      row.lifecycle_state,
+    ) as LocalLoggedExportSourceGroup["lifecycleState"],
+    projectId: String(row.project_id),
+    batchId: String(row.batch_id),
+    youtubeVideoId: String(row.youtube_video_id),
+    sourceIdentity: {
+      schemaVersion: 1,
+      provider:
+        row.source_provider === "tiktok" ||
+        row.source_provider === "instagram" ||
+        row.source_provider === "facebook"
+          ? row.source_provider
+          : "youtube",
+      providerMediaId: String(row.provider_media_id ?? row.youtube_video_id),
+      canonicalUrl: String(
+        row.canonical_url ??
+          `https://www.youtube.com/watch?v=${String(row.provider_media_id ?? row.youtube_video_id)}`,
+      ),
+    },
+    acquisitionProfileFingerprint: String(row.acquisition_profile_fingerprint),
+    workerId: String(row.worker_id),
+    workerEpoch: Number(row.worker_epoch),
+    createdAt: String(row.created_at),
+    expiresAt: String(row.expires_at),
+    ...(row.ready_at ? { readyAt: String(row.ready_at) } : {}),
+    ...(row.deleted_at ? { deletedAt: String(row.deleted_at) } : {}),
+  };
+}
+
+function sourceGroupFromLocalRow(row: Record<string, unknown>): {
+  sourceGroup?: { batchId: string; batchItemId: string };
+} {
+  if (!row.job_payload_json) return {};
+  try {
+    const payload = JSON.parse(String(row.job_payload_json)) as {
+      sourceGroup?: { batchId?: unknown; batchItemId?: unknown };
+    };
+    return typeof payload.sourceGroup?.batchId === "string" &&
+      typeof payload.sourceGroup.batchItemId === "string"
+      ? {
+          sourceGroup: {
+            batchId: payload.sourceGroup.batchId,
+            batchItemId: payload.sourceGroup.batchItemId,
+          },
+        }
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+function mapLocalExportRequest(
+  row: Record<string, unknown>,
+  subtitleSidecars: readonly Record<string, unknown>[] = [],
+  finalArtifacts: readonly Record<string, unknown>[] = [],
+): ExportRequest {
+  const selection = JSON.parse(
+    String(row.selection_snapshot_json),
+  ) as ExportRequest["selection"];
+  const noSpeechAttestation =
+    selection.selectionType === "player_time_range"
+      ? selection.noSpeechAttestation
+      : undefined;
   return ExportRequestSchema.parse({
     id: row.id,
     jobId: row.job_id,
-    mode: row.mode,
+    mode: row.cloud_delivery_state ? "logged" : row.mode,
+    ...(row.request_origin
+      ? { requestOrigin: String(row.request_origin) }
+      : {}),
+    ...(row.cloud_delivery_state
+      ? {
+          projectId: row.cloud_project_id,
+          clipId: row.cloud_clip_id,
+          ...(sourceGroupFromLocalRow(row).sourceGroup
+            ? {
+                batchItemId:
+                  sourceGroupFromLocalRow(row).sourceGroup!.batchItemId,
+              }
+            : {}),
+        }
+      : {}),
     video: JSON.parse(String(row.video_snapshot_json)),
-    selection: JSON.parse(String(row.selection_snapshot_json)),
+    selection,
+    ...(noSpeechAttestation ? { noSpeechAttestation } : {}),
     sourceLanguageClass: row.source_language_class,
+    ...(row.source_rights_confirmation_json === null ||
+    row.source_rights_confirmation_json === undefined
+      ? {}
+      : {
+          sourceRights: ExportSourceRightsSnapshotSchema.parse(
+            JSON.parse(String(row.source_rights_confirmation_json)),
+          ),
+        }),
+    ...(row.subtitle_tracks_snapshot_json === null ||
+    row.subtitle_tracks_snapshot_json === undefined
+      ? {}
+      : {
+          subtitleTracks: JSON.parse(String(row.subtitle_tracks_snapshot_json)),
+        }),
     preset: JSON.parse(String(row.preset_snapshot_json)),
+    ...(row.resolved_settings_snapshot_json
+      ? {
+          resolvedSettingsSnapshot: JSON.parse(
+            String(row.resolved_settings_snapshot_json),
+          ),
+        }
+      : {}),
+    ...(row.media_duration_ms === null || row.media_duration_ms === undefined
+      ? {}
+      : {
+          mediaProvenance: {
+            durationMs: Number(row.media_duration_ms),
+            ...(row.media_container_format === null
+              ? {}
+              : { containerFormat: String(row.media_container_format) }),
+            ...(row.media_video_codec === null
+              ? {}
+              : { videoCodec: String(row.media_video_codec) }),
+            ...(row.media_audio_codec === null
+              ? {}
+              : { audioCodec: String(row.media_audio_codec) }),
+            ...(row.media_ffprobe_version === null
+              ? {}
+              : { ffprobeVersion: String(row.media_ffprobe_version) }),
+          },
+        }),
+    ...(row.resolved_export_start_ms === null ||
+    row.resolved_export_start_ms === undefined ||
+    row.resolved_export_end_ms === null ||
+    row.resolved_source_attempt === null ||
+    row.resolved_at === null
+      ? {}
+      : {
+          resolvedExportBounds: {
+            startMs: Number(row.resolved_export_start_ms),
+            endMs: Number(row.resolved_export_end_ms),
+            sourceAttempt: Number(row.resolved_source_attempt),
+            resolvedAt: String(row.resolved_at),
+          },
+        }),
+    ...(row.rendered_duration_ms === null ||
+    row.rendered_duration_ms === undefined ||
+    row.rendered_source_attempt === null ||
+    row.rendered_validated_at === null
+      ? {}
+      : {
+          renderedMediaProvenance: {
+            durationMs: Number(row.rendered_duration_ms),
+            ...(row.rendered_container_format === null
+              ? {}
+              : { containerFormat: String(row.rendered_container_format) }),
+            ...(row.rendered_video_codec === null
+              ? {}
+              : { videoCodec: String(row.rendered_video_codec) }),
+            ...(row.rendered_audio_codec === null
+              ? {}
+              : { audioCodec: String(row.rendered_audio_codec) }),
+            ...(row.rendered_ffprobe_version === null
+              ? {}
+              : { ffprobeVersion: String(row.rendered_ffprobe_version) }),
+            ...(row.rendered_ffmpeg_version === null
+              ? {}
+              : { ffmpegVersion: String(row.rendered_ffmpeg_version) }),
+            ...(row.rendered_conformance_schema_version === null ||
+            row.rendered_conformance_schema_version === undefined
+              ? {}
+              : {
+                  verificationSchemaVersion: Number(
+                    row.rendered_conformance_schema_version,
+                  ),
+                }),
+            ...(row.rendered_settings_sha256 === null ||
+            row.rendered_settings_sha256 === undefined
+              ? {}
+              : { settingsSha256: String(row.rendered_settings_sha256) }),
+            ...(row.rendered_observed_properties_json === null ||
+            row.rendered_observed_properties_json === undefined
+              ? {}
+              : {
+                  observedProperties: JSON.parse(
+                    String(row.rendered_observed_properties_json),
+                  ),
+                }),
+            sourceAttempt: Number(row.rendered_source_attempt),
+            validatedAt: String(row.rendered_validated_at),
+          },
+        }),
+    ...(row.thumbnail_extraction_time_ms === null ||
+    row.thumbnail_extraction_time_ms === undefined ||
+    row.thumbnail_width === null ||
+    row.thumbnail_height === null ||
+    row.thumbnail_source_attempt === null ||
+    row.thumbnail_validated_at === null
+      ? {}
+      : {
+          thumbnailProvenance: {
+            extractionTimeMs: Number(row.thumbnail_extraction_time_ms),
+            width: Number(row.thumbnail_width),
+            height: Number(row.thumbnail_height),
+            sourceAttempt: Number(row.thumbnail_source_attempt),
+            validatedAt: String(row.thumbnail_validated_at),
+          },
+        }),
+    ...(row.subtitle_omission_policy === null ||
+    row.subtitle_omission_policy === undefined ||
+    row.subtitle_omission_source_attempt === null ||
+    row.subtitle_omission_validated_at === null
+      ? {}
+      : {
+          subtitleOmissionProvenance: {
+            policy: String(row.subtitle_omission_policy),
+            sourceAttempt: Number(row.subtitle_omission_source_attempt),
+            validatedAt: String(row.subtitle_omission_validated_at),
+          },
+        }),
+    ...(row.english_subtitle_track_id === null ||
+    row.english_subtitle_track_id === undefined ||
+    row.english_subtitle_track_version === null ||
+    row.english_subtitle_cue_count === null ||
+    row.english_subtitle_byte_size === null ||
+    row.english_subtitle_content_sha256 === null ||
+    row.english_subtitle_start_ms === null ||
+    row.english_subtitle_end_ms === null ||
+    row.english_subtitle_source_attempt === null ||
+    row.english_subtitle_validated_at === null
+      ? {}
+      : {
+          englishSubtitleProvenance: {
+            trackId: String(row.english_subtitle_track_id),
+            trackVersion: Number(row.english_subtitle_track_version),
+            cueCount: Number(row.english_subtitle_cue_count),
+            byteSize: Number(row.english_subtitle_byte_size),
+            contentSha256: String(row.english_subtitle_content_sha256),
+            startMs: Number(row.english_subtitle_start_ms),
+            endMs: Number(row.english_subtitle_end_ms),
+            sourceAttempt: Number(row.english_subtitle_source_attempt),
+            validatedAt: String(row.english_subtitle_validated_at),
+          },
+        }),
+    ...(subtitleSidecars.length === 0
+      ? {}
+      : {
+          subtitleSidecars: subtitleSidecars.map((sidecar) =>
+            sidecar.empty_reason
+              ? {
+                  role: String(sidecar.role),
+                  language: String(sidecar.language),
+                  emptyReason: "attested_no_speech",
+                  noSpeechAttestation: JSON.parse(
+                    String(sidecar.no_speech_attestation_json),
+                  ),
+                  cueCount: 0,
+                  byteSize: Number(sidecar.byte_size),
+                  contentSha256: String(sidecar.content_sha256),
+                  startMs: 0,
+                  endMs: 0,
+                  sourceAttempt: Number(sidecar.source_attempt),
+                  validatedAt: String(sidecar.validated_at),
+                }
+              : {
+                  role: String(sidecar.role),
+                  language: String(sidecar.language),
+                  trackId: String(sidecar.track_id),
+                  trackVersion: Number(sidecar.track_version),
+                  cueCount: Number(sidecar.cue_count),
+                  byteSize: Number(sidecar.byte_size),
+                  contentSha256: String(sidecar.content_sha256),
+                  startMs: Number(sidecar.start_ms),
+                  endMs: Number(sidecar.end_ms),
+                  sourceAttempt: Number(sidecar.source_attempt),
+                  validatedAt: String(sidecar.validated_at),
+                },
+          ),
+        }),
+    ...(finalArtifacts.length === 0
+      ? {}
+      : {
+          finalArtifacts: finalArtifacts.map((artifact) => ({
+            role: String(artifact.role),
+            packageIdentity: String(artifact.package_identity),
+            byteSize: Number(artifact.byte_size),
+            contentSha256: String(artifact.content_sha256),
+            sourceAttempt: Number(artifact.source_attempt),
+            validatedAt: String(artifact.validated_at),
+          })),
+        }),
     state: row.state,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   });
+}
+
+function requireExactSourceRightsSnapshot(
+  value: unknown,
+  youtubeVideoId: string,
+) {
+  if (!value) {
+    throw new LocalExportLifecycleError(
+      "Confirm source rights for this exact video before creating or processing an export.",
+      "source_rights_confirmation_required",
+    );
+  }
+  const rights = ExportSourceRightsSnapshotSchema.parse(value);
+  if (rights.youtubeVideoId !== youtubeVideoId) {
+    throw new LocalExportLifecycleError(
+      "Source-rights confirmation does not match this export request video.",
+      "source_rights_confirmation_video_mismatch",
+    );
+  }
+  return rights;
+}
+
+function assertUtcTimestamp(value: string, label: string): void {
+  if (
+    !Number.isFinite(Date.parse(value)) ||
+    !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/u.test(
+      value,
+    )
+  ) {
+    throw new LocalExportLifecycleError(
+      `${label} is invalid.`,
+      "logged_export_terminal_reconciliation_time_invalid",
+    );
+  }
+}
+
+function mapLocalSourceScratchAsset(
+  row: Record<string, unknown>,
+): LocalSourceScratchAsset {
+  return {
+    jobId: String(row.job_id),
+    attempt: Number(row.attempt),
+    ...(row.provider === null ? {} : { provider: String(row.provider) }),
+    ...(row.source_identity === null
+      ? {}
+      : { sourceIdentity: String(row.source_identity) }),
+    ...(row.byte_size === null ? {} : { byteSize: Number(row.byte_size) }),
+    ...(row.content_sha256 === null
+      ? {}
+      : { contentSha256: String(row.content_sha256) }),
+    ...(row.duration_ms === null
+      ? {}
+      : { durationMs: Number(row.duration_ms) }),
+    ...(row.container_format === null
+      ? {}
+      : { containerFormat: String(row.container_format) }),
+    ...(row.video_codec === null
+      ? {}
+      : { videoCodec: String(row.video_codec) }),
+    ...(row.audio_codec === null
+      ? {}
+      : { audioCodec: String(row.audio_codec) }),
+    ...(row.ffprobe_version === null
+      ? {}
+      : { ffprobeVersion: String(row.ffprobe_version) }),
+    lifecycleState:
+      row.lifecycle_state as LocalSourceScratchAsset["lifecycleState"],
+    ...(row.cleanup_error_code === null
+      ? {}
+      : { cleanupErrorCode: String(row.cleanup_error_code) }),
+    ...(row.cleanup_error_message === null
+      ? {}
+      : { cleanupErrorMessage: String(row.cleanup_error_message) }),
+    ...(row.deleted_at === null ? {} : { deletedAt: String(row.deleted_at) }),
+    expiresAt: String(row.expires_at),
+    ...(row.scratch_layout_version === null ||
+    row.scratch_layout_version === undefined
+      ? {}
+      : { scratchLayoutVersion: Number(row.scratch_layout_version) }),
+  };
+}
+
+function safeLocalError(message: string) {
+  return sanitizeLoggedExportFailureMessage(message);
+}
+
+function parseLocalJobPayload(value: string): Record<string, unknown> {
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>;
+    }
+  } catch {
+    // Report the durable corruption through the ordinary lifecycle boundary.
+  }
+  throw new LocalExportLifecycleError(
+    "Persisted local job payload is invalid.",
+    "local_job_payload_invalid",
+  );
+}
+
+function safeProbeValue(value: string | undefined, maximumLength: number) {
+  if (!value) return null;
+  const normalized = value.trim();
+  return /^[A-Za-z0-9._,+-]+$/u.test(normalized) &&
+    normalized.length <= maximumLength
+    ? normalized
+    : null;
+}
+
+function validSubtitleSidecar(sidecar: LocalSubtitleSidecarValidation) {
+  return (
+    safeSubtitleLanguage(sidecar.language) !== null &&
+    !/\s/u.test(sidecar.trackId) &&
+    Number.isSafeInteger(sidecar.trackVersion) &&
+    sidecar.trackVersion > 0 &&
+    Number.isSafeInteger(sidecar.cueCount) &&
+    sidecar.cueCount > 0 &&
+    Number.isSafeInteger(sidecar.byteSize) &&
+    sidecar.byteSize > 0 &&
+    /^[a-f0-9]{64}$/u.test(sidecar.contentSha256) &&
+    Number.isSafeInteger(sidecar.startMs) &&
+    Number.isSafeInteger(sidecar.endMs) &&
+    sidecar.startMs >= 0 &&
+    sidecar.endMs > sidecar.startMs
+  );
+}
+
+function validEmptySubtitleSidecar(
+  sidecar: LocalEmptySubtitleSidecarValidation,
+) {
+  return (
+    safeSubtitleLanguage(sidecar.language) !== null &&
+    sidecar.emptyReason === "attested_no_speech" &&
+    sidecar.cueCount === 0 &&
+    Number.isSafeInteger(sidecar.byteSize) &&
+    sidecar.byteSize > 0 &&
+    /^[a-f0-9]{64}$/u.test(sidecar.contentSha256) &&
+    sidecar.startMs === 0 &&
+    sidecar.endMs === 0
+  );
+}
+
+function validFinalArtifact(artifact: LocalFinalArtifactProvenance) {
+  return validFinalArtifactFields(artifact);
+}
+
+function validFinalArtifactFields(artifact: {
+  packageIdentity: string;
+  byteSize: number;
+  contentSha256: string;
+  sourceAttempt: number;
+  validatedAt: string;
+}) {
+  return (
+    /^clip-[a-f0-9-]{36}$/u.test(artifact.packageIdentity) &&
+    Number.isSafeInteger(artifact.byteSize) &&
+    artifact.byteSize > 0 &&
+    /^[a-f0-9]{64}$/u.test(artifact.contentSha256) &&
+    Number.isSafeInteger(artifact.sourceAttempt) &&
+    artifact.sourceAttempt > 0 &&
+    isCanonicalIsoTimestamp(artifact.validatedAt)
+  );
+}
+
+function isCanonicalIsoTimestamp(value: string) {
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/u.test(value)) {
+    return false;
+  }
+  const timestamp = Date.parse(value);
+  if (!Number.isFinite(timestamp)) return false;
+  const normalized = value.includes(".")
+    ? value
+    : value.replace(/Z$/u, ".000Z");
+  return new Date(timestamp).toISOString() === normalized;
+}
+
+function safeSubtitleLanguage(language: string) {
+  const normalized = language.trim();
+  return /^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$/u.test(normalized) &&
+    normalized.length <= 35
+    ? normalized
+    : null;
 }
 
 export class LocalTranscriptIndex {
@@ -358,5 +6304,191 @@ export class LocalTranscriptIndex {
           : { alignmentStatus: token.alignment_status }),
       })),
     });
+  }
+
+  findExactEnglish(input: {
+    trackId: string;
+    trackVersion: number;
+    videoId: string;
+  }): NormalizedTranscript | undefined {
+    return this.findExact(input, "english");
+  }
+
+  findExactOriginal(input: {
+    trackId: string;
+    trackVersion: number;
+    videoId: string;
+  }): NormalizedTranscript | undefined {
+    return this.findExact(input, "original");
+  }
+
+  promoteDerivedTranslation(input: {
+    identity: DerivedTranslationIdentity;
+    translationVersionId: string;
+    manifestSha256: string;
+    normalizedSha256: string;
+    transcript: NormalizedTranscript;
+  }): NormalizedTranscript {
+    const transcript = NormalizedTranscriptSchema.parse(input.transcript);
+    if (
+      transcript.track.kind !== "translation" ||
+      transcript.track.sourceTrackId !== input.identity.originalTrackId ||
+      !languagesEquivalent(
+        transcript.track.language,
+        input.identity.targetLanguage,
+      ) ||
+      transcript.track.provider !== input.identity.provider ||
+      (transcript.track.model ?? null) !== (input.identity.model ?? null) ||
+      transcript.track.schemaVersion !==
+        input.identity.normalizationSchemaVersion
+    ) {
+      throw new Error(
+        "Derived translation does not match its exact cache identity.",
+      );
+    }
+    const encoded = JSON.stringify(transcript);
+    const encodedSha256 = createHash("sha256").update(encoded).digest("hex");
+    if (
+      !/^[a-f0-9]{64}$/u.test(input.manifestSha256) ||
+      encodedSha256 !== input.normalizedSha256
+    ) {
+      throw new Error("Derived translation checksum verification failed.");
+    }
+    this.database.exec("BEGIN IMMEDIATE;");
+    try {
+      this.database
+        .prepare(
+          `DELETE FROM derived_translation_cache
+           WHERE project_id = ? AND catalog_video_id = ?
+             AND base_transcript_version_id = ? AND original_track_id = ?
+             AND original_content_sha256 = ? AND target_primary_language = ?
+             AND provider = ? AND COALESCE(model, '') = COALESCE(?, '')
+             AND normalization_schema_version = ?`,
+        )
+        .run(
+          input.identity.projectId,
+          input.identity.catalogVideoId,
+          input.identity.baseTranscriptVersionId,
+          input.identity.originalTrackId,
+          input.identity.originalContentSha256,
+          primaryLanguage(input.identity.targetLanguage),
+          input.identity.provider,
+          input.identity.model ?? null,
+          input.identity.normalizationSchemaVersion,
+        );
+      this.database
+        .prepare(
+          `INSERT INTO derived_translation_cache
+             (translation_version_id, project_id, catalog_video_id,
+              base_transcript_version_id, original_track_id,
+              original_content_sha256, target_language,
+              target_primary_language, provider, model,
+              normalization_schema_version, translated_track_id,
+              translated_track_version, manifest_sha256, normalized_sha256,
+              normalized_transcript_json, promoted_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          input.translationVersionId,
+          input.identity.projectId,
+          input.identity.catalogVideoId,
+          input.identity.baseTranscriptVersionId,
+          input.identity.originalTrackId,
+          input.identity.originalContentSha256,
+          input.identity.targetLanguage,
+          primaryLanguage(input.identity.targetLanguage),
+          input.identity.provider,
+          input.identity.model ?? null,
+          input.identity.normalizationSchemaVersion,
+          transcript.track.id,
+          transcript.track.version,
+          input.manifestSha256,
+          input.normalizedSha256,
+          encoded,
+          this.now().toISOString(),
+        );
+      this.database.exec("COMMIT;");
+    } catch (error) {
+      this.database.exec("ROLLBACK;");
+      throw error;
+    }
+    return transcript;
+  }
+
+  findDerivedTranslation(
+    identity: DerivedTranslationIdentity,
+  ): NormalizedTranscript | undefined {
+    const row = this.database
+      .prepare(
+        `SELECT normalized_transcript_json, normalized_sha256,
+                translated_track_id, translated_track_version
+         FROM derived_translation_cache
+         WHERE project_id = ? AND catalog_video_id = ?
+           AND base_transcript_version_id = ? AND original_track_id = ?
+           AND original_content_sha256 = ? AND target_primary_language = ?
+           AND provider = ? AND COALESCE(model, '') = COALESCE(?, '')
+           AND normalization_schema_version = ?`,
+      )
+      .get(
+        identity.projectId,
+        identity.catalogVideoId,
+        identity.baseTranscriptVersionId,
+        identity.originalTrackId,
+        identity.originalContentSha256,
+        primaryLanguage(identity.targetLanguage),
+        identity.provider,
+        identity.model ?? null,
+        identity.normalizationSchemaVersion,
+      ) as Record<string, unknown> | undefined;
+    if (!row) return undefined;
+    const encoded = String(row.normalized_transcript_json);
+    if (
+      createHash("sha256").update(encoded).digest("hex") !==
+      row.normalized_sha256
+    ) {
+      return undefined;
+    }
+    let decoded: unknown;
+    try {
+      decoded = JSON.parse(encoded);
+    } catch {
+      return undefined;
+    }
+    const parsed = NormalizedTranscriptSchema.safeParse(decoded);
+    if (!parsed.success) return undefined;
+    const track = parsed.data.track;
+    return track.kind === "translation" &&
+      track.id === row.translated_track_id &&
+      track.version === Number(row.translated_track_version) &&
+      track.sourceTrackId === identity.originalTrackId &&
+      languagesEquivalent(track.language, identity.targetLanguage)
+      ? parsed.data
+      : undefined;
+  }
+
+  private findExact(
+    input: { trackId: string; trackVersion: number; videoId: string },
+    kind: "original" | "english",
+  ): NormalizedTranscript | undefined {
+    if (!Number.isSafeInteger(input.trackVersion) || input.trackVersion <= 0)
+      return undefined;
+    const matches = this.database
+      .prepare(
+        `SELECT transcript_version_id FROM transcript_tracks
+         WHERE id = ? AND version = ? AND video_id = ? AND kind = ?
+         ORDER BY transcript_version_id
+         LIMIT 2`,
+      )
+      .all(input.trackId, input.trackVersion, input.videoId, kind) as Array<{
+      transcript_version_id: string;
+    }>;
+    if (matches.length !== 1) return undefined;
+    const transcript = this.get(matches[0]!.transcript_version_id, kind);
+    return transcript?.track.id === input.trackId &&
+      transcript.track.version === input.trackVersion &&
+      transcript.track.videoId === input.videoId &&
+      transcript.track.kind === kind
+      ? transcript
+      : undefined;
   }
 }
