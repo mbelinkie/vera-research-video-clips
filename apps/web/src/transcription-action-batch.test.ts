@@ -9,7 +9,11 @@ import {
 } from "@research-video/contracts";
 import { runCloudMigrations } from "@research-video/db-cloud";
 import { MemoryTranscriptObjectStore } from "@research-video/storage";
-import { retryWorkspaceTranscript } from "./desktop-transcript-retry.ts";
+import {
+  pollWorkspaceRetry,
+  retryWorkspaceTranscript,
+  type WorkspaceRetry,
+} from "./desktop-transcript-retry.ts";
 
 import {
   findRetryableTranscriptionItem,
@@ -218,12 +222,17 @@ describe("desktop Retry transcript action through the fake API bridge", () => {
   afterEach(() => vi.unstubAllGlobals());
 
   it.each([
-    { mode: "automatic", retryable: true },
-    { mode: "manual", retryable: true },
-    { mode: "automatic", retryable: false },
+    { mode: "automatic", retryable: true, race: undefined },
+    { mode: "manual", retryable: true, race: undefined },
+    { mode: "automatic", retryable: false, race: undefined },
+    { mode: "automatic", retryable: true, race: "initial" },
+    { mode: "automatic", retryable: true, race: "initial-error" },
+    { mode: "automatic", retryable: true, race: "poll" },
+    { mode: "automatic", retryable: true, race: "poll-before-cleanup" },
+    { mode: "automatic", retryable: true, race: "poll-error" },
   ])(
-    "handles $mode processing (retryable=$retryable)",
-    async ({ mode, retryable }) => {
+    "handles $mode processing (retryable=$retryable, race=$race)",
+    async ({ mode, retryable, race }) => {
       const database = new PGlite();
       try {
         await runCloudMigrations(database);
@@ -309,6 +318,18 @@ describe("desktop Retry transcript action through the fake API bridge", () => {
 
         const base = `/api/projects/${project.id}`;
         const retryPath = `${base}/transcription-batches/${batchId}/items/${itemId}/retry`;
+        let release!: () => void;
+        const held = new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        let markHeld!: () => void;
+        const reachedHold = new Promise<void>((resolve) => {
+          markHeld = resolve;
+        });
+        let polling = false;
+        let holdPoll = true;
+        let replay = false;
+        let retryResult: unknown;
         const request = vi.fn(async (input: DesktopApiRequest) => {
           const url = new URL(input.path, "https://fixture.invalid");
           let payload: unknown;
@@ -320,11 +341,13 @@ describe("desktop Retry transcript action through the fake API bridge", () => {
               payload = { items: [], total: 1, nextCursor: "fixture+page" };
             else {
               expect(url.searchParams.get("cursor")).toBe("fixture+page");
-              payload = await catalog.listProjectVideoWorklist(
-                actor,
-                project.id,
-                ProjectVideoWorklistQuerySchema.parse({ limit: 50 }),
-              );
+              payload = replay
+                ? { items: [row], total: 1 }
+                : await catalog.listProjectVideoWorklist(
+                    actor,
+                    project.id,
+                    ProjectVideoWorklistQuerySchema.parse({ limit: 50 }),
+                  );
             }
           } else if (
             input.method === "GET" &&
@@ -335,11 +358,29 @@ describe("desktop Retry transcript action through the fake API bridge", () => {
             input.method === "GET" &&
             url.pathname === `${base}/transcription-batches/${batchId}`
           ) {
-            payload = await catalog.getTranscriptionBatch(
-              actor,
-              project.id,
-              batchId,
-            );
+            if (polling) {
+              if (holdPoll && race?.startsWith("poll")) {
+                markHeld();
+                await held;
+                if (race === "poll-error")
+                  throw new Error("late A poll failure");
+              }
+              payload = {
+                ...detail,
+                items: detail.items.map((item) => ({
+                  ...item,
+                  state: "ready_for_review",
+                })),
+              };
+            } else {
+              payload = replay
+                ? detail
+                : await catalog.getTranscriptionBatch(
+                    actor,
+                    project.id,
+                    batchId,
+                  );
+            }
           } else if (input.method === "POST" && url.pathname === retryPath) {
             const command = RetryTranscriptionBatchItemRequestSchema.parse(
               JSON.parse(input.body!),
@@ -348,13 +389,22 @@ describe("desktop Retry transcript action through the fake API bridge", () => {
               expectedVersion: failedItem.version,
               idempotencyKey: `workspace-transcript-retry:${project.id}:${itemId}:v${failedItem.version}`,
             });
-            payload = await catalog.retryTranscriptionBatchItem(
-              actor,
-              project.id,
-              batchId,
-              itemId,
-              command,
-            );
+            payload = replay
+              ? retryResult
+              : await catalog.retryTranscriptionBatchItem(
+                  actor,
+                  project.id,
+                  batchId,
+                  itemId,
+                  command,
+                );
+            retryResult = payload;
+            if (race?.startsWith("initial") && !replay) {
+              markHeld();
+              await held;
+              if (race === "initial-error")
+                throw new Error("late A retry failure");
+            }
           } else {
             throw new Error(
               `Unexpected fake API request: ${input.method} ${input.path}`,
@@ -366,26 +416,125 @@ describe("desktop Retry transcript action through the fake API bridge", () => {
             contentType: "application/json",
           };
         });
-        vi.stubGlobal("window", { researchVideoDesktop: { request } });
+        let tick: (() => void) | undefined;
+        const clearInterval = vi.fn(() => {
+          tick = undefined;
+        });
+        vi.stubGlobal("window", {
+          researchVideoDesktop: { request },
+          setInterval: (callback: () => void) => {
+            tick = callback;
+            return 17;
+          },
+          clearInterval,
+        });
         const state = vi.fn();
         const message = vi.fn();
         const reload = vi.fn();
-        const pending = vi.fn();
-        await retryWorkspaceTranscript({
-          authorization: "desktop-connected",
-          target: { projectId: project.id, catalogVideoId: video.id },
-          projectId: project.id,
+        const pending = vi.fn<(retry: WorkspaceRetry | undefined) => void>();
+        const target = { projectId: project.id, catalogVideoId: video.id };
+        let current = { ...target, generation: 1 };
+        const callbacks = {
           setWorkspaceLoadState: state,
           setWorkspaceMessage: message,
           setWorkspaceReload: reload,
           setWorkspaceRetry: pending,
-        });
+        };
+        const startRetry = (attempt = current) =>
+          retryWorkspaceTranscript({
+            authorization: "desktop-connected",
+            target,
+            projectId: project.id,
+            attempt,
+            isCurrent: () => current === attempt,
+            ...callbacks,
+          });
+        const startPoll = (attempt: WorkspaceRetry) =>
+          pollWorkspaceRetry({
+            authorization: "desktop-connected",
+            pendingRetry: attempt,
+            isCurrent: () =>
+              current.generation === attempt.generation &&
+              current.projectId === attempt.projectId &&
+              current.catalogVideoId === attempt.catalogVideoId,
+            ...callbacks,
+          });
+        const clearWrites = () => {
+          state.mockClear();
+          message.mockClear();
+          reload.mockClear();
+          pending.mockClear();
+        };
+        const switchToB = () => {
+          current = { ...current, catalogVideoId: randomUUID(), generation: 2 };
+          clearWrites();
+        };
+        const assertNoWrites = () => {
+          expect(state).not.toHaveBeenCalled();
+          expect(message).not.toHaveBeenCalled();
+          expect(reload).not.toHaveBeenCalled();
+          expect(pending).not.toHaveBeenCalled();
+        };
+        const action = startRetry();
+        if (race?.startsWith("initial")) {
+          await reachedHold;
+          switchToB();
+          release();
+          await action;
+          assertNoWrites();
+        } else {
+          await action;
+          if (race) {
+            const attempt = pending.mock.lastCall?.[0];
+            expect(attempt).toBeDefined();
+            polling = true;
+            const stop = startPoll(attempt!);
+            await reachedHold;
+            const oldTick = tick!;
+            switchToB();
+            if (race !== "poll-before-cleanup") stop();
+            release();
+            await new Promise<void>((resolve) => setImmediate(resolve));
+            assertNoWrites();
+            // Even before React's passive cleanup, invalidation must prevent
+            // another request. After cleanup, the captured callback is inert.
+            const requestCount = request.mock.calls.length;
+            oldTick();
+            expect(request.mock.calls).toHaveLength(requestCount);
+            stop();
+            expect(clearInterval).toHaveBeenCalledWith(17);
+            expect(tick).toBeUndefined();
+          }
+        }
+        if (race) {
+          // Returning to A starts a new generation. Use a generated failed-job
+          // snapshot and successful retry response rather than a live provider.
+          current = { ...target, generation: 3 };
+          replay = true;
+          polling = false;
+          holdPoll = false;
+          await startRetry();
+          const attempt = pending.mock.lastCall?.[0];
+          expect(attempt).toMatchObject({ ...current, batchId, itemId });
+          polling = true;
+          const stop = startPoll(attempt!);
+          await vi.waitFor(() => expect(reload).toHaveBeenCalledOnce());
+          expect(message).toHaveBeenLastCalledWith(
+            "Transcript published. Loading it now…",
+          );
+          stop();
+          return;
+        }
         const posts = request.mock.calls
           .map(([input]) => input)
           .filter((input) => input.method === "POST");
         if (retryable) {
           expect(posts.map((input) => input.path)).toEqual([retryPath]);
-          expect(pending).toHaveBeenLastCalledWith({ batchId, itemId });
+          expect(pending).toHaveBeenLastCalledWith({
+            ...current,
+            batchId,
+            itemId,
+          });
           expect(state).toHaveBeenLastCalledWith("unavailable");
           expect(message).toHaveBeenLastCalledWith(
             expect.stringContaining("Retry queued"),
