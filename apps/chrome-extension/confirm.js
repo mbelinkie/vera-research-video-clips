@@ -108,6 +108,7 @@ async function prefillYouTubeReason(projectId) {
       paired.key,
     );
     if (
+      complete ||
       generation !== prefillGeneration ||
       projects.value !== projectId ||
       reasonRevision !== revision ||
@@ -122,6 +123,7 @@ async function prefillYouTubeReason(projectId) {
     reasonHydration.set(projectId, "ready");
   } catch (error) {
     if (
+      !complete &&
       generation === prefillGeneration &&
       projects.value === projectId &&
       reasonRevision === revision &&
@@ -134,7 +136,7 @@ async function prefillYouTubeReason(projectId) {
       byId("retry").hidden = false;
     }
   } finally {
-    syncYouTubeSubmit();
+    if (!complete) syncYouTubeSubmit();
   }
 }
 
