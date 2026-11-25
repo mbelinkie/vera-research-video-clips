@@ -179,3 +179,65 @@ causes are not established. The environment uses the local installation
 workaround described above. The subsequent issue-policy, build and migration
 steps were not reached. Do not claim a green aggregate check; phase 4 must
 recheck and report the actual final gate, without weakening tests.
+
+## Phase 2 — incomplete repair attempt
+
+The worktree contains uncommitted test-only changes: deterministic fake player
+duration (4,000 seconds, covering the final caption cue), readiness waits before
+hosted player actions, unexpected page-error assertions, current V2 clip
+language-evidence and export command parsing, source-rights response echoes,
+and removal of the invented logged-export selection fallback. No product code
+was changed. No tests were removed or skipped; retries remain unchanged.
+
+The attempted 17-case parallel run used the phase 1 environment and Chromium,
+with output in the ticket's workspace-phase2.log and workspace-phase2-traces.
+The first three tests timed out before initial Workspace controls appeared;
+the recorded trace shows unusually delayed Vite startup/module loading.
+The broader catch-all browser request route has now been narrowed to backend
+and non-local-origin requests to avoid intercepting Vite module fetches.
+This revised change is **unverified**. The first run's command handle
+B2vJYb97 stopped responding to polling; its exit code could not be retrieved.
+A Vite process remains on port 43112; ownership/cleanup must be verified before
+a new isolated run. Do not reuse that server or terminate another agent's
+process. No final browser count, focused unit/type result, coverage restoration,
+or phase-2 acceptance is claimed. Historical mapping remains as in phase 1.
+
+Recovery: inspect the uncommitted diff and command-session.json, resolve the
+stale server/handle, run the two baseline failures and all 17 tests with the
+narrowed route, review missing settled coverage against current renderer and
+unit tests, run focused checks, and commit only verified repairs.
+
+## Phase 2 recovery — verified retained Workspace repair
+
+The previous interrupted run left an orphaned Vite process on port 43112.
+Verified the process's working directory was this exact worktree and the
+launch shell was reparented to PID 1; stopped only that orphan tree. Ports
+43110, 43111 and 43112 were free before both fresh test runs and after
+completion. Node 24.19.0, locked Playwright 1.62.1 / Chromium were used.
+The revised route filters intercept only backend and non-local requests,
+not Vite module loads; test-specific routes retain precedence.
+
+- Focused Chromium, one worker, grep canonical YouTube/timed auto-caption:
+  **2 passed, 29.7s, exit 0** (workspace-recovery-focused.log).
+- Complete Workspace Chromium, one worker: **17 passed, 1.4m, exit 0**
+  (workspace-recovery-full.log). All original assertions retained, no
+  Workspace skips or retries, no product change, no live backend/provider.
+  Unexpected page-error assertions passed in every case.
+- `npm run typecheck` and Prettier check of the changed spec passed.
+- Eight focused unit files (contracts, transcript, immediate transcript,
+  desktop auth, batch actions, spoken language, notification navigation,
+  YouTube source view): 172 passed, one timed out at its existing 30s limit
+  (workspace-recovery-checks.log). The unmodified batch test
+  `poll-before-cleanup` passed on isolated rerun in 8.3s with the existing
+  limit (workspace-recovery-unit-retry.log; 16 nonmatching cases filtered).
+  No retry policy or timeout was changed; the initial aggregate failure
+  remains part of the evidence.
+- Retained count remains 17. The earlier checkpoint mapping is historical,
+  not a confirmed list of missing current regressions; no historical tests
+  were blindly transplanted into the hosted/desktop split. Current focused
+  unit coverage includes exact language gate selection, retry races, and
+  notification navigation. The original audit's eight identities and
+  historical browser-only equivalence remain unverified.
+- No full `npm run check` rerun or CI result is claimed in phase 2; phase 1
+  baseline failures remain documented. Phase 3 must wire the required Check;
+  phase 4 must repeat the broader gates and review historical coverage gaps.
