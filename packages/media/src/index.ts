@@ -58,6 +58,12 @@ export interface MediaInspector {
     durationMs: number;
     videoCodec?: string;
     audioCodec?: string;
+    /** Evidence from the selected streams, never inferred from format duration. */
+    videoDurationMs?: number;
+    audioDurationMs?: number;
+    videoStartMs?: number;
+    audioStartMs?: number;
+    videoFrameDurationMs?: number;
   }>;
 }
 

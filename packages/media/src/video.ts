@@ -193,6 +193,39 @@ export function createFullVideoAcquirer(
     : undefined;
 }
 
+// ffprobe reports seconds as decimal strings; absent or invalid stream
+// evidence stays absent rather than falling back to the container duration.
+function streamMilliseconds(
+  value: unknown,
+  duration: boolean,
+): number | undefined {
+  if (
+    (typeof value !== "number" && typeof value !== "string") ||
+    (typeof value === "string" && !value.trim())
+  )
+    return undefined;
+  const seconds = Number(value);
+  if (!Number.isFinite(seconds) || Math.abs(seconds) > 1e9) return undefined;
+  const milliseconds = Math.round(seconds * 1_000);
+  return duration && milliseconds <= 0 ? undefined : milliseconds;
+}
+
+function frameDurationMilliseconds(value: unknown): number | undefined {
+  if (typeof value !== "string" || !/^\d+\/\d+$/u.test(value)) return undefined;
+  const [numerator, denominator] = value.split("/").map(Number);
+  if (
+    !numerator ||
+    !denominator ||
+    !Number.isFinite(numerator) ||
+    !Number.isFinite(denominator)
+  )
+    return undefined;
+  const milliseconds = Math.ceil((denominator / numerator) * 1_000);
+  return Number.isSafeInteger(milliseconds) && milliseconds > 0
+    ? milliseconds
+    : undefined;
+}
+
 export class FfprobeMediaInspector implements MediaInspector {
   readonly #executable: string;
   readonly #runner: MediaCommandRunner;
@@ -204,11 +237,7 @@ export class FfprobeMediaInspector implements MediaInspector {
     this.#timeoutMs = validTimeout(options.timeoutMs ?? 30_000);
   }
 
-  async inspect(path: string): Promise<{
-    durationMs: number;
-    videoCodec?: string;
-    audioCodec?: string;
-  }> {
+  async inspect(path: string): ReturnType<MediaInspector["inspect"]> {
     await assertRegularMediaFile(path);
     const { stdout } = await this.#runner.run(
       this.#executable,
@@ -216,7 +245,7 @@ export class FfprobeMediaInspector implements MediaInspector {
         "-v",
         "error",
         "-show_entries",
-        "format=duration:stream=codec_type,codec_name",
+        "format=duration:stream=codec_type,codec_name,duration,start_time,avg_frame_rate",
         "-of",
         "json",
         path,
@@ -245,6 +274,9 @@ export class FfprobeMediaInspector implements MediaInspector {
     const streams = result.streams as Array<{
       codec_type?: unknown;
       codec_name?: unknown;
+      duration?: unknown;
+      start_time?: unknown;
+      avg_frame_rate?: unknown;
     }>;
     const video = streams.find((stream) => stream.codec_type === "video");
     const audio = streams.find((stream) => stream.codec_type === "audio");
@@ -258,10 +290,22 @@ export class FfprobeMediaInspector implements MediaInspector {
         "Media requires a video and an audio stream.",
       );
     }
+    const videoDurationMs = streamMilliseconds(video.duration, true);
+    const audioDurationMs = streamMilliseconds(audio.duration, true);
+    const videoStartMs = streamMilliseconds(video.start_time, false);
+    const audioStartMs = streamMilliseconds(audio.start_time, false);
+    const videoFrameDurationMs = frameDurationMilliseconds(
+      video.avg_frame_rate,
+    );
     return {
       durationMs: Math.round(seconds * 1_000),
       videoCodec: video.codec_name,
       audioCodec: audio.codec_name,
+      ...(videoDurationMs === undefined ? {} : { videoDurationMs }),
+      ...(audioDurationMs === undefined ? {} : { audioDurationMs }),
+      ...(videoStartMs === undefined ? {} : { videoStartMs }),
+      ...(audioStartMs === undefined ? {} : { audioStartMs }),
+      ...(videoFrameDurationMs === undefined ? {} : { videoFrameDurationMs }),
     };
   }
 }

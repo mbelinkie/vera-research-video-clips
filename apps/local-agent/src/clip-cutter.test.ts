@@ -1,5 +1,13 @@
 import { randomUUID } from "node:crypto";
-import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import {
+  mkdtemp,
+  readFile,
+  readdir,
+  realpath,
+  rm,
+  stat,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -7,7 +15,13 @@ import {
   ClipCandidateSchema,
   type ClipCandidate,
 } from "@research-video/contracts";
-import { hashMediaFile } from "@research-video/media";
+import {
+  FfmpegVideoRangeRenderer,
+  FfprobeVideoInspector,
+  hashMediaFile,
+  SpawnMediaCommandRunner,
+  type MediaInspector,
+} from "@research-video/media";
 import { normalizeTranscriptFixture } from "@research-video/transcript";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -73,7 +87,7 @@ afterEach(async () => {
 });
 
 async function fakeCutter(clips: ClipCandidate[]) {
-  const root = await mkdtemp(join(tmpdir(), "logged-cut-"));
+  const root = await mkdtemp(join(await realpath(tmpdir()), "logged-cut-"));
   tempRoots.push(root);
   const exportDirectory = join(root, "exports");
   const sources: string[] = [];
@@ -138,11 +152,18 @@ async function fakeCutter(clips: ClipCandidate[]) {
     }),
   };
   const inspector = {
-    inspect: vi.fn(async (path: string) =>
-      path.includes(".stage-")
-        ? { durationMs: 3_400, videoCodec: "h264", audioCodec: "aac" }
-        : { durationMs: 10_000, videoCodec: "h264", audioCodec: "aac" },
-    ),
+    inspect: vi.fn<MediaInspector["inspect"]>(async (path) => {
+      const durationMs = path.includes(".stage-") ? 3_400 : 10_000;
+      return {
+        durationMs,
+        videoCodec: "h264",
+        audioCodec: "aac",
+        videoDurationMs: durationMs,
+        audioDurationMs: durationMs,
+        videoStartMs: 0,
+        audioStartMs: 0,
+      };
+    }),
   };
   const deps: ClipCutterDependencies = {
     catalog,
@@ -173,6 +194,181 @@ async function fakeCutter(clips: ClipCandidate[]) {
 }
 
 describe("foreground logged clip cutter", () => {
+  it.each([
+    { videoSeconds: 2, audioSeconds: 4, complete: false },
+    { videoSeconds: 4, audioSeconds: 2, complete: false },
+    { videoSeconds: 4, audioSeconds: 4, complete: true },
+  ])(
+    "checks each real output stream (video $videoSeconds s, audio $audioSeconds s)",
+    async ({ videoSeconds, audioSeconds, complete }) => {
+      const clip = makeClip();
+      clip.selection.exportStartMs = 400;
+      const f = await fakeCutter([clip]);
+      const runner = new SpawnMediaCommandRunner();
+      const inspector = new FfprobeVideoInspector();
+      f.deps.inspector = inspector;
+      f.deps.renderer = new FfmpegVideoRangeRenderer();
+      f.acquirer.acquireAuthorizedVideo.mockImplementation(
+        async ({ videoId, scratchDirectory }) => {
+          const scratchPath = join(scratchDirectory, `video-${videoId}.mp4`);
+          await runner.run(
+            "ffmpeg",
+            [
+              "-hide_banner",
+              "-nostdin",
+              "-loglevel",
+              "error",
+              "-f",
+              "lavfi",
+              "-i",
+              `color=c=blue:s=160x90:r=25:d=${videoSeconds}`,
+              "-f",
+              "lavfi",
+              "-i",
+              `sine=frequency=440:sample_rate=48000:duration=${audioSeconds}`,
+              "-c:v",
+              "libx264",
+              "-pix_fmt",
+              "yuv420p",
+              "-c:a",
+              "aac",
+              "-n",
+              scratchPath,
+            ],
+            { timeoutMs: 30_000 },
+          );
+          return {
+            videoId,
+            scratchPath,
+            format: "mp4" as const,
+            byteSize: (await stat(scratchPath)).size,
+            contentSha256: await hashMediaFile(scratchPath),
+          };
+        },
+      );
+      if (!complete) {
+        await expect(cutLoggedClips(f.request, f.deps)).rejects.toThrow(
+          /verification/u,
+        );
+        expect(await readdir(f.exportDirectory)).toEqual([".locks"]);
+      } else {
+        const [result] = await cutLoggedClips(f.request, f.deps);
+        expect(result!.subtitlePaths).toHaveLength(1);
+        expect(await readFile(result!.subtitlePaths[0]!, "utf8")).toContain(
+          "00:00:03,000",
+        );
+        expect(await inspector.inspect(result!.mediaPath)).toMatchObject({
+          durationMs: 3000,
+          videoCodec: "h264",
+          audioCodec: "aac",
+          videoDurationMs: 3000,
+          audioDurationMs: 3000,
+          videoStartMs: 0,
+          audioStartMs: 0,
+        });
+      }
+    },
+    60_000,
+  );
+
+  it.each([
+    {
+      label: "missing video duration",
+      coverage: { audioDurationMs: 3400, videoStartMs: 0, audioStartMs: 0 },
+    },
+    {
+      label: "missing audio duration",
+      coverage: { videoDurationMs: 3400, videoStartMs: 0, audioStartMs: 0 },
+    },
+    {
+      label: "invalid video duration",
+      coverage: {
+        videoDurationMs: NaN,
+        audioDurationMs: 3400,
+        videoStartMs: 0,
+        audioStartMs: 0,
+      },
+    },
+    {
+      label: "missing audio start",
+      coverage: {
+        videoDurationMs: 3400,
+        audioDurationMs: 3400,
+        videoStartMs: 0,
+      },
+    },
+    {
+      label: "late video start",
+      coverage: {
+        videoDurationMs: 3400,
+        audioDurationMs: 3400,
+        videoStartMs: 400,
+        audioStartMs: 0,
+      },
+    },
+    {
+      label: "short audio",
+      coverage: {
+        videoDurationMs: 3400,
+        audioDurationMs: 3000,
+        videoStartMs: 0,
+        audioStartMs: 0,
+      },
+    },
+    {
+      label: "short video",
+      coverage: {
+        videoDurationMs: 3000,
+        audioDurationMs: 3400,
+        videoStartMs: 0,
+        audioStartMs: 0,
+      },
+    },
+  ])(
+    "refuses $label despite a complete container duration",
+    async ({ coverage }) => {
+      const f = await fakeCutter([makeClip()]);
+      const inspect = f.inspector.inspect.getMockImplementation()!;
+      f.inspector.inspect.mockImplementation(async (path) =>
+        path.includes(".stage-")
+          ? {
+              durationMs: 3400,
+              videoCodec: "h264",
+              audioCodec: "aac",
+              ...coverage,
+            }
+          : inspect(path),
+      );
+      await expect(cutLoggedClips(f.request, f.deps)).rejects.toThrow(
+        /per-stream range coverage verification/u,
+      );
+      expect(await readdir(f.exportDirectory)).toEqual([".locks"]);
+    },
+  );
+
+  it("accepts frame and encoder rounding while retaining subtitles", async () => {
+    const f = await fakeCutter([makeClip()]);
+    const inspect = f.inspector.inspect.getMockImplementation()!;
+    f.inspector.inspect.mockImplementation(async (path) =>
+      path.includes(".stage-")
+        ? {
+            durationMs: 3400,
+            videoCodec: "h264",
+            audioCodec: "aac",
+            videoDurationMs: 3360,
+            audioDurationMs: 3379,
+            videoStartMs: 40,
+            audioStartMs: -10,
+            videoFrameDurationMs: 40,
+          }
+        : inspect(path),
+    );
+    const [result] = await cutLoggedClips(f.request, f.deps);
+    expect(await readFile(result!.subtitlePaths[0]!, "utf8")).toContain(
+      "00:00:03,400",
+    );
+  });
+
   it("pre-authorizes two same-video clips, fetches once, stages verified packages and deletes source", async () => {
     const a = makeClip(),
       b = makeClip();

@@ -226,6 +226,26 @@ async function verifyPackage(
   }
 }
 
+// Allow small timestamp/encoder rounding (and a video frame for slower
+// footage), never the container's duration as a substitute for stream evidence.
+function coversRequestedRange(
+  startMs: number | undefined,
+  durationMs: number | undefined,
+  wantedMs: number,
+  toleranceMs: number,
+): boolean {
+  return (
+    startMs !== undefined &&
+    durationMs !== undefined &&
+    Number.isSafeInteger(startMs) &&
+    Number.isSafeInteger(durationMs) &&
+    durationMs > 0 &&
+    Math.abs(startMs) <= toleranceMs &&
+    durationMs >= wantedMs - toleranceMs &&
+    startMs + durationMs >= wantedMs - toleranceMs
+  );
+}
+
 async function renderClip(
   item: PreparedClip,
   sourcePath: string,
@@ -265,6 +285,31 @@ async function renderClip(
     ) {
       throw new Error(
         "Rendered MP4 failed duration or H.264/AAC verification.",
+      );
+    }
+    // MP4 time is clip-relative. Cap frame rounding at the existing
+    // container tolerance; AAC encoder rounding normally fits within 100 ms.
+    const frameMs = media.videoFrameDurationMs;
+    const videoToleranceMs =
+      frameMs !== undefined && Number.isSafeInteger(frameMs) && frameMs > 0
+        ? Math.min(500, Math.max(100, frameMs))
+        : 100;
+    if (
+      !coversRequestedRange(
+        media.videoStartMs,
+        media.videoDurationMs,
+        wanted,
+        videoToleranceMs,
+      ) ||
+      !coversRequestedRange(
+        media.audioStartMs,
+        media.audioDurationMs,
+        wanted,
+        100,
+      )
+    ) {
+      throw new Error(
+        "Rendered MP4 failed per-stream range coverage verification.",
       );
     }
     const artifacts: ManifestArtifact[] = [

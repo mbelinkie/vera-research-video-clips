@@ -800,8 +800,19 @@ describe("FFprobe/FFmpeg guarded cut adapters", () => {
       stdout: JSON.stringify({
         format: { duration: "3.420" },
         streams: [
-          { codec_type: "video", codec_name: "h264" },
-          { codec_type: "audio", codec_name: "aac" },
+          {
+            codec_type: "video",
+            codec_name: "h264",
+            duration: "1.600",
+            start_time: "0.040",
+            avg_frame_rate: "25/1",
+          },
+          {
+            codec_type: "audio",
+            codec_name: "aac",
+            duration: "3.4196",
+            start_time: "-0.021333",
+          },
         ],
       }),
       stderr: "",
@@ -813,16 +824,57 @@ describe("FFprobe/FFmpeg guarded cut adapters", () => {
         durationMs: 3420,
         videoCodec: "h264",
         audioCodec: "aac",
+        videoDurationMs: 1600,
+        audioDurationMs: 3420,
+        videoStartMs: 40,
+        audioStartMs: -21,
+        videoFrameDurationMs: 40,
       });
       expect(run.mock.calls[0]![1]).toEqual([
         "-v",
         "error",
         "-show_entries",
-        "format=duration:stream=codec_type,codec_name",
+        "format=duration:stream=codec_type,codec_name,duration,start_time,avg_frame_rate",
         "-of",
         "json",
         media,
       ]);
+      // Source preflight may still use format duration, but missing or invalid
+      // stream values must not masquerade as coverage on the rendered clip.
+      for (const duration of [
+        undefined,
+        null,
+        "N/A",
+        "",
+        "0",
+        "-1",
+        "Infinity",
+        true,
+      ]) {
+        run.mockResolvedValueOnce({
+          stdout: JSON.stringify({
+            format: { duration: "3.420" },
+            streams: [
+              {
+                codec_type: "video",
+                codec_name: "h264",
+                duration,
+                start_time: "N/A",
+                avg_frame_rate: "0/0",
+              },
+              { codec_type: "audio", codec_name: "aac", duration },
+            ],
+          }),
+          stderr: "",
+        });
+        await expect(
+          new FfprobeVideoInspector({ runner: { run } }).inspect(media),
+        ).resolves.toEqual({
+          durationMs: 3420,
+          videoCodec: "h264",
+          audioCodec: "aac",
+        });
+      }
       await expect(
         new FfprobeVideoInspector({
           runner: {
