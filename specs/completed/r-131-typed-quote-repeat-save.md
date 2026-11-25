@@ -25,3 +25,18 @@ Narrow checks: generated Chromium cases in tests/e2e/typed-quotes.spec.ts,
 followed by the entire typed-quotes spec and typed-quote-model tests. Run
 npm run check in Linux during verification phase. No live services or data;
 independent deployment acceptance is separate.
+
+## Verification
+
+- Phase 1: both generated regressions failed against main `9494251` (two
+  POSTs rather than one); both passed after the fix in `a92b78d`. The full
+  typed-quotes browser suite passed 18/18 and the model suite passed 12/12.
+- Phase 2: repeated the entire typed-quotes Chromium suite in Linux with a
+  temporary worktree-local Playwright configuration on port 43232, one
+  worker, and no reused server: 18/18 passed. Temporary configuration removed.
+- `npm run check` exited 0: formatting and TypeScript passed; Vitest 477
+  passed, 5 skipped (62 files passed, 4 skipped); issue-policy tests 8/8;
+  web build succeeded; local and cloud test migrations validated (6 and 17).
+- Reviewed the complete change against the phase-1 base and checked whitespace.
+  Generated routes and local test adapters only; production/deployed checks
+  remain separate. The default gate's skipped tests were not run separately.
