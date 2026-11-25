@@ -1390,6 +1390,82 @@ describe("transcription batch retry and archive", () => {
 });
 
 describe("project local processing policy", () => {
+  it("exposes the exact hidden automatic failed item through the worklist and requeues it by version", async () => {
+    const { catalog } = await authorityCatalog();
+    const actor = authorityActor("automatic-retry");
+    await catalog.registerUser(actor, "Automatic Retry", "automatic_retry");
+    const project = await catalog.createProject(actor, {
+      name: "Automatic retry",
+    });
+    const video = await catalog.addVideo(
+      actor,
+      project.id,
+      {
+        youtubeVideoId: "RetryItem01",
+        canonicalUrl: "https://www.youtube.com/watch?v=RetryItem01",
+        title: "Generated retry fixture",
+        sourceLanguage: "en",
+      },
+      { automaticLocalProcessing: true },
+    );
+    const claim = await catalog.claimTranscriptionJob(actor, "local", 120);
+    expect(claim).toBeDefined();
+    await catalog.failTranscriptionJob(actor, claim!.job.id, {
+      attempt: claim!.lease.attempt,
+      code: "temporary_failure",
+      message: "Generated retryable failure",
+      retryable: true,
+    });
+    await expect(
+      catalog.listTranscriptionBatches(actor, project.id),
+    ).resolves.toEqual({ batches: [] });
+    const page = await catalog.listProjectVideoWorklist(actor, project.id, {
+      limit: 50,
+      view: "all",
+    });
+    const processing = page.items.find(
+      (item) => item.video.id === video.id,
+    )!.processing;
+    expect(processing).toMatchObject({
+      state: "failed",
+      jobId: claim!.job.id,
+      error: { retryable: true },
+    });
+    const detail = await catalog.getTranscriptionBatch(
+      actor,
+      project.id,
+      processing.batchId!,
+    );
+    const item = detail.items.find(
+      (candidate) => candidate.id === processing.batchItemId,
+    )!;
+    expect(item).toMatchObject({
+      catalogVideoId: video.id,
+      state: "failed",
+      error: { retryable: true },
+    });
+    const result = await catalog.retryTranscriptionBatchItem(
+      actor,
+      project.id,
+      detail.batch.id,
+      item.id,
+      {
+        idempotencyKey: "retry-generated-automatic-item",
+        expectedVersion: item.version,
+      },
+    );
+    expect(result).toMatchObject({
+      outcome: "queued",
+      item: { id: item.id, state: "queued" },
+    });
+    await expect(
+      catalog.listTranscriptionBatches(actor, project.id),
+    ).resolves.toEqual({ batches: [] });
+    const reclaimed = await catalog.claimTranscriptionJob(actor, "local", 120);
+    expect(reclaimed?.job.id).toBe(claim!.job.id);
+    expect(reclaimed?.lease.attempt).toBe(claim!.lease.attempt + 1);
+  });
+
   it("automates direct ingest, gates local starts, and replays Administrator policy commands", async () => {
     const { database, catalog } = await authorityCatalog();
     const owner = authorityActor("local-policy-owner");

@@ -1,4 +1,15 @@
-import { describe, expect, it } from "vitest";
+import { randomUUID } from "node:crypto";
+import { PGlite } from "@electric-sql/pglite";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { SharedProjectCatalog } from "@research-video/catalog";
+import {
+  ProjectVideoWorklistQuerySchema,
+  RetryTranscriptionBatchItemRequestSchema,
+  type DesktopApiRequest,
+} from "@research-video/contracts";
+import { runCloudMigrations } from "@research-video/db-cloud";
+import { MemoryTranscriptObjectStore } from "@research-video/storage";
+import { retryWorkspaceTranscript } from "./desktop-transcript-retry.ts";
 
 import {
   findRetryableTranscriptionItem,
@@ -201,4 +212,207 @@ describe("selected-video transcript retry", () => {
       ),
     ).toBeUndefined();
   });
+});
+
+describe("desktop Retry transcript action through the fake API bridge", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it.each([
+    { mode: "automatic", retryable: true },
+    { mode: "manual", retryable: true },
+    { mode: "automatic", retryable: false },
+  ])(
+    "handles $mode processing (retryable=$retryable)",
+    async ({ mode, retryable }) => {
+      const database = new PGlite();
+      try {
+        await runCloudMigrations(database);
+        const catalog = new SharedProjectCatalog(
+          database,
+          new MemoryTranscriptObjectStore(),
+        );
+        const actor = {
+          userId: randomUUID(),
+          externalSubject: "fixture:desktop-retry",
+        };
+        await catalog.registerUser(actor, "Retry Fixture", "retry_fixture");
+        const project = await catalog.createProject(actor, {
+          name: "Generated retry fixture",
+        });
+        const metadata = {
+          youtubeVideoId: "RetryItem01",
+          canonicalUrl: "https://www.youtube.com/watch?v=RetryItem01",
+          title: "Generated selected video",
+          sourceLanguage: "en",
+        };
+        const video = await catalog.addVideo(actor, project.id, metadata, {
+          automaticLocalProcessing: mode === "automatic",
+        });
+        if (mode === "manual") {
+          await catalog.createTranscriptionBatch(actor, {
+            projectId: project.id,
+            name: "Manual fixture",
+            options: {
+              targetLanguage: "en",
+              transcriptionProfile: "default",
+              sourcePolicy: "prefer-existing",
+              executionLocation: "local",
+              priority: "normal",
+            },
+            items: [
+              {
+                ...metadata,
+                inputIndex: 0,
+                input: metadata.canonicalUrl,
+                status: "ready",
+                processingNeed: "transcription",
+              },
+            ],
+          });
+        }
+        const claim = await catalog.claimTranscriptionJob(actor, "local", 120);
+        expect(claim).toBeDefined();
+        await catalog.failTranscriptionJob(actor, claim!.job.id, {
+          attempt: claim!.lease.attempt,
+          code: "generated_failure",
+          message: "Generated failure",
+          retryable,
+        });
+        const row = (
+          await catalog.listProjectVideoWorklist(actor, project.id, {
+            limit: 50,
+          })
+        ).items.find((item) => item.video.id === video.id)!;
+        expect(row.processing).toMatchObject({
+          state: "failed",
+          error: { retryable },
+        });
+        const batchId = row.processing.batchId!;
+        const itemId = row.processing.batchItemId!;
+        const detail = await catalog.getTranscriptionBatch(
+          actor,
+          project.id,
+          batchId,
+        );
+        const failedItem = detail.items.find((item) => item.id === itemId)!;
+        expect(failedItem).toMatchObject({
+          catalogVideoId: video.id,
+          state: "failed",
+        });
+        const listed = await catalog.listTranscriptionBatches(
+          actor,
+          project.id,
+        );
+        expect(listed.batches.map((entry) => entry.batch.id)).toEqual(
+          mode === "manual" ? [batchId] : [],
+        );
+
+        const base = `/api/projects/${project.id}`;
+        const retryPath = `${base}/transcription-batches/${batchId}/items/${itemId}/retry`;
+        const request = vi.fn(async (input: DesktopApiRequest) => {
+          const url = new URL(input.path, "https://fixture.invalid");
+          let payload: unknown;
+          if (input.method === "GET" && url.pathname === `${base}/worklist`) {
+            // Force a second page in the automatic case and an absent row in the
+            // manual case to exercise the existing listed-batch fallback.
+            if (mode === "manual") payload = { items: [], total: 0 };
+            else if (!url.searchParams.has("cursor"))
+              payload = { items: [], total: 1, nextCursor: "fixture+page" };
+            else {
+              expect(url.searchParams.get("cursor")).toBe("fixture+page");
+              payload = await catalog.listProjectVideoWorklist(
+                actor,
+                project.id,
+                ProjectVideoWorklistQuerySchema.parse({ limit: 50 }),
+              );
+            }
+          } else if (
+            input.method === "GET" &&
+            url.pathname === `${base}/transcription-batches`
+          ) {
+            payload = await catalog.listTranscriptionBatches(actor, project.id);
+          } else if (
+            input.method === "GET" &&
+            url.pathname === `${base}/transcription-batches/${batchId}`
+          ) {
+            payload = await catalog.getTranscriptionBatch(
+              actor,
+              project.id,
+              batchId,
+            );
+          } else if (input.method === "POST" && url.pathname === retryPath) {
+            const command = RetryTranscriptionBatchItemRequestSchema.parse(
+              JSON.parse(input.body!),
+            );
+            expect(command).toEqual({
+              expectedVersion: failedItem.version,
+              idempotencyKey: `workspace-transcript-retry:${project.id}:${itemId}:v${failedItem.version}`,
+            });
+            payload = await catalog.retryTranscriptionBatchItem(
+              actor,
+              project.id,
+              batchId,
+              itemId,
+              command,
+            );
+          } else {
+            throw new Error(
+              `Unexpected fake API request: ${input.method} ${input.path}`,
+            );
+          }
+          return {
+            status: 200,
+            body: JSON.stringify(payload),
+            contentType: "application/json",
+          };
+        });
+        vi.stubGlobal("window", { researchVideoDesktop: { request } });
+        const state = vi.fn();
+        const message = vi.fn();
+        const reload = vi.fn();
+        const pending = vi.fn();
+        await retryWorkspaceTranscript({
+          authorization: "desktop-connected",
+          target: { projectId: project.id, catalogVideoId: video.id },
+          projectId: project.id,
+          setWorkspaceLoadState: state,
+          setWorkspaceMessage: message,
+          setWorkspaceReload: reload,
+          setWorkspaceRetry: pending,
+        });
+        const posts = request.mock.calls
+          .map(([input]) => input)
+          .filter((input) => input.method === "POST");
+        if (retryable) {
+          expect(posts.map((input) => input.path)).toEqual([retryPath]);
+          expect(pending).toHaveBeenLastCalledWith({ batchId, itemId });
+          expect(state).toHaveBeenLastCalledWith("unavailable");
+          expect(message).toHaveBeenLastCalledWith(
+            expect.stringContaining("Retry queued"),
+          );
+          expect(reload).not.toHaveBeenCalled();
+          const reclaimed = await catalog.claimTranscriptionJob(
+            actor,
+            "local",
+            120,
+          );
+          expect(reclaimed?.job.id).toBe(claim!.job.id);
+        } else {
+          expect(posts).toEqual([]);
+          expect(pending).toHaveBeenLastCalledWith(undefined);
+          expect(state).toHaveBeenLastCalledWith("failed");
+          expect(message).toHaveBeenLastCalledWith(
+            expect.stringContaining("No retryable failed job exists"),
+          );
+          expect(reload).toHaveBeenCalledOnce();
+          expect(
+            await catalog.claimTranscriptionJob(actor, "local", 120),
+          ).toBeFalsy();
+        }
+      } finally {
+        await database.close();
+      }
+    },
+    30_000,
+  );
 });
