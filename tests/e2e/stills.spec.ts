@@ -69,6 +69,8 @@ async function connectSavedStill(
             id: projectId,
             name: "Fixture project",
             description: "",
+            kind: "shared",
+            visibility: "invitation_only",
             version: 1,
             createdAt: now,
             updatedAt: now,

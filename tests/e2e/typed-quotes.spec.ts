@@ -210,6 +210,8 @@ async function fixture(
             id,
             name: index === 0 ? "Fixture research" : "Another project",
             description: "",
+            kind: "shared",
+            visibility: "invitation_only",
             version: 1,
             createdAt: now,
             updatedAt: now,

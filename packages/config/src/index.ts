@@ -12,20 +12,29 @@ const LoopbackHostSchema = z
   );
 
 const PortSchema = z.coerce.number().int().min(1).max(65_535);
+const LocalAgentPortSchema = z.coerce.number().int().min(0).max(65_535);
 const MillisecondsSchema = z.coerce.number().int().min(1).max(60_000);
 
 export const AppConfigSchema = z
   .object({
     nodeEnv: z.enum(["development", "test", "production"]),
+    runtimeRole: z.enum(["cloud-api", "desktop-local", "desktop-worker"]),
     localAgentHost: LoopbackHostSchema,
-    localAgentPort: PortSchema,
+    localAgentPort: LocalAgentPortSchema,
     cloudApiHost: z.string().min(1),
-    cloudAuthMode: z.enum(["development", "browser"]),
+    cloudAuthMode: z.enum(["development", "browser", "cognito"]),
+    cognitoUserPoolId: z.string().trim().min(1).optional(),
     browserPublicOrigin: z.string().optional(),
     browserCallbackUrl: z.string().optional(),
     browserLogoutUrl: z.string().optional(),
+    cognitoRedirectUri: z
+      .literal("research-video-clips://oauth/callback")
+      .optional(),
+    cognitoLogoutUri: z
+      .literal("research-video-clips://oauth/logout")
+      .optional(),
     cognitoIssuer: z.string().optional(),
-    cognitoDomain: z.string().optional(),
+    cognitoDomain: z.url().optional(),
     cognitoClientId: z.string().trim().min(1).optional(),
     cognitoClientSecret: z.string().min(1).optional(),
     trustedProxyPeers: z.array(LoopbackHostSchema),
@@ -40,6 +49,16 @@ export const AppConfigSchema = z
       .min(300_000)
       .max(86_400_000),
     cloudApiPort: PortSchema,
+    publicApiOrigin: z.url().optional(),
+    cloudDatabaseMode: z.enum(["pglite", "postgres"]),
+    databaseUrl: z.string().trim().min(1).optional(),
+    databaseHost: z.string().trim().min(1).optional(),
+    databasePort: PortSchema.optional(),
+    databaseName: z.string().trim().min(1).optional(),
+    databaseUsername: z.string().trim().min(1).optional(),
+    databasePassword: z.string().min(1).optional(),
+    databaseSslMode: z.enum(["disable", "require", "verify-full"]),
+    databaseCaCertPath: z.string().trim().min(1).optional(),
     runtimeMode: z.enum(["development", "mac-pilot", "managed-local"]),
     databaseMode: z.enum(["pglite", "postgres"]),
     pilotPgUrl: z.string().optional(),
@@ -54,10 +73,12 @@ export const AppConfigSchema = z
       }),
     objectStoreMode: z.enum(["memory", "s3", "local"]),
     queueMode: z.enum(["memory", "sqs"]),
+    jobQueueUrl: z.url().optional(),
     captionProvider: z.enum(["disabled", "yt-dlp"]),
     mediaProvider: z.enum(["disabled", "yt-dlp-audio"]),
     exportSourceProvider: z.enum(["disabled", "yt-dlp"]),
     ytDlpPath: z.string().trim().min(1),
+    youtubeApiKey: z.string().trim().min(1).optional(),
     ffmpegPath: z.string().trim().min(1),
     wordTimingPython: z.string().trim().min(1).optional(),
     ffprobePath: z.string().trim().min(1),
@@ -65,8 +86,22 @@ export const AppConfigSchema = z
     whisperCppPath: z.string().trim().min(1),
     whisperCppModelPath: z.string().trim().min(1).optional(),
     whisperCppModelName: z.string().trim().min(1).optional(),
-    translationProvider: z.enum(["disabled", "aws-translate"]),
+    translationProvider: z
+      .string()
+      .regex(/^(disabled|[a-z0-9][a-z0-9.-]{1,158}[a-z0-9])$/u),
     awsTranslateTerminology: z.string().trim().min(1).optional(),
+    localModelCatalogSigningKeyId: z.string().trim().min(1).max(160).optional(),
+    localModelCatalogSigningPrivateKeyBase64: z
+      .string()
+      .trim()
+      .min(1)
+      .optional(),
+    localModelCatalogTrustRoots: z.record(
+      z.string().trim().min(1).max(160),
+      z.string().trim().min(1).max(32_768),
+    ),
+    argosSidecarPath: z.string().trim().min(1).optional(),
+    argosRuntimeVersions: z.array(z.string().trim().min(1).max(160)).max(32),
     awsRegion: z.string().min(1),
     transcriptBucket: z.string().min(3).optional(),
     workerAuthorization: z.string().trim().min(1).optional(),
@@ -80,7 +115,10 @@ export const AppConfigSchema = z
   .superRefine((config, context) => {
     const reject = (path: string, message: string) =>
       context.addIssue({ code: "custom", path: [path], message });
-    if (config.nodeEnv === "production" && config.cloudAuthMode !== "browser") {
+    if (
+      config.nodeEnv === "production" &&
+      config.cloudAuthMode === "development"
+    ) {
       reject("cloudAuthMode", "Production cloud API requires browser BFF mode");
     }
     if (
@@ -208,7 +246,14 @@ export const AppConfigSchema = z
         "cloudflareAccessAud",
         "A friend-facing Mac pilot requires CF_ACCESS_TEAM_DOMAIN and CF_ACCESS_AUD",
       );
-    if (config.nodeEnv === "production" && config.runtimeMode !== "mac-pilot") {
+    if (
+      config.nodeEnv === "production" &&
+      config.runtimeMode !== "mac-pilot" &&
+      !(
+        config.runtimeRole === "cloud-api" &&
+        config.cloudDatabaseMode === "postgres"
+      )
+    ) {
       context.addIssue({
         code: "custom",
         path: ["runtimeMode"],
@@ -360,6 +405,119 @@ export const AppConfigSchema = z
         message: "VERA_WORD_TIMING_PYTHON is only supported by local workers",
       });
     }
+    if (config.localAgentPort === 0 && config.runtimeRole !== "desktop-local") {
+      context.addIssue({
+        code: "custom",
+        path: ["localAgentPort"],
+        message:
+          "Only the supervised desktop agent may request an ephemeral port",
+      });
+    }
+    const hasDatabaseParts = Boolean(
+      config.databaseHost &&
+      config.databasePort &&
+      config.databaseName &&
+      config.databaseUsername &&
+      config.databasePassword,
+    );
+    if (
+      config.cloudDatabaseMode === "postgres" &&
+      !config.databaseUrl &&
+      !hasDatabaseParts
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["databaseUrl"],
+        message:
+          "DATABASE_URL or all DATABASE_HOST/PORT/NAME/USERNAME/PASSWORD fields are required when CLOUD_DATABASE_MODE=postgres",
+      });
+    }
+    if (config.queueMode === "sqs" && !config.jobQueueUrl) {
+      context.addIssue({
+        code: "custom",
+        path: ["jobQueueUrl"],
+        message: "JOB_QUEUE_URL is required when QUEUE_MODE=sqs",
+      });
+    }
+    if (config.cloudAuthMode === "cognito") {
+      for (const [path, value, message] of [
+        ["cognitoUserPoolId", config.cognitoUserPoolId, "COGNITO_USER_POOL_ID"],
+        ["cognitoClientId", config.cognitoClientId, "COGNITO_CLIENT_ID"],
+        ["cognitoDomain", config.cognitoDomain, "COGNITO_DOMAIN"],
+        [
+          "cognitoRedirectUri",
+          config.cognitoRedirectUri,
+          "COGNITO_REDIRECT_URI",
+        ],
+        ["cognitoLogoutUri", config.cognitoLogoutUri, "COGNITO_LOGOUT_URI"],
+      ] as const) {
+        if (!value) {
+          context.addIssue({
+            code: "custom",
+            path: [path],
+            message: `${message} is required when CLOUD_AUTH_MODE=cognito`,
+          });
+        }
+      }
+    }
+    if (
+      Boolean(config.localModelCatalogSigningKeyId) !==
+      Boolean(config.localModelCatalogSigningPrivateKeyBase64)
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["localModelCatalogSigningPrivateKeyBase64"],
+        message:
+          "LOCAL_MODEL_CATALOG_SIGNING_KEY_ID and LOCAL_MODEL_CATALOG_SIGNING_PRIVATE_KEY_BASE64 must be configured together",
+      });
+    }
+    if (
+      config.nodeEnv === "production" &&
+      config.runtimeRole === "cloud-api" &&
+      config.runtimeMode !== "mac-pilot"
+    ) {
+      const productionRequirements = [
+        [
+          config.cloudDatabaseMode === "postgres",
+          "cloudDatabaseMode",
+          "Production requires PostgreSQL.",
+        ],
+        [
+          config.databaseSslMode === "verify-full",
+          "databaseSslMode",
+          "Production PostgreSQL requires verify-full TLS.",
+        ],
+        [
+          Boolean(config.databaseCaCertPath),
+          "databaseCaCertPath",
+          "Production PostgreSQL requires an explicit trusted CA bundle.",
+        ],
+        [
+          config.cloudAuthMode === "browser" ||
+            config.cloudAuthMode === "cognito",
+          "cloudAuthMode",
+          "Production requires authenticated cloud mode.",
+        ],
+        [
+          config.objectStoreMode === "s3",
+          "objectStoreMode",
+          "Production requires private S3 object storage.",
+        ],
+        [
+          config.queueMode === "sqs",
+          "queueMode",
+          "Production requires SQS delivery.",
+        ],
+        [
+          Boolean(config.publicApiOrigin?.startsWith("https://")),
+          "publicApiOrigin",
+          "Production requires an HTTPS public API origin.",
+        ],
+      ] as const;
+      for (const [valid, path, message] of productionRequirements) {
+        if (!valid) context.addIssue({ code: "custom", path: [path], message });
+      }
+    }
     if (config.speechToTextProvider === "whisper-cpp") {
       if (!config.whisperCppModelPath) {
         context.addIssue({
@@ -385,13 +543,17 @@ export type AppConfig = z.infer<typeof AppConfigSchema>;
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   return AppConfigSchema.parse({
     nodeEnv: env.NODE_ENV ?? "development",
+    runtimeRole: env.APP_RUNTIME_ROLE ?? "cloud-api",
     localAgentHost: env.LOCAL_AGENT_HOST ?? "127.0.0.1",
     localAgentPort: env.LOCAL_AGENT_PORT ?? 43_110,
     cloudApiHost: env.CLOUD_API_HOST ?? "127.0.0.1",
     cloudAuthMode: env.CLOUD_AUTH_MODE ?? "development",
+    cognitoUserPoolId: env.COGNITO_USER_POOL_ID,
     browserPublicOrigin: env.BROWSER_PUBLIC_ORIGIN,
     browserCallbackUrl: env.BROWSER_CALLBACK_URL,
     browserLogoutUrl: env.BROWSER_LOGOUT_URL,
+    cognitoRedirectUri: env.COGNITO_REDIRECT_URI,
+    cognitoLogoutUri: env.COGNITO_LOGOUT_URI,
     cognitoIssuer: env.COGNITO_ISSUER,
     cognitoDomain: env.COGNITO_DOMAIN,
     cognitoClientId: env.COGNITO_CLIENT_ID,
@@ -406,6 +568,16 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     browserSessionIdleMs: env.BROWSER_SESSION_IDLE_MS ?? 1_800_000,
     browserSessionAbsoluteMs: env.BROWSER_SESSION_ABSOLUTE_MS ?? 28_800_000,
     cloudApiPort: env.CLOUD_API_PORT ?? 43_111,
+    publicApiOrigin: env.PUBLIC_API_ORIGIN,
+    cloudDatabaseMode: env.CLOUD_DATABASE_MODE ?? "pglite",
+    databaseUrl: env.DATABASE_URL,
+    databaseHost: env.DATABASE_HOST,
+    databasePort: env.DATABASE_PORT,
+    databaseName: env.DATABASE_NAME,
+    databaseUsername: env.DATABASE_USERNAME,
+    databasePassword: env.DATABASE_PASSWORD,
+    databaseSslMode: env.DATABASE_SSL_MODE ?? "disable",
+    databaseCaCertPath: env.DATABASE_CA_CERT_PATH,
     runtimeMode: env.VERA_RUNTIME_MODE ?? "development",
     databaseMode: env.DATABASE_MODE ?? "pglite",
     pilotPgUrl: env.PILOT_PG_URL,
@@ -417,10 +589,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       env.CLIP_EXPORT_DIR ?? join(resolve(env.DATA_DIR ?? "./data"), "exports"),
     objectStoreMode: env.OBJECT_STORE_MODE ?? "memory",
     queueMode: env.QUEUE_MODE ?? "memory",
+    jobQueueUrl: env.JOB_QUEUE_URL,
     captionProvider: env.CAPTION_PROVIDER ?? "disabled",
     mediaProvider: env.MEDIA_PROVIDER ?? "disabled",
     exportSourceProvider: env.EXPORT_SOURCE_PROVIDER ?? "disabled",
     ytDlpPath: env.YT_DLP_PATH ?? "yt-dlp",
+    youtubeApiKey: env.YOUTUBE_API_KEY,
     ffmpegPath: env.FFMPEG_PATH ?? "ffmpeg",
     wordTimingPython: env.VERA_WORD_TIMING_PYTHON,
     ffprobePath: env.FFPROBE_PATH ?? "ffprobe",
@@ -430,6 +604,17 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     whisperCppModelName: env.WHISPER_CPP_MODEL_NAME,
     translationProvider: env.TRANSLATION_PROVIDER ?? "disabled",
     awsTranslateTerminology: env.AWS_TRANSLATE_TERMINOLOGY,
+    localModelCatalogSigningKeyId: env.LOCAL_MODEL_CATALOG_SIGNING_KEY_ID,
+    localModelCatalogSigningPrivateKeyBase64:
+      env.LOCAL_MODEL_CATALOG_SIGNING_PRIVATE_KEY_BASE64,
+    localModelCatalogTrustRoots: parseStringRecord(
+      env.LOCAL_MODEL_CATALOG_TRUST_ROOTS_JSON,
+    ),
+    argosSidecarPath: env.ARGOS_SIDECAR_PATH,
+    argosRuntimeVersions: (env.ARGOS_RUNTIME_VERSIONS ?? "1.9")
+      .split(",")
+      .map((value) => value.trim())
+      .filter(Boolean),
     awsRegion: env.AWS_REGION ?? "us-east-1",
     transcriptBucket: env.TRANSCRIPT_BUCKET,
     workerAuthorization: env.WORKER_AUTHORIZATION,
@@ -440,4 +625,20 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     workerErrorBackoffMs: env.WORKER_ERROR_BACKOFF_MS ?? 5_000,
     workerLeaseSeconds: env.WORKER_LEASE_SECONDS ?? 120,
   });
+}
+
+function parseStringRecord(value: string | undefined): Record<string, string> {
+  if (!value) return {};
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
+      return {};
+    return Object.fromEntries(
+      Object.entries(parsed).filter(
+        (entry): entry is [string, string] => typeof entry[1] === "string",
+      ),
+    );
+  } catch {
+    return {};
+  }
 }

@@ -28,6 +28,11 @@ function fakeBatch(
       transcriptionProfile: "default",
       sourcePolicy: "prefer-existing",
       executionLocation: "local",
+      transcriptionExecutionPolicy: {
+        schemaVersion: 1,
+        execution: "local",
+        fallback: "local",
+      },
       priority: "high",
       dispatchStatus: "active",
       createdBy: "019fbb95-cd76-7920-93fa-e23ba755ee36",
@@ -113,6 +118,8 @@ async function connectFakeProject(page: Page, projects = [liveProject]) {
         id,
         name: index === 0 ? "Personal research" : "Second research",
         description: "",
+        kind: "shared",
+        visibility: "invitation_only",
         version: 1,
         createdAt: liveTime,
         updatedAt: liveTime,
@@ -518,6 +525,11 @@ test.beforeEach(async ({ page }) => {
           __pauseCalls: Number(Reflect.get(window, "__pauseCalls") ?? 0) + 1,
         });
       }
+      playVideo() {
+        Object.assign(window, {
+          __playCalls: Number(Reflect.get(window, "__playCalls") ?? 0) + 1,
+        });
+      }
     }
 
     Object.assign(window, {
@@ -546,11 +558,403 @@ test("loads a canonical YouTube video and seeks from its transcript", async ({
   await expect
     .poll(() => page.evaluate(() => Reflect.get(window, "__lastSeekSeconds")))
     .toBe(2.2);
+  await expect
+    .poll(() => page.evaluate(() => Reflect.get(window, "__playCalls")))
+    .toBe(1);
 
   await page.getByLabel("Search transcript").fill("accurate");
   await expect(page.getByText("1 of 1")).toBeVisible();
   await page.getByRole("button", { name: "Next match", exact: true }).click();
   await expect(page.getByText("Cue requested 0:00.")).toBeVisible();
+});
+
+test("onboards a first Cognito desktop user, creates a project, and persists setup", async ({
+  page,
+}) => {
+  const now = "2026-08-24T23:10:00.000Z";
+  const userId = "019fbb95-cd76-7920-93fa-e23ba755ee90";
+  const projectId = "019fbb95-cd76-7920-93fa-e23ba755ee91";
+  await page.addInitScript(
+    ({ now, userId, projectId }) => {
+      const profile = {
+        id: userId,
+        externalSubject: "cognito:fixture:first-user",
+        handle: "first_researcher",
+        displayName: "First Researcher",
+        preferredLanguage: "en",
+        createdAt: now,
+        updatedAt: now,
+      };
+      const readProjects = () =>
+        JSON.parse(localStorage.getItem("desktop-first-run-projects") ?? "[]");
+      const response = (status: number, value: unknown) => ({
+        status,
+        body: JSON.stringify(value),
+        contentType: "application/json",
+      });
+      const readSetup = () => ({
+        setup: {
+          schemaVersion: 1,
+          rightsAcknowledged:
+            localStorage.getItem("desktop-first-run-rights") === "true",
+          privacyAcknowledged: false,
+          workerEnabled: false,
+          translationConsent: false,
+          captionProvider: "disabled",
+          mediaProvider: "disabled",
+          exportSourceProvider: "disabled",
+          speechToTextProvider: "disabled",
+          translationProvider: "disabled",
+          updatedAt: now,
+        },
+        activeComponents: [],
+      });
+      Object.defineProperty(window, "researchVideoDesktop", {
+        configurable: true,
+        value: {
+          async getStatus() {
+            return {
+              auth: { state: "signed_in", expiresAt: now },
+              services: [
+                { service: "local_agent", state: "healthy", restartCount: 0 },
+                {
+                  service: "transcription_worker",
+                  state: "stopped",
+                  restartCount: 0,
+                },
+              ],
+            };
+          },
+          async signIn() {
+            return { state: "signed_in", expiresAt: now };
+          },
+          async signOut() {
+            return { state: "signed_out" };
+          },
+          async getSetup() {
+            return readSetup();
+          },
+          async getReadiness() {
+            return {
+              schemaVersion: 1,
+              generatedAt: now,
+              components: [
+                {
+                  component: "cloud_api",
+                  state: "ready",
+                  reason: "ready",
+                  remediation: "none",
+                  checkedAt: now,
+                },
+              ],
+              operations: [
+                "project_browsing",
+                "verified_cached_review",
+                "project_logging",
+                "transcript_processing",
+                "export_processing",
+              ].map((operation) => ({
+                operation,
+                state: "ready",
+                blockingComponents: [],
+              })),
+            };
+          },
+          async updateSetup(action: {
+            action: string;
+            acknowledged?: boolean;
+          }) {
+            if (action.action === "set_rights_acknowledgement") {
+              localStorage.setItem(
+                "desktop-first-run-rights",
+                String(action.acknowledged === true),
+              );
+            }
+            return readSetup();
+          },
+          async checkRecommendedSetup() {
+            return {
+              state: "ready_to_setup",
+              roots: [
+                {
+                  target: "output_root",
+                  displayName: "Movies exports folder",
+                  state: "will_create",
+                },
+                {
+                  target: "cache_root",
+                  displayName: "Private transcript cache",
+                  state: "will_create",
+                },
+              ],
+              tools: [
+                {
+                  target: "ffmpeg",
+                  displayName: "FFmpeg",
+                  state: "detected",
+                  version: "8.1.2",
+                },
+                {
+                  target: "ffprobe",
+                  displayName: "FFprobe media inspector",
+                  state: "detected",
+                  version: "8.1.2",
+                },
+                {
+                  target: "yt_dlp",
+                  displayName: "Authorized source helper",
+                  state: "detected",
+                  version: "2026.08.19",
+                },
+                {
+                  target: "whisper_cli",
+                  displayName: "whisper.cpp speech engine",
+                  state: "detected",
+                },
+              ],
+              model: {
+                displayName: "Whisper large-v3-turbo",
+                byteSize: 1624555275,
+                state: "download_required",
+              },
+              enables: ["create_transcripts", "export_clips"],
+            };
+          },
+          async applyRecommendedSetup() {
+            const plan = await this.checkRecommendedSetup();
+            localStorage.setItem("desktop-first-run-local-setup", "true");
+            return {
+              ...plan,
+              state: "completed",
+              roots: plan.roots.map(
+                (root: {
+                  target: string;
+                  displayName: string;
+                  state: string;
+                }) => ({
+                  ...root,
+                  state: "active",
+                }),
+              ),
+              tools: plan.tools.map(
+                (tool: {
+                  target: string;
+                  displayName: string;
+                  state: string;
+                  version?: string;
+                }) => ({ ...tool, state: "active" }),
+              ),
+            };
+          },
+          async chooseSetupTarget() {
+            return readSetup();
+          },
+          async startModelDownload() {
+            throw new Error("not configured");
+          },
+          async cancelModelDownload() {
+            throw new Error("not active");
+          },
+          onModelDownloadProgress() {
+            return () => undefined;
+          },
+          async request(request: {
+            method: string;
+            path: string;
+            body?: string;
+          }) {
+            if (request.path === "/api/session/profile") {
+              return localStorage.getItem("desktop-first-run-registered")
+                ? response(200, profile)
+                : response(404, {
+                    error: {
+                      code: "not_found",
+                      message: "User is not registered.",
+                      retryable: false,
+                    },
+                  });
+            }
+            if (
+              request.path === "/api/session/register" &&
+              request.method === "POST"
+            ) {
+              localStorage.setItem("desktop-first-run-registered", "true");
+              return response(200, profile);
+            }
+            if (request.path === "/api/projects" && request.method === "GET") {
+              return response(200, readProjects());
+            }
+            if (request.path === "/api/projects" && request.method === "POST") {
+              const input = JSON.parse(request.body ?? "{}") as {
+                name?: string;
+                description?: string;
+                kind?: "personal" | "shared";
+              };
+              const project = {
+                id: projectId,
+                name: input.name ?? "First project",
+                description: input.description ?? "",
+                kind: input.kind ?? "shared",
+                visibility:
+                  input.kind === "personal" ? "private" : "invitation_only",
+                version: 1,
+                createdAt: now,
+                updatedAt: now,
+              };
+              localStorage.setItem(
+                "desktop-first-run-projects",
+                JSON.stringify([
+                  { ...project, currentUserRole: "owner", memberCount: 1 },
+                ]),
+              );
+              return response(200, project);
+            }
+            return response(503, {
+              error: {
+                code: "unavailable",
+                message: "Fixture unavailable.",
+                retryable: true,
+              },
+            });
+          },
+          async uploadTimedTranscript() {
+            throw new Error("not configured");
+          },
+          async getNotificationPreferences() {
+            throw new Error("not configured");
+          },
+          async updateNotificationPreferences() {
+            throw new Error("not configured");
+          },
+          async getNotificationSupport() {
+            throw new Error("not configured");
+          },
+          onNotificationNavigation() {
+            return () => undefined;
+          },
+        },
+      });
+    },
+    { now, userId, projectId },
+  );
+
+  await page.goto("/");
+  await page.locator("details.account-menu > summary").click();
+  await page.locator("details.local-setup-menu > summary").click();
+  await expect(page.getByLabel("Account display name")).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "Create", exact: true }),
+  ).toBeDisabled();
+
+  await page.getByLabel("Account display name").fill("First Researcher");
+  await page.getByRole("button", { name: "Create account profile" }).click();
+  await expect(page.getByLabel("Account display name")).toHaveCount(0);
+  await page.getByLabel("New project name").fill("First research project");
+  await page.getByRole("button", { name: "Create", exact: true }).click();
+  const activeProject = page
+    .locator(".vera-project-control")
+    .getByLabel("Active project");
+  await expect(activeProject).toHaveValue(projectId);
+  await expect(activeProject).toContainText("First research project");
+
+  const rights = page.getByLabel(
+    "I will process only sources I am authorized to use.",
+  );
+  await rights.check();
+  await expect(rights).toBeChecked();
+
+  await page.getByRole("button", { name: "Set up this Mac" }).click();
+  await expect(
+    page.getByText("Ready to set up", { exact: true }),
+  ).toBeVisible();
+  await expect(page.getByText("Whisper large-v3-turbo")).toBeVisible();
+  await expect(page.getByText("1.5 GiB", { exact: false })).toBeVisible();
+  await page.getByRole("button", { name: "Confirm local setup" }).click();
+  await expect(page.getByText("Local setup active")).toBeVisible();
+  await expect(page.getByText("Advanced setup")).toBeVisible();
+
+  await page.reload();
+  await page.locator("details.account-menu > summary").click();
+  await page.locator("details.local-setup-menu > summary").click();
+  await expect(page.getByLabel("Account display name")).toHaveCount(0);
+  await expect(
+    page.getByLabel("I will process only sources I am authorized to use."),
+  ).toBeChecked();
+  await expect(
+    page.locator(".vera-project-control").getByLabel("Active project"),
+  ).toHaveValue(projectId);
+});
+
+test("desktop player waits for readiness and plays from a transcript word", async ({
+  page,
+}) => {
+  await page.route("https://www.youtube-nocookie.com/embed/**", (route) =>
+    route.fulfill({
+      contentType: "text/html",
+      body: `<!doctype html><body><script>
+        document.body.dataset.listens = "0";
+        document.body.dataset.ready = "false";
+        window.__receivedPlayerCommands = [];
+        window.addEventListener("message", ({ data, source, origin }) => {
+          const message = JSON.parse(data);
+          if (message.event === "listening") {
+            const attempts = Number(document.body.dataset.listens) + 1;
+            document.body.dataset.listens = String(attempts);
+            if (attempts === 2) {
+              document.body.dataset.ready = "true";
+              source.postMessage(JSON.stringify({ event: "onReady" }), origin);
+            }
+          }
+          if (message.event === "command") {
+            if (document.body.dataset.ready !== "true") {
+              document.body.dataset.earlyCommand = message.func;
+            }
+            window.__receivedPlayerCommands.push(message);
+            if (message.func === "playVideo") {
+              source.postMessage(
+                JSON.stringify({ info: { playerState: 1 } }),
+                origin,
+              );
+            }
+          }
+        });
+      </script>`,
+    }),
+  );
+  await page.goto("/?fixture=english-word");
+  await expect(
+    page.getByRole("heading", { name: "Navigate video by transcript" }),
+  ).toBeVisible();
+  await page.evaluate(() => {
+    Object.assign(window, { researchVideoDesktop: {} });
+  });
+  await page.getByRole("button", { name: "Load video" }).click();
+
+  const player = page.frameLocator('iframe[title="YouTube video player"]');
+  await expect(page.getByRole("button", { name: "Play video" })).toBeEnabled();
+  await expect(player.locator("body")).toHaveAttribute("data-ready", "true");
+  await expect(player.locator("body")).not.toHaveAttribute(
+    "data-early-command",
+    /./u,
+  );
+  await page.getByRole("button", { name: "any word", exact: true }).click();
+  await expect(page.getByText("Word requested 0:02.")).toBeVisible();
+  await expect
+    .poll(() =>
+      player.locator("body").evaluate((body) => {
+        const commands = Reflect.get(
+          body.ownerDocument.defaultView!,
+          "__receivedPlayerCommands",
+        ) as Array<{ func?: string; args?: unknown[] }> | undefined;
+        return commands?.filter((command) =>
+          ["seekTo", "playVideo"].includes(command.func ?? ""),
+        );
+      }),
+    )
+    .toEqual([
+      { event: "command", func: "seekTo", args: [2.2, true] },
+      { event: "command", func: "playVideo", args: [] },
+    ]);
 });
 
 test("rejects a non-YouTube URL without replacing the workspace", async ({
@@ -585,6 +989,8 @@ test("timed auto-caption fixture seeks exact starts and retains derived-end sele
             id: projectId,
             name: "Caption evidence",
             description: "",
+            kind: "shared",
+            visibility: "invitation_only",
             version: 1,
             createdAt: now,
             updatedAt: now,
@@ -780,6 +1186,11 @@ test("timed auto-caption fixture seeks exact starts and retains derived-end sele
     timingPrecision: "estimated",
     endTiming: "derived",
   });
+  await page
+    .getByLabel(
+      /I confirm I am authorized to process this exact YouTube source/,
+    )
+    .check();
   await page.getByRole("button", { name: "Export + log" }).click();
   await expect(panel).toContainText("queued an export");
   expect(loggedExportRequests).toBe(1);
@@ -881,6 +1292,8 @@ test("maps transcript text selection to stable source and export bounds", async 
                 id: createdProjectId,
                 name: "New essay",
                 description: "Created without losing the selection",
+                kind: "shared",
+                visibility: "invitation_only",
                 version: 1,
                 createdAt: now,
                 updatedAt: now,
@@ -890,6 +1303,8 @@ test("maps transcript text selection to stable source and export bounds", async 
                   id: existingProjectId,
                   name: "Existing essay",
                   description: "",
+                  kind: "shared",
+                  visibility: "invitation_only",
                   version: 1,
                   createdAt: now,
                   updatedAt: now,
@@ -1128,6 +1543,11 @@ test("maps transcript text selection to stable source and export bounds", async 
   await page
     .getByLabel("Omit subtitle files for confirmed-English videos")
     .check();
+  await page
+    .getByLabel(
+      /I confirm I am authorized to process this exact YouTube source/,
+    )
+    .check();
   await page.getByRole("button", { name: "Export + log" }).click();
   await expect(panel).toContainText(
     "Logged to New essay and queued an export with the Editing MP4 snapshot.",
@@ -1179,6 +1599,11 @@ test("connects an explicit project, controls a batch, and updates review state",
     transcriptionProfile: "default",
     sourcePolicy: "prefer-existing",
     executionLocation: "local",
+    transcriptionExecutionPolicy: {
+      schemaVersion: 1,
+      execution: "local",
+      fallback: "local",
+    },
     priority: "normal",
     dispatchStatus,
     createdBy: "019fbb95-cd76-7920-93fa-e23ba755ee36",
@@ -1230,6 +1655,8 @@ test("connects an explicit project, controls a batch, and updates review state",
             id: projectId,
             name: "Essay project",
             description: "",
+            kind: "shared",
+            visibility: "invitation_only",
             version: 1,
             createdAt: now,
             updatedAt: now,

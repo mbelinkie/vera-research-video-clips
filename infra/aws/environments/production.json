@@ -2,5 +2,16 @@
   "EnvironmentName": "production",
   "TranscriptBucketName": "replace-with-production-bucket-name",
   "AllowedUploadOrigins": "https://replace-with-production-origin.example",
-  "CloudApiRoleArn": ""
+  "CloudApiRoleArn": "",
+  "VpcId": "replace-with-production-vpc-id",
+  "VpcDnsResolverCidr": "replace-with-production-vpc-resolver-cidr",
+  "PublicSubnetIds": "replace-with-production-public-subnet-a,replace-with-production-public-subnet-b",
+  "PrivateSubnetIds": "replace-with-production-private-subnet-a,replace-with-production-private-subnet-b",
+  "AcmCertificateArn": "replace-with-production-acm-certificate-arn",
+  "HostedZoneId": "replace-with-production-hosted-zone-id",
+  "ApiDomainName": "replace-with-production-api-domain",
+  "ApiContainerImage": "replace-with-production-api-image-uri-at-digest",
+  "CognitoDomainPrefix": "replace-with-production-cognito-domain-prefix",
+  "DatabaseRuntimePasswordSecretArn": "replace-with-production-runtime-database-secret-arn",
+  "AlarmTopicArn": "replace-with-production-alarm-topic-arn"
 }

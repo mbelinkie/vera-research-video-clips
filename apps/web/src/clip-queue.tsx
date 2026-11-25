@@ -4,6 +4,7 @@ import { useEffect, useMemo, useState } from "react";
 import {
   ClipCandidateSchema,
   ClipTagNameSchema,
+  UpdateClipCandidateRequestSchema,
   type ClipCandidate,
 } from "@research-video/contracts";
 
@@ -76,8 +77,8 @@ export function ClipQueue({
       if (!normalizedQuery) return true;
       return [
         clip.video.title,
-        clip.englishText,
-        clip.notes,
+        clip.englishText ?? "",
+        clip.notes ?? "",
         ...clip.tags,
       ].some((value) => value.toLocaleLowerCase().includes(normalizedQuery));
     });
@@ -97,14 +98,15 @@ export function ClipQueue({
         .split(/[,\n]/u)
         .map((tag) => tag.trim())
         .filter(Boolean);
+      const command = UpdateClipCandidateRequestSchema.parse({
+        expectedVersion: clip.version,
+        notes,
+        tags,
+      });
       const updated = ClipCandidateSchema.parse(
         await request(`/api/projects/${projectId}/clips/${clip.id}`, {
           method: "PATCH",
-          body: JSON.stringify({
-            expectedVersion: clip.version,
-            notes,
-            tags,
-          }),
+          body: JSON.stringify(command),
         }),
       );
       setClips((current) =>

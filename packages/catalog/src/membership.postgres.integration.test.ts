@@ -5,9 +5,10 @@ import { describe, expect, it } from "vitest";
 
 import type { AuthenticatedActor } from "@research-video/contracts";
 import {
+  asCloudDatabase,
   ConnectionAffineDatabase,
   runCloudMigrations,
-  type SqlDatabase,
+  type CloudDatabase,
 } from "@research-video/db-cloud";
 import { MemoryTranscriptObjectStore } from "@research-video/storage";
 
@@ -93,20 +94,22 @@ describe.skipIf(!enabled)("real PostgreSQL membership serialization", () => {
       const paused = new Promise<void>((resolve) => {
         reached = resolve;
       });
-      const observed: SqlDatabase = {
+      // The catalog takes a CloudDatabase. Wrapping the connection-affine
+      // pilot database keeps every observed query on its leased transaction.
+      const firstCloud = asCloudDatabase(first);
+      const observed: CloudDatabase = {
+        ...firstCloud,
         query: async <Row extends Record<string, unknown>>(
           sql: string,
-          params: unknown[] = [],
+          params?: readonly unknown[],
         ) => {
-          const result = await first.query<Row>(sql, params);
+          const result = await firstCloud.query<Row>(sql, params);
           if (sql.startsWith("SELECT 1 FROM users WHERE id =")) {
             reached();
             await held;
           }
           return result;
         },
-        exec: (sql) => first.exec(sql),
-        withTransaction: (action) => first.withTransaction(action),
       };
       const lockCatalog = new SharedProjectCatalog(
         observed,
@@ -282,12 +285,12 @@ describe.skipIf(!enabled)("real PostgreSQL membership serialization", () => {
       let probedAssociationWrite = false;
       const lockProbe = new SharedProjectCatalog(
         {
-          ...observed,
+          ...firstCloud,
           async query<Row extends Record<string, unknown>>(
             sql: string,
-            params: unknown[] = [],
+            params?: readonly unknown[],
           ) {
-            const result = await first.query<Row>(sql, params);
+            const result = await firstCloud.query<Row>(sql, params);
             if (sql.startsWith("SELECT user_id, observed_at >")) {
               await expect(
                 second.withTransaction(() =>

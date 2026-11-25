@@ -2,6 +2,8 @@
 node_modules/
 .pnpm-store/
 dist/
+out/
+/main.cjs
 coverage/
 playwright-report/
 test-results/

@@ -1,0 +1,12 @@
+{
+  "name": "@research-video/export-settings",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@research-video/contracts": "0.1.0"
+  }
+}

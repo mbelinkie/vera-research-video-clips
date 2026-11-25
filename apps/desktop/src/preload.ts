@@ -1,0 +1,124 @@
+import { contextBridge, ipcRenderer } from "electron";
+
+import {
+  DesktopApiRequestSchema,
+  DesktopApiResponseSchema,
+  DesktopTimedTranscriptUploadRequestSchema,
+  DesktopTimedTranscriptUploadResponseSchema,
+  DesktopAuthStatusSchema,
+  DesktopNotificationNavigationTargetSchema,
+  DesktopNotificationPreferencesSchema,
+  DesktopNotificationSupportStatusSchema,
+  UpdateDesktopNotificationPreferencesSchema,
+  DesktopStatusSchema,
+  ModelDownloadProgressSchema,
+  ReadinessReportSchema,
+  RecommendedSetupPlanSchema,
+  SetupActionSchema,
+  SetupSelectionTargetSchema,
+  SetupSnapshotSchema,
+} from "@research-video/contracts";
+
+import { desktopIpcChannels } from "./ipc.ts";
+
+contextBridge.exposeInMainWorld("researchVideoDesktop", {
+  getStatus: async () =>
+    DesktopStatusSchema.parse(
+      await ipcRenderer.invoke(desktopIpcChannels.getStatus),
+    ),
+  signIn: async () =>
+    DesktopAuthStatusSchema.parse(
+      await ipcRenderer.invoke(desktopIpcChannels.signIn),
+    ),
+  signOut: async () =>
+    DesktopAuthStatusSchema.parse(
+      await ipcRenderer.invoke(desktopIpcChannels.signOut),
+    ),
+  getSetup: async () =>
+    SetupSnapshotSchema.parse(
+      await ipcRenderer.invoke(desktopIpcChannels.getSetup),
+    ),
+  getReadiness: async () =>
+    ReadinessReportSchema.parse(
+      await ipcRenderer.invoke(desktopIpcChannels.getReadiness),
+    ),
+  updateSetup: async (action: unknown) =>
+    SetupSnapshotSchema.parse(
+      await ipcRenderer.invoke(
+        desktopIpcChannels.updateSetup,
+        SetupActionSchema.parse(action),
+      ),
+    ),
+  checkRecommendedSetup: async () =>
+    RecommendedSetupPlanSchema.parse(
+      await ipcRenderer.invoke(desktopIpcChannels.checkRecommendedSetup),
+    ),
+  applyRecommendedSetup: async () =>
+    RecommendedSetupPlanSchema.parse(
+      await ipcRenderer.invoke(desktopIpcChannels.applyRecommendedSetup),
+    ),
+  chooseSetupTarget: async (target: unknown) =>
+    SetupSnapshotSchema.parse(
+      await ipcRenderer.invoke(
+        desktopIpcChannels.chooseSetupTarget,
+        SetupSelectionTargetSchema.parse(target),
+      ),
+    ),
+  startModelDownload: async () =>
+    ModelDownloadProgressSchema.parse(
+      await ipcRenderer.invoke(desktopIpcChannels.startModelDownload),
+    ),
+  cancelModelDownload: async () =>
+    ModelDownloadProgressSchema.parse(
+      await ipcRenderer.invoke(desktopIpcChannels.cancelModelDownload),
+    ),
+  onModelDownloadProgress: (listener: (progress: unknown) => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, progress: unknown) =>
+      listener(ModelDownloadProgressSchema.parse(progress));
+    ipcRenderer.on(desktopIpcChannels.modelDownloadProgress, handler);
+    return () =>
+      ipcRenderer.removeListener(
+        desktopIpcChannels.modelDownloadProgress,
+        handler,
+      );
+  },
+  request: async (input: unknown) =>
+    DesktopApiResponseSchema.parse(
+      await ipcRenderer.invoke(
+        desktopIpcChannels.request,
+        DesktopApiRequestSchema.parse(input),
+      ),
+    ),
+  uploadTimedTranscript: async (input: unknown) =>
+    DesktopTimedTranscriptUploadResponseSchema.parse(
+      await ipcRenderer.invoke(
+        desktopIpcChannels.timedTranscriptUpload,
+        DesktopTimedTranscriptUploadRequestSchema.parse(input),
+      ),
+    ),
+  getNotificationPreferences: async () =>
+    DesktopNotificationPreferencesSchema.parse(
+      await ipcRenderer.invoke(desktopIpcChannels.getNotificationPreferences),
+    ),
+  updateNotificationPreferences: async (input: unknown) =>
+    DesktopNotificationPreferencesSchema.parse(
+      await ipcRenderer.invoke(
+        desktopIpcChannels.updateNotificationPreferences,
+        UpdateDesktopNotificationPreferencesSchema.parse(input),
+      ),
+    ),
+  getNotificationSupport: async () =>
+    DesktopNotificationSupportStatusSchema.parse(
+      await ipcRenderer.invoke(desktopIpcChannels.getNotificationSupport),
+    ),
+  onNotificationNavigation: (listener: (target: unknown) => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, target: unknown) =>
+      listener(DesktopNotificationNavigationTargetSchema.parse(target));
+    ipcRenderer.on(desktopIpcChannels.notificationNavigation, handler);
+    return () =>
+      ipcRenderer.removeListener(
+        desktopIpcChannels.notificationNavigation,
+        handler,
+      );
+  },
+});
