@@ -318,3 +318,39 @@ audit's exact eight failures and the historical desktop-only coverage gaps
 remain limitations, as recorded above. No production/live-app verification
 is claimed. Delivery remains blocked until a clean full gate and the actual
 required GitHub Check are recorded.
+
+## Phase 4 recovery — aggregate gate completed, one unrelated-file timeout
+
+The unchanged pinned main catalog suite was rechecked as an unprivileged user:
+83/83 passed in 244.90 seconds, including all 11 failures from the interrupted
+aggregate run. The prior failures did not reproduce in isolation.
+
+The clean branch at `3784b86` was copied into the retained disposable Linux
+checkout (tracked files compared and the evidence document synchronized).
+With Node 24.19.0, locked offline dependencies, no concurrent browser runs,
+and the existing single-worker setting, `CI=true npm run check` completed
+with exit 1 in 856.5 seconds. Format and typecheck passed. Catalog passed
+83/83 in 292.977 seconds. Vitest reported 121 files passed, one failed, four
+skipped; 1,192 tests passed, one failed, eight skipped (1,201 total).
+
+The sole failure was the existing `apps/web/src/transcription-action-batch.test.ts`
+case `handles 'automatic' processing (retryable=true, race='poll')`: the
+30-second test budget expired (39.468 seconds reported). This file and all
+product code are unchanged by #126. The pinned baseline aggregate had passed
+the same case. A focused rerun of the three polling variants passed 3/3 on
+both the recovered branch (24.51 seconds total; exact case 8.333 seconds)
+and pinned unchanged main (19.59 seconds total; exact case 7.048 seconds).
+This establishes non-reproduction in isolation, not a proven baseline
+failure or a green aggregate gate. No timeout, retry, or assertion changed.
+
+The steps short-circuited by Vitest's failure were run separately, without
+altering their commands: issue policy 8/8, web build passed, local migrations
+39 applied, cloud migrations 62 applied; all exited 0. Retained logs:
+`check-phase4-recovery.log`, `recovery-branch-poll.log`,
+`recovery-main-poll.log`, and `recovery-remaining-gate.log`.
+
+All Workspace and adjacent evidence above remains valid (no test or CI code
+changed in this recovery). The complete aggregate gate and actual GitHub
+Check on the final published SHA still need a green run. No production or
+live-app verification is claimed. The next step is a clean required CI run
+under Conductor ownership, not speculative edits to an unrelated test.
