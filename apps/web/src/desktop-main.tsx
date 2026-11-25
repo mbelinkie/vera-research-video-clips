@@ -5,7 +5,6 @@ import {
   ApiErrorSchema,
   ClipCandidateSchema,
   ClipSelectionSchema,
-  CreateTranscriptionBatchResponseSchema,
   CreateClipCandidateRequestSchema,
   ExportPresetSnapshotSchema,
   ExportSettingsPreviewSchema,
@@ -62,7 +61,11 @@ import {
   DESKTOP_CONNECTED_SENTINEL,
 } from "./api-client.ts";
 import { BatchWorkspace } from "./desktop-batch-workspace.tsx";
-import { retryWorkspaceTranscript } from "./desktop-transcript-retry.ts";
+import {
+  pollWorkspaceRetry,
+  retryWorkspaceTranscript,
+  type WorkspaceRetry,
+} from "./desktop-transcript-retry.ts";
 import { DesktopSetup, type DesktopProfileState } from "./desktop-setup.tsx";
 import { NotificationPreferencesPanel } from "./notification-preferences.tsx";
 import { resolveNotificationNavigation } from "./notification-navigation.ts";
@@ -334,11 +337,11 @@ function App() {
     useState<WorkspaceLoadState>("idle");
   const [workspaceMessage, setWorkspaceMessage] = useState<string>();
   const [workspaceReload, setWorkspaceReload] = useState(0);
-  const [workspaceRetry, setWorkspaceRetry] = useState<{
-    batchId: string;
-    itemId: string;
-  }>();
+  const [workspaceRetry, setWorkspaceRetry] = useState<WorkspaceRetry>();
   const workspaceGeneration = useRef(0);
+  // Retry lifetime is separate from transcript resolution: a successful poll
+  // can reload the same workspace without invalidating its own retry.
+  const workspaceRetryGeneration = useRef(0);
   const handledKeywordEvidence = useRef<string | undefined>(undefined);
   const recentProjectValidation = useRef<string | undefined>(undefined);
   const [recentProjectReadyIdentity, setRecentProjectReadyIdentity] =
@@ -537,8 +540,14 @@ function App() {
   const playerRef = useRef<YouTubePlayerHandle>(null);
   const videoId = workspaceTarget?.youtubeVideoId;
 
+  function clearWorkspaceRetry() {
+    workspaceRetryGeneration.current += 1;
+    setWorkspaceRetry(undefined);
+  }
+
   function clearWorkspaceInteraction() {
     workspaceGeneration.current += 1;
+    clearWorkspaceRetry();
     setWorkspace(undefined);
     setWorkspaceLoadState("idle");
     setWorkspaceMessage(undefined);
@@ -1330,7 +1339,7 @@ function App() {
         )
           return;
         setWorkspace(resolved);
-        setWorkspaceRetry(undefined);
+        clearWorkspaceRetry();
         setTranscriptView(
           resolved.preferred.state === "ready" ? "preferred" : "english",
         );
@@ -1371,82 +1380,27 @@ function App() {
   ]);
 
   useEffect(() => {
-    const pending = workspaceRetry;
-    const target = workspaceTarget;
-    if (!pending || !authorization || !target) return;
-    const pendingRetry = pending;
-    const retryTarget = target;
-    let stopped = false;
-    let polling = false;
-    async function poll() {
-      if (polling || stopped) return;
-      polling = true;
-      try {
-        const response = await apiFetch(
-          "cloud",
-          `/api/projects/${retryTarget.projectId}/transcription-batches/${pendingRetry.batchId}`,
-          {},
-          authorization,
-        );
-        const payload = await response.json().catch(() => undefined);
-        if (!response.ok)
-          throw new Error("Unable to refresh transcript retry.");
-        const detail = CreateTranscriptionBatchResponseSchema.parse(payload);
-        const item = detail.items.find(
-          (candidate) => candidate.id === pendingRetry.itemId,
-        );
-        if (!item)
-          throw new Error("The retried transcription item is missing.");
-        if (item.state === "ready_for_review") {
-          setWorkspaceMessage("Transcript published. Loading it now…");
-          setWorkspaceReload((value) => value + 1);
-        } else if (item.state === "failed") {
-          setWorkspaceRetry(undefined);
-          setWorkspaceLoadState("failed");
-          setWorkspaceMessage(
-            item.error?.message ?? "The transcript retry failed.",
-          );
-        } else if (
-          ["blocked", "needs_language_confirmation", "canceled"].includes(
-            item.state,
-          )
-        ) {
-          setWorkspaceRetry(undefined);
-          setWorkspaceLoadState("unavailable");
-          setWorkspaceMessage(
-            item.state === "needs_language_confirmation"
-              ? "Confirm the spoken language in Project Videos to continue."
-              : item.state === "blocked"
-                ? "Transcript processing needs attention in Project Videos."
-                : "The transcript retry was canceled.",
-          );
-        } else {
-          setWorkspaceLoadState("unavailable");
-          setWorkspaceMessage(
-            item.sourcePlan?.strategy === "caption"
-              ? "Downloading and verifying the YouTube transcript…"
-              : "Checking the YouTube transcript before Whisper…",
-          );
-        }
-      } catch (caught: unknown) {
-        if (!stopped) {
-          setWorkspaceMessage(
-            caught instanceof Error
-              ? caught.message
-              : "Unable to refresh transcript retry.",
-          );
-        }
-      } finally {
-        polling = false;
-      }
-    }
-    void poll();
-    const timer = window.setInterval(() => void poll(), 3_000);
-    return () => {
-      stopped = true;
-      window.clearInterval(timer);
-    };
-  }, [authorization, workspaceRetry, workspaceTarget]);
+    if (
+      !workspaceRetry ||
+      !authorization ||
+      !workspaceTarget ||
+      workspaceRetry.projectId !== projectId ||
+      workspaceRetry.projectId !== workspaceTarget.projectId ||
+      workspaceRetry.catalogVideoId !== workspaceTarget.catalogVideoId ||
+      workspaceRetry.generation !== workspaceRetryGeneration.current
+    )
+      return;
+    return pollWorkspaceRetry({
+      authorization,
+      pendingRetry: workspaceRetry,
+      isCurrent: () =>
+        workspaceRetry.generation === workspaceRetryGeneration.current,
+      setWorkspaceMessage,
+      setWorkspaceReload,
+      setWorkspaceRetry,
+      setWorkspaceLoadState,
+    });
+  }, [authorization, projectId, workspaceRetry, workspaceTarget]);
 
   useEffect(() => {
     const intent = workspaceTarget?.keywordEvidence;
@@ -2956,17 +2910,32 @@ function App() {
                 setExportOnlyRequestId(undefined);
                 setSelectionError(undefined);
               }}
-              onRetry={() =>
+              onRetry={() => {
+                if (
+                  !authorization ||
+                  !workspaceTarget ||
+                  workspaceTarget.projectId !== projectId
+                )
+                  return;
+                clearWorkspaceRetry();
+                const generation = workspaceRetryGeneration.current;
                 void retryWorkspaceTranscript({
                   authorization,
                   target: workspaceTarget,
                   projectId,
+                  attempt: {
+                    projectId: workspaceTarget.projectId,
+                    catalogVideoId: workspaceTarget.catalogVideoId,
+                    generation,
+                  },
+                  isCurrent: () =>
+                    generation === workspaceRetryGeneration.current,
                   setWorkspaceLoadState,
                   setWorkspaceMessage,
                   setWorkspaceReload,
                   setWorkspaceRetry,
-                })
-              }
+                });
+              }}
             />
           }
           player={
