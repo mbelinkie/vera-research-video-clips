@@ -241,3 +241,28 @@ not Vite module loads; test-specific routes retain precedence.
 - No full `npm run check` rerun or CI result is claimed in phase 2; phase 1
   baseline failures remain documented. Phase 3 must wire the required Check;
   phase 4 must repeat the broader gates and review historical coverage gaps.
+
+## Phase 3 — required Check integration
+
+The existing `Check` job, npm ci, FFmpeg setup, and `npm run check` are
+unchanged. Two steps now install the lockfile-selected Chromium with
+`npx --no-install playwright install --with-deps chromium` and run
+`npm run test:e2e -- tests/e2e/workspace.spec.ts --project=chromium`.
+The CI step explicitly disables browser authentication and managed Research.
+CI uses one worker to reduce contention, retains zero retries, and refuses to
+reuse an existing Vite server; non-CI parallelism is unchanged. The existing
+20-minute job timeout is unchanged.
+
+Local Linux verification with locked Playwright/Chromium and
+`CI=true VITE_BROWSER_AUTH=false VITE_MANAGED_RESEARCH=false`:
+
+- Exact browser command with `--list`: 17 tests in one file, exit 0.
+- Exact browser command without filters: 17 passed (1.3m), exit 0;
+  output retained in `workspace-phase3-ci.log` in the pipeline folder.
+- Temporary synthetic `expect(1).toBe(2)` test in the same spec, selected
+  with `--grep 'synthetic CI exit status proof'`: one failed, exit 1.
+  Output retained in `workspace-phase3-negative.log`; original spec restored
+  byte-for-byte and verified against git. No synthetic test is committed.
+- Prettier and git diff --check pass. Actual GitHub execution and the full
+  existing gate remain for phase 4; the Ubuntu dependency installation step
+  was not executed locally because locked Chromium was already installed.
