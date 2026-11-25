@@ -349,17 +349,18 @@ export function TypedQuotesWorkspace({
   ]);
 
   useEffect(() => {
-    if (focusSavedId) savedQuoteRefs.current.get(focusSavedId)?.focus();
-  }, [focusSavedId, quotes]);
+    if (open && editingItem) quoteTextRef.current?.focus();
+  }, [open, editingItem]);
 
   useEffect(() => {
-    if (
-      open &&
-      (editingItem ||
-        message === "Quote saved. Add another to the same source.")
-    )
+    if (open && message === "Quote saved. Add another to the same source.")
       quoteTextRef.current?.focus();
-  }, [open, editingItem, message]);
+  }, [open, message]);
+
+  // Ordinary Save retains the edit target but still focuses its saved row.
+  useEffect(() => {
+    if (focusSavedId) savedQuoteRefs.current.get(focusSavedId)?.focus();
+  }, [focusSavedId, quotes]);
 
   function changeSourceDraft<K extends keyof OfflineSourceDraft>(
     field: K,
@@ -496,6 +497,9 @@ export function TypedQuotesWorkspace({
       setFocusSavedId(wasEditing ? item.id : undefined);
       if (continueAdding) queueMicrotask(() => quoteTextRef.current?.focus());
     } else {
+      // A retained draft belongs to this saved item, not a fresh create
+      // intent. Reuse the versioned edit flow until the form is cleared.
+      setEditingItem(item);
       setFocusSavedId(item.id);
     }
   }
