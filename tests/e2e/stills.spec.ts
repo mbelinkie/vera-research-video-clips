@@ -6,6 +6,10 @@ const ownerId = "019fbb95-cd76-7920-93fa-e23ba755ee36";
 const parentId = "019fbb95-cd76-7920-93fa-e23ba755ee42";
 const childId = "019fbb95-cd76-7920-93fa-e23ba755ee45";
 const sourceId = "019fbb95-cd76-7920-93fa-e23ba755ee43";
+const secondSourceId = "019fbb95-cd76-7920-93fa-e23ba755ee46";
+const noUrlSourceId = "019fbb95-cd76-7920-93fa-e23ba755ee47";
+const pageA = "https://example.org/page-a";
+const pageB = "https://example.org/page-b";
 const now = "2026-11-20T12:00:00.000Z";
 
 type Crop = { x: number; y: number; width: number; height: number };
@@ -51,7 +55,7 @@ async function savedImage() {
 
 async function connectSavedStill(
   page: Page,
-  options: { failFirstSave?: boolean } = {},
+  options: { failFirstSave?: boolean; pagePictures?: boolean } = {},
 ) {
   const bytes = await savedImage();
   const writes: Array<{
@@ -59,7 +63,23 @@ async function connectSavedStill(
     crop: Crop;
     [key: string]: unknown;
   }> = [];
-  await page.route("**/cloud-api/**", (route) => {
+  const pictureWrites: Array<Record<string, unknown>> = [];
+  const sources = [
+    { id: sourceId, title: "Page A", url: pageA },
+    { id: secondSourceId, title: "Page B", url: pageB },
+    { id: noUrlSourceId, title: "Page without URL" },
+  ].map(({ id, title, url }) => ({
+    id,
+    projectId,
+    kind: "web_page",
+    bibliography: {
+      title: { value: title, state: "confirmed" },
+      ...(url ? { url: { value: url, state: "confirmed" } } : {}),
+    },
+    details: {},
+    version: 1,
+  }));
+  await page.route("**/cloud-api/**", async (route) => {
     const request = route.request();
     const path = new URL(request.url()).pathname.replace("/cloud-api", "");
     if (path === "/api/projects")
@@ -80,7 +100,28 @@ async function connectSavedStill(
     if (path === `/api/projects/${projectId}/items`)
       return route.fulfill({ json: [item(parentId, "Synthetic saved still")] });
     if (path === `/api/projects/${projectId}/sources`)
-      return route.fulfill({ json: [] });
+      return route.fulfill({ json: options.pagePictures ? sources : [] });
+    if (
+      path === `/api/projects/${projectId}/stills/from-page-picture` &&
+      request.method() === "POST" &&
+      options.pagePictures
+    ) {
+      const body = await new Response(
+        new Uint8Array(request.postDataBuffer()!),
+        {
+          headers: { "content-type": request.headers()["content-type"]! },
+        },
+      ).formData();
+      const metadata = JSON.parse(String(body.get("metadata")));
+      pictureWrites.push(metadata);
+      return route.fulfill({
+        status: 201,
+        json: {
+          ...item(childId, metadata.title),
+          sourceId: metadata.sourceId,
+        },
+      });
+    }
     if (path === `/api/projects/${projectId}/sources/${sourceId}`)
       return route.fulfill({
         status: 404,
@@ -143,8 +184,68 @@ async function connectSavedStill(
     .getByRole("button", { name: /Synthetic saved still/ })
     .first()
     .click();
-  return writes;
+  return { writes, pictureWrites };
 }
+
+test("Page picture replaces automatic provenance but preserves manual URL and resets drafts", async ({
+  page,
+}) => {
+  test.setTimeout(120_000); // Three generated image saves and draft resets on slower CI hosts.
+  const { pictureWrites } = await connectSavedStill(page, {
+    pagePictures: true,
+  });
+  const form = page.locator(".stills-import-panel");
+  const source = form.getByLabel("Existing web-page source");
+  const url = form.getByLabel("Page URL (optional)");
+  async function startPicture() {
+    await form.getByRole("tab", { name: "Page picture" }).click();
+    await source.selectOption(sourceId);
+    await expect(url).toHaveValue(pageA);
+  }
+  async function savePicture(title: string) {
+    await form.getByLabel("Title", { exact: true }).fill(title);
+    await form.getByLabel("Image file").setInputFiles({
+      name: "generated.png",
+      mimeType: "image/png",
+      buffer: await savedImage(),
+    });
+    await form.getByRole("button", { name: "Save new still" }).click();
+    await expect(form.getByRole("status")).toHaveText(/Still saved/);
+  }
+
+  await startPicture();
+  await source.selectOption(secondSourceId);
+  await savePicture("Switched picture");
+  expect(pictureWrites[0]).toMatchObject({
+    sourceId: secondSourceId,
+    pageUrl: pageB,
+  });
+
+  await startPicture();
+  await source.selectOption(noUrlSourceId);
+  await expect(url).toHaveValue("");
+  await savePicture("No URL picture");
+  expect(pictureWrites[1]).toMatchObject({ sourceId: noUrlSourceId });
+  expect(pictureWrites[1]).not.toHaveProperty("pageUrl");
+
+  await startPicture();
+  const manual = "https://example.org/manual";
+  await url.fill(manual);
+  await source.selectOption(secondSourceId);
+  await expect(url).toHaveValue(manual);
+  await savePicture("Manual picture");
+  expect(pictureWrites[2]).toMatchObject({
+    sourceId: secondSourceId,
+    pageUrl: manual,
+  });
+
+  await startPicture();
+  await url.fill(manual);
+  await form.getByRole("button", { name: "Cancel", exact: true }).click();
+  await startPicture();
+  await source.selectOption(secondSourceId);
+  await expect(url).toHaveValue(pageB);
+});
 
 function coordinates(page: Page) {
   const editor = page.locator(".stills-import-panel");
@@ -212,7 +313,7 @@ test("draw, move and corner-resize a contained saved still; keyboard and failed-
   page,
 }) => {
   test.setTimeout(90_000); // Real browser image decode and gestures on slower CI hosts.
-  const writes = await connectSavedStill(page, { failFirstSave: true });
+  const { writes } = await connectSavedStill(page, { failFirstSave: true });
   await page.getByRole("button", { name: "Crop this still" }).click();
   const surface = page.locator(".stills-crop-surface");
   await expect(surface).toBeVisible();
@@ -281,7 +382,7 @@ test("draw, move and corner-resize a contained saved still; keyboard and failed-
 test("tiny drag, cancel and unavailable kept image cannot submit a crop", async ({
   page,
 }) => {
-  const writes = await connectSavedStill(page);
+  const { writes } = await connectSavedStill(page);
   await page.getByRole("button", { name: "Crop this still" }).click();
   const surface = page.locator(".stills-crop-surface");
   await surface.scrollIntoViewIfNeeded();

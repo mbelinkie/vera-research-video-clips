@@ -40,6 +40,7 @@ type Draft = {
   licence: string;
   usageNote: string;
   pageUrl: string;
+  pageUrlManuallyEdited: boolean;
   altText: string;
   originalUrl: string;
   url: string;
@@ -84,6 +85,7 @@ function emptyDraft(): Draft {
     licence: "",
     usageNote: "",
     pageUrl: "",
+    pageUrlManuallyEdited: false,
     altText: "",
     originalUrl: "",
     url: "",
@@ -753,8 +755,16 @@ export function StillsWorkspace({
     setImportMode("url");
   }
 
-  function updateDraft(field: keyof Draft, value: string) {
-    setDraft((current) => ({ ...current, [field]: value }));
+  function updateDraft(
+    field: Exclude<keyof Draft, "pageUrlManuallyEdited">,
+    value: string,
+  ) {
+    setDraft((current) => ({
+      ...current,
+      [field]: value,
+      pageUrlManuallyEdited:
+        field === "pageUrl" || current.pageUrlManuallyEdited,
+    }));
     setFormError(undefined);
     setFormMessage(undefined);
   }
@@ -1425,11 +1435,11 @@ export function StillsWorkspace({
                       (source) => source.id === event.target.value,
                     );
                     const url = sourceUrl(selected);
-                    if (url)
-                      setDraft((current) => ({
-                        ...current,
-                        pageUrl: current.pageUrl || url,
-                      }));
+                    setDraft((current) =>
+                      current.pageUrlManuallyEdited
+                        ? current
+                        : { ...current, pageUrl: url ?? "" },
+                    );
                   }}
                 >
                   <option value="">Choose a source</option>
