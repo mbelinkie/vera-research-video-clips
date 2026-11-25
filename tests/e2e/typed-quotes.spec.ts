@@ -431,6 +431,67 @@ test("creates an offline book, saves exact text, then adds another quote without
   ]);
 });
 
+test("a second ordinary Save keeps exactly one saved quote", async ({
+  page,
+}) => {
+  const { workspace, quotePosts, quotes } = await fixture(page);
+  await workspace.getByRole("button", { name: /Paywalled archive/ }).click();
+  await workspace.getByLabel("Quote text").fill("One deliberate quote");
+  await workspace.getByRole("button", { name: "Save", exact: true }).click();
+  await expect(
+    workspace.getByText("Quote saved to this source."),
+  ).toBeVisible();
+
+  // The same submit control becomes Save changes when the saved item is
+  // retained as the edit target. Wait for the actual write before counting.
+  const secondWrite = page.waitForResponse(
+    (response) =>
+      response.url().includes(`/api/projects/${projectId}/items`) &&
+      ["POST", "PATCH"].includes(response.request().method()),
+  );
+  await workspace.locator(".typed-quotes-form button[type=submit]").click();
+  await secondWrite;
+  await expect(workspace.getByRole("status")).toContainText("saved");
+  expect(quotePosts).toHaveLength(1);
+  expect(quotes.map((quote) => quote.id)).toEqual([firstQuoteId]);
+  await expect(
+    workspace.getByLabel("Saved quote: One deliberate quote"),
+  ).toHaveCount(1);
+});
+
+test("correcting a just-saved quote updates its existing item", async ({
+  page,
+}) => {
+  const { workspace, quotePosts, quotes, patches } = await fixture(page);
+  await workspace.getByRole("button", { name: /Paywalled archive/ }).click();
+  await workspace.getByLabel("Quote text").fill("Original wording");
+  await workspace.getByRole("button", { name: "Save", exact: true }).click();
+  await expect(
+    workspace.getByText("Quote saved to this source."),
+  ).toBeVisible();
+  await workspace.getByLabel("Quote text").fill("Corrected wording");
+  const correction = page.waitForResponse(
+    (response) =>
+      response.url().includes(`/api/projects/${projectId}/items`) &&
+      ["POST", "PATCH"].includes(response.request().method()),
+  );
+  await workspace.locator(".typed-quotes-form button[type=submit]").click();
+  await correction;
+  await expect(workspace.getByRole("status")).toContainText("saved");
+  expect(quotePosts).toHaveLength(1);
+  expect(patches).toHaveLength(1);
+  expect(patches[0]?.expectedVersion).toBe(1);
+  expect(quotes.map((quote) => [quote.id, quote.content.text])).toEqual([
+    [firstQuoteId, "Corrected wording"],
+  ]);
+  await expect(
+    workspace.getByLabel("Saved quote: Corrected wording"),
+  ).toBeVisible();
+  await expect(
+    workspace.getByLabel("Saved quote: Original wording"),
+  ).toHaveCount(0);
+});
+
 test("searches and pages existing sources, then adds a quote to a failed-extraction web page", async ({
   page,
 }) => {
