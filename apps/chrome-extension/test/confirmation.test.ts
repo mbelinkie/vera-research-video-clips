@@ -201,7 +201,7 @@ it.each(["rejects", "resolves"] as const)(
       path.endsWith("/youtube-source"),
     );
     expect(lookupIndex).toBeGreaterThanOrEqual(0);
-    const lookup = fixture.gateway.mock.results[lookupIndex].value;
+    const lookup = fixture.gateway.mock.results[lookupIndex]!.value;
     expect(fixture.byId("submit").disabled).toBe(true);
     fixture.byId("time").checked = true;
     await fixture.byId("time").onchange!();
