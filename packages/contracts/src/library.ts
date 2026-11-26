@@ -543,6 +543,7 @@ const ListQueryFields = {
 export const SourceListQuerySchema = z.strictObject({
   ...ListQueryFields,
   kind: SourceKindSchema.optional(),
+  sort: z.literal("recent").optional(),
 });
 
 export const ItemListQuerySchema = z.strictObject({
@@ -697,3 +698,30 @@ export const ExtensionDraftSchema = z.discriminatedUnion("kind", [
     ),
 ]);
 export type ExtensionDraft = z.infer<typeof ExtensionDraftSchema>;
+
+export const SourceDiscussionIdsSchema = z.array(IdSchema).min(1).max(30);
+export const SourceDiscussionReadSchema = z.array(IdSchema).min(1).max(50);
+export const CreateSourceDiscussionCommentSchema = z.strictObject({
+  id: IdSchema,
+  body: TextSchema.trim().min(1).max(2000),
+});
+export type CreateSourceDiscussionComment = z.infer<
+  typeof CreateSourceDiscussionCommentSchema
+>;
+
+export const SourceDiscussionCountSchema = z.strictObject({
+  total: z.number().int().nonnegative(),
+  unread: z.number().int().nonnegative(),
+});
+export const SourceDiscussionCommentSchema = z.strictObject({
+  id: IdSchema,
+  authorName: z.string(),
+  body: z.string(),
+  createdAt: TimestampSchema,
+  unread: z.boolean(),
+});
+export const SourceDiscussionPageSchema = z.strictObject({
+  comments: SourceDiscussionCommentSchema.array(),
+  canReply: z.boolean(),
+  more: z.boolean(),
+});
