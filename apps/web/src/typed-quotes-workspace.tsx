@@ -8,7 +8,7 @@ import {
   type Project,
 } from "@research-video/contracts";
 
-import { cloudFetch } from "./browser-api.ts";
+import { researchCloudFetch as cloudFetch } from "./research-library-data.ts";
 import {
   createOfflineSourceRequest,
   createTypedQuoteRequest,
@@ -26,12 +26,18 @@ import {
 } from "./typed-quote-pictures.tsx";
 
 type Props = {
+  hidden?: boolean;
   authorization: string;
   browserSession?: boolean;
   csrfToken?: string | undefined;
   onAuthUnavailable?: (() => void) | undefined;
   projectId: string;
   projects: readonly Project[];
+  initialSource?: LibrarySource | undefined;
+  initialQuote?: QuoteItem | undefined;
+  initialOpen?: boolean;
+  onSaved?: (item: QuoteItem, continueAdding: boolean) => void;
+  onClose?: () => void;
 };
 
 const pageSize = 20;
@@ -99,20 +105,34 @@ async function apiFailure(
 
 /** Standalone entrypoint: #81 can later mount this within a source workspace. */
 export function TypedQuotesWorkspace({
+  hidden,
   authorization,
   browserSession = false,
   csrfToken,
   onAuthUnavailable,
   projectId,
   projects,
+  initialSource,
+  initialQuote,
+  initialOpen = false,
+  onSaved,
+  onClose,
 }: Props) {
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useState(initialOpen);
   const [addMenuOpen, setAddMenuOpen] = useState(false);
   const [sourceMode, setSourceMode] = useState<"existing" | "new">("existing");
-  const [selectedSource, setSelectedSource] = useState<LibrarySource>();
+  const [selectedSource, setSelectedSource] = useState<
+    LibrarySource | undefined
+  >(initialSource);
   const [sourceDraft, setSourceDraft] = useState(newOfflineDraft);
-  const [quoteDraft, setQuoteDraft] = useState(emptyTypedQuoteDraft);
-  const [topicsText, setTopicsText] = useState("");
+  const [quoteDraft, setQuoteDraft] = useState(() =>
+    initialQuote
+      ? typedQuoteDraftFromItem(initialQuote)
+      : emptyTypedQuoteDraft(),
+  );
+  const [topicsText, setTopicsText] = useState(
+    () => initialQuote?.topics.join(", ") ?? "",
+  );
   const [queryInput, setQueryInput] = useState("");
   const [query, setQuery] = useState("");
   const [offset, setOffset] = useState(0);
@@ -130,7 +150,9 @@ export function TypedQuotesWorkspace({
   const [error, setError] = useState<string>();
   const [message, setMessage] = useState<string>();
   const [focusSavedId, setFocusSavedId] = useState<string>();
-  const [editingItem, setEditingItem] = useState<QuoteItem>();
+  const [editingItem, setEditingItem] = useState<QuoteItem | undefined>(
+    initialQuote,
+  );
   const [editLoading, setEditLoading] = useState(false);
   const [editConflict, setEditConflict] = useState(false);
   const [sourcePicture, setSourcePicture] = useState<File>();
@@ -480,6 +502,7 @@ export function TypedQuotesWorkspace({
     quoteIntentKey.current = crypto.randomUUID();
     const continueAdding = pendingAddAnother.current;
     pendingAddAnother.current = false;
+    onSaved?.(item, continueAdding);
     setEditConflict(false);
     setEditingItem(undefined);
     setMessage(
@@ -689,6 +712,7 @@ export function TypedQuotesWorkspace({
   return (
     <section
       className="typed-quotes-workspace"
+      hidden={hidden}
       aria-labelledby="typed-quotes-heading"
     >
       <div className="section-heading">
@@ -741,6 +765,7 @@ export function TypedQuotesWorkspace({
                 setOpen(false);
                 setError(undefined);
                 setMessage(undefined);
+                onClose?.();
               }}
             >
               Close
@@ -763,6 +788,7 @@ export function TypedQuotesWorkspace({
                 </p>
                 <button
                   type="button"
+                  hidden={Boolean(initialSource)}
                   disabled={
                     saving ||
                     Boolean(editingItem) ||
