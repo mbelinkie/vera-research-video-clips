@@ -111,6 +111,7 @@ async function research(page: Page, options: { reader?: boolean } = {}) {
     }),
   );
   const sent: unknown[] = [];
+  const replies: { sourceId: string; id: string; body: string }[] = [];
   const counts: Record<string, { total: number; unread: number }> = {
     [articleId]: { total: 2, unread: 1 },
     [videoId]: { total: 2, unread: 1 },
@@ -253,9 +254,27 @@ async function research(page: Page, options: { reader?: boolean } = {}) {
                 createdAt: now,
                 unread: !!counts[source.id]?.unread,
               },
+              ...replies
+                .filter((reply) => reply.sourceId === source.id)
+                .map((reply) => ({
+                  id: reply.id,
+                  authorName: "Fixture researcher",
+                  body: reply.body,
+                  createdAt: now,
+                  unread: false,
+                })),
             ],
           },
         });
+      if (match[2] === "/discussion" && method === "POST") {
+        const { id, body } = req.postDataJSON();
+        replies.push({ sourceId: source.id, id, body });
+        counts[source.id] = {
+          total: counts[source.id].total + 1,
+          unread: counts[source.id].unread,
+        };
+        return route.fulfill({ json: { id }, status: 201 });
+      }
       if (match[2] === "/discussion/read") {
         expect(req.postDataJSON()).toEqual([id(51)]);
         counts[source.id] = { total: 2, unread: 0 };
@@ -272,7 +291,7 @@ async function research(page: Page, options: { reader?: boolean } = {}) {
   await expect(
     page.getByRole("region", { name: "Research sources" }),
   ).toBeVisible();
-  return { sent, sources };
+  return { sent, sources, replies };
 }
 
 test("pages mixed Sources, filters by Topic and notices a newly arrived source", async ({
@@ -386,7 +405,7 @@ test("logs the exact article selection, confirms citation fields, and opens the 
 test("shows the same read counts on sources and workspaces and retains the article reply draft", async ({
   page,
 }) => {
-  await research(page);
+  const { replies } = await research(page);
   const article = page
     .getByRole("listitem")
     .filter({ hasText: "A fixture article" });
@@ -429,9 +448,33 @@ test("shows the same read counts on sources and workspaces and retains the artic
   ).toBeEnabled();
   await dialog.getByRole("button", { name: "Close comments" }).click();
   await expect(readControl).toBeFocused();
+  expect(replies).toEqual([]);
+  await readControl.click();
+  await expect(dialog.getByRole("textbox", { name: "Reply" })).toHaveValue(
+    "An unsent reply",
+  );
+  await dialog.getByRole("button", { name: "Post reply" }).click();
+  await expect(
+    dialog.getByText("An unsent reply", { exact: true }),
+  ).toBeVisible();
+  await expect(dialog.getByRole("textbox", { name: "Reply" })).toHaveValue("");
+  expect(replies).toEqual([
+    { sourceId: articleId, id: expect.any(String), body: "An unsent reply" },
+  ]);
+  await dialog.getByRole("button", { name: "Close comments" }).click();
+  const updatedControl = page.getByRole("button", {
+    name: "Comments · 3",
+    exact: true,
+  });
+  await expect(updatedControl).toBeFocused();
+  await updatedControl.click();
+  await dialog
+    .getByRole("textbox", { name: "Reply" })
+    .fill("Another unsent article reply");
+  await dialog.getByRole("button", { name: "Close comments" }).click();
   await page.getByRole("button", { name: "Back to Sources" }).click();
   await expect(
-    article.getByText("Comments · 2", { exact: true }),
+    article.getByText("Comments · 3", { exact: true }),
   ).toBeVisible();
   await page
     .getByRole("button", { name: "A fixture video", exact: true })
