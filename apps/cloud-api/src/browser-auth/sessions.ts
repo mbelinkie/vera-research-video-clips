@@ -29,6 +29,7 @@ export function readCookie(
 export type ServerSession = {
   subject: string;
   tokens: VerifiedTokens;
+  memberEmail: { email: string | null; observedAt: Date };
   csrf: string;
   createdAtMs: number;
   lastSeenMs: number;
@@ -44,7 +45,10 @@ export class MemorySessionStore {
     private readonly absoluteMs = 28_800_000,
     private readonly cap = 1000,
   ) {}
-  create(tokens: VerifiedTokens): { id: string; session: ServerSession } {
+  create(
+    tokens: VerifiedTokens,
+    observedAtMs = this.now(),
+  ): { id: string; session: ServerSession } {
     const time = this.now();
     for (const [key, session] of this.sessions)
       if (session.revoked || this.expired(session, time))
@@ -52,9 +56,30 @@ export class MemorySessionStore {
     if (this.sessions.size >= this.cap)
       throw new Error("Too many active sessions");
     const id = secret();
+    let memberEmail = {
+      email: tokens.verifiedEmail ?? null,
+      observedAt: new Date(observedAtMs),
+    };
+    const sameSubject = [...this.sessions.values()].filter(
+      (session) => session.subject === tokens.subject,
+    );
+    // A new login may supersede evidence held by another browser that has
+    // signed in but hasn't created a profile yet.
+    for (const session of sameSubject) {
+      const prior = session.memberEmail;
+      if (prior.observedAt > memberEmail.observedAt) memberEmail = prior;
+      else if (
+        prior.observedAt.getTime() === memberEmail.observedAt.getTime() &&
+        prior.email !== memberEmail.email
+      ) {
+        memberEmail = { email: null, observedAt: memberEmail.observedAt };
+      }
+    }
+    for (const session of sameSubject) session.memberEmail = memberEmail;
     const session: ServerSession = {
       subject: tokens.subject,
       tokens,
+      memberEmail,
       csrf: secret(),
       createdAtMs: time,
       lastSeenMs: time,

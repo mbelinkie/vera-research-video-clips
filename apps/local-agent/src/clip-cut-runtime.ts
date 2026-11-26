@@ -2,8 +2,8 @@ import type { AppConfig } from "@research-video/config";
 import { ClipCandidateSchema } from "@research-video/contracts";
 import {
   createFullVideoAcquirer,
-  FfmpegRangeRenderer,
-  FfprobeMediaInspector,
+  FfmpegVideoRangeRenderer,
+  FfprobeVideoInspector,
 } from "@research-video/media";
 import {
   HttpActiveTranscriptCatalogClient,
@@ -93,7 +93,11 @@ export class ClipSourceDisabledError extends Error {
 /** The foreground CLI and loopback API use the identical authorized cutter. */
 export function createClipCutRunner(
   config: AppConfig,
-  cache: VerifiedTranscriptCache,
+  cache:
+    | VerifiedTranscriptCache
+    | ((authorization: string) => VerifiedTranscriptCache),
+  cloudApiUrl = config.publicApiOrigin ??
+    `http://${config.cloudApiHost}:${config.cloudApiPort}`,
 ): (request: CutLoggedClipsRequest) => ReturnType<typeof cutLoggedClips> {
   const acquirer = createFullVideoAcquirer({
     mode: config.exportSourceProvider,
@@ -104,7 +108,6 @@ export function createClipCutRunner(
       throw new ClipSourceDisabledError();
     };
   }
-  const cloudApiUrl = `http://${config.cloudApiHost}:${config.cloudApiPort}`;
   const deps: ClipCutterDependencies = {
     catalog: new HttpProjectClipCatalog(cloudApiUrl),
     transcripts: {
@@ -115,7 +118,7 @@ export function createClipCutRunner(
       }) => {
         const resolution = await new SharedFirstTranscriptResolver(
           new HttpActiveTranscriptCatalogClient(cloudApiUrl, authorization),
-          cache,
+          typeof cache === "function" ? cache(authorization) : cache,
         ).resolve(clip.projectId, clip.catalogVideoId);
         return readVerifiedLoggedClipTracks({
           resolution,
@@ -125,8 +128,8 @@ export function createClipCutRunner(
       },
     },
     acquirer,
-    inspector: new FfprobeMediaInspector({ executable: config.ffprobePath }),
-    renderer: new FfmpegRangeRenderer({ executable: config.ffmpegPath }),
+    inspector: new FfprobeVideoInspector({ executable: config.ffprobePath }),
+    renderer: new FfmpegVideoRangeRenderer({ executable: config.ffmpegPath }),
     exportDirectory: config.clipExportDir,
   };
   return (request) => cutLoggedClips(request, deps);

@@ -34,19 +34,25 @@ describe("local signed transcript HTTP transport", () => {
       "https://research.example/cloud-api/",
       "local-objects-test-secret-at-least-32-bytes",
     );
-    const catalog = {} as SharedProjectCatalog;
+    const projectId = "fca4f774-f508-4e47-ae4e-a1a508f5ce11";
+    const projectKey = `projects/${projectId}/transcripts/english-normalized.json`;
+    const actor = {
+      userId: "fa23cc45-03b5-4517-82a8-f5e408d1a0d4",
+      externalSubject: "fixture:member",
+    };
+    const getOwnMembership = vi.fn().mockResolvedValue({ role: "viewer" });
+    const catalog = { getOwnMembership } as unknown as SharedProjectCatalog;
     const auth = createBrowserAuth({
       publicOrigin: "https://research.example",
       trustedProxyPeers: ["127.0.0.1"],
       catalog,
-      // Neither login nor provider calls are needed for an anonymous session
-      // status check; this verifies route registration and signed transport.
       provider: {} as IdentityProvider,
     });
+    const authenticate = vi.fn(auth.authenticate);
     const app = createCloudApi({
       catalog,
       browserAuth: auth,
-      authenticate: (request) => auth.authenticate(request),
+      authenticate,
       localArtifacts: { store, issuer, objectRoot: root },
     });
     const headers = { host: "research.example" };
@@ -63,7 +69,10 @@ describe("local signed transcript HTTP transport", () => {
       });
 
       const putCapability = new URL(
-        await issuer.issuePutUrl({ objectKey: key, expiresInSeconds: 30 }),
+        await issuer.issuePutUrl({
+          objectKey: projectKey,
+          expiresInSeconds: 30,
+        }),
       );
       expect(putCapability.origin).toBe("https://research.example");
       expect(putCapability.pathname).toMatch(/^\/cloud-api\/__objects\//u);
@@ -76,25 +85,26 @@ describe("local signed transcript HTTP transport", () => {
           payload: Buffer.from("test object"),
         });
       expect((await upload()).statusCode).toBe(200);
-      const stored = await store.get(key);
+      const stored = await store.get(projectKey);
       const pinnedCapability = new URL(
         await issuer.issueGetUrl({
-          objectKey: key,
+          objectKey: projectKey,
           objectVersionId: stored!.versionId,
           expiresInSeconds: 30,
         }),
       );
       expect(pinnedCapability.origin).toBe("https://research.example");
       expect(pinnedCapability.pathname).toMatch(/^\/cloud-api\/__objects\//u);
-      const downloaded = await app.inject({
-        method: "GET",
-        url: pinnedCapability.pathname,
-        headers,
-      });
-      expect(downloaded.statusCode).toBe(200);
-      expect(downloaded.rawPayload.toString()).toBe("test object");
+      const download = () =>
+        app.inject({ method: "GET", url: pinnedCapability.pathname, headers });
+      expect((await download()).statusCode).toBe(401);
       await mkdir(join(root, ".vera-backup-writes-blocked"));
       expect((await upload()).statusCode).toBe(503);
+      authenticate.mockResolvedValueOnce(actor);
+      const downloaded = await download();
+      expect(downloaded.statusCode).toBe(200);
+      expect(downloaded.rawPayload.toString()).toBe("test object");
+      expect(getOwnMembership).toHaveBeenCalledWith(actor, projectId);
       expect(
         (
           await app.inject({

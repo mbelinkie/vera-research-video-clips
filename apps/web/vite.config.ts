@@ -27,6 +27,7 @@ const proxySettings = {
 
 export default defineConfig({
   root: fileURLToPath(new URL(".", import.meta.url)),
+  base: "./",
   plugins: [
     react(),
     ...(managed ? [managedResearchPlugin(proxySettings)] : []),
@@ -37,6 +38,14 @@ export default defineConfig({
     strictPort: true,
     cors: { origin: `http://127.0.0.1:${webPort}` },
     proxy: {
+      ...(managed
+        ? {
+            "/extension/v1/": {
+              target: `http://127.0.0.1:${process.env.CLOUD_API_PORT ?? 43111}`,
+              changeOrigin: false,
+            },
+          }
+        : {}),
       "/local-agent": managed
         ? managedResearchProxyOptions(
             `http://127.0.0.1:${process.env.LOCAL_AGENT_PORT ?? 43110}`,

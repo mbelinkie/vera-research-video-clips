@@ -1,18 +1,26 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { z } from "zod";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 import {
   ApiErrorSchema,
   BatchPreflightResponseSchema,
   CreateTranscriptionBatchResponseSchema,
   ProjectSchema,
+  ProjectRoleSchema,
+  VideoCommentSchema,
+  type VideoComment,
   ReviewInboxResponseSchema,
   TranscriptionBatchListResponseSchema,
+  languagesEquivalent,
   type BatchPreflightResponse,
+  type CloudTranslationConsent,
   type CreateTranscriptionBatchResponse,
+  type LanguageGate,
   type Project,
   type ReviewInboxItem,
   type TranscriptionBatchControlRequest,
   type TranscriptionBatchListResponse,
+  type TranscriptionExecutionPolicy,
 } from "@research-video/contracts";
 
 import {
@@ -23,35 +31,61 @@ import {
   type CsvImportDocument,
 } from "./csv-import.ts";
 import { ClipQueue } from "./clip-queue.tsx";
+import { apiFetch, isDesktopRuntime } from "./api-client.ts";
 import { cloudFetch } from "./browser-api.ts";
 import { immediateProgress } from "./immediate-transcript.ts";
+import { ProjectMembersPanel } from "./project-members-panel.tsx";
+import {
+  normalizeSpokenLanguageChoice,
+  spokenLanguageChoiceLabel,
+  suggestedSpokenLanguages,
+} from "./spoken-language-choice.ts";
 
 type BatchWorkspaceProps = {
+  hidden?: boolean;
+  hideProjectPicker?: boolean;
   authorization: string;
   browserSession?: boolean;
   csrfToken?: string | undefined;
   onAuthUnavailable?: () => void;
   onAuthorizationChange(value: string): void;
+  onOpenSource?: (sourceId: string) => void;
   onOpenVideo(canonicalUrl: string): void;
   onProjectChange(projectId: string): void;
   onProjectsChange(projects: Project[]): void;
   projectId: string;
   projects: readonly Project[];
+  batchProviderSelector?: ReactNode;
+  transcriptionExecutionPolicy?: TranscriptionExecutionPolicy;
+  translationConsent?: CloudTranslationConsent;
 };
 
 const apiRoot = "/cloud-api";
 
+type LanguageDecisionDraft = {
+  resolvedLanguage: string;
+  busy: boolean;
+  idempotencyKey?: string;
+  error?: string;
+};
+
 export function BatchWorkspace({
+  hidden,
+  hideProjectPicker,
   authorization,
   browserSession = false,
   csrfToken,
   onAuthUnavailable,
   onAuthorizationChange,
+  onOpenSource,
   onOpenVideo,
   onProjectChange,
   onProjectsChange,
   projectId,
   projects,
+  batchProviderSelector,
+  transcriptionExecutionPolicy,
+  translationConsent,
 }: BatchWorkspaceProps) {
   const [batchName, setBatchName] = useState("Research batch");
   const [inputsText, setInputsText] = useState("");
@@ -66,6 +100,9 @@ export function BatchWorkspace({
     useState<CreateTranscriptionBatchResponse>();
   const [selectedBatchId, setSelectedBatchId] = useState("");
   const [reviewItems, setReviewItems] = useState<ReviewInboxItem[]>([]);
+  const [languageDecisionDrafts, setLanguageDecisionDrafts] = useState<
+    Record<string, LanguageDecisionDraft>
+  >({});
   const [reviewProjectId, setReviewProjectId] = useState("");
   const [busy, setBusy] = useState(false);
   const [newProject, setNewProject] = useState("");
@@ -87,6 +124,7 @@ export function BatchWorkspace({
     setSelectedBatchId("");
     setReviewItems([]);
     setReviewProjectId("");
+    setLanguageDecisionDrafts({});
   }, [projectId, authorization]);
 
   const visibleReviewItems = reviewProjectId === projectId ? reviewItems : [];
@@ -103,19 +141,45 @@ export function BatchWorkspace({
     [inputsText],
   );
 
-  async function request(path: string, init: RequestInit = {}) {
-    const response = await cloudFetch(
-      `${apiRoot}${path}`,
-      {
-        ...init,
-        headers: {
-          accept: "application/json",
-          ...(init.body ? { "content-type": "application/json" } : {}),
-          ...init.headers,
-        },
-      },
-      { authorization, csrfToken, onUnavailable: onAuthUnavailable },
+  async function loadComments(sourceId: string, offset: number) {
+    return VideoCommentSchema.array().parse(
+      await request(
+        `/api/projects/${projectId}/sources/${sourceId}/comments?offset=${offset}`,
+      ),
     );
+  }
+  async function request(path: string, init: RequestInit = {}) {
+    const response = isDesktopRuntime()
+      ? await apiFetch(
+          "cloud",
+          path,
+          {
+            ...(init.method ? { method: init.method } : {}),
+            ...(init.body === undefined
+              ? {}
+              : typeof init.body === "string"
+                ? { body: init.body }
+                : (() => {
+                    throw new TypeError(
+                      "Desktop API requests require a JSON string body.",
+                    );
+                  })()),
+            ...(init.signal ? { signal: init.signal } : {}),
+          },
+          authorization,
+        )
+      : await cloudFetch(
+          `${apiRoot}${path}`,
+          {
+            ...init,
+            headers: {
+              accept: "application/json",
+              ...(init.body ? { "content-type": "application/json" } : {}),
+              ...init.headers,
+            },
+          },
+          { authorization, csrfToken, onUnavailable: onAuthUnavailable },
+        );
     const payload = await response.json().catch(() => undefined);
     if (!response.ok) {
       const parsed = ApiErrorSchema.safeParse(payload);
@@ -157,9 +221,11 @@ export function BatchWorkspace({
   async function connect() {
     setBusy(true);
     try {
-      const loaded = ProjectSchema.array().parse(
-        await request("/api/projects"),
-      );
+      const loaded = ProjectSchema.and(
+        z.object({ currentUserRole: ProjectRoleSchema.optional() }),
+      )
+        .array()
+        .parse(await request("/api/projects"));
       onProjectsChange(loaded);
       onProjectChange(projectId || loaded[0]?.id || "");
       setMessage(
@@ -243,8 +309,14 @@ export function BatchWorkspace({
     targetLanguage: "en",
     transcriptionProfile: "default",
     sourcePolicy,
-    executionLocation,
+    executionLocation: transcriptionExecutionPolicy
+      ? transcriptionExecutionPolicy.execution === "cloud"
+        ? "hosted"
+        : "local"
+      : executionLocation,
     priority,
+    ...(transcriptionExecutionPolicy ? { transcriptionExecutionPolicy } : {}),
+    ...(translationConsent ? { translationConsent } : {}),
   };
 
   async function runPreflight() {
@@ -361,6 +433,78 @@ export function BatchWorkspace({
     }
   }
 
+  async function confirmLanguage(
+    item: CreateTranscriptionBatchResponse["items"][number],
+    gate: LanguageGate,
+    resolvedLanguage: string,
+  ) {
+    if (!projectId || !item.catalogVideoId || !resolvedLanguage) return;
+    const targetProjectId = projectId;
+    const expectedAuth = authorization;
+    const key = languageDecisionKey(
+      targetProjectId,
+      item.catalogVideoId,
+      item.id,
+    );
+    const idempotencyKey =
+      languageDecisionDrafts[key]?.idempotencyKey ?? crypto.randomUUID();
+    setLanguageDecisionDrafts((current) => ({
+      ...current,
+      [key]: { resolvedLanguage, busy: true, idempotencyKey },
+    }));
+    try {
+      await request(
+        `/api/projects/${targetProjectId}/videos/${item.catalogVideoId}/language-decisions`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            idempotencyKey,
+            expectedDecisionVersion: gate.decision?.decisionVersion ?? 0,
+            resolvedLanguage,
+            basis: "user_confirmation",
+            ...(gate.providerEvidence?.id
+              ? { evidenceId: gate.providerEvidence.id }
+              : {}),
+            batchItemId: item.id,
+            expectedBatchItemVersion: item.version,
+          }),
+        },
+      );
+      if (!sameContext(targetProjectId, expectedAuth)) return;
+      setLanguageDecisionDrafts((current) => {
+        const { [key]: _completed, ...remaining } = current;
+        return remaining;
+      });
+      setMessage("Language confirmation recorded. Refreshing the batch.");
+    } catch (error) {
+      if (!sameContext(targetProjectId, expectedAuth)) return;
+      setLanguageDecisionDrafts((current) => ({
+        ...current,
+        [key]: {
+          resolvedLanguage,
+          busy: false,
+          idempotencyKey,
+          error: errorMessage(error),
+        },
+      }));
+    } finally {
+      if (sameContext(targetProjectId, expectedAuth))
+        await refreshProject(targetProjectId, selectedBatchId);
+    }
+  }
+
+  function setLanguageDecisionDraft(
+    item: CreateTranscriptionBatchResponse["items"][number],
+    resolvedLanguage: string,
+  ) {
+    if (!projectId || !item.catalogVideoId) return;
+    const key = languageDecisionKey(projectId, item.catalogVideoId, item.id);
+    setLanguageDecisionDrafts((current) => ({
+      ...current,
+      [key]: { resolvedLanguage, busy: false },
+    }));
+  }
+
   async function updateReview(item: ReviewInboxItem, reviewStatus: string) {
     if (!projectId) return;
     setBusy(true);
@@ -380,7 +524,11 @@ export function BatchWorkspace({
   }
 
   return (
-    <section className="batch-workspace" aria-labelledby="queue-title">
+    <section
+      hidden={hidden}
+      className="batch-workspace"
+      aria-labelledby="queue-title"
+    >
       <div className="section-heading">
         <div>
           <p className="eyebrow">Shared project preparation</p>
@@ -442,23 +590,37 @@ export function BatchWorkspace({
       )}
       {projects.length ? (
         <>
-          <label className="project-picker" htmlFor="batch-project">
-            <span>Target project</span>
-            <select
-              id="batch-project"
-              value={projectId}
-              onChange={(event) => {
-                onProjectChange(event.target.value);
-                setPreflight(undefined);
-              }}
-            >
-              {projects.map((project) => (
-                <option key={project.id} value={project.id}>
-                  {project.name}
-                </option>
-              ))}
-            </select>
-          </label>
+          {!hideProjectPicker && (
+            <label className="project-picker" htmlFor="batch-project">
+              <span>Target project</span>
+              <select
+                id="batch-project"
+                value={projectId}
+                onChange={(event) => {
+                  onProjectChange(event.target.value);
+                  setPreflight(undefined);
+                }}
+              >
+                {projects.map((project) => (
+                  <option key={project.id} value={project.id}>
+                    {project.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
+
+          <ProjectMembersPanel
+            key={`${projectId}:${authorization}:${csrfToken ?? ""}`}
+            authorization={authorization}
+            csrfToken={csrfToken}
+            onAuthUnavailable={onAuthUnavailable}
+            projectId={projectId}
+            projectName={
+              projects.find((project) => project.id === projectId)?.name ??
+              "Selected project"
+            }
+          />
 
           <div className="batch-grid">
             <article className="queue-card batch-create-card">
@@ -538,19 +700,23 @@ export function BatchWorkspace({
                     <option value="force-generate">Force generation</option>
                   </select>
                 </label>
-                <label>
-                  Worker
-                  <select
-                    value={executionLocation}
-                    onChange={(event) => {
-                      setExecutionLocation(event.target.value);
-                      setPreflight(undefined);
-                    }}
-                  >
-                    <option value="local">Local</option>
-                    <option value="hosted">Hosted</option>
-                  </select>
-                </label>
+                {batchProviderSelector ? (
+                  batchProviderSelector
+                ) : (
+                  <label>
+                    Worker
+                    <select
+                      value={executionLocation}
+                      onChange={(event) => {
+                        setExecutionLocation(event.target.value);
+                        setPreflight(undefined);
+                      }}
+                    >
+                      <option value="local">Local</option>
+                      <option value="hosted">Hosted</option>
+                    </select>
+                  </label>
+                )}
                 <label>
                   Priority
                   <select
@@ -617,8 +783,15 @@ export function BatchWorkspace({
               {selectedBatch && selectedBatch.batch.projectId === projectId ? (
                 <BatchDetail
                   batch={selectedBatch}
+                  loadComments={loadComments}
                   busy={busy}
                   onControl={controlBatch}
+                  projectId={projectId}
+                  languageDecisionDrafts={languageDecisionDrafts}
+                  onLanguageDraftChange={setLanguageDecisionDraft}
+                  onConfirmLanguage={(item, gate, resolvedLanguage) =>
+                    void confirmLanguage(item, gate, resolvedLanguage)
+                  }
                 />
               ) : null}
             </article>
@@ -635,6 +808,11 @@ export function BatchWorkspace({
                   <div className="review-item" key={item.id}>
                     <div>
                       <strong>{item.title ?? item.youtubeVideoId}</strong>
+                      <VideoComments
+                        key={item.id}
+                        item={item}
+                        load={loadComments}
+                      />
                       <span>
                         {item.batchName}
                         {item.channel ? ` · ${item.channel}` : ""}
@@ -653,6 +831,15 @@ export function BatchWorkspace({
                       <option value="reviewed">Reviewed</option>
                       <option value="skipped">Skipped</option>
                     </select>
+                    {item.catalogVideoId && onOpenSource ? (
+                      <button
+                        type="button"
+                        data-testid="open-youtube-source"
+                        onClick={() => onOpenSource(item.catalogVideoId!)}
+                      >
+                        Open source
+                      </button>
+                    ) : null}
                     {item.canonicalUrl ? (
                       <button
                         type="button"
@@ -718,12 +905,29 @@ function PreflightTable({ preflight }: { preflight: BatchPreflightResponse }) {
 
 function BatchDetail({
   batch,
+  loadComments,
   busy,
   onControl,
+  projectId,
+  languageDecisionDrafts,
+  onLanguageDraftChange,
+  onConfirmLanguage,
 }: {
   batch: CreateTranscriptionBatchResponse;
+  loadComments: (sourceId: string, offset: number) => Promise<VideoComment[]>;
   busy: boolean;
   onControl(action: TranscriptionBatchControlRequest["action"]): void;
+  projectId: string;
+  languageDecisionDrafts: Record<string, LanguageDecisionDraft>;
+  onLanguageDraftChange(
+    item: CreateTranscriptionBatchResponse["items"][number],
+    resolvedLanguage: string,
+  ): void;
+  onConfirmLanguage(
+    item: CreateTranscriptionBatchResponse["items"][number],
+    gate: LanguageGate,
+    resolvedLanguage: string,
+  ): void;
 }) {
   const canDispatch = batch.batch.dispatchStatus !== "canceled";
   return (
@@ -781,7 +985,32 @@ function BatchDetail({
               <tr key={item.id}>
                 <td>
                   {item.title ?? item.input}
+                  <VideoComments
+                    key={item.id}
+                    item={item}
+                    load={loadComments}
+                  />
                   {item.error ? <small>{safeBatchError(item)}</small> : null}
+                  {item.languageGate?.state &&
+                  item.languageGate.state !== "ready" ? (
+                    <LanguageConfirmation
+                      item={item}
+                      gate={item.languageGate}
+                      draft={
+                        item.catalogVideoId
+                          ? languageDecisionDrafts[
+                              languageDecisionKey(
+                                projectId,
+                                item.catalogVideoId,
+                                item.id,
+                              )
+                            ]
+                          : undefined
+                      }
+                      onDraftChange={onLanguageDraftChange}
+                      onConfirm={onConfirmLanguage}
+                    />
+                  ) : null}
                 </td>
                 <td>{item.state}</td>
                 <td>{item.attempt}</td>
@@ -792,6 +1021,179 @@ function BatchDetail({
       </div>
     </div>
   );
+}
+
+function languageDecisionKey(
+  projectId: string,
+  catalogVideoId: string,
+  batchItemId: string,
+) {
+  return `${projectId}:${catalogVideoId}:${batchItemId}`;
+}
+
+function LanguageConfirmation({
+  item,
+  gate,
+  draft,
+  onDraftChange,
+  onConfirm,
+}: {
+  item: CreateTranscriptionBatchResponse["items"][number];
+  gate: LanguageGate;
+  draft?: LanguageDecisionDraft | undefined;
+  onDraftChange(
+    item: CreateTranscriptionBatchResponse["items"][number],
+    resolvedLanguage: string,
+  ): void;
+  onConfirm(
+    item: CreateTranscriptionBatchResponse["items"][number],
+    gate: LanguageGate,
+    resolvedLanguage: string,
+  ): void;
+}) {
+  const choices = [
+    ...new Set([
+      gate.creatorReportedLanguage,
+      gate.providerEvidence?.reportedLanguage,
+      gate.decision?.resolvedLanguage,
+    ]),
+  ].filter((language): language is string => Boolean(language));
+  const selectedLanguage = draft?.resolvedLanguage ?? choices[0] ?? "";
+  const confirmedLanguage = normalizeSpokenLanguageChoice(selectedLanguage);
+  const requiresExplicitLanguage = choices.length === 0;
+  const suggestionsId = `spoken-language-suggestions-${item.id}`;
+  const unsupported = [gate.speechCapability, gate.translationCapability]
+    .filter((capability): capability is NonNullable<typeof capability> =>
+      Boolean(capability),
+    )
+    .find((capability) => capability.state !== "supported");
+  const selectedCapabilityUnsupported = Boolean(
+    unsupported?.sourceLanguage &&
+    confirmedLanguage &&
+    languagesEquivalent(unsupported.sourceLanguage, confirmedLanguage),
+  );
+
+  return (
+    <fieldset>
+      <legend>Language confirmation required</legend>
+      <p>
+        Provider-reported language:{" "}
+        {gate.providerEvidence?.reportedLanguage ?? "Unknown"}
+      </p>
+      <p>
+        Creator-reported language: {gate.creatorReportedLanguage ?? "Unknown"}
+      </p>
+      <p>
+        Current resolved language:{" "}
+        {gate.decision?.resolvedLanguage ?? "Unresolved"}
+      </p>
+      <p>
+        Status: {gate.status}. Basis:{" "}
+        {gate.decision?.basis ?? "Not yet confirmed"}. Decision version:{" "}
+        {gate.decision?.decisionVersion ?? 0}.
+      </p>
+      <p>Speech capability: {capabilitySummary(gate.speechCapability)}</p>
+      <p>
+        Translation capability: {capabilitySummary(gate.translationCapability)}
+      </p>
+      <p>{remediationCopy(gate.remediationReason)}</p>
+      <label>
+        Confirmed spoken language
+        {requiresExplicitLanguage ? (
+          <>
+            <input
+              aria-label={`Confirmed spoken language for ${item.title ?? item.input}`}
+              list={suggestionsId}
+              value={selectedLanguage}
+              maxLength={35}
+              autoCapitalize="none"
+              autoCorrect="off"
+              spellCheck={false}
+              disabled={draft?.busy}
+              placeholder="Choose or type a language code"
+              onChange={(event) => onDraftChange(item, event.target.value)}
+            />
+            <datalist id={suggestionsId}>
+              {suggestedSpokenLanguages.map((language) => (
+                <option key={language.value} value={language.value}>
+                  {language.label}
+                </option>
+              ))}
+            </datalist>
+          </>
+        ) : (
+          <select
+            aria-label={`Confirmed spoken language for ${item.title ?? item.input}`}
+            value={selectedLanguage}
+            disabled={draft?.busy}
+            onChange={(event) => onDraftChange(item, event.target.value)}
+          >
+            {choices.map((language) => (
+              <option key={language} value={language}>
+                {language}
+              </option>
+            ))}
+          </select>
+        )}
+      </label>
+      {requiresExplicitLanguage ? (
+        selectedLanguage && !confirmedLanguage ? (
+          <p role="alert">
+            Enter a valid BCP-47 language tag, such as en, dz, or zh-Hant.
+          </p>
+        ) : (
+          <p className="form-message">
+            {confirmedLanguage
+              ? `Selected: ${spokenLanguageChoiceLabel(confirmedLanguage)}`
+              : "No language was detected. Choose a suggestion or type a BCP-47 language tag."}
+          </p>
+        )
+      ) : null}
+      <button
+        type="button"
+        disabled={
+          draft?.busy ||
+          !confirmedLanguage ||
+          !item.catalogVideoId ||
+          selectedCapabilityUnsupported
+        }
+        onClick={() => onConfirm(item, gate, confirmedLanguage ?? "")}
+      >
+        {selectedCapabilityUnsupported
+          ? "Choose a supported language to retry"
+          : "Confirm language and retry"}
+      </button>
+      {!item.catalogVideoId ? (
+        <p role="alert">
+          This item cannot be confirmed until its project video is available.
+        </p>
+      ) : null}
+      {draft?.error ? <p role="alert">{draft.error}</p> : null}
+    </fieldset>
+  );
+}
+
+function remediationCopy(reason: LanguageGate["remediationReason"]) {
+  switch (reason) {
+    case "confirm_language":
+      return "Confirm the spoken language before transcription can continue.";
+    case "resolve_conflict":
+      return "Provider and creator language evidence conflict. Confirm the spoken language before any dependent work continues.";
+    case "select_supported_provider":
+      return "The selected language needs a supported provider before work can continue.";
+    default:
+      return "Language evidence needs remediation before work can continue.";
+  }
+}
+
+function capabilitySummary(
+  capability:
+    LanguageGate["speechCapability"] | LanguageGate["translationCapability"],
+) {
+  if (!capability) return "Not evaluated";
+  return capability.state === "supported"
+    ? "Supported"
+    : `${capability.state.replaceAll("_", " ")} (${capability.reason.replaceAll("_", " ")})`;
 }
 
 function safeBatchError(
@@ -805,4 +1207,59 @@ function safeBatchError(
 
 function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : "Unexpected request failure.";
+}
+
+function VideoComments({
+  item,
+  load,
+}: {
+  item: CreateTranscriptionBatchResponse["items"][number];
+  load: (sourceId: string, offset: number) => Promise<VideoComment[]>;
+}) {
+  const [older, setOlder] = useState<VideoComment[]>([]);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const comments = [...(item.videoComments ?? []), ...older];
+  if (!comments.length) return null;
+  async function more() {
+    if (!item.catalogVideoId || busy) return;
+    setBusy(true);
+    setError("");
+    try {
+      const page = await load(item.catalogVideoId, comments.length);
+      setOlder((previous) => [...previous, ...page]);
+    } catch {
+      setError("Comments could not be loaded.");
+    } finally {
+      setBusy(false);
+    }
+  }
+  return (
+    <div aria-label="Video comments">
+      {comments.map((comment) => {
+        const { timecodeMs } = comment;
+        const sec = Math.floor((timecodeMs ?? 0) / 1000);
+        return (
+          <p className="submission-comment" key={comment.id}>
+            <strong>{comment.authorName}</strong>
+            {" · "}
+            {timecodeMs !== null && (
+              <>
+                <time dateTime={`PT${timecodeMs / 1000}S`}>
+                  {Math.floor(sec / 60)}:{String(sec % 60).padStart(2, "0")}
+                </time>{" "}
+              </>
+            )}
+            {comment.text}
+          </p>
+        );
+      })}
+      {comments.length < (item.videoCommentCount ?? 0) && (
+        <button type="button" disabled={busy} onClick={() => void more()}>
+          More comments
+        </button>
+      )}
+      {error && <p role="status">{error}</p>}
+    </div>
+  );
 }

@@ -13,6 +13,7 @@ import {
   readFile,
   readdir,
   rename,
+  rm,
   rmdir,
 } from "node:fs/promises";
 import { join, dirname, isAbsolute, resolve, relative, sep } from "node:path";
@@ -185,6 +186,9 @@ async function readSnapshot(pool: Pool) {
       "SELECT version FROM schema_migrations ORDER BY version",
     );
     const schemaVersions = versions.rows.map((row) => row.version);
+    const hasCaptures = schemaVersions.includes(
+      "0059_extension_capture_assets",
+    );
     const hasStills = schemaVersions.includes("0055_library_still_assets");
     const references =
       await client.query<Ref>(`SELECT object_key, object_version_id, sha256, byte_size::text
@@ -230,6 +234,15 @@ async function readSnapshot(pool: Pool) {
         ? ["library_source_reuse_receipts"]
         : []),
       ...(hasStills ? ["library_still_assets"] : []),
+      ...(hasCaptures
+        ? ["extension_captures", "extension_capture_assets"]
+        : []),
+      ...(schemaVersions.includes("0060_chrome_capture_connections")
+        ? ["chrome_capture_connections", "chrome_video_submissions"]
+        : []),
+      ...(schemaVersions.includes("0061_youtube_source_moments")
+        ? ["youtube_source_moments"]
+        : []),
     ];
     for (const table of snapshotTables) {
       const result = await client.query<{ total: string }>(
@@ -256,10 +269,21 @@ async function readSnapshot(pool: Pool) {
           FROM library_still_assets ORDER BY object_key, object_version_id`)
         ).rows
       : [];
+    const captureReferences = hasCaptures
+      ? (
+          await client.query<Ref>(
+            `SELECT object_key,object_version_id,sha256,byte_size::text FROM extension_capture_assets ORDER BY object_key,object_version_id`,
+          )
+        ).rows
+      : [];
     await client.query("COMMIT");
     return {
       schemaVersions,
-      references: [...references.rows, ...stillReferences],
+      references: [
+        ...references.rows,
+        ...stillReferences,
+        ...captureReferences,
+      ],
       tableCounts: counts,
       tableDigests,
     };
@@ -555,6 +579,10 @@ export async function restorePilot(
       objects: manifest.objects.length,
       tables: Object.keys(snapshot.tableCounts).length,
     };
+  } catch (error) {
+    // Never leave a partial plaintext copy of transcripts behind (#53 review).
+    await rm(stage, { recursive: true, force: true });
+    throw error;
   } finally {
     await pool.end();
   }

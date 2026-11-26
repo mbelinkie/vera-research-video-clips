@@ -13,6 +13,7 @@ import {
   type ProjectRole,
   type CreateSourceRequest,
   type CreateItemRequest,
+  type CreateSourceDiscussionComment,
   type UpdateSourceRequest,
   type UpdateItemRequest,
   type CreateTranscriptClipItemRequest,
@@ -24,6 +25,8 @@ import {
   type StillAssetRole,
   type StillContent,
   type StillUpload,
+  ExtensionCaptureRequestSchema,
+  type ExtensionCaptureRequest,
 } from "@research-video/contracts";
 import type { SqlDatabase } from "@research-video/db-cloud";
 import type { TranscriptObjectStore } from "@research-video/storage";
@@ -41,6 +44,25 @@ import {
   readAudioPlayback,
   readAudioReference,
 } from "./library-audio-assets.ts";
+import {
+  assertReferencePictureOwner,
+  checkReferencePictureRevision,
+  keepReferencePictureAssets,
+  readReferencePictureManifest,
+  readReferencePictureObject,
+  replaceReferencePictureRows,
+  type ReferencePictureOwnerKind,
+} from "./library-reference-pictures.ts";
+import {
+  extensionCaptureFingerprint,
+  insertExtensionCaptureAssets,
+  keepExtensionCaptureAssets,
+  readExtensionCaptureAsset,
+  readExtensionCaptureReceipt,
+  type ExtensionCaptureAssetRole,
+  type ExtensionCaptureReceipt,
+  type ExtensionCaptureRasters,
+} from "./extension-assets.ts";
 import {
   CatalogConflictError,
   CatalogNotFoundError,
@@ -120,6 +142,85 @@ async function validateAudioSelection(
     throw new CatalogConflictError(
       "Name the selection and keep its in and out within the source duration.",
     );
+}
+
+function automatic<T>(value: T) {
+  return { value, state: "automatic" as const };
+}
+
+function sameSite(left: string, right: string) {
+  const hostname = (value: string) =>
+    new URL(value).hostname.replace(/^www\./u, "").toLowerCase();
+  return hostname(left) === hostname(right);
+}
+
+function captureSourceRequest(
+  input: ExtensionCaptureRequest,
+): CreateSourceRequest {
+  if (input.kind === "audio") {
+    return CreateSourceRequestSchema.parse({
+      kind: "audio",
+      idempotencyKey: input.requestId,
+      bibliography: {
+        ...(input.title ? { title: automatic(input.title) } : {}),
+        url: automatic(input.url),
+      },
+      details: {},
+    });
+  }
+
+  const metadata = input.metadata;
+  const canonicalUrl =
+    metadata.url && sameSite(metadata.url, input.url)
+      ? metadata.url
+      : input.url;
+  return CreateSourceRequestSchema.parse({
+    kind: "web_page",
+    idempotencyKey: input.requestId,
+    bibliography: {
+      ...(metadata.title ? { title: automatic(metadata.title) } : {}),
+      ...(metadata.authors ? { authors: automatic(metadata.authors) } : {}),
+      ...(metadata.publication
+        ? { publication: automatic(metadata.publication) }
+        : {}),
+      ...(metadata.date ? { date: automatic(metadata.date) } : {}),
+      url: automatic(canonicalUrl),
+    },
+    details: {
+      submittedUrl: input.url,
+      extraction: input.articleText
+        ? { status: "ready", text: input.articleText }
+        : { status: "failed", reason: "no_article" },
+    },
+  });
+}
+
+function capturePageUrl(input: ExtensionCaptureRequest) {
+  return input.kind === "audio" ? input.pageUrl : input.url;
+}
+
+function captureItemRequest(
+  input: Extract<ExtensionCaptureRequest, { kind: "quote" }>,
+  sourceId: string,
+): CreateItemRequest {
+  return CreateItemRequestSchema.parse({
+    kind: "quote",
+    sourceId,
+    idempotencyKey: input.requestId,
+    notes: input.notes,
+    topics: input.topics,
+    content: {
+      text: input.quote.text,
+      ...(input.quote.speaker ? { speaker: input.quote.speaker } : {}),
+      ...(input.quote.speakerTitle
+        ? { speakerTitle: input.quote.speakerTitle }
+        : {}),
+      ...(input.quote.surroundingWords
+        ? { surroundingWords: input.quote.surroundingWords }
+        : {}),
+      ...(input.quote.highlight ? { highlight: input.quote.highlight } : {}),
+    },
+  });
 }
 
 async function insertLibrarySource(
@@ -218,6 +319,129 @@ export class ProjectLibrary {
     await this.authorizeRead(actor, projectId);
     return listLibrarySources(this.db, projectId, input);
   }
+  async sourceDiscussionCounts(
+    actor: Actor,
+    projectId: string,
+    sourceIds: string[],
+  ) {
+    await this.authorizeRead(actor, projectId);
+    const { rows } = await this.db.query<{
+      source_id: string;
+      total: number;
+      unread: number;
+    }>(
+      `SELECT c.source_id, count(*)::integer AS total,
+          count(*) FILTER (WHERE c.author_id <> $3 AND r.reader_id IS NULL)::integer AS unread
+       FROM source_discussion_comments c
+       LEFT JOIN source_discussion_reads r
+         ON (r.project_id,r.source_id,r.comment_id,r.reader_id)=(c.project_id,c.source_id,c.id,$3)
+       WHERE c.project_id=$1 AND c.source_id=ANY($2::uuid[])
+       GROUP BY c.source_id`,
+      [projectId, sourceIds, actor.userId],
+    );
+    return Object.fromEntries(
+      rows.map(({ source_id, total, unread }) => [
+        source_id,
+        { total, unread },
+      ]),
+    );
+  }
+
+  async sourceDiscussion(
+    actor: Actor,
+    projectId: string,
+    sourceId: string,
+    offset: number,
+  ) {
+    await this.getSource(actor, projectId, sourceId);
+    const result = await this.db.query<{
+      id: string;
+      author_name: string;
+      body: string;
+      created_at: Date | string;
+      unread: boolean;
+    }>(
+      `SELECT c.id, u.display_name AS author_name, c.body, c.created_at,
+          (c.author_id <> $3 AND r.reader_id IS NULL) AS unread
+       FROM source_discussion_comments c
+       JOIN users u ON u.id=c.author_id
+       LEFT JOIN source_discussion_reads r
+         ON (r.project_id,r.source_id,r.comment_id,r.reader_id)=(c.project_id,c.source_id,c.id,$3)
+       WHERE c.project_id=$1 AND c.source_id=$2
+       ORDER BY c.created_at, c.id LIMIT 51 OFFSET $4`,
+      [projectId, sourceId, actor.userId, offset],
+    );
+    const member = await this.db.query<{ role: ProjectRole }>(
+      "SELECT role FROM project_members WHERE project_id=$1 AND user_id=$2",
+      [projectId, actor.userId],
+    );
+    return {
+      comments: result.rows.slice(0, 50).map((row) => ({
+        id: row.id,
+        authorName: row.author_name || "Project member",
+        body: row.body,
+        createdAt: new Date(row.created_at).toISOString(),
+        unread: row.unread,
+      })),
+      more: result.rows.length > 50,
+      canReply: Boolean(member.rows[0] && member.rows[0].role !== "viewer"),
+    };
+  }
+
+  async addSourceDiscussionComment(
+    actor: Actor,
+    projectId: string,
+    sourceId: string,
+    input: CreateSourceDiscussionComment,
+  ) {
+    return this.write(actor, projectId, async (tx) => {
+      const source = await readLibrarySource(tx, projectId, sourceId);
+      if (source.kind !== "youtube" && source.kind !== "web_page")
+        throw new CatalogConflictError(
+          "This source kind does not support discussion.",
+        );
+      await tx.query(
+        `INSERT INTO source_discussion_comments(project_id, source_id, id, author_id, body, created_at)
+         VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING`,
+        [
+          projectId,
+          sourceId,
+          input.id,
+          actor.userId,
+          input.body,
+          this.now().toISOString(),
+        ],
+      );
+      const { rows } = await tx.query<{ id: string }>(
+        `SELECT id FROM source_discussion_comments
+         WHERE (project_id,source_id,id,author_id,body)=($1,$2,$3,$4,$5)`,
+        [projectId, sourceId, input.id, actor.userId, input.body],
+      );
+      if (!rows[0])
+        throw new CatalogConflictError(
+          "This comment identity has already been used.",
+        );
+      return rows[0];
+    });
+  }
+
+  async readSourceDiscussionComments(
+    actor: Actor,
+    projectId: string,
+    sourceId: string,
+    commentIds: string[],
+  ) {
+    await this.getSource(actor, projectId, sourceId);
+    await this.db.query(
+      `INSERT INTO source_discussion_reads(project_id,source_id,comment_id,reader_id)
+       SELECT project_id, source_id, id, $3 FROM source_discussion_comments
+       WHERE project_id=$1 AND source_id=$2 AND id=ANY($4::uuid[]) AND author_id<>$3
+       ON CONFLICT DO NOTHING`,
+      [projectId, sourceId, actor.userId, commentIds],
+    );
+    return this.sourceDiscussionCounts(actor, projectId, [sourceId]);
+  }
+
   async getItem(actor: Actor, projectId: string, id: string) {
     await this.authorizeRead(actor, projectId);
     return (await readLibraryItemRow(this.db, projectId, id)).item;
@@ -225,6 +449,97 @@ export class ProjectLibrary {
   async listItems(actor: Actor, projectId: string, input: ItemListQuery) {
     await this.authorizeRead(actor, projectId);
     return listLibraryItems(this.db, projectId, input);
+  }
+  async authorizeReferencePictureWrite(
+    actor: Actor,
+    projectId: string,
+    kind: ReferencePictureOwnerKind,
+    ownerId: string,
+  ) {
+    await this.write(actor, projectId, (tx) =>
+      assertReferencePictureOwner(tx, projectId, kind, ownerId),
+    );
+  }
+  async putReferencePicture(
+    actor: Actor,
+    projectId: string,
+    kind: ReferencePictureOwnerKind,
+    ownerId: string,
+    expectedRevisionId: string | null,
+    images: StillImages,
+  ) {
+    // No object is retained before checking membership and its exact owner.
+    await this.authorizeReferencePictureWrite(actor, projectId, kind, ownerId);
+    const kept = await keepReferencePictureAssets(
+      this.store,
+      projectId,
+      kind,
+      ownerId,
+      images,
+    );
+    return this.write(actor, projectId, async (tx) => {
+      await assertReferencePictureOwner(tx, projectId, kind, ownerId, true);
+      await replaceReferencePictureRows(
+        tx,
+        projectId,
+        kind,
+        ownerId,
+        expectedRevisionId,
+        kept,
+      );
+      return readReferencePictureManifest(tx, projectId, kind, ownerId);
+    });
+  }
+  async getReferencePictureManifest(
+    actor: Actor,
+    projectId: string,
+    kind: ReferencePictureOwnerKind,
+    ownerId: string,
+  ) {
+    await this.authorizeRead(actor, projectId);
+    await assertReferencePictureOwner(this.db, projectId, kind, ownerId);
+    return readReferencePictureManifest(this.db, projectId, kind, ownerId);
+  }
+  async getReferencePictureObject(
+    actor: Actor,
+    projectId: string,
+    kind: ReferencePictureOwnerKind,
+    ownerId: string,
+    role: StillAssetRole,
+  ) {
+    await this.authorizeRead(actor, projectId);
+    await assertReferencePictureOwner(this.db, projectId, kind, ownerId);
+    return readReferencePictureObject(
+      this.db,
+      this.store,
+      projectId,
+      kind,
+      ownerId,
+      role,
+    );
+  }
+  async deleteReferencePicture(
+    actor: Actor,
+    projectId: string,
+    kind: ReferencePictureOwnerKind,
+    ownerId: string,
+    expectedRevisionId: string,
+  ) {
+    return this.write(actor, projectId, async (tx) => {
+      await assertReferencePictureOwner(tx, projectId, kind, ownerId, true);
+      await checkReferencePictureRevision(
+        tx,
+        projectId,
+        kind,
+        ownerId,
+        expectedRevisionId,
+      );
+      await tx.query(
+        `DELETE FROM library_reference_pictures
+         WHERE project_id=$1 AND owner_kind=$2 AND owner_id=$3`,
+        [projectId, kind, ownerId],
+      );
+    });
   }
   private write<T>(
     actor: Actor,
@@ -590,6 +905,304 @@ export class ProjectLibrary {
       await insertStillAssets(tx, projectId, id, references, input.provenance);
       return (await readLibraryItemRow(tx, projectId, id)).item;
     });
+  }
+
+  async createExtensionCapture(
+    actor: Actor,
+    projectId: string,
+    request: ExtensionCaptureRequest,
+    rasters: ExtensionCaptureRasters,
+  ): Promise<ExtensionCaptureReceipt> {
+    const input = ExtensionCaptureRequestSchema.parse(request);
+    if (input.kind !== "audio" && input.repairCaptureId) {
+      const originalId = input.repairCaptureId;
+      return this.write(actor, projectId, async (tx) => {
+        const original = (
+          await tx.query<{ source_id: string; item_id: string | null }>(
+            `SELECT c.source_id,c.item_id FROM extension_captures c
+           LEFT JOIN library_items i ON i.project_id=c.project_id AND i.id=c.item_id
+           WHERE c.project_id=$1 AND c.capture_id=$2 AND c.actor_id=$3 AND c.kind=$4 AND c.page_url=$5
+             AND (c.kind='page' OR i.content->>'text'=$6) FOR UPDATE OF c`,
+            [
+              projectId,
+              originalId,
+              actor.userId,
+              input.kind,
+              input.url,
+              input.kind === "quote" ? input.quote.text : null,
+            ],
+          )
+        ).rows[0];
+        if (!original)
+          throw new CatalogConflictError(
+            "The repair code does not match this capture.",
+          );
+        const current = await readExtensionCaptureReceipt(
+          tx,
+          projectId,
+          originalId,
+        );
+        const missing: ExtensionCaptureRasters = {};
+        for (const role of current.missingPictures) {
+          if (rasters[role]) missing[role] = rasters[role];
+        }
+        if (!Object.keys(missing).length) return current;
+        const refs = await keepExtensionCaptureAssets(
+          this.store,
+          projectId,
+          originalId,
+          missing,
+        );
+        await insertExtensionCaptureAssets(
+          tx,
+          projectId,
+          originalId,
+          original.source_id,
+          original.item_id ?? undefined,
+          refs,
+          input.url,
+          actor.userId,
+          this.now().toISOString(),
+        );
+        if (
+          original.item_id &&
+          missing.passage &&
+          input.kind === "quote" &&
+          input.quote.highlight
+        ) {
+          await tx.query(
+            `UPDATE library_items SET content=jsonb_set(content,'{highlight}',$3::jsonb), version=version+1,updated_at=$4 WHERE project_id=$1 AND id=$2`,
+            [
+              projectId,
+              original.item_id,
+              JSON.stringify(input.quote.highlight),
+              this.now().toISOString(),
+            ],
+          );
+        }
+        return readExtensionCaptureReceipt(tx, projectId, originalId);
+      });
+    }
+    const captureId = input.requestId;
+    const fingerprint = extensionCaptureFingerprint(input);
+    const replay = async (tx: Session) => {
+      const { rows } = await tx.query<{
+        actor_id: string;
+        request_fingerprint: string;
+      }>(
+        `SELECT actor_id,request_fingerprint FROM extension_captures
+         WHERE project_id=$1 AND capture_id=$2`,
+        [projectId, captureId],
+      );
+      const existing = rows[0];
+      if (!existing) return undefined;
+      if (
+        existing.actor_id !== actor.userId ||
+        existing.request_fingerprint !== fingerprint
+      )
+        throw new CatalogConflictError(
+          "This capture request key is already in use.",
+        );
+      return readExtensionCaptureReceipt(tx, projectId, captureId);
+    };
+    const lock = (tx: Session) =>
+      tx.query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 79))", [
+        `${projectId}:${captureId}`,
+      ]);
+
+    // A successful earlier transaction should never rewrite its immutable
+    // images. This check also gives retries the original receipt before any
+    // object-store work occurs.
+    const earlier = await this.write(actor, projectId, async (tx) => {
+      await lock(tx);
+      return replay(tx);
+    });
+    if (earlier) return earlier;
+
+    const references = await keepExtensionCaptureAssets(
+      this.store,
+      projectId,
+      captureId,
+      rasters,
+    );
+    return this.write(actor, projectId, async (tx) => {
+      await lock(tx);
+      const alreadySaved = await replay(tx);
+      if (alreadySaved) return alreadySaved;
+
+      const sourceRequest = captureSourceRequest(input);
+      let sourceId: string | undefined;
+      if (input.kind !== "audio") {
+        await lockSourceIdentity(tx, projectId);
+        const url = sourceRequest.bibliography.url?.value;
+        if (!url)
+          throw new CatalogConflictError("A page capture needs its URL.");
+        sourceId = await findArticle(tx, projectId, articleIdentity(url));
+      }
+      if (!sourceId) {
+        const retry = createRetry(sourceRequest);
+        sourceId = randomUUID();
+        if (
+          !(await insertLibrarySource(
+            tx,
+            projectId,
+            sourceId,
+            actor.userId,
+            sourceRequest,
+            retry,
+          ))
+        ) {
+          sourceId = await readCreateReplay(
+            tx,
+            "library_sources",
+            projectId,
+            actor.userId,
+            retry,
+          );
+          if (!sourceId)
+            throw new CatalogConflictError(
+              "The source could not be saved. Try again.",
+            );
+        }
+      }
+
+      let itemId: string | undefined;
+      if (input.kind === "quote") {
+        const itemRequest = captureItemRequest(input, sourceId);
+        const itemRetry = createRetry(itemRequest);
+        const existingItem = await readCreateReplay(
+          tx,
+          "library_items",
+          projectId,
+          actor.userId,
+          itemRetry,
+        );
+        itemId = existingItem ?? randomUUID();
+        if (!existingItem) {
+          if (
+            !(await insertLibraryItem(
+              tx,
+              projectId,
+              itemId,
+              actor.userId,
+              this.now().toISOString(),
+              itemRequest,
+              itemRetry,
+            ))
+          ) {
+            const winner = await readCreateReplay(
+              tx,
+              "library_items",
+              projectId,
+              actor.userId,
+              itemRetry,
+            );
+            if (!winner)
+              throw new CatalogConflictError(
+                "The quote could not be saved. Try again.",
+              );
+            itemId = winner;
+          }
+        }
+      }
+
+      const now = this.now().toISOString();
+      await tx.query(
+        `INSERT INTO extension_captures(
+             project_id,capture_id,actor_id,kind,request_fingerprint,
+             source_id,item_id,page_url,created_at
+           ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+        [
+          projectId,
+          captureId,
+          actor.userId,
+          input.kind,
+          fingerprint,
+          sourceId,
+          itemId ?? null,
+          capturePageUrl(input),
+          now,
+        ],
+      );
+      await insertExtensionCaptureAssets(
+        tx,
+        projectId,
+        captureId,
+        sourceId,
+        itemId,
+        references,
+        input.url,
+        actor.userId,
+        now,
+      );
+      return readExtensionCaptureReceipt(tx, projectId, captureId);
+    });
+  }
+
+  async getExtensionCapture(
+    actor: Actor,
+    projectId: string,
+    captureId: string,
+  ) {
+    await this.authorizeRead(actor, projectId);
+    return readExtensionCaptureReceipt(this.db, projectId, captureId);
+  }
+
+  async getExtensionCaptureAsset(
+    actor: Actor,
+    projectId: string,
+    captureId: string,
+    role: ExtensionCaptureAssetRole,
+    revisionId?: string,
+  ) {
+    await this.authorizeRead(actor, projectId);
+    return readExtensionCaptureAsset(
+      this.db,
+      this.store,
+      projectId,
+      captureId,
+      role,
+      revisionId,
+    );
+  }
+
+  async getExtensionCaptureForItem(
+    actor: Actor,
+    projectId: string,
+    itemId: string,
+  ) {
+    await this.authorizeRead(actor, projectId);
+    const { rows } = await this.db.query<{ capture_id: string }>(
+      `SELECT capture_id FROM extension_captures
+       WHERE project_id=$1 AND item_id=$2 ORDER BY created_at DESC, capture_id
+       LIMIT 1`,
+      [projectId, itemId],
+    );
+    const captureId = rows[0]?.capture_id;
+    if (!captureId)
+      throw new CatalogNotFoundError(
+        "No browser capture is linked to this item.",
+      );
+    return readExtensionCaptureReceipt(this.db, projectId, captureId);
+  }
+
+  async listExtensionCapturesForSource(
+    actor: Actor,
+    projectId: string,
+    sourceId: string,
+    offset: number,
+  ) {
+    await this.authorizeRead(actor, projectId);
+    const { rows } = await this.db.query<{ capture_id: string }>(
+      `SELECT capture_id FROM extension_captures
+       WHERE project_id=$1 AND source_id=$2 ORDER BY created_at DESC, capture_id LIMIT 50 OFFSET $3`,
+      [projectId, sourceId, offset],
+    );
+    return Promise.all(
+      rows.map(({ capture_id }) =>
+        readExtensionCaptureReceipt(this.db, projectId, capture_id),
+      ),
+    );
   }
 
   async getStillManifest(actor: Actor, projectId: string, itemId: string) {

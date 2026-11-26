@@ -1,7 +1,44 @@
 import { expect, test, type Page } from "@playwright/test";
+import {
+  CreateClipCandidateRequestSchema,
+  CreateClipExportRequestSchema,
+  CreateExportOnlyRequestSchema,
+} from "@research-video/contracts";
 import { normalizeTranscriptFixture } from "@research-video/transcript";
 import captionFixture from "../fixtures/transcripts/auto-word-timed.json" with { type: "json" };
 import englishFixture from "../fixtures/transcripts/english-word.json" with { type: "json" };
+
+const unexpectedPageErrors = new WeakMap<Page, string[]>();
+
+test.beforeEach(async ({ page }) => {
+  const errors: string[] = [];
+  unexpectedPageErrors.set(page, errors);
+  page.on("pageerror", (error) => errors.push(error.message));
+  // Specific synthetic routes registered by each test take precedence.
+  // No unhandled API request may reach a backend, even if one is running.
+  const isBackend = (url: URL) =>
+    url.pathname.startsWith("/cloud-api/") ||
+    url.pathname.startsWith("/local-agent/");
+  await page.route(
+    (url) => url.origin !== "http://127.0.0.1:43112" || isBackend(url),
+    (route) => {
+      const url = new URL(route.request().url());
+      if (url.origin !== "http://127.0.0.1:43112") return route.abort();
+      return route.fulfill({ status: 404, json: {} });
+    },
+  );
+});
+
+test.afterEach(({ page }) => {
+  expect(unexpectedPageErrors.get(page)).toEqual([]);
+});
+
+async function waitForHostedPlayer(page: Page) {
+  await expect(page.locator(".player-frame")).toHaveAttribute(
+    "data-player-state",
+    "ready",
+  );
+}
 
 const liveProject = "019fbb95-cd76-7920-93fa-e23ba755ee40";
 const secondProject = "019fbb95-cd76-7920-93fa-e23ba755ee48";
@@ -28,6 +65,11 @@ function fakeBatch(
       transcriptionProfile: "default",
       sourcePolicy: "prefer-existing",
       executionLocation: "local",
+      transcriptionExecutionPolicy: {
+        schemaVersion: 1,
+        execution: "local",
+        fallback: "local",
+      },
       priority: "high",
       dispatchStatus: "active",
       createdBy: "019fbb95-cd76-7920-93fa-e23ba755ee36",
@@ -113,6 +155,8 @@ async function connectFakeProject(page: Page, projects = [liveProject]) {
         id,
         name: index === 0 ? "Personal research" : "Second research",
         description: "",
+        kind: "shared",
+        visibility: "invitation_only",
         version: 1,
         createdAt: liveTime,
         updatedAt: liveTime,
@@ -258,6 +302,7 @@ for (const source of ["caption", "asr", "failed"] as const) {
       await expect(
         page.getByText(/test fixture—not|Navigation fixture for the API demo/),
       ).toHaveCount(0);
+      await waitForHostedPlayer(page);
       if (source === "caption") {
         await page.getByRole("button", { name: "closely" }).click();
         await expect(
@@ -474,13 +519,42 @@ test.beforeEach(async ({ page }) => {
 
       constructor(
         _element: HTMLElement,
-        options: { events: { onReady(): void } },
+        options: {
+          videoId: string;
+          events: {
+            onReady(): void;
+            onStateChange(event: { data: number }): void;
+            onError(event: { data: number }): void;
+          };
+        },
       ) {
         queueMicrotask(() => options.events.onReady());
+        Object.assign(window, {
+          __triggerYouTubeEnded: () =>
+            options.events.onStateChange({ data: 0 }),
+        });
       }
 
       cueVideoById() {}
       destroy() {}
+      loadVideoById(options: {
+        videoId: string;
+        startSeconds: number;
+        endSeconds: number;
+      }) {
+        this.currentTime = options.startSeconds;
+        const calls = (Reflect.get(window, "__loadVideoByIdCalls") ??
+          []) as (typeof options)[];
+        calls.push(options);
+        Object.assign(window, {
+          __loadVideoByIdCalls: calls,
+          __lastSeekSeconds: options.startSeconds,
+          __playCalls: Number(Reflect.get(window, "__playCalls") ?? 0) + 1,
+        });
+      }
+      getDuration() {
+        return 4000; // synthetic duration includes the last timed-caption cue
+      }
       getCurrentTime() {
         return this.currentTime;
       }
@@ -488,20 +562,23 @@ test.beforeEach(async ({ page }) => {
         this.currentTime = seconds;
         Object.assign(window, { __lastSeekSeconds: seconds });
       }
-      playVideo() {
-        Object.assign(window, {
-          __playCalls: Number(Reflect.get(window, "__playCalls") ?? 0) + 1,
-        });
-      }
       pauseVideo() {
         Object.assign(window, {
           __pauseCalls: Number(Reflect.get(window, "__pauseCalls") ?? 0) + 1,
         });
       }
+      playVideo() {
+        Object.assign(window, {
+          __playCalls: Number(Reflect.get(window, "__playCalls") ?? 0) + 1,
+        });
+      }
     }
 
     Object.assign(window, {
-      YT: { Player: MockPlayer, PlayerState: { PLAYING: 1 } },
+      YT: {
+        Player: MockPlayer,
+        PlayerState: { ENDED: 0, PAUSED: 2, PLAYING: 1 },
+      },
     });
   });
 });
@@ -517,17 +594,410 @@ test("loads a canonical YouTube video and seeks from its transcript", async ({
   await page.getByRole("button", { name: "Load video" }).click();
   await expect(page.getByText("word timing", { exact: true })).toBeVisible();
   await expect(page.getByTestId("transcript-window-row")).toHaveCount(2);
+  await waitForHostedPlayer(page);
   await page.getByRole("button", { name: "any word", exact: true }).click();
 
   await expect(page.getByText("Word requested 0:02.")).toBeVisible();
   await expect
     .poll(() => page.evaluate(() => Reflect.get(window, "__lastSeekSeconds")))
     .toBe(2.2);
+  await expect
+    .poll(() => page.evaluate(() => Reflect.get(window, "__playCalls")))
+    .toBe(1);
 
   await page.getByLabel("Search transcript").fill("accurate");
   await expect(page.getByText("1 of 1")).toBeVisible();
   await page.getByRole("button", { name: "Next match", exact: true }).click();
   await expect(page.getByText("Cue requested 0:00.")).toBeVisible();
+});
+
+test("onboards a first Cognito desktop user, creates a project, and persists setup", async ({
+  page,
+}) => {
+  const now = "2026-08-24T23:10:00.000Z";
+  const userId = "019fbb95-cd76-7920-93fa-e23ba755ee90";
+  const projectId = "019fbb95-cd76-7920-93fa-e23ba755ee91";
+  await page.addInitScript(
+    ({ now, userId, projectId }) => {
+      const profile = {
+        id: userId,
+        externalSubject: "cognito:fixture:first-user",
+        handle: "first_researcher",
+        displayName: "First Researcher",
+        preferredLanguage: "en",
+        createdAt: now,
+        updatedAt: now,
+      };
+      const readProjects = () =>
+        JSON.parse(localStorage.getItem("desktop-first-run-projects") ?? "[]");
+      const response = (status: number, value: unknown) => ({
+        status,
+        body: JSON.stringify(value),
+        contentType: "application/json",
+      });
+      const readSetup = () => ({
+        setup: {
+          schemaVersion: 1,
+          rightsAcknowledged:
+            localStorage.getItem("desktop-first-run-rights") === "true",
+          privacyAcknowledged: false,
+          workerEnabled: false,
+          translationConsent: false,
+          captionProvider: "disabled",
+          mediaProvider: "disabled",
+          exportSourceProvider: "disabled",
+          speechToTextProvider: "disabled",
+          translationProvider: "disabled",
+          updatedAt: now,
+        },
+        activeComponents: [],
+      });
+      Object.defineProperty(window, "researchVideoDesktop", {
+        configurable: true,
+        value: {
+          async getStatus() {
+            return {
+              auth: { state: "signed_in", expiresAt: now },
+              services: [
+                { service: "local_agent", state: "healthy", restartCount: 0 },
+                {
+                  service: "transcription_worker",
+                  state: "stopped",
+                  restartCount: 0,
+                },
+              ],
+            };
+          },
+          async signIn() {
+            return { state: "signed_in", expiresAt: now };
+          },
+          async signOut() {
+            return { state: "signed_out" };
+          },
+          async getSetup() {
+            return readSetup();
+          },
+          async getReadiness() {
+            return {
+              schemaVersion: 1,
+              generatedAt: now,
+              components: [
+                {
+                  component: "cloud_api",
+                  state: "ready",
+                  reason: "ready",
+                  remediation: "none",
+                  checkedAt: now,
+                },
+              ],
+              operations: [
+                "project_browsing",
+                "verified_cached_review",
+                "project_logging",
+                "transcript_processing",
+                "export_processing",
+              ].map((operation) => ({
+                operation,
+                state: "ready",
+                blockingComponents: [],
+              })),
+            };
+          },
+          async updateSetup(action: {
+            action: string;
+            acknowledged?: boolean;
+          }) {
+            if (action.action === "set_rights_acknowledgement") {
+              localStorage.setItem(
+                "desktop-first-run-rights",
+                String(action.acknowledged === true),
+              );
+            }
+            return readSetup();
+          },
+          async checkRecommendedSetup() {
+            return {
+              state: "ready_to_setup",
+              roots: [
+                {
+                  target: "output_root",
+                  displayName: "Movies exports folder",
+                  state: "will_create",
+                },
+                {
+                  target: "cache_root",
+                  displayName: "Private transcript cache",
+                  state: "will_create",
+                },
+              ],
+              tools: [
+                {
+                  target: "ffmpeg",
+                  displayName: "FFmpeg",
+                  state: "detected",
+                  version: "8.1.2",
+                },
+                {
+                  target: "ffprobe",
+                  displayName: "FFprobe media inspector",
+                  state: "detected",
+                  version: "8.1.2",
+                },
+                {
+                  target: "yt_dlp",
+                  displayName: "Authorized source helper",
+                  state: "detected",
+                  version: "2026.08.19",
+                },
+                {
+                  target: "whisper_cli",
+                  displayName: "whisper.cpp speech engine",
+                  state: "detected",
+                },
+              ],
+              model: {
+                displayName: "Whisper large-v3-turbo",
+                byteSize: 1624555275,
+                state: "download_required",
+              },
+              enables: ["create_transcripts", "export_clips"],
+            };
+          },
+          async applyRecommendedSetup() {
+            const plan = await this.checkRecommendedSetup();
+            localStorage.setItem("desktop-first-run-local-setup", "true");
+            return {
+              ...plan,
+              state: "completed",
+              roots: plan.roots.map(
+                (root: {
+                  target: string;
+                  displayName: string;
+                  state: string;
+                }) => ({
+                  ...root,
+                  state: "active",
+                }),
+              ),
+              tools: plan.tools.map(
+                (tool: {
+                  target: string;
+                  displayName: string;
+                  state: string;
+                  version?: string;
+                }) => ({ ...tool, state: "active" }),
+              ),
+            };
+          },
+          async chooseSetupTarget() {
+            return readSetup();
+          },
+          async startModelDownload() {
+            throw new Error("not configured");
+          },
+          async cancelModelDownload() {
+            throw new Error("not active");
+          },
+          onModelDownloadProgress() {
+            return () => undefined;
+          },
+          async request(request: {
+            method: string;
+            path: string;
+            body?: string;
+          }) {
+            if (request.path === "/api/session/profile") {
+              return localStorage.getItem("desktop-first-run-registered")
+                ? response(200, profile)
+                : response(404, {
+                    error: {
+                      code: "not_found",
+                      message: "User is not registered.",
+                      retryable: false,
+                    },
+                  });
+            }
+            if (
+              request.path === "/api/session/register" &&
+              request.method === "POST"
+            ) {
+              localStorage.setItem("desktop-first-run-registered", "true");
+              return response(200, profile);
+            }
+            if (request.path === "/api/projects" && request.method === "GET") {
+              return response(200, readProjects());
+            }
+            if (request.path === "/api/projects" && request.method === "POST") {
+              const input = JSON.parse(request.body ?? "{}") as {
+                name?: string;
+                description?: string;
+                kind?: "personal" | "shared";
+              };
+              const project = {
+                id: projectId,
+                name: input.name ?? "First project",
+                description: input.description ?? "",
+                kind: input.kind ?? "shared",
+                visibility:
+                  input.kind === "personal" ? "private" : "invitation_only",
+                version: 1,
+                createdAt: now,
+                updatedAt: now,
+              };
+              localStorage.setItem(
+                "desktop-first-run-projects",
+                JSON.stringify([
+                  { ...project, currentUserRole: "owner", memberCount: 1 },
+                ]),
+              );
+              return response(200, project);
+            }
+            return response(503, {
+              error: {
+                code: "unavailable",
+                message: "Fixture unavailable.",
+                retryable: true,
+              },
+            });
+          },
+          async uploadTimedTranscript() {
+            throw new Error("not configured");
+          },
+          async getNotificationPreferences() {
+            throw new Error("not configured");
+          },
+          async updateNotificationPreferences() {
+            throw new Error("not configured");
+          },
+          async getNotificationSupport() {
+            throw new Error("not configured");
+          },
+          onNotificationNavigation() {
+            return () => undefined;
+          },
+        },
+      });
+    },
+    { now, userId, projectId },
+  );
+
+  await page.goto("/");
+  await page.locator("details.account-menu > summary").click();
+  await page.locator("details.local-setup-menu > summary").click();
+  await expect(page.getByLabel("Account display name")).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "Create", exact: true }),
+  ).toBeDisabled();
+
+  await page.getByLabel("Account display name").fill("First Researcher");
+  await page.getByRole("button", { name: "Create account profile" }).click();
+  await expect(page.getByLabel("Account display name")).toHaveCount(0);
+  await page.getByLabel("New project name").fill("First research project");
+  await page.getByRole("button", { name: "Create", exact: true }).click();
+  const activeProject = page
+    .locator(".vera-project-control")
+    .getByLabel("Active project");
+  await expect(activeProject).toHaveValue(projectId);
+  await expect(activeProject).toContainText("First research project");
+
+  const rights = page.getByLabel(
+    "I will process only sources I am authorized to use.",
+  );
+  await rights.check();
+  await expect(rights).toBeChecked();
+
+  await page.getByRole("button", { name: "Set up this Mac" }).click();
+  await expect(
+    page.getByText("Ready to set up", { exact: true }),
+  ).toBeVisible();
+  await expect(page.getByText("Whisper large-v3-turbo")).toBeVisible();
+  await expect(page.getByText("1.5 GiB", { exact: false })).toBeVisible();
+  await page.getByRole("button", { name: "Confirm local setup" }).click();
+  await expect(page.getByText("Local setup active")).toBeVisible();
+  await expect(page.getByText("Advanced setup")).toBeVisible();
+
+  await page.reload();
+  await page.locator("details.account-menu > summary").click();
+  await page.locator("details.local-setup-menu > summary").click();
+  await expect(page.getByLabel("Account display name")).toHaveCount(0);
+  await expect(
+    page.getByLabel("I will process only sources I am authorized to use."),
+  ).toBeChecked();
+  await expect(
+    page.locator(".vera-project-control").getByLabel("Active project"),
+  ).toHaveValue(projectId);
+});
+
+test("desktop player waits for readiness and plays from a transcript word", async ({
+  page,
+}) => {
+  await page.route("https://www.youtube-nocookie.com/embed/**", (route) =>
+    route.fulfill({
+      contentType: "text/html",
+      body: `<!doctype html><body><script>
+        document.body.dataset.listens = "0";
+        document.body.dataset.ready = "false";
+        window.__receivedPlayerCommands = [];
+        window.addEventListener("message", ({ data, source, origin }) => {
+          const message = JSON.parse(data);
+          if (message.event === "listening") {
+            const attempts = Number(document.body.dataset.listens) + 1;
+            document.body.dataset.listens = String(attempts);
+            if (attempts === 2) {
+              document.body.dataset.ready = "true";
+              source.postMessage(JSON.stringify({ event: "onReady" }), origin);
+            }
+          }
+          if (message.event === "command") {
+            if (document.body.dataset.ready !== "true") {
+              document.body.dataset.earlyCommand = message.func;
+            }
+            window.__receivedPlayerCommands.push(message);
+            if (message.func === "playVideo") {
+              source.postMessage(
+                JSON.stringify({ info: { playerState: 1 } }),
+                origin,
+              );
+            }
+          }
+        });
+      </script>`,
+    }),
+  );
+  await page.goto("/?fixture=english-word");
+  await expect(
+    page.getByRole("heading", { name: "Navigate video by transcript" }),
+  ).toBeVisible();
+  await page.evaluate(() => {
+    Object.assign(window, { researchVideoDesktop: {} });
+  });
+  await page.getByRole("button", { name: "Load video" }).click();
+
+  const player = page.frameLocator('iframe[title="YouTube video player"]');
+  await expect(page.getByRole("button", { name: "Play video" })).toBeEnabled();
+  await expect(player.locator("body")).toHaveAttribute("data-ready", "true");
+  await expect(player.locator("body")).not.toHaveAttribute(
+    "data-early-command",
+    /./u,
+  );
+  await page.getByRole("button", { name: "any word", exact: true }).click();
+  await expect(page.getByText("Word requested 0:02.")).toBeVisible();
+  await expect
+    .poll(() =>
+      player.locator("body").evaluate((body) => {
+        const commands = Reflect.get(
+          body.ownerDocument.defaultView!,
+          "__receivedPlayerCommands",
+        ) as Array<{ func?: string; args?: unknown[] }> | undefined;
+        return commands?.filter((command) =>
+          ["seekTo", "playVideo"].includes(command.func ?? ""),
+        );
+      }),
+    )
+    .toEqual([
+      { event: "command", func: "seekTo", args: [2.2, true] },
+      { event: "command", func: "playVideo", args: [] },
+    ]);
 });
 
 test("rejects a non-YouTube URL without replacing the workspace", async ({
@@ -562,6 +1032,8 @@ test("timed auto-caption fixture seeks exact starts and retains derived-end sele
             id: projectId,
             name: "Caption evidence",
             description: "",
+            kind: "shared",
+            visibility: "invitation_only",
             version: 1,
             createdAt: now,
             updatedAt: now,
@@ -573,7 +1045,27 @@ test("timed auto-caption fixture seeks exact starts and retains derived-end sele
       path === `/cloud-api/api/projects/${projectId}/clips` &&
       route.request().method() === "POST"
     ) {
-      const body = route.request().postDataJSON();
+      const body = CreateClipCandidateRequestSchema.parse(
+        route.request().postDataJSON(),
+      );
+      expect(body.languageEvidence).toMatchObject({
+        schemaVersion: 2,
+        native: {
+          role: "native",
+          language: "en",
+          trackId: captionFixture.track.id,
+          trackVersion: 1,
+        },
+        english: {
+          role: "english",
+          language: "en",
+          trackId: captionFixture.track.id,
+          trackVersion: 1,
+        },
+      });
+      expect(body.languageEvidence?.english.text).toContain(
+        "closely now please",
+      );
       loggedSelection = body.selection;
       return route.fulfill({
         status: 201,
@@ -583,7 +1075,7 @@ test("timed auto-caption fixture seeks exact starts and retains derived-end sele
           catalogVideoId: "019fbb95-cd76-7920-93fa-e23ba755ee43",
           video: body.video,
           selection: body.selection,
-          englishText: body.englishText,
+          languageEvidence: body.languageEvidence,
           notes: body.notes,
           tags: body.tags,
           researchStatus: "candidate",
@@ -597,7 +1089,9 @@ test("timed auto-caption fixture seeks exact starts and retains derived-end sele
     }
     if (path.endsWith("/exports") && route.request().method() === "POST") {
       loggedExportRequests += 1;
-      const body = route.request().postDataJSON();
+      const body = CreateClipExportRequestSchema.parse(
+        route.request().postDataJSON(),
+      );
       return route.fulfill({
         status: 201,
         json: {
@@ -613,6 +1107,7 @@ test("timed auto-caption fixture seeks exact starts and retains derived-end sele
           },
           selection: loggedSelection,
           sourceLanguageClass: body.sourceLanguageClass,
+          sourceRights: body.sourceRights,
           preset: body.preset,
           state: "queued",
           createdAt: now,
@@ -629,7 +1124,9 @@ test("timed auto-caption fixture seeks exact starts and retains derived-end sele
     return route.fulfill({ status: 404, json: { error: "not found" } });
   });
   await page.route("**/local-agent/api/exports", async (route) => {
-    const body = route.request().postDataJSON();
+    const body = CreateExportOnlyRequestSchema.parse(
+      route.request().postDataJSON(),
+    );
     exportedSelection = body.selection;
     return route.fulfill({
       status: 201,
@@ -640,6 +1137,7 @@ test("timed auto-caption fixture seeks exact starts and retains derived-end sele
         video: body.video,
         selection: body.selection,
         sourceLanguageClass: body.sourceLanguageClass,
+        sourceRights: body.sourceRights,
         preset: body.preset,
         state: "queued",
         createdAt: now,
@@ -657,6 +1155,7 @@ test("timed auto-caption fixture seeks exact starts and retains derived-end sele
     "title",
     "Exact caption word start 11.840s; derived end (estimate) 12.030s",
   );
+  await waitForHostedPlayer(page);
   await page.getByRole("button", { name: "closely" }).click();
   await expect(
     page.getByText(/Exact caption start requested 11.840s/),
@@ -688,14 +1187,58 @@ test("timed auto-caption fixture seeks exact starts and retains derived-end sele
   await expect(panel).toContainText("Transcript selection: 11.840s–13.100s");
   await expect(page.getByLabel("Export start (seconds)")).toHaveValue("11.840");
   await expect(page.getByLabel("Export end (seconds)")).toHaveValue("13.100");
+  const rangeLoads = () =>
+    page.evaluate(
+      () =>
+        (Reflect.get(window, "__loadVideoByIdCalls") ?? []) as Array<{
+          videoId: string;
+          startSeconds: number;
+          endSeconds: number;
+        }>,
+    );
+  const expectRangeLoadCount = async (count: number) =>
+    expect.poll(async () => (await rangeLoads()).length).toBe(count);
+
   await page.getByRole("button", { name: "Loop preview" }).click();
   await expect
     .poll(() => page.evaluate(() => Reflect.get(window, "__lastSeekSeconds")))
     .toBe(11.84);
-  await page.getByRole("button", { name: "Stop preview" }).click();
+  await expectRangeLoadCount(1);
+  expect((await rangeLoads()).at(-1)).toEqual({
+    videoId: "M7lc1UVf-VE",
+    startSeconds: 11.84,
+    endSeconds: 13.1,
+  });
+  await page.evaluate(() => window.getSelection()?.removeAllRanges());
+  await page.getByRole("button", { name: "now" }).click();
+  await expectRangeLoadCount(2);
+  expect((await rangeLoads()).at(-1)).toEqual({
+    videoId: "M7lc1UVf-VE",
+    startSeconds: 12.03,
+    endSeconds: 13.1,
+  });
+  await page.evaluate(() => {
+    const triggerEnded = Reflect.get(window, "__triggerYouTubeEnded");
+    if (typeof triggerEnded !== "function")
+      throw new Error("Missing YouTube ended event mock.");
+    triggerEnded();
+  });
+  await expectRangeLoadCount(3);
+  expect((await rangeLoads()).at(-1)).toEqual({
+    videoId: "M7lc1UVf-VE",
+    startSeconds: 11.84,
+    endSeconds: 13.1,
+  });
   await page.getByRole("button", { name: "Add 0.5s handles" }).click();
   await expect(page.getByLabel("Export start (seconds)")).toHaveValue("11.340");
   await expect(page.getByLabel("Export end (seconds)")).toHaveValue("13.600");
+  await expectRangeLoadCount(4);
+  expect((await rangeLoads()).at(-1)).toEqual({
+    videoId: "M7lc1UVf-VE",
+    startSeconds: 11.34,
+    endSeconds: 13.6,
+  });
+  await page.getByRole("button", { name: "Stop preview" }).click();
   await page
     .getByLabel("Development session credential")
     .fill("Bearer 019fbb95-cd76-7920-93fa-e23ba755ee36|fixture:web");
@@ -713,12 +1256,90 @@ test("timed auto-caption fixture seeks exact starts and retains derived-end sele
     timingPrecision: "estimated",
     endTiming: "derived",
   });
+  await page
+    .getByLabel(
+      /I confirm I am authorized to process this exact YouTube source/,
+    )
+    .check();
   await page.getByRole("button", { name: "Export + log" }).click();
   await expect(panel).toContainText("queued an export");
   expect(loggedExportRequests).toBe(1);
   await page.getByRole("button", { name: "Export only" }).click();
   await expect(panel).toContainText("Queued a local export-only job");
   expect(exportedSelection).toEqual(loggedSelection);
+});
+
+test("updates a running preview when the selected passage changes", async ({
+  page,
+}) => {
+  await page.goto("/?fixture=auto-word-timed");
+  await page.getByRole("button", { name: "Load video" }).click();
+  await expect(page.getByText(/Timed auto-caption test fixture/)).toBeVisible();
+
+  const selectRange = async (anchorText: string, focusText: string) => {
+    await page.evaluate(
+      ({ anchorText, focusText }) => {
+        const words = Array.from(
+          document.querySelectorAll<HTMLElement>("[data-transcript-token-id]"),
+        );
+        const anchor = words.find((word) => word.textContent === anchorText);
+        const focus = words.find((word) => word.textContent === focusText);
+        if (!anchor?.firstChild || !focus?.firstChild || !focus.textContent)
+          throw new Error("Missing transcript words for selection.");
+        const range = document.createRange();
+        range.setStart(anchor.firstChild, 0);
+        range.setEnd(focus.firstChild, focus.textContent.length);
+        window.getSelection()?.removeAllRanges();
+        window.getSelection()?.addRange(range);
+        focus.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+      },
+      { anchorText, focusText },
+    );
+  };
+  const rangeLoads = () =>
+    page.evaluate(
+      () =>
+        (Reflect.get(window, "__loadVideoByIdCalls") ?? []) as Array<{
+          videoId: string;
+          startSeconds: number;
+          endSeconds: number;
+        }>,
+    );
+
+  await waitForHostedPlayer(page);
+  await selectRange("closely", "please");
+  const panel = page.getByLabel("Clip selection");
+  await expect(panel).toContainText("Transcript selection: 11.840s–13.100s");
+  await page.getByRole("button", { name: "Loop preview" }).click();
+  await expect(
+    page.getByRole("button", { name: "Stop preview" }),
+  ).toBeVisible();
+  expect((await rangeLoads()).at(-1)).toEqual({
+    videoId: "M7lc1UVf-VE",
+    startSeconds: 11.84,
+    endSeconds: 13.1,
+  });
+
+  await selectRange("Résumé", "José");
+  await expect(panel).toContainText("Transcript selection: 13.200s–14.700s");
+  await expect(
+    page.getByRole("button", { name: "Stop preview" }),
+  ).toBeVisible();
+  expect((await rangeLoads()).at(-1)).toEqual({
+    videoId: "M7lc1UVf-VE",
+    startSeconds: 13.2,
+    endSeconds: 14.7,
+  });
+
+  await page.evaluate(() => window.getSelection()?.removeAllRanges());
+  await page.getByRole("button", { name: "Look" }).click();
+  await expect(
+    page.getByRole("button", { name: "Loop preview" }),
+  ).toBeVisible();
+  await expect
+    .poll(() => page.evaluate(() => Reflect.get(window, "__lastSeekSeconds")))
+    .toBe(11.5);
+  expect(await rangeLoads()).toHaveLength(2);
 });
 
 test("maps transcript text selection to stable source and export bounds", async ({
@@ -742,6 +1363,8 @@ test("maps transcript text selection to stable source and export bounds", async 
                 id: createdProjectId,
                 name: "New essay",
                 description: "Created without losing the selection",
+                kind: "shared",
+                visibility: "invitation_only",
                 version: 1,
                 createdAt: now,
                 updatedAt: now,
@@ -751,6 +1374,8 @@ test("maps transcript text selection to stable source and export bounds", async 
                   id: existingProjectId,
                   name: "Existing essay",
                   description: "",
+                  kind: "shared",
+                  visibility: "invitation_only",
                   version: 1,
                   createdAt: now,
                   updatedAt: now,
@@ -763,14 +1388,34 @@ test("maps transcript text selection to stable source and export bounds", async 
         return route.fulfill({ json: loggedClip ? [loggedClip] : [] });
       }
       clipPostCount += 1;
-      const body = request.postDataJSON();
+      const body = CreateClipCandidateRequestSchema.parse(
+        request.postDataJSON(),
+      );
+      expect(body.languageEvidence).toMatchObject({
+        schemaVersion: 2,
+        native: {
+          role: "native",
+          language: "en",
+          trackId: englishFixture.track.id,
+          trackVersion: 1,
+        },
+        english: {
+          role: "english",
+          language: "en",
+          trackId: englishFixture.track.id,
+          trackVersion: 1,
+        },
+      });
+      expect(body.languageEvidence?.english.text).toContain(
+        "fixture has accurate word timing. Click any word",
+      );
       loggedClip = {
         id: "019fbb95-cd76-7920-93fa-e23ba755ee42",
         projectId: createdProjectId,
         catalogVideoId: "019fbb95-cd76-7920-93fa-e23ba755ee43",
         video: body.video,
         selection: body.selection,
-        englishText: body.englishText,
+        languageEvidence: body.languageEvidence,
         notes: body.notes,
         tags: ["Opening", "Person: Ada"],
         researchStatus: "candidate",
@@ -815,7 +1460,7 @@ test("maps transcript text selection to stable source and export bounds", async 
       `/cloud-api/api/projects/${createdProjectId}/clips/019fbb95-cd76-7920-93fa-e23ba755ee42/exports`
     ) {
       loggedExportPostCount += 1;
-      const body = request.postDataJSON();
+      const body = CreateClipExportRequestSchema.parse(request.postDataJSON());
       return route.fulfill({
         status: 201,
         json: {
@@ -829,21 +1474,9 @@ test("maps transcript text selection to stable source and export bounds", async 
             canonicalUrl: "https://www.youtube.com/watch?v=M7lc1UVf-VE",
             title: "YouTube IFrame API demo",
           },
-          selection: body.selection ?? {
-            trackId: "019fbb95-cd76-7920-93fa-e23ba755e301",
-            transcriptVersion: 1,
-            firstSegmentId: "019fbb95-cd76-7920-93fa-e23ba755e311",
-            lastSegmentId: "019fbb95-cd76-7920-93fa-e23ba755e312",
-            firstTokenId: "019fbb95-cd76-7920-93fa-e23ba755e322",
-            lastTokenId: "019fbb95-cd76-7920-93fa-e23ba755e326",
-            transcriptStartMs: 300,
-            transcriptEndMs: 2_900,
-            exportStartMs: 0,
-            exportEndMs: 3_400,
-            text: "fixture has accurate word timing. Click any word",
-            timingPrecision: "word",
-          },
+          selection: loggedClip?.selection,
           sourceLanguageClass: body.sourceLanguageClass,
+          sourceRights: body.sourceRights,
           preset: body.preset,
           state: "queued",
           createdAt: now,
@@ -861,7 +1494,9 @@ test("maps transcript text selection to stable source and export bounds", async 
   });
   await page.route("**/local-agent/api/exports", async (route) => {
     exportOnlyPostCount += 1;
-    const body = route.request().postDataJSON();
+    const body = CreateExportOnlyRequestSchema.parse(
+      route.request().postDataJSON(),
+    );
     return route.fulfill({
       status: 201,
       json: {
@@ -871,6 +1506,7 @@ test("maps transcript text selection to stable source and export bounds", async 
         video: body.video,
         selection: body.selection,
         sourceLanguageClass: body.sourceLanguageClass,
+        sourceRights: body.sourceRights,
         preset: body.preset,
         state: "queued",
         createdAt: now,
@@ -881,6 +1517,8 @@ test("maps transcript text selection to stable source and export bounds", async 
   await page.goto("/?fixture=english-word");
   await page.getByRole("button", { name: "Load video" }).click();
 
+  await waitForHostedPlayer(page);
+  await expect(page.getByTestId("transcript-window-row")).toHaveCount(2);
   await page.evaluate(() => {
     const anchor = Array.from(
       document.querySelectorAll<HTMLElement>("[data-transcript-token-id]"),
@@ -989,6 +1627,11 @@ test("maps transcript text selection to stable source and export bounds", async 
   await page
     .getByLabel("Omit subtitle files for confirmed-English videos")
     .check();
+  await page
+    .getByLabel(
+      /I confirm I am authorized to process this exact YouTube source/,
+    )
+    .check();
   await page.getByRole("button", { name: "Export + log" }).click();
   await expect(panel).toContainText(
     "Logged to New essay and queued an export with the Editing MP4 snapshot.",
@@ -1040,6 +1683,11 @@ test("connects an explicit project, controls a batch, and updates review state",
     transcriptionProfile: "default",
     sourcePolicy: "prefer-existing",
     executionLocation: "local",
+    transcriptionExecutionPolicy: {
+      schemaVersion: 1,
+      execution: "local",
+      fallback: "local",
+    },
     priority: "normal",
     dispatchStatus,
     createdBy: "019fbb95-cd76-7920-93fa-e23ba755ee36",
@@ -1091,6 +1739,8 @@ test("connects an explicit project, controls a batch, and updates review state",
             id: projectId,
             name: "Essay project",
             description: "",
+            kind: "shared",
+            visibility: "invitation_only",
             version: 1,
             createdAt: now,
             updatedAt: now,

@@ -126,6 +126,8 @@ it("claims, publishes over signed HTTP, resolves verified cache and fails no-cap
         projectId,
         catalogVideoId,
         authorization: presented,
+        preferredLanguage,
+        offlineReviewCapability,
       }) =>
         new SharedTranscriptWorkspaceService(
           new SharedFirstTranscriptResolver(
@@ -137,7 +139,12 @@ it("claims, publishes over signed HTTP, resolves verified cache and fails no-cap
             ),
           ),
           new CachedTranscriptDocumentReader(new LocalTranscriptIndex(localDb)),
-        ).resolve(projectId, catalogVideoId),
+        ).resolveWorkspace(
+          projectId,
+          catalogVideoId,
+          preferredLanguage,
+          offlineReviewCapability,
+        ),
     });
     await local.listen({ host: "127.0.0.1", port: localPort });
     const submit = async (videoId: string) => {
@@ -226,7 +233,7 @@ it("claims, publishes over signed HTTP, resolves verified cache and fails no-cap
     const firstPayload = (await first.json()) as {
       source: string;
       transcriptVersionId: string;
-      transcript: {
+      english: {
         track: { videoId: string; timingPrecision: string };
         tokens: unknown[];
       };
@@ -235,8 +242,8 @@ it("claims, publishes over signed HTTP, resolves verified cache and fails no-cap
     expect(firstPayload.transcriptVersionId).toBe(
       batch.items[0]?.activeTranscriptVersionId,
     );
-    expect(firstPayload.transcript.track.videoId).toBe("M7lc1UVf-VE");
-    expect(firstPayload.transcript.tokens.length).toBeGreaterThan(0);
+    expect(firstPayload.english.track.videoId).toBe("M7lc1UVf-VE");
+    expect(firstPayload.english.tokens.length).toBeGreaterThan(0);
     const second = await fetch(transcriptPath, { headers: { authorization } });
     expect(((await second.json()) as { source: string }).source).toBe(
       "verified-local-cache",

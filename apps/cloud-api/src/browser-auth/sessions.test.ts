@@ -83,6 +83,32 @@ describe("opaque browser sessions", () => {
     now = 1000;
     expect(await store.get(id, false)).toBeUndefined();
   });
+  it("supersedes older registration evidence only for the same subject", () => {
+    const store = new MemorySessionStore(
+      provider(async () => token("cognito:alice", 100000)),
+      () => 0,
+    );
+    const first = store.create(
+      { ...token("cognito:alice", 100000), verifiedEmail: "old@example.com" },
+      5,
+    );
+    const other = store.create(
+      { ...token("cognito:bob", 100000), verifiedEmail: "bob@example.com" },
+      5,
+    );
+    store.create(token("cognito:alice", 100000), 10);
+    expect(first.session.memberEmail).toEqual({
+      email: null,
+      observedAt: new Date(10),
+    });
+    expect(other.session.memberEmail.email).toBe("bob@example.com");
+    const late = store.create(
+      { ...token("cognito:alice", 100000), verifiedEmail: "old@example.com" },
+      7,
+    );
+    expect(late.session.memberEmail).toEqual(first.session.memberEmail);
+  });
+
   it("single-flights refresh and fails closed on changed identity", async () => {
     let now = 0,
       calls = 0;

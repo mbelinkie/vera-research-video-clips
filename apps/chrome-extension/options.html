@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+  <meta charset="utf-8" /><title>VERA connection</title
+  ><link rel="stylesheet" href="popup.css" />
+  <main>
+    <h1>VERA connection</h1>
+    <form id="connect">
+      <label
+        >VERA address<input
+          id="origin"
+          required
+          type="url"
+          placeholder="https://research.example.com"
+          autocomplete="off" /></label
+      ><button>Connect to VERA</button>
+    </form>
+    <section id="pair" hidden>
+      <p>Enter this code in the VERA window within five minutes.</p>
+      <strong id="code"></strong>
+      <p><button id="approve">Open VERA to approve</button></p>
+    </section>
+    <p role="status" id="status"></p>
+    <button id="check" hidden>Check connection</button>
+    <button id="disconnect" hidden>Disconnect this extension</button>
+  </main>
+  <script type="module" src="options.js"></script>
+</html>

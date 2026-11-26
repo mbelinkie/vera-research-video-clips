@@ -92,7 +92,11 @@ export function immediateProgress(item: BatchItem): ImmediateProgress {
           ? "English translation is not configured for this source language."
           : item.error?.code === "source_unavailable"
             ? "This video cannot be fetched for authorized transcription."
-            : "Transcript processing failed; check the local worker and retry.";
+            : item.error?.code === "alignment_shutdown_unconfirmed"
+              ? "Word alignment shutdown could not be confirmed. Temporary audio was retained."
+              : item.error?.code === "previous_alignment_pending"
+                ? "An earlier word alignment attempt must stop before retrying on this worker."
+                : "Transcript processing failed; check the local worker and retry.";
     return { kind: "failed", message };
   }
   return {

@@ -41,7 +41,7 @@ function createFixture() {
       const request = (
         method: "POST" | "GET" | "PATCH" | "DELETE",
         url: string,
-        payload?: Record<string, unknown>,
+        payload?: Record<string, unknown> | string[],
       ) =>
         app.inject({
           method,
@@ -83,8 +83,10 @@ const sourceIdentity = {
 };
 
 function clipFixture(idempotencyKey: string, identity = sourceIdentity) {
+  const nativeTrackId = randomUUID();
+  const englishTrackId = randomUUID();
   const selection = {
-    trackId: randomUUID(),
+    trackId: englishTrackId,
     transcriptVersion: 1,
     firstSegmentId: randomUUID(),
     lastSegmentId: randomUUID(),
@@ -105,14 +107,117 @@ function clipFixture(idempotencyKey: string, identity = sourceIdentity) {
       channel: "Fixture archive",
     },
     selection,
-    englishText: selection.text,
-    originalText,
+    languageEvidence: {
+      schemaVersion: 2 as const,
+      native: {
+        role: "native" as const,
+        language: "fr",
+        text: originalText,
+        trackId: nativeTrackId,
+        trackVersion: 1,
+        timingPrecision: "cue" as const,
+      },
+      english: {
+        role: "english" as const,
+        language: "en",
+        text: selection.text,
+        trackId: englishTrackId,
+        trackVersion: 1,
+        sourceTrackId: nativeTrackId,
+        timingPrecision: "cue" as const,
+      },
+    },
     notes: "Original notes",
     tags: ["Opening"],
   };
 }
 
 describe("project Library API", () => {
+  it("keeps source discussion counts, read receipts and reply rights scoped by actor and source", async () => {
+    const { database, register } = createFixture();
+    await runCloudMigrations(database);
+    const owner = await register("discussion-owner");
+    const viewer = await register("discussion-viewer");
+    const outsider = await register("discussion-outsider");
+    const project = await owner.read("POST", "/api/projects", {
+      name: "Discussion fixture",
+    });
+    const otherProject = await owner.read("POST", "/api/projects", {
+      name: "Other discussion fixture",
+    });
+    const base = `/api/projects/${project.id}`;
+    await owner.request("POST", `${base}/members`, {
+      userId: viewer.id,
+      role: "viewer",
+    });
+    const article = await owner.read("POST", `${base}/sources`, {
+      kind: "web_page",
+    });
+    const video = await owner.read("POST", `${base}/sources`, {
+      kind: "youtube",
+      sourceIdentity,
+    });
+    const path = `${base}/sources/${article.id}/discussion`;
+    const videoPath = `${base}/sources/${video.id}/discussion`;
+    const first = { id: randomUUID(), body: "First reply" };
+    const second = { id: randomUUID(), body: "Second reply" };
+
+    expect(await owner.read("POST", path, first)).toEqual({ id: first.id });
+    expect(await owner.read("POST", path, first)).toEqual({ id: first.id });
+    expect(
+      (await owner.request("POST", path, { ...first, body: "Different reply" }))
+        .statusCode,
+    ).toBe(409);
+    await owner.read("POST", path, second);
+    await owner.read("POST", videoPath, {
+      id: first.id,
+      body: "YouTube reply",
+    });
+
+    expect(
+      (
+        await viewer.request("POST", path, {
+          id: randomUUID(),
+          body: "Forbidden",
+        })
+      ).statusCode,
+    ).toBe(403);
+    expect((await outsider.request("GET", path)).statusCode).toBe(403);
+    expect(
+      (
+        await owner.request(
+          "GET",
+          `/api/projects/${otherProject.id}/sources/${article.id}/discussion`,
+        )
+      ).statusCode,
+    ).toBe(404);
+
+    const readResult = await viewer.request("POST", `${path}/read`, [first.id]);
+    expect(readResult.statusCode, readResult.body).toBe(200);
+    expect(readResult.json()).toEqual({
+      [article.id]: { total: 2, unread: 1 },
+    });
+    const countsPath = `${base}/source-discussion-counts?ids=${article.id},${video.id}`;
+    expect(await viewer.read("GET", countsPath)).toEqual({
+      [article.id]: { total: 2, unread: 1 },
+      [video.id]: { total: 1, unread: 1 },
+    });
+    expect(await viewer.read("GET", path)).toMatchObject({
+      canReply: false,
+      comments: [
+        { id: first.id, authorName: "discussion-owner", unread: false },
+        { id: second.id, unread: true },
+      ],
+    });
+    expect(await owner.read("GET", path)).toMatchObject({
+      canReply: true,
+      comments: [
+        { id: first.id, unread: false },
+        { id: second.id, unread: false },
+      ],
+    });
+  });
+
   it("stores exact offline quotes and edits display text independently through deletion", async () => {
     const { database, register } = createFixture();
     await runCloudMigrations(database);
@@ -665,7 +770,11 @@ describe("project Library API", () => {
     expect(item).toMatchObject({
       sourceId: source.id,
       kind: "clip",
-      content: { startMs: 0, endMs: 3_400, text: itemInput.clip.englishText },
+      content: {
+        startMs: 0,
+        endMs: 3_400,
+        text: itemInput.clip.selection.text,
+      },
       notes: itemInput.clip.notes,
       topics: itemInput.clip.tags,
     });
@@ -722,10 +831,14 @@ describe("project Library API", () => {
     );
     const legacyMigrations = await mkdtemp(join(tmpdir(), "library-legacy-"));
     try {
-      const filenames = (await readdir(migrations)).filter((filename) =>
-        /^000[1-9]_.*\.sql$/u.test(filename),
+      // Legacy state is every migration before the Library tables (0053):
+      // the hosted API needs the identity, provider and comment schema that
+      // the pilot added before the Library, so 0001-0009 alone cannot serve it.
+      const filenames = (await readdir(migrations)).filter(
+        (filename) => /^\d{4}_.*\.sql$/u.test(filename) && filename < "0053_",
       );
-      expect(filenames).toHaveLength(9);
+      expect(filenames.length).toBeGreaterThan(0);
+      expect(filenames).not.toContain("0053_project_library.sql");
       await Promise.all(
         filenames.map((filename) =>
           copyFile(
@@ -745,7 +858,8 @@ describe("project Library API", () => {
     });
     const base = `/api/projects/${project.id}`;
     const input = clipFixture("fixture:legacy-library-clip");
-    const { selection, originalText } = input;
+    const { selection } = input;
+    const originalText = input.languageEvidence.native.text;
     const legacy = await read("POST", `${base}/clips`, input);
     const clipUrl = `${base}/clips/${legacy.id}`;
     const unrelatedProject = await read("POST", "/api/projects", {
@@ -754,6 +868,13 @@ describe("project Library API", () => {
     const exported = await read("POST", `${clipUrl}/exports`, {
       idempotencyKey: "fixture:legacy-library-export",
       sourceLanguageClass: "confirmed_english",
+      sourceRights: {
+        schemaVersion: 1,
+        source: "youtube",
+        youtubeVideoId: sourceIdentity.providerMediaId,
+        confirmation: "authorized_to_process",
+        disclosureVersion: 1,
+      },
       preset: {
         presetVersion: 1,
         name: "Fixture MP4",
@@ -814,30 +935,6 @@ describe("project Library API", () => {
       unlinkedId,
     ]);
 
-    // The pilot checkpoint adds these provider columns and a project-scoped comment FK.
-    await database.exec(`
-      ALTER TABLE videos ADD COLUMN source_provider text, ADD COLUMN provider_media_id text,
-        ADD COLUMN source_fingerprint_evidence jsonb;
-      UPDATE videos SET source_provider = 'youtube', provider_media_id = youtube_video_id;
-      ALTER TABLE videos ALTER COLUMN source_provider SET NOT NULL,
-        ALTER COLUMN provider_media_id SET NOT NULL,
-        ADD UNIQUE (source_provider, provider_media_id);
-      ALTER TABLE clip_candidates ADD COLUMN source_provider text, ADD COLUMN provider_media_id text;
-      UPDATE clip_candidates SET source_provider = 'youtube', provider_media_id = youtube_video_id;
-      ALTER TABLE clip_candidates ALTER COLUMN source_provider SET NOT NULL,
-        ALTER COLUMN provider_media_id SET NOT NULL,
-        ADD CONSTRAINT clip_candidates_project_identity UNIQUE (project_id, id);
-      CREATE TABLE clip_comments (
-        id uuid PRIMARY KEY,
-        project_id uuid NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-        clip_id uuid NOT NULL,
-        author_id uuid NOT NULL REFERENCES users(id),
-        author_handle text NOT NULL,
-        author_display_name text NOT NULL,
-        body text,
-        FOREIGN KEY (project_id, clip_id) REFERENCES clip_candidates(project_id, id) ON DELETE CASCADE
-      );
-    `);
     const commentId = randomUUID();
     await database.query(
       `INSERT INTO clip_comments (id, project_id, clip_id, author_id, author_handle, author_display_name, body)

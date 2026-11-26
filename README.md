@@ -1,8 +1,47 @@
-# Research Video Transcript & Clip Extraction Tool
+# VERA Research Video Clips
 
 Shared-project research software for resolving English transcripts, navigating YouTube videos by transcript, logging candidate ranges, and exporting editing-ready clips.
 
-The authoritative product and architecture plan is in [`PROJECT_GUIDE.md`](./PROJECT_GUIDE.md). The active implementation checklist is in [`outline.md`](./outline.md).
+The authoritative product and architecture plan is in [`PROJECT_GUIDE.md`](./PROJECT_GUIDE.md). The concise execution map is in [`outline.md`](./outline.md).
+
+The separate authoring companion is
+[`VERA Script to Timeline`](https://github.com/mbelinkie/vera-script-to-timeline).
+It consumes versioned, authorized APIs and verified artifact descriptors; it
+does not share this application's database or depend on this UI. The completed
+research-side integration boundary is documented in
+[`specs/completed/M6-06-authoring-client-handoff.md`](./specs/completed/M6-06-authoring-client-handoff.md).
+
+## Current project state
+
+As of 2026-08-24, the deterministic core pilot punch list is complete:
+PUNCH-001 through PUNCH-008 and PUNCH-010 are implemented and linked to their
+verification records in [`specs/completed`](./specs/completed). This includes
+language-integrity and corrected-transcript workflows, the VERA Workbench and
+canonical project-video worklist, project governance, keyword scans, manual
+player-range logging, collaboration/comments, Topics, and immutable authoring
+snapshots.
+
+The separately integrated
+[`PLATFORM-001`](./specs/completed/PLATFORM-001-youtube-search-source-foundation.md)
+foundation adds provider-neutral source identities and official YouTube search
+with an explicit candidate-to-preflight handoff. YouTube remains the only
+supported ingest/playback platform. TikTok, Instagram, and Facebook are shown
+honestly as disabled; no social or AI capability should be inferred from their
+adapter seams or fixture-only acquisition spike.
+
+PUNCH-009 remains proposed M8 expansion scope apart from that completed
+foundation. Production AWS/Cognito proof, authorized live-source dogfood,
+signing/notarization, cross-platform release publication, updates, diagnostics,
+and independent QA remain external or later release gates. The bounded
+post-punch keyword maintenance, project bookmarks, desktop mention
+notifications, and provider-neutral YouTube search foundation are also
+complete. No specification is currently active.
+
+The current deterministic verification gate passes with 667 Vitest tests (4
+optional skips), 19 Playwright flows, 35 local migrations, 43 cloud migrations,
+typecheck, and web/desktop builds. Earlier release evidence also covers the real
+30-second foreign-language FFmpeg fixture, Electron Forge packaging, and
+packaged SQLite `PRAGMA quick_check`.
 
 ## Delivery workflow
 
@@ -22,7 +61,8 @@ debugging attempts, start a fresh task with the confirmed facts and a focused
 reproduction.
 
 For an **opt-in local Mac PostgreSQL/transcript-store pilot** (not friend-facing),
-see [the #50 data and backup operator guide](./docs/operations/mac-pilot-data.md).
+see [the #50 data and backup operator guide](./docs/operations/mac-pilot-data.md)
+and [the #53 friends-only hosting runbook](./docs/operations/mac-pilot-hosting.md).
 No service installation, live migration or external networking is performed by
 the application defaults.
 
@@ -98,6 +138,28 @@ language translation stays **off** unless separately enabled (it uses a
 remote billable service); unavailable translation fails terminally. Source
 restrictions, missing executables/model, and unavailable videos may still fail.
 
+### Local acoustic word timing
+
+Use the audio acquisition settings above and install Timeline's
+`packages/word-timing` in a Python 3.12 environment. Use a package that includes
+[worker cancellation](https://github.com/mbelinkie/vera-script-to-timeline/pull/668).
+Set `VERA_WORD_TIMING_PYTHON` to the Python executable in that environment.
+Configure `VERA_TOOLS_PYTHON` for Silero VAD, `VERA_MFA_COMMAND` for the MFA
+Python runtime, and `VERA_MFA_ROOT_DIR` for its installed models.
+
+On a newly processed source the local worker aligns English caption tracks
+or recognizer output in English, German, French, or Swedish when the matching
+model is installed. Spoken words without a measured interval appear with a
+dotted underline and use cue bounds when selected as a clip endpoint.
+Translation keeps cue timing. Previously saved transcripts retain their timing.
+
+If the worker reports unconfirmed aligner shutdown, the job audio is kept
+under its private data directory in `jobs/transcription-scratch`. Confirm the
+job's aligner has stopped before removing that scratch or retrying the job.
+The local `.alignment-<job ID>` marker prevents another local attempt from
+starting alignment. Once you confirm shutdown and remove the marker, submit
+the source in a new batch.
+
 ### Ordinary multi-service development
 
 ```bash
@@ -105,6 +167,38 @@ npm install
 cp .env.example .env
 npm run dev
 ```
+
+### Start the packaged desktop app
+
+Build a fresh unsigned Intel macOS package from the current worktree:
+
+```bash
+npm run desktop:package:x64
+open "out/Research Video Clips-darwin-x64/Research Video Clips.app"
+```
+
+Managed sign-in requires the three approved public deployment values to be
+exported together when the package is built: `PUBLIC_API_ORIGIN`,
+`COGNITO_DOMAIN`, and `COGNITO_CLIENT_ID`. The desktop build embeds those public
+connection identifiers in `desktop-config.json`; it never embeds a client
+secret. Every build embeds the approved checksum-pinned Whisper model identity
+independently. If the cloud values are absent, the app remains usable for local
+setup and the approved model download but reports that cloud sign-in is not
+configured instead of opening a browser. The current package embeds the
+approved low-cost development deployment values. That
+single-instance/PGlite/memory-adapter environment enables personal dogfood but
+does not satisfy the separate M7-01 production acceptance gate.
+
+The current verified local package is:
+
+```text
+out/Research Video Clips-darwin-x64/Research Video Clips.app
+```
+
+It is an unsigned, unnotarized x86_64 development/dogfood build, not a pilot
+release for remote distribution. The verified package's `app.asar` SHA-256 is
+`ff1e09a0669bfaed15b9c0749800c792137929dbb29a3be8f41f81ee03e73ead`;
+rebuilding changes the package and requires recording a new hash.
 
 The default development ports are:
 
@@ -125,8 +219,29 @@ copies at most 500 nonempty values into the same editable preflight list. It
 does not submit automatically; duplicates and unsupported rows remain visible
 for the normal server preflight.
 
-Caption acquisition is disabled by default. To opt into the local `yt-dlp`
-adapter for sources you are authorized to process, set:
+The ingest Search tab uses the official YouTube Data API v3 and is enabled only
+when the cloud API has a backend-only key:
+
+```bash
+YOUTUBE_API_KEY=server-side-api-key
+```
+
+Search and preview do not add project records or enqueue processing. Selected
+results are copied into the existing editable batch preflight, where the user
+must explicitly confirm them. TikTok, Instagram, and Facebook remain visibly
+disabled unless a future deployment configures a qualifying official search
+adapter; they are not supported ingest platforms in this release.
+
+The normal transcript-acquisition order is: reuse the exact verified shared
+transcript when one exists; otherwise prefer a downloadable YouTube caption
+(manual before automatic, and the target language before another language);
+only then fall back to configured speech recognition. Local Whisper is a
+captionless-source recovery path, not the primary path. `Force generation` is
+the explicit exception.
+
+Caption acquisition is disabled by default in an unconfigured source checkout.
+To opt into the local `yt-dlp` adapter for sources you are authorized to
+process, set:
 
 ```bash
 CAPTION_PROVIDER=yt-dlp

@@ -9,10 +9,13 @@ describe("configuration", () => {
     expect(config.localAgentHost).toBe("127.0.0.1");
     expect(config.objectStoreMode).toBe("memory");
     expect(config.queueMode).toBe("memory");
+    expect(config.cloudDatabaseMode).toBe("pglite");
+    expect(config.cloudAuthMode).toBe("development");
     expect(config.captionProvider).toBe("disabled");
     expect(config.mediaProvider).toBe("disabled");
     expect(config.exportSourceProvider).toBe("disabled");
     expect(config.ffmpegPath).toBe("ffmpeg");
+    expect(config.wordTimingPython).toBeUndefined();
     expect(config.ffprobePath).toBe("ffprobe");
     expect(config.clipExportDir).toMatch(/\/data\/exports$/u);
     expect(config.ytDlpPath).toBe("yt-dlp");
@@ -32,6 +35,7 @@ describe("configuration", () => {
     const config = loadConfig({
       NODE_ENV: "test",
       MEDIA_PROVIDER: "yt-dlp-audio",
+      EXPORT_SOURCE_PROVIDER: "yt-dlp",
       YT_DLP_PATH: "/opt/tools/yt-dlp",
       SPEECH_TO_TEXT_PROVIDER: "whisper-cpp",
       WHISPER_CPP_PATH: "/opt/whisper/whisper-cli",
@@ -40,8 +44,33 @@ describe("configuration", () => {
     });
 
     expect(config.mediaProvider).toBe("yt-dlp-audio");
+    expect(config.exportSourceProvider).toBe("yt-dlp");
     expect(config.speechToTextProvider).toBe("whisper-cpp");
     expect(config.whisperCppModelName).toBe("large-v3-turbo");
+  });
+
+  it("enables local word timing only with explicit Python and audio acquisition", () => {
+    const config = loadConfig({
+      NODE_ENV: "test",
+      MEDIA_PROVIDER: "yt-dlp-audio",
+      VERA_WORD_TIMING_PYTHON: "/opt/timeline/bin/python3",
+    });
+
+    expect(config.wordTimingPython).toBe("/opt/timeline/bin/python3");
+    expect(() =>
+      loadConfig({
+        NODE_ENV: "test",
+        VERA_WORD_TIMING_PYTHON: "/opt/timeline/bin/python3",
+      }),
+    ).toThrow("VERA_WORD_TIMING_PYTHON requires MEDIA_PROVIDER=yt-dlp-audio");
+    expect(() =>
+      loadConfig({
+        NODE_ENV: "test",
+        MEDIA_PROVIDER: "yt-dlp-audio",
+        WORKER_EXECUTION_LOCATION: "hosted",
+        VERA_WORD_TIMING_PYTHON: "/opt/timeline/bin/python3",
+      }),
+    ).toThrow("VERA_WORD_TIMING_PYTHON is only supported by local workers");
   });
 
   it("enables full-video cutting only by separate opt-in and requires a fixed absolute output root", () => {
@@ -83,6 +112,23 @@ describe("configuration", () => {
     expect(config.awsRegion).toBe("us-west-2");
   });
 
+  it("requires the protected catalog signing key and key ID together", () => {
+    expect(() =>
+      loadConfig({
+        NODE_ENV: "test",
+        LOCAL_MODEL_CATALOG_SIGNING_KEY_ID: "catalog-key-1",
+      }),
+    ).toThrow("must be configured together");
+
+    expect(
+      loadConfig({
+        NODE_ENV: "test",
+        LOCAL_MODEL_CATALOG_SIGNING_KEY_ID: "catalog-key-1",
+        LOCAL_MODEL_CATALOG_SIGNING_PRIVATE_KEY_BASE64: "cHJpdmF0ZS1rZXk=",
+      }),
+    ).toMatchObject({ localModelCatalogSigningKeyId: "catalog-key-1" });
+  });
+
   it("accepts an explicitly configured yt-dlp caption provider", () => {
     const config = loadConfig({
       NODE_ENV: "test",
@@ -94,9 +140,29 @@ describe("configuration", () => {
     expect(config.ytDlpPath).toBe("/opt/tools/yt-dlp");
   });
 
+  it("keeps official YouTube search optional and backend-configured", () => {
+    expect(loadConfig({ NODE_ENV: "test" }).youtubeApiKey).toBeUndefined();
+    expect(
+      loadConfig({ NODE_ENV: "test", YOUTUBE_API_KEY: "fixture-api-key" })
+        .youtubeApiKey,
+    ).toBe("fixture-api-key");
+  });
+
   it("rejects exposing the local agent", () => {
     expect(() => loadConfig({ LOCAL_AGENT_HOST: "0.0.0.0" })).toThrow(
       "Local services must bind to a loopback address",
+    );
+  });
+
+  it("allows only the supervised desktop agent to bind an ephemeral port", () => {
+    expect(
+      loadConfig({
+        APP_RUNTIME_ROLE: "desktop-local",
+        LOCAL_AGENT_PORT: "0",
+      }).localAgentPort,
+    ).toBe(0);
+    expect(() => loadConfig({ LOCAL_AGENT_PORT: "0" })).toThrow(
+      "Only the supervised desktop agent",
     );
   });
 
@@ -104,6 +170,41 @@ describe("configuration", () => {
     expect(() => loadConfig({ OBJECT_STORE_MODE: "s3" })).toThrow(
       "TRANSCRIPT_BUCKET is required",
     );
+  });
+
+  it("fails closed unless every production cloud boundary is explicit", () => {
+    expect(() => loadConfig({ NODE_ENV: "production" })).toThrow(
+      "Production requires PostgreSQL",
+    );
+
+    const config = loadConfig({
+      NODE_ENV: "production",
+      CLOUD_DATABASE_MODE: "postgres",
+      DATABASE_URL: "postgresql://runtime@db.internal/research_video_clips",
+      DATABASE_SSL_MODE: "verify-full",
+      DATABASE_CA_CERT_PATH: "/fixtures/rds-ca.pem",
+      CLOUD_AUTH_MODE: "cognito",
+      COGNITO_USER_POOL_ID: "us-east-1_example",
+      COGNITO_CLIENT_ID: "public-client-id",
+      COGNITO_DOMAIN: "https://auth.example.test",
+      COGNITO_REDIRECT_URI: "research-video-clips://oauth/callback",
+      COGNITO_LOGOUT_URI: "research-video-clips://oauth/logout",
+      OBJECT_STORE_MODE: "s3",
+      TRANSCRIPT_BUCKET: "private-production-transcripts",
+      QUEUE_MODE: "sqs",
+      JOB_QUEUE_URL: "https://sqs.us-east-1.amazonaws.com/123/jobs",
+      TRANSLATION_PROVIDER: "aws-translate",
+      PUBLIC_API_ORIGIN: "https://api.example.test",
+    });
+
+    expect(config).toMatchObject({
+      cloudDatabaseMode: "postgres",
+      databaseSslMode: "verify-full",
+      cloudAuthMode: "cognito",
+      objectStoreMode: "s3",
+      queueMode: "sqs",
+      translationProvider: "aws-translate",
+    });
   });
 
   it("accepts bounded continuous hosted worker settings", () => {
@@ -183,7 +284,35 @@ describe("browser BFF configuration boundary", () => {
     COGNITO_DOMAIN: "https://vera.auth.us-east-1.amazoncognito.com",
     COGNITO_CLIENT_ID: "test-client",
     COGNITO_CLIENT_SECRET: "test-only-not-real",
+    CF_ACCESS_TEAM_DOMAIN: "https://vera-test.cloudflareaccess.com",
+    CF_ACCESS_AUD: "a".repeat(64),
   };
+  it("requires Cloudflare Access verification for a friend-facing pilot", () => {
+    const withoutAccess: Record<string, string> = { ...valid };
+    delete withoutAccess.CF_ACCESS_TEAM_DOMAIN;
+    delete withoutAccess.CF_ACCESS_AUD;
+    expect(() => loadConfig(withoutAccess)).toThrow(
+      "requires CF_ACCESS_TEAM_DOMAIN and CF_ACCESS_AUD",
+    );
+    for (const team of [
+      "http://vera-test.cloudflareaccess.com",
+      "https://vera-test.cloudflareaccess.com/",
+      "https://*.cloudflareaccess.com",
+      "https://evil.example",
+      "https://vera-test.cloudflareaccess.com.evil.example",
+    ])
+      expect(() =>
+        loadConfig({ ...valid, CF_ACCESS_TEAM_DOMAIN: team }),
+      ).toThrow("CF_ACCESS_TEAM_DOMAIN");
+    expect(() => loadConfig({ ...valid, CF_ACCESS_AUD: "short" })).toThrow(
+      "CF_ACCESS_AUD",
+    );
+    expect(() => loadConfig({ ...valid, OPERATOR_PORT: "43111" })).toThrow(
+      "OPERATOR_PORT must differ",
+    );
+    expect(loadConfig(valid).operatorPort).toBe(43_114);
+    expect(loadConfig(valid).diskPauseBelowMb).toBe(2_048);
+  });
   it("requires explicit browser auth for production", () => {
     expect(() => loadConfig({ NODE_ENV: "production" })).toThrow(
       "Production cloud API requires browser BFF mode",

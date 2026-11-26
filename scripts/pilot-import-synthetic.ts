@@ -39,6 +39,9 @@ const tablesInFkOrder = [
   "library_items",
   "library_item_topics",
   "library_still_assets",
+  "chrome_video_submissions",
+  "extension_captures",
+  "extension_capture_assets",
 ] as const;
 const keyColumns: Record<string, string[]> = {
   users: ["id"],
@@ -63,6 +66,9 @@ const keyColumns: Record<string, string[]> = {
   export_requests: ["id"],
   library_items: ["id"],
   library_item_topics: ["item_id", "tag_id"],
+  chrome_video_submissions: ["id"],
+  extension_captures: ["project_id", "capture_id"],
+  extension_capture_assets: ["project_id", "capture_id", "role"],
   library_still_assets: ["project_id", "item_id", "role"],
 };
 
@@ -191,7 +197,8 @@ export async function importSyntheticPglite(
     }>(
       `SELECT object_key, object_version_id, sha256, byte_size FROM transcript_artifacts
        UNION ALL
-       SELECT object_key, object_version_id, sha256, byte_size FROM library_still_assets`,
+       SELECT object_key, object_version_id, sha256, byte_size FROM library_still_assets
+       UNION ALL SELECT object_key,object_version_id,sha256,byte_size FROM extension_capture_assets`,
     );
     const imported = new Set<string>();
     for (const ref of refs.rows) {

@@ -78,12 +78,6 @@ export class SpawnCommandRunner implements CommandRunner {
   }
 }
 
-type YtDlpMetadata = {
-  language?: string;
-  subtitles?: Record<string, unknown>;
-  automatic_captions?: Record<string, unknown>;
-};
-
 export type YtDlpCaptionProviderOptions = {
   executable?: string;
   runner?: CommandRunner;
@@ -130,28 +124,27 @@ export class YtDlpCaptionProvider implements CaptionProvider {
         "--no-config",
         "--no-playlist",
         "--skip-download",
-        "--dump-single-json",
+        "--print",
+        "%(language|-)s\t%(subtitles|-)l\t%(automatic_captions|-)l",
         "--no-warnings",
         "--",
         canonicalVideoUrl(videoId),
       ],
       { timeoutMs: this.#timeoutMs, ...(signal ? { signal } : {}) },
     );
-    let metadata: YtDlpMetadata;
-    try {
-      metadata = JSON.parse(result.stdout) as YtDlpMetadata;
-    } catch {
+    const columns = result.stdout.replace(/\r?\n$/u, "").split("\t");
+    if (
+      columns.length !== 3 ||
+      columns.some((column) => /[\r\n]/u.test(column))
+    ) {
       throw new ProviderExecutionError(
-        "Caption provider returned invalid metadata JSON.",
+        "Caption provider returned an invalid track list.",
       );
     }
+    const [language, manual, automatic] = columns as [string, string, string];
     return [
-      ...captionCandidates(metadata.subtitles, "manual"),
-      ...captionCandidates(
-        metadata.automatic_captions,
-        "automatic",
-        metadata.language,
-      ),
+      ...captionCandidates(manual, "manual"),
+      ...captionCandidates(automatic, "automatic", language),
     ];
   }
 
@@ -218,34 +211,27 @@ export async function normalizeAcquiredCaption(caption: AcquiredCaption) {
 }
 
 function captionCandidates(
-  source: Record<string, unknown> | undefined,
+  source: string,
   kind: "manual" | "automatic",
-  sourceLanguage?: string,
+  sourceLanguage = "-",
 ): CaptionTrackCandidate[] {
-  if (!source) return [];
-  let entries = Object.entries(source);
+  let entries = source
+    .split(", ")
+    .filter((language) => language !== "live_chat");
   if (kind === "automatic") {
-    const originals = entries.filter(([language]) =>
-      language.endsWith("-orig"),
-    );
+    const originals = entries.filter((language) => language.endsWith("-orig"));
     entries =
       originals.length > 0
         ? originals
-        : sourceLanguage
-          ? entries.filter(([language]) =>
-              sameLanguage(language, sourceLanguage),
-            )
-          : [];
+        : entries.filter((language) => sameLanguage(language, sourceLanguage));
   }
   return entries
     .filter(
-      ([providerLanguage, formats]) =>
-        normalizedProviderLanguage(providerLanguage).length >= 2 &&
-        normalizedProviderLanguage(providerLanguage).length <= 35 &&
-        Array.isArray(formats) &&
-        formats.length > 0,
+      (providerLanguage) =>
+        /^[a-z]{2,8}(?:[-_][a-z0-9]{1,8})*$/iu.test(providerLanguage) &&
+        normalizedProviderLanguage(providerLanguage).length <= 35,
     )
-    .map(([providerLanguage]) => {
+    .map((providerLanguage) => {
       const language = normalizedProviderLanguage(providerLanguage);
       return CaptionTrackCandidateSchema.parse({
         id: `yt-dlp:${kind}:${providerLanguage}`,

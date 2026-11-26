@@ -1,0 +1,97 @@
+{
+  "original": {
+    "track": {
+      "id": "019fbb95-cd76-7920-93fa-e23ba755e501",
+      "videoId": "Romanian001",
+      "language": "ro",
+      "kind": "original",
+      "source": "fixture",
+      "provider": "fixture",
+      "timingPrecision": "cue",
+      "schemaVersion": 1,
+      "contentSha256": "1111111111111111111111111111111111111111111111111111111111111111",
+      "version": 1
+    },
+    "segments": [
+      {
+        "id": "019fbb95-cd76-7920-93fa-e23ba755e511",
+        "ordinal": 0,
+        "startMs": 0,
+        "endMs": 1800,
+        "text": "Acesta este un exemplu românesc."
+      },
+      {
+        "id": "019fbb95-cd76-7920-93fa-e23ba755e512",
+        "ordinal": 1,
+        "startMs": 1800,
+        "endMs": 4000,
+        "text": "Selecția rămâne legată de timp."
+      }
+    ],
+    "tokens": []
+  },
+  "english": {
+    "track": {
+      "id": "019fbb95-cd76-7920-93fa-e23ba755e502",
+      "videoId": "Romanian001",
+      "language": "en",
+      "kind": "english",
+      "source": "translated",
+      "provider": "fixture-translation",
+      "sourceTrackId": "019fbb95-cd76-7920-93fa-e23ba755e501",
+      "timingPrecision": "cue",
+      "schemaVersion": 1,
+      "contentSha256": "2222222222222222222222222222222222222222222222222222222222222222",
+      "version": 1
+    },
+    "segments": [
+      {
+        "id": "019fbb95-cd76-7920-93fa-e23ba755e521",
+        "ordinal": 0,
+        "startMs": 0,
+        "endMs": 1800,
+        "text": "This is a Romanian example."
+      },
+      {
+        "id": "019fbb95-cd76-7920-93fa-e23ba755e522",
+        "ordinal": 1,
+        "startMs": 1800,
+        "endMs": 4000,
+        "text": "The selection stays linked by time."
+      }
+    ],
+    "tokens": []
+  },
+  "spanish": {
+    "track": {
+      "id": "019fbb95-cd76-7920-93fa-e23ba755e503",
+      "videoId": "Romanian001",
+      "language": "es",
+      "kind": "translation",
+      "source": "translated",
+      "provider": "fixture-translation",
+      "sourceTrackId": "019fbb95-cd76-7920-93fa-e23ba755e501",
+      "timingPrecision": "cue",
+      "schemaVersion": 1,
+      "contentSha256": "3333333333333333333333333333333333333333333333333333333333333333",
+      "version": 1
+    },
+    "segments": [
+      {
+        "id": "019fbb95-cd76-7920-93fa-e23ba755e531",
+        "ordinal": 0,
+        "startMs": 0,
+        "endMs": 1800,
+        "text": "Este es un ejemplo rumano."
+      },
+      {
+        "id": "019fbb95-cd76-7920-93fa-e23ba755e532",
+        "ordinal": 1,
+        "startMs": 1800,
+        "endMs": 4000,
+        "text": "La selección permanece vinculada por tiempo."
+      }
+    ],
+    "tokens": []
+  }
+}

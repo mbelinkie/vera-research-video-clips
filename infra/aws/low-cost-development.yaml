@@ -1,0 +1,419 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Development-only Cognito and single-instance HTTPS API for Research Video
+  Clips. This intentionally avoids the production RDS, ECS, ALB, NAT, DNS, and
+  certificate topology.
+
+Parameters:
+  ApplicationName:
+    Type: String
+    Default: research-video-clips
+    AllowedPattern: "^[a-z0-9][a-z0-9-]{1,30}$"
+  EnvironmentName:
+    Type: String
+    Default: development
+    AllowedValues: [development]
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  PublicSubnetId:
+    Type: AWS::EC2::Subnet::Id
+  InstanceType:
+    Type: String
+    Default: t4g.micro
+    AllowedValues: [t4g.nano, t4g.micro, t4g.small]
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
+  SourceRepository:
+    Type: String
+    Default: https://github.com/mbelinkie/vera-research-video-clips.git
+    AllowedPattern: "^https://github[.]com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+[.]git$"
+  SourceCommit:
+    Type: String
+    AllowedPattern: "^[0-9a-f]{7,40}$"
+    Description: Reviewed immutable Git commit containing the cloud API
+  CognitoDomainPrefix:
+    Type: String
+    AllowedPattern: "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$"
+  CognitoLogoutUrl:
+    Type: String
+    Default: research-video-clips://oauth/logout
+  YouTubeApiKeyParameterName:
+    Type: String
+    Default: /research-video-clips/development/youtube-api-key
+    AllowedPattern: "^/[A-Za-z0-9_.\u002F-]{1,1010}$"
+    Description: >-
+      Existing SSM SecureString parameter containing the server-only YouTube
+      Data API v3 key. Search remains unavailable while the parameter is absent.
+
+Resources:
+  CognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub "${ApplicationName}-${EnvironmentName}-low-cost"
+      AutoVerifiedAttributes: [email]
+      UsernameAttributes: [email]
+      AccountRecoverySetting:
+        RecoveryMechanisms: [{ Name: verified_email, Priority: 1 }]
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+      # Development uses email recovery and no SMS spend/configuration. The
+      # separate production template retains the reviewed MFA policy.
+      MfaConfiguration: "OFF"
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 14
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          RequireUppercase: true
+          TemporaryPasswordValidityDays: 7
+      DeletionProtection: INACTIVE
+      UserPoolTags:
+        application: !Ref ApplicationName
+        environment: !Ref EnvironmentName
+        cost-profile: low-cost-development
+
+  CognitoUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: desktop-public-pkce
+      UserPoolId: !Ref CognitoUserPool
+      GenerateSecret: false
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows: [code]
+      AllowedOAuthScopes: [openid, email, profile]
+      CallbackURLs: ["research-video-clips://oauth/callback"]
+      LogoutURLs: [!Ref CognitoLogoutUrl]
+      SupportedIdentityProviders: [COGNITO]
+      ExplicitAuthFlows: [ALLOW_REFRESH_TOKEN_AUTH, ALLOW_USER_SRP_AUTH]
+      PreventUserExistenceErrors: ENABLED
+      EnableTokenRevocation: true
+      AccessTokenValidity: 60
+      IdTokenValidity: 60
+      RefreshTokenValidity: 30
+      TokenValidityUnits:
+        AccessToken: minutes
+        IdToken: minutes
+        RefreshToken: days
+
+  CognitoUserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Ref CognitoDomainPrefix
+      UserPoolId: !Ref CognitoUserPool
+
+  ApiSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Public HTTPS and certificate-validation HTTP only
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: ACME HTTP challenge and HTTPS redirect
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: Development cloud API HTTPS
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+          Description: Package install, Cognito JWKS, and provider metadata
+      Tags:
+        - { Key: application, Value: !Ref ApplicationName }
+        - { Key: environment, Value: !Ref EnvironmentName }
+        - { Key: cost-profile, Value: low-cost-development }
+
+  ApiElasticIp:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      Tags:
+        - { Key: application, Value: !Ref ApplicationName }
+        - { Key: environment, Value: !Ref EnvironmentName }
+        - { Key: cost-profile, Value: low-cost-development }
+
+  ApiInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore"
+      Policies:
+        - PolicyName: read-youtube-search-key
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub >-
+                  arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${YouTubeApiKeyParameterName}
+      Tags:
+        - { Key: application, Value: !Ref ApplicationName }
+        - { Key: environment, Value: !Ref EnvironmentName }
+        - { Key: cost-profile, Value: low-cost-development }
+
+  ApiInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref ApiInstanceRole]
+
+  ApiInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref InstanceType
+      SubnetId: !Ref PublicSubnetId
+      SecurityGroupIds: [!Ref ApiSecurityGroup]
+      IamInstanceProfile: !Ref ApiInstanceProfile
+      MetadataOptions:
+        HttpEndpoint: enabled
+        HttpTokens: required
+        HttpPutResponseHopLimit: 1
+        InstanceMetadataTags: disabled
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            DeleteOnTermination: true
+            Encrypted: true
+            VolumeSize: 12
+            VolumeType: gp3
+      Tags:
+        - { Key: Name, Value: !Sub "${ApplicationName}-${EnvironmentName}-api" }
+        - { Key: application, Value: !Ref ApplicationName }
+        - { Key: environment, Value: !Ref EnvironmentName }
+        - { Key: cost-profile, Value: low-cost-development }
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+          exec > >(tee /var/log/research-video-bootstrap.log | logger -t research-video-bootstrap -s 2>/dev/console) 2>&1
+
+          # AL2023 ships curl-minimal. Installing the mutually exclusive full
+          # curl package makes dnf fail, so retain the patched system client.
+          dnf install -y git tar xz gzip
+
+          dd if=/dev/zero of=/swapfile bs=1M count=2048
+          chmod 600 /swapfile
+          mkswap /swapfile
+          swapon /swapfile
+          echo '/swapfile none swap sw 0 0' >> /etc/fstab
+
+          curl --fail --silent --show-error --location \
+            --output /tmp/node.tar.xz \
+            https://nodejs.org/dist/v22.23.0/node-v22.23.0-linux-arm64.tar.xz
+          tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1
+          rm /tmp/node.tar.xz
+
+          curl --fail --silent --show-error --location \
+            --output /tmp/caddy.tar.gz \
+            https://github.com/caddyserver/caddy/releases/download/v2.10.2/caddy_2.10.2_linux_arm64.tar.gz
+          tar -xzf /tmp/caddy.tar.gz -C /usr/local/bin caddy
+          chmod 0755 /usr/local/bin/caddy
+          rm /tmp/caddy.tar.gz
+
+          git clone --filter=blob:none ${SourceRepository} /opt/research-video-clips
+          git -C /opt/research-video-clips checkout --detach ${SourceCommit}
+          cd /opt/research-video-clips
+          npm ci --omit=dev --no-audit --no-fund
+          npm install --global tsx@4.23.1
+          npm cache clean --force
+
+          useradd --system --home-dir /var/lib/research-video --shell /sbin/nologin vera
+          install -d -o vera -g vera -m 0750 /var/lib/research-video
+          install -d -o root -g vera -m 0750 /etc/research-video
+
+          cat > /etc/research-video/cloud-api.env <<'EOF'
+          NODE_ENV=development
+          APP_RUNTIME_ROLE=cloud-api
+          CLOUD_API_HOST=127.0.0.1
+          CLOUD_API_PORT=43111
+          PUBLIC_API_ORIGIN=https://${ApiElasticIp.PublicIp}.sslip.io
+          DATA_DIR=/var/lib/research-video
+          CLOUD_DATABASE_MODE=pglite
+          DATABASE_SSL_MODE=disable
+          CLOUD_AUTH_MODE=cognito
+          COGNITO_USER_POOL_ID=${CognitoUserPool}
+          COGNITO_CLIENT_ID=${CognitoUserPoolClient}
+          COGNITO_DOMAIN=https://${CognitoDomainPrefix}.auth.${AWS::Region}.amazoncognito.com
+          COGNITO_REDIRECT_URI=research-video-clips://oauth/callback
+          COGNITO_LOGOUT_URI=research-video-clips://oauth/logout
+          OBJECT_STORE_MODE=memory
+          QUEUE_MODE=memory
+          TRANSLATION_PROVIDER=disabled
+          AWS_REGION=${AWS::Region}
+          EOF
+          chown root:vera /etc/research-video/cloud-api.env
+          chmod 0640 /etc/research-video/cloud-api.env
+
+          cat > /etc/systemd/system/research-video-api.service <<'EOF'
+          [Unit]
+          Description=Research Video Clips development cloud API
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          Type=simple
+          User=vera
+          Group=vera
+          WorkingDirectory=/opt/research-video-clips
+          EnvironmentFile=/etc/research-video/cloud-api.env
+          ExecStart=/usr/local/bin/tsx apps/cloud-api/src/main.ts
+          Restart=always
+          RestartSec=5
+          NoNewPrivileges=true
+          PrivateTmp=true
+          ProtectHome=true
+          ProtectSystem=strict
+          ReadWritePaths=/var/lib/research-video
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+
+          useradd --system --home-dir /var/lib/caddy --shell /sbin/nologin caddy
+          install -d -o caddy -g caddy -m 0750 /var/lib/caddy /var/log/caddy /etc/caddy
+          cat > /etc/caddy/Caddyfile <<'EOF'
+          ${ApiElasticIp.PublicIp}.sslip.io {
+            encode zstd gzip
+            reverse_proxy 127.0.0.1:43111
+            header {
+              Strict-Transport-Security "max-age=31536000"
+              X-Content-Type-Options "nosniff"
+              X-Frame-Options "DENY"
+            }
+          }
+          EOF
+          chown root:caddy /etc/caddy/Caddyfile
+          chmod 0640 /etc/caddy/Caddyfile
+
+          cat > /etc/systemd/system/caddy.service <<'EOF'
+          [Unit]
+          Description=Caddy HTTPS reverse proxy
+          After=network-online.target research-video-api.service
+          Wants=network-online.target
+
+          [Service]
+          Type=notify
+          User=caddy
+          Group=caddy
+          ExecStart=/usr/local/bin/caddy run --environ --config /etc/caddy/Caddyfile
+          ExecReload=/usr/local/bin/caddy reload --config /etc/caddy/Caddyfile --force
+          TimeoutStopSec=5s
+          LimitNOFILE=1048576
+          PrivateTmp=true
+          ProtectHome=true
+          ProtectSystem=strict
+          ReadWritePaths=/var/lib/caddy /var/log/caddy
+          AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+          CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+          NoNewPrivileges=true
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+
+          systemctl daemon-reload
+          systemctl enable --now research-video-api.service
+          systemctl enable --now caddy.service
+
+          for attempt in $(seq 1 90); do
+            if curl --fail --silent --show-error --max-time 5 \
+              https://${ApiElasticIp.PublicIp}.sslip.io/health >/tmp/health.json; then
+              exit 0
+            fi
+            sleep 10
+          done
+
+          systemctl status research-video-api.service caddy.service --no-pager || true
+          journalctl -u research-video-api.service -u caddy.service --no-pager -n 200 || true
+          exit 1
+
+  YouTubeSearchConfigurationAssociation:
+    Type: AWS::SSM::Association
+    Properties:
+      Name: AWS-RunShellScript
+      AssociationName: !Sub "${ApplicationName}-${EnvironmentName}-youtube-search"
+      ApplyOnlyAtCronInterval: false
+      ScheduleExpression: rate(30 minutes)
+      Targets:
+        - Key: InstanceIds
+          Values: [!Ref ApiInstance]
+      Parameters:
+        commands:
+          - !Sub |
+            set -euo pipefail
+            set +x
+            for attempt in $(seq 1 180); do
+              if test -f /etc/systemd/system/research-video-api.service; then
+                break
+              fi
+              sleep 10
+            done
+            test -f /etc/systemd/system/research-video-api.service
+            if ! command -v aws >/dev/null 2>&1; then
+              dnf install -y awscli2 >/dev/null
+            fi
+            install -d -o root -g vera -m 0750 /etc/research-video
+            provider_env=/etc/research-video/cloud-api-provider.env
+            temporary_env=$(mktemp /etc/research-video/cloud-api-provider.env.XXXXXX)
+            trap 'rm -f "$temporary_env"' EXIT
+            umask 027
+            if api_key=$(aws ssm get-parameter \
+              --region ${AWS::Region} \
+              --name '${YouTubeApiKeyParameterName}' \
+              --with-decryption \
+              --query 'Parameter.Value' \
+              --output text 2>/dev/null); then
+              if ! printf '%s' "$api_key" | grep -Eq '^[A-Za-z0-9_-]{20,200}$'; then
+                exit 1
+              fi
+              printf 'YOUTUBE_API_KEY=%s\n' "$api_key" > "$temporary_env"
+              chown root:vera "$temporary_env"
+              chmod 0640 "$temporary_env"
+            else
+              : > "$temporary_env"
+              chown root:vera "$temporary_env"
+              chmod 0640 "$temporary_env"
+            fi
+            install -d -o root -g root -m 0755 \
+              /etc/systemd/system/research-video-api.service.d
+            cat > /etc/systemd/system/research-video-api.service.d/providers.conf <<'EOF'
+            [Service]
+            EnvironmentFile=-/etc/research-video/cloud-api-provider.env
+            EOF
+            if ! cmp -s "$temporary_env" "$provider_env"; then
+              mv -f "$temporary_env" "$provider_env"
+              trap - EXIT
+              systemctl daemon-reload
+              systemctl try-restart research-video-api.service
+            fi
+
+  ApiElasticIpAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      AllocationId: !GetAtt ApiElasticIp.AllocationId
+      InstanceId: !Ref ApiInstance
+
+Outputs:
+  PublicApiOrigin:
+    Value: !Sub "https://${ApiElasticIp.PublicIp}.sslip.io"
+  CognitoUserPoolId:
+    Value: !Ref CognitoUserPool
+  CognitoUserPoolClientId:
+    Value: !Ref CognitoUserPoolClient
+  CognitoHostedUiDomain:
+    Value: !Sub "https://${CognitoDomainPrefix}.auth.${AWS::Region}.amazoncognito.com"
+  ApiInstanceId:
+    Value: !Ref ApiInstance
+  PersistenceNotice:
+    Value: Development PGlite persists on the instance volume; memory transcript objects and queue messages do not survive process restart.

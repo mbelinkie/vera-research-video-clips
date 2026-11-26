@@ -1,0 +1,30 @@
+name: Roadmap goal
+description: Create a parent outcome that rolls up bounded sub-issues.
+title: "Goal: "
+labels: ["model:terra", "effort:medium", "type:goal"]
+body:
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Goal outcome
+    validations:
+      required: true
+  - type: textarea
+    id: exit
+    attributes:
+      label: Exit criteria
+      value: "- [ ] "
+    validations:
+      required: true
+  - type: textarea
+    id: exclusions
+    attributes:
+      label: Non-goals
+    validations:
+      required: true
+  - type: textarea
+    id: dependencies
+    attributes:
+      label: Dependencies and child work
+    validations:
+      required: true

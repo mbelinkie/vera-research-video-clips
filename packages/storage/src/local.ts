@@ -1,12 +1,21 @@
 import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { lstat, mkdir, open, readdir } from "node:fs/promises";
+import {
+  lstat,
+  mkdir,
+  open,
+  readdir,
+  rm,
+  stat as statFile,
+} from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
 
-import type {
-  PutObjectInput,
-  StoredObject,
-  TranscriptObjectStore,
+import {
+  ObjectStoreSizeLimitError,
+  type PutObjectInput,
+  type StoredObject,
+  type StoredObjectMetadata,
+  type TranscriptObjectStore,
 } from "./index.ts";
 
 const digest = (bytes: Uint8Array) =>
@@ -294,6 +303,67 @@ export class LocalTranscriptObjectStore implements TranscriptObjectStore {
       contentType: metadata.contentType,
       sha256: metadata.sha256,
     };
+  }
+
+  async head(
+    key: string,
+    versionId?: string,
+  ): Promise<StoredObjectMetadata | undefined> {
+    const value = await this.get(key, versionId);
+    if (!value) return undefined;
+    const { bytes, ...metadata } = value;
+    return { ...metadata, byteSize: bytes.byteLength };
+  }
+
+  async getBounded(
+    key: string,
+    versionId: string,
+    maxBytes: number,
+  ): Promise<StoredObject | undefined> {
+    if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0) {
+      throw new TypeError("Object byte limit must be a positive safe integer.");
+    }
+    const value = await this.get(key, versionId);
+    if (value && value.bytes.byteLength > maxBytes) {
+      throw new ObjectStoreSizeLimitError();
+    }
+    return value;
+  }
+
+  /**
+   * Removes exactly one pinned version. If it was the visible head, the head
+   * falls back to the most recently written remaining version, or "deleted".
+   */
+  async deleteVersion(key: string, versionId: string): Promise<boolean> {
+    assertTranscriptObjectKey(key);
+    if (!versionPattern.test(versionId)) return false;
+    let folder: string;
+    try {
+      folder = await this.checkedFolder(key);
+    } catch (error) {
+      if (isMissing(error)) return false;
+      throw error;
+    }
+    const versions = join(folder, "versions");
+    await this.verifyDirectory(versions);
+    if (!(await this.readFile(join(versions, versionId + ".json"))))
+      return false;
+    const head = (await this.readFile(join(folder, "head")))?.toString("utf8");
+    await rm(join(versions, versionId + ".json"), { force: true });
+    await rm(join(versions, versionId + ".blob"), { force: true });
+    await this.syncDir(versions);
+    if (head === versionId) {
+      let fallback: { id: string; mtime: number } | undefined;
+      for (const name of await readdir(versions)) {
+        const match = /^(.+)\.json$/u.exec(name);
+        if (!match?.[1] || !versionPattern.test(match[1])) continue;
+        const info = await statFile(join(versions, name));
+        if (!fallback || info.mtimeMs > fallback.mtime)
+          fallback = { id: match[1], mtime: info.mtimeMs };
+      }
+      await this.writeHead(folder, fallback?.id ?? "deleted");
+    }
+    return true;
   }
 
   async delete(key: string): Promise<boolean> {

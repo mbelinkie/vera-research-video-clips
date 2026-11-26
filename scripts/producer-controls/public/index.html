@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="controls-token" content="__CONTROLS_TOKEN__" />
+    <title>Producer Controls · VERA Research</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <a class="skip" href="#main">Skip to content</a>
+    <div class="shell">
+      <header class="topbar">
+        <div>
+          <h1><span class="crumb">VERA Research ›</span> Producer Controls</h1>
+        </div>
+        <div class="mode" id="mode" aria-label="Mode"></div>
+      </header>
+      <nav
+        class="tabs"
+        role="tablist"
+        aria-label="Producer Controls sections"
+        id="tabs"
+      ></nav>
+      <div id="op" aria-live="polite"></div>
+      <main id="main" tabindex="-1"></main>
+      <p class="foot">
+        Producer Controls runs on this Mac only and keeps working when the
+        website or tunnel is down. It never shows secrets or the backup key.
+      </p>
+    </div>
+    <dialog id="confirm" aria-labelledby="confirm-title">
+      <h2 id="confirm-title"></h2>
+      <p id="confirm-text"></p>
+      <div class="actions">
+        <button class="btn primary" id="confirm-yes" type="button"></button>
+        <button class="btn" id="confirm-no" type="button">Cancel</button>
+      </div>
+    </dialog>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

@@ -1,8 +1,10 @@
+import { MemberEmailSchema } from "@research-video/contracts";
 import { CognitoJwtVerifier } from "aws-jwt-verify";
 import type { JwksCache } from "aws-jwt-verify/jwk";
 
 export type VerifiedTokens = Readonly<{
   subject: string;
+  verifiedEmail?: string;
   accessToken: string;
   refreshToken: string;
   expiresAtMs: number;
@@ -106,6 +108,7 @@ export function createCognitoProvider(
     if (access.iss !== options.issuer || !access.sub)
       throw new Error("Invalid identity provider issuer");
     if (nonce && !tokens.id_token) throw new Error("Missing identity token");
+    let verifiedEmail: string | undefined;
     if (tokens.id_token) {
       const id = await idVerifier.verify(tokens.id_token);
       if (
@@ -115,8 +118,13 @@ export function createCognitoProvider(
       ) {
         throw new Error("Invalid identity token");
       }
+      if (nonce && id.email_verified === true) {
+        const email = MemberEmailSchema.safeParse(id.email);
+        if (email.success) verifiedEmail = email.data;
+      }
     }
     return {
+      ...(verifiedEmail === undefined ? {} : { verifiedEmail }),
       subject: `cognito:${options.issuer}#${access.sub}`,
       accessToken: tokens.access_token,
       refreshToken: tokens.refresh_token ?? previousRefresh!,
@@ -133,6 +141,7 @@ export function createCognitoProvider(
         client_id: options.clientId,
         response_type: "code",
         redirect_uri: options.callbackUrl,
+        // Cognito includes readable attributes (including email) with openid alone.
         scope: "openid",
         code_challenge: challenge,
         code_challenge_method: "S256",

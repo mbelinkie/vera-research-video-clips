@@ -1,0 +1,301 @@
+import { readFile } from "node:fs/promises";
+import { runInNewContext } from "node:vm";
+import { expect, it, vi } from "vitest";
+
+type FakeElement = {
+  hidden: boolean;
+  disabled: boolean;
+  value: string;
+  checked: boolean;
+  textContent: string;
+  selectedOptions: Array<{ text: string }>;
+  focus(): void;
+  replaceChildren(...children: unknown[]): void;
+  add(...children: unknown[]): void;
+  append(...children: unknown[]): void;
+  onsubmit?: (event: { preventDefault(): void }) => Promise<void>;
+  onchange?: () => void;
+  oninput?: () => void;
+};
+
+function element(): FakeElement {
+  return {
+    hidden: true,
+    disabled: false,
+    value: "",
+    checked: false,
+    textContent: "",
+    selectedOptions: [{ text: "Editorial" }],
+    focus() {},
+    replaceChildren() {},
+    add() {},
+    append() {},
+  };
+}
+
+async function runConfirmation(
+  options: {
+    draft?: Record<string, unknown>;
+    sourceReason?: string | null;
+    delayReason?: Promise<void>;
+    captureResponses?: Array<unknown | Error>;
+  } = {},
+) {
+  const requestId = "3874ec11-5ba7-4249-8985-e16bbe14dbde";
+  const draft = options.draft ?? {
+    kind: "youtube",
+    requestId,
+    url: "https://www.youtube.com/watch?v=M7lc1UVf-VE",
+  };
+  const paired = { origin: "https://vera.example", key: "fixture" };
+  const elements = new Map<string, FakeElement>();
+  const captures: unknown[] = [];
+  const byId = (id: string) => {
+    if (!elements.has(id)) elements.set(id, element());
+    return elements.get(id)!;
+  };
+  let captureIndex = 0;
+  const gateway = vi.fn(
+    async (_origin: string, path: string, body: unknown) => {
+      if (path === "projects") return [{ id: "project", name: "Editorial" }];
+      if (path.endsWith("/youtube-source")) {
+        await options.delayReason;
+        return {
+          sourceId: "source-id",
+          reason:
+            options.sourceReason === null
+              ? null
+              : {
+                  text: options.sourceReason ?? "Compare this video.",
+                  updatedBy: "member-id",
+                  updatedByName: "Researcher",
+                  updatedAt: "2026-11-20T00:00:00.000Z",
+                },
+        };
+      }
+      captures.push(body);
+      const response = options.captureResponses?.[captureIndex++];
+      if (response instanceof Error) throw response;
+      return (
+        response ?? {
+          batchId: "batch-id",
+          status: "queued",
+          sourceId: "source-id",
+          sourcePath: "/?projectId=project&sourceId=source-id",
+        }
+      );
+    },
+  );
+  const sendMessage = vi.fn(async (message: { type: string }) => {
+    if (message.type === "vera.capture.read") return { ...draft };
+    if (message.type === "vera.capture.youtube-playhead")
+      return { ok: true, playheadMs: 193001 };
+    return undefined;
+  });
+  const script = await readFile(
+    new URL("../confirm.js", import.meta.url),
+    "utf8",
+  );
+  await runInNewContext(
+    script
+      .replace(/^import .*?;\s*/u, "")
+      .replace("void load();\n", "load();\n"),
+    {
+      document: { getElementById: byId },
+      window: {},
+      location: { hash: "#" + requestId },
+      URL,
+      Option: class {},
+      crypto: { randomUUID: () => "fresh-request-id" },
+      chrome: {
+        runtime: {
+          sendMessage,
+          openOptionsPage: vi.fn(),
+        },
+      },
+      connection: async () => paired,
+      gateway,
+    },
+  );
+  await vi.waitFor(() =>
+    expect(byId("status").textContent).toContain("Connected"),
+  );
+  return { byId, gateway, captures, sendMessage, requestId };
+}
+
+it("prefills and explicitly clears a general YouTube reason", async () => {
+  const fixture = await runConfirmation();
+  expect(fixture.byId("reason").value).toBe("Compare this video.");
+  fixture.byId("reason").value = "";
+  fixture.byId("reason").oninput!();
+  fixture.byId("project").value = "project";
+  await fixture.byId("save").onsubmit!({ preventDefault() {} });
+  expect(fixture.captures[0]).toEqual({
+    kind: "youtube",
+    requestId: fixture.requestId,
+    url: "https://www.youtube.com/watch?v=M7lc1UVf-VE",
+    youtubeDetails: { kind: "general", reason: "" },
+  });
+});
+
+it("waits for the selected project's reason before enabling an untouched general save", async () => {
+  let finishLookup!: () => void;
+  const delayReason = new Promise<void>((resolve) => {
+    finishLookup = resolve;
+  });
+  const fixture = await runConfirmation({ delayReason });
+  expect(fixture.byId("submit").disabled).toBe(true);
+  finishLookup();
+  await vi.waitFor(() => expect(fixture.byId("submit").disabled).toBe(false));
+  expect(fixture.byId("reason").value).toBe("Compare this video.");
+  await fixture.byId("save").onsubmit!({ preventDefault() {} });
+  expect(fixture.captures[0]).toMatchObject({
+    youtubeDetails: { kind: "general" },
+  });
+  expect(fixture.captures[0]).not.toHaveProperty("youtubeDetails.reason");
+});
+
+it("samples a frozen time once and sends a separate moment note", async () => {
+  const fixture = await runConfirmation({ sourceReason: null });
+  expect(fixture.byId("time").checked).toBe(false);
+  expect(fixture.byId("time-text").textContent).toBe("Capture current time");
+  fixture.byId("time").checked = true;
+  await fixture.byId("time").onchange!();
+  await vi.waitFor(() =>
+    expect(fixture.byId("time-text").textContent).toBe("Include 3:13"),
+  );
+  expect(fixture.byId("video-reason").hidden).toBe(true);
+  expect(fixture.byId("moment-note-field").hidden).toBe(false);
+  fixture.byId("note").value = "Revisit the opening claim.";
+  fixture.byId("note").oninput!();
+  fixture.byId("project").value = "project";
+  await fixture.byId("save").onsubmit!({ preventDefault() {} });
+  expect(fixture.captures[0]).toEqual({
+    kind: "youtube",
+    requestId: fixture.requestId,
+    url: "https://www.youtube.com/watch?v=M7lc1UVf-VE",
+    youtubeDetails: {
+      kind: "moment",
+      timecodeMs: 193001,
+      note: "Revisit the opening claim.",
+    },
+  });
+  expect(
+    fixture.sendMessage.mock.calls.filter(
+      ([message]) => message.type === "vera.capture.youtube-playhead",
+    ),
+  ).toHaveLength(1);
+});
+
+it.each(["rejects", "resolves"] as const)(
+  "keeps the completed moment save unchanged when the pending reason lookup %s",
+  async (outcome) => {
+    let finishLookup!: () => void;
+    let failLookup!: (error: Error) => void;
+    const delayReason = new Promise<void>((resolve, reject) => {
+      finishLookup = resolve;
+      failLookup = reject;
+    });
+    const fixture = await runConfirmation({ delayReason });
+    const lookupIndex = fixture.gateway.mock.calls.findIndex(([, path]) =>
+      path.endsWith("/youtube-source"),
+    );
+    expect(lookupIndex).toBeGreaterThanOrEqual(0);
+    const lookup = fixture.gateway.mock.results[lookupIndex]!.value;
+    expect(fixture.byId("submit").disabled).toBe(true);
+    fixture.byId("time").checked = true;
+    await fixture.byId("time").onchange!();
+    expect(fixture.byId("submit").disabled).toBe(false);
+    fixture.byId("note").value = "A moment to revisit";
+    fixture.byId("note").oninput!();
+    await fixture.byId("save").onsubmit!({ preventDefault() {} });
+    expect(fixture.captures).toHaveLength(1);
+    expect(fixture.captures[0]).toMatchObject({
+      youtubeDetails: {
+        kind: "moment",
+        timecodeMs: 193001,
+        note: "A moment to revisit",
+      },
+    });
+    const savedStatus =
+      "Moment saved in Editorial. The video is in the transcription queue.";
+    expect(fixture.byId("status").textContent).toBe(savedStatus);
+    expect(fixture.byId("retry").hidden).toBe(true);
+    expect(fixture.byId("fields").disabled).toBe(true);
+    expect(fixture.byId("reason").value).toBe("");
+    if (outcome === "rejects") {
+      failLookup(new Error("Lookup failed"));
+      await expect(lookup).rejects.toThrow("Lookup failed");
+    } else {
+      finishLookup();
+      await expect(lookup).resolves.toMatchObject({
+        reason: { text: "Compare this video." },
+      });
+    }
+    expect(fixture.byId("status").textContent).toBe(savedStatus);
+    expect(fixture.byId("retry").hidden).toBe(true);
+    expect(fixture.byId("reason").value).toBe("");
+    expect(fixture.byId("fields").disabled).toBe(true);
+    expect(fixture.captures).toHaveLength(1);
+  },
+);
+
+it("still reports a reason lookup failure before saving and allows an explicit reason edit", async () => {
+  let failLookup!: (error: Error) => void;
+  const delayReason = new Promise<void>((_resolve, reject) => {
+    failLookup = reject;
+  });
+  const fixture = await runConfirmation({ delayReason });
+  failLookup(new Error("Lookup failed"));
+  await vi.waitFor(() => expect(fixture.byId("retry").hidden).toBe(false));
+  expect(fixture.byId("status").textContent).toContain("Refresh projects");
+  fixture.byId("reason").value = "Explicit reason";
+  fixture.byId("reason").oninput!();
+  await fixture.byId("save").onsubmit!({ preventDefault() {} });
+  expect(fixture.captures[0]).toMatchObject({
+    youtubeDetails: { kind: "general", reason: "Explicit reason" },
+  });
+  expect(fixture.byId("status").textContent).toContain(
+    "Video saved in Editorial",
+  );
+  expect(fixture.byId("retry").hidden).toBe(true);
+});
+
+it("restores separate reason and moment drafts across mode switches", async () => {
+  const fixture = await runConfirmation({ sourceReason: null });
+  fixture.byId("reason").value = "General context";
+  fixture.byId("reason").oninput!();
+  fixture.byId("time").checked = true;
+  await fixture.byId("time").onchange!();
+  fixture.byId("note").value = "A point to revisit";
+  fixture.byId("note").oninput!();
+  fixture.byId("time").checked = false;
+  fixture.byId("time").onchange!();
+  expect(fixture.byId("reason").value).toBe("General context");
+  fixture.byId("time").checked = true;
+  await fixture.byId("time").onchange!();
+  expect(fixture.byId("note").value).toBe("A point to revisit");
+});
+
+it("keeps the request ID for an unchanged retry and refreshes it after intent changes", async () => {
+  const fixture = await runConfirmation({
+    sourceReason: null,
+    captureResponses: [
+      new Error("temporary outage"),
+      new Error("temporary outage"),
+      { batchId: "batch-id", status: "queued" },
+    ],
+  });
+  fixture.byId("project").value = "project";
+  await fixture.byId("save").onsubmit!({ preventDefault() {} });
+  await fixture.byId("save").onsubmit!({ preventDefault() {} });
+  const first = fixture.captures[0] as { requestId: string };
+  const second = fixture.captures[1] as { requestId: string };
+  expect(second.requestId).toBe(first.requestId);
+  fixture.byId("reason").value = "Changed intent";
+  fixture.byId("reason").oninput!();
+  await fixture.byId("save").onsubmit!({ preventDefault() {} });
+  expect((fixture.captures[2] as { requestId: string }).requestId).toBe(
+    "fresh-request-id",
+  );
+});

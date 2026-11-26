@@ -78,6 +78,35 @@ export class LocalCacheIntegrityError extends Error {
   readonly code = "local_cache_integrity_failed";
 }
 
+/** A catalog failure classified before any stale local-cache decision. */
+export class TranscriptCatalogError extends Error {
+  constructor(
+    readonly statusCode: 401 | 403 | 404 | 502,
+    readonly code:
+      | "authentication_required"
+      | "authorization_denied"
+      | "not_found"
+      | "transcript_catalog_unavailable",
+  ) {
+    super("The shared transcript catalog is unavailable.");
+  }
+
+  get permitsOfflineCache(): boolean {
+    return this.statusCode === 502;
+  }
+}
+
+export class OfflineTranscriptUnavailableError extends Error {
+  readonly statusCode = 503;
+  readonly code = "offline_transcript_not_authorized";
+
+  constructor() {
+    super(
+      "Reconnect to verify access before reviewing this cached transcript.",
+    );
+  }
+}
+
 export interface TranscriptArtifactDownloader {
   download(target: TranscriptDownloadTarget): Promise<Uint8Array>;
 }
@@ -100,10 +129,36 @@ export class ObjectStoreArtifactDownloader implements TranscriptArtifactDownload
 }
 
 export class HttpArtifactDownloader implements TranscriptArtifactDownloader {
+  constructor(
+    private readonly authenticatedRequest?: {
+      origin: string;
+      authorization: string;
+    },
+  ) {}
+
   async download(target: TranscriptDownloadTarget): Promise<Uint8Array> {
-    const response = await fetch(target.downloadUrl, {
+    const targetUrl = new URL(target.downloadUrl);
+    const isAuthenticatedTranscriptArtifact =
+      /^\/api\/projects\/[0-9a-f-]+\/videos\/[0-9a-f-]+\/transcripts\/[0-9a-f-]+\/artifacts\/[a-z-]+$/iu.test(
+        targetUrl.pathname,
+      );
+    const requestUrl =
+      this.authenticatedRequest && isAuthenticatedTranscriptArtifact
+        ? new URL(
+            `${targetUrl.pathname}${targetUrl.search}`,
+            this.authenticatedRequest.origin,
+          ).toString()
+        : target.downloadUrl;
+    const headers =
+      this.authenticatedRequest &&
+      new URL(requestUrl).origin ===
+        new URL(this.authenticatedRequest.origin).origin
+        ? { authorization: this.authenticatedRequest.authorization }
+        : undefined;
+    const response = await fetch(requestUrl, {
       method: "GET",
       redirect: "error",
+      ...(headers ? { headers } : {}),
     });
     if (!response.ok) {
       throw new LocalCacheIntegrityError(
@@ -115,14 +170,22 @@ export class HttpArtifactDownloader implements TranscriptArtifactDownloader {
 }
 
 export class VerifiedTranscriptCache {
+  private readonly authorizations: LocalTranscriptCacheAuthorizationRepository;
+
   constructor(
     private readonly database: DatabaseSync,
     private readonly downloader: TranscriptArtifactDownloader,
     private readonly rootDirectory: string,
     private readonly now: () => Date = () => new Date(),
-  ) {}
+  ) {
+    this.authorizations = new LocalTranscriptCacheAuthorizationRepository(
+      database,
+      now,
+    );
+  }
 
   findVerified(bundle: ActiveTranscriptBundle): string | undefined {
+    this.assertBundleBinding(bundle);
     const row = this.database
       .prepare(
         `SELECT cache_path, manifest_sha256
@@ -139,18 +202,7 @@ export class VerifiedTranscriptCache {
       return undefined;
 
     try {
-      const manifestBytes = readFileSync(join(row.cache_path, "manifest.json"));
-      const digest = createHash("sha256").update(manifestBytes).digest("hex");
-      const manifest = TranscriptManifestSchema.parse(
-        JSON.parse(manifestBytes.toString("utf8")),
-      );
-      if (
-        digest !== bundle.manifestObject.sha256 ||
-        manifest.id !== bundle.transcriptVersionId
-      ) {
-        throw new LocalCacheIntegrityError("Cached manifest identity changed.");
-      }
-      return row.cache_path;
+      return this.assertCachedBundle(row.cache_path, bundle);
     } catch {
       this.database
         .prepare(
@@ -168,6 +220,7 @@ export class VerifiedTranscriptCache {
 
   async download(bundle: ActiveTranscriptBundle): Promise<string> {
     const { manifest, manifestObject } = bundle;
+    this.assertBundleBinding(bundle);
     const targets = new Map(
       bundle.downloads.map((target) => [target.type, target]),
     );
@@ -191,9 +244,9 @@ export class VerifiedTranscriptCache {
       const parsedManifest = TranscriptManifestSchema.parse(
         JSON.parse(new TextDecoder().decode(manifestBytes)),
       );
-      if (parsedManifest.id !== bundle.transcriptVersionId) {
+      if (!isDeepStrictEqual(parsedManifest, manifest)) {
         throw new LocalCacheIntegrityError(
-          "Downloaded manifest does not identify the active transcript.",
+          "Downloaded manifest does not match the active transcript manifest.",
         );
       }
       writeFileSync(join(staging, "manifest.json"), manifestBytes);
@@ -217,6 +270,7 @@ export class VerifiedTranscriptCache {
 
       mkdirSync(parent, { recursive: true });
       if (existsSync(destination)) {
+        this.assertCachedBundle(destination, bundle);
         rmSync(staging, { recursive: true });
       } else {
         renameSync(staging, destination);
@@ -248,6 +302,165 @@ export class VerifiedTranscriptCache {
     }
   }
 
+  authorize(input: {
+    resolution: TranscriptResolution;
+    authorizationScopeSha256: string | undefined;
+  }): void {
+    if (!input.authorizationScopeSha256) return;
+    this.authorizations.authorize({
+      projectId: input.resolution.bundle.manifest.projectId,
+      catalogVideoId: input.resolution.bundle.manifest.catalogVideoId,
+      transcriptVersionId: input.resolution.bundle.transcriptVersionId,
+      authorizationScopeSha256: input.authorizationScopeSha256,
+    });
+  }
+
+  findOfflineAuthorized(input: {
+    projectId: string;
+    catalogVideoId: string;
+    authorizationScopeSha256: string;
+  }): CachedTranscriptBundleResolution {
+    const row = this.database
+      .prepare(
+        `SELECT cache.cache_path, cache.manifest_sha256,
+                cache.transcript_version_id
+         FROM verified_transcript_cache cache
+         JOIN verified_transcript_cache_authorizations authorization
+           ON authorization.project_id = cache.project_id
+          AND authorization.video_id = cache.video_id
+          AND authorization.transcript_version_id = cache.transcript_version_id
+         WHERE cache.project_id = ? AND cache.video_id = ?
+           AND cache.sync_state = 'verified'
+           AND authorization.authorization_scope_sha256 = ?
+         ORDER BY authorization.authorized_at DESC
+         LIMIT 1`,
+      )
+      .get(
+        input.projectId,
+        input.catalogVideoId,
+        input.authorizationScopeSha256,
+      ) as
+      | {
+          cache_path: string;
+          manifest_sha256: string;
+          transcript_version_id: string;
+        }
+      | undefined;
+    if (!row) throw new OfflineTranscriptUnavailableError();
+
+    try {
+      const cachePath = this.assertCacheDirectory(row.cache_path);
+      const manifestBytes = this.readContainedRegularFile(
+        cachePath,
+        "manifest.json",
+      );
+      if (sha256(manifestBytes) !== row.manifest_sha256) {
+        throw new LocalCacheIntegrityError("Cached manifest identity changed.");
+      }
+      const manifest = TranscriptManifestSchema.parse(
+        JSON.parse(manifestBytes.toString("utf8")),
+      );
+      if (
+        manifest.id !== row.transcript_version_id ||
+        manifest.projectId !== input.projectId ||
+        manifest.catalogVideoId !== input.catalogVideoId
+      ) {
+        throw new LocalCacheIntegrityError("Cached manifest identity changed.");
+      }
+      for (const type of requiredNormalizedArtifactTypes(manifest)) {
+        const descriptor = manifest.artifacts.find(
+          (artifact) => artifact.type === type,
+        );
+        if (!descriptor) {
+          throw new LocalCacheIntegrityError(
+            `Cached ${type} transcript is missing.`,
+          );
+        }
+        const filename = `${type}${extname(descriptor.objectKey) || ".bin"}`;
+        const bytes = this.readContainedRegularFile(cachePath, filename);
+        if (
+          bytes.byteLength !== descriptor.byteSize ||
+          sha256(bytes) !== descriptor.sha256
+        ) {
+          throw new LocalCacheIntegrityError(
+            `Cached ${type} transcript checksum does not match its manifest.`,
+          );
+        }
+      }
+      return {
+        bundle: { transcriptVersionId: manifest.id, manifest },
+        cachePath,
+      };
+    } catch (error) {
+      const integrityError =
+        error instanceof LocalCacheIntegrityError
+          ? error
+          : new LocalCacheIntegrityError(
+              "Cached transcript verification failed.",
+            );
+      this.database
+        .prepare(
+          `UPDATE verified_transcript_cache SET sync_state = 'failed'
+           WHERE project_id = ? AND video_id = ? AND transcript_version_id = ?`,
+        )
+        .run(input.projectId, input.catalogVideoId, row.transcript_version_id);
+      throw integrityError;
+    }
+  }
+
+  private assertCacheDirectory(value: string): string {
+    return assertContainedCacheDirectory(this.rootDirectory, value);
+  }
+
+  private readContainedRegularFile(
+    cachePath: string,
+    filename: string,
+  ): Buffer {
+    return readContainedRegularCacheFile(
+      this.rootDirectory,
+      cachePath,
+      filename,
+    );
+  }
+
+  private assertCachedBundle(
+    cacheDirectory: string,
+    bundle: ActiveTranscriptBundle,
+  ): string {
+    const cachePath = this.assertCacheDirectory(cacheDirectory);
+    const manifestBytes = this.readContainedRegularFile(
+      cachePath,
+      "manifest.json",
+    );
+    const manifest = TranscriptManifestSchema.parse(
+      JSON.parse(manifestBytes.toString("utf8")),
+    );
+    if (
+      sha256(manifestBytes) !== bundle.manifestObject.sha256 ||
+      !isDeepStrictEqual(manifest, bundle.manifest)
+    ) {
+      throw new LocalCacheIntegrityError(
+        "Cached manifest does not match the active transcript manifest.",
+      );
+    }
+    for (const artifact of manifest.artifacts) {
+      const extension = extname(artifact.objectKey) || ".bin";
+      const bytes = this.readContainedRegularFile(
+        cachePath,
+        `${artifact.type}${extension}`,
+      );
+      if (
+        bytes.byteLength !== artifact.byteSize ||
+        sha256(bytes) !== artifact.sha256
+      ) {
+        throw new LocalCacheIntegrityError(
+          `Cached ${artifact.type} artifact does not match its manifest.`,
+        );
+      }
+    }
+    return cachePath;
+  }
+
   private async verifiedBytes(
     descriptor: TranscriptDownloadTarget,
   ): Promise<Uint8Array> {
@@ -263,6 +476,54 @@ export class VerifiedTranscriptCache {
     }
     return bytes;
   }
+
+  private assertBundleBinding(bundle: ActiveTranscriptBundle): void {
+    const { manifest, manifestObject, downloads } = bundle;
+    if (bundle.transcriptVersionId !== manifest.id) {
+      throw new LocalCacheIntegrityError(
+        "Active transcript version does not match its manifest.",
+      );
+    }
+
+    const targets = new Map(
+      downloads.map((target) => [target.type, target] as const),
+    );
+    const artifacts = new Map(
+      manifest.artifacts.map((artifact) => [artifact.type, artifact] as const),
+    );
+    if (
+      targets.size !== downloads.length ||
+      artifacts.size !== manifest.artifacts.length ||
+      targets.size !== artifacts.size + 1
+    ) {
+      throw new LocalCacheIntegrityError(
+        "Active transcript download targets are not unique and complete.",
+      );
+    }
+
+    const manifestTarget = targets.get("manifest");
+    if (
+      !manifestTarget ||
+      !sameFinalizedObject(manifestTarget, manifestObject)
+    ) {
+      throw new LocalCacheIntegrityError(
+        "Manifest download target does not match the active manifest object.",
+      );
+    }
+
+    for (const artifact of manifest.artifacts) {
+      const target = targets.get(artifact.type);
+      if (
+        !artifact.objectVersionId ||
+        !target ||
+        !sameFinalizedObject(target, artifact)
+      ) {
+        throw new LocalCacheIntegrityError(
+          `Download target does not match the manifest descriptor for ${artifact.type}.`,
+        );
+      }
+    }
+  }
 }
 
 export interface ActiveTranscriptCatalogClient {
@@ -273,10 +534,28 @@ export interface ActiveTranscriptCatalogClient {
 }
 
 export type TranscriptResolution = {
-  bundle: ActiveTranscriptBundle;
+  bundle: ResolvedTranscriptBundle;
   cachePath: string;
   source: "verified-local-cache" | "shared-store";
+  catalogState: "active_verified" | "offline_cached";
+  authorizationScopeSha256?: string;
 };
+
+/**
+ * Offline-cached resolutions only carry the verified manifest identity.
+ * Active catalog resolutions additionally carry the pinned manifest object and
+ * download targets, which export-time artifact verification requires.
+ */
+export type ResolvedTranscriptBundle = Pick<
+  ActiveTranscriptBundle,
+  "transcriptVersionId" | "manifest"
+> &
+  Partial<Pick<ActiveTranscriptBundle, "manifestObject" | "downloads">>;
+
+type CachedTranscriptBundleResolution = Pick<
+  TranscriptResolution,
+  "bundle" | "cachePath"
+>;
 
 export class SharedFirstTranscriptResolver {
   constructor(
@@ -287,81 +566,253 @@ export class SharedFirstTranscriptResolver {
   async resolve(
     projectId: string,
     catalogVideoId: string,
+    offlineReviewCapability?: string,
   ): Promise<TranscriptResolution> {
-    const bundle = await this.catalog.getActiveTranscript(
-      projectId,
-      catalogVideoId,
-    );
-    const existing = this.cache.findVerified(bundle);
-    if (existing) {
-      return { bundle, cachePath: existing, source: "verified-local-cache" };
+    const authorizationScopeSha256 = offlineReviewCapability
+      ? sha256(Buffer.from(offlineReviewCapability, "utf8"))
+      : undefined;
+    try {
+      const bundle = await this.catalog.getActiveTranscript(
+        projectId,
+        catalogVideoId,
+      );
+      const existing = this.cache.findVerified(bundle);
+      if (existing) {
+        return {
+          bundle,
+          cachePath: existing,
+          source: "verified-local-cache",
+          catalogState: "active_verified",
+          ...(authorizationScopeSha256 ? { authorizationScopeSha256 } : {}),
+        };
+      }
+      return {
+        bundle,
+        cachePath: await this.cache.download(bundle),
+        source: "shared-store",
+        catalogState: "active_verified",
+        ...(authorizationScopeSha256 ? { authorizationScopeSha256 } : {}),
+      };
+    } catch (error) {
+      if (
+        !(error instanceof TranscriptCatalogError) ||
+        !error.permitsOfflineCache ||
+        !authorizationScopeSha256
+      ) {
+        throw error;
+      }
+      const cached = this.cache.findOfflineAuthorized({
+        projectId,
+        catalogVideoId,
+        authorizationScopeSha256,
+      });
+      return {
+        ...cached,
+        source: "verified-local-cache",
+        catalogState: "offline_cached",
+        authorizationScopeSha256,
+      };
     }
-    return {
-      bundle,
-      cachePath: await this.cache.download(bundle),
-      source: "shared-store",
-    };
+  }
+
+  authorize(resolution: TranscriptResolution): void {
+    this.cache.authorize({
+      resolution,
+      authorizationScopeSha256: resolution.authorizationScopeSha256,
+    });
+  }
+}
+
+export interface DerivedTranslationCatalogClient {
+  getDerivedTranslation(
+    identity: DerivedTranslationIdentity,
+  ): Promise<DerivedTranslation | undefined>;
+}
+
+export type DerivedTranslationResolution = {
+  transcript: NormalizedTranscript;
+  source: "verified-local-cache" | "shared-store";
+};
+
+export class SharedDerivedTranslationResolver {
+  constructor(
+    private readonly catalog: DerivedTranslationCatalogClient,
+    private readonly index: LocalTranscriptIndex,
+  ) {}
+
+  async resolve(
+    identity: DerivedTranslationIdentity,
+  ): Promise<DerivedTranslationResolution | undefined> {
+    const local = this.index.findDerivedTranslation(identity);
+    if (local) {
+      return {
+        source: "verified-local-cache",
+        transcript: local,
+      };
+    }
+    const shared = await this.catalog.getDerivedTranslation(identity);
+    if (!shared) return undefined;
+    const translation = DerivedTranslationSchema.parse(shared);
+    const normalizedArtifact = translation.manifest.artifacts.find(
+      (artifact) => artifact.type === "translated-normalized",
+    );
+    const normalizedEncoded = JSON.stringify(translation.transcript);
+    if (
+      !normalizedArtifact ||
+      createHash("sha256").update(normalizedEncoded).digest("hex") !==
+        normalizedArtifact.sha256 ||
+      translation.manifest.identity.baseTranscriptVersionId !==
+        identity.baseTranscriptVersionId ||
+      translation.manifest.identity.originalTrackId !== identity.originalTrackId
+    ) {
+      throw new LocalCacheIntegrityError(
+        "Shared derived translation failed identity or checksum verification.",
+      );
+    }
+    const manifestSha256 = createHash("sha256")
+      .update(JSON.stringify(translation.manifest))
+      .digest("hex");
+    this.index.promoteDerivedTranslation({
+      identity,
+      translationVersionId: translation.manifest.id,
+      manifestSha256,
+      normalizedSha256: normalizedArtifact.sha256,
+      transcript: translation.transcript,
+    });
+    return { source: "shared-store", transcript: translation.transcript };
   }
 }
 
 export class CachedTranscriptDocumentReader {
-  constructor(private readonly index: LocalTranscriptIndex) {}
+  constructor(
+    private readonly index: LocalTranscriptIndex,
+    private readonly cacheRootDirectory?: string,
+  ) {}
 
-  read(resolution: TranscriptResolution): NormalizedTranscript {
-    const expectedArtifact = resolution.bundle.manifest.artifacts.find(
-      (item) => item.type === "english-normalized",
+  read(resolution: TranscriptResolution): CachedBaseTranscriptTracks {
+    const { manifest } = resolution.bundle;
+    const english = this.readNormalizedArtifact(
+      resolution,
+      "english-normalized",
     );
-    if (!expectedArtifact) {
-      throw new LocalCacheIntegrityError(
-        "Verified bundle has no pinned English transcript artifact.",
-      );
-    }
-    const artifact = readdirSync(resolution.cachePath).find((filename) =>
-      filename.startsWith("english-normalized."),
-    );
-    if (!artifact) {
+    if (!english) {
       throw new LocalCacheIntegrityError(
         "Verified bundle does not contain an English normalized transcript.",
       );
     }
-    const artifactPath = join(resolution.cachePath, artifact);
-    const stored = readRegularCacheFile(artifactPath);
-    if (
-      stored.byteLength !== expectedArtifact.byteSize ||
-      digestBytes(stored) !== expectedArtifact.sha256
-    ) {
+    this.assertTrack({
+      transcript: english,
+      resolution,
+      kind: "english",
+      language: "en",
+    });
+
+    const original = isEnglish(manifest.sourceLanguage)
+      ? english
+      : this.readNormalizedArtifact(resolution, "original-normalized");
+    if (!original) {
       throw new LocalCacheIntegrityError(
-        "Cached English transcript bytes no longer match the published version.",
+        "A foreign-language bundle does not contain an original normalized transcript.",
       );
     }
-    const bytes = artifact.endsWith(".gz") ? gunzipSync(stored) : stored;
-    let transcript: NormalizedTranscript;
+    if (!isEnglish(manifest.sourceLanguage)) {
+      this.assertTrack({
+        transcript: original,
+        resolution,
+        kind: "original",
+        language: manifest.sourceLanguage,
+      });
+      if (
+        english.track.sourceTrackId !== original.track.id ||
+        english.track.timingPrecision !== original.track.timingPrecision
+      ) {
+        throw new LocalCacheIntegrityError(
+          "Cached English transcript is not time-linked to the exact original track.",
+        );
+      }
+    }
+
+    this.indexTrack(resolution, english);
+    if (original !== english) this.indexTrack(resolution, original);
+    return { original, english };
+  }
+
+  private readNormalizedArtifact(
+    resolution: TranscriptResolution,
+    type: "original-normalized" | "english-normalized",
+  ): NormalizedTranscript | undefined {
+    const descriptor = resolution.bundle.manifest.artifacts.find(
+      (artifact) => artifact.type === type,
+    );
+    if (!descriptor) return undefined;
+    const extension = extname(descriptor.objectKey) || ".bin";
+    let stored: Buffer;
     try {
-      transcript = NormalizedTranscriptSchema.parse(
+      stored = this.cacheRootDirectory
+        ? readContainedRegularCacheFile(
+            this.cacheRootDirectory,
+            resolution.cachePath,
+            `${type}${extension}`,
+          )
+        : readRegularCacheFile(
+            join(resolution.cachePath, `${type}${extension}`),
+          );
+    } catch {
+      throw new LocalCacheIntegrityError(
+        `Cached ${type} transcript is missing.`,
+      );
+    }
+    if (
+      stored.byteLength !== descriptor.byteSize ||
+      createHash("sha256").update(stored).digest("hex") !== descriptor.sha256
+    ) {
+      throw new LocalCacheIntegrityError(
+        `Cached ${type} transcript checksum does not match its manifest.`,
+      );
+    }
+    try {
+      const bytes = extension === ".gz" ? gunzipSync(stored) : stored;
+      return NormalizedTranscriptSchema.parse(
         JSON.parse(bytes.toString("utf8")),
       );
     } catch {
       throw new LocalCacheIntegrityError(
-        "Cached English transcript does not match the normalized schema.",
+        `Cached ${type} transcript does not match the normalized schema.`,
       );
     }
+  }
+
+  private assertTrack(input: {
+    transcript: NormalizedTranscript;
+    resolution: TranscriptResolution;
+    kind: "original" | "english";
+    language: string;
+  }): void {
+    const { transcript, resolution, kind, language } = input;
+    const manifest = resolution.bundle.manifest;
     if (
-      transcript.track.videoId !== resolution.bundle.manifest.videoId ||
-      transcript.track.kind !== "english" ||
-      transcript.track.timingPrecision !==
-        resolution.bundle.manifest.timingPrecision
+      transcript.track.videoId !== manifest.videoId ||
+      transcript.track.kind !== kind ||
+      !sameLanguage(transcript.track.language, language) ||
+      transcript.track.timingPrecision !== manifest.timingPrecision ||
+      transcript.track.schemaVersion !== manifest.normalizationSchemaVersion
     ) {
       throw new LocalCacheIntegrityError(
-        "Cached English transcript identity does not match its manifest.",
+        `Cached ${kind} transcript identity does not match its manifest.`,
       );
     }
+  }
+
+  private indexTrack(
+    resolution: TranscriptResolution,
+    transcript: NormalizedTranscript,
+  ): void {
     this.index.replace({
       projectId: resolution.bundle.manifest.projectId,
       catalogVideoId: resolution.bundle.manifest.catalogVideoId,
       transcriptVersionId: resolution.bundle.transcriptVersionId,
       transcript,
     });
-    return transcript;
   }
 }
 
@@ -390,6 +841,11 @@ export function readVerifiedLoggedClipTracks(input: {
   if (!lstatSync(resolution.cachePath).isDirectory()) {
     throw new LocalCacheIntegrityError(
       "Verified transcript cache directory is unsafe.",
+    );
+  }
+  if (!bundle.manifestObject || !bundle.downloads) {
+    throw new LocalCacheIntegrityError(
+      "Export requires an active verified transcript bundle with pinned artifacts.",
     );
   }
   const manifestBytes = readRegularCacheFile(
@@ -507,7 +963,7 @@ function readTrackFromVerifiedBundle(
   type: "english-normalized" | "original-normalized",
 ): NormalizedTranscript {
   const artifacts = manifest.artifacts.filter((item) => item.type === type);
-  const targets = resolution.bundle.downloads.filter(
+  const targets = (resolution.bundle.downloads ?? []).filter(
     (item) => item.type === type,
   );
   const artifact = artifacts[0];
@@ -597,23 +1053,265 @@ function digestBytes(bytes: Uint8Array): string {
   return createHash("sha256").update(bytes).digest("hex");
 }
 
+function requiredNormalizedArtifactTypes(manifest: {
+  sourceLanguage: string;
+}): Array<"original-normalized" | "english-normalized"> {
+  return isEnglish(manifest.sourceLanguage)
+    ? ["english-normalized"]
+    : ["original-normalized", "english-normalized"];
+}
+
+function sha256(bytes: Uint8Array): string {
+  return createHash("sha256").update(bytes).digest("hex");
+}
+
+function sameFinalizedObject(
+  left: FinalizedObjectIdentity,
+  right: FinalizedObjectIdentity,
+): boolean {
+  return (
+    left.type === right.type &&
+    left.objectKey === right.objectKey &&
+    left.objectVersionId === right.objectVersionId &&
+    left.byteSize === right.byteSize &&
+    left.sha256 === right.sha256
+  );
+}
+
+type FinalizedObjectIdentity = {
+  type: TranscriptDownloadTarget["type"];
+  objectKey: string;
+  objectVersionId?: string | undefined;
+  byteSize: number;
+  sha256: string;
+};
+
+function isContainedPath(root: string, candidate: string): boolean {
+  const relativePath = relative(resolve(root), resolve(candidate));
+  return (
+    relativePath === "" ||
+    (!relativePath.startsWith("..") && !isAbsolute(relativePath))
+  );
+}
+
+function assertContainedCacheDirectory(
+  rootDirectory: string,
+  value: string,
+): string {
+  const root = realpathSync(rootDirectory);
+  const candidate = resolve(value);
+  const real = realpathSync(candidate);
+  if (!isContainedPath(root, real)) {
+    throw new LocalCacheIntegrityError("Cached transcript path is invalid.");
+  }
+  const stat = lstatSync(candidate);
+  if (!stat.isDirectory() || stat.isSymbolicLink()) {
+    throw new LocalCacheIntegrityError("Cached transcript path is invalid.");
+  }
+  return real;
+}
+
+function readContainedRegularCacheFile(
+  rootDirectory: string,
+  cachePath: string,
+  filename: string,
+): Buffer {
+  const directory = assertContainedCacheDirectory(rootDirectory, cachePath);
+  const target = join(directory, filename);
+  const root = realpathSync(rootDirectory);
+  const real = realpathSync(target);
+  if (!isContainedPath(root, real)) {
+    throw new LocalCacheIntegrityError("Cached transcript path is invalid.");
+  }
+  const descriptor = openSync(
+    real,
+    fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0),
+  );
+  try {
+    const stat = fstatSync(descriptor);
+    if (!stat.isFile()) {
+      throw new LocalCacheIntegrityError("Cached transcript file is invalid.");
+    }
+    return readFileSync(descriptor);
+  } finally {
+    closeSync(descriptor);
+  }
+}
+
+export type CachedBaseTranscriptTracks = {
+  original: NormalizedTranscript;
+  english: NormalizedTranscript;
+};
+
+export type PreferredTranscriptResolverInput = {
+  projectId: string;
+  catalogVideoId: string;
+  transcriptVersionId: string;
+  preferredLanguage: string;
+  original: NormalizedTranscript;
+  english: NormalizedTranscript;
+};
+
+/** Extension points for local-cache, shared-store, and generated preferred tracks. */
+export interface PreferredTranscriptResolver {
+  findLocal?(
+    input: PreferredTranscriptResolverInput,
+  ): Promise<NormalizedTranscript | undefined>;
+  findShared?(
+    input: PreferredTranscriptResolverInput,
+  ): Promise<NormalizedTranscript | undefined>;
+  requestTranslation?(
+    input: PreferredTranscriptResolverInput,
+  ): Promise<NormalizedTranscript | undefined>;
+}
+
+/**
+ * Internal compatibility projection. Its `workspace` member is the only
+ * renderer-safe contract; cache and download metadata remain local-only until
+ * the existing route moves to `resolveWorkspace`.
+ */
 export type WorkspaceTranscriptResolution = TranscriptResolution & {
   transcript: NormalizedTranscript;
+  workspace: TranscriptWorkspaceResponse;
 };
 
 export class SharedTranscriptWorkspaceService {
   constructor(
     private readonly resolver: SharedFirstTranscriptResolver,
     private readonly reader: CachedTranscriptDocumentReader,
+    private readonly preferredResolver?: PreferredTranscriptResolver,
   ) {}
 
   async resolve(
     projectId: string,
     catalogVideoId: string,
+    preferredLanguage = "en",
+    offlineReviewCapability?: string,
   ): Promise<WorkspaceTranscriptResolution> {
-    const resolution = await this.resolver.resolve(projectId, catalogVideoId);
-    return { ...resolution, transcript: this.reader.read(resolution) };
+    return this.resolveInternal(
+      projectId,
+      catalogVideoId,
+      preferredLanguage,
+      offlineReviewCapability,
+    );
   }
+
+  async resolveWorkspace(
+    projectId: string,
+    catalogVideoId: string,
+    preferredLanguage = "en",
+    offlineReviewCapability?: string,
+  ): Promise<TranscriptWorkspaceResponse> {
+    return (
+      await this.resolveInternal(
+        projectId,
+        catalogVideoId,
+        preferredLanguage,
+        offlineReviewCapability,
+      )
+    ).workspace;
+  }
+
+  private async resolveInternal(
+    projectId: string,
+    catalogVideoId: string,
+    preferredLanguage: string,
+    offlineReviewCapability?: string,
+  ): Promise<WorkspaceTranscriptResolution> {
+    const language = LanguageTagSchema.parse(preferredLanguage);
+    const resolution = await this.resolver.resolve(
+      projectId,
+      catalogVideoId,
+      offlineReviewCapability,
+    );
+    const tracks = this.reader.read(resolution);
+    this.resolver.authorize(resolution);
+    const preferredInput: PreferredTranscriptResolverInput & {
+      offlineCached: boolean;
+    } = {
+      projectId,
+      catalogVideoId,
+      transcriptVersionId: resolution.bundle.transcriptVersionId,
+      preferredLanguage: language,
+      original: tracks.original,
+      english: tracks.english,
+      offlineCached: resolution.catalogState === "offline_cached",
+    };
+    const preferred = await this.resolvePreferred(preferredInput);
+    const workspace = TranscriptWorkspaceResponseSchema.parse({
+      schemaVersion: 1,
+      projectId,
+      catalogVideoId,
+      youtubeVideoId: resolution.bundle.manifest.videoId,
+      sourceIdentity: {
+        schemaVersion: 1,
+        provider: "youtube",
+        providerMediaId: resolution.bundle.manifest.videoId,
+        canonicalUrl: `https://www.youtube.com/watch?v=${resolution.bundle.manifest.videoId}`,
+      },
+      transcriptVersionId: resolution.bundle.transcriptVersionId,
+      source: resolution.source,
+      catalogState: resolution.catalogState,
+      original: tracks.original,
+      english: tracks.english,
+      preferred,
+    });
+    return { ...resolution, transcript: workspace.english, workspace };
+  }
+
+  private async resolvePreferred(
+    input: PreferredTranscriptResolverInput & {
+      offlineCached: boolean;
+    },
+  ): Promise<PreferredTranscriptResolution> {
+    const local = this.preferredResolver?.findLocal;
+    const shared = this.preferredResolver?.findShared;
+    const requested = this.preferredResolver?.requestTranslation;
+    return resolvePreferredTranscript({
+      preferredLanguage: input.preferredLanguage,
+      original: input.original,
+      english: input.english,
+      ...(local
+        ? {
+            findLocal: (targetLanguage: string) =>
+              local({
+                ...input,
+                preferredLanguage: targetLanguage,
+              }),
+          }
+        : {}),
+      ...(shared && !input.offlineCached
+        ? {
+            findShared: (targetLanguage: string) =>
+              shared({
+                ...input,
+                preferredLanguage: targetLanguage,
+              }),
+          }
+        : {}),
+      ...(requested && !input.offlineCached
+        ? {
+            requestTranslation: (targetLanguage: string) =>
+              requested({
+                ...input,
+                preferredLanguage: targetLanguage,
+              }),
+          }
+        : {}),
+    });
+  }
+}
+
+function isEnglish(language: string): boolean {
+  return sameLanguage(language, "en");
+}
+
+function sameLanguage(left: string, right: string): boolean {
+  return (
+    left.toLocaleLowerCase() === right.toLocaleLowerCase() ||
+    left.split("-", 1)[0]!.toLocaleLowerCase() ===
+      right.split("-", 1)[0]!.toLocaleLowerCase()
+  );
 }
 
 export class HttpActiveTranscriptCatalogClient implements ActiveTranscriptCatalogClient {
@@ -627,17 +1325,28 @@ export class HttpActiveTranscriptCatalogClient implements ActiveTranscriptCatalo
     projectId: string,
     catalogVideoId: string,
   ): Promise<ActiveTranscriptBundle> {
-    const response = await this.fetcher(
-      `${this.baseUrl}/api/projects/${encodeURIComponent(projectId)}/videos/${encodeURIComponent(catalogVideoId)}/transcripts/active`,
-      {
-        headers: {
-          accept: "application/json",
-          authorization: this.authorization,
+    let response: Response;
+    try {
+      response = await this.fetcher(
+        `${this.baseUrl}/api/projects/${encodeURIComponent(projectId)}/videos/${encodeURIComponent(catalogVideoId)}/transcripts/active`,
+        {
+          headers: {
+            accept: "application/json",
+            authorization: this.authorization,
+          },
         },
-      },
-    );
+      );
+    } catch {
+      throw new TranscriptCatalogError(502, "transcript_catalog_unavailable");
+    }
     if (!response.ok) {
-      throw new SharedCatalogHttpError(response.status);
+      if (response.status === 401)
+        throw new TranscriptCatalogError(401, "authentication_required");
+      if (response.status === 403)
+        throw new TranscriptCatalogError(403, "authorization_denied");
+      if (response.status === 404)
+        throw new TranscriptCatalogError(404, "not_found");
+      throw new TranscriptCatalogError(502, "transcript_catalog_unavailable");
     }
     return ActiveTranscriptBundleSchema.parse(await response.json());
   }
@@ -672,6 +1381,8 @@ export interface OutboxCommand {
   attempt: number;
   nextAttemptAt?: string;
   createdAt: string;
+  lastErrorCode?: string;
+  conflict?: unknown;
 }
 
 export class OfflineOutbox {
@@ -709,26 +1420,100 @@ export class OfflineOutbox {
     return existing.id;
   }
 
+  enqueueClipCandidate(
+    projectId: string,
+    input: CreateClipCandidateRequest,
+  ): string {
+    const command = CreateClipCandidateRequestSchema.parse(input);
+    return this.enqueue({
+      projectId,
+      commandType: "clip_candidate.create.v2",
+      idempotencyKey: command.idempotencyKey,
+      payload: command,
+    });
+  }
+
+  enqueueClipCommentCreate(
+    projectId: string,
+    clipId: string,
+    input: CreateClipCommentRequest,
+  ): string {
+    const command = CreateClipCommentRequestSchema.parse(input);
+    return this.enqueue({
+      projectId,
+      commandType: "clip_comment.create.v1",
+      idempotencyKey: command.idempotencyKey,
+      payload: { clipId, command },
+    });
+  }
+
+  enqueueClipCommentUpdate(
+    projectId: string,
+    clipId: string,
+    commentId: string,
+    input: UpdateClipCommentRequest,
+  ): string {
+    const command = UpdateClipCommentRequestSchema.parse(input);
+    return this.enqueue({
+      projectId,
+      commandType: "clip_comment.update.v1",
+      idempotencyKey: command.idempotencyKey,
+      payload: { clipId, commentId, command },
+    });
+  }
+
+  enqueueClipCommentDelete(
+    projectId: string,
+    clipId: string,
+    commentId: string,
+    input: DeleteClipCommentRequest,
+  ): string {
+    const command = DeleteClipCommentRequestSchema.parse(input);
+    return this.enqueue({
+      projectId,
+      commandType: "clip_comment.delete.v1",
+      idempotencyKey: command.idempotencyKey,
+      payload: { clipId, commentId, command },
+    });
+  }
+
   due(limit = 50): OutboxCommand[] {
     const rows = this.database
       .prepare(
         `SELECT * FROM sync_outbox
-         WHERE next_attempt_at IS NULL OR next_attempt_at <= ?
-         ORDER BY created_at LIMIT ?`,
+         WHERE conflict_json IS NULL
+           AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+         ORDER BY created_at, rowid LIMIT ?`,
       )
       .all(this.now().toISOString(), limit) as Record<string, unknown>[];
-    return rows.map((row) => ({
-      id: String(row.id),
-      ...(row.project_id === null ? {} : { projectId: String(row.project_id) }),
-      commandType: String(row.command_type),
-      idempotencyKey: String(row.idempotency_key),
-      payload: JSON.parse(String(row.payload_json)),
-      attempt: Number(row.attempt),
-      ...(row.next_attempt_at === null
-        ? {}
-        : { nextAttemptAt: String(row.next_attempt_at) }),
-      createdAt: String(row.created_at),
-    }));
+    return rows.map(mapOutboxCommand);
+  }
+
+  list(projectId?: string, limit = 100): OutboxCommand[] {
+    const rows = (
+      projectId
+        ? this.database
+            .prepare(
+              `SELECT * FROM sync_outbox
+             WHERE project_id = ?
+             ORDER BY created_at, rowid LIMIT ?`,
+            )
+            .all(projectId, limit)
+        : this.database
+            .prepare(
+              `SELECT * FROM sync_outbox
+             ORDER BY created_at, rowid LIMIT ?`,
+            )
+            .all(limit)
+    ) as Record<string, unknown>[];
+    return rows.map(mapOutboxCommand);
+  }
+
+  get(id: string): OutboxCommand | undefined {
+    const row = this.database
+      .prepare("SELECT * FROM sync_outbox WHERE id = ?")
+      .get(id) as Record<string, unknown> | undefined;
+    return row ? mapOutboxCommand(row) : undefined;
   }
 
   acknowledge(id: string): void {
@@ -751,34 +1536,88 @@ export class OfflineOutbox {
       )
       .run(attempt, nextAttemptAt, id);
   }
+
+  recordConflict(id: string, code: string, evidence: unknown): void {
+    this.database
+      .prepare(
+        `UPDATE sync_outbox
+         SET conflict_json = ?, last_error_code = ?, next_attempt_at = NULL
+         WHERE id = ?`,
+      )
+      .run(JSON.stringify(evidence), code, id);
+  }
+}
+
+function mapOutboxCommand(row: Record<string, unknown>): OutboxCommand {
+  return {
+    id: String(row.id),
+    ...(row.project_id === null ? {} : { projectId: String(row.project_id) }),
+    commandType: String(row.command_type),
+    idempotencyKey: String(row.idempotency_key),
+    payload: JSON.parse(String(row.payload_json)),
+    attempt: Number(row.attempt),
+    ...(row.next_attempt_at === null
+      ? {}
+      : { nextAttemptAt: String(row.next_attempt_at) }),
+    createdAt: String(row.created_at),
+    ...(row.last_error_code === null
+      ? {}
+      : { lastErrorCode: String(row.last_error_code) }),
+    ...(row.conflict_json === null
+      ? {}
+      : { conflict: JSON.parse(String(row.conflict_json)) }),
+  };
 }
 import { createHash, randomUUID } from "node:crypto";
-import { isDeepStrictEqual } from "node:util";
 import {
+  closeSync,
+  constants as fsConstants,
   existsSync,
+  fstatSync,
   lstatSync,
   mkdirSync,
+  openSync,
   readFileSync,
-  readdirSync,
+  realpathSync,
   renameSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { extname, join } from "node:path";
+import { extname, isAbsolute, join, relative, resolve } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
+import { isDeepStrictEqual } from "node:util";
 import { gunzipSync } from "node:zlib";
 
 import {
   ActiveTranscriptBundleSchema,
   ClipCandidateSchema,
   ExportSourceLanguageClassSchema,
+  CreateClipCandidateRequestSchema,
+  CreateClipCommentRequestSchema,
+  UpdateClipCommentRequestSchema,
+  DeleteClipCommentRequestSchema,
+  DerivedTranslationSchema,
+  LanguageTagSchema,
   NormalizedTranscriptSchema,
+  TranscriptWorkspaceResponseSchema,
   TranscriptManifestSchema,
   type ActiveTranscriptBundle,
   type ClipCandidate,
+  type CreateClipCandidateRequest,
+  type CreateClipCommentRequest,
+  type UpdateClipCommentRequest,
+  type DeleteClipCommentRequest,
+  type DerivedTranslation,
+  type DerivedTranslationIdentity,
   type NormalizedTranscript,
+  type PreferredTranscriptResolution,
   type TranscriptDownloadTarget,
   type TranscriptManifest,
+  type TranscriptWorkspaceResponse,
 } from "@research-video/contracts";
-import { LocalTranscriptIndex } from "@research-video/db-local";
+import {
+  LocalTranscriptCacheAuthorizationRepository,
+  LocalTranscriptIndex,
+} from "@research-video/db-local";
 import type { TranscriptObjectStore } from "@research-video/storage";
+import { resolvePreferredTranscript } from "@research-video/transcript";
