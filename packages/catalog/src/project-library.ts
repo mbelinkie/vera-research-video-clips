@@ -10,6 +10,7 @@ import {
   type ProjectRole,
   type CreateSourceRequest,
   type CreateItemRequest,
+  type CreateSourceDiscussionComment,
   type UpdateSourceRequest,
   type UpdateItemRequest,
   type CreateTranscriptClipItemRequest,
@@ -294,6 +295,129 @@ export class ProjectLibrary {
     await this.authorizeRead(actor, projectId);
     return listLibrarySources(this.db, projectId, input);
   }
+  async sourceDiscussionCounts(
+    actor: Actor,
+    projectId: string,
+    sourceIds: string[],
+  ) {
+    await this.authorizeRead(actor, projectId);
+    const { rows } = await this.db.query<{
+      source_id: string;
+      total: number;
+      unread: number;
+    }>(
+      `SELECT c.source_id, count(*)::integer AS total,
+          count(*) FILTER (WHERE c.author_id <> $3 AND r.reader_id IS NULL)::integer AS unread
+       FROM source_discussion_comments c
+       LEFT JOIN source_discussion_reads r
+         ON (r.project_id,r.source_id,r.comment_id,r.reader_id)=(c.project_id,c.source_id,c.id,$3)
+       WHERE c.project_id=$1 AND c.source_id=ANY($2::uuid[])
+       GROUP BY c.source_id`,
+      [projectId, sourceIds, actor.userId],
+    );
+    return Object.fromEntries(
+      rows.map(({ source_id, total, unread }) => [
+        source_id,
+        { total, unread },
+      ]),
+    );
+  }
+
+  async sourceDiscussion(
+    actor: Actor,
+    projectId: string,
+    sourceId: string,
+    offset: number,
+  ) {
+    await this.getSource(actor, projectId, sourceId);
+    const result = await this.db.query<{
+      id: string;
+      author_name: string;
+      body: string;
+      created_at: Date | string;
+      unread: boolean;
+    }>(
+      `SELECT c.id, u.display_name AS author_name, c.body, c.created_at,
+          (c.author_id <> $3 AND r.reader_id IS NULL) AS unread
+       FROM source_discussion_comments c
+       JOIN users u ON u.id=c.author_id
+       LEFT JOIN source_discussion_reads r
+         ON (r.project_id,r.source_id,r.comment_id,r.reader_id)=(c.project_id,c.source_id,c.id,$3)
+       WHERE c.project_id=$1 AND c.source_id=$2
+       ORDER BY c.created_at, c.id LIMIT 51 OFFSET $4`,
+      [projectId, sourceId, actor.userId, offset],
+    );
+    const member = await this.db.query<{ role: ProjectRole }>(
+      "SELECT role FROM project_members WHERE project_id=$1 AND user_id=$2",
+      [projectId, actor.userId],
+    );
+    return {
+      comments: result.rows.slice(0, 50).map((row) => ({
+        id: row.id,
+        authorName: row.author_name || "Project member",
+        body: row.body,
+        createdAt: new Date(row.created_at).toISOString(),
+        unread: row.unread,
+      })),
+      more: result.rows.length > 50,
+      canReply: Boolean(member.rows[0] && member.rows[0].role !== "viewer"),
+    };
+  }
+
+  async addSourceDiscussionComment(
+    actor: Actor,
+    projectId: string,
+    sourceId: string,
+    input: CreateSourceDiscussionComment,
+  ) {
+    return this.write(actor, projectId, async (tx) => {
+      const source = await readLibrarySource(tx, projectId, sourceId);
+      if (source.kind !== "youtube" && source.kind !== "web_page")
+        throw new CatalogConflictError(
+          "This source kind does not support discussion.",
+        );
+      await tx.query(
+        `INSERT INTO source_discussion_comments(project_id, source_id, id, author_id, body, created_at)
+         VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING`,
+        [
+          projectId,
+          sourceId,
+          input.id,
+          actor.userId,
+          input.body,
+          this.now().toISOString(),
+        ],
+      );
+      const { rows } = await tx.query<{ id: string }>(
+        `SELECT id FROM source_discussion_comments
+         WHERE (project_id,source_id,id,author_id,body)=($1,$2,$3,$4,$5)`,
+        [projectId, sourceId, input.id, actor.userId, input.body],
+      );
+      if (!rows[0])
+        throw new CatalogConflictError(
+          "This comment identity has already been used.",
+        );
+      return rows[0];
+    });
+  }
+
+  async readSourceDiscussionComments(
+    actor: Actor,
+    projectId: string,
+    sourceId: string,
+    commentIds: string[],
+  ) {
+    await this.getSource(actor, projectId, sourceId);
+    await this.db.query(
+      `INSERT INTO source_discussion_reads(project_id,source_id,comment_id,reader_id)
+       SELECT project_id, source_id, id, $3 FROM source_discussion_comments
+       WHERE project_id=$1 AND source_id=$2 AND id=ANY($4::uuid[]) AND author_id<>$3
+       ON CONFLICT DO NOTHING`,
+      [projectId, sourceId, actor.userId, commentIds],
+    );
+    return this.sourceDiscussionCounts(actor, projectId, [sourceId]);
+  }
+
   async getItem(actor: Actor, projectId: string, id: string) {
     await this.authorizeRead(actor, projectId);
     return (await readLibraryItemRow(this.db, projectId, id)).item;
