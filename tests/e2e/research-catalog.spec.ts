@@ -412,6 +412,23 @@ test("shows the same read counts on sources and workspaces and retains the artic
     "An unsent reply",
   );
   await dialog.getByRole("button", { name: "Close comments" }).click();
+  await page.getByRole("button", { name: "Text", exact: true }).click();
+  await page.getByRole("button", { name: "Details & citation" }).click();
+  await expect(page.getByRole("button", { name: /^Comments/ })).toHaveCount(0);
+  await page.getByRole("button", { name: "Text", exact: true }).click();
+  const readControl = page.getByRole("button", {
+    name: "Comments · 2",
+    exact: true,
+  });
+  await readControl.click();
+  await expect(dialog.getByRole("textbox", { name: "Reply" })).toHaveValue(
+    "An unsent reply",
+  );
+  await expect(
+    dialog.getByRole("button", { name: "Post reply" }),
+  ).toBeEnabled();
+  await dialog.getByRole("button", { name: "Close comments" }).click();
+  await expect(readControl).toBeFocused();
   await page.getByRole("button", { name: "Back to Sources" }).click();
   await expect(
     article.getByText("Comments · 2", { exact: true }),
@@ -426,6 +443,10 @@ test("shows the same read counts on sources and workspaces and retains the artic
     .getByRole("button", { name: "Comments · 2 · 1 new", exact: true })
     .click();
   await expect(dialog.getByText("New", { exact: true })).toHaveCount(1);
+  await expect(dialog.getByRole("textbox", { name: "Reply" })).toHaveValue("");
+  await expect(
+    dialog.getByRole("button", { name: "Post reply" }),
+  ).toBeDisabled();
   await dialog.getByRole("button", { name: "Close comments" }).click();
   await expect(
     page.getByRole("button", { name: "Comments · 2", exact: true }),
