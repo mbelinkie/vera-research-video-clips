@@ -34,6 +34,9 @@ type Version = {
   lineageId: string;
   version: number;
   schemaVersion: number;
+  sourceLanguage: string;
+  targetLanguage: string;
+  timingPrecision: string;
   activeVersionId: string | null;
   manifestKey: string;
   manifestVersion: string;
@@ -158,6 +161,9 @@ async function checkBundle(
               manifest.lineageId === version.lineageId &&
               manifest.version === version.version &&
               manifest.schemaVersion === version.schemaVersion &&
+              manifest.sourceLanguage === version.sourceLanguage &&
+              manifest.targetLanguage === version.targetLanguage &&
+              manifest.timingPrecision === version.timingPrecision &&
               manifest.artifacts.length === tracks.length &&
               tracks.every((expected) =>
                 manifest.artifacts.some(
@@ -198,7 +204,9 @@ export async function auditTranscriptRecovery(
   const { rows } = await database.query<Version>(`
     SELECT tv.id, tv.project_id AS "projectId", tv.video_id AS "catalogVideoId",
       v.youtube_video_id AS "videoId", tv.lineage_id AS "lineageId", tv.version,
-      tv.schema_version AS "schemaVersion", pv.active_transcript_version_id AS "activeVersionId",
+      tv.schema_version AS "schemaVersion", tv.source_language AS "sourceLanguage",
+      tv.target_language AS "targetLanguage", tv.timing_precision AS "timingPrecision",
+      pv.active_transcript_version_id AS "activeVersionId",
       tv.manifest_object_key AS "manifestKey",
       tv.manifest_object_version_id AS "manifestVersion",
       tv.manifest_sha256 AS "manifestSha",

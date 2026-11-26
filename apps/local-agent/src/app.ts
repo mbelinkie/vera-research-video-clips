@@ -2470,7 +2470,7 @@ function localFailureMessage(
     case "storage_insufficient":
       return "Local storage is insufficient for this operation.";
     case "verification_failed":
-      if (operation === "transcript")
+      if (candidateCode === "transcript_integrity_failed")
         return "Published transcript unavailable. Stored content could not be verified.";
       return "Local data verification failed. Refresh the transcript when the project connection is available.";
     case "provider_unavailable":

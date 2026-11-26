@@ -11880,6 +11880,8 @@ export class SharedProjectCatalog {
   async listUndispatchedTranscriptionJobs(
     limit = 25,
   ): Promise<Array<{ jobId: string; executionLocation: "local" | "hosted" }>> {
+    // The reservation writer only emits ISO UTC strings. Sorting those strings
+    // keeps a malformed legacy reservation from aborting the whole scan.
     const result = await this.database.query<DbRow>(
       `SELECT DISTINCT j.id, j.payload->>'executionLocation' AS execution_location
        FROM jobs j
@@ -12038,6 +12040,7 @@ export class SharedProjectCatalog {
           [cancellationJobId],
         );
       }
+      // A running job was already accepted, including pre-SQS claims.
       const candidate = await this.database.query<DbRow>(
         `SELECT j.*
          FROM jobs j

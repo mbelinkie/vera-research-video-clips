@@ -25,12 +25,12 @@ it("reports partial, corrupt and verified pinned copies without disclosing locat
     lineageId: randomUUID(),
     version: 1,
     schemaVersion: 1,
-  };
-  const manifest = JSON.stringify({
-    ...identity,
     sourceLanguage: "en",
     targetLanguage: "en",
     timingPrecision: "cue",
+  };
+  const manifest = JSON.stringify({
+    ...identity,
     provider: "fixture",
     normalizationSchemaVersion: 1,
     jobId: randomUUID(),

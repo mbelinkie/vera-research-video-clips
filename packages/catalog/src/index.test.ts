@@ -7568,10 +7568,26 @@ describe("claimed transcript finalization", () => {
     await expect(catalog.listUndispatchedTranscriptionJobs()).resolves.toEqual([
       { jobId: item.jobId, executionLocation: "local" },
     ]);
-    await catalog.markTranscriptionJobDispatched(item.jobId!);
+    await expect(
+      catalog.markTranscriptionJobDispatched(item.jobId!),
+    ).resolves.toBe(true);
+    await expect(
+      catalog.markTranscriptionJobDispatched(item.jobId!),
+    ).resolves.toBe(false);
     await expect(catalog.listUndispatchedTranscriptionJobs()).resolves.toEqual(
       [],
     );
+    await database.query(
+      `UPDATE jobs SET payload = payload || jsonb_build_object('queueDispatchedAt', 'invalid')
+       WHERE id = $1`,
+      [item.jobId],
+    );
+    await expect(catalog.listUndispatchedTranscriptionJobs()).resolves.toEqual([
+      { jobId: item.jobId, executionLocation: "local" },
+    ]);
+    await expect(
+      catalog.markTranscriptionJobDispatched(item.jobId!),
+    ).resolves.toBe(true);
     await database.query(
       `UPDATE jobs
        SET payload = payload || jsonb_build_object(

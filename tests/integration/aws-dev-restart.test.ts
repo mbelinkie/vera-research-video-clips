@@ -221,7 +221,7 @@ it("preserves published bytes and fences accepted work across API process deaths
             outsider,
           )
         ).status,
-      ).toBe(404);
+      ).toBe(403);
     };
 
     const legacy = (await submit("TEST0000002")).items[0];
