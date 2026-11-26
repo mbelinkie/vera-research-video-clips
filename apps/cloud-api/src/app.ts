@@ -26,6 +26,9 @@ import {
   UpdateProjectMemberRequestSchema,
   CreateSourceRequestSchema,
   UpdateSourceRequestSchema,
+  CreateSourceDiscussionCommentSchema,
+  SourceDiscussionIdsSchema,
+  SourceDiscussionReadSchema,
   SourceListQuerySchema,
   CreateItemRequestSchema,
   DeleteQuoteRequestSchema,
@@ -2045,6 +2048,74 @@ export function createCloudApi(
         projectId,
         sourceId,
         offset,
+      );
+    },
+  );
+
+  app.get(
+    "/api/projects/:projectId/source-discussion-counts",
+    async (request, reply) => {
+      const { projectId } = IdParamsSchema.parse(request.params);
+      const { ids } = z
+        .strictObject({ ids: z.string().max(1110) })
+        .parse(request.query);
+      reply.header("cache-control", "private, no-store");
+      return catalog.library.sourceDiscussionCounts(
+        await authenticate(request),
+        projectId,
+        SourceDiscussionIdsSchema.parse(ids.split(",")),
+      );
+    },
+  );
+
+  app.get(
+    "/api/projects/:projectId/sources/:sourceId/discussion",
+    async (request, reply) => {
+      const { projectId, sourceId } = ProjectSourceParamsSchema.parse(
+        request.params,
+      );
+      const { offset } = z
+        .strictObject({
+          offset: z.coerce.number().int().min(0).max(100_000).default(0),
+        })
+        .parse(request.query);
+      reply.header("cache-control", "private, no-store");
+      return catalog.library.sourceDiscussion(
+        await authenticate(request),
+        projectId,
+        sourceId,
+        offset,
+      );
+    },
+  );
+
+  app.post(
+    "/api/projects/:projectId/sources/:sourceId/discussion",
+    async (request, reply) => {
+      const { projectId, sourceId } = ProjectSourceParamsSchema.parse(
+        request.params,
+      );
+      const result = await catalog.library.addSourceDiscussionComment(
+        await authenticate(request),
+        projectId,
+        sourceId,
+        CreateSourceDiscussionCommentSchema.parse(request.body),
+      );
+      return reply.code(201).send(result);
+    },
+  );
+
+  app.post(
+    "/api/projects/:projectId/sources/:sourceId/discussion/read",
+    async (request) => {
+      const { projectId, sourceId } = ProjectSourceParamsSchema.parse(
+        request.params,
+      );
+      return catalog.library.readSourceDiscussionComments(
+        await authenticate(request),
+        projectId,
+        sourceId,
+        SourceDiscussionReadSchema.parse(request.body),
       );
     },
   );
