@@ -69,19 +69,41 @@ export async function apiFetch(
   options: Pick<RequestInit, "body" | "method" | "signal"> = {},
   developmentAuthorization?: string,
 ): Promise<Response> {
-  const body = normalizeBody(options.body);
+  const bridge = desktopBridge();
+  const multipart =
+    bridge && options.body instanceof FormData
+      ? new Request(window.location.href, {
+          method: "POST",
+          body: options.body,
+        })
+      : undefined;
+  const body = multipart ? undefined : normalizeBody(options.body);
+  options.signal?.throwIfAborted();
   const request = DesktopApiRequestSchema.parse({
     target,
     method: (options.method ?? "GET").toUpperCase(),
     path,
-    ...(body === undefined ? {} : { body, contentType: "application/json" }),
+    ...(multipart
+      ? {
+          bytes: new Uint8Array(await multipart.arrayBuffer()),
+          contentType: multipart.headers.get("content-type"),
+        }
+      : body === undefined
+        ? {}
+        : { body, contentType: "application/json" }),
   });
-  const bridge = desktopBridge();
   if (bridge) {
+    options.signal?.throwIfAborted();
     const response = DesktopApiResponseSchema.parse(
       await bridge.request(request),
     );
-    return new Response(response.body, {
+    options.signal?.throwIfAborted();
+    const responseBody = response.bytes
+      ? new Uint8Array(response.bytes).buffer
+      : [204, 205, 304].includes(response.status)
+        ? null
+        : response.body;
+    return new Response(responseBody, {
       status: response.status,
       ...(response.contentType
         ? { headers: { "content-type": response.contentType } }
