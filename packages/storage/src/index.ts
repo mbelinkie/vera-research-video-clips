@@ -181,6 +181,7 @@ export class S3TranscriptObjectStore implements TranscriptObjectStore {
     key: string,
     versionId?: string,
   ): Promise<StoredObjectMetadata | undefined> {
+    if (versionId === "null") return undefined;
     try {
       const response = await this.client.send(
         new HeadObjectCommand({
@@ -220,6 +221,7 @@ export class S3TranscriptObjectStore implements TranscriptObjectStore {
     versionId?: string,
     maxBytes?: number,
   ): Promise<StoredObject | undefined> {
+    if (versionId === "null") return undefined;
     try {
       const response = await this.client.send(
         new GetObjectCommand({

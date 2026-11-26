@@ -12049,7 +12049,7 @@ export class SharedProjectCatalog {
            AND pm.role IN ('owner', 'administrator', 'researcher')
            AND j.payload->>'executionLocation' = $2
            AND ($2 = 'hosted' OR p.local_processing_state = 'automatic')
-           ${requireQueueDelivery ? "AND j.payload->>'queueDeliveredAt' IS NOT NULL" : ""}
+           ${requireQueueDelivery ? "AND (j.state <> 'queued' OR j.payload->>'queueDeliveredAt' IS NOT NULL)" : ""}
            AND EXISTS (
              SELECT 1
              FROM transcription_batch_items bi
@@ -12066,7 +12066,8 @@ export class SharedProjectCatalog {
            )
            AND (
              j.state = 'queued'
-             OR (j.state IN ('claimed', 'processing') AND wl.expires_at <= $3)
+             OR (j.state IN ('claimed', 'processing')
+               AND (wl.job_id IS NULL OR wl.expires_at <= $3))
            )
            AND NOT EXISTS (
              SELECT 1 FROM transcription_job_cancel_requests cancel_request
@@ -12304,7 +12305,6 @@ export class SharedProjectCatalog {
     jobId: string,
     failure: WorkerFailureRequest,
   ): Promise<void> {
-    await this.requireActiveWorkerLease(actor, jobId, failure.attempt);
     const failedAt = this.now().toISOString();
     const lastError = JSON.stringify({
       code: failure.code,
@@ -12314,6 +12314,11 @@ export class SharedProjectCatalog {
       attempt: failure.attempt,
     });
     await this.transaction(async () => {
+      await this.database.query(
+        "SELECT id FROM jobs WHERE id = $1 FOR UPDATE",
+        [jobId],
+      );
+      await this.requireActiveWorkerLease(actor, jobId, failure.attempt);
       await this.database.query(
         `UPDATE jobs
          SET state = 'failed',
@@ -13871,6 +13876,11 @@ export class SharedProjectCatalog {
   ): Promise<ActiveTranscriptBundle> {
     const upload = await this.loadUpload(request.uploadId);
     await this.authorize(actor, String(upload.project_id), "write");
+    if (!claim && Number(upload.job_attempt) > 0) {
+      throw new CatalogConflictError(
+        "A worker lease is required to finalize this transcript.",
+      );
+    }
     if (claim && String(upload.job_id) !== claim.jobId) {
       throw new CatalogConflictError(
         "Transcript upload does not belong to the claimed job.",
@@ -14061,6 +14071,15 @@ export class SharedProjectCatalog {
 
     await this.transaction(async () => {
       if (claim) {
+        const job = await this.database.query<DbRow>(
+          "SELECT state FROM jobs WHERE id = $1 FOR UPDATE",
+          [claim.jobId],
+        );
+        if (!["claimed", "processing"].includes(String(job.rows[0]?.state))) {
+          throw new CatalogConflictError(
+            "The transcription job is no longer active.",
+          );
+        }
         const lease = await this.database.query<DbRow>(
           `SELECT 1 FROM worker_leases
            WHERE job_id = $1 AND worker_id = $2 AND attempt = $3
@@ -14466,7 +14485,8 @@ export class SharedProjectCatalog {
 
   private async loadUpload(uploadId: string): Promise<DbRow> {
     const result = await this.database.query<DbRow>(
-      "SELECT * FROM transcript_uploads WHERE id = $1",
+      `SELECT u.*, j.attempt AS job_attempt FROM transcript_uploads u
+       JOIN jobs j ON j.id = u.job_id WHERE u.id = $1`,
       [uploadId],
     );
     if (!result.rows[0]) throw new CatalogNotFoundError("Upload not found.");

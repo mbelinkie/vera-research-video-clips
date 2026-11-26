@@ -114,3 +114,7 @@ AWS_PROFILE=your-profile AWS_REGION=us-east-1 \
 AWS_TRANSCRIPT_TEST_BUCKET=approved-versioned-test-bucket \
 npm run test:aws:s3
 ```
+
+## Optional development durability
+
+The [low-cost durability add-on](low-cost-development-durable-addons.yaml) supplies an S3 bucket and SQS queues for an explicitly configured PGlite development API. The low-cost bootstrap still starts in memory mode. The [development durability runbook](../../docs/operations/aws-development-durability.md) covers the separate upgrade, audit, rollback, and proposed costs.
