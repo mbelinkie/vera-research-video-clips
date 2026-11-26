@@ -1,5 +1,9 @@
 import { z } from "zod";
-import { ClipTagNameSchema } from "./library.js";
+import {
+  ClipTagNameSchema,
+  MaxAudioBytes,
+  MaxAudioDurationMs,
+} from "./library.js";
 
 export * from "./library.js";
 
@@ -237,6 +241,22 @@ export function isDesktopResearchImageRead(path: string) {
   );
 }
 
+export function isDesktopAudioPlaybackPath(path: string) {
+  return /^\/api\/projects\/[a-f0-9-]{36}\/audio\/[a-f0-9-]{36}\/playback$/iu.test(
+    path,
+  );
+}
+
+export function isLocalAudioTranscriptionPath(path: string) {
+  return /^\/api\/projects\/[a-f0-9-]{36}\/audio\/[a-f0-9-]{36}\/transcript$/iu.test(
+    path,
+  );
+}
+
+const DesktopAudioBytes = z
+  .instanceof(Uint8Array)
+  .refine((bytes) => bytes.byteLength > 0 && bytes.byteLength <= MaxAudioBytes);
+
 export const DesktopApiRequestSchema = z
   .object({
     target: z.enum(["cloud", "local"]),
@@ -250,19 +270,35 @@ export const DesktopApiRequestSchema = z
     contentType: z
       .union([
         z.literal("application/json"),
+        z.literal("application/octet-stream"),
         z.string().regex(/^multipart\/form-data; boundary=[a-z0-9-]{1,70}$/iu),
       ])
       .optional(),
-    bytes: DesktopResearchImageBytes.optional(),
+    bytes: DesktopAudioBytes.optional(),
   })
   .strict()
   .superRefine((request, context) => {
+    const localAudio =
+      request.target === "local" &&
+      request.method === "POST" &&
+      isLocalAudioTranscriptionPath(request.path) &&
+      request.contentType === "application/octet-stream" &&
+      request.body === undefined &&
+      request.bytes !== undefined;
+    if (request.contentType === "application/octet-stream" && !localAudio) {
+      context.addIssue({
+        code: "custom",
+        path: ["bytes"],
+        message: "Audio input must stay on the workstation.",
+      });
+    }
     if (
-      request.bytes !== undefined ||
-      request.contentType?.startsWith("multipart/")
+      !localAudio &&
+      (request.bytes !== undefined ||
+        request.contentType?.startsWith("multipart/"))
     ) {
       if (
-        request.bytes === undefined ||
+        !DesktopResearchImageBytes.safeParse(request.bytes).success ||
         request.body !== undefined ||
         !request.contentType?.startsWith("multipart/") ||
         request.target !== "cloud" ||
@@ -309,7 +345,7 @@ export const DesktopApiResponseSchema = z
   .object({
     status: z.number().int().min(100).max(599),
     body: z.string().max(4_000_000),
-    bytes: DesktopResearchImageBytes.optional(),
+    bytes: DesktopAudioBytes.optional(),
     contentType: z.string().max(160).optional(),
   })
   .strict();
@@ -2808,6 +2844,37 @@ export const NormalizedTranscriptSchema = z.object({
   segments: z.array(TranscriptSegmentSchema),
   tokens: z.array(TranscriptTokenSchema).default([]),
 });
+
+export const AudioSpeechTranscriptSchema = z
+  .strictObject({
+    audioSha256: Sha256Schema,
+    language: LanguageTagSchema,
+    model: z.string().trim().min(1).max(160),
+    segments: z
+      .array(
+        z.strictObject({
+          startMs: z.number().int().nonnegative().max(MaxAudioDurationMs),
+          endMs: z.number().int().positive().max(MaxAudioDurationMs),
+          text: z.string().trim().min(1).max(100_000),
+        }),
+      )
+      .min(1)
+      .max(10_000),
+  })
+  .refine(({ segments }) => {
+    let characters = 0;
+    return segments.every((segment, index) => {
+      characters += segment.text.length;
+      return (
+        characters <= 100_000 &&
+        !segment.text.includes("\0") &&
+        segment.endMs > segment.startMs &&
+        segment.startMs >= (segments[index - 1]?.startMs ?? 0)
+      );
+    });
+  }, "Speech transcript is too large or has invalid timing.");
+
+export type AudioSpeechTranscript = z.infer<typeof AudioSpeechTranscriptSchema>;
 
 export const PublishedEnglishTranscriptSchema = z.object({
   transcriptVersionId: IdSchema,

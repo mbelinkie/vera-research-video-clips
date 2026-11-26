@@ -1,5 +1,5 @@
 import Fastify, { type FastifyInstance, type FastifyRequest } from "fastify";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { z, ZodError } from "zod";
 
 import {
@@ -94,6 +94,8 @@ import {
   HealthResponseSchema,
   ImportWebPageRequestSchema,
   MaxWebPageHtmlBytes,
+  MaxAudioBytes,
+  AudioAssetManifestSchema,
   LocalOperationFailureSchema,
   LocalRuntimeDrainResultSchema,
   LocalRuntimeQuiescenceSchema,
@@ -182,7 +184,13 @@ import {
   type createWebPageImporter,
 } from "./web-page/import.ts";
 
+import {
+  LibraryAudioSpeechError,
+  type LibraryAudioTranscriber,
+} from "@research-video/providers/library-audio-speech";
+
 export interface LocalAgentDependencies {
+  audioSpeech?: { cloudOrigin: string; transcribe?: LibraryAudioTranscriber };
   importWebPage?: ReturnType<typeof createWebPageImporter>;
   desktopSession?: {
     secret: string;
@@ -693,6 +701,119 @@ export function createLocalAgent(
       timestamp: new Date().toISOString(),
     }),
   );
+
+  if (dependencies?.audioSpeech) {
+    const { cloudOrigin, transcribe } = dependencies.audioSpeech;
+    const contexts = new WeakMap<
+      FastifyRequest,
+      {
+        sourceId: string;
+        sha256: string;
+        durationMs: number;
+        origin: "file" | "url";
+      }
+    >();
+    void app.register(async (audio) => {
+      audio.addContentTypeParser(
+        "application/octet-stream",
+        { parseAs: "buffer", bodyLimit: MaxAudioBytes },
+        (_request, body, done) => done(null, body),
+      );
+      audio.post(
+        "/api/projects/:projectId/audio/:sourceId/transcript",
+        {
+          bodyLimit: MaxAudioBytes,
+          async onRequest(request) {
+            if (
+              dependencies.desktopSession &&
+              (request.headers["x-research-video-session"] !==
+                dependencies.desktopSession.secret ||
+                request.headers.origin !== dependencies.desktopSession.origin)
+            ) {
+              throw new LocalAuthenticationError(
+                "The desktop launch session is required for local access.",
+              );
+            }
+            const { projectId, sourceId } = z
+              .object({ projectId: z.uuid(), sourceId: z.uuid() })
+              .parse(request.params);
+            const authorization = requireRuntimeAuthorization(
+              request.headers.authorization,
+            );
+            const headers = { authorization };
+            const project = `${cloudOrigin}/api/projects/${projectId}`;
+            const access = await fetch(`${project}/source-write-access`, {
+              method: "HEAD",
+              headers,
+              redirect: "error",
+              signal: AbortSignal.timeout(10_000),
+            });
+            if (!access.ok)
+              throw new LibraryAudioSpeechError(
+                access.status,
+                "Project write access is required to transcribe audio.",
+              );
+            const response = await fetch(`${project}/audio/${sourceId}`, {
+              headers,
+              redirect: "error",
+              signal: AbortSignal.timeout(10_000),
+            });
+            if (!response.ok)
+              throw new LibraryAudioSpeechError(
+                response.status,
+                "This audio source is unavailable.",
+              );
+            const manifest = AudioAssetManifestSchema.parse(
+              await response.json(),
+            );
+            if (!transcribe)
+              throw new LibraryAudioSpeechError(
+                503,
+                "Set up FFmpeg and local Whisper in Research before transcribing.",
+              );
+            contexts.set(request, {
+              sourceId,
+              sha256:
+                manifest.origin.kind === "file"
+                  ? manifest.origin.originalSha256
+                  : manifest.playbackSha256,
+              durationMs: manifest.durationMs,
+              origin: manifest.origin.kind,
+            });
+          },
+        },
+        async (request, reply) => {
+          const context = contexts.get(request)!;
+          if (
+            request.headers["content-type"] !== "application/octet-stream" ||
+            !Buffer.isBuffer(request.body) ||
+            createHash("sha256").update(request.body).digest("hex") !==
+              context.sha256
+          )
+            throw new LibraryAudioSpeechError(
+              400,
+              context.origin === "file"
+                ? "Relink the original recording before transcribing."
+                : "The kept audio could not be verified.",
+            );
+          const abort = new AbortController();
+          const cancel = () => abort.abort();
+          reply.raw.once("close", cancel);
+          try {
+            reply.header("Cache-Control", "private, no-store");
+            return await transcribe!(
+              context.sourceId,
+              request.body,
+              context.durationMs,
+              abort.signal,
+            );
+          } finally {
+            reply.raw.off("close", cancel);
+          }
+        },
+      );
+    });
+  }
 
   if (dependencies?.importWebPage) {
     const importWebPage = dependencies.importWebPage;
@@ -2366,6 +2487,7 @@ const SafeLocalMessageCodes = new Set([
   "clip_source_disabled",
   "project_clip_access_failed",
   "web_page_import_failed",
+  "library_audio_speech_failed",
 ]);
 
 const SafeLocalErrorCodes = new Set([

@@ -3,6 +3,8 @@ import type { PGlite } from "@electric-sql/pglite";
 import { requirePermission } from "@research-video/auth";
 import {
   AudioAssetManifestSchema,
+  AudioSpeechTranscriptSchema,
+  type AudioSpeechTranscript,
   CreateItemRequestSchema,
   CreateSourceRequestSchema,
   LibrarySourceSchema,
@@ -809,6 +811,71 @@ export class ProjectLibrary {
     await this.authorizeRead(actor, projectId);
     const ref = await readAudioReference(this.db, projectId, sourceId);
     return readAudioPlayback(this.store, projectId, sourceId, ref);
+  }
+
+  async getAudioTranscript(actor: Actor, projectId: string, sourceId: string) {
+    await this.authorizeRead(actor, projectId);
+    const {
+      rows: [row],
+    } = await this.db.query<{ transcript: unknown }>(
+      `SELECT speech_transcript AS transcript FROM library_audio_assets
+       WHERE project_id=$1 AND source_id=$2`,
+      [projectId, sourceId],
+    );
+    if (!row) throw new CatalogNotFoundError("This source has no kept audio.");
+    return row.transcript === null
+      ? null
+      : AudioSpeechTranscriptSchema.parse(row.transcript);
+  }
+
+  async publishAudioTranscript(
+    actor: Actor,
+    projectId: string,
+    sourceId: string,
+    input: AudioSpeechTranscript,
+    origin: "file" | "url",
+  ) {
+    const transcript = AudioSpeechTranscriptSchema.parse(input);
+    return this.write(actor, projectId, async (tx) => {
+      const ref = await readAudioReference(tx, projectId, sourceId);
+      if (!ref)
+        throw new CatalogNotFoundError("This source has no kept audio.");
+      const source = await readLibrarySource(tx, projectId, sourceId);
+      if (
+        source.kind !== "audio" ||
+        !("role" in source.details) ||
+        source.details.role !== "speech"
+      )
+        throw new CatalogConflictError(
+          "Set the source role to Speech before transcribing.",
+        );
+      const { manifest } = ref;
+      const expected =
+        manifest.origin.kind === "file"
+          ? manifest.origin.originalSha256
+          : manifest.playbackSha256;
+      if (
+        manifest.origin.kind !== origin ||
+        transcript.audioSha256 !== expected ||
+        transcript.segments.some(
+          (segment) => segment.endMs > manifest.durationMs,
+        )
+      )
+        throw new CatalogConflictError(
+          "The transcript does not match this audio source.",
+        );
+      // Repeated or concurrent requests adopt the first complete transcript.
+      const {
+        rows: [row],
+      } = await tx.query<{ transcript: unknown }>(
+        `UPDATE library_audio_assets SET speech_transcript=COALESCE(speech_transcript, $3::jsonb)
+         WHERE project_id=$1 AND source_id=$2 RETURNING speech_transcript AS transcript`,
+        [projectId, sourceId, JSON.stringify(transcript)],
+      );
+      if (!row)
+        throw new CatalogNotFoundError("This source has no kept audio.");
+      return AudioSpeechTranscriptSchema.parse(row.transcript);
+    });
   }
 
   async publishStill(actor: Actor, projectId: string, input: StillPublication) {

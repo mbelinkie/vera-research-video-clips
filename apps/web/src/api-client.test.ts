@@ -76,6 +76,30 @@ describe("desktop API client", () => {
     expect(request).toHaveBeenCalledTimes(2);
   });
 
+  it("restricts raw Speech bytes to the authenticated workstation route", async () => {
+    const project = "019fbb95-cd76-7920-93fa-e23ba755ee40";
+    const path = `/api/projects/${project}/audio/${project}/transcript`;
+    const bytes = new Uint8Array([82, 73, 70, 70]);
+    const request = vi.fn(async () => ({ status: 200, body: "{}" }));
+    vi.stubGlobal("window", { researchVideoDesktop: { request } });
+    const body = new Blob([bytes], { type: "audio/wav" });
+    await apiFetch("local", path, { method: "POST", body });
+    expect(request).toHaveBeenCalledExactlyOnceWith({
+      target: "local",
+      path,
+      method: "POST",
+      bytes,
+      contentType: "application/octet-stream",
+    });
+    await expect(
+      apiFetch("cloud", path, { method: "POST", body }),
+    ).rejects.toThrow();
+    await expect(
+      apiFetch("local", path + "?other=true", { method: "POST", body }),
+    ).rejects.toThrow();
+    expect(request).toHaveBeenCalledTimes(1);
+  });
+
   it("retains the explicit browser-development authorization header", async () => {
     vi.stubGlobal("window", {});
     const fetch = vi.fn(async () => new Response("{}", { status: 200 }));

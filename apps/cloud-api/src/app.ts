@@ -175,6 +175,7 @@ import {
 } from "@research-video/providers";
 import type { LanguageServiceRegistry } from "@research-video/providers/language-service-registry";
 import { transcriptToSrt } from "@research-video/transcript";
+import type { LibraryAudioTranscriber } from "@research-video/providers/library-audio-speech";
 
 import {
   registerAudioRoutes,
@@ -202,6 +203,7 @@ export interface CloudApiDependencies {
   videoMetadataProvider?: VideoMetadataProvider;
   publicStillReader?: PublicStillReader;
   publicAudioReader?: PublicAudioReader;
+  transcribePublicAudio?: LibraryAudioTranscriber;
   publicAudioPreparation?: PublicAudioPreparation;
   localArtifacts?: {
     store: TranscriptObjectStore;

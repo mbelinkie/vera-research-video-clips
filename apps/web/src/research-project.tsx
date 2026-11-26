@@ -37,6 +37,7 @@ import {
 import { getDiscussionCounts, SourceDiscussion } from "./source-discussion.tsx";
 import { CitationEditor, WebPageWorkspace } from "./web-page-workspace.tsx";
 import { TypedQuotesWorkspace } from "./typed-quotes-workspace.tsx";
+import { AudioIntake, AudioWorkspace } from "./audio-workspace.tsx";
 import { StillsWorkspace } from "./stills-workspace.tsx";
 import { YouTubeSourceView } from "./youtube-source-view.tsx";
 
@@ -78,7 +79,24 @@ export function ResearchProject({
   );
   const [refresh, setRefresh] = useState(0);
   const [textSize, setTextSize] = useState("standard");
-  const [intake, setIntake] = useState<"web" | "image" | "file" | "quote">();
+  const [intake, setIntake] = useState<
+    | "web"
+    | "image"
+    | "file"
+    | "image-file"
+    | "quote"
+    | "audio-url"
+    | "audio-file"
+  >();
+  const [localAudio, setLocalAudio] = useState<{
+    sourceId: string;
+    file: File;
+  }>();
+  function audioOpened(id: string, file?: File) {
+    if (file) setLocalAudio({ sourceId: id, file });
+    closeIntake();
+    onOpenSource(id);
+  }
   const [manualQuote, setManualQuote] = useState<{
     sourceId: string;
     quote?: Quote;
@@ -184,8 +202,15 @@ export function ResearchProject({
         >
           Image URL
         </button>
-        <button type="button" disabled>
-          Audio URL (unavailable)
+        <button
+          type="button"
+          disabled={!canWrite}
+          onClick={(event) => {
+            event.currentTarget.closest("details")?.removeAttribute("open");
+            setIntake("audio-url");
+          }}
+        >
+          Audio URL
         </button>
         <button
           type="button"
@@ -270,9 +295,36 @@ export function ResearchProject({
           onClose={closeIntake}
         />
       )}
+      {tab === "sources" && !sourceId && intake === "file" && (
+        <div
+          className="research-detail research-intake research-toolbar"
+          aria-label="File type"
+        >
+          <button type="button" onClick={() => setIntake("image-file")}>
+            Image file
+          </button>
+          <button type="button" onClick={() => setIntake("audio-file")}>
+            Audio file
+          </button>
+          <button type="button" onClick={closeIntake}>
+            Cancel
+          </button>
+        </div>
+      )}
       {tab === "sources" &&
         !sourceId &&
-        (intake === "image" || intake === "file") && (
+        (intake === "audio-url" || intake === "audio-file") && (
+          <AudioIntake
+            request={request}
+            projectId={projectId}
+            mode={intake === "audio-url" ? "url" : "file"}
+            onCreated={audioOpened}
+            onCancel={closeIntake}
+          />
+        )}
+      {tab === "sources" &&
+        !sourceId &&
+        (intake === "image" || intake === "image-file") && (
           <StillsWorkspace
             {...sharedIntake}
             initialMode={intake === "image" ? "url" : "file"}
@@ -288,6 +340,7 @@ export function ResearchProject({
             active
             refresh={refresh}
             onOpenSource={onOpenSource}
+            localAudio={localAudio}
           />
           {legacyLibrary}
         </>
@@ -380,6 +433,23 @@ export function ResearchProject({
               />
             </>
           )}
+          {source?.kind === "audio" && (
+            <AudioWorkspace
+              key={source.id}
+              request={request}
+              source={source}
+              canWrite={canWrite}
+              localSpeech={localImport}
+              file={
+                localAudio?.sourceId === source.id ? localAudio.file : undefined
+              }
+              onRelinked={(file) =>
+                setLocalAudio({ sourceId: source.id, file })
+              }
+              onSourceChange={sourceChanged}
+              onLogged={bump}
+            />
+          )}
           {source &&
             source.kind !== "web_page" &&
             source.kind !== "youtube" && (
@@ -399,7 +469,7 @@ export function ResearchProject({
                     New quote
                   </button>
                 )}
-                {source.kind !== "offline" && (
+                {source.kind !== "offline" && source.kind !== "audio" && (
                   <p>Open Library to see logged items from this source.</p>
                 )}
               </div>

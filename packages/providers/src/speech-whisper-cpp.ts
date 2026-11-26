@@ -182,6 +182,34 @@ export class WhisperCppSpeechToTextProvider implements SpeechToTextProvider {
     signal?: AbortSignal;
   }) {
     validateVideoId(input.videoId);
+    return this.#transcribe(input);
+  }
+
+  async transcribeLibrarySource(input: {
+    sourceId: string;
+    wav: Uint8Array;
+    scratchDirectory: string;
+    signal?: AbortSignal;
+  }) {
+    if (!/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/iu.test(input.sourceId))
+      throw new ProviderExecutionError("Invalid Library source ID.");
+    return this.#transcribe({
+      ...input,
+      videoId: input.sourceId,
+      inputPath: "-",
+      outputDirectory: input.scratchDirectory,
+      stdin: input.wav,
+    });
+  }
+
+  async #transcribe(input: {
+    videoId: string;
+    inputPath: string;
+    language?: string;
+    signal?: AbortSignal;
+    outputDirectory?: string;
+    stdin?: Uint8Array;
+  }) {
     if (
       input.language &&
       this.checkLanguageSupport(input.language).state !== "supported"
@@ -191,14 +219,16 @@ export class WhisperCppSpeechToTextProvider implements SpeechToTextProvider {
       );
     }
     validPath(input.inputPath, "audio input path");
-    const inputInfo = await stat(input.inputPath).catch(() => undefined);
-    if (!inputInfo?.isFile() || inputInfo.size <= 0) {
-      throw new ProviderExecutionError(
-        "Speech-recognition audio input is missing or empty.",
-      );
+    if (!input.stdin) {
+      const inputInfo = await stat(input.inputPath).catch(() => undefined);
+      if (!inputInfo?.isFile() || inputInfo.size <= 0) {
+        throw new ProviderExecutionError(
+          "Speech-recognition audio input is missing or empty.",
+        );
+      }
     }
     const outputBase = join(
-      dirname(input.inputPath),
+      input.outputDirectory ?? dirname(input.inputPath),
       `whisper-${input.videoId}-${shortHash(this.#modelName)}`,
     );
     const outputPath = `${outputBase}.json`;
@@ -220,6 +250,7 @@ export class WhisperCppSpeechToTextProvider implements SpeechToTextProvider {
         ],
         {
           timeoutMs: this.#timeoutMs,
+          ...(input.stdin ? { stdin: input.stdin } : {}),
           ...(input.signal ? { signal: input.signal } : {}),
         },
       );

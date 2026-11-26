@@ -28,6 +28,8 @@ type VirtualTranscriptProps = {
   activeSearchMatchId?: string;
   selectedTokenIds?: ReadonlySet<string>;
   follow: boolean;
+  wrapCues?: boolean;
+  onWordSelect?: (word: TranscriptSelectionBoundary, extend: boolean) => void;
   onFollowSuspended(): void;
   onSeek(milliseconds: number, precision: TranscriptSeekPrecision): void;
   /** Precision-aware token activation (hosted app); takes priority over onPlayFromToken. */
@@ -52,6 +54,8 @@ export function VirtualTranscript({
   activeSearchMatchId,
   selectedTokenIds,
   follow,
+  wrapCues = false,
+  onWordSelect,
   onFollowSuspended,
   onSeek,
   onPlayFromToken,
@@ -109,10 +113,9 @@ export function VirtualTranscript({
     viewportHeight,
     rowHeight,
   });
-  const rendered = segments.slice(
-    virtualWindow.startIndex,
-    virtualWindow.endIndex,
-  );
+  const rendered = wrapCues
+    ? segments
+    : segments.slice(virtualWindow.startIndex, virtualWindow.endIndex);
   const activeSearchMatch = searchMatches.find(
     (match) => match.id === activeSearchMatchId,
   );
@@ -146,8 +149,12 @@ export function VirtualTranscript({
   return (
     <div
       ref={containerRef}
-      className="transcript-list"
-      onScroll={(event) => setScrollTop(event.currentTarget.scrollTop)}
+      className={`transcript-list${wrapCues ? " transcript-list-wrap" : ""}`}
+      onScroll={
+        wrapCues
+          ? undefined
+          : (event) => setScrollTop(event.currentTarget.scrollTop)
+      }
       onWheel={onFollowSuspended}
       onTouchMove={onFollowSuspended}
       onMouseUp={(event) => {
@@ -173,11 +180,15 @@ export function VirtualTranscript({
     >
       <div
         className="transcript-spacer"
-        style={{ height: virtualWindow.totalHeight }}
+        style={wrapCues ? undefined : { height: virtualWindow.totalHeight }}
       >
         <div
           className="transcript-window"
-          style={{ transform: `translateY(${virtualWindow.offsetTop}px)` }}
+          style={
+            wrapCues
+              ? undefined
+              : { transform: `translateY(${virtualWindow.offsetTop}px)` }
+          }
         >
           {rendered.map((segment) => {
             const segmentTokens = tokensBySegment.get(segment.id) ?? [];
@@ -244,15 +255,33 @@ export function VirtualTranscript({
                                     ? `Exact caption word start ${(token.startMs / 1_000).toFixed(3)}s; derived end (estimate) ${(token.endMs! / 1_000).toFixed(3)}s`
                                     : `Word timing ${(token.startMs / 1_000).toFixed(3)}s`
                             }
-                            onClick={() => {
-                              if (!window.getSelection()?.isCollapsed) return;
-                              activateToken(token, segment, navigationTarget);
+                            onClick={(event) => {
+                              if (
+                                !window.getSelection()?.isCollapsed &&
+                                !(onWordSelect && event.shiftKey)
+                              )
+                                return;
+                              if (onWordSelect) {
+                                onWordSelect(
+                                  { segmentId: segment.id, tokenId: token.id },
+                                  event.shiftKey,
+                                );
+                              } else {
+                                activateToken(token, segment, navigationTarget);
+                              }
                             }}
                             onKeyDown={(event) => {
                               if (event.key !== "Enter" && event.key !== " ")
                                 return;
                               event.preventDefault();
-                              activateToken(token, segment, navigationTarget);
+                              if (onWordSelect) {
+                                onWordSelect(
+                                  { segmentId: segment.id, tokenId: token.id },
+                                  event.shiftKey,
+                                );
+                              } else {
+                                activateToken(token, segment, navigationTarget);
+                              }
                             }}
                           >
                             {token.text}

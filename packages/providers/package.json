@@ -8,6 +8,8 @@
     "./alignment-local": "./src/alignment-local.ts",
     "./captions-local": "./src/captions-local.ts",
     "./public-egress": "./src/public-egress.ts",
+    "./library-audio-speech": "./src/library-audio-speech.ts",
+    "./library-audio-media": "./src/library-audio-media.ts",
     "./speech-whisper-cpp": "./src/speech-whisper-cpp.ts",
     "./speech-aws-transcribe": "./src/speech-aws-transcribe.ts",
     "./translation-aws": "./src/translation-aws.ts",

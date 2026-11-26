@@ -12,12 +12,6 @@ const MAX_AUDIO_SECONDS = MaxAudioDurationMs / 1_000;
 // Decode a small amount past the accepted duration so an input that is just
 // over the limit cannot be mistaken for a valid, exactly-limit recording.
 const DURATION_PROBE_GRACE_SECONDS = 0.5;
-const MAX_DECODED_SAMPLES = (MaxAudioDurationMs * PCM_SAMPLE_RATE) / 1_000;
-const MAX_DECODED_BYTES = Math.ceil(
-  (MAX_AUDIO_SECONDS + DURATION_PROBE_GRACE_SECONDS) *
-    PCM_SAMPLE_RATE *
-    PCM_BYTES_PER_SAMPLE,
-);
 const FFMPEG_TIMEOUT_MS = 60_000;
 const MAX_FFMPEG_ALLOCATION_BYTES = 64 * 1024 * 1024;
 const MAX_PROCESS_STDERR_BYTES = 64 * 1024;
@@ -61,6 +55,22 @@ export async function preparePublicAudio(bytes: Buffer): Promise<{
   peaks: number[];
   mimeType: PublicAudioMimeType;
 }> {
+  const { pcm, durationMs, mimeType } = await decodeAudio(
+    bytes,
+    PCM_SAMPLE_RATE,
+  );
+  return {
+    durationMs,
+    peaks: calculatePeaks(pcm, pcm.byteLength / PCM_BYTES_PER_SAMPLE),
+    mimeType,
+  };
+}
+
+export async function decodeAudio(
+  bytes: Buffer,
+  sampleRate: number,
+  executable?: string,
+) {
   if (!Buffer.isBuffer(bytes) || bytes.byteLength === 0) {
     throw new InvalidAudio("The audio upload is empty or malformed.");
   }
@@ -75,7 +85,7 @@ export async function preparePublicAudio(bytes: Buffer): Promise<{
     );
   }
 
-  if (format.mayContainVideo) await rejectVideo(bytes, format);
+  if (format.mayContainVideo) await rejectVideo(bytes, format, executable);
 
   const result = await runFfmpeg(
     [
@@ -88,7 +98,7 @@ export async function preparePublicAudio(bytes: Buffer): Promise<{
       "-ac",
       "1",
       "-ar",
-      String(PCM_SAMPLE_RATE),
+      String(sampleRate),
       "-t",
       String(MAX_AUDIO_SECONDS + DURATION_PROBE_GRACE_SECONDS),
       "-f",
@@ -96,7 +106,12 @@ export async function preparePublicAudio(bytes: Buffer): Promise<{
       "pipe:1",
     ],
     bytes,
-    MAX_DECODED_BYTES,
+    Math.ceil(
+      (MAX_AUDIO_SECONDS + DURATION_PROBE_GRACE_SECONDS) *
+        sampleRate *
+        PCM_BYTES_PER_SAMPLE,
+    ),
+    executable,
   );
 
   if (result.timedOut || result.outputLimitExceeded) {
@@ -114,12 +129,12 @@ export async function preparePublicAudio(bytes: Buffer): Promise<{
   }
 
   const sampleCount = result.stdout.byteLength / PCM_BYTES_PER_SAMPLE;
-  if (sampleCount > MAX_DECODED_SAMPLES) {
+  if (sampleCount > (MaxAudioDurationMs * sampleRate) / 1000) {
     throw new InvalidAudio("Audio duration cannot exceed 30 minutes.");
   }
   const durationMs = Math.max(
     1,
-    Math.round((sampleCount * 1_000) / PCM_SAMPLE_RATE),
+    Math.round((sampleCount * 1_000) / sampleRate),
   );
   if (durationMs > MaxAudioDurationMs) {
     throw new InvalidAudio("Audio duration cannot exceed 30 minutes.");
@@ -127,7 +142,7 @@ export async function preparePublicAudio(bytes: Buffer): Promise<{
 
   return {
     durationMs,
-    peaks: calculatePeaks(result.stdout, sampleCount),
+    pcm: result.stdout,
     mimeType: format.mimeType,
   };
 }
@@ -212,7 +227,11 @@ function commonInputArgs(format: AudioFormat): string[] {
   ];
 }
 
-async function rejectVideo(bytes: Buffer, format: AudioFormat): Promise<void> {
+async function rejectVideo(
+  bytes: Buffer,
+  format: AudioFormat,
+  executable?: string,
+): Promise<void> {
   const result = await runFfmpeg(
     [
       ...commonInputArgs(format),
@@ -229,6 +248,7 @@ async function rejectVideo(bytes: Buffer, format: AudioFormat): Promise<void> {
     ],
     bytes,
     VIDEO_PROBE_STDOUT_BYTES,
+    executable,
   );
   if (result.timedOut || result.outputLimitExceeded) {
     throw new InvalidAudio("The audio could not be inspected safely.");
@@ -245,8 +265,8 @@ function runFfmpeg(
   args: readonly string[],
   input: Buffer,
   maxOutputBytes: number,
+  executable = process.env.FFMPEG_PATH?.trim() || "ffmpeg",
 ): Promise<ProcessResult> {
-  const executable = process.env.FFMPEG_PATH?.trim() || "ffmpeg";
   if (executable.includes("\0")) {
     throw new Error("FFMPEG_PATH contains a null byte.");
   }

@@ -8,11 +8,13 @@ import {
 import { z } from "zod";
 import {
   ProjectMemberSummarySchema,
+  AudioAssetManifestSchema,
   type ItemKind,
   type LibraryItem,
   type LibrarySource,
   type SourceKind,
 } from "@research-video/contracts";
+import { AudioPlayer, audioRoles } from "./audio-player.tsx";
 import { YouTubePlayer, type YouTubePlayerHandle } from "./youtube-player.tsx";
 import {
   getResearchSource,
@@ -152,12 +154,14 @@ export function ResearchCatalog({
   onOpenSource,
   toolbar,
   commentCounts,
+  localAudio,
 }: CatalogProps & {
   tab: "sources" | "library";
   active: boolean;
   visible?: boolean;
   refresh: number;
   toolbar?: ReactNode;
+  localAudio?: { sourceId: string; file: File } | undefined;
   commentCounts?: (
     ids: string[],
     signal: AbortSignal,
@@ -446,6 +450,11 @@ export function ResearchCatalog({
                 item={selectedItem}
                 request={request}
                 detail
+                audioFile={
+                  localAudio?.sourceId === selectedItem.sourceId
+                    ? localAudio.file
+                    : undefined
+                }
               />
               {selectedItem.notes && <p>{selectedItem.notes}</p>}
               <button
@@ -494,10 +503,12 @@ function ItemSummary({
   request,
   item,
   detail = false,
+  audioFile,
 }: {
   request: ResearchRequest;
   item: LibraryItem;
   detail?: boolean;
+  audioFile?: File | undefined;
 }) {
   const { projectId, sourceId } = item;
   const loadSource = useCallback(
@@ -583,10 +594,21 @@ function ItemSummary({
           <p className="muted">Clip preview unavailable.</p>
         ))}
       {item.kind === "audio" && detail && (
-        <p className="muted">Waveform unavailable.</p>
+        <AudioItemPlayer item={item} request={request} file={audioFile} />
       )}
       {item.kind === "audio" && (
-        <p>{item.content.role?.replaceAll("_", " ") ?? "Audio selection"}</p>
+        <>
+          <p>
+            {item.content.role
+              ? audioRoles[item.content.role]
+              : "Audio selection"}
+          </p>
+          {item.content.text && (
+            <p className={detail ? undefined : "research-excerpt"}>
+              {item.content.text}
+            </p>
+          )}
+        </>
       )}
       {(quote?.citationOverride || sourceName) && (
         <p className="muted">{quote?.citationOverride ?? sourceName}</p>
@@ -595,6 +617,37 @@ function ItemSummary({
         <p className="research-topics">{item.topics.join(" · ")}</p>
       )}
     </>
+  );
+}
+
+function AudioItemPlayer({
+  item,
+  request,
+  file,
+}: {
+  item: Extract<LibraryItem, { kind: "audio" }>;
+  request: ResearchRequest;
+  file: File | undefined;
+}) {
+  const player = useRef<HTMLAudioElement>(null);
+  const path = `${projectPath(item.projectId)}/audio/${item.sourceId}`;
+  const load = useCallback(
+    (signal: AbortSignal) =>
+      readResearch(request, path, AudioAssetManifestSchema, { signal }),
+    [path, request],
+  );
+  const { data, error } = useResearchRead(load);
+  if (error) return <p className="muted">{error}</p>;
+  if (!data) return <p role="status">Loading waveform…</p>;
+  return (
+    <AudioPlayer
+      request={request}
+      path={path}
+      manifest={data}
+      file={file}
+      player={player}
+      range={item.content}
+    />
   );
 }
 

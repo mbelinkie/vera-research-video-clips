@@ -3,6 +3,7 @@ import { z } from "zod";
 import {
   AudioFileImportSchema,
   AudioPreviewLimitMs,
+  AudioSpeechTranscriptSchema,
   AudioUrlImportSchema,
   CreateSourceRequestSchema,
   MaxAudioBytes,
@@ -16,7 +17,10 @@ import {
   PublicEgressGuard,
   SystemDnsResolver,
 } from "@research-video/providers/public-egress";
-import { InvalidAudio, preparePublicAudio } from "./audio-media.ts";
+import {
+  InvalidAudio,
+  preparePublicAudio,
+} from "@research-video/providers/library-audio-media";
 import type { CloudApiDependencies } from "./app.ts";
 
 const ProjectParams = z.object({ projectId: z.uuid() });
@@ -239,6 +243,110 @@ export function registerAudioRoutes(
       sourceId,
     );
   });
+
+  const transcriptPath = base + "/:sourceId/transcript";
+  app.get(transcriptPath, async (request, reply) => {
+    const { projectId, sourceId } = SourceParams.parse(request.params);
+    reply.header("Cache-Control", "private, no-store");
+    return {
+      transcript: await catalog.library.getAudioTranscript(
+        await authenticate(request),
+        projectId,
+        sourceId,
+      ),
+    };
+  });
+
+  app.post(
+    transcriptPath,
+    { bodyLimit: 768 * 1024 },
+    async (request, reply) => {
+      const { projectId, sourceId } = SourceParams.parse(request.params);
+      const actor = writes.get(request);
+      if (!actor)
+        throw new AudioImportError(400, "The audio request was interrupted.");
+      reply.header("Cache-Control", "private, no-store");
+      const action = z
+        .discriminatedUnion("mode", [
+          z.strictObject({
+            mode: z.enum(["file", "kept_audio"]),
+            transcript: AudioSpeechTranscriptSchema,
+          }),
+          z.strictObject({ mode: z.literal("url") }),
+        ])
+        .parse(request.body);
+      if (action.mode !== "url") {
+        return catalog.library.publishAudioTranscript(
+          actor,
+          projectId,
+          sourceId,
+          action.transcript,
+          action.mode === "file" ? "file" : "url",
+        );
+      }
+      const source = await catalog.library.getSource(
+        actor,
+        projectId,
+        sourceId,
+      );
+      const manifest = await catalog.library.getAudioManifest(
+        actor,
+        projectId,
+        sourceId,
+      );
+      if (manifest.origin.kind !== "url")
+        throw new AudioImportError(
+          400,
+          "Relink the original in the workstation app to transcribe this file.",
+        );
+      if (
+        source.kind !== "audio" ||
+        !("role" in source.details) ||
+        source.details.role !== "speech"
+      )
+        throw new AudioImportError(
+          409,
+          "Set the source role to Speech before transcribing.",
+        );
+      const existing = await catalog.library.getAudioTranscript(
+        actor,
+        projectId,
+        sourceId,
+      );
+      if (existing) return existing;
+      if (!dependencies.transcribePublicAudio)
+        throw new AudioImportError(
+          503,
+          "Local Whisper is unavailable on the Research host.",
+        );
+      const object = await catalog.library.getAudioPlayback(
+        actor,
+        projectId,
+        sourceId,
+      );
+      const abort = new AbortController();
+      const cancel = () => abort.abort();
+      reply.raw.once("close", cancel);
+      try {
+        const transcript = await dependencies.transcribePublicAudio(
+          sourceId,
+          Buffer.from(object.bytes),
+          manifest.durationMs,
+          abort.signal,
+        );
+        abort.signal.throwIfAborted();
+        return await catalog.library.publishAudioTranscript(
+          actor,
+          projectId,
+          sourceId,
+          transcript,
+          "url",
+        );
+      } finally {
+        reply.raw.off("close", cancel);
+      }
+    },
+  );
 
   app.get(base + "/:sourceId/playback", async (request, reply) => {
     const { projectId, sourceId } = SourceParams.parse(request.params);

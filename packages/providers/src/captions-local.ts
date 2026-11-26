@@ -21,7 +21,7 @@ export interface CommandRunner {
   run(
     executable: string,
     args: readonly string[],
-    options?: { signal?: AbortSignal; timeoutMs?: number },
+    options?: { signal?: AbortSignal; timeoutMs?: number; stdin?: Uint8Array },
   ): Promise<CommandResult>;
 }
 
@@ -29,24 +29,30 @@ export class SpawnCommandRunner implements CommandRunner {
   async run(
     executable: string,
     args: readonly string[],
-    options: { signal?: AbortSignal; timeoutMs?: number } = {},
+    options: {
+      signal?: AbortSignal;
+      timeoutMs?: number;
+      stdin?: Uint8Array;
+    } = {},
   ): Promise<CommandResult> {
     validateExecutable(executable);
     return new Promise((resolve, reject) => {
       const child = spawn(executable, [...args], {
         shell: false,
-        stdio: ["ignore", "pipe", "pipe"],
+        stdio: [options.stdin ? "pipe" : "ignore", "pipe", "pipe"],
         ...(options.signal ? { signal: options.signal } : {}),
       });
+      child.stdin?.on("error", () => undefined);
+      child.stdin?.end(options.stdin);
       let stdout = "";
       let stderr = "";
       const maxOutputBytes = 4 * 1024 * 1024;
       const append = (current: string, chunk: Buffer) =>
         (current + chunk.toString("utf8")).slice(-maxOutputBytes);
-      child.stdout.on("data", (chunk: Buffer) => {
+      child.stdout?.on("data", (chunk: Buffer) => {
         stdout = append(stdout, chunk);
       });
-      child.stderr.on("data", (chunk: Buffer) => {
+      child.stderr?.on("data", (chunk: Buffer) => {
         stderr = append(stderr, chunk);
       });
       const timeout = setTimeout(

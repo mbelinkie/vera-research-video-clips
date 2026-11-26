@@ -2,7 +2,10 @@ import { createHash, randomUUID } from "node:crypto";
 import { PGlite } from "@electric-sql/pglite";
 import { afterAll, beforeAll, expect, it, vi } from "vitest";
 import { SharedProjectCatalog } from "@research-video/catalog";
-import { AudioPeakCount } from "@research-video/contracts";
+import {
+  AudioPeakCount,
+  type AudioSpeechTranscript,
+} from "@research-video/contracts";
 import { runCloudMigrations } from "@research-video/db-cloud";
 import { MemoryTranscriptObjectStore } from "@research-video/storage";
 import { authenticateDevBearer, createCloudApi } from "./app.ts";
@@ -43,6 +46,13 @@ const prepare = vi.fn(async (_bytes: Buffer) => ({
   peaks,
 }));
 
+const publicTranscriber = vi.fn(async (_sourceId: string, bytes: Buffer) => ({
+  audioSha256: createHash("sha256").update(bytes).digest("hex"),
+  language: "en",
+  model: "fixture",
+  segments: [{ startMs: 1000, endMs: 2000, text: "Public speech fixture" }],
+}));
+
 class CorruptibleStore extends MemoryTranscriptObjectStore {
   corrupt = false;
 
@@ -75,6 +85,7 @@ beforeAll(async () => {
     authenticate: authenticateDevBearer,
     publicAudioReader: reader,
     publicAudioPreparation: prepare,
+    transcribePublicAudio: publicTranscriber,
   });
   for (const [id, displayName] of [
     [owner, "Audio owner"],
@@ -285,4 +296,94 @@ it("does not publish a source if its stored playback cannot be verified", async 
   });
   expect(sources.statusCode, sources.body).toBe(200);
   expect(sources.json()).toEqual([]);
+});
+
+it("stores Speech transcript text for project readers and binds it to the original", async () => {
+  const source = (
+    await importFile("speech-fixture", { role: "speech" })
+  ).json();
+  const path = `${audioPath}/${source.id}/transcript`;
+  const transcript: AudioSpeechTranscript = {
+    audioSha256: originalSha256,
+    language: "en",
+    model: "fixture",
+    segments: [
+      { startMs: 17_000, endMs: 22_000, text: "Recorded beyond the preview" },
+    ],
+  };
+  const publish = (
+    user: string,
+    changes: Partial<AudioSpeechTranscript> = {},
+  ) =>
+    cloud.inject({
+      method: "POST",
+      url: path,
+      headers: auth(user),
+      payload: { mode: "file", transcript: { ...transcript, ...changes } },
+    });
+  const read = (user: string) =>
+    cloud.inject({ url: path, headers: auth(user) });
+  expect((await read(viewer)).json()).toEqual({ transcript: null });
+  expect((await publish(viewer)).statusCode).toBe(403);
+  expect((await read(outsider)).statusCode).toBe(403);
+  expect(
+    (await publish(owner, { audioSha256: "a".repeat(64) })).statusCode,
+  ).toBe(409);
+  expect(
+    (
+      await publish(owner, {
+        segments: [{ ...transcript.segments[0]!, endMs: durationMs + 1 }],
+      })
+    ).statusCode,
+  ).toBe(409);
+  const saved = await publish(owner);
+  expect(saved.statusCode, saved.body).toBe(200);
+  expect((await publish(owner, { model: "another-run" })).json()).toEqual(
+    transcript,
+  );
+  expect((await read(viewer)).json()).toEqual({ transcript });
+  const attemptedRemoteTranscription = await cloud.inject({
+    method: "POST",
+    url: path,
+    headers: auth(owner),
+    payload: { mode: "url" },
+  });
+  expect(attemptedRemoteTranscription.statusCode).toBe(400);
+});
+
+it("transcribes a verified public asset once without downloading the URL again", async () => {
+  publicTranscriber.mockClear();
+  const response = await cloud.inject({
+    method: "POST",
+    url: audioPath + "/from-url",
+    headers: auth(owner),
+    payload: {
+      idempotencyKey: "public-speech-fixture",
+      title: "Public speech",
+      url: sourceUrl,
+      role: "speech",
+    },
+  });
+  expect(response.statusCode, response.body).toBe(201);
+  const source = response.json();
+  reader.mockClear();
+  const path = `${audioPath}/${source.id}/transcript`;
+  const transcribe = (user: string) =>
+    cloud.inject({
+      method: "POST",
+      url: path,
+      headers: auth(user),
+      payload: { mode: "url" },
+    });
+  expect((await transcribe(viewer)).statusCode).toBe(403);
+  const first = await transcribe(owner);
+  expect(first.statusCode, first.body).toBe(200);
+  expect((await transcribe(owner)).json()).toEqual(first.json());
+  expect(publicTranscriber).toHaveBeenCalledExactlyOnceWith(
+    source.id,
+    fullAudio,
+    durationMs,
+    expect.any(AbortSignal),
+  );
+  expect(reader).not.toHaveBeenCalled();
 });

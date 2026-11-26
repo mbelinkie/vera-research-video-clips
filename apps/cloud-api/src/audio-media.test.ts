@@ -2,7 +2,10 @@ import { execFileSync } from "node:child_process";
 
 import { describe, expect, it } from "vitest";
 
-import { InvalidAudio, preparePublicAudio } from "./audio-media.ts";
+import {
+  InvalidAudio,
+  preparePublicAudio,
+} from "@research-video/providers/library-audio-media";
 
 const ffmpegAvailable = (() => {
   try {
