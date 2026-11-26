@@ -1,0 +1,119 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Optional durable storage and job delivery for the Research development API.
+
+Parameters:
+  ApiRoleName:
+    Type: String
+    Description: Existing low-cost development API instance role name (not profile or ARN).
+    AllowedPattern: "[A-Za-z0-9_+=,.@-]{1,64}"
+  QueueName:
+    Type: String
+    Default: research-video-development-transcription
+    AllowedPattern: "[A-Za-z0-9_-]{1,76}"
+  UploadOrigin:
+    Type: String
+    Description: Exact approved HTTPS origin for browser artifact requests.
+    AllowedPattern: "https://[A-Za-z0-9.-]+(:[0-9]+)?"
+
+Resources:
+  TranscriptBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      VersioningConfiguration: { Status: Enabled }
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      CorsConfiguration:
+        CorsRules:
+          - AllowedOrigins: [!Ref UploadOrigin]
+            AllowedMethods: [GET, HEAD, PUT]
+            AllowedHeaders: ["*"]
+            ExposedHeaders: [ETag, x-amz-version-id, x-amz-checksum-sha256]
+            MaxAge: 900
+  TranscriptBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref TranscriptBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource:
+              [!GetAtt TranscriptBucket.Arn, !Sub "${TranscriptBucket.Arn}/*"]
+            Condition:
+              Bool: { "aws:SecureTransport": "false" }
+  JobDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      QueueName: !Sub "${QueueName}-dlq"
+      SqsManagedSseEnabled: true
+      MessageRetentionPeriod: 1209600
+      RedriveAllowPolicy:
+        redrivePermission: byQueue
+        sourceQueueArns:
+          - !Sub "arn:${AWS::Partition}:sqs:${AWS::Region}:${AWS::AccountId}:${QueueName}"
+  JobQueue:
+    Type: AWS::SQS::Queue
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      QueueName: !Ref QueueName
+      SqsManagedSseEnabled: true
+      MessageRetentionPeriod: 345600
+      VisibilityTimeout: 30
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt JobDeadLetterQueue.Arn
+        maxReceiveCount: 5
+  ApiStorageAndDelivery:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub "${QueueName}-durability"
+      Roles: [!Ref ApiRoleName]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              [s3:GetBucketLocation, s3:GetBucketVersioning, s3:ListBucket]
+            Resource: !GetAtt TranscriptBucket.Arn
+          - Effect: Allow
+            Action: [s3:GetObject, s3:GetObjectVersion, s3:PutObject]
+            Resource:
+              - !Sub "${TranscriptBucket.Arn}/projects/*"
+              - !Sub "${TranscriptBucket.Arn}/staging/*"
+              - !Sub "${TranscriptBucket.Arn}/language-model/*"
+          - Effect: Allow
+            Action: [s3:DeleteObject, s3:DeleteObjectVersion]
+            Resource:
+              - !Sub "${TranscriptBucket.Arn}/staging/*"
+              - !Sub "${TranscriptBucket.Arn}/projects/*/videos/*/manual-imports/*/candidate/*"
+          - Effect: Allow
+            Action:
+              - sqs:GetQueueAttributes
+              - sqs:SendMessage
+              - sqs:ReceiveMessage
+              - sqs:DeleteMessage
+              - sqs:ChangeMessageVisibility
+            Resource: !GetAtt JobQueue.Arn
+
+Outputs:
+  TranscriptBucketName:
+    Value: !Ref TranscriptBucket
+  JobQueueUrl:
+    Value: !Ref JobQueue
+  JobDeadLetterQueueUrl:
+    Value: !Ref JobDeadLetterQueue

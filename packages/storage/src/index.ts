@@ -158,7 +158,7 @@ export class S3TranscriptObjectStore implements TranscriptObjectStore {
         Metadata: { sha256: input.sha256 },
       }),
     );
-    if (!response.VersionId) {
+    if (!response.VersionId || response.VersionId === "null") {
       throw new Error(
         "S3 did not return a version ID; bucket versioning is required.",
       );

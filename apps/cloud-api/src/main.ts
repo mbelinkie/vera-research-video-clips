@@ -12,6 +12,7 @@ import { createBrowserAuth } from "./browser-auth/routes.ts";
 import { createCognitoProvider } from "./browser-auth/provider.ts";
 
 import { S3Client } from "@aws-sdk/client-s3";
+import { SQSClient } from "@aws-sdk/client-sqs";
 import { PGlite } from "@electric-sql/pglite";
 import type { FastifyRequest } from "fastify";
 import { SharedProjectCatalog } from "@research-video/catalog";
@@ -70,8 +71,26 @@ import {
 } from "./pilot-operations.ts";
 import { bootstrapManagedResearch } from "./managed-bootstrap.ts";
 import { pumpJobQueueOnce, SqsJobQueue } from "./job-queue.ts";
+import { verifyAwsDevDurability } from "./aws-dev-durability.ts";
 
 const config = loadConfig();
+const s3 =
+  config.objectStoreMode === "s3"
+    ? new S3Client({ region: config.awsRegion })
+    : undefined;
+const sqs =
+  config.queueMode === "sqs"
+    ? new SQSClient({ region: config.awsRegion })
+    : undefined;
+if (config.awsDevDurability === "enabled") {
+  await verifyAwsDevDurability({
+    s3: s3!,
+    sqs: sqs!,
+    bucket: config.transcriptBucket!,
+    queueUrl: config.jobQueueUrl!,
+    region: config.awsRegion,
+  });
+}
 await mkdir(config.dataDir, { recursive: true });
 if (config.runtimeMode === "managed-local") {
   const rootInfo = await lstat(config.dataDir);
@@ -185,14 +204,10 @@ await languageServices.synchronizeLocalModelSources([
   },
 ]);
 
-const s3 =
-  config.objectStoreMode === "s3"
-    ? new S3Client({ region: config.awsRegion })
-    : undefined;
-const transcriptBucket = config.transcriptBucket;
+const transcriptBucket = config.transcriptBucket!;
 const objectStore = localObjects
   ? new LocalTranscriptObjectStore(config.pilotObjectRoot!)
-  : s3 && transcriptBucket
+  : s3
     ? new S3TranscriptObjectStore(s3, transcriptBucket)
     : new MemoryTranscriptObjectStore();
 const uploadUrlIssuer = localObjects
@@ -202,7 +217,7 @@ const uploadUrlIssuer = localObjects
         : `http://${config.cloudApiHost}:${config.cloudApiPort}/`,
       config.localSigningSecret!,
     )
-  : s3 && transcriptBucket
+  : s3
     ? new S3StagedUploadUrlIssuer(s3, transcriptBucket)
     : new MemoryStagedUploadUrlIssuer();
 const localModelOperationStore = new CloudDatabaseLocalModelOperationStore(
@@ -279,13 +294,13 @@ const ingressGuard =
         }),
       )
     : undefined;
-const jobQueue =
-  config.queueMode === "sqs"
-    ? new SqsJobQueue({
-        queueUrl: config.jobQueueUrl!,
-        region: config.awsRegion,
-      })
-    : undefined;
+const jobQueue = sqs
+  ? new SqsJobQueue({
+      queueUrl: config.jobQueueUrl!,
+      region: config.awsRegion,
+      client: sqs,
+    })
+  : undefined;
 const app = createCloudApi({
   ...(browserAuth ? { browserAuth } : {}),
   ...(ingressGuard ? { ingressGuard } : {}),

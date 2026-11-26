@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { gunzipSync } from "node:zlib";
+import { ZodError } from "zod";
 
 import {
   AuthenticationError,
@@ -11889,13 +11890,15 @@ export class SharedProjectCatalog {
          AND j.payload->>'queueDeliveredAt' IS NULL
          AND (
            j.payload->>'queueDispatchedAt' IS NULL
-           OR (j.payload->>'queueDispatchedAt')::timestamptz <= $2::timestamptz
+           OR (j.payload->>'queueDispatchedAt') COLLATE "C" <= $2::text
+           OR j.payload->>'queueDispatchedAt' !~ '^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$'
          )
          AND b.dispatch_status = 'active' AND bi.state = 'queued'
          AND (
            (j.payload->>'executionLocation' = 'local'
              AND p.local_processing_state = 'automatic')
-           OR b.hosted_approval_state = 'approved'
+           OR (j.payload->>'executionLocation' = 'hosted'
+             AND b.hosted_approval_state = 'approved')
          )
        ORDER BY j.id
        LIMIT $1::integer`,
@@ -11912,6 +11915,7 @@ export class SharedProjectCatalog {
   }
 
   async markTranscriptionJobDispatched(jobId: string): Promise<boolean> {
+    const now = this.now();
     const result = await this.database.query<DbRow>(
       `UPDATE jobs
        SET payload = payload || jsonb_build_object(
@@ -11920,6 +11924,11 @@ export class SharedProjectCatalog {
            updated_at = $1::timestamptz
        WHERE id = $2 AND kind = 'transcription' AND state = 'queued'
          AND payload->>'queueDeliveredAt' IS NULL
+         AND (
+           payload->>'queueDispatchedAt' IS NULL
+           OR (payload->>'queueDispatchedAt') COLLATE "C" <= $3::text
+           OR payload->>'queueDispatchedAt' !~ '^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$'
+         )
          AND EXISTS (
            SELECT 1
            FROM transcription_batch_items bi
@@ -11930,11 +11939,16 @@ export class SharedProjectCatalog {
              AND (
                (jobs.payload->>'executionLocation' = 'local'
                  AND p.local_processing_state = 'automatic')
-               OR b.hosted_approval_state = 'approved'
+               OR (jobs.payload->>'executionLocation' = 'hosted'
+                 AND b.hosted_approval_state = 'approved')
              )
          )
        RETURNING id`,
-      [this.now().toISOString(), jobId],
+      [
+        now.toISOString(),
+        jobId,
+        new Date(now.getTime() - 5 * 60_000).toISOString(),
+      ],
     );
     return Boolean(result.rows[0]);
   }
@@ -11952,6 +11966,7 @@ export class SharedProjectCatalog {
            updated_at = $1::timestamptz
        WHERE id = $2 AND kind = 'transcription' AND state = 'queued'
          AND payload->>'executionLocation' = $3
+         AND payload->>'queueDeliveredAt' IS NULL
          AND EXISTS (
            SELECT 1
            FROM transcription_batch_items bi
@@ -11960,7 +11975,7 @@ export class SharedProjectCatalog {
            WHERE bi.job_id = jobs.id
              AND b.dispatch_status = 'active' AND bi.state = 'queued'
              AND (($3 = 'local' AND p.local_processing_state = 'automatic')
-               OR b.hosted_approval_state = 'approved')
+               OR ($3 = 'hosted' AND b.hosted_approval_state = 'approved'))
          )
        RETURNING id`,
       [deliveredAt, jobId, executionLocation],
@@ -14199,11 +14214,25 @@ export class SharedProjectCatalog {
     if (!row?.active_transcript_version_id) {
       throw new CatalogNotFoundError("No active transcript found.");
     }
-    return this.loadTranscriptBundleByVersion(
-      projectId,
-      catalogVideoId,
-      String(row.active_transcript_version_id),
-    );
+    try {
+      return await this.loadTranscriptBundleByVersion(
+        projectId,
+        catalogVideoId,
+        String(row.active_transcript_version_id),
+      );
+    } catch (error) {
+      if (
+        error instanceof CatalogNotFoundError ||
+        error instanceof TranscriptIntegrityError ||
+        error instanceof SyntaxError ||
+        error instanceof ZodError
+      ) {
+        throw new TranscriptIntegrityError(
+          "Published transcript unavailable. Stored content could not be verified.",
+        );
+      }
+      throw error;
+    }
   }
 
   async readPublishedEnglishTranscript(
@@ -14287,7 +14316,7 @@ export class SharedProjectCatalog {
       sha256(object.bytes) !== descriptor.sha256
     ) {
       throw new TranscriptIntegrityError(
-        "Transcript artifact does not match its active descriptor.",
+        "Published transcript unavailable. Stored content could not be verified.",
       );
     }
     return object;

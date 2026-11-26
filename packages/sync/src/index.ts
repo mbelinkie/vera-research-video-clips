@@ -81,14 +81,19 @@ export class LocalCacheIntegrityError extends Error {
 /** A catalog failure classified before any stale local-cache decision. */
 export class TranscriptCatalogError extends Error {
   constructor(
-    readonly statusCode: 401 | 403 | 404 | 502,
+    readonly statusCode: 401 | 403 | 404 | 422 | 502,
     readonly code:
       | "authentication_required"
       | "authorization_denied"
       | "not_found"
-      | "transcript_catalog_unavailable",
+      | "transcript_catalog_unavailable"
+      | "transcript_integrity_failed",
   ) {
-    super("The shared transcript catalog is unavailable.");
+    super(
+      code === "transcript_integrity_failed"
+        ? "Published transcript unavailable. Stored content could not be verified."
+        : "The shared transcript catalog is unavailable.",
+    );
   }
 
   get permitsOfflineCache(): boolean {
@@ -1346,6 +1351,8 @@ export class HttpActiveTranscriptCatalogClient implements ActiveTranscriptCatalo
         throw new TranscriptCatalogError(403, "authorization_denied");
       if (response.status === 404)
         throw new TranscriptCatalogError(404, "not_found");
+      if (response.status === 422)
+        throw new TranscriptCatalogError(422, "transcript_integrity_failed");
       throw new TranscriptCatalogError(502, "transcript_catalog_unavailable");
     }
     return ActiveTranscriptBundleSchema.parse(await response.json());

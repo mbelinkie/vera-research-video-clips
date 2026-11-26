@@ -73,6 +73,7 @@ export const AppConfigSchema = z
       }),
     objectStoreMode: z.enum(["memory", "s3", "local"]),
     queueMode: z.enum(["memory", "sqs"]),
+    awsDevDurability: z.enum(["disabled", "enabled"]),
     jobQueueUrl: z.url().optional(),
     captionProvider: z.enum(["disabled", "yt-dlp"]),
     mediaProvider: z.enum(["disabled", "yt-dlp-audio"]),
@@ -432,6 +433,42 @@ export const AppConfigSchema = z
           "DATABASE_URL or all DATABASE_HOST/PORT/NAME/USERNAME/PASSWORD fields are required when CLOUD_DATABASE_MODE=postgres",
       });
     }
+    if (config.awsDevDurability === "enabled") {
+      if (
+        config.nodeEnv === "production" ||
+        config.runtimeRole !== "cloud-api" ||
+        config.runtimeMode !== "development" ||
+        config.cloudDatabaseMode !== "pglite" ||
+        config.cloudAuthMode !== "cognito" ||
+        !config.publicApiOrigin?.startsWith("https://") ||
+        config.objectStoreMode !== "s3" ||
+        config.queueMode !== "sqs"
+      ) {
+        reject(
+          "awsDevDurability",
+          "AWS_DEV_DURABILITY=enabled requires the HTTPS Cognito development cloud API with PGlite, S3 and SQS",
+        );
+      }
+      const queue = config.jobQueueUrl && URL.parse(config.jobQueueUrl);
+      if (
+        !queue ||
+        queue.host !== `sqs.${config.awsRegion}.amazonaws.com` ||
+        queue.protocol !== "https:" ||
+        queue.username ||
+        queue.password ||
+        queue.search ||
+        queue.hash ||
+        !/^\/[0-9]{12}\/[a-zA-Z0-9_-]{1,80}$/u.test(queue.pathname)
+      ) {
+        reject("jobQueueUrl", "Use the regional HTTPS SQS Standard queue URL");
+      }
+      if (
+        !config.transcriptBucket ||
+        !/^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/u.test(config.transcriptBucket)
+      ) {
+        reject("transcriptBucket", "Use the S3 transcript bucket name");
+      }
+    }
     if (config.queueMode === "sqs" && !config.jobQueueUrl) {
       context.addIssue({
         code: "custom",
@@ -589,6 +626,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       env.CLIP_EXPORT_DIR ?? join(resolve(env.DATA_DIR ?? "./data"), "exports"),
     objectStoreMode: env.OBJECT_STORE_MODE ?? "memory",
     queueMode: env.QUEUE_MODE ?? "memory",
+    awsDevDurability: env.AWS_DEV_DURABILITY ?? "disabled",
     jobQueueUrl: env.JOB_QUEUE_URL,
     captionProvider: env.CAPTION_PROVIDER ?? "disabled",
     mediaProvider: env.MEDIA_PROVIDER ?? "disabled",
