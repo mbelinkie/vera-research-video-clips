@@ -1,5 +1,6 @@
 import {
   DesktopApiRequestSchema,
+  isLocalAudioTranscriptionPath,
   DesktopApiResponseSchema,
   type DesktopApiRequest,
   type DesktopApiResponse,
@@ -70,6 +71,7 @@ export async function apiFetch(
   developmentAuthorization?: string,
 ): Promise<Response> {
   const bridge = desktopBridge();
+  const method = (options.method ?? "GET").toUpperCase();
   const multipart =
     bridge && options.body instanceof FormData
       ? new Request(window.location.href, {
@@ -77,20 +79,33 @@ export async function apiFetch(
           body: options.body,
         })
       : undefined;
-  const body = multipart ? undefined : normalizeBody(options.body);
+  const localAudio =
+    target === "local" &&
+    method === "POST" &&
+    isLocalAudioTranscriptionPath(path) &&
+    options.body instanceof Blob
+      ? options.body
+      : undefined;
+  const body =
+    multipart || localAudio ? undefined : normalizeBody(options.body);
   options.signal?.throwIfAborted();
   const request = DesktopApiRequestSchema.parse({
     target,
-    method: (options.method ?? "GET").toUpperCase(),
+    method,
     path,
-    ...(multipart
+    ...(localAudio
       ? {
-          bytes: new Uint8Array(await multipart.arrayBuffer()),
-          contentType: multipart.headers.get("content-type"),
+          bytes: new Uint8Array(await localAudio.arrayBuffer()),
+          contentType: "application/octet-stream",
         }
-      : body === undefined
-        ? {}
-        : { body, contentType: "application/json" }),
+      : multipart
+        ? {
+            bytes: new Uint8Array(await multipart.arrayBuffer()),
+            contentType: multipart.headers.get("content-type"),
+          }
+        : body === undefined
+          ? {}
+          : { body, contentType: "application/json" }),
   });
   if (bridge) {
     options.signal?.throwIfAborted();
@@ -120,7 +135,7 @@ export async function apiFetch(
         : {}),
       ...(request.contentType ? { "content-type": request.contentType } : {}),
     },
-    ...(body === undefined ? {} : { body }),
+    ...(localAudio ? { body: localAudio } : body === undefined ? {} : { body }),
     ...(options.signal ? { signal: options.signal } : {}),
   });
 }

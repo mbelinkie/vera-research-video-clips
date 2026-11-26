@@ -20,6 +20,9 @@ import {
   DesktopApiRequestSchema,
   DesktopApiResponseSchema,
   isDesktopResearchImageRead,
+  isDesktopAudioPlaybackPath,
+  isLocalAudioTranscriptionPath,
+  AudioMimeSchema,
   CloudProviderLaunchGrantSchema,
   DesktopTimedTranscriptUploadRequestSchema,
   CreateManualTimedTranscriptImportRequestSchema,
@@ -421,7 +424,7 @@ async function serveTrustedRenderer(request: Request): Promise<Response> {
       headers: {
         "content-type": contentType(extname(filePath)),
         "content-security-policy":
-          "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; frame-src https://www.youtube.com https://www.youtube-nocookie.com; connect-src 'self'; media-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'",
+          "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; frame-src https://www.youtube.com https://www.youtube-nocookie.com; connect-src 'self'; media-src blob:; object-src 'none'; base-uri 'none'; form-action 'none'",
         "x-content-type-options": "nosniff",
       },
     });
@@ -917,6 +920,10 @@ function installIpcHandlers(options: {
       input.target === "local" &&
       input.method === "POST" &&
       /^\/api\/projects\/[a-f0-9-]{36}\/web-page-sources$/iu.test(input.path);
+    const transcribesAudio =
+      input.target === "local" &&
+      input.method === "POST" &&
+      isLocalAudioTranscriptionPath(input.path);
     if (isPrivateDesktopSetupPath(input.path)) {
       return DesktopApiResponseSchema.parse({
         status: 403,
@@ -955,7 +962,7 @@ function installIpcHandlers(options: {
         });
       }
     }
-    if (input.target === "cloud" || importsWebPage) {
+    if (input.target === "cloud" || importsWebPage || transcribesAudio) {
       try {
         accessToken = await broker!.getAccessTokenForTrustedProxy();
       } catch {
@@ -1005,7 +1012,7 @@ function installIpcHandlers(options: {
       headers: {
         accept: "application/json",
         authorization:
-          input.target === "local" && !importsWebPage
+          input.target === "local" && !importsWebPage && !transcribesAudio
             ? `Bearer ${options.sessionSecret}`
             : `Bearer ${accessToken!}`,
         ...(input.contentType ? { "content-type": input.contentType } : {}),
@@ -1033,20 +1040,22 @@ function installIpcHandlers(options: {
           : {}),
       redirect: "error",
     });
-    const imageType = response.headers.get("content-type")?.split(";", 1)[0];
+    const mediaType = response.headers.get("content-type")?.split(";", 1)[0];
     if (
       response.ok &&
       input.target === "cloud" &&
       input.method === "GET" &&
-      isDesktopResearchImageRead(input.path) &&
-      imageType &&
-      ["image/png", "image/jpeg", "image/webp"].includes(imageType)
+      mediaType &&
+      ((isDesktopResearchImageRead(input.path) &&
+        ["image/png", "image/jpeg", "image/webp"].includes(mediaType)) ||
+        (isDesktopAudioPlaybackPath(input.path) &&
+          AudioMimeSchema.safeParse(mediaType).success))
     ) {
       return DesktopApiResponseSchema.parse({
         status: response.status,
         body: "",
         bytes: new Uint8Array(await response.arrayBuffer()),
-        contentType: imageType,
+        contentType: mediaType,
       });
     }
     let body = await response.text();

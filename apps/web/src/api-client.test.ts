@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { DesktopApiResponseSchema } from "@research-video/contracts";
 
 import { apiFetch } from "./api-client.ts";
 
@@ -74,6 +75,50 @@ describe("desktop API client", () => {
       apiFetch("cloud", `${base}/sources`, { method: "POST", body: form }),
     ).rejects.toThrow();
     expect(request).toHaveBeenCalledTimes(2);
+  });
+
+  it("restricts raw Speech bytes to the authenticated workstation route", async () => {
+    const project = "019fbb95-cd76-7920-93fa-e23ba755ee40";
+    const path = `/api/projects/${project}/audio/${project}/transcript`;
+    const bytes = new Uint8Array([82, 73, 70, 70]);
+    const request = vi.fn(async () => ({ status: 200, body: "{}" }));
+    vi.stubGlobal("window", { researchVideoDesktop: { request } });
+    const body = new Blob([bytes], { type: "audio/wav" });
+    await apiFetch("local", path, { method: "POST", body });
+    expect(request).toHaveBeenCalledExactlyOnceWith({
+      target: "local",
+      path,
+      method: "POST",
+      bytes,
+      contentType: "application/octet-stream",
+    });
+    await expect(
+      apiFetch("cloud", path, { method: "POST", body }),
+    ).rejects.toThrow();
+    await expect(
+      apiFetch("local", path + "?other=true", { method: "POST", body }),
+    ).rejects.toThrow();
+    expect(request).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the previous binary size limit for desktop pictures", () => {
+    const payload = {
+      status: 200,
+      body: "",
+      bytes: new Uint8Array(24 * 1024 * 1024 + 1),
+    };
+    expect(
+      DesktopApiResponseSchema.safeParse({
+        ...payload,
+        contentType: "audio/wav",
+      }).success,
+    ).toBe(true);
+    expect(
+      DesktopApiResponseSchema.safeParse({
+        ...payload,
+        contentType: "image/png",
+      }).success,
+    ).toBe(false);
   });
 
   it("retains the explicit browser-development authorization header", async () => {

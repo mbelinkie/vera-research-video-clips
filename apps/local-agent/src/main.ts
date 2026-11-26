@@ -65,6 +65,7 @@ import {
 } from "@research-video/media";
 import { withInstalledExportWorkerAvailability } from "@research-video/export-settings";
 
+import { createLibraryAudioTranscriber } from "@research-video/providers/library-audio-speech";
 import { createLocalAgent } from "./app.ts";
 import { createClipCutRunner } from "./clip-cut-runtime.ts";
 import { createWebPageImporter } from "./web-page/import.ts";
@@ -442,7 +443,38 @@ if (desktopSessionSecret) {
   });
 }
 
+const localSpeechModel = desktopSetup
+  .getSnapshot()
+  .activeComponents.find((component) => component.target === "whisper_model");
+const localSpeech =
+  persistedDesktopSetup?.speechToTextProvider === "whisper_cpp" &&
+  trustedDesktopConfig.whisperCli &&
+  trustedDesktopConfig.whisperModel &&
+  trustedDesktopConfig.ffmpeg
+    ? {
+        executable: trustedDesktopConfig.whisperCli,
+        modelPath: trustedDesktopConfig.whisperModel,
+        modelName:
+          localSpeechModel?.version ??
+          localSpeechModel?.displayName ??
+          "Whisper",
+        ffmpeg: trustedDesktopConfig.ffmpeg,
+      }
+    : !isDesktopRuntime && config.speechToTextProvider === "whisper-cpp"
+      ? {
+          executable: config.whisperCppPath,
+          modelPath: config.whisperCppModelPath!,
+          modelName: config.whisperCppModelName!,
+          ffmpeg: process.env.FFMPEG_PATH ?? ffmpegPath,
+        }
+      : undefined;
 app = createLocalAgent({
+  audioSpeech: {
+    cloudOrigin: cloudApiUrl,
+    ...(localSpeech
+      ? { transcribe: createLibraryAudioTranscriber(localSpeech) }
+      : {}),
+  },
   importWebPage: createWebPageImporter(cloudApiUrl),
   cutLoggedClips: createClipCutRunner(
     config,

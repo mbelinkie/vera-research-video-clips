@@ -56,6 +56,7 @@ import {
   S3TranscriptObjectStore,
 } from "@research-video/storage";
 
+import { createLibraryAudioTranscriber } from "@research-video/providers/library-audio-speech";
 import { authenticateDevBearer, createCloudApi } from "./app.ts";
 import {
   cloudflareAccessVerifier,
@@ -291,6 +292,15 @@ const app = createCloudApi({
   counters,
   catalog,
   languageServices,
+  ...(config.speechToTextProvider === "whisper-cpp"
+    ? {
+        transcribePublicAudio: createLibraryAudioTranscriber({
+          executable: config.whisperCppPath,
+          modelPath: config.whisperCppModelPath!,
+          modelName: config.whisperCppModelName!,
+        }),
+      }
+    : {}),
   localModelArtifactDownloads: {
     issue: async (input) => {
       const stored = objectStore.head

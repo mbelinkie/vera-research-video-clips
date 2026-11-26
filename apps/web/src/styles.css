@@ -3511,3 +3511,133 @@ h1 {
 .add-layout[hidden] {
   display: none;
 }
+
+.audio-workspace,
+.audio-form,
+.audio-player,
+.audio-speech {
+  display: grid;
+  gap: 0.65rem;
+}
+
+.audio-workspace {
+  margin-block: 1rem;
+  max-width: 60rem;
+}
+
+.audio-workspace h3,
+.audio-form h3,
+.audio-workspace p {
+  margin: 0;
+}
+
+.audio-form,
+.audio-speech {
+  border-top: 1px solid var(--border, #64748b);
+  padding-top: 0.75rem;
+}
+
+.audio-form label,
+.audio-workspace > label {
+  display: grid;
+  gap: 0.3rem;
+}
+
+.audio-form button,
+.audio-player button {
+  justify-self: start;
+}
+
+.audio-waveform {
+  position: relative;
+  height: 5rem;
+  overflow: hidden;
+  border: 1px solid currentColor;
+  border-radius: 0.35rem;
+  color: var(--accent, #3b82f6);
+}
+
+.audio-waveform-peaks {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+}
+
+.audio-waveform-peaks span {
+  flex: 1;
+  height: var(--peak);
+  background: currentColor;
+  margin-inline: 0.25px;
+}
+
+.audio-waveform-selection {
+  position: absolute;
+  inset-block: 0;
+  background: color-mix(in srgb, currentColor 18%, transparent);
+}
+
+.audio-waveform-position {
+  position: absolute;
+  inset-block: 0;
+  border-left: 2px solid currentColor;
+}
+
+.audio-time-labels,
+.audio-bounds {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.audio-time-labels,
+.audio-selections span {
+  font-variant-numeric: tabular-nums;
+}
+
+.audio-player audio {
+  width: 100%;
+}
+
+.audio-bounds button {
+  margin-block-start: 0.35rem;
+}
+
+.audio-selections {
+  display: grid;
+  gap: 0.65rem;
+  padding-inline-start: 0;
+  list-style: none;
+}
+
+.audio-selections li {
+  display: grid;
+  justify-items: start;
+  gap: 0.25rem;
+}
+
+.audio-speech .transcript-list-wrap {
+  height: auto;
+  max-height: 18rem;
+  min-height: 3.5rem;
+}
+
+.transcript-list-wrap .transcript-window {
+  position: static;
+}
+
+.transcript-list-wrap .transcript-row {
+  height: auto;
+  min-height: 3rem;
+  grid-template-columns: 4rem 1fr;
+}
+
+.transcript-list-wrap .transcript-text {
+  display: block;
+  overflow: visible;
+}
+
+.transcript-list-wrap .cue-time {
+  white-space: nowrap;
+}

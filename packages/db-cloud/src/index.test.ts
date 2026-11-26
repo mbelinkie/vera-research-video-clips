@@ -111,15 +111,19 @@ describe("cloud migrations", () => {
 
     const applied = await runCloudMigrations(database);
 
-    expect(applied).toHaveLength(63);
-    expect(calls.filter((call) => call === "pool:connect")).toHaveLength(64);
-    expect(calls.filter((call) => call === "client:BEGIN")).toHaveLength(64);
+    expect(applied).toHaveLength(65);
+    expect(calls.filter((call) => call === "pool:connect")).toHaveLength(
+      applied.length + 1,
+    );
+    expect(calls.filter((call) => call === "client:BEGIN")).toHaveLength(
+      applied.length + 1,
+    );
     for (const lock of ["7245850, 50", "$1"]) {
       expect(
         calls.filter((call) =>
           call.startsWith(`client:SELECT pg_advisory_xact_lock(${lock})`),
         ),
-      ).toHaveLength(64);
+      ).toHaveLength(applied.length + 1);
     }
     expect(
       calls.some((call) =>
@@ -212,12 +216,14 @@ describe("cloud migrations", () => {
           "0053_project_library",
           "0054_library_source_reuse",
           "0055_library_still_assets",
+          "0056_library_audio_assets",
           "0057_verified_member_emails",
           "0059_extension_capture_assets",
           "0060_chrome_capture_connections",
           "0061_youtube_source_moments",
           "0062_library_reference_pictures",
           "0063_research_source_workspace",
+          "0064_library_audio_transcript",
         ]);
         expect(
           (
@@ -334,12 +340,14 @@ describe("cloud migrations", () => {
       "0053_project_library",
       "0054_library_source_reuse",
       "0055_library_still_assets",
+      "0056_library_audio_assets",
       "0057_verified_member_emails",
       "0059_extension_capture_assets",
       "0060_chrome_capture_connections",
       "0061_youtube_source_moments",
       "0062_library_reference_pictures",
       "0063_research_source_workspace",
+      "0064_library_audio_transcript",
     ]);
     expect(await runCloudMigrations(database)).toEqual([]);
     expect(

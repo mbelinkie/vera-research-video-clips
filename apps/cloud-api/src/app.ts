@@ -175,7 +175,13 @@ import {
 } from "@research-video/providers";
 import type { LanguageServiceRegistry } from "@research-video/providers/language-service-registry";
 import { transcriptToSrt } from "@research-video/transcript";
+import type { LibraryAudioTranscriber } from "@research-video/providers/library-audio-speech";
 
+import {
+  registerAudioRoutes,
+  type PublicAudioReader,
+  type PublicAudioPreparation,
+} from "./audio-import.ts";
 import { registerChromeConnection } from "./chrome-connection.ts";
 import { registerExtensionCaptureRoutes } from "./extension-capture.ts";
 import type { BrowserAuth } from "./browser-auth/routes.ts";
@@ -196,6 +202,9 @@ export interface CloudApiDependencies {
   verifyActiveTranscriptArtifacts?: boolean;
   videoMetadataProvider?: VideoMetadataProvider;
   publicStillReader?: PublicStillReader;
+  publicAudioReader?: PublicAudioReader;
+  transcribePublicAudio?: LibraryAudioTranscriber;
+  publicAudioPreparation?: PublicAudioPreparation;
   localArtifacts?: {
     store: TranscriptObjectStore;
     issuer: LocalStagedUploadUrlIssuer;
@@ -1986,6 +1995,9 @@ export function createCloudApi(
     },
   );
 
+  app.register(async (audioRoutes) => {
+    registerAudioRoutes(audioRoutes, dependencies);
+  });
   app.register(async (stillRoutes) => {
     registerStillRoutes(stillRoutes, dependencies);
   });
