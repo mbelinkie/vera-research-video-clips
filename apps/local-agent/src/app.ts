@@ -2427,6 +2427,7 @@ function localFailureClass(
   if (code?.includes("storage")) return "storage_insufficient" as const;
   if (
     code === "local_cache_integrity_failed" ||
+    code === "transcript_integrity_failed" ||
     code === "transcript_workspace_identity_mismatch" ||
     code?.includes("verification") ||
     code?.includes("artifact")
@@ -2469,6 +2470,8 @@ function localFailureMessage(
     case "storage_insufficient":
       return "Local storage is insufficient for this operation.";
     case "verification_failed":
+      if (candidateCode === "transcript_integrity_failed")
+        return "Published transcript unavailable. Stored content could not be verified.";
       return "Local data verification failed. Refresh the transcript when the project connection is available.";
     case "provider_unavailable":
       return "A required local or cloud provider is unavailable.";
@@ -2535,6 +2538,7 @@ const SafeLocalErrorCodes = new Set([
   "project_clip_access_failed",
   "shared_transcript_unavailable",
   "tool_probe_failed",
+  "transcript_integrity_failed",
   "transcript_workspace_identity_mismatch",
   "unsupported",
   "web_page_import_failed",

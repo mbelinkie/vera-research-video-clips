@@ -411,3 +411,52 @@ describe("managed local Research configuration", () => {
     }
   });
 });
+
+describe("AWS development durability", () => {
+  const durable = {
+    AWS_DEV_DURABILITY: "enabled",
+    CLOUD_AUTH_MODE: "cognito",
+    COGNITO_USER_POOL_ID: "us-east-1_example",
+    COGNITO_CLIENT_ID: "public-fixture",
+    COGNITO_DOMAIN: "https://auth.example.test",
+    COGNITO_REDIRECT_URI: "research-video-clips://oauth/callback",
+    COGNITO_LOGOUT_URI: "research-video-clips://oauth/logout",
+    PUBLIC_API_ORIGIN: "https://api.example.test",
+    OBJECT_STORE_MODE: "s3",
+    TRANSCRIPT_BUCKET: "fixture-transcripts",
+    QUEUE_MODE: "sqs",
+    JOB_QUEUE_URL:
+      "https://sqs.us-east-1.amazonaws.com/123456789012/transcription",
+  };
+
+  it("keeps ordinary memory mode and requires explicit durable config", () => {
+    expect(loadConfig({})).toMatchObject({
+      awsDevDurability: "disabled",
+      objectStoreMode: "memory",
+      queueMode: "memory",
+    });
+    expect(loadConfig(durable)).toMatchObject({
+      awsDevDurability: "enabled",
+      cloudDatabaseMode: "pglite",
+      objectStoreMode: "s3",
+      queueMode: "sqs",
+    });
+  });
+
+  it.each([
+    { OBJECT_STORE_MODE: "memory" },
+    { QUEUE_MODE: "memory" },
+    { TRANSCRIPT_BUCKET: undefined },
+    { JOB_QUEUE_URL: undefined },
+    { JOB_QUEUE_URL: "%%% invalid %%%" },
+    { JOB_QUEUE_URL: "https://sqs.us-west-1.amazonaws.com/123456789012/jobs" },
+    {
+      JOB_QUEUE_URL:
+        "https://sqs.us-east-1.amazonaws.com/123456789012/jobs.fifo",
+    },
+    { CLOUD_AUTH_MODE: "development" },
+    { PUBLIC_API_ORIGIN: "http://api.example.test" },
+  ])("rejects an unsafe durable configuration: %j", (override) => {
+    expect(() => loadConfig({ ...durable, ...override })).toThrow();
+  });
+});
