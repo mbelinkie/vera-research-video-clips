@@ -482,6 +482,21 @@ The research project owns the canonical clip record and verified reusable clip
 packages. A script build may copy or clone a verified package into its own
 project workspace, but it must not move or mutate the canonical package.
 
+### 5.10 Library audio
+
+Add an audio file or a public audio URL in the selected project's Sources tab.
+Open the source to play its waveform and log named in/out selections, with
+optional role and Topics. The Library shows saved selections and plays their
+ranges where the audio is available.
+
+File imports share a waveform and up to 15 seconds of low-resolution audio.
+Relink the matching original on the workstation for full playback. URL imports
+keep a verified project asset. Mark a source Speech and request transcription
+to share the transcript with project members. Private files use the connected
+workstation's local Whisper. Kept URL assets can use workstation or Research
+host Whisper. Transcript selections retain their excerpt and cue-level timing
+and can be trimmed before saving.
+
 ## 6. Transcript acquisition and normalization
 
 ### 6.1 Resolution order

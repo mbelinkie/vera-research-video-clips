@@ -71,6 +71,7 @@ export async function apiFetch(
   developmentAuthorization?: string,
 ): Promise<Response> {
   const bridge = desktopBridge();
+  const method = (options.method ?? "GET").toUpperCase();
   const multipart =
     bridge && options.body instanceof FormData
       ? new Request(window.location.href, {
@@ -80,7 +81,7 @@ export async function apiFetch(
       : undefined;
   const localAudio =
     target === "local" &&
-    options.method === "POST" &&
+    method === "POST" &&
     isLocalAudioTranscriptionPath(path) &&
     options.body instanceof Blob
       ? options.body
@@ -90,7 +91,7 @@ export async function apiFetch(
   options.signal?.throwIfAborted();
   const request = DesktopApiRequestSchema.parse({
     target,
-    method: (options.method ?? "GET").toUpperCase(),
+    method,
     path,
     ...(localAudio
       ? {

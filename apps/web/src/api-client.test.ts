@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { DesktopApiResponseSchema } from "@research-video/contracts";
 
 import { apiFetch } from "./api-client.ts";
 
@@ -98,6 +99,26 @@ describe("desktop API client", () => {
       apiFetch("local", path + "?other=true", { method: "POST", body }),
     ).rejects.toThrow();
     expect(request).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the previous binary size limit for desktop pictures", () => {
+    const payload = {
+      status: 200,
+      body: "",
+      bytes: new Uint8Array(24 * 1024 * 1024 + 1),
+    };
+    expect(
+      DesktopApiResponseSchema.safeParse({
+        ...payload,
+        contentType: "audio/wav",
+      }).success,
+    ).toBe(true);
+    expect(
+      DesktopApiResponseSchema.safeParse({
+        ...payload,
+        contentType: "image/png",
+      }).success,
+    ).toBe(false);
   });
 
   it("retains the explicit browser-development authorization header", async () => {

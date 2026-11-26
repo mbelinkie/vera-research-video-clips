@@ -1,5 +1,6 @@
 import { z } from "zod";
 import {
+  AudioMimeSchema,
   ClipTagNameSchema,
   MaxAudioBytes,
   MaxAudioDurationMs,
@@ -348,7 +349,20 @@ export const DesktopApiResponseSchema = z
     bytes: DesktopAudioBytes.optional(),
     contentType: z.string().max(160).optional(),
   })
-  .strict();
+  .strict()
+  .superRefine(({ bytes, contentType }, context) => {
+    if (
+      bytes &&
+      !AudioMimeSchema.safeParse(contentType).success &&
+      !DesktopResearchImageBytes.safeParse(bytes).success
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["bytes"],
+        message: "This Research asset exceeds the desktop response size limit.",
+      });
+    }
+  });
 
 export const DesktopTimedTranscriptUploadRequestSchema = z
   .object({
