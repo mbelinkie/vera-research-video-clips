@@ -45,6 +45,7 @@ import {
   hostedNativeEnglishTrack,
 } from "./clip-request.ts";
 import { ChromePairing } from "./chrome-pairing.tsx";
+import { ResearchProject, type ResearchTab } from "./research-project.tsx";
 import { BatchWorkspace } from "./batch-workspace.tsx";
 import { StillsWorkspace } from "./stills-workspace.tsx";
 import { TypedQuotesWorkspace } from "./typed-quotes-workspace.tsx";
@@ -68,7 +69,6 @@ import {
 import {
   parseYouTubeSourceReceipt,
   sourceReceiptReturnTo,
-  YouTubeSourceView,
   type SourceReceipt,
 } from "./youtube-source-view.tsx";
 
@@ -103,6 +103,7 @@ function formatPreciseTime(milliseconds: number) {
 }
 
 function App() {
+  const [researchTab, setResearchTab] = useState<ResearchTab>("sources");
   const [sourceReceipt, setSourceReceipt] = useState<SourceReceipt | undefined>(
     () => parseYouTubeSourceReceipt(window.location.search),
   );
@@ -155,6 +156,7 @@ function App() {
       `?projectId=${encodeURIComponent(nextProjectId)}&sourceId=${encodeURIComponent(sourceId)}`,
     );
     if (!receipt) return;
+    setResearchTab("sources");
     setSourceReceipt(receipt);
     setProjectId(receipt.projectId);
     setLoadRequest(undefined);
@@ -184,6 +186,7 @@ function App() {
   }
 
   const clearPrivateState = useCallback(() => {
+    setResearchTab("sources");
     setProjects([]);
     setProjectId("");
     setSourceReceipt(undefined);
@@ -946,6 +949,15 @@ function App() {
     seekTo(visibleSegments[next]!.startMs, "cue");
   }
 
+  const activeProject = authorization
+    ? projects.find((project) => project.id === projectId)
+    : undefined;
+  const activeReceipt =
+    sourceReceipt?.projectId === projectId ? sourceReceipt : undefined;
+  const onUnavailable = managedResearch ? loseManagedConnection : loseSession;
+  const hideResearchTools =
+    researchTab !== "sources" || Boolean(activeProject && activeReceipt);
+
   if (browserMode && (!session?.authenticated || !session.registered)) {
     return (
       <main className="shell">
@@ -1017,10 +1029,10 @@ function App() {
       )}
       <header className="topbar">
         <div>
-          <p className="eyebrow">Research video workspace</p>
-          <h1>Navigate video by transcript</h1>
+          <h1>
+            {explicitFixture ? "Navigate video by transcript" : "Research"}
+          </h1>
         </div>
-        <span className="status">Milestone 4 in progress</span>
       </header>
 
       {managedResearch && managedIssue && (
@@ -1032,24 +1044,89 @@ function App() {
         </div>
       )}
 
-      {sourceReceipt && projectId === sourceReceipt.projectId ? (
-        <YouTubeSourceView
-          key={`${sourceReceipt.projectId}/${sourceReceipt.sourceId}`}
-          receipt={sourceReceipt}
-          authorization={authorization}
-          {...(csrfToken ? { csrfToken } : {})}
-          projectName={
-            projects.find((project) => project.id === projectId)?.name ?? ""
+      {projects.length > 0 && (
+        <label className="project-picker" htmlFor="batch-project">
+          <span>Target project</span>
+          <select
+            id="batch-project"
+            value={projectId}
+            onChange={(event) => {
+              if (sourceReceipt) closeSourceReceipt();
+              setProjectId(event.target.value);
+            }}
+          >
+            {projects.map((project) => (
+              <option key={project.id} value={project.id}>
+                {project.name}
+              </option>
+            ))}
+          </select>
+        </label>
+      )}
+      <nav className="research-tabs" aria-label="Research">
+        <button
+          type="button"
+          aria-current={researchTab === "sources" ? "page" : undefined}
+          onClick={() => setResearchTab("sources")}
+        >
+          Sources
+        </button>
+        <button
+          type="button"
+          disabled={!activeProject}
+          aria-current={researchTab === "library" ? "page" : undefined}
+          onClick={() => setResearchTab("library")}
+        >
+          Library
+        </button>
+      </nav>
+      {activeProject && (
+        <ResearchProject
+          key={JSON.stringify([projectId, authorization, csrfToken])}
+          project={activeProject}
+          auth={{ authorization, csrfToken, onUnavailable }}
+          browserSession={browserMode || managedResearch}
+          localImport={managedResearch}
+          canWrite={
+            !("currentUserRole" in activeProject) ||
+            activeProject.currentUserRole !== "viewer"
           }
-          onAuthUnavailable={
-            managedResearch ? loseManagedConnection : loseSession
+          tab={researchTab}
+          sourceId={activeReceipt?.sourceId}
+          onOpenSource={(id) => openSourceReceipt(projectId, id)}
+          onCloseSource={closeSourceReceipt}
+          onAddYouTube={() => document.getElementById("video-url")?.focus()}
+          onReviewVideo={(source) => {
+            const videoUrl =
+              source.sourceIdentity?.canonicalUrl ??
+              source.bibliography.url?.value;
+            if (videoUrl) {
+              closeSourceReceipt();
+              loadVideoUrl(videoUrl);
+              window.requestAnimationFrame(() =>
+                document.getElementById("video-url")?.focus(),
+              );
+            }
+          }}
+          legacyLibrary={
+            <button
+              type="button"
+              onClick={() => {
+                closeSourceReceipt();
+                setResearchTab("sources");
+                window.requestAnimationFrame(() =>
+                  document.getElementById("queue-title")?.scrollIntoView(),
+                );
+              }}
+            >
+              Clip queue and CSV export
+            </button>
           }
-          onClose={closeSourceReceipt}
         />
-      ) : null}
+      )}
       <form
         className="loader"
-        hidden={Boolean(sourceReceipt && projectId === sourceReceipt.projectId)}
+        hidden={hideResearchTools}
         onSubmit={(event) => {
           event.preventDefault();
           loadVideo();
@@ -1076,7 +1153,7 @@ function App() {
 
       <section
         className="workspace"
-        hidden={Boolean(sourceReceipt && projectId === sourceReceipt.projectId)}
+        hidden={hideResearchTools}
         aria-label="Research workspace"
       >
         <article className="panel transcript-panel">
@@ -1646,6 +1723,7 @@ function App() {
         </aside>
       </section>
       <BatchWorkspace
+        hidden={hideResearchTools}
         authorization={authorization}
         browserSession={browserMode || managedResearch}
         csrfToken={csrfToken}
@@ -1672,8 +1750,10 @@ function App() {
         onProjectsChange={setProjects}
         projectId={projectId}
         projects={projects}
+        hideProjectPicker={Boolean(projects.length)}
       />
       <StillsWorkspace
+        hidden={hideResearchTools}
         key={JSON.stringify([
           "stills",
           projectId,
@@ -1690,6 +1770,7 @@ function App() {
         projects={projects}
       />
       <TypedQuotesWorkspace
+        hidden={hideResearchTools}
         key={JSON.stringify([
           "quotes",
           projectId,
