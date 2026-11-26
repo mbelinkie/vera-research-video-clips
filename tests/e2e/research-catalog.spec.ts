@@ -269,15 +269,16 @@ async function research(page: Page, options: { reader?: boolean } = {}) {
       if (match[2] === "/discussion" && method === "POST") {
         const { id, body } = req.postDataJSON();
         replies.push({ sourceId: source.id, id, body });
+        const count = counts[source.id] ?? { total: 0, unread: 0 };
         counts[source.id] = {
-          total: counts[source.id].total + 1,
-          unread: counts[source.id].unread,
+          total: count.total + 1,
+          unread: count.unread,
         };
         return route.fulfill({ json: { id }, status: 201 });
       }
       if (match[2] === "/discussion/read") {
         expect(req.postDataJSON()).toEqual([id(51)]);
-        counts[source.id] = { total: 2, unread: 0 };
+        counts[source.id] = { total: counts[source.id]?.total ?? 2, unread: 0 };
         return route.fulfill({ json: { [source.id]: counts[source.id] } });
       }
     }
