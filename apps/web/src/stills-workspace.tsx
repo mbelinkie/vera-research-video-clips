@@ -9,7 +9,7 @@ import {
   type Project,
 } from "@research-video/contracts";
 
-import { cloudFetch } from "./browser-api.ts";
+import { researchCloudFetch as cloudFetch } from "./research-library-data.ts";
 import {
   containedImageRect,
   drawnCrop,
@@ -24,12 +24,15 @@ import {
 } from "./still-crop-geometry.ts";
 
 type StillsWorkspaceProps = {
+  hidden?: boolean;
   authorization: string;
   browserSession?: boolean;
   csrfToken?: string | undefined;
   onAuthUnavailable: (() => void) | undefined;
   projectId: string;
   projects: readonly Project[];
+  initialMode?: ImportMode;
+  onClose?: () => void;
 };
 
 type ImportMode = "url" | "file" | "page_picture";
@@ -253,21 +256,26 @@ function StillThumbnail({
 }
 
 export function StillsWorkspace({
+  hidden,
   authorization,
   browserSession = false,
   csrfToken,
   onAuthUnavailable,
   projectId,
   projects,
+  initialMode,
+  onClose,
 }: StillsWorkspaceProps) {
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useState(Boolean(initialMode));
   const [items, setItems] = useState<LibraryItem[]>([]);
   const [pageSources, setPageSources] = useState<LibrarySource[]>([]);
   const [loadedSources, setLoadedSources] = useState<LibrarySource[]>([]);
   const [selectedItemId, setSelectedItemId] = useState("");
   const [loading, setLoading] = useState(false);
   const [loadError, setLoadError] = useState<string>();
-  const [importMode, setImportMode] = useState<ImportMode>("url");
+  const [importMode, setImportMode] = useState<ImportMode>(
+    initialMode ?? "url",
+  );
   const [draft, setDraft] = useState<Draft>(() => emptyDraft());
   const [file, setFile] = useState<File>();
   const [filePreviewUrl, setFilePreviewUrl] = useState<string>();
@@ -1049,7 +1057,11 @@ export function StillsWorkspace({
   }, [currentSourceForForm, importMode, pageSourceUrl]);
 
   return (
-    <section className="stills-workspace" aria-labelledby="stills-title">
+    <section
+      className="stills-workspace"
+      hidden={hidden}
+      aria-labelledby="stills-title"
+    >
       <div className="section-heading">
         <div>
           <p className="eyebrow">Project library</p>
@@ -1063,7 +1075,10 @@ export function StillsWorkspace({
             type="button"
             disabled={formBusy || editBusy}
             onClick={() => {
-              if (open) resetForm();
+              if (open) {
+                resetForm();
+                onClose?.();
+              }
               setOpen(!open);
             }}
           >
