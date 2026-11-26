@@ -60,6 +60,7 @@ import {
   desktopBridge,
   DESKTOP_CONNECTED_SENTINEL,
 } from "./api-client.ts";
+import { ResearchProject } from "./research-project.tsx";
 import { BatchWorkspace } from "./desktop-batch-workspace.tsx";
 import {
   pollWorkspaceRetry,
@@ -454,6 +455,10 @@ function App() {
   const [projectsLoaded, setProjectsLoaded] = useState(false);
   const [projectId, setProjectId] = useState("");
   const [destination, setDestination] = useState<ProjectDestination>("videos");
+  const [researchSource, setResearchSource] = useState<{
+    projectId: string;
+    sourceId: string;
+  }>();
   const [notificationTarget, setNotificationTarget] =
     useState<DesktopNotificationNavigationTarget>();
   const [pendingNotificationTarget, setPendingNotificationTarget] =
@@ -2089,6 +2094,7 @@ function App() {
 
   function selectProject(nextProjectId: string) {
     if (nextProjectId !== projectId) {
+      setResearchSource(undefined);
       videoLoadGeneration.current += 1;
       setVideoLoadBusy(false);
       setVideoLoadMessage(undefined);
@@ -2759,6 +2765,14 @@ function App() {
     seekTo(match.startMs, match.timingPrecision);
   }
 
+  const activeProject = authorization
+    ? projects.find((project) => project.id === projectId)
+    : undefined;
+  const activeResearchSource =
+    researchSource?.projectId === projectId
+      ? researchSource.sourceId
+      : undefined;
+
   return (
     <WorkspaceShell
       projects={projects}
@@ -2777,7 +2791,58 @@ function App() {
         label: entry.title ?? entry.youtubeVideoId,
       }))}
       onProjectChange={selectProject}
-      onDestinationChange={setDestination}
+      onDestinationChange={(next) => {
+        setResearchSource(undefined);
+        setDestination(next);
+      }}
+      sourceOpen={
+        destination === "videos" &&
+        Boolean(activeProject && activeResearchSource)
+      }
+      researchContent={
+        activeProject &&
+        (destination === "videos" || destination === "clips") && (
+          <ResearchProject
+            key={JSON.stringify([projectId, authorization, user?.id])}
+            project={activeProject}
+            auth={{ authorization }}
+            browserSession={false}
+            localImport
+            canWrite={activeProject.currentUserRole !== "viewer"}
+            tab={destination === "clips" ? "library" : "sources"}
+            sourceId={activeResearchSource}
+            onOpenSource={(sourceId) => {
+              setResearchSource({ projectId, sourceId });
+              setDestination("videos");
+            }}
+            onCloseSource={() => setResearchSource(undefined)}
+            onAddYouTube={() => document.getElementById("video-url")?.focus()}
+            onReviewVideo={(source) => {
+              const video = projectVideos?.find(
+                (candidate) => candidate.id === source.id,
+              );
+              if (video?.canonicalUrl && video.youtubeVideoId) {
+                setResearchSource(undefined);
+                openProjectVideo({
+                  projectId,
+                  catalogVideoId: video.id,
+                  canonicalUrl: video.canonicalUrl,
+                  youtubeVideoId: video.youtubeVideoId,
+                  ...(video.title ? { title: video.title } : {}),
+                });
+              } else {
+                setResearchSource(undefined);
+                setError(
+                  "This source has no published transcript in the selected project.",
+                );
+                requestAnimationFrame(() =>
+                  document.getElementById("video-url")?.focus(),
+                );
+              }
+            }}
+          />
+        )
+      }
       onBack={navigateBack}
       onNavigationHistorySelect={(id) => {
         const snapshot = navigationBackStack[Number(id)];

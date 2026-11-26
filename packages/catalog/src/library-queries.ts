@@ -77,6 +77,7 @@ export async function listLibrarySources(
 ) {
   const { rows } = await db.query(
     `SELECT s.* FROM project_library_sources s
+     JOIN library_sources record ON (record.project_id, record.id)=(s.project_id, s.id)
      WHERE s.project_id = $1
        AND ($2::text IS NULL OR s.kind = $2)
        AND ($3::text IS NULL OR EXISTS (
@@ -88,7 +89,7 @@ export async function listLibrarySources(
            AND t.normalized_name = $3
        ))
        AND ($4::text IS NULL OR ${sourceTextMatches})
-     ORDER BY s.id
+     ORDER BY CASE WHEN $7::boolean THEN record.created_at END DESC, s.id
      LIMIT $5 OFFSET $6`,
     [
       projectId,
@@ -97,6 +98,7 @@ export async function listLibrarySources(
       query.q ?? null,
       query.limit,
       query.offset,
+      query.sort === "recent",
     ],
   );
   return rows.map(mapSource);

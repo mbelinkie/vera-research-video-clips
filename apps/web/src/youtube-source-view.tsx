@@ -7,7 +7,7 @@ import {
 } from "@research-video/contracts";
 import { normalizeYouTubeUrl } from "@research-video/providers";
 
-import { cloudFetch } from "./browser-api.ts";
+import { researchRequest } from "./research-library-data.ts";
 import { YouTubePlayer, type YouTubePlayerHandle } from "./youtube-player.tsx";
 
 type SourceReceipt = Readonly<{
@@ -22,6 +22,7 @@ type YouTubeSourceViewProps = Readonly<{
   projectName?: string;
   onAuthUnavailable?: () => void;
   onClose(): void;
+  nested?: boolean;
 }>;
 
 const uuidPattern =
@@ -77,6 +78,7 @@ export function YouTubeSourceView({
   projectName,
   onAuthUnavailable,
   onClose,
+  nested = false,
 }: YouTubeSourceViewProps) {
   const [details, setDetails] = useState<YouTubeSourceDetails>();
   const [videoId, setVideoId] = useState<string>();
@@ -103,10 +105,13 @@ export function YouTubeSourceView({
     pendingSeekRef.current = undefined;
     setState("loading");
     setMessage(undefined);
-    void cloudFetch(
-      `/cloud-api/api/projects/${encodeURIComponent(receipt.projectId)}/sources/${encodeURIComponent(receipt.sourceId)}/youtube-details`,
+    void researchRequest({
+      authorization,
+      csrfToken,
+      onUnavailable: onAuthUnavailable,
+    })(
+      `/api/projects/${encodeURIComponent(receipt.projectId)}/sources/${encodeURIComponent(receipt.sourceId)}/youtube-details`,
       { signal: controller.signal, headers: { accept: "application/json" } },
-      { authorization, csrfToken, onUnavailable: onAuthUnavailable },
     )
       .then(async (response) => {
         const payload = await response.json().catch(() => undefined);
@@ -170,9 +175,11 @@ export function YouTubeSourceView({
           <h2>{details?.title ?? "YouTube source"}</h2>
           {projectName ? <p className="muted">Project: {projectName}</p> : null}
         </div>
-        <button type="button" className="quiet-button" onClick={onClose}>
-          Back to workspace
-        </button>
+        {!nested && (
+          <button type="button" className="quiet-button" onClick={onClose}>
+            Back to workspace
+          </button>
+        )}
       </div>
 
       {state === "loading" ? (

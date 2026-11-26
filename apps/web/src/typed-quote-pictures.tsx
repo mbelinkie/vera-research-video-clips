@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 
-import { cloudFetch } from "./browser-api.ts";
+import { researchCloudFetch as cloudFetch } from "./research-library-data.ts";
 
 export type PictureOwner = "source" | "quote";
 

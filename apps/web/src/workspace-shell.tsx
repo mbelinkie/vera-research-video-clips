@@ -51,6 +51,8 @@ type WorkspaceShellProps = Readonly<{
   accountSettings: ReactNode;
   workspace: ReactNode;
   projectContent: ReactNode;
+  researchContent: ReactNode;
+  sourceOpen: boolean;
   projects: readonly ProjectSummary[];
   projectId: string;
   destination: ProjectDestination;
@@ -71,6 +73,8 @@ export function WorkspaceShell({
   accountSettings,
   workspace,
   projectContent,
+  researchContent,
+  sourceOpen,
   projects,
   projectId,
   destination,
@@ -209,7 +213,33 @@ export function WorkspaceShell({
         </details>
       </header>
 
-      <nav className="vera-destinations" aria-label="Project destinations">
+      <nav className="research-tabs" aria-label="Research">
+        <button
+          type="button"
+          aria-current={
+            destination === "videos" || destination === "workbench"
+              ? "page"
+              : undefined
+          }
+          onClick={() => onDestinationChange("videos")}
+        >
+          Sources
+        </button>
+        <button
+          type="button"
+          disabled={!activeProject}
+          aria-current={destination === "clips" ? "page" : undefined}
+          onClick={() => onDestinationChange("clips")}
+        >
+          Library
+        </button>
+      </nav>
+      {researchContent}
+      <nav
+        className="vera-destinations"
+        aria-label="Project tools"
+        hidden={sourceOpen}
+      >
         <button
           type="button"
           aria-current={destination === "videos" ? "page" : undefined}
@@ -282,7 +312,7 @@ export function WorkspaceShell({
       </nav>
 
       {destination === "videos" ? (
-        <div className="add-layout">
+        <div className="add-layout" hidden={sourceOpen}>
           <div className="workbench-ingest">{ingest}</div>
           <div className="workbench-project-session">{projectContent}</div>
         </div>

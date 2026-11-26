@@ -1,3 +1,4 @@
+import { z } from "zod";
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 import {
@@ -5,6 +6,7 @@ import {
   BatchPreflightResponseSchema,
   CreateTranscriptionBatchResponseSchema,
   ProjectSchema,
+  ProjectRoleSchema,
   VideoCommentSchema,
   type VideoComment,
   ReviewInboxResponseSchema,
@@ -40,6 +42,8 @@ import {
 } from "./spoken-language-choice.ts";
 
 type BatchWorkspaceProps = {
+  hidden?: boolean;
+  hideProjectPicker?: boolean;
   authorization: string;
   browserSession?: boolean;
   csrfToken?: string | undefined;
@@ -66,6 +70,8 @@ type LanguageDecisionDraft = {
 };
 
 export function BatchWorkspace({
+  hidden,
+  hideProjectPicker,
   authorization,
   browserSession = false,
   csrfToken,
@@ -215,9 +221,11 @@ export function BatchWorkspace({
   async function connect() {
     setBusy(true);
     try {
-      const loaded = ProjectSchema.array().parse(
-        await request("/api/projects"),
-      );
+      const loaded = ProjectSchema.and(
+        z.object({ currentUserRole: ProjectRoleSchema.optional() }),
+      )
+        .array()
+        .parse(await request("/api/projects"));
       onProjectsChange(loaded);
       onProjectChange(projectId || loaded[0]?.id || "");
       setMessage(
@@ -516,7 +524,11 @@ export function BatchWorkspace({
   }
 
   return (
-    <section className="batch-workspace" aria-labelledby="queue-title">
+    <section
+      hidden={hidden}
+      className="batch-workspace"
+      aria-labelledby="queue-title"
+    >
       <div className="section-heading">
         <div>
           <p className="eyebrow">Shared project preparation</p>
@@ -578,23 +590,25 @@ export function BatchWorkspace({
       )}
       {projects.length ? (
         <>
-          <label className="project-picker" htmlFor="batch-project">
-            <span>Target project</span>
-            <select
-              id="batch-project"
-              value={projectId}
-              onChange={(event) => {
-                onProjectChange(event.target.value);
-                setPreflight(undefined);
-              }}
-            >
-              {projects.map((project) => (
-                <option key={project.id} value={project.id}>
-                  {project.name}
-                </option>
-              ))}
-            </select>
-          </label>
+          {!hideProjectPicker && (
+            <label className="project-picker" htmlFor="batch-project">
+              <span>Target project</span>
+              <select
+                id="batch-project"
+                value={projectId}
+                onChange={(event) => {
+                  onProjectChange(event.target.value);
+                  setPreflight(undefined);
+                }}
+              >
+                {projects.map((project) => (
+                  <option key={project.id} value={project.id}>
+                    {project.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
 
           <ProjectMembersPanel
             key={`${projectId}:${authorization}:${csrfToken ?? ""}`}

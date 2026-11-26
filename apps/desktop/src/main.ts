@@ -19,6 +19,7 @@ import { CognitoOAuthClient } from "@research-video/auth";
 import {
   DesktopApiRequestSchema,
   DesktopApiResponseSchema,
+  isDesktopResearchImageRead,
   CloudProviderLaunchGrantSchema,
   DesktopTimedTranscriptUploadRequestSchema,
   CreateManualTimedTranscriptImportRequestSchema,
@@ -912,6 +913,10 @@ function installIpcHandlers(options: {
   ipcMain.handle(desktopIpcChannels.request, async (event, rawInput) => {
     requireTrustedRenderer(event);
     const input = DesktopApiRequestSchema.parse(rawInput);
+    const importsWebPage =
+      input.target === "local" &&
+      input.method === "POST" &&
+      /^\/api\/projects\/[a-f0-9-]{36}\/web-page-sources$/iu.test(input.path);
     if (isPrivateDesktopSetupPath(input.path)) {
       return DesktopApiResponseSchema.parse({
         status: 403,
@@ -950,7 +955,7 @@ function installIpcHandlers(options: {
         });
       }
     }
-    if (input.target === "cloud") {
+    if (input.target === "cloud" || importsWebPage) {
       try {
         accessToken = await broker!.getAccessTokenForTrustedProxy();
       } catch {
@@ -1000,7 +1005,7 @@ function installIpcHandlers(options: {
       headers: {
         accept: "application/json",
         authorization:
-          input.target === "local"
+          input.target === "local" && !importsWebPage
             ? `Bearer ${options.sessionSecret}`
             : `Bearer ${accessToken!}`,
         ...(input.contentType ? { "content-type": input.contentType } : {}),
@@ -1021,9 +1026,29 @@ function installIpcHandlers(options: {
             }
           : {}),
       },
-      ...(input.body !== undefined ? { body: input.body } : {}),
+      ...(input.bytes
+        ? { body: new Uint8Array(input.bytes).buffer }
+        : input.body !== undefined
+          ? { body: input.body }
+          : {}),
       redirect: "error",
     });
+    const imageType = response.headers.get("content-type")?.split(";", 1)[0];
+    if (
+      response.ok &&
+      input.target === "cloud" &&
+      input.method === "GET" &&
+      isDesktopResearchImageRead(input.path) &&
+      imageType &&
+      ["image/png", "image/jpeg", "image/webp"].includes(imageType)
+    ) {
+      return DesktopApiResponseSchema.parse({
+        status: response.status,
+        body: "",
+        bytes: new Uint8Array(await response.arrayBuffer()),
+        contentType: imageType,
+      });
+    }
     let body = await response.text();
     if (
       response.ok &&

@@ -215,6 +215,28 @@ export const DesktopStatusSchema = z
   })
   .strict();
 
+const MaxDesktopResearchImageBytes = 24 * 1024 * 1024;
+const DesktopResearchImageBytes = z
+  .instanceof(Uint8Array)
+  .refine(
+    (bytes) =>
+      bytes.byteLength > 0 && bytes.byteLength <= MaxDesktopResearchImageBytes,
+  );
+
+const desktopProjectPath = /^\/api\/projects\/[a-f0-9-]{36}\//iu;
+const desktopImageUploadPath =
+  /^(?:stills\/from-(?:file|page-picture)|library-reference-pictures\/(?:source|quote)\/[a-f0-9-]{36})$/iu;
+const desktopImageReadPath =
+  /^(?:stills\/[a-f0-9-]{36}\/assets\/(?:thumbnail|display)|library-reference-pictures\/(?:source|quote)\/[a-f0-9-]{36}\/(?:display|thumbnail)|extension-captures\/[a-f0-9-]{36}\/assets\/(?:top|passage))$/iu;
+
+export function isDesktopResearchImageRead(path: string) {
+  const pathname = path.split("?", 1)[0] ?? "";
+  return (
+    desktopProjectPath.test(pathname) &&
+    desktopImageReadPath.test(pathname.replace(desktopProjectPath, ""))
+  );
+}
+
 export const DesktopApiRequestSchema = z
   .object({
     target: z.enum(["cloud", "local"]),
@@ -225,10 +247,38 @@ export const DesktopApiRequestSchema = z
       .max(2_048)
       .regex(/^\/api\/[A-Za-z0-9?&=._~!$'()*+,;:@%\/-]*$/),
     body: z.string().max(2_000_000).optional(),
-    contentType: z.literal("application/json").optional(),
+    contentType: z
+      .union([
+        z.literal("application/json"),
+        z.string().regex(/^multipart\/form-data; boundary=[a-z0-9-]{1,70}$/iu),
+      ])
+      .optional(),
+    bytes: DesktopResearchImageBytes.optional(),
   })
   .strict()
   .superRefine((request, context) => {
+    if (
+      request.bytes !== undefined ||
+      request.contentType?.startsWith("multipart/")
+    ) {
+      if (
+        request.bytes === undefined ||
+        request.body !== undefined ||
+        !request.contentType?.startsWith("multipart/") ||
+        request.target !== "cloud" ||
+        request.method !== "POST" ||
+        !desktopProjectPath.test(request.path) ||
+        !desktopImageUploadPath.test(
+          request.path.replace(desktopProjectPath, ""),
+        )
+      )
+        context.addIssue({
+          code: "custom",
+          path: ["bytes"],
+          message:
+            "Desktop multipart uploads are limited to Research pictures.",
+        });
+    }
     let canonical: URL;
     try {
       canonical = new URL(request.path, "https://desktop.invalid");
@@ -259,6 +309,7 @@ export const DesktopApiResponseSchema = z
   .object({
     status: z.number().int().min(100).max(599),
     body: z.string().max(4_000_000),
+    bytes: DesktopResearchImageBytes.optional(),
     contentType: z.string().max(160).optional(),
   })
   .strict();
