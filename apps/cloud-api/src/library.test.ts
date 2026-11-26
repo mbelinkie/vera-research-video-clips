@@ -41,7 +41,7 @@ function createFixture() {
       const request = (
         method: "POST" | "GET" | "PATCH" | "DELETE",
         url: string,
-        payload?: Record<string, unknown>,
+        payload?: Record<string, unknown> | string[],
       ) =>
         app.inject({
           method,
@@ -133,6 +133,91 @@ function clipFixture(idempotencyKey: string, identity = sourceIdentity) {
 }
 
 describe("project Library API", () => {
+  it("keeps source discussion counts, read receipts and reply rights scoped by actor and source", async () => {
+    const { database, register } = createFixture();
+    await runCloudMigrations(database);
+    const owner = await register("discussion-owner");
+    const viewer = await register("discussion-viewer");
+    const outsider = await register("discussion-outsider");
+    const project = await owner.read("POST", "/api/projects", {
+      name: "Discussion fixture",
+    });
+    const otherProject = await owner.read("POST", "/api/projects", {
+      name: "Other discussion fixture",
+    });
+    const base = `/api/projects/${project.id}`;
+    await owner.request("POST", `${base}/members`, {
+      userId: viewer.id,
+      role: "viewer",
+    });
+    const article = await owner.read("POST", `${base}/sources`, {
+      kind: "web_page",
+    });
+    const video = await owner.read("POST", `${base}/sources`, {
+      kind: "youtube",
+      sourceIdentity,
+    });
+    const path = `${base}/sources/${article.id}/discussion`;
+    const videoPath = `${base}/sources/${video.id}/discussion`;
+    const first = { id: randomUUID(), body: "First reply" };
+    const second = { id: randomUUID(), body: "Second reply" };
+
+    expect(await owner.read("POST", path, first)).toEqual({ id: first.id });
+    expect(await owner.read("POST", path, first)).toEqual({ id: first.id });
+    expect(
+      (await owner.request("POST", path, { ...first, body: "Different reply" }))
+        .statusCode,
+    ).toBe(409);
+    await owner.read("POST", path, second);
+    await owner.read("POST", videoPath, {
+      id: first.id,
+      body: "YouTube reply",
+    });
+
+    expect(
+      (
+        await viewer.request("POST", path, {
+          id: randomUUID(),
+          body: "Forbidden",
+        })
+      ).statusCode,
+    ).toBe(403);
+    expect((await outsider.request("GET", path)).statusCode).toBe(403);
+    expect(
+      (
+        await owner.request(
+          "GET",
+          `/api/projects/${otherProject.id}/sources/${article.id}/discussion`,
+        )
+      ).statusCode,
+    ).toBe(404);
+
+    const readResult = await viewer.request("POST", `${path}/read`, [first.id]);
+    expect(readResult.statusCode, readResult.body).toBe(200);
+    expect(readResult.json()).toEqual({
+      [article.id]: { total: 2, unread: 1 },
+    });
+    const countsPath = `${base}/source-discussion-counts?ids=${article.id},${video.id}`;
+    expect(await viewer.read("GET", countsPath)).toEqual({
+      [article.id]: { total: 2, unread: 1 },
+      [video.id]: { total: 1, unread: 1 },
+    });
+    expect(await viewer.read("GET", path)).toMatchObject({
+      canReply: false,
+      comments: [
+        { id: first.id, authorName: "discussion-owner", unread: false },
+        { id: second.id, unread: true },
+      ],
+    });
+    expect(await owner.read("GET", path)).toMatchObject({
+      canReply: true,
+      comments: [
+        { id: first.id, unread: false },
+        { id: second.id, unread: false },
+      ],
+    });
+  });
+
   it("stores exact offline quotes and edits display text independently through deletion", async () => {
     const { database, register } = createFixture();
     await runCloudMigrations(database);
