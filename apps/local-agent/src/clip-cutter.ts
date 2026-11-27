@@ -1,5 +1,6 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
+  appendFile,
   lstat,
   mkdir,
   mkdtemp,
@@ -180,6 +181,20 @@ type ManifestArtifact = {
   cueCount?: number;
 };
 
+/** An ISO BMFF UUID box added after the verified media. Existing offsets
+ * and the encoded picture/audio payload stay exactly as rendered. */
+async function bindTranscriptClock(
+  path: string,
+  record: object,
+): Promise<void> {
+  const payload = Buffer.from(JSON.stringify(record), "utf8");
+  const header = Buffer.alloc(24);
+  header.writeUInt32BE(header.length + payload.length);
+  header.write("uuid", 4, "ascii");
+  Buffer.from("8a4266a98b524776bd451c894db33d53", "hex").copy(header, 8);
+  await appendFile(path, Buffer.concat([header, payload]));
+}
+
 async function verifiedArtifact(
   stage: string,
   name: string,
@@ -195,6 +210,7 @@ async function verifiedArtifact(
 async function verifyPackage(
   directory: string,
   manifestName: string,
+  manifestSha256: string,
   artifacts: ManifestArtifact[],
 ): Promise<void> {
   await assertSafeDirectory(directory);
@@ -215,7 +231,9 @@ async function verifyPackage(
       throw new Error("Clip package bytes changed during staging.");
     }
   }
-  await assertRegularMediaFile(join(directory, manifestName));
+  if ((await hashMediaFile(join(directory, manifestName))) !== manifestSha256) {
+    throw new Error("Clip package manifest changed during staging.");
+  }
   const manifest = JSON.parse(
     await readFile(join(directory, manifestName), "utf8"),
   ) as {
@@ -267,11 +285,16 @@ async function renderClip(
   const manifestName = `${clip.id}.json`;
   try {
     if (signal?.aborted) throw new Error("Clip cut canceled.");
-    await deps.renderer.render({
+    const selectedTrack = [tracks.english.track, tracks.original?.track].find(
+      (track) => track?.id === clip.selection.trackId,
+    );
+    const alignment = selectedTrack?.alignment;
+    const clock = await deps.renderer.render({
       sourcePath,
       outputPath: join(stage, mediaName),
       startMs,
       endMs,
+      ...(alignment?.audio ? { alignmentAudio: alignment.audio } : {}),
       ...(signal ? { signal } : {}),
     });
     await assertRegularMediaFile(join(stage, mediaName));
@@ -312,6 +335,21 @@ async function renderClip(
         "Rendered MP4 failed per-stream range coverage verification.",
       );
     }
+    const clockEvidence =
+      clock && selectedTrack && alignment?.audio
+        ? {
+            schemaVersion: 1,
+            transcriptVersionId: tracks.transcriptVersionId,
+            trackId: selectedTrack.id,
+            trackVersion: selectedTrack.version,
+            trackContentSha256: selectedTrack.contentSha256,
+            alignmentFingerprint: alignment.fingerprint,
+            alignmentAudioSha256: alignment.audio.hash,
+            ...clock,
+          }
+        : undefined;
+    if (clockEvidence)
+      await bindTranscriptClock(join(stage, mediaName), clockEvidence);
     const artifacts: ManifestArtifact[] = [
       await verifiedArtifact(stage, mediaName),
     ];
@@ -378,21 +416,29 @@ async function renderClip(
       exportStartMs: startMs,
       exportEndMs: endMs,
       outputDurationMs: media.durationMs,
+      ...(clockEvidence
+        ? {
+            transcriptClock: {
+              mediaSha256: artifacts[0]!.sha256,
+              ...clockEvidence,
+            },
+          }
+        : {}),
       artifacts,
     };
-    await writeFile(
-      join(stage, manifestName),
-      JSON.stringify(manifest, null, 2) + "\n",
-      {
-        flag: "wx",
-        mode: 0o600,
-      },
-    );
-    await verifyPackage(stage, manifestName, artifacts);
+    const manifestBytes = JSON.stringify(manifest, null, 2) + "\n";
+    const manifestSha256 = createHash("sha256")
+      .update(manifestBytes)
+      .digest("hex");
+    await writeFile(join(stage, manifestName), manifestBytes, {
+      flag: "wx",
+      mode: 0o600,
+    });
+    await verifyPackage(stage, manifestName, manifestSha256, artifacts);
     if (await exists(target))
       throw new Error("Clip package already exists; refusing overwrite.");
     await rename(stage, target);
-    await verifyPackage(target, manifestName, artifacts);
+    await verifyPackage(target, manifestName, manifestSha256, artifacts);
     return {
       clipId: clip.id,
       videoId: clip.video.youtubeVideoId,

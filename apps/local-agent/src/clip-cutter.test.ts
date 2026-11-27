@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import {
+  copyFile,
   mkdtemp,
   readFile,
   readdir,
@@ -194,6 +195,152 @@ async function fakeCutter(clips: ClipCandidate[]) {
 }
 
 describe("foreground logged clip cutter", () => {
+  it("binds a fractional, offset cut to the measured alignment audio and exact MP4", async () => {
+    const clip = makeClip();
+    clip.selection.exportStartMs = 400;
+    const other = makeClip();
+    other.selection.exportStartMs = 400;
+    const f = await fakeCutter([clip, other]);
+    const runner = new SpawnMediaCommandRunner();
+    const sourcePath = join(f.root, "source.mp4");
+    const sourceAudio = join(f.root, "source.flac");
+    const alignment = join(f.root, "alignment.wav");
+    const ffmpeg = (args: string[]) =>
+      runner.run(
+        "ffmpeg",
+        ["-nostdin", "-hide_banner", "-loglevel", "error", ...args],
+        { timeoutMs: 30_000 },
+      );
+    await ffmpeg([
+      "-f",
+      "lavfi",
+      "-i",
+      "testsrc2=s=64x64:r=24000/1001:d=4",
+      "-f",
+      "lavfi",
+      "-i",
+      "sine=frequency=440:sample_rate=48000:duration=4",
+      "-c:v",
+      "libx264",
+      "-threads",
+      "1",
+      "-pix_fmt",
+      "yuv420p",
+      "-c:a",
+      "aac",
+      "-output_ts_offset",
+      "2",
+      sourcePath,
+    ]);
+    await ffmpeg([
+      "-n",
+      "-i",
+      sourcePath,
+      "-map",
+      "0:a:0",
+      "-vn",
+      "-c:a",
+      "flac",
+      sourceAudio,
+    ]);
+    await ffmpeg([
+      "-n",
+      "-i",
+      sourceAudio,
+      "-map",
+      "0:a:0",
+      "-vn",
+      "-ar",
+      "16000",
+      "-ac",
+      "1",
+      "-c:a",
+      "pcm_s16le",
+      alignment,
+    ]);
+    const { stdout } = await runner.run("ffprobe", [
+      "-v",
+      "error",
+      "-select_streams",
+      "a:0",
+      "-show_entries",
+      "stream=duration_ts",
+      "-of",
+      "default=nk=1:nw=1",
+      alignment,
+    ]);
+    const durationSamples = Number(stdout.trim());
+    expect(durationSamples).toBeGreaterThan(60_000);
+    const audioHash = await hashMediaFile(alignment);
+    f.transcripts.getVerifiedTracks.mockImplementation(
+      async ({ clip: { id } }) => {
+        const transcript = structuredClone(baseTranscript);
+        transcript.track.alignment = {
+          artifactId: "numbered-cut-alignment",
+          fingerprint: "f".repeat(64),
+          sourceContentSha256: transcript.track.contentSha256,
+          audio: {
+            hash: `sha256:${id === clip.id ? audioHash : "0".repeat(64)}`,
+            sampleRate: 16_000,
+            durationSamples,
+          },
+        };
+        return {
+          english: transcript,
+          transcriptVersionId: "019fbb95-cd76-7920-93fa-e23ba755e399",
+        };
+      },
+    );
+    f.acquirer.acquireAuthorizedVideo.mockImplementation(
+      async ({ videoId, scratchDirectory }) => {
+        const scratchPath = join(scratchDirectory, `video-${videoId}.mp4`);
+        await copyFile(sourcePath, scratchPath);
+        return {
+          videoId,
+          scratchPath,
+          format: "mp4",
+          byteSize: (await stat(scratchPath)).size,
+          contentSha256: await hashMediaFile(scratchPath),
+        };
+      },
+    );
+    f.deps.renderer = new FfmpegVideoRangeRenderer();
+    f.deps.inspector = new FfprobeVideoInspector();
+    const [verified, mismatch] = await cutLoggedClips(f.request, f.deps);
+    const a = JSON.parse(await readFile(verified!.manifestPath, "utf8"));
+    const b = JSON.parse(await readFile(mismatch!.manifestPath, "utf8"));
+    const mediaSha256 = await hashMediaFile(verified!.mediaPath);
+    expect(a.transcriptClock).toMatchObject({
+      schemaVersion: 1,
+      mediaSha256,
+      alignmentAudioSha256: `sha256:${audioHash}`,
+      frameDuration: { numerator: 1001, denominator: 24000 },
+      frameCount: expect.any(Number),
+    });
+    const { firstFrame } = a.transcriptClock;
+    expect(
+      firstFrame.numerator / firstFrame.denominator,
+    ).toBeGreaterThanOrEqual(0.4);
+    expect(firstFrame.numerator / firstFrame.denominator).toBeLessThan(0.45);
+    expect(b.transcriptClock).toBeUndefined();
+    const baseline = await readFile(mismatch!.mediaPath);
+    const bound = await readFile(verified!.mediaPath);
+    expect(bound.subarray(0, baseline.length)).toEqual(baseline);
+    expect(
+      bound.subarray(baseline.length + 4, baseline.length + 8).toString(),
+    ).toBe("uuid");
+    expect(JSON.parse(bound.subarray(baseline.length + 24).toString())).toEqual(
+      Object.fromEntries(
+        Object.entries(a.transcriptClock).filter(
+          ([key]) => key !== "mediaSha256",
+        ),
+      ),
+    );
+    expect(await f.deps.inspector.inspect(verified!.mediaPath)).toEqual(
+      await f.deps.inspector.inspect(mismatch!.mediaPath),
+    );
+  }, 45_000);
+
   it.each([
     { videoSeconds: 2, audioSeconds: 4, complete: false },
     { videoSeconds: 4, audioSeconds: 2, complete: false },

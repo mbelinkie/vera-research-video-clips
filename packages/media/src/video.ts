@@ -3,12 +3,15 @@ import { createReadStream } from "node:fs";
 import { lstat, readdir, realpath, stat } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, parse } from "node:path";
 
+import type { TranscriptAlignmentProvenance } from "@research-video/contracts";
+
 import {
   MediaAcquisitionError,
   SpawnMediaCommandRunner,
   type MediaCommandRunner,
   type MediaInspector,
 } from "./index.ts";
+import { observeVideoClock, type VerifiedVideoClock } from "./video-clock.ts";
 
 /** Follow no symlink at any component of an owned local media path. */
 export async function assertSafeDirectory(directory: string): Promise<void> {
@@ -315,25 +318,28 @@ export type VideoRenderRange = {
   outputPath: string;
   startMs: number;
   endMs: number;
+  alignmentAudio?: NonNullable<TranscriptAlignmentProvenance["audio"]>;
   signal?: AbortSignal;
 };
 
 export interface RangeRenderer {
-  render(input: VideoRenderRange): Promise<void>;
+  render(input: VideoRenderRange): Promise<VerifiedVideoClock | void>;
 }
 
 export class FfmpegRangeRenderer implements RangeRenderer {
   readonly #executable: string;
+  readonly #ffprobe: string;
   readonly #runner: MediaCommandRunner;
   readonly #timeoutMs: number;
 
-  constructor(options: VideoAdapterOptions = {}) {
+  constructor(options: VideoAdapterOptions & { ffprobe?: string } = {}) {
     this.#executable = validExecutable(options.executable ?? "ffmpeg");
+    this.#ffprobe = validExecutable(options.ffprobe ?? "ffprobe");
     this.#runner = options.runner ?? new SpawnMediaCommandRunner();
     this.#timeoutMs = validTimeout(options.timeoutMs ?? 10 * 60_000);
   }
 
-  async render(input: VideoRenderRange): Promise<void> {
+  async render(input: VideoRenderRange): Promise<VerifiedVideoClock | void> {
     if (
       !Number.isSafeInteger(input.startMs) ||
       input.startMs < 0 ||
@@ -362,47 +368,61 @@ export class FfmpegRangeRenderer implements RangeRenderer {
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     }
-    await this.#runner.run(
-      this.#executable,
-      [
-        "-hide_banner",
-        "-nostdin",
-        "-i",
-        input.sourcePath,
-        "-ss",
-        (input.startMs / 1_000).toFixed(3),
-        "-t",
-        ((input.endMs - input.startMs) / 1_000).toFixed(3),
-        "-map",
-        "0:v:0",
-        "-map",
-        "0:a:0",
-        "-sn",
-        "-dn",
-        "-map_metadata",
-        "-1",
-        "-map_chapters",
-        "-1",
-        "-c:v",
-        "libx264",
-        "-profile:v",
-        "high",
-        "-pix_fmt",
-        "yuv420p",
-        "-crf",
-        "20",
-        "-c:a",
-        "aac",
-        "-movflags",
-        "+faststart",
-        "-n",
-        input.outputPath,
-      ],
-      {
-        timeoutMs: this.#timeoutMs,
-        ...(input.signal ? { signal: input.signal } : {}),
-      },
-    );
-    await assertRegularMediaFile(input.outputPath);
+    const render = async (extraArgs: string[]) => {
+      await this.#runner.run(
+        this.#executable,
+        [
+          "-hide_banner",
+          "-nostdin",
+          "-i",
+          input.sourcePath,
+          "-ss",
+          (input.startMs / 1_000).toFixed(3),
+          "-t",
+          ((input.endMs - input.startMs) / 1_000).toFixed(3),
+          "-map",
+          "0:v:0",
+          "-map",
+          "0:a:0",
+          "-sn",
+          "-dn",
+          "-map_metadata",
+          "-1",
+          "-map_chapters",
+          "-1",
+          "-c:v",
+          "libx264",
+          "-profile:v",
+          "high",
+          "-pix_fmt",
+          "yuv420p",
+          "-crf",
+          "20",
+          "-c:a",
+          "aac",
+          "-movflags",
+          "+faststart",
+          ...extraArgs,
+          "-n",
+          input.outputPath,
+        ],
+        {
+          timeoutMs: this.#timeoutMs,
+          ...(input.signal ? { signal: input.signal } : {}),
+        },
+      );
+      await assertRegularMediaFile(input.outputPath);
+    };
+    if (!input.alignmentAudio) return render([]);
+    return observeVideoClock({
+      sourcePath: input.sourcePath,
+      outputPath: input.outputPath,
+      audio: input.alignmentAudio,
+      ffmpeg: this.#executable,
+      ffprobe: this.#ffprobe,
+      runner: this.#runner,
+      render,
+      ...(input.signal ? { signal: input.signal } : {}),
+    });
   }
 }

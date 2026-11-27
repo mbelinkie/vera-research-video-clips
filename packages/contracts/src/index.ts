@@ -1208,10 +1208,17 @@ export const ProjectVideoWorklistQuerySchema = z
 
 const Sha256Schema = z.string().regex(/^[a-f0-9]{64}$/);
 
+export const TranscriptAlignmentAudioEvidenceSchema = z.strictObject({
+  hash: z.string().regex(/^sha256:[a-f0-9]{64}$/u),
+  sampleRate: z.literal(16_000),
+  durationSamples: z.number().int().positive(),
+});
+
 export const TranscriptAlignmentProvenanceSchema = z.strictObject({
   artifactId: z.string().trim().min(1).max(512),
   fingerprint: Sha256Schema,
   sourceContentSha256: Sha256Schema,
+  audio: TranscriptAlignmentAudioEvidenceSchema.optional(),
 });
 
 export const TranscriptSourceSchema = z.enum([

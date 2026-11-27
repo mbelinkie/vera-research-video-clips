@@ -3,7 +3,10 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import type { NormalizedTranscript } from "@research-video/contracts";
+import {
+  TranscriptAlignmentAudioEvidenceSchema,
+  type NormalizedTranscript,
+} from "@research-video/contracts";
 import { SpawnMediaCommandRunner } from "@research-video/media";
 import { applyAcousticAlignment } from "@research-video/transcript";
 import { z } from "zod";
@@ -19,11 +22,7 @@ export { AlignmentShutdownUnconfirmedError } from "./word-timing-process.ts";
 
 const artifactId = z.string().regex(/^sha256:[a-f0-9]{64}$/u);
 const sourceMs = z.number().int().nonnegative();
-const audioIdentity = z.object({
-  hash: artifactId,
-  sampleRate: z.literal(16_000),
-  durationSamples: z.number().int().positive(),
-});
+const audioIdentity = TranscriptAlignmentAudioEvidenceSchema;
 const recognitionArtifact = z.object({
   schemaVersion: z.literal("recognition-artifact/v1"),
   artifactId,
@@ -315,6 +314,7 @@ async function alignTranscript(
     const audioSeconds = audioInfo.durationSamples / audioInfo.sampleRate;
     return {
       artifactId: alignment.artifactId,
+      audio: audioInfo,
       aligner: alignment.identity.aligner,
       audioSeconds,
       alignmentSeconds,
