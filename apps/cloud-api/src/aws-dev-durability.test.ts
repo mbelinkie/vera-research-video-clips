@@ -25,7 +25,13 @@ it("verifies bucket owner, region, versioning and the Standard queue before star
     .fn()
     .mockResolvedValueOnce({})
     .mockResolvedValueOnce({ Status: "Enabled" });
-  const sqs = vi.fn().mockResolvedValue({ Attributes: { QueueArn: arn } });
+  const sqs = vi.fn(async (command: GetQueueAttributesCommand) => {
+    // Real Standard queues reject an explicitly requested FIFO-only attribute.
+    if (command.input.AttributeNames?.includes("FifoQueue")) {
+      throw new Error("InvalidAttributeName: Unknown Attribute FifoQueue");
+    }
+    return { Attributes: { QueueArn: arn } };
+  });
   await expect(verify(s3, sqs)).resolves.toBeUndefined();
   expect(
     s3.mock.calls.map(([command]) => [command.constructor, command.input]),
@@ -40,6 +46,7 @@ it("verifies bucket owner, region, versioning and the Standard queue before star
     ],
   ]);
   expect(sqs).toHaveBeenCalledWith(expect.any(GetQueueAttributesCommand));
+  expect(sqs.mock.calls[0]?.[0].input.AttributeNames).toEqual(["All"]);
 });
 
 it.each([
