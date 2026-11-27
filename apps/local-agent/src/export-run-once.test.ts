@@ -65,8 +65,8 @@ const fixtureMediaPath = fileURLToPath(
 const thirtyTwoSecondFixtureMediaPath = fileURLToPath(
   new URL("../../../tests/fixtures/media/synthetic-32s.mp4", import.meta.url),
 );
-const ffmpegPath = "/usr/local/bin/ffmpeg";
-const ffprobePath = "/usr/local/bin/ffprobe";
+const ffmpegPath = process.env.FFMPEG_PATH ?? "ffmpeg";
+const ffprobePath = process.env.FFPROBE_PATH ?? "ffprobe";
 const temporaryRoots = new Set<string>();
 const execFile = promisify(execFileCallback);
 
@@ -74,8 +74,8 @@ beforeAll(async () => {
   await Promise.all([
     access(fixtureMediaPath),
     access(thirtyTwoSecondFixtureMediaPath),
-    access(ffmpegPath),
-    access(ffprobePath),
+    execFile(ffmpegPath, ["-version"]),
+    execFile(ffprobePath, ["-version"]),
   ]);
 });
 
