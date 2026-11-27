@@ -6160,8 +6160,9 @@ export class LocalTranscriptIndex {
               video_id, language, kind, source, provider, model,
               source_track_id, timing_precision, schema_version,
               content_sha256, version, indexed_at, alignment_artifact_id,
-              alignment_fingerprint, alignment_source_content_sha256)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+              alignment_fingerprint, alignment_source_content_sha256,
+              alignment_audio_json)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           input.transcriptVersionId,
@@ -6183,6 +6184,9 @@ export class LocalTranscriptIndex {
           transcript.track.alignment?.artifactId ?? null,
           transcript.track.alignment?.fingerprint ?? null,
           transcript.track.alignment?.sourceContentSha256 ?? null,
+          transcript.track.alignment?.audio
+            ? JSON.stringify(transcript.track.alignment.audio)
+            : null,
         );
       const insertSegment = this.database.prepare(
         `INSERT INTO transcript_segments
@@ -6273,6 +6277,9 @@ export class LocalTranscriptIndex {
                 artifactId: track.alignment_artifact_id,
                 fingerprint: track.alignment_fingerprint,
                 sourceContentSha256: track.alignment_source_content_sha256,
+                ...(track.alignment_audio_json === null
+                  ? {}
+                  : { audio: JSON.parse(String(track.alignment_audio_json)) }),
               },
             }),
         timingPrecision: track.timing_precision,

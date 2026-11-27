@@ -204,6 +204,7 @@ describe("local migrations", () => {
       "0035_local_export_notification_receipts",
       "0036_language_service_catalog_and_model_runtime",
       "0037_transcription_provider_policy",
+      "0038_transcript_alignment_audio",
     ]);
     expect(runLocalMigrations(database)).toEqual([]);
     expect(
@@ -595,6 +596,7 @@ describe("local migrations", () => {
       "0035_local_export_notification_receipts",
       "0036_language_service_catalog_and_model_runtime",
       "0037_transcription_provider_policy",
+      "0038_transcript_alignment_audio",
     ]);
     expect(
       database
@@ -653,6 +655,7 @@ describe("local migrations", () => {
       "0035_local_export_notification_receipts",
       "0036_language_service_catalog_and_model_runtime",
       "0037_transcription_provider_policy",
+      "0038_transcript_alignment_audio",
     ]);
     expect(
       database
@@ -968,6 +971,7 @@ describe("local migrations", () => {
       "0035_local_export_notification_receipts",
       "0036_language_service_catalog_and_model_runtime",
       "0037_transcription_provider_policy",
+      "0038_transcript_alignment_audio",
     ]);
     expect(
       database
@@ -1159,6 +1163,7 @@ describe("local migrations", () => {
       "0035_local_export_notification_receipts",
       "0036_language_service_catalog_and_model_runtime",
       "0037_transcription_provider_policy",
+      "0038_transcript_alignment_audio",
     ]);
     expect(
       database.prepare("SELECT * FROM export_final_artifacts").all(),
@@ -1306,6 +1311,7 @@ describe("local migrations", () => {
       "0035_local_export_notification_receipts",
       "0036_language_service_catalog_and_model_runtime",
       "0037_transcription_provider_policy",
+      "0038_transcript_alignment_audio",
     ]);
     expect(
       database
@@ -2653,6 +2659,7 @@ describe("logged export delivery import", () => {
       "0035_local_export_notification_receipts",
       "0036_language_service_catalog_and_model_runtime",
       "0037_transcription_provider_policy",
+      "0038_transcript_alignment_audio",
     ]);
     const after = new LocalExportQueue(database).get(before.id);
     expect(after).toEqual(before);
@@ -2737,6 +2744,7 @@ describe("logged export delivery import", () => {
       "0035_local_export_notification_receipts",
       "0036_language_service_catalog_and_model_runtime",
       "0037_transcription_provider_policy",
+      "0038_transcript_alignment_audio",
     ]);
     expect(
       new LocalExportQueue(database).getAcceptedLoggedDelivery(
@@ -3159,6 +3167,11 @@ describe("derived transcript timing persistence", () => {
       });
       const aligned = await applyAcousticAlignment(source, {
         artifactId: "recognition-fixture",
+        audio: {
+          hash: `sha256:${"1".repeat(64)}`,
+          sampleRate: 16_000,
+          durationSamples: 48_000,
+        },
         tokens: [
           {
             tokenId: source.tokens[0]!.id,

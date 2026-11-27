@@ -129,7 +129,10 @@ export function createClipCutRunner(
     },
     acquirer,
     inspector: new FfprobeVideoInspector({ executable: config.ffprobePath }),
-    renderer: new FfmpegVideoRangeRenderer({ executable: config.ffmpegPath }),
+    renderer: new FfmpegVideoRangeRenderer({
+      executable: config.ffmpegPath,
+      ffprobe: config.ffprobePath,
+    }),
     exportDirectory: config.clipExportDir,
   };
   return (request) => cutLoggedClips(request, deps);
