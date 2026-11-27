@@ -1,5 +1,6 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
+  copyFile,
   mkdtemp,
   readFile,
   readdir,
@@ -19,6 +20,7 @@ import {
   FfmpegVideoRangeRenderer,
   FfprobeVideoInspector,
   hashMediaFile,
+  readAlignmentWave,
   SpawnMediaCommandRunner,
   type MediaInspector,
 } from "@research-video/media";
@@ -194,6 +196,184 @@ async function fakeCutter(clips: ClipCandidate[]) {
 }
 
 describe("foreground logged clip cutter", () => {
+  it("binds a fractional, offset cut to the measured alignment audio and exact MP4", async () => {
+    const clip = makeClip();
+    clip.selection.exportStartMs = 400;
+    const other = makeClip();
+    other.selection.exportStartMs = 400;
+    const f = await fakeCutter([clip, other]);
+    const runner = new SpawnMediaCommandRunner();
+    const sourcePath = join(f.root, "source.mp4");
+    const sourceAudioOnly = join(f.root, "source-audio.m4a");
+    const sourceAudio = join(f.root, "source.flac");
+    const alignment = join(f.root, "alignment.wav");
+    const ffmpeg = (args: string[]) =>
+      runner.run(
+        "ffmpeg",
+        ["-nostdin", "-hide_banner", "-loglevel", "error", ...args],
+        { timeoutMs: 30_000 },
+      );
+    await ffmpeg([
+      "-f",
+      "lavfi",
+      "-i",
+      "testsrc2=s=64x64:r=24000/1001:d=4",
+      "-f",
+      "lavfi",
+      "-i",
+      "sine=frequency=440:sample_rate=48000:duration=4",
+      "-c:v",
+      "libx264",
+      "-threads",
+      "1",
+      "-pix_fmt",
+      "yuv420p",
+      "-color_primaries",
+      "bt709",
+      "-color_trc",
+      "bt709",
+      "-colorspace",
+      "bt709",
+      "-color_range",
+      "tv",
+      "-x264-params",
+      "colorprim=bt709:transfer=bt709:colormatrix=bt709",
+      "-c:a",
+      "aac",
+      "-output_ts_offset",
+      "2",
+      sourcePath,
+    ]);
+    await ffmpeg([
+      "-i",
+      sourcePath,
+      "-map",
+      "0:a:0",
+      "-c:a",
+      "copy",
+      sourceAudioOnly,
+    ]);
+    await ffmpeg([
+      "-n",
+      "-i",
+      sourceAudioOnly,
+      "-map",
+      "0:a:0",
+      "-vn",
+      "-c:a",
+      "flac",
+      sourceAudio,
+    ]);
+    await ffmpeg([
+      "-n",
+      "-i",
+      sourceAudio,
+      "-map",
+      "0:a:0",
+      "-vn",
+      "-ar",
+      "16000",
+      "-ac",
+      "1",
+      "-c:a",
+      "pcm_s16le",
+      "-metadata",
+      "comment=alignment worker metadata",
+      alignment,
+    ]);
+    const { stdout } = await runner.run("ffprobe", [
+      "-v",
+      "error",
+      "-select_streams",
+      "a:0",
+      "-show_entries",
+      "stream=duration_ts",
+      "-of",
+      "default=nk=1:nw=1",
+      alignment,
+    ]);
+    const durationSamples = Number(stdout.trim());
+    expect(durationSamples).toBeGreaterThan(60_000);
+    const waveform = await readAlignmentWave(alignment);
+    expect(waveform.audio.durationSamples).toBe(durationSamples);
+    f.transcripts.getVerifiedTracks.mockImplementation(
+      async ({ clip: { id } }) => {
+        const transcript = structuredClone(baseTranscript);
+        transcript.track.alignment = {
+          artifactId: "numbered-cut-alignment",
+          fingerprint: "f".repeat(64),
+          sourceContentSha256: transcript.track.contentSha256,
+          audio: {
+            hash:
+              id === clip.id ? waveform.audio.hash : `sha256:${"0".repeat(64)}`,
+            sampleRate: 16_000,
+            durationSamples,
+          },
+        };
+        return {
+          english: transcript,
+          transcriptVersionId: "019fbb95-cd76-7920-93fa-e23ba755e399",
+        };
+      },
+    );
+    f.acquirer.acquireAuthorizedVideo.mockImplementation(
+      async ({ videoId, scratchDirectory }) => {
+        const scratchPath = join(scratchDirectory, `video-${videoId}.mp4`);
+        await copyFile(sourcePath, scratchPath);
+        return {
+          videoId,
+          scratchPath,
+          format: "mp4",
+          byteSize: (await stat(scratchPath)).size,
+          contentSha256: await hashMediaFile(scratchPath),
+        };
+      },
+    );
+    const renderer = new FfmpegVideoRangeRenderer();
+    const prepare = vi.spyOn(renderer, "prepareSourceClock");
+    f.deps.renderer = renderer;
+    f.deps.inspector = new FfprobeVideoInspector();
+    const [verified, mismatch] = await cutLoggedClips(f.request, f.deps);
+    expect(prepare).toHaveBeenCalledTimes(1);
+    const a = JSON.parse(await readFile(verified!.manifestPath, "utf8"));
+    const b = JSON.parse(await readFile(mismatch!.manifestPath, "utf8"));
+    const mediaSha256 = await hashMediaFile(verified!.mediaPath);
+    expect(a.transcriptClock).toMatchObject({
+      schemaVersion: 1,
+      mediaSha256,
+      alignmentAudioSha256: waveform.audio.hash,
+      frameDuration: { numerator: 1001, denominator: 24000 },
+      frameCount: expect.any(Number),
+    });
+    const { firstFrame } = a.transcriptClock;
+    expect(
+      firstFrame.numerator / firstFrame.denominator,
+    ).toBeGreaterThanOrEqual(0.4);
+    expect(firstFrame.numerator / firstFrame.denominator).toBeLessThan(0.45);
+    expect(b.transcriptClock).toBeUndefined();
+    const baseline = await readFile(mismatch!.mediaPath);
+    const bound = await readFile(verified!.mediaPath);
+    expect(bound.subarray(0, baseline.length)).toEqual(baseline);
+    expect(
+      bound.subarray(baseline.length + 4, baseline.length + 8).toString(),
+    ).toBe("uuid");
+    const { mediaSha256: _mediaDigest, ...embeddedEvidence } =
+      a.transcriptClock;
+    const fields = [
+      ...Object.keys(embeddedEvidence),
+      "denominator",
+      "numerator",
+    ].sort();
+    expect(bound.subarray(baseline.length + 24)).toEqual(
+      createHash("sha256")
+        .update(JSON.stringify(embeddedEvidence, fields))
+        .digest(),
+    );
+    expect(await f.deps.inspector.inspect(verified!.mediaPath)).toEqual(
+      await f.deps.inspector.inspect(mismatch!.mediaPath),
+    );
+  }, 45_000);
+
   it.each([
     { videoSeconds: 2, audioSeconds: 4, complete: false },
     { videoSeconds: 4, audioSeconds: 2, complete: false },

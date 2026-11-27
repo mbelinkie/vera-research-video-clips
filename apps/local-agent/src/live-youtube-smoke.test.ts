@@ -399,10 +399,10 @@ describe("opt-in live YouTube smoke", () => {
             ...options,
             sourceProvider: offlineFixtureSourceProvider(),
             inspector: new FfprobeMediaInspector({
-              executable: "/usr/local/bin/ffprobe",
+              executable: process.env.FFPROBE_PATH ?? "ffprobe",
             }),
             renderer: new FfmpegCapabilityRangeRenderer({
-              executable: "/usr/local/bin/ffmpeg",
+              executable: process.env.FFMPEG_PATH ?? "ffmpeg",
             }),
           }),
       },
@@ -448,10 +448,10 @@ describe("opt-in live YouTube smoke", () => {
             ...options,
             sourceProvider: offlineFixtureSourceProvider(),
             inspector: new FfprobeMediaInspector({
-              executable: "/usr/local/bin/ffprobe",
+              executable: process.env.FFPROBE_PATH ?? "ffprobe",
             }),
             renderer: new FfmpegCapabilityRangeRenderer({
-              executable: "/usr/local/bin/ffmpeg",
+              executable: process.env.FFMPEG_PATH ?? "ffmpeg",
             }),
           });
           if (execution.packageIdentity) {

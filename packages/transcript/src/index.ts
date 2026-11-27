@@ -4,6 +4,7 @@ import {
   ProjectKeywordMatchArtifactSchema,
   ProjectKeywordScanAliasInputSchema,
   ProjectKeywordScannerSchemaVersion,
+  TranscriptAlignmentAudioEvidenceSchema,
   TranscriptSelectionSchema,
   languagesEquivalent,
   normalizeLanguageTag,
@@ -481,6 +482,7 @@ export async function applyAcousticAlignment(
   alignment: {
     artifactId: string;
     tokens: readonly AcousticAlignmentToken[];
+    audio?: NonNullable<TranscriptTrack["alignment"]>["audio"];
   },
 ): Promise<NormalizedTranscript> {
   const source = NormalizedTranscriptSchema.parse(transcript);
@@ -566,11 +568,15 @@ export async function applyAcousticAlignment(
   });
   const sourceContentSha256 =
     source.track.alignment?.sourceContentSha256 ?? source.track.contentSha256;
+  const audio = alignment.audio
+    ? { audio: TranscriptAlignmentAudioEvidenceSchema.parse(alignment.audio) }
+    : {};
   const fingerprint = await sha256Hex(
     new TextEncoder().encode(
       JSON.stringify({
         artifactId,
         sourceContentSha256,
+        ...audio,
         tokens: tokens.map((token) => ({
           tokenId: token.id,
           status: token.alignmentStatus,
@@ -586,7 +592,7 @@ export async function applyAcousticAlignment(
     track: {
       ...source.track,
       id: trackId,
-      alignment: { artifactId, fingerprint, sourceContentSha256 },
+      alignment: { artifactId, fingerprint, sourceContentSha256, ...audio },
       timingPrecision:
         tokens.length > 0 &&
         tokens.every((token) => token.alignmentStatus === "acoustic")
