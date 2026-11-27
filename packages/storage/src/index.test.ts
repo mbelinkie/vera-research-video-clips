@@ -100,6 +100,28 @@ describe("memory transcript object store", () => {
 });
 
 describe("S3 transcript object store", () => {
+  it("rejects mutable S3 null versions for direct and presigned uploads", async () => {
+    const client = { send: vi.fn(async () => ({ VersionId: "null" })) };
+    const store = new S3TranscriptObjectStore(
+      client as unknown as ConstructorParameters<
+        typeof S3TranscriptObjectStore
+      >[0],
+      "fixture-bucket",
+    );
+    const key = "private/manifest.json";
+    await expect(store.get(key, "null")).resolves.toBeUndefined();
+    await expect(store.head(key, "null")).resolves.toBeUndefined();
+    expect(client.send).not.toHaveBeenCalled();
+    await expect(
+      store.put({
+        key,
+        bytes: new Uint8Array([1]),
+        contentType: "application/json",
+        sha256: "a".repeat(64),
+      }),
+    ).rejects.toThrow("versioning is required");
+  });
+
   it("uses authoritative content length to reject before buffering", async () => {
     const transformToByteArray = vi.fn(async () => new Uint8Array(32));
     const client = {

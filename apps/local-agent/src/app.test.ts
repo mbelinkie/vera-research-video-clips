@@ -1219,6 +1219,37 @@ describe("local agent", () => {
     expect(response.body).not.toContain("/cache/path");
   });
 
+  it("reports an unavailable published transcript after an integrity failure", async () => {
+    const code = "transcript_integrity_failed";
+    const app = createLocalAgent({
+      resolveTranscript: async () => {
+        throw Object.assign(new Error("private bucket/key"), {
+          statusCode: 422,
+          code,
+        });
+      },
+    });
+    apps.add(app);
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/projects/019fbb95-cd76-7920-93fa-e23ba755e391/videos/019fbb95-cd76-7920-93fa-e23ba755e392/transcript",
+      headers: { authorization: "Bearer fixture-session" },
+    });
+    expect(response.statusCode).toBe(422);
+    expect(response.json()).toMatchObject({
+      error: {
+        code,
+        message:
+          "Published transcript unavailable. Stored content could not be verified.",
+      },
+      operationFailure: {
+        operation: "transcript",
+        failureClass: "verification_failed",
+      },
+    });
+    expect(response.body).not.toContain("private bucket/key");
+  });
+
   it("preserves cloud project authorization denials without revealing credentials", async () => {
     const app = createLocalAgent({
       resolveTranscript: async () => {

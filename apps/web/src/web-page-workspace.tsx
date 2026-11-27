@@ -267,7 +267,7 @@ export function WebPageWorkspace({
             Details &amp; citation
           </button>
         </nav>
-        {view !== "details" && comments}
+        {comments && <div hidden={view === "details"}>{comments}</div>}
       </div>
       <div className="research-article-split">
         <div className="research-detail">
