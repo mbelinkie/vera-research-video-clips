@@ -704,6 +704,7 @@ export function createLocalAgent(
 
   if (dependencies?.audioSpeech) {
     const { cloudOrigin, transcribe } = dependencies.audioSpeech;
+    const { desktopSession } = dependencies;
     const contexts = new WeakMap<
       FastifyRequest,
       {
@@ -725,10 +726,10 @@ export function createLocalAgent(
           bodyLimit: MaxAudioBytes,
           async onRequest(request) {
             if (
-              dependencies.desktopSession &&
+              desktopSession &&
               (request.headers["x-research-video-session"] !==
-                dependencies.desktopSession.secret ||
-                request.headers.origin !== dependencies.desktopSession.origin)
+                desktopSession.secret ||
+                request.headers.origin !== desktopSession.origin)
             ) {
               throw new LocalAuthenticationError(
                 "The desktop launch session is required for local access.",
@@ -737,9 +738,10 @@ export function createLocalAgent(
             const { projectId, sourceId } = z
               .object({ projectId: z.uuid(), sourceId: z.uuid() })
               .parse(request.params);
-            const authorization = requireRuntimeAuthorization(
-              request.headers.authorization,
-            );
+            // The desktop proxy exchanges the launch session for a cloud bearer.
+            const authorization = desktopSession
+              ? `Bearer ${desktopSession.secret}`
+              : requireRuntimeAuthorization(request.headers.authorization);
             const headers = { authorization };
             const project = `${cloudOrigin}/api/projects/${projectId}`;
             const access = await fetch(`${project}/source-write-access`, {
