@@ -51,7 +51,9 @@ export async function verifyAwsDevDurability({
     .send(
       new GetQueueAttributesCommand({
         QueueUrl: queueUrl,
-        AttributeNames: ["QueueArn", "FifoQueue"],
+        // Standard queues reject an explicit FIFO-only attribute request.
+        // All returns the ARN and FIFO metadata when applicable.
+        AttributeNames: ["All"],
       }),
     )
     .catch(() => {
