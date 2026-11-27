@@ -427,6 +427,10 @@ export class FfmpegRangeRenderer implements RangeRenderer {
           "20",
           "-c:a",
           "aac",
+          // Retain the decoded source cadence: automatic CFR synchronization can
+          // duplicate a frame at a fractional cut boundary.
+          "-fps_mode:v",
+          "passthrough",
           "-movflags",
           "+faststart",
           ...extraArgs,

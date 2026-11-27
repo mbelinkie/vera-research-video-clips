@@ -925,6 +925,12 @@ describe("FFprobe/FFmpeg guarded cut adapters", () => {
       expect(args).toContain("libx264");
       expect(args).toContain("aac");
       expect(args).toContain("-n");
+      expect(
+        args.slice(
+          args.indexOf("-fps_mode:v"),
+          args.indexOf("-fps_mode:v") + 2,
+        ),
+      ).toEqual(["-fps_mode:v", "passthrough"]);
       await expect(
         renderer.render({
           sourcePath: source,
