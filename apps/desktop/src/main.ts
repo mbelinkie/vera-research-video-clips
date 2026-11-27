@@ -21,7 +21,6 @@ import {
   DesktopApiResponseSchema,
   isDesktopResearchImageRead,
   isDesktopAudioPlaybackPath,
-  isLocalAudioTranscriptionPath,
   AudioMimeSchema,
   CloudProviderLaunchGrantSchema,
   DesktopTimedTranscriptUploadRequestSchema,
@@ -920,10 +919,6 @@ function installIpcHandlers(options: {
       input.target === "local" &&
       input.method === "POST" &&
       /^\/api\/projects\/[a-f0-9-]{36}\/web-page-sources$/iu.test(input.path);
-    const transcribesAudio =
-      input.target === "local" &&
-      input.method === "POST" &&
-      isLocalAudioTranscriptionPath(input.path);
     if (isPrivateDesktopSetupPath(input.path)) {
       return DesktopApiResponseSchema.parse({
         status: 403,
@@ -962,7 +957,7 @@ function installIpcHandlers(options: {
         });
       }
     }
-    if (input.target === "cloud" || importsWebPage || transcribesAudio) {
+    if (input.target === "cloud" || importsWebPage) {
       try {
         accessToken = await broker!.getAccessTokenForTrustedProxy();
       } catch {
@@ -1012,7 +1007,7 @@ function installIpcHandlers(options: {
       headers: {
         accept: "application/json",
         authorization:
-          input.target === "local" && !importsWebPage && !transcribesAudio
+          input.target === "local" && !importsWebPage
             ? `Bearer ${options.sessionSecret}`
             : `Bearer ${accessToken!}`,
         ...(input.contentType ? { "content-type": input.contentType } : {}),
