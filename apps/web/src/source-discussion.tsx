@@ -61,6 +61,7 @@ export function SourceDiscussion({
   const [draft, setDraft] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string>();
+  const [readError, setReadError] = useState<string>();
   const [savedCount, setSavedCount] =
     useState<z.infer<typeof SourceDiscussionCountSchema>>();
   const write = useResearchMutation();
@@ -121,29 +122,36 @@ export function SourceDiscussion({
       const controller = new AbortController();
       write.current = controller;
       setBusy(true);
+      let acknowledged = false;
       try {
         for (let index = 0; index < unread.length; index += 50) {
+          const batch = unread.slice(index, index + 50);
           const counts = await readResearch(
             request,
             `${base}/read`,
             countMapSchema,
             {
-              ...jsonWrite("POST", unread.slice(index, index + 50)),
+              ...jsonWrite("POST", batch),
               signal: controller.signal,
             },
           );
           if (controller.signal.aborted) return;
+          for (const id of batch) loadedUnread.current.delete(id);
+          acknowledged = true;
           setSavedCount(counts[sourceId] ?? emptyCount);
         }
-        loadedUnread.current.clear();
-        onChanged();
-      } catch (caught) {
-        if (!controller.signal.aborted)
-          setError(researchError(caught, "Unable to update unread comments."));
-        return;
+        setReadError(undefined);
+      } catch {
+        if (controller.signal.aborted) return;
+        setReadError(
+          "Unable to mark comments as read. Close the thread again to retry.",
+        );
       } finally {
         write.current = null;
-        if (!controller.signal.aborted) setBusy(false);
+        if (!controller.signal.aborted) {
+          setBusy(false);
+          if (acknowledged) onChanged();
+        }
       }
     }
     dialog.current?.close();
@@ -187,6 +195,7 @@ export function SourceDiscussion({
       >
         {savedCount?.total ? commentLabel(savedCount) : "Comments"}
       </button>
+      {!open && readError && <p role="alert">{readError}</p>}
       {open && (
         <dialog
           ref={dialog}
@@ -268,6 +277,7 @@ export function SourceDiscussion({
             </form>
           )}
           {error && <p role="alert">{error}</p>}
+          {readError && <p role="alert">{readError}</p>}
         </dialog>
       )}
     </>

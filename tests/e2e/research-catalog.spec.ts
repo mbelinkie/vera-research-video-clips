@@ -17,7 +17,10 @@ const articleText =
 const now = "2026-11-25T12:00:00.000Z";
 const confirmed = (value: string) => ({ value, state: "confirmed" as const });
 
-async function research(page: Page, options: { reader?: boolean } = {}) {
+async function research(
+  page: Page,
+  options: { reader?: boolean; markReadFailures?: number } = {},
+) {
   const article = LibrarySourceSchema.parse({
     projectId,
     id: articleId,
@@ -111,6 +114,7 @@ async function research(page: Page, options: { reader?: boolean } = {}) {
     }),
   );
   const sent: unknown[] = [];
+  const markReadRequests: string[] = [];
   const counts: Record<string, { total: number; unread: number }> = {
     [articleId]: { total: 2, unread: 1 },
     [videoId]: { total: 2, unread: 1 },
@@ -258,6 +262,9 @@ async function research(page: Page, options: { reader?: boolean } = {}) {
         });
       if (match[2] === "/discussion/read") {
         expect(req.postDataJSON()).toEqual([id(51)]);
+        markReadRequests.push(source.id);
+        if (markReadRequests.length <= (options.markReadFailures ?? 0))
+          return route.fulfill({ status: 503, json: {} });
         counts[source.id] = { total: 2, unread: 0 };
         return route.fulfill({ json: { [source.id]: counts[source.id] } });
       }
@@ -272,7 +279,7 @@ async function research(page: Page, options: { reader?: boolean } = {}) {
   await expect(
     page.getByRole("region", { name: "Research sources" }),
   ).toBeVisible();
-  return { sent, sources };
+  return { sent, sources, markReadRequests };
 }
 
 test("pages mixed Sources, filters by Topic and notices a newly arrived source", async ({
@@ -430,4 +437,54 @@ test("shows the same read counts on sources and workspaces and retains the artic
   await expect(
     page.getByRole("button", { name: "Comments · 2", exact: true }),
   ).toBeFocused();
+});
+
+test("dismisses source comments on read failure and retries without losing unread counts", async ({
+  page,
+}) => {
+  const { markReadRequests } = await research(page, { markReadFailures: 2 });
+  const article = page
+    .getByRole("listitem")
+    .filter({ hasText: "A fixture article" });
+  await article.getByRole("button").click();
+  const control = page.getByRole("button", {
+    name: "Comments · 2 · 1 new",
+    exact: true,
+  });
+  const dialog = page.getByRole("dialog", { name: "Source comments" });
+  await control.click();
+  await expect(dialog.getByText("New", { exact: true })).toHaveCount(1);
+  await dialog.getByRole("textbox", { name: "Reply" }).fill("Unsent reply");
+  await page.keyboard.press("Escape");
+  await expect(dialog).toBeHidden();
+  await expect(control).toBeFocused();
+  await expect(page.getByRole("alert")).toContainText("mark");
+  await control.click();
+  await expect(dialog.getByText("New", { exact: true })).toHaveCount(1);
+  await expect(dialog.getByRole("textbox", { name: "Reply" })).toHaveValue(
+    "Unsent reply",
+  );
+  await dialog.getByRole("button", { name: "Close comments" }).click();
+  await expect(dialog).toBeHidden();
+  await expect(control).toBeFocused();
+  await expect(page.getByRole("alert")).toContainText("mark");
+  await control.click();
+  await expect(dialog.getByText("New", { exact: true })).toHaveCount(1);
+  await dialog.getByRole("button", { name: "Close comments" }).click();
+  await expect(dialog).toBeHidden();
+  await expect(
+    page.getByRole("button", { name: "Comments · 2", exact: true }),
+  ).toBeFocused();
+  await expect(page.getByRole("alert")).toHaveCount(0);
+  expect(markReadRequests).toEqual([articleId, articleId, articleId]);
+  await page.getByRole("button", { name: "Back to Sources" }).click();
+  await expect(
+    article.getByText("Comments · 2", { exact: true }),
+  ).toBeVisible();
+  await expect(
+    page
+      .getByRole("listitem")
+      .filter({ hasText: "A fixture video" })
+      .getByText("Comments · 2 · 1 new"),
+  ).toBeVisible();
 });
