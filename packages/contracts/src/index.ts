@@ -1209,6 +1209,7 @@ export const ProjectVideoWorklistQuerySchema = z
 const Sha256Schema = z.string().regex(/^[a-f0-9]{64}$/);
 
 export const TranscriptAlignmentAudioEvidenceSchema = z.strictObject({
+  /** SHA-256 of little-endian PCM sample bytes, excluding WAV metadata. */
   hash: z.string().regex(/^sha256:[a-f0-9]{64}$/u),
   sampleRate: z.literal(16_000),
   durationSamples: z.number().int().positive(),

@@ -3,11 +3,11 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import type { NormalizedTranscript } from "@research-video/contracts";
 import {
-  TranscriptAlignmentAudioEvidenceSchema,
-  type NormalizedTranscript,
-} from "@research-video/contracts";
-import { SpawnMediaCommandRunner } from "@research-video/media";
+  readAlignmentWave,
+  SpawnMediaCommandRunner,
+} from "@research-video/media";
 import { applyAcousticAlignment } from "@research-video/transcript";
 import { z } from "zod";
 
@@ -22,7 +22,11 @@ export { AlignmentShutdownUnconfirmedError } from "./word-timing-process.ts";
 
 const artifactId = z.string().regex(/^sha256:[a-f0-9]{64}$/u);
 const sourceMs = z.number().int().nonnegative();
-const audioIdentity = TranscriptAlignmentAudioEvidenceSchema;
+const audioIdentity = z.object({
+  hash: artifactId,
+  sampleRate: z.literal(16000),
+  durationSamples: z.number().int().positive(),
+});
 const recognitionArtifact = z.object({
   schemaVersion: z.literal("recognition-artifact/v1"),
   artifactId,
@@ -311,10 +315,21 @@ async function alignTranscript(
     )
       throw invalidArtifacts();
 
+    const actualAudio = worker
+      ? await readAlignmentWave(audio).catch(() => {
+          throw invalidArtifacts();
+        })
+      : undefined;
+    if (
+      actualAudio &&
+      (actualAudio.containerHash !== audioInfo.hash ||
+        actualAudio.audio.durationSamples !== audioInfo.durationSamples)
+    )
+      throw invalidArtifacts();
     const audioSeconds = audioInfo.durationSamples / audioInfo.sampleRate;
     return {
       artifactId: alignment.artifactId,
-      audio: audioInfo,
+      ...(actualAudio ? { audio: actualAudio.audio } : {}),
       aligner: alignment.identity.aligner,
       audioSeconds,
       alignmentSeconds,

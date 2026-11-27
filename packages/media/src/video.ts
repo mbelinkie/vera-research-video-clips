@@ -11,7 +11,13 @@ import {
   type MediaCommandRunner,
   type MediaInspector,
 } from "./index.ts";
-import { observeVideoClock, type VerifiedVideoClock } from "./video-clock.ts";
+import {
+  observeVideoClock,
+  prepareSourceAudioClock,
+  type SourceAudioClock,
+  type VerifiedVideoClock,
+} from "./video-clock.ts";
+export type { SourceAudioClock } from "./video-clock.ts";
 
 /** Follow no symlink at any component of an owned local media path. */
 export async function assertSafeDirectory(directory: string): Promise<void> {
@@ -150,7 +156,7 @@ export class YtDlpFullVideoAcquirer implements FullSourceAcquirer {
         "--no-write-thumbnail",
         "--no-part",
         "--format",
-        "bv*+ba/b",
+        "bv+ba/b",
         "--merge-output-format",
         "mp4",
         "--remux-video",
@@ -319,10 +325,16 @@ export type VideoRenderRange = {
   startMs: number;
   endMs: number;
   alignmentAudio?: NonNullable<TranscriptAlignmentProvenance["audio"]>;
+  sourceAudioClock?: SourceAudioClock;
   signal?: AbortSignal;
 };
 
 export interface RangeRenderer {
+  prepareSourceClock?(input: {
+    sourcePath: string;
+    scratchDirectory: string;
+    signal?: AbortSignal;
+  }): Promise<SourceAudioClock | undefined>;
   render(input: VideoRenderRange): Promise<VerifiedVideoClock | void>;
 }
 
@@ -337,6 +349,21 @@ export class FfmpegRangeRenderer implements RangeRenderer {
     this.#ffprobe = validExecutable(options.ffprobe ?? "ffprobe");
     this.#runner = options.runner ?? new SpawnMediaCommandRunner();
     this.#timeoutMs = validTimeout(options.timeoutMs ?? 10 * 60_000);
+  }
+
+  async prepareSourceClock(input: {
+    sourcePath: string;
+    scratchDirectory: string;
+    signal?: AbortSignal;
+  }) {
+    await assertRegularMediaFile(input.sourcePath);
+    await assertSafeDirectory(input.scratchDirectory);
+    return prepareSourceAudioClock({
+      ...input,
+      ffmpeg: this.#executable,
+      runner: this.#runner,
+      timeoutMs: this.#timeoutMs,
+    });
   }
 
   async render(input: VideoRenderRange): Promise<VerifiedVideoClock | void> {
@@ -413,14 +440,22 @@ export class FfmpegRangeRenderer implements RangeRenderer {
       );
       await assertRegularMediaFile(input.outputPath);
     };
-    if (!input.alignmentAudio) return render([]);
+    const sourceAudio = input.sourceAudioClock;
+    const alignmentAudio = input.alignmentAudio;
+    if (
+      !sourceAudio ||
+      !alignmentAudio ||
+      sourceAudio.audio.hash !== alignmentAudio.hash ||
+      sourceAudio.audio.durationSamples !== alignmentAudio.durationSamples ||
+      sourceAudio.audio.sampleRate !== alignmentAudio.sampleRate
+    )
+      return render([]);
     return observeVideoClock({
-      sourcePath: input.sourcePath,
       outputPath: input.outputPath,
-      audio: input.alignmentAudio,
-      ffmpeg: this.#executable,
+      sourceAudio,
       ffprobe: this.#ffprobe,
       runner: this.#runner,
+      timeoutMs: this.#timeoutMs,
       render,
       ...(input.signal ? { signal: input.signal } : {}),
     });

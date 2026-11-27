@@ -24,6 +24,7 @@ import {
   type FullSourceAcquirer,
   type MediaInspector,
   type RangeRenderer,
+  type SourceAudioClock,
 } from "@research-video/media";
 import type { VerifiedLoggedClipTracks } from "@research-video/sync";
 import {
@@ -95,6 +96,12 @@ type PreparedClip = {
   tracks: VerifiedLoggedClipTracks;
   sourceLanguageClass: SourceLanguageClass;
 };
+
+function pinnedTrack({ clip, tracks }: PreparedClip) {
+  return [tracks.english.track, tracks.original?.track].find(
+    (track) => track?.id === clip.selection.trackId,
+  );
+}
 
 function sourceLanguageClass(clip: ClipCandidate): SourceLanguageClass {
   const language = clip.video.sourceLanguage?.toLowerCase();
@@ -187,7 +194,10 @@ async function bindTranscriptClock(
   path: string,
   record: object,
 ): Promise<void> {
-  const payload = Buffer.from(JSON.stringify(record), "utf8");
+  const fields = [...Object.keys(record), "denominator", "numerator"].sort();
+  const payload = createHash("sha256")
+    .update(JSON.stringify(record, fields))
+    .digest();
   const header = Buffer.alloc(24);
   header.writeUInt32BE(header.length + payload.length);
   header.write("uuid", 4, "ascii");
@@ -270,6 +280,7 @@ async function renderClip(
   sourceDurationMs: number,
   root: string,
   deps: ClipCutterDependencies,
+  sourceAudioClock: SourceAudioClock | undefined,
   signal?: AbortSignal,
 ): Promise<CutClipResult> {
   const { clip, tracks, sourceLanguageClass: kind } = item;
@@ -285,9 +296,7 @@ async function renderClip(
   const manifestName = `${clip.id}.json`;
   try {
     if (signal?.aborted) throw new Error("Clip cut canceled.");
-    const selectedTrack = [tracks.english.track, tracks.original?.track].find(
-      (track) => track?.id === clip.selection.trackId,
-    );
+    const selectedTrack = pinnedTrack(item);
     const alignment = selectedTrack?.alignment;
     const clock = await deps.renderer.render({
       sourcePath,
@@ -295,6 +304,7 @@ async function renderClip(
       startMs,
       endMs,
       ...(alignment?.audio ? { alignmentAudio: alignment.audio } : {}),
+      ...(sourceAudioClock ? { sourceAudioClock } : {}),
       ...(signal ? { signal } : {}),
     });
     await assertRegularMediaFile(join(stage, mediaName));
@@ -546,6 +556,16 @@ export async function cutLoggedClips(
         if (!Number.isSafeInteger(info.durationMs) || info.durationMs <= 0) {
           throw new Error("Source video duration is invalid.");
         }
+        const hasAlignment = group.some(
+          (item) => pinnedTrack(item)?.alignment?.audio,
+        );
+        const sourceAudioClock = hasAlignment
+          ? await deps.renderer.prepareSourceClock?.({
+              sourcePath: video.scratchPath,
+              scratchDirectory: scratch,
+              ...(signal ? { signal } : {}),
+            })
+          : undefined;
         for (const item of group) {
           results.push(
             await renderClip(
@@ -554,6 +574,7 @@ export async function cutLoggedClips(
               info.durationMs,
               deps.exportDirectory,
               deps,
+              sourceAudioClock,
               signal,
             ),
           );

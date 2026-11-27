@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   copyFile,
   mkdtemp,
@@ -20,6 +20,7 @@ import {
   FfmpegVideoRangeRenderer,
   FfprobeVideoInspector,
   hashMediaFile,
+  readAlignmentWave,
   SpawnMediaCommandRunner,
   type MediaInspector,
 } from "@research-video/media";
@@ -203,6 +204,7 @@ describe("foreground logged clip cutter", () => {
     const f = await fakeCutter([clip, other]);
     const runner = new SpawnMediaCommandRunner();
     const sourcePath = join(f.root, "source.mp4");
+    const sourceAudioOnly = join(f.root, "source-audio.m4a");
     const sourceAudio = join(f.root, "source.flac");
     const alignment = join(f.root, "alignment.wav");
     const ffmpeg = (args: string[]) =>
@@ -226,6 +228,16 @@ describe("foreground logged clip cutter", () => {
       "1",
       "-pix_fmt",
       "yuv420p",
+      "-color_primaries",
+      "bt709",
+      "-color_trc",
+      "bt709",
+      "-colorspace",
+      "bt709",
+      "-color_range",
+      "tv",
+      "-x264-params",
+      "colorprim=bt709:transfer=bt709:colormatrix=bt709",
       "-c:a",
       "aac",
       "-output_ts_offset",
@@ -233,9 +245,18 @@ describe("foreground logged clip cutter", () => {
       sourcePath,
     ]);
     await ffmpeg([
-      "-n",
       "-i",
       sourcePath,
+      "-map",
+      "0:a:0",
+      "-c:a",
+      "copy",
+      sourceAudioOnly,
+    ]);
+    await ffmpeg([
+      "-n",
+      "-i",
+      sourceAudioOnly,
       "-map",
       "0:a:0",
       "-vn",
@@ -256,6 +277,8 @@ describe("foreground logged clip cutter", () => {
       "1",
       "-c:a",
       "pcm_s16le",
+      "-metadata",
+      "comment=alignment worker metadata",
       alignment,
     ]);
     const { stdout } = await runner.run("ffprobe", [
@@ -271,7 +294,8 @@ describe("foreground logged clip cutter", () => {
     ]);
     const durationSamples = Number(stdout.trim());
     expect(durationSamples).toBeGreaterThan(60_000);
-    const audioHash = await hashMediaFile(alignment);
+    const waveform = await readAlignmentWave(alignment);
+    expect(waveform.audio.durationSamples).toBe(durationSamples);
     f.transcripts.getVerifiedTracks.mockImplementation(
       async ({ clip: { id } }) => {
         const transcript = structuredClone(baseTranscript);
@@ -280,7 +304,8 @@ describe("foreground logged clip cutter", () => {
           fingerprint: "f".repeat(64),
           sourceContentSha256: transcript.track.contentSha256,
           audio: {
-            hash: `sha256:${id === clip.id ? audioHash : "0".repeat(64)}`,
+            hash:
+              id === clip.id ? waveform.audio.hash : `sha256:${"0".repeat(64)}`,
             sampleRate: 16_000,
             durationSamples,
           },
@@ -304,16 +329,19 @@ describe("foreground logged clip cutter", () => {
         };
       },
     );
-    f.deps.renderer = new FfmpegVideoRangeRenderer();
+    const renderer = new FfmpegVideoRangeRenderer();
+    const prepare = vi.spyOn(renderer, "prepareSourceClock");
+    f.deps.renderer = renderer;
     f.deps.inspector = new FfprobeVideoInspector();
     const [verified, mismatch] = await cutLoggedClips(f.request, f.deps);
+    expect(prepare).toHaveBeenCalledTimes(1);
     const a = JSON.parse(await readFile(verified!.manifestPath, "utf8"));
     const b = JSON.parse(await readFile(mismatch!.manifestPath, "utf8"));
     const mediaSha256 = await hashMediaFile(verified!.mediaPath);
     expect(a.transcriptClock).toMatchObject({
       schemaVersion: 1,
       mediaSha256,
-      alignmentAudioSha256: `sha256:${audioHash}`,
+      alignmentAudioSha256: waveform.audio.hash,
       frameDuration: { numerator: 1001, denominator: 24000 },
       frameCount: expect.any(Number),
     });
@@ -329,12 +357,17 @@ describe("foreground logged clip cutter", () => {
     expect(
       bound.subarray(baseline.length + 4, baseline.length + 8).toString(),
     ).toBe("uuid");
-    expect(JSON.parse(bound.subarray(baseline.length + 24).toString())).toEqual(
-      Object.fromEntries(
-        Object.entries(a.transcriptClock).filter(
-          ([key]) => key !== "mediaSha256",
-        ),
-      ),
+    const { mediaSha256: _mediaDigest, ...embeddedEvidence } =
+      a.transcriptClock;
+    const fields = [
+      ...Object.keys(embeddedEvidence),
+      "denominator",
+      "numerator",
+    ].sort();
+    expect(bound.subarray(baseline.length + 24)).toEqual(
+      createHash("sha256")
+        .update(JSON.stringify(embeddedEvidence, fields))
+        .digest(),
     );
     expect(await f.deps.inspector.inspect(verified!.mediaPath)).toEqual(
       await f.deps.inspector.inspect(mismatch!.mediaPath),

@@ -1,14 +1,18 @@
+import { createReadStream } from "node:fs";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import { createInterface } from "node:readline";
 
 import type { TranscriptAlignmentProvenance } from "@research-video/contracts";
 
 import type { MediaCommandRunner } from "./index.ts";
-import { assertRegularMediaFile, hashMediaFile } from "./video.ts";
+import { readAlignmentWave } from "./alignment-wave.ts";
+import { assertRegularMediaFile } from "./video.ts";
 
 type AlignmentAudio = NonNullable<TranscriptAlignmentProvenance["audio"]>;
 type Rational = { numerator: number; denominator: number };
 type PcmClock = { first: bigint; rate: bigint; samples: bigint };
+export type SourceAudioClock = { audio: AlignmentAudio; native: PcmClock };
 
 export type VerifiedVideoClock = {
   firstFrame: Rational;
@@ -16,28 +20,32 @@ export type VerifiedVideoClock = {
   frameCount: number;
 };
 
-const maximumTraceBytes = 1024 * 1024;
+const maximumVideoClockBytes = 64 * 1024 * 1024;
 const signedInteger = /^-?\d+$/u;
 const ratePattern = /^(\d+)\/(\d+)$/u;
 
-async function traceRows(path: string) {
-  if ((await assertRegularMediaFile(path)) > maximumTraceBytes) return [];
-  return (await readFile(path, "utf8"))
-    .trim()
-    .split("\n")
-    .map((line) => line.trim().split(/\s+/u));
+async function* traceRows(path: string) {
+  await assertRegularMediaFile(path);
+  const stream = createReadStream(path);
+  try {
+    const lines = createInterface({ input: stream, crlfDelay: Infinity });
+    for await (const line of lines) yield line.trim().split(/\s+/u);
+  } finally {
+    stream.destroy();
+  }
 }
 
-function audioClock(rows: string[][]): PcmClock | undefined {
-  const rate = exactRate(rows[0]?.[2]);
-  if (!rate || rate[0] !== 1n) return;
+async function audioClock(path: string): Promise<PcmClock | undefined> {
+  let timeBase: string | undefined;
+  let index = 0;
   let first: bigint | undefined;
   let samples = 0n;
-  for (const [index, [n, pts, base, prior, count, extra]] of rows.entries()) {
+  for await (const [n, pts, base, prior, count, extra] of traceRows(path)) {
+    timeBase ??= base;
     if (
       extra !== undefined ||
       n !== String(index) ||
-      base !== rows[0]?.[2] ||
+      base !== timeBase ||
       !pts ||
       !prior ||
       !count ||
@@ -52,8 +60,11 @@ function audioClock(rows: string[][]): PcmClock | undefined {
     )
       return;
     samples += BigInt(count);
+    index++;
   }
-  if (first !== undefined) return { first, rate: rate[1], samples };
+  const rate = exactRate(timeBase);
+  if (rate?.[0] === 1n && first !== undefined)
+    return { first, rate: rate[1], samples };
 }
 
 function exactRate(value: unknown) {
@@ -139,117 +150,116 @@ function verifyVideoClock(
   return { firstFrame, frameDuration, frameCount: rows.length };
 }
 
-export async function observeVideoClock(input: {
-  sourcePath: string;
-  outputPath: string;
-  audio: AlignmentAudio;
+type ClockTools = {
   ffmpeg: string;
-  ffprobe: string;
   runner: MediaCommandRunner;
-  render: (extraArgs: string[]) => Promise<void>;
+  timeoutMs: number;
   signal?: AbortSignal;
-}): Promise<VerifiedVideoClock | undefined> {
-  const {
-    sourcePath,
-    outputPath,
-    audio,
-    ffmpeg,
-    ffprobe,
-    runner,
-    render,
-    signal,
-  } = input;
-  const options = { timeoutMs: 10 * 60_000, ...(signal ? { signal } : {}) };
-  const directory = await mkdtemp(join(dirname(outputPath), ".clock-"));
+};
+
+export async function prepareSourceAudioClock(
+  input: ClockTools & {
+    sourcePath: string;
+    scratchDirectory: string;
+  },
+): Promise<SourceAudioClock | undefined> {
+  const options = {
+    timeoutMs: input.timeoutMs,
+    ...(input.signal ? { signal: input.signal } : {}),
+  };
+  const directory = await mkdtemp(join(input.scratchDirectory, ".clock-"));
   const wav = join(directory, "alignment.wav");
   const flac = join(directory, "alignment.flac");
   const sourceAudioTrace = join(directory, "source-audio.txt");
   const wavTrace = join(directory, "wav.txt");
-  const videoTrace = join(directory, "video.txt");
   try {
-    let sourceAudio: PcmClock | undefined;
-    try {
-      // The alignment worker reads acquired FLAC. Reproduce that decode path
-      // from this video and keep the pre-encoding origin before FLAC resets it.
-      const audioFlags = [
-        "-nostdin",
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-n",
-      ];
-      const traceFlags = (path: string) => [
-        "-stats_enc_pre:a",
-        path,
-        "-stats_enc_pre_fmt:a",
-        "{n} {pts} {tb} {sn} {samp}",
-      ];
-      await runner.run(
-        ffmpeg,
-        [
-          ...audioFlags,
-          "-i",
-          sourcePath,
-          "-map",
-          "0:a:0",
-          "-vn",
-          "-c:a",
-          "flac",
-          ...traceFlags(sourceAudioTrace),
-          flac,
-        ],
-        options,
-      );
-      await runner.run(
-        ffmpeg,
-        [
-          ...audioFlags,
-          "-i",
-          flac,
-          "-map",
-          "0:a:0",
-          "-vn",
-          "-ar",
-          "16000",
-          "-ac",
-          "1",
-          "-c:a",
-          "pcm_s16le",
-          ...traceFlags(wavTrace),
-          wav,
-        ],
-        options,
-      );
-      if (`sha256:${await hashMediaFile(wav)}` === audio.hash) {
-        const pcm = audioClock(await traceRows(wavTrace));
-        const native = audioClock(await traceRows(sourceAudioTrace));
-        if (
-          pcm &&
-          native &&
-          pcm.first === 0n &&
-          pcm.rate === 16000n &&
-          pcm.samples === BigInt(audio.durationSamples)
-        ) {
-          const error = native.samples * pcm.rate - pcm.samples * native.rate;
-          if (error > -native.rate && error < native.rate) sourceAudio = native;
-        }
-      }
-    } catch {
-      signal?.throwIfAborted();
-    }
-    await render(
-      sourceAudio === undefined
-        ? []
-        : [
-            "-stats_enc_pre:v",
-            videoTrace,
-            "-stats_enc_pre_fmt:v",
-            "{n} {ni} {ptsi} {tbi}",
-          ],
+    // Reproduce the worker's conversion and measure the native timestamps
+    // before the FLAC container resets the clock.
+    const common = ["-nostdin", "-hide_banner", "-loglevel", "error", "-n"];
+    const traceFlags = (path: string) => [
+      "-stats_enc_pre:a",
+      path,
+      "-stats_enc_pre_fmt:a",
+      "{n} {pts} {tb} {sn} {samp}",
+    ];
+    await input.runner.run(
+      input.ffmpeg,
+      [
+        ...common,
+        "-i",
+        input.sourcePath,
+        "-map",
+        "0:a:0",
+        "-vn",
+        "-c:a",
+        "flac",
+        ...traceFlags(sourceAudioTrace),
+        flac,
+      ],
+      options,
     );
-    if (sourceAudio === undefined) return;
+    await input.runner.run(
+      input.ffmpeg,
+      [
+        ...common,
+        "-i",
+        flac,
+        "-map",
+        "0:a:0",
+        "-vn",
+        "-ar",
+        "16000",
+        "-ac",
+        "1",
+        "-c:a",
+        "pcm_s16le",
+        ...traceFlags(wavTrace),
+        wav,
+      ],
+      options,
+    );
+    const { audio } = await readAlignmentWave(wav);
+    const pcm = await audioClock(wavTrace);
+    const native = await audioClock(sourceAudioTrace);
+    if (
+      !pcm ||
+      !native ||
+      pcm.first !== 0n ||
+      pcm.rate !== 16000n ||
+      pcm.samples !== BigInt(audio.durationSamples)
+    )
+      return;
+    const error = native.samples * pcm.rate - pcm.samples * native.rate;
+    if (error > -native.rate && error < native.rate) return { audio, native };
+  } catch {
+    input.signal?.throwIfAborted();
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+}
+
+export async function observeVideoClock(
+  input: Pick<ClockTools, "runner" | "timeoutMs" | "signal"> & {
+    outputPath: string;
+    sourceAudio: SourceAudioClock;
+    ffprobe: string;
+    render: (extraArgs: string[]) => Promise<void>;
+  },
+): Promise<VerifiedVideoClock | undefined> {
+  const { outputPath, sourceAudio, ffprobe, runner, render, signal } = input;
+  const options = { timeoutMs: input.timeoutMs, ...(signal ? { signal } : {}) };
+  const directory = await mkdtemp(join(dirname(outputPath), ".clock-"));
+  const videoTrace = join(directory, "video.txt");
+  const decodedPath = join(directory, "decoded.json");
+  try {
+    await render([
+      "-stats_enc_pre:v",
+      videoTrace,
+      "-stats_enc_pre_fmt:v",
+      "{n} {ni} {ptsi} {tbi}",
+    ]);
     try {
-      const { stdout } = await runner.run(
+      await runner.run(
         ffprobe,
         [
           "-v",
@@ -260,22 +270,31 @@ export async function observeVideoClock(input: {
           "stream=time_base:frame=pts",
           "-of",
           "json",
+          "-o",
+          decodedPath,
           outputPath,
         ],
         options,
       );
-      const decoded = JSON.parse(stdout) as {
+      if (
+        (await assertRegularMediaFile(decodedPath)) > maximumVideoClockBytes ||
+        (await assertRegularMediaFile(videoTrace)) > maximumVideoClockBytes
+      )
+        return;
+      const decoded = JSON.parse(await readFile(decodedPath, "utf8")) as {
         streams: { time_base: unknown }[];
         frames: { pts: unknown }[];
       };
+      const rows: string[][] = [];
+      for await (const row of traceRows(videoTrace)) rows.push(row);
       return verifyVideoClock(
-        await traceRows(videoTrace),
+        rows,
         {
           timeBase: decoded.streams[0]?.time_base,
           pts: decoded.frames.map(({ pts }) => pts),
         },
-        sourceAudio,
-        audio.durationSamples,
+        sourceAudio.native,
+        sourceAudio.audio.durationSamples,
       );
     } catch {
       signal?.throwIfAborted();

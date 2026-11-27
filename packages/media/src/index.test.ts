@@ -628,6 +628,8 @@ describe("YtDlpAudioAcquisitionProvider", () => {
         "--no-config",
         "--no-playlist",
         "--no-progress",
+        "--format",
+        "ba/b",
         "--extract-audio",
         "--audio-format",
         "flac",

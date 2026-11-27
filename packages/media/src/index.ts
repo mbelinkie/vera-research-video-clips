@@ -30,6 +30,7 @@ export {
   FfprobeMediaInspector as FfprobeVideoInspector,
 } from "./video.ts";
 export * from "./video.ts";
+export { readAlignmentWave } from "./alignment-wave.ts";
 
 export type AcquiredMedia = {
   scratchPath: string;
@@ -255,6 +256,8 @@ export class YtDlpAudioAcquisitionProvider implements MediaAcquisitionProvider {
         "--no-config",
         "--no-playlist",
         "--no-progress",
+        "--format",
+        "ba/b",
         "--extract-audio",
         "--audio-format",
         "flac",
