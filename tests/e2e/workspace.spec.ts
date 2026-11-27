@@ -171,6 +171,92 @@ async function connectFakeProject(page: Page, projects = [liveProject]) {
   await expect(page.getByLabel("Target project")).toHaveValue(projects[0]!);
 }
 
+for (const delayed of [false, true]) {
+  test(`batch preflight resets on project switch (${delayed ? "late" : "completed"} response)`, async ({
+    page,
+  }) => {
+    let releaseFirst!: () => void;
+    const holdFirst = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const requests: string[] = [];
+    const titleA = "First project preflight fixture";
+    const titleB = "Second project preflight fixture";
+    await page.route("**/cloud-api/api/projects/**", async (route) => {
+      const request = route.request();
+      const path = new URL(request.url()).pathname;
+      if (path.endsWith("/review-inbox"))
+        return route.fulfill({ json: { items: [] } });
+      if (path.endsWith("/transcription-batches"))
+        return route.fulfill({ json: { batches: [] } });
+      if (path.endsWith("/videos/preflight")) {
+        const projectId = path.split("/")[4]!;
+        const { inputs, ...options } = request.postDataJSON();
+        requests.push(projectId);
+        expect(inputs).toEqual([liveVideo]);
+        expect(options.priority).toBe("high");
+        if (delayed && projectId === liveProject) await holdFirst;
+        return route.fulfill({
+          json: {
+            projectId,
+            options,
+            items: [
+              {
+                inputIndex: 0,
+                input: liveVideo,
+                status: "ready",
+                processingNeed: "transcription",
+                title: projectId === liveProject ? titleA : titleB,
+              },
+            ],
+            summary: {
+              total: 1,
+              ready: 1,
+              existingTranscripts: 0,
+              duplicates: 0,
+              unsupported: 0,
+              metadataFailed: 0,
+            },
+          },
+        });
+      }
+      return route.fulfill({ status: 404, json: {} });
+    });
+
+    await connectFakeProject(page, [liveProject, secondProject]);
+    const queue = page.getByRole("region", { name: "Transcription queue" });
+    const inputs = queue.getByLabel("YouTube URLs or video IDs, one per line");
+    const preflight = queue.getByRole("button", { name: "Preflight 1" });
+    const create = queue.getByRole("button", { name: "Create batch" });
+    await inputs.fill(liveVideo);
+    await queue.getByLabel("Priority").selectOption("high");
+    await expect(create).toBeDisabled();
+    await preflight.click();
+    await expect.poll(() => requests).toEqual([liveProject]);
+    if (!delayed) {
+      await expect(queue.getByText(titleA)).toBeVisible();
+      await expect(create).toBeEnabled();
+    }
+
+    await page.getByLabel("Target project").selectOption(secondProject);
+    if (delayed) releaseFirst();
+    await expect(preflight).toBeEnabled();
+    await expect(queue.getByText(titleA)).toHaveCount(0);
+    await expect(create).toBeDisabled();
+    await expect(inputs).toHaveValue(liveVideo);
+    await expect(queue.getByLabel("Priority")).toHaveValue("high");
+    await preflight.click();
+    await expect.poll(() => requests).toEqual([liveProject, secondProject]);
+    await expect(queue.getByText(titleB)).toBeVisible();
+    await expect(create).toBeEnabled();
+
+    // Existing input and option invalidation still requires a fresh preflight.
+    await queue.getByLabel("Priority").selectOption("normal");
+    await expect(queue.getByText(titleB)).toHaveCount(0);
+    await expect(create).toBeDisabled();
+  });
+}
+
 test("a normal launch never substitutes the API demo transcript", async ({
   page,
 }) => {

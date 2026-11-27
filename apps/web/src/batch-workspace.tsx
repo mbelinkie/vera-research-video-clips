@@ -61,6 +61,10 @@ type BatchWorkspaceProps = {
 };
 
 const apiRoot = "/cloud-api";
+const preflightCompleteMessage =
+  "Preflight complete. Review every row before creating the batch.";
+
+type ProjectContext = { projectId: string; authorization: string };
 
 type LanguageDecisionDraft = {
   resolvedLanguage: string;
@@ -92,7 +96,10 @@ export function BatchWorkspace({
   const [sourcePolicy, setSourcePolicy] = useState("prefer-existing");
   const [executionLocation, setExecutionLocation] = useState("local");
   const [priority, setPriority] = useState("normal");
-  const [preflight, setPreflight] = useState<BatchPreflightResponse>();
+  const [preflightResult, setPreflight] = useState<{
+    context: ProjectContext;
+    response: BatchPreflightResponse;
+  }>();
   const [csvDocument, setCsvDocument] = useState<CsvImportDocument>();
   const [csvColumnIndex, setCsvColumnIndex] = useState("");
   const [batchList, setBatchList] = useState<TranscriptionBatchListResponse>();
@@ -111,14 +118,29 @@ export function BatchWorkspace({
       ? "Refresh your projects."
       : "Connect with a development session credential to load your projects.",
   );
-  const currentContext = useRef({ projectId, authorization });
-  currentContext.current = { projectId, authorization };
+  const currentContext = useRef<ProjectContext>({ projectId, authorization });
+  if (
+    currentContext.current.projectId !== projectId ||
+    currentContext.current.authorization !== authorization
+  ) {
+    currentContext.current = { projectId, authorization };
+  }
+  const preflight =
+    preflightResult?.context === currentContext.current
+      ? preflightResult.response
+      : undefined;
   const sameContext = (targetProjectId: string, targetAuth = authorization) =>
     currentContext.current.projectId === targetProjectId &&
     currentContext.current.authorization === targetAuth;
 
   useEffect(() => {
-    // Never keep another project's private batch/review rows visible.
+    // Never keep another project's preflight or batch/review rows visible.
+    setPreflight(undefined);
+    setMessage((current) =>
+      current === preflightCompleteMessage
+        ? "Run preflight for the selected project."
+        : current,
+    );
     setBatchList(undefined);
     setSelectedBatch(undefined);
     setSelectedBatchId("");
@@ -321,6 +343,7 @@ export function BatchWorkspace({
 
   async function runPreflight() {
     if (!projectId || inputs.length === 0) return;
+    const context = currentContext.current;
     setBusy(true);
     try {
       const payload = await request(
@@ -330,12 +353,14 @@ export function BatchWorkspace({
           body: JSON.stringify({ inputs, ...requestOptions }),
         },
       );
-      setPreflight(BatchPreflightResponseSchema.parse(payload));
-      setMessage(
-        "Preflight complete. Review every row before creating the batch.",
-      );
+      if (currentContext.current !== context) return;
+      const response = BatchPreflightResponseSchema.parse(payload);
+      if (response.projectId !== projectId)
+        throw new Error("Preflight does not match the selected project.");
+      setPreflight({ context, response });
+      setMessage(preflightCompleteMessage);
     } catch (error) {
-      setMessage(errorMessage(error));
+      if (currentContext.current === context) setMessage(errorMessage(error));
     } finally {
       setBusy(false);
     }
