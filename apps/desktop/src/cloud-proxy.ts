@@ -6,6 +6,8 @@ import {
 } from "node:http";
 
 const PERMITTED_METHODS = new Set(["GET", "POST", "PUT", "PATCH", "DELETE"]);
+const SOURCE_WRITE_ACCESS_PATH =
+  /^\/api\/projects\/[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\/source-write-access$/iu;
 const DEFAULT_MAX_REQUEST_BODY_BYTES = 1_048_576;
 const DEFAULT_MAX_RESPONSE_BODY_BYTES = 4_194_304;
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
@@ -116,6 +118,10 @@ async function handleRequest(options: RequestHandlerOptions): Promise<void> {
     }
 
     const requestBody = await readRequestBody(request, options.requestLimit);
+    if (target.method === "HEAD" && requestBody.byteLength > 0) {
+      replyError(response, 400, "invalid_request");
+      return;
+    }
     const token = await options.tokenProvider();
     if (!isBearerToken(token)) {
       throw new LocalAuthenticationUnavailableError();
@@ -244,7 +250,12 @@ function parseApiTarget(
   request: IncomingMessage,
 ): { method: string; pathname: string; search: string } | undefined {
   const method = request.method?.toUpperCase();
-  if (!method || !PERMITTED_METHODS.has(method) || !request.url) {
+  if (
+    !method ||
+    !request.url ||
+    (!PERMITTED_METHODS.has(method) &&
+      !(method === "HEAD" && SOURCE_WRITE_ACCESS_PATH.test(request.url)))
+  ) {
     return undefined;
   }
   const rawPath = request.url.split("?", 1)[0] ?? "";

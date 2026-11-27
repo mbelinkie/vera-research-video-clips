@@ -1,5 +1,7 @@
+import { createHash } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { createLocalAgent } from "../../local-agent/src/app.ts";
 import { startLoopbackCloudCredentialProxy } from "./cloud-proxy.ts";
 
 const launchSecret = "u".repeat(43);
@@ -128,8 +130,87 @@ describe("loopback cloud credential proxy", () => {
     );
   });
 
+  it("verifies project write access and transcribes desktop Speech through the real credential proxy", async () => {
+    const project = "/api/projects/4c27fb62-bef0-4bc0-8a4c-031697115f68";
+    const source = `${project}/audio/d9b8d4e9-8ab3-4a17-bec0-602278ee44cf`;
+    const access = `${project}/source-write-access`;
+    const original = Buffer.from("local speech fixture");
+    const sha256 = createHash("sha256").update(original).digest("hex");
+    const result = {
+      audioSha256: sha256,
+      language: "en",
+      model: "fixture",
+      segments: [{ startMs: 1000, endMs: 2000, text: "A fixture for Speech." }],
+    };
+    const upstream = vi.fn(async (url: URL, init: RequestInit) => {
+      expect(init.headers).toEqual({
+        accept: "application/json",
+        authorization: `Bearer ${cloudBearer}`,
+      });
+      expect(init.body).toBeUndefined();
+      if (url.pathname === access && init.method === "HEAD")
+        return new Response(null, { status: 204 });
+      expect(url.pathname).toBe(source);
+      expect(init.method).toBe("GET");
+      return Response.json({
+        durationMs: 20_000,
+        peaks: Array(256).fill(0),
+        playbackDurationMs: 15_000,
+        mimeType: "audio/wav",
+        playbackSha256: "a".repeat(64),
+        origin: { kind: "file", originalSha256: sha256 },
+      });
+    });
+    const proxy = await start({
+      cloudOrigin: "https://api.example.test",
+      launchSecret,
+      tokenProvider: async () => cloudBearer,
+      fetch: upstream as typeof fetch,
+    });
+    const transcribe = vi.fn(async () => result);
+    const agent = createLocalAgent({
+      desktopSession: { secret: launchSecret, origin: "rvc://app" },
+      audioSpeech: { cloudOrigin: proxy.origin, transcribe },
+    });
+    try {
+      const submit = (secret: string) =>
+        agent.inject({
+          method: "POST",
+          url: `${source}/transcript`,
+          headers: {
+            origin: "rvc://app",
+            "x-research-video-session": secret,
+            "content-type": "application/octet-stream",
+            authorization: "Bearer ignored-in-desktop-mode",
+          },
+          payload: original,
+        });
+      expect((await submit("wrong-launch-session")).statusCode).toBe(401);
+      expect(upstream).not.toHaveBeenCalled();
+      expect(transcribe).not.toHaveBeenCalled();
+
+      const response = await submit(launchSecret);
+      expect(response.statusCode, response.body).toBe(200);
+      expect(response.json()).toEqual(result);
+      expect(upstream).toHaveBeenCalledTimes(2);
+      expect(transcribe).toHaveBeenCalledExactlyOnceWith(
+        source.split("/").at(-1),
+        original,
+        20_000,
+        expect.any(AbortSignal),
+      );
+    } finally {
+      await agent.close();
+    }
+  });
+
   it.each([
     ["HEAD", "/api/projects"],
+    ["HEAD", "/api/projects/project-1/source-write-access"],
+    [
+      "HEAD",
+      "/api/projects/4c27fb62-bef0-4bc0-8a4c-031697115f68/source-write-access?debug=1",
+    ],
     ["OPTIONS", "/api/projects"],
     ["GET", "/not-api/projects"],
     ["GET", "/api/../private"],
