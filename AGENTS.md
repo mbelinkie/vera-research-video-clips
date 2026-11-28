@@ -11,6 +11,10 @@ claim in the Research Project. Follow the [filing and readiness policy](https://
 
 ## Branches and delivery
 
+- Before a local run or review that needs current code, fetch `origin/main`.
+  If the checkout is clean and on `main` at or behind `origin/main`, run
+  `git merge --ff-only origin/main`. Otherwise, preserve the checkout and use
+  a separate clean worktree at the fetched commit. Record the commit used.
 - Start each issue from current `origin/main`. Push the first commit and open
   a draft PR targeting `main` with `Closes #<issue>` when an issue exists.
   Bring reviewed drafts up to date with `main` before delivery.
